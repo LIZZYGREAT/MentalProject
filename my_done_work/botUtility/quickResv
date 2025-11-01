@@ -1,0 +1,128 @@
+#!/usr/bin/python3
+import cgitb
+cgitb.enable(display=1,logdir='/home/jason/log')
+import os
+import re
+import rsa
+import sys
+import json
+import time
+import fcntl
+import random
+import hashlib
+import requests
+import datetime
+from loginProxy import libic_login,login,new_session,get_libic_session,proxies
+from diskcache import Cache
+import json
+import time
+import os
+
+user_info_cache = Cache('/home/www/app.BOT/.uinfo_cache')
+user_info_cache.eviction_policy='none'
+user_info_cache.expire()
+
+def read_user_info(open_id):
+    assert open_id.startswith('ou_'), 'Not valid open ID!'
+    return user_info_cache.get(open_id)
+
+def consume_queue(queue_name):
+    try:
+        token_file = f"/home/www/app.TOKEN/token/{queue_name}_tokens.json"
+        if not os.path.exists(token_file):
+            return False
+        with open(token_file,'r+') as f:
+            fcntl.flock(f,fcntl.LOCK_EX)
+            data = json.load(f)
+            if len(data['tokens']) == data['current']:
+                data['tokens'] = data['tokens'][1:]
+                data['current'] -= 1
+                f.seek(0)
+                json.dump(data,f)
+                f.truncate()
+                return True
+            else:
+                return False
+    except Exception as e:
+        return False
+
+def consume_token(queue_list):
+    queue_list = list(queue_list)
+    random.shuffle(queue_list)
+    for q in queue_list:
+        if consume_queue(q):
+            return True
+    return False
+
+def badRequest(content = "Invalid parameters"):
+    print("Status: 400 Bad Request\nContent-Type: text/html\n\n",end='')
+    print(f"<html><body><h1>400 Bad Request</h1><p>{content}</p></body></html>",end='')
+    exit()
+
+def success(content):
+    print("Status: 200 OK")
+    print("Content-Type:Application")
+    print(f"Content-Length:{len(content)}")
+    print("")
+    print(content)
+    exit()
+
+def unavailable():
+    print("Status: 503 Service Unavailable")
+    print("Content-Type: text/html")
+    print("")
+    print("<html><body><h1>503 Service Unavailable</h1><p>Please try again later.</p></body></html>")
+    exit()
+
+def make_reservation(uid,password,startTime,endTime,roomID):
+    if not consume_token(('LIBIC0','LIBIC1','LIBIC2')):unavailable()
+    startTime = time.strptime(startTime,"%Y-%m-%d,%H:%M")
+    endTime = time.strptime(endTime,"%Y-%m-%d,%H:%M")
+    duration = (time.mktime(endTime)-time.mktime(startTime))//60
+    startTime = time.strftime("%Y-%m-%d %H:%M",startTime)
+    endTime = time.strftime("%Y-%m-%d %H:%M",endTime)
+    session,response = get_libic_session(uid,password)
+    infos = response.json()['data']
+    accountNo = infos['accNo']
+    token = infos['token']
+    headers = dict(token=token,lan='1')
+    headers['Content-Type'] = 'application/json;charset=utf-8'
+    data = dict(roomId=int(roomID),
+            scopeEndTime=endTime,
+            memo="",
+            captcha="",
+            duration=int(duration),
+            scopeBeginTime=startTime,
+            testName="")
+    url = "https://libic.nankai.edu.cn/ic-web/reserve/quickResv"
+    with open('record','a') as file:
+        file.write(str(data))
+    response = session.post(url,data=json.dumps(data),headers=headers,proxies=proxies).json()
+    return json.dumps(dict(message=response['message']))
+
+if __name__ == "__main__":
+    request_method = os.environ.get('REQUEST_METHOD', 'GET')
+    if request_method != 'GET':badRequest('Unsupported request')
+    request_uri = os.environ.get('REQUEST_URI', '')
+    
+    headers = dict()
+    for key, value in os.environ.items():
+        if key.startswith("HTTP_"):
+            headers[key[5:].replace('_',' ')] = value
+
+    def get_from_header(name,def_val = None):
+        cont = headers.get(name,def_val)
+        if cont != def_val and cont.endswith(','):
+            return cont[:-1]
+        return cont
+    openID = get_from_header('OPENID')
+    try:
+        userID, password = read_user_info(openID)
+    except Exception:
+        unavailable()
+    startTime = get_from_header('STARTTIME')
+    endTime = get_from_header('ENDTIME')
+    roomID = get_from_header('ROOMID')
+    if not password or not userID or not startTime or not endTime or not roomID:
+        badRequest('Empty paramater')
+    success(make_reservation(userID,password,startTime,endTime,roomID))

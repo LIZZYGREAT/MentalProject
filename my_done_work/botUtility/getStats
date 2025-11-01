@@ -1,0 +1,298 @@
+#!/usr/bin/python3
+import cgitb
+cgitb.enable(display=1,logdir='/home/jason/log')
+import os
+import re
+import rsa
+import sys
+import json
+import time
+import fcntl
+import random
+import hashlib
+import asyncio
+import aiohttp
+from aiohttp_socks import ProxyConnector
+import requests
+import datetime
+from loginProxy import libic_login,login,new_session,proxies,get_libic_session
+from diskcache import Cache
+import json
+import time
+import os
+
+user_info_cache = Cache('/home/www/app.BOT/.uinfo_cache')
+user_info_cache.eviction_policy='none'
+user_info_cache.expire()
+
+def read_user_info(open_id):
+    assert open_id.startswith('ou_'), 'Not valid open ID!'
+    return user_info_cache.get(open_id)
+
+def consume_queue(queue_name):
+    try:
+        token_file = f"/home/www/app.TOKEN/token/{queue_name}_tokens.json"
+        if not os.path.exists(token_file):
+            return False
+        with open(token_file,'r+') as f:
+            fcntl.flock(f,fcntl.LOCK_EX)
+            data = json.load(f)
+            if len(data['tokens']) == data['current']:
+                data['tokens'] = data['tokens'][1:]
+                data['current'] -= 1
+                f.seek(0)
+                json.dump(data,f)
+                f.truncate()
+                return True
+            else:
+                return False
+    except Exception as e:
+        return False
+
+def consume_token(queue_list):
+    queue_list = list(queue_list)
+    random.shuffle(queue_list)
+    for q in queue_list:
+        if consume_queue(q):
+            return True
+    return False
+
+def badRequest(content = "Invalid parameters"):
+    print("Status: 400 Bad Request\nContent-Type: text/html\n\n",end='')
+    print(f"<html><body><h1>400 Bad Request</h1><p>{content}</p></body></html>",end='')
+    exit()
+
+def success(content):
+    print("Status: 200 OK")
+    print("Content-Type:Application")
+    print(f"Content-Length:{len(content)}")
+    print("")
+    print(content)
+    exit()
+
+def unavailable():
+    print("Status: 503 Service Unavailable")
+    print("Content-Type: text/html")
+    print("")
+    print("<html><body><h1>503 Service Unavailable</h1><p>Please try again later.</p></body></html>")
+    exit()
+
+
+class account:
+    def __init__(self,aid,apassword):
+        self.ID = aid
+        self.PASSWORD = apassword
+
+cache = Cache("/home/www/app.LIBIC/.status_cache")
+cache.size_limit = 5*1024*1024 #100M
+cache.eviction_policy = 'least-recently-used'
+cache.expire()
+
+smallcache = Cache("/home/www/app.LIBIC/.list_cache")
+smallcache.size_limit = 5*1024*1024 #15M
+smallcache.eviction_policy = 'least-recently-used'
+smallcache.expire()
+
+uid = '2111504'
+password = 'HtML60oU'
+session = None
+token=None
+accountNo=None
+
+def jit_login():
+    global session
+    session,response = get_libic_session(uid,password)
+    infos = response.json()['data']
+    global accountNo
+    accountNo = infos['accNo']
+    global token
+    token = infos['token']
+
+from datetime import datetime
+
+def normalize_time(time_str):
+    # List of possible input formats
+    input_formats = [
+        "%Y-%m-%d,%H:%M",     # e.g., 20250519,15:30
+        "%Y-%m-%d %H:%M"
+        "%Y%m%d,%H:%M",     # e.g., 20250519,15:30
+        "%Y%m%d %H:%M"
+    ]
+
+    # Desired output format
+    output_format = "%Y-%m-%d,%H:%M"
+
+    for fmt in input_formats:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            return dt.strftime(output_format)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Time string '{time_str}' does not match any known formats.")
+
+
+pre_fetch_work = None
+def get_tables(start_time=None,end_time=None):
+    assert uid is not None
+    assert password is not None
+    if not start_time:
+        start_time = time.strftime("%Y-%m-%d,%H:%M",time.localtime(time.time()))
+    else:
+        start_time = normalize_time(start_time)
+    if not end_time:
+        end_time = start_time
+    else:
+        end_time = normalize_time(end_time)
+    result = '可预约/总座位数:'
+    result = '可预约座位数:'
+    seat_content = get_something(0)
+    rooms = list()
+    for library in seat_content['data']:
+        for floor in library['children']:
+            for room in floor['children']:
+                rooms.append(room['id'])
+    global pre_fetch_work
+    pre_fetch_work = (pre_fetch,rooms,start_time)
+    for library in seat_content['data']:
+        result += f"图书馆:{library['name']}\n"
+        for floor in library['children']:
+            #result += f"\t({floor['id']}){floor['name']}:"
+            #result += f"\t{floor['name']}:"
+            buffer = ''
+            avail=0
+            total=0
+            for room in floor['children']:
+                room_list,tot = check_room_available(start_time,end_time,room['id'])
+                avail += len(room_list)
+                total += tot
+                #buffer += f"\t\t({room['id']}){room['name']}:{len(room_list)}/{tot}\n"
+                if len(room_list):
+                    buffer += f"\t\t({room['id']}){room['name']}:{len(room_list)}\n"
+            #result += f"{avail}\n"
+            result += buffer
+    return json.dumps(dict(result=result))
+
+@smallcache.memoize(expire=2*60*60)#2hours
+def get_something(dummy):
+    if not session:
+        jit_login()
+    return session.get('https://libic.nankai.edu.cn/ic-web/seatMenu',proxies=proxies).json()
+
+async def single_prefetch(async_session,roomID,date):
+    headers = dict(token=token, lan='1')
+    url = f"https://libic.nankai.edu.cn/ic-web/reserve"
+    params = dict(roomIds=roomID,
+                  resvDates=date,
+                  sysKind='8')
+    async with async_session.get(url,headers=headers,params = params) as response:
+        result = await response.json()
+    cache.set(('room_reservation',roomID,date,None),result, expire=10*60)#10min
+
+async def pre_fetch(rooms,start_time):
+    if not session:
+        jit_login()
+    date = to_time_struct(start_time)
+    date = time.strftime("%Y%m%d",date)
+    connector = ProxyConnector.from_url("socks5://localhost:1027")
+    cookie_jar = aiohttp.CookieJar()
+    for cookie in session.cookies:
+        cookie_jar.update_cookies({cookie.name: cookie.value})
+    async with aiohttp.ClientSession(connector=connector,cookie_jar=cookie_jar) as async_session:
+        tasks = [single_prefetch(async_session,roomID,date) for roomID in rooms]
+        await asyncio.gather(*tasks)
+
+URLIC = 'https://libic.nankai.edu.cn/'
+@cache.memoize(name='room_reservation',expire=10*60)#10 min
+def get_room_reservation(roomID,date)->object:
+    if not session:
+        jit_login()
+    func,*pars = pre_fetch_work
+    asyncio.run(func(*pars))
+    headers = dict(token=token,lan='1')
+    url = f"{URLIC}ic-web/reserve"
+    params = dict(roomIds=roomID,
+                  resvDates=date,
+                  sysKind='8')
+    return session.get(url,headers=headers,params = params,proxies=proxies).json()
+
+def check_room_available(time_start,time_end,roomID):
+    date = to_time_struct(time_start)
+    time_start = to_time_stamp(time_start)
+    time_end = to_time_stamp(time_end)
+    available_seats = list()
+    total_cnt = 0
+    for item in get_room_reservation(roomID,time.strftime('%Y%m%d',date))['data']:
+        if item['onlyView']:
+            continue
+        total_cnt += 1
+        open_info = item['openTimes'][0]
+        open_start = open_info['openStartTime']
+        open_end = open_info['openEndTime']
+        open_start = parse_time(open_start,date)
+        open_end = parse_time(open_end,date)
+        if open_start == open_end or time_start < open_start < time_end or time_start < open_end < time_end:
+            continue
+        if item['resvInfo'] and check_coverage(time_start,time_end,(v['startTime'] for v in item['resvInfo']),(v['endTime'] for v in item['resvInfo'])):
+            continue
+        available_seats.append(tuple((item['labId'],item['roomId'],item['devId'],item['devName'])))
+    return available_seats,total_cnt
+
+def parse_time(rel_time,date):
+    return to_time_stamp(time.strftime('%Y-%m-%d,',date)+rel_time)
+
+def to_time_struct(time_string):
+    try:
+        return time.strptime(time_string,"%Y-%m-%d,%H:%M")
+    except ValueError:
+        return -1
+
+def to_time_stamp(time_string):
+    time_struct = to_time_struct(time_string)
+    if time_struct == -1:
+        return -1
+    return int(1000*time.mktime(time_struct))
+
+def check_coverage(start,end,starts,ends):
+    for cstart,cend in zip(starts,ends):
+        if cstart <= end <= cend or cstart <= start <= cend:
+            return True
+    return False
+
+
+
+if __name__ == "__main__":
+    request_method = os.environ.get('REQUEST_METHOD', 'GET')
+    if request_method != 'GET':badRequest('Unsupported request')
+    request_uri = os.environ.get('REQUEST_URI', '')
+    
+    headers = dict()
+    for key, value in os.environ.items():
+        if key.startswith("HTTP_"):
+            headers[key[5:].replace('_',' ')] = value
+
+    def get_from_header(name,def_val = None):
+        cont = headers.get(name,def_val)
+        if cont != def_val and cont.endswith(','):
+            return cont[:-1]
+        return cont
+
+    openID = get_from_header('OPENID')
+
+    if openID == '000000':
+        from time import sleep
+        sleep(55)
+        success(json.dumps(dict(result='No library open now')))
+
+    try:
+        uid, password = read_user_info(openID)
+    except Exception:
+        unavailable()
+
+    startTime = get_from_header('STARTTIME')
+    endTime = get_from_header('ENDTIME')
+
+    success(get_tables(start_time=startTime,end_time=endTime))
+
+    #except Exception as e:
+    #   unavailable() 

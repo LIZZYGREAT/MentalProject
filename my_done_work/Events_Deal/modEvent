@@ -1,0 +1,589 @@
+#!/usr/bin/python3
+from typing import Iterable, Tuple, Dict, List, Callable, Any
+import requests
+import asyncio
+import aiohttp
+from LarkCalRead import TypedList, unserialize
+from LarkCalRead import vevent as eventInstance
+from LarkCal import vevent, event_location, time_info
+from LarkCal import reminder as type_reminder
+import os
+import sys
+import time
+import json
+
+from diskcache import Cache
+
+tokenDB = Cache('/home/www/app.BOT/.tokenDB')
+tokenDB.eviction_policy='none'
+tokenDB.expire()
+
+def badRequest(content = "Invalid parameters"):
+    print("Status: 400 Bad Request\nContent-Type: text/html\n\n",end='')
+    print(f"<html><body><h1>400 Bad Request</h1><p>{content}</p></body></html>",end='')
+    exit()
+
+def success(content):
+    print("Status: 200 OK")
+    print("Content-Type:Application")
+    print(f"Content-Length:{len(content)}")
+    print("")
+    print(content)
+    exit()
+
+def unavailable():
+    print("Status: 503 Service Unavailable")
+    print("Content-Type: text/html")
+    print("")
+    print("<html><body><h1>503 Service Unavailable</h1><p>Please try again later.</p></body></html>")
+    exit()
+def readFromDatabase(dataBase:Cache, key:str)->object:
+    return dataBase.get(key,None)
+
+class eventRepr():
+    """
+    Calendar class to manage calendar events.
+    """
+    def __init__(self,**kwargs):
+        self.eventId = []
+        self.summary = None
+        self.description = None
+        self.startTime = []
+        self.endTime = []
+        self.location=None
+        self.auxiliary = None
+        for key,item in kwargs.items():
+            setattr(self,key,item)
+    def __repr__(self):
+        if len(self.eventId) == 1:
+            buffer = ''
+            buffer += f'({self.eventId[0]})'
+            buffer += f'标题：{self.summary}\t'
+            if self.description: buffer += f'描述：{self.description}\t'
+            dateStart, specStart = self.startTime[0].split(' ')
+            dateEnd, specEnd = self.endTime[0].split(' ')
+            if dateStart == dateEnd:
+                buffer += f'时间：{dateStart} {specStart}-{specEnd} '
+            else:
+                buffer += f'时间：{self.startTime[0]} - {self.endTime[0]}'
+            if self.location:buffer += f'地点：{self.location}\t'
+            if self.auxiliary:buffer += f'{self.auxiliary}\t'
+            return buffer
+        else:
+            idPrefix = self.eventId[0].split('_')[0]
+            buffer = []
+            #buffer.append(f'后续日程ID的前缀为:{idPrefix}')
+            flag = False
+            def replacement(x):
+                nonlocal flag
+                if flag:
+                    return x.replace(idPrefix[3:-3],'......')
+                else:
+                    flag = True
+                    return x
+            buffer.append(f'标题:{self.summary}')
+            if self.description: buffer.append(f'描述：{self.description}')
+            occurrences = dict() # map time interval to list of dates
+            for eventID, timeStart, timeEnd in zip(self.eventId,self.startTime,self.endTime):
+                dateStart, specStart = timeStart.split(' ')
+                dateEnd, specEnd = timeEnd.split(' ')
+                if dateStart == dateEnd:
+                    dateDescript = (dateStart,)
+                else:
+                    dateDescript = (dateStart, dateEnd)
+                keyword = specStart + '-' + specEnd
+                if keyword not in occurrences:
+                    occurrences[keyword] = []
+                occurrences[keyword].append((replacement(eventID), dateDescript))
+            timeBuffer = []
+            prefix = ''
+            for specTime, specOccur in occurrences.items():
+                if len(specOccur[0][1]) == 1:
+                    prefix = '日期:'
+                    for eventID, dateDescript in specOccur:
+                        timeBuffer.append(f'(ID:{eventID}){dateDescript[0]}')
+                    timeBuffer.append(f'具体时间:{specTime}')
+                else:
+                    prefix = '时间:'
+                    for eventID, dateDescript in specOccur:
+                        specStart, specEnd = specTime.split('-')
+                        timeBuffer.append(f'(ID:{eventID}){dateDescript[0]} {specStart}-{dateDescript[1]} {specEnd}')
+            buffer.append(prefix + ','.join(timeBuffer))
+            if self.location:buffer.append(f'地点：{self.location}')
+            if self.auxiliary:buffer.append(f'{self.auxiliary}')
+            return '\t'.join(buffer)
+    def __str__(self):
+        return self.__repr__()
+
+def _convertTimestampToTimeString(timeStamp:int)->str:
+    """
+    Convert a timestamp to a time string.
+    :param timeStamp: The timestamp to convert.
+    :return: The formatted time string.
+    """
+    timeStruct = time.localtime(timeStamp)
+    return time.strftime('%Y-%m-%d %H:%M',timeStruct)
+
+def _convertTimeStringToTimestamp(timeString:str)->int:
+    '''
+    Convert a time string to a timestamp.
+    :param timeString: The time string to convert.
+    :return: The timestamp.
+    '''
+    timeStruct = time.strptime(timeString, '%Y-%m-%d %H:%M')
+    return int(time.mktime(timeStruct))
+
+session = requests.Session()
+def _generateHeader() -> Dict[str, str]:
+    """
+    Generate headers for the request.
+    :return: A dictionary of headers.
+    """
+    token = _getAccessToken()
+    return {'Content-Type': 'application/json; charset=utf-8',
+            'Authorization': 'Bearer '+token}
+
+def _getAccessToken():
+    global openID
+    curInfo = readFromDatabase(tokenDB,openID)
+    if curInfo is None:
+        raise Exception('No token found')
+    accessToken = curInfo.get('accessToken','')
+    return accessToken
+
+def _inferUidType(uid: str) -> str:
+    """
+    Infer the type of a user ID.
+    :param uid: The user ID to infer the type of.
+    :return: The type of the user ID ('openID', 'unionID', or 'userID').
+    """
+    if uid.startswith('ou_'):
+        return 'open_id'
+    elif uid.startswith('on_'):
+        return 'union_id'
+    else:
+        return 'user_id'
+
+def _getOpenID(userID:str,redundant:bool=False)->str:
+    """
+    Convert a user ID to an OpenID.
+    :param userID: The user ID to convert.
+    :param redundant: If True, return also user's name and employee number.
+    :return: The OpenID corresponding to the user ID.
+    """
+    url = f'https://open.feishu.cn/open-apis/contact/v3/users/{userID}'
+    id_type = _inferUidType(userID)
+    params = dict(user_id_type=id_type,department_id_type='department_id')
+    res = requests.get(url,params=params,headers=_generateHeader()).json()
+    if res['msg'] != 'success':
+        raise ValueError(f"Error: {res['msg']}")
+    if redundant:
+        userName = res['data']['user'].get('name','UNKNOWN')
+        employeeNumber = res['data']['user'].get('employee_no','UNKNOWN')
+        return res['data']['user']['open_id'], userName, employeeNumber
+    return res['data']['user']['open_id']
+
+def _addRoleToCalendar(calendarID:str, userID:str, role:str)->bool:
+    """
+    Add a role to a calendar for a given user ID.
+    :param calendarID: The ID of the calendar, must be openId
+    :param userID: The user ID to add the role to.
+    :param role: The role to add ('free_busy_reader', 'reader', 'writer', 'owner').
+    :return: True if the role was added successfully, False otherwise.
+    """
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/acls'
+    params = dict(user_id_type='open_id')
+    body = dict(role=role, scope=dict(type='user', user_id=userID))
+    res = requests.post(url,params=params, json=body, headers=_generateHeader()).json()
+    return res['msg'] == 'success'
+
+def _createCalendar(userID:str)->str:
+    """
+    Create a calendar for a given user ID.
+    :param userID: The user ID to create a calendar for.
+    :return: The ID of the created calendar.
+    Create a shared calendar, which is owned by the robot.
+    Then set the user as the manager of the calendar.
+    """
+    url = 'https://open.feishu.cn/open-apis/calendar/v4/calendars'
+    openID, userName, employeeNumber = _getOpenID(userID,redundant=True)
+    body = dict(summary=f'{userName}的日历喵',
+                description=f'这是一个由机器人为{userName}创建的日历，机器人会自动更新日历内容，并且机器人仅能访问和修改这一日历中的日程。您可将您的日程添加到这个日历中。',
+                permission="private",
+                color=-1,
+                summary_alias=f'{userID},{userName},{employeeNumber}的日历')
+    res = requests.post(url,json=body,headers=_generateHeader()).json()
+    if res['msg'] != 'success':
+        raise ValueError(f"Error: {res['msg']}")
+    calendarID:str = res['data']['calendar']['calendar_id']
+    status = _addRoleToCalendar(calendarID, openID, 'owner')
+    if not status:
+        raise ValueError(f"Permission failed to add")
+    return calendarID
+
+
+def _getCalendarIdforUser(userID:str)->str:
+    """
+    Get the calendar ID for a given user ID.
+    """
+    if _inferUidType(userID) != 'openID':
+        userID = _getOpenID(userID)
+    
+    if userID in dataBase:
+        return dataBase[userID]['calendarID']
+    else:
+        calendarID = _createCalendar(userID)
+        _writeCalendarID(userID, calendarID)
+        return calendarID
+
+def _getEventsFromCalendar(calendarID:str,timeInterval:Tuple[Any])->List[Any]:
+    """
+    Get events from a calendar given its calendarID.
+    """
+
+def _getCoord(descript:str)->Tuple[float, float]:
+    """
+    Get the coordinates of a location given its description.
+    :param descript: The description of the location.
+    :return: A tuple containing the latitude and longitude.
+    """
+    return None
+
+
+
+def _createEvent(calendarID:str, eventDetails)->str:
+    """
+    Create an event in the calendar and return its ID.
+    Details should be in the form of a dictionary.
+    details should include:
+    - summary: The title of the event, should be str.
+    - description: The description of the event, should be str.
+    - startTime: The start time of the event, should be time string in the form of %Y-%m-%d %H:%M.
+    - endTime: The end time of the event, form:%Y-%m-%d %H:%M.
+    - location: The location of the event. Can be none.
+    - reminder: The reminder time ahead of the event, in minutes. Default is 15 minutes before.
+    """
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events'
+    curevent = vevent()
+    curevent.summary = eventDetails.get('summary','')
+    curevent.description = eventDetails.get('description','')
+    curevent.start_time = time_info(timestamp=str(_convertTimeStringToTimestamp(eventDetails['startTime'])))
+    curevent.end_time = time_info(timestamp=str(_convertTimeStringToTimestamp(eventDetails['endTime'])))
+    curevent.vchat = curevent.get_type('vchat')(vc_type='no_meeting')
+    curevent.reminders = curevent.get_type('reminders')([type_reminder(minutes=eventDetails.get('reminder',15))])
+    location = eventDetails.get('location',None)
+    with open('record','a') as file:
+        file.write(str(curevent.serialize()))
+    if location:
+        curevent.location = event_location()
+        curevent.location.name = location.get('name','')
+        curevent.location.address = location.get('address','')
+        for descript in (curevent.location.name, curevent.location.address):
+            res = _getCoord(descript)
+            if res:
+                curevent.location.latitude, curevent.location.longitude = res
+    res = requests.post(url,json=curevent.serialize(),headers=_generateHeader()).json()
+    with open('record','a') as file:
+        file.write(str(res))
+    if res['code']:
+        raise ValueError(f"Error: {res['msg']}")
+    return res['data']['event']['event_id']
+    
+
+def _updateEvent(calendarID:str, eventID:str, openID:str, eventDetails)->bool:
+    preset, timestamp = eventID.split('_')
+    if len(timestamp) > 2: #instance of repeated event
+        fatherEventID = preset+'_0'
+        url = f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{fatherEventID}/attendees"
+        params = dict(user_id_type='open_id')
+        data = dict(attendees = [dict(type='user',
+                                      is_optional=False,
+                                      user_id = openID),],
+                    need_notification=False,
+                    instance_start_time_admin=timestamp)
+        res = requests.post(url, headers=_generateHeader(), params=params, json=data).json()
+        if res['code']: raise Exception(res['msg'])
+
+        url = f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{eventID}/reply"
+        data = dict(rsvp_status="accept")
+        res = requests.post(url, headers=_generateHeader(), json=data).json()
+        if res['code']: raise Exception(res['msg'])
+
+    url = f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{eventID}"
+    headers = _generateHeader()
+    params = dict(user_id_type='user_id')
+    body = dict()
+    if 'summary' in eventDetails: body['summary'] = eventDetails['summary']
+    if 'description' in eventDetails: body['description'] = eventDetails['description']
+    if 'startTime' in eventDetails: body['start_time'] = dict(timestamp=str(_convertTimeStringToTimestamp(eventDetails['startTime'])))
+    if 'endTime' in eventDetails: body['end_time'] = dict(timestamp=str(_convertTimeStringToTimestamp(eventDetails['endTime'])))
+    if 'location' in eventDetails:
+        locationInfo = eventDetails['location']
+        location = event_location()
+        location.name = location.get('name','')
+        location.address = location.get('address','')
+        for descript in (location.name, location.address):
+            res = _getCoord(descript)
+            if res:
+                location.latitude, location.longitude = res
+        body['location'] = location.serialize()
+    if not body:
+        return
+    res = requests.patch(url, json=body, headers=headers, params=params).json()
+    return res['msg']
+
+def _deleteEvent(calendarID:str, eventID:str, needNotifications=False)->bool:
+    """
+    Delete an event from the calendar.
+    """
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{eventID}'
+    params = dict(need_notifications=needNotifications)
+    res = requests.delete(url,headers=_generateHeader(), params=params).json()
+    if res['msg'] != 'success':
+        raise ValueError(f"Error: {res['msg']}")
+    return True
+
+def _timeInfoToStr(timePoint:'time_info')->str:
+    if hasattr(timePoint,'date') and timePoint.date:
+        return timePoint.date+'全天'
+    elif hasattr(timePoint,'timestamp') and timePoint.timestamp:
+        timePoint = int(timePoint.timestamp)
+        timeStruct = time.localtime(timePoint)
+        return time.strftime('%Y-%m-%d %H:%M',timeStruct)
+    raise ValueError('Invalid time info format')
+
+def _locationToStr(location:'event_location')->str:
+    buffer = ''
+    if hasattr(location,'name') and location.name:
+        buffer += location.name+','
+    if hasattr(location,'address') and location.address:
+        buffer += location.address+','
+    if hasattr(location,'latitude') and location.latitude:
+        buffer += str(location.latitude)+','
+    if hasattr(location,'longitude') and location.longitude:
+        buffer += str(location.longitude)
+    return buffer
+
+def _expandRecurringEvent(calendarID:str, eventID:str, timeInterval:Tuple[Any])->List[Any]:
+    """
+    Expand a recurring event into its individual occurrences, by finding all its instances
+    within the specified time interval.
+    :param calendarID: The ID of the calendar.
+    :param eventID: The ID of the event to expand.
+    :param timeInterval: The time interval to search for occurrences.
+        where start and end are timestamps, with type being str, the format is %Y-%m-%d %H:%M
+    :return: A tuple, the first is a list of exceptions instances (instances that are different)
+        and the second is a list of non-exception instances (instances that are the same).
+    Events are rpresented by strings in the form of:
+        (eventID)summary, description, occuring time, and location
+    """
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{eventID}/instances'
+    startTime, endTime = timeInterval
+    startTime = _convertTimeStringToTimestamp(startTime)
+    endTime = _convertTimeStringToTimestamp(endTime)
+    params = dict(start_time=startTime,
+                   end_time=endTime,
+                   page_size=500)
+    res = requests.get(url, params=params, headers=_generateHeader()).json()
+    if res['code'] != 0:
+        raise ValueError(f"Error: {res['msg']}")
+    instanceList = res['data']['items']
+    instanceList = unserialize(instanceList, TypedList[eventInstance])
+    Exceptions = TypedList[eventRepr]()
+    NonException = eventRepr()
+    for instance in instanceList:
+        if instance.is_exception:
+            curEvent = eventRepr()
+            curEvent.eventId = (instance.event_id,)
+            curEvent.summary = instance.summary
+            curEvent.description = instance.description
+            curEvent.location = _locationToStr(instance.location)
+            curEvent.startTime = (_timeInfoToStr(instance.start_time),)
+            curEvent.endTime = (_timeInfoToStr(instance.end_time),)
+            Exceptions.append(curEvent)
+        else:
+            NonException.eventId.append(instance.event_id)
+            NonException.summary = instance.summary
+            NonException.description = instance.description
+            NonException.location = _locationToStr(instance.location)
+            NonException.startTime.append(_timeInfoToStr(instance.start_time))
+            NonException.endTime.append(_timeInfoToStr(instance.end_time))
+    return Exceptions, NonException
+
+async def _expandRecurringEventAsync(calendarID:str, eventID:str, timeInterval:Tuple[Any], session)->List[Any]:
+    """
+    Expand a recurring event into its individual occurrences, by finding all its instances
+    within the specified time interval.
+    :param calendarID: The ID of the calendar.
+    :param eventID: The ID of the event to expand.
+    :param timeInterval: The time interval to search for occurrences.
+        where start and end are timestamps, with type being str, the format is %Y-%m-%d %H:%M
+    :return: A tuple, the first is a list of exceptions instances (instances that are different)
+        and the second is a list of non-exception instances (instances that are the same).
+    """
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/{eventID}/instances'
+    startTime, endTime = timeInterval
+    startTime = _convertTimeStringToTimestamp(startTime)
+    endTime = _convertTimeStringToTimestamp(endTime)
+    params = dict(start_time=startTime,
+                   end_time=endTime,
+                   page_size=500)
+    res = await session.get(url, params=params, headers=_generateHeader())
+    res = await res.json()
+    if res['code'] != 0:
+        raise ValueError(f"Error: {res['msg']}")
+    instanceList = res['data']['items']
+    instanceList = unserialize(instanceList, TypedList[eventInstance])
+    Exceptions = TypedList[eventRepr]()
+    NonException = eventRepr()
+    for instance in instanceList:
+        if instance.is_exception:
+            curEvent = eventRepr()
+            curEvent.eventId = (instance.event_id,)
+            curEvent.summary = instance.summary
+            curEvent.description = instance.description
+            curEvent.location = _locationToStr(instance.location)
+            curEvent.startTime = (_timeInfoToStr(instance.start_time),)
+            curEvent.endTime = (_timeInfoToStr(instance.end_time),)
+            Exceptions.append(curEvent)
+        else:
+            NonException.eventId.append(instance.event_id)
+            NonException.summary = instance.summary
+            NonException.description = instance.description
+            NonException.location = _locationToStr(instance.location)
+            NonException.startTime.append(_timeInfoToStr(instance.start_time))
+            NonException.endTime.append(_timeInfoToStr(instance.end_time))
+    return Exceptions, NonException
+    
+
+def _findEvent(calendarID:str, keyword:str='', startTime:str=None, endTime:str=None)->Any:
+    """
+    Find an event in the calendar using a keyword.
+    :param calendarID: The ID of the calendar.
+    :param keyword: The keyword to search for, if empty, match all events.
+    :param startTime: The start time of the search interval, in the form of %Y-%m-%d %H:%M,
+        default set to the start of current month
+    :param endTime: The end time of the search interval, in the form of %Y-%m-%d %H:%M,
+        default set to the end of current month
+    :return: The event found, or None if not found.
+    """
+    if not startTime:
+        startTime = time.strftime('%Y-%m-01 00:00')
+    if not endTime:
+        endTime = time.strftime('%Y-%m-01 23:59',time.localtime(time.time()+30*24*3600))
+    url = f'https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendarID}/events/search'
+    params = dict(user_id_type='user_id',
+                  page_size = 100)
+    headers = _generateHeader()
+    body = dict(query=keyword,
+                filter = dict(start_time=dict(timestamp=_convertTimeStringToTimestamp(startTime)),
+                              end_time=dict(timestamp=_convertTimeStringToTimestamp(endTime))
+                ))
+    response = requests.post(url, params=params, json=body, headers=headers).json()
+    if response['code']:
+        raise Exception
+    return response['data']['items']
+
+async def _fetchExpand(calendarID:str, eventIDs:str, timeInterval:Tuple[Any])->List[Any]:
+    async with aiohttp.ClientSession() as session:
+        res = await asyncio.gather(*[_expandRecurringEventAsync(calendarID, eventID, timeInterval, session) for eventID in eventIDs])
+    return res
+
+def findEvent(calendarID:str, keyword:str='', startTime:str=None, endTime:str=None)->str:
+    if not startTime:
+        startTime = time.strftime('%Y-%m-01 00:00')
+    if not endTime:
+        endTime = time.strftime('%Y-%m-01 23:59',time.localtime(time.time()+30*24*3600))
+    try:
+        eventsBuffer = list()
+        result = _findEvent(calendarID, keyword=keyword, startTime=startTime, endTime=endTime)
+        recurring = set()
+        for item in result:
+            isExcept = item.get('is_exception',False)
+            isRecurr = item.get('recurrence','')
+            if isExcept:
+                recurring.add(item['recurring_event_id'])
+                continue
+            elif isRecurr:
+                recurring.add(item['event_id'])
+                continue
+            else:
+                instance = unserialize(item,eventInstance)
+                curEvent = eventRepr()
+                curEvent.eventId = (instance.event_id,)
+                curEvent.summary = instance.summary
+                curEvent.description = instance.description
+                curEvent.location = _locationToStr(instance.location)
+                curEvent.startTime = (_timeInfoToStr(instance.start_time),)
+                curEvent.endTime = (_timeInfoToStr(instance.end_time),)
+                eventsBuffer.append(repr(curEvent))
+        for exceptions, recurDescript in asyncio.run(_fetchExpand(calendarID, recurring, (startTime, endTime))):
+            eventsBuffer.extend(map(str,exceptions))
+            eventsBuffer.append(recurDescript.__repr__())
+        #for recurID in recurring:
+        #    exceptions, recurDescript = _expandRecurringEvent(calendarID, recurID, [startTime, endTime])
+        #    eventsBuffer.extend(map(str,exceptions))
+        #    eventsBuffer.append(recurDescript.__repr__())
+        return '\n'.join(eventsBuffer)
+    except Exception as e:
+        return 'Error'
+    
+
+def _fetchMainCalId()->str:
+    """
+    Fetch the main calendar ID.
+    """
+    url = 'https://open.feishu.cn/open-apis/calendar/v4/calendars/primary'
+    params = dict(user_id_type='user_id')
+    res = requests.post(url,params=params,headers=_generateHeader()).json()
+    if res['code']:
+        raise ValueError(f"Error: {res['msg']}")
+    return res['data']['calendars'][0]['calendar']['calendar_id']
+
+if __name__ == '__main__':
+    request_method = os.environ.get('REQUEST_METHOD', 'GET')
+    if request_method != 'POST':badRequest('Unsupported request')
+    request_uri = os.environ.get('REQUEST_URI', '')
+
+    headers = dict()
+    for key, value in os.environ.items():
+        if key.startswith("HTTP_"):
+            headers[key[5:].replace('_',' ')] = value
+    
+    content_length = int(os.environ.get('CONTENT_LENGTH', 0))
+    if content_length > 0:
+        raw_data = sys.stdin.read(content_length)
+        bodyData = json.loads(raw_data)
+    else:
+        success(json.dumps(dict(result='无需修改')))
+    
+
+    def get_from_header(name,def_val = None):
+        cont = headers.get(name,def_val)
+        if cont != def_val and cont.endswith(','):
+            return cont[:-1]
+        return cont
+    
+    global openID
+    openID = get_from_header('OPENID')
+    eventID = get_from_header('EVENTID')
+    startTime = bodyData.get('STARTTIME')
+    endTime = bodyData.get('ENDTIME')
+    summary = bodyData.get('SUMMARY')
+    description = bodyData.get('DESCRIPTION')
+    location = bodyData.get('LOCATION')
+    token = get_from_header('TOKEN',None)
+    if token: _getAccessToken = lambda :token
+    cid = _fetchMainCalId()
+    #try:
+    if True:
+        eventDetails = dict()
+        if startTime: eventDetails['startTime'] = startTime
+        if endTime: eventDetails['endTime'] = endTime
+        if summary: eventDetails['summary'] = summary
+        if description: eventDetails['description'] = description
+        if location: eventDetails['location'] = {'name': location}
+        res = _updateEvent(cid, eventID, openID, eventDetails)
+    #except Exception as e:
+    #    success(json.dumps(dict(result=str(e))))
+    success(json.dumps(dict(result = str(res))))

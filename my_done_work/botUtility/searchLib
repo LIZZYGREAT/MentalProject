@@ -1,0 +1,133 @@
+#!/usr/bin/python3
+import cgitb
+cgitb.enable(display=1,logdir='/home/jason/log')
+import os
+import sys
+import json
+import requests
+from loginProxy import proxies
+from functools import lru_cache
+
+def badRequest(content = "Invalid parameters"):
+    print("Status: 400 Bad Request\nContent-Type: text/html\n\n",end='')
+    print(f"<html><body><h1>400 Bad Request</h1><p>{content}</p></body></html>",end='')
+    exit()
+
+def success(content):
+    print("Status: 200 OK")
+    print("Content-Type:Application")
+    print(f"Content-Length:{len(content)}")
+    print("")
+    print(content)
+    exit()
+
+def unavailable():
+    print("Status: 503 Service Unavailable")
+    print("Content-Type: text/html")
+    print("")
+    print("<html><body><h1>503 Service Unavailable</h1><p>Please try again later.</p></body></html>")
+    exit()
+
+def _constructData(bookName:str,pageNo:int=1)->object:
+    data = dict(page=pageNo,
+                pageSize=25,
+                indexName="idx.opac",
+                sortField="relevance",
+                sortType="desc",
+                collapseField="groupId",
+                queryFieldList= [dict(logic=0,
+                                      field="all",
+                                      values=[bookName],
+                                      operator="*"),],
+                filterFieldList = []
+                #filterFieldList= [dict(logic=0,
+                #                       field="circCount",
+                #                       values=[0],
+                #                       operator="("),],
+    )
+    return data
+
+@lru_cache(maxsize=1024)
+def _findLocation(bookID:str):
+    url = 'http://192.168.129.74:8080/web3d/ConnectDataBaseDeal.php'
+    payload = dict(id=bookID, sub=bookID)
+    try:
+        result = requests.post(url, data=payload, proxies=proxies)
+        result = result.json()
+        result = result.get('GCWZ','')+result.get('CJWZ','')
+    except Exception as e:
+        result = ''
+    return result
+
+def _doQuery(bookName:str, numRecords:int=50):
+    url = "https://space.nankai.edu.cn/meta-local/opac/search"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+    }
+    curPage = 1
+    existingRecords = 0
+    resultBooks = []
+    while existingRecords < numRecords:
+        searchData = _constructData(bookName, curPage)
+        response = requests.post(url, headers=headers, json=searchData, proxies=proxies)
+        if response.status_code != 200:
+            break
+        result = response.json()
+        if result['code'] != 0:
+            break
+        dataList = result['data']['dataList']
+        if not dataList:
+            break
+        existingRecords += len(dataList)
+        resultBooks.extend(dataList)
+    returnBooks = []
+    for book in resultBooks[:numRecords]:
+        ret = dict()
+        if 'title' in book: ret['title'] = book['title']
+        if 'author' in book: ret['author'] = book['author']
+        if 'abstract' in book: ret['abstract'] = book['abstract']
+        ret['holdings'] = []
+        if book.get('holdings','') is not None:
+            for holding in json.loads(book.get('holdings',[])):
+                ret['holdings'].append(dict(
+                    count = holding.get('itemsCount',''),
+                    location = _findLocation(holding.get('barCode','')) or holding.get('location',''),
+                    status = holding.get('status',''),
+                    callNo = holding.get('callNo',''),
+                    volume = holding.get('vol',''),
+                ))
+        for holding in json.loads(book.get('eholdings',[])):
+            ret['holdings'].append(dict(
+                count = -1,
+                location = holding.get('storage',''),
+                status = '电子书',
+                callno = holding.get('url','')
+            ))
+        returnBooks.append(ret)
+    return returnBooks
+print(_doQuery('三体',5))
+exit()
+
+if __name__ == "__main__":
+    request_method = os.environ.get('REQUEST_METHOD', 'GET')
+    if request_method != 'POST':badRequest('Unsupported request')
+    request_uri = os.environ.get('REQUEST_URI', '')
+
+    headers = dict()
+    for key, value in os.environ.items():
+        if key.startswith("HTTP_"):
+            headers[key[5:].replace('_',' ')] = value
+
+    content_length = int(os.environ.get('CONTENT_LENGTH', 0))
+    if content_length > 0:raw_data = sys.stdin.read(content_length)
+    else:raw_data = '{}'
+    bodyData = json.loads(raw_data)
+    request_method = os.environ.get('REQUEST_METHOD', 'GET')
+    numRecord = bodyData.get('NUMREC',5)
+    if numRecord > 20:
+        badRequest("小贪心鬼，请求太多了")
+    query = bodyData.get('QUERY')
+
+    success(json.dumps(_doQuery(query,numRecord)))

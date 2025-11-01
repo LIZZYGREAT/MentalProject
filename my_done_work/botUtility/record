@@ -1,0 +1,985 @@
+{'uuid': 'cc76e11884d24d3ea5144744717d377e', 'resvId': 30736185, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747638600000, 'resvEndTime': 1747642080000, 'resvEndRealTime': 1747639758000, 'resvCheckTime': 1747638548000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747638548000, 'gmtModified': 1747639757575, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736185, 'devId': 13059747, 'devName': '320-008', 'devSn': 13059747, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '2b2b4cf88a5d4530a5c83f67185f33ed', 'resvId': 30736185, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747639623000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': 'ce7f286a90674193a6f79df57407d6a7', 'resvId': 30736382, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747641660000, 'resvEndTime': 1747656000000, 'resvEndRealTime': 1747642386000, 'resvCheckTime': 1747641728000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747641728000, 'gmtModified': 1747642385800, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736382, 'devId': 13059759, 'devName': '320-020', 'devSn': 13059759, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '7aea4ff819f045a1849d9c4450a66f6a', 'resvId': 30736382, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747642372000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': 'cc76e11884d24d3ea5144744717d377e', 'resvId': 30736185, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747638600000, 'resvEndTime': 1747642080000, 'resvEndRealTime': 1747639758000, 'resvCheckTime': 1747638548000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747638548000, 'gmtModified': 1747639757575, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736185, 'devId': 13059747, 'devName': '320-008', 'devSn': 13059747, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '2b2b4cf88a5d4530a5c83f67185f33ed', 'resvId': 30736185, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747639623000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': 'ce7f286a90674193a6f79df57407d6a7', 'resvId': 30736382, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747641660000, 'resvEndTime': 1747656000000, 'resvEndRealTime': 1747642386000, 'resvCheckTime': 1747641728000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747641728000, 'gmtModified': 1747642385800, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736382, 'devId': 13059759, 'devName': '320-020', 'devSn': 13059759, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '7aea4ff819f045a1849d9c4450a66f6a', 'resvId': 30736382, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747642372000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '65c28e2a8cb2434a835403d9f86c51e9', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '65c28e2a8cb2434a835403d9f86c51e9', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100{'uuid': 'cc76e11884d24d3ea5144744717d377e', 'resvId': 30736185, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747638600000, 'resvEndTime': 1747642080000, 'resvEndRealTime': 1747639758000, 'resvCheckTime': 1747638548000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747638548000, 'gmtModified': 1747639757575, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736185, 'devId': 13059747, 'devName': '320-008', 'devSn': 13059747, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '2b2b4cf88a5d4530a5c83f67185f33ed', 'resvId': 30736185, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747639623000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': 'ce7f286a90674193a6f79df57407d6a7', 'resvId': 30736382, 'appAccNo': 31611, 'memberKind': 1, 'resvDate': 20250519, 'resvBeginTime': 1747641660000, 'resvEndTime': 1747656000000, 'resvEndRealTime': 1747642386000, 'resvCheckTime': 1747641728000, 'resvDelTime': None, 'resvStatus': 5313, 'classKind': 8, 'resvProperty': 1, 'appUrl': None, 'testName': '', 'resvKind': None, 'memo': '', 'resvRuleId': 5, 'openRuleId': 16718115, 'statFlag': 1, 'feeRuleId': None, 'dayOfWeek': 0, 'realUsers': None, 'signTime': None, 'addValueNum': 0, 'gmtCreate': 1747641728000, 'gmtModified': 1747642385800, 'devName': None, 'leftTime': None, 'checkInfo': None, 'logonName': '2111504', 'resvName': '吴轩泰', 'resvDevInfoList': [{'resvId': 30736382, 'devId': 13059759, 'devName': '320-020', 'devSn': 13059759, 'kindId': 13059497, 'parentId': 0, 'devStatus': 0, 'devProp': 2, 'kindName': '八里台逸夫馆座位类型', 'classKind': 8, 'roomId': 13059392, 'roomSn': '43', 'roomName': '逸夫馆三楼320', 'labId': 13059278, 'labName': '八里台逸夫馆三楼', 'roomKind': 8, 'memo': None, 'borrowDevStatus': None, 'campusId': 3}], 'resvMemberInfoList': [{'uuid': '7aea4ff819f045a1849d9c4450a66f6a', 'resvId': 30736382, 'accNo': 31611, 'logonName': '2111504', 'trueName': '吴轩泰', 'ident': 258, 'handPhone': '', 'status': 1, 'kind': 9, 'memo': None, 'signTime': 1747642372000, 'cardNo': '', 'cardId': 0}], 'endEarly': False, 'addServices': None, 'tempLeaveEndTime': None, 'activityNo': None, 'resvEndOperationTime': None, 'endNormal': False, 'latestCheckInTime': None, 'latestJoinTime': None, 'operateName': None, 'operateLogonName': None}{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '65c28e2a8cb2434a835403d9f86c51e9', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100
+{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '65c28e2a8cb2434a835403d9f86c51e9', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100
+1305975930736382{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '90e3ea5c00f046eba327f8156b8bb19a', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100
+1305975930736382{'roomId': 13059392, 'scopeEndTime': '2025-05-19 18:08', 'memo': '', 'captcha': '', 'duration': 60, 'scopeBeginTime': '2025-05-19 17:08', 'testName': ''}{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '61e8da4f1e044db9bd848d7812274a1c', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100
+1305975930736382{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': 'c2b7dad9606d455fa30c5aa9f8221abf', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=3&page=1&pageNum=100
+1305975930736382{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '0ec9a1e5268846d1a9357f6f42c56cb8', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-19&endDate=2025-05-19&needStatus=2&page=1&pageNum=100{'roomId': 13059392, 'scopeEndTime': '2025-05-19 22:00', 'memo': '', 'captcha': '', 'duration': 240, 'scopeBeginTime': '2025-05-19 18:00', 'testName': ''}{'roomId': 13059381, 'scopeEndTime': '2025-05-20 16:00', 'memo': '', 'captcha': '', 'duration': 180, 'scopeBeginTime': '2025-05-20 13:00', 'testName': ''}{'roomId': 13059382, 'scopeEndTime': '2025-05-20 16:00', 'memo': '', 'captcha': '', 'duration': 180, 'scopeBeginTime': '2025-05-20 13:00', 'testName': ''}{'roomId': 13059392, 'scopeEndTime': '2025-05-20 16:00', 'memo': '', 'captcha': '', 'duration': 200, 'scopeBeginTime': '2025-05-20 12:40', 'testName': ''}{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '095008fbde304c2586fda1cc9af0b2cf', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-20&endDate=2025-05-20&needStatus=2&page=1&pageNum=100{'uuid': '2179392970b1408e8d7cc8c764c75a1d', 'accNo': 31611, 'pid': '2111504', 'logonName': '2111504', 'cardNo': '2CC5A072', 'cardId': '751149170', 'idCard': '120104200302157615', 'trueName': '吴轩泰', 'kind': 1, 'ident': 258, 'status': 1, 'localstatus': 1, 'classId': 148, 'className': '理科试验班(数理科学与大数据)', 'subsidy': 0, 'sex': 1, 'handPhone': '13302175951', 'email': '', 'deptId': 136, 'deptName': '理科试验班(数理科学与大数据)', 'birthday': 0, 'balance': 2147483647, 'freeTime': 0, 'useQuota': None, 'roleId': None, 'roleLevel': None, 'manager': 1, 'permsSet': [], 'token': '095008fbde304c2586fda1cc9af0b2cf', 'property': 0, 'expiredDate': 20991230}https://libic.nankai.edu.cn/ic-web/reserve/resvInfo?beginDate=2025-05-20&endDate=2025-05-20&needStatus=6&page=1&pageNum=100
+1305974130738795<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" dir="ltr">
+<head>
+  <title></title>
+  <meta http-equiv="content-type" content="text/html;charset=utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta http-equiv="pragma" content="no-cache"/>
+  <meta http-equiv="cache-control" content="no-cache"/>
+  <meta http-equiv="expires" content="0"/>
+  <meta http-equiv="content-style-type" content="text/css"/>
+  <meta http-equiv="content-script-type" content="text/javascript"/>
+  <script>
+      window.$BG_LANG='zh';
+  </script>
+  <script type="text/javascript" src="/eams/static/scripts/jquery/jquery,jquery.ui.core.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/scripts/plugins/jquery-form,jquery-history,jquery-colorbox,jquery-chosen.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/js/plugins/jquery.subscribe,/js/struts2/jquery.struts2,jquery.ui.struts2.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/scripts/beangle/beangle,beangle-ui.js?bg=3.4.3"></script>
+  <script type="text/javascript">var App = {contextPath:"/eams"};jQuery(document).ready(function () {jQuery.struts2_jquery.version="3.6.1";beangle.contextPath=App.contextPath;jQuery.scriptPath = App.contextPath+"/static/";jQuery.struts2_jquerySuffix = "";jQuery.ajaxSettings.traditional = true;jQuery.ajaxSetup ({cache: false});});</script>
+  <script type="text/javascript" src="/eams/static/scripts/my97/WdatePicker-4.72.js?compress=no"></script>
+  <link id="jquery_theme_link" rel="stylesheet" href="/eams/static/themes/smoothness/jquery-ui.css?s2j=3.6.1" type="text/css"/>
+  <link id="beangle_theme_link" href="/eams/static/themes/default/beangle-ui,colorbox,chosen.css" rel="stylesheet" type="text/css" />
+  <link rel="stylesheet" href="/eams/static/css/foundation.css" type="text/css"/>
+  <script type="text/javascript" src="/eams/static/scripts/highcharts.js" ></script>
+	<script src="/eams/static/scripts/require.config.js?v=3"></script>
+	<script>
+	require.baseUrl="/eams/static/scripts";
+	</script>
+	<script src="/eams/static/scripts/require.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/require.js"></script>
+	
+	<!-- backbone & underscore -- fontend MVC framework -->
+	<script type="text/javascript" src="/eams/static/scripts/underscore.min.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/backbone.min.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/underscore.string.min.js"></script>
+	<script>
+	require(['underscore.string'], function(_s) {
+	        _.str = _s;
+	        _.mixin(_.str.exports());
+	});
+	</script>
+	
+
+</head>
+<body>
+
+	<p style="text-align:center"><label style="color: red;font-size: 17px;">您当前所查看的成绩排名为时点数据，如需获取排名证明，请前往学院教学办开具。</label></p>
+ 
+<div  style="margin-top:10px;" class="ajax_container"></div>
+
+
+<table class="gridtable">
+	<thead class="gridhead">
+	<tr>
+			<th width="12%">平均学分绩</th>
+		<th width="12%">平均学分绩点</th>
+		<th width="8%">专业排名</th>
+		<th width="13%">专业排名百分比</th>
+		<th width="12%">类型</th>
+		<th width="30%">统计学期</th>
+		<th width="12%">统计时间</th>
+	</tr>
+	</thead>
+	<tbody>
+		<tr class="griddata-even">
+			<td>88.43</td>
+			<td>3.69</td>
+			<td>16</td>
+			<td>80.0%</td>
+			<td>必修</td>
+			<td>全部学期</td>
+			<td> 2025-05-22 01:01:18</td>
+		</tr>
+		<tr class="griddata-odd">
+			<td>88.04</td>
+			<td>3.72</td>
+			<td>11</td>
+			<td>55.0%</td>
+			<td>通识必修课</td>
+			<td>全部学期</td>
+			<td> 2025-05-22 01:00:29</td>
+		</tr>
+		<tr class="griddata-even">
+			<td>89.37</td>
+			<td>3.73</td>
+			<td>15</td>
+			<td>75.0%</td>
+			<td>必修专选</td>
+			<td>全部学期</td>
+			<td> 2025-05-22 01:00:30</td>
+		</tr>
+		<tr class="griddata-odd">
+			<td>90.05</td>
+			<td>3.74</td>
+			<td>16</td>
+			<td>80.0%</td>
+			<td>专业课</td>
+			<td>全部学期</td>
+			<td> 2025-05-22 01:00:30</td>
+		</tr>
+		<tr class="griddata-even">
+			<td>89.43</td>
+			<td>3.74</td>
+			<td>15</td>
+			<td>75.0%</td>
+			<td>全部</td>
+			<td>全部学期</td>
+			<td> 2025-05-22 01:00:30</td>
+		</tr>
+	</tbody>
+</table>
+<div  style="margin-top:25px;" class="ajax_container"></div>
+
+
+<table class="gridtable">
+	<thead class="gridhead">
+		<tr>
+			<th width="25%">学年度</th>
+			<th width="25%">学期</th>
+			<th width="25%">门数</th>
+			<th width="25%">总学分</th>
+		</tr>
+	</thead>
+	<tbody>
+					<tr class="griddata-even">
+						<td>2022-2023</td>
+						<td>2</td>
+						<td>9</td>
+						<td>24.5</td>
+					</tr>
+					<tr class="griddata-odd">
+						<td>2021-2022</td>
+						<td>1</td>
+						<td>9</td>
+						<td>24.5</td>
+					</tr>
+					<tr class="griddata-even">
+						<td>2024-2025</td>
+						<td>2</td>
+						<td>2</td>
+						<td>4</td>
+					</tr>
+					<tr class="griddata-odd">
+						<td>2021-2022</td>
+						<td>2</td>
+						<td>11</td>
+						<td>28.5</td>
+					</tr>
+					<tr class="griddata-even">
+						<td>2024-2025</td>
+						<td>1</td>
+						<td>4</td>
+						<td>11</td>
+					</tr>
+					<tr class="griddata-odd">
+						<td>2023-2024</td>
+						<td>1</td>
+						<td>8</td>
+						<td>18</td>
+					</tr>
+					<tr class="griddata-even">
+						<td>2023-2024</td>
+						<td>2</td>
+						<td>2</td>
+						<td>4.5</td>
+					</tr>
+					<tr class="griddata-odd">
+						<td>2022-2023</td>
+						<td>1</td>
+						<td>11</td>
+						<td>25.5</td>
+					</tr>
+				<tr class="griddata-even">
+						<th colSpan="2">在校汇总</th>
+						<th>56</th>
+						<th>140.5</th>
+				</tr>
+			 	<tr class="griddata-even">
+			 			<th colSpan="4" align="right">平均学分绩：89.43 / 100&nbsp;&nbsp;&nbsp;&nbsp;平均学分绩点:3.74/4&nbsp;</th>
+				</tr>
+	 	<tr class="griddata-odd">
+	 		<th colSpan="5" align="right">统计时间：2025-05-22 10:12&nbsp;</th>
+		</tr>
+	</tbody>
+</table>
+
+	<div  style="margin-top:10px;text-align:center;font-weight:bold;" class="ajax_container">成绩列表</div>
+
+
+ 
+<div class="grid">
+
+
+<table id="grid21344342991" class="gridtable">
+<thead class="gridhead">
+
+
+<tr>
+<th  width="10%" >学年学期</th>
+<th  width="10%" >课程代码</th>
+<th  width="10%" >课程序号</th>
+<th  width="20%" >课程名称</th>
+<th  width="14%" >课程类别</th>
+<th  width="9%" >学分</th>
+<th  width="9%" >总评成绩</th>
+<th  width="9%" >最终</th>
+</tr>
+
+</thead>
+
+<tbody id="grid21344342991_data"><tr>		<td>2021-2022 1</td>
+		<td>ENTD0056</td>
+		<td>0233</td>
+<td>基础英语I A		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>PETD0131</td>
+		<td>2931</td>
+<td>网球初级		
+		</td>
+<td>体育</td>		<td>1</td>
+<td style="">	  				87 
+</td><td style="">				87
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>COTD0016</td>
+		<td>1103</td>
+<td>C++程序设计基础		
+		</td>
+<td>通识必修课</td>		<td>3</td>
+<td style="">	  				88 
+</td><td style="">				88
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>UPEC0541</td>
+		<td>0049</td>
+<td>话剧表演与剧本写作入门		
+		</td>
+<td>艺术审美与文化思辨</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>IPTD0015</td>
+		<td>0458</td>
+<td>思想道德修养与法律基础		
+		</td>
+<td>通识必修课</td>		<td>2.5</td>
+<td style="">	  				83 
+</td><td style="">				83
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>STAT0039</td>
+		<td>3306</td>
+<td>数学分析I		
+		</td>
+<td>专业必修课</td>		<td>5.5</td>
+<td style="">	  				91 
+</td><td style="">				91
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>STAT0010</td>
+		<td>3295</td>
+<td>高等代数与解析几何2-1		
+		</td>
+<td>专业必修课</td>		<td>4.5</td>
+<td style="">	  				99 
+</td><td style="">				99
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>MITD0003</td>
+		<td>2770</td>
+<td>军事理论		
+		</td>
+<td>通识选修课</td>		<td>2</td>
+<td style="">	  				87 
+</td><td style="">				87
+</td>		
+</tr><tr>		<td>2021-2022 1</td>
+		<td>LITE0266</td>
+		<td>2433</td>
+<td>大学语文（理工类）		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				78 
+</td><td style="">				78
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>IPTD0017</td>
+		<td>0355</td>
+<td>马克思主义基本原理概论		
+		</td>
+<td>通识必修课</td>		<td>3.5</td>
+<td style="">	  				87 
+</td><td style="">				87
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>CPTD0007</td>
+		<td>1031</td>
+<td>大学基础物理实验		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				92 
+</td><td style="">				92
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>MHEC0001</td>
+		<td>2799</td>
+<td>大学生活导航		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>ENTD0059</td>
+		<td>0233</td>
+<td>基础英语II A		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>STAT0040</td>
+		<td>3341</td>
+<td>数学分析II		
+		</td>
+<td>专业必修课</td>		<td>4.5</td>
+<td style="">	  				83 
+</td><td style="">				83
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>PHYS0146</td>
+		<td>1038</td>
+<td>大学物理Ⅰ（数理科学与大数据类）		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				90 
+</td><td style="">				90
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>UPEC0935</td>
+		<td>2772</td>
+<td>公共卫生与健康		
+		</td>
+<td>科学精神与健康生活</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>UPEC0166</td>
+		<td>0003</td>
+<td>数学建模		
+		</td>
+<td>公能素质和服务中国</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>PETD0119</td>
+		<td>2897</td>
+<td>排球初级		
+		</td>
+<td>体育</td>		<td>1</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>PHYS0147</td>
+		<td>1043</td>
+<td>大学物理II（数理科学与大数据类）		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				85 
+</td><td style="">				85
+</td>		
+</tr><tr>		<td>2021-2022 2</td>
+		<td>STAT0011</td>
+		<td>3333</td>
+<td>高等代数与解析几何2-2		
+		</td>
+<td>专业必修课</td>		<td>5.5</td>
+<td style="">	  				94 
+</td><td style="">				94
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>UPEC1026</td>
+		<td>3336</td>
+<td>趣味物理实验与探究		
+		</td>
+<td>科学精神与健康生活</td>		<td>1</td>
+<td style="">	  				94 
+</td><td style="">				94
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0006</td>
+		<td>2632</td>
+<td>LaTeX		
+		</td>
+<td>专业选修课</td>		<td>1</td>
+<td style="">	  				95 
+</td><td style="">				95
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>UPEC0127</td>
+		<td>2776</td>
+<td>急救与灾难应变		
+		</td>
+<td>科学精神与健康生活</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MITD0005</td>
+		<td>2863</td>
+<td>军事技能训练		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				91.1 
+</td><td style="">				91.1
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>IPTD0013</td>
+		<td>0301</td>
+<td>中国近现代史纲要		
+		</td>
+<td>通识必修课</td>		<td>2.5</td>
+<td style="">	  				91 
+</td><td style="">				91
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0132</td>
+		<td>2664</td>
+<td>抽象代数 I		
+		</td>
+<td>专业必修课</td>		<td>3</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0145</td>
+		<td>2671</td>
+<td>复变函数		
+		</td>
+<td>专业必修课</td>		<td>3</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0097</td>
+		<td>2653</td>
+<td>常微分方程		
+		</td>
+<td>专业必修课</td>		<td>3</td>
+<td style="">	  				95 
+</td><td style="">				95
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0147</td>
+		<td>2675</td>
+<td>复变函数II		
+		</td>
+<td>专业选修课</td>		<td>1</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>MATH0146</td>
+		<td>2673</td>
+<td>数学分析III		
+		</td>
+<td>专业必修课</td>		<td>5</td>
+<td style="">	  				86 
+</td><td style="">				86
+</td>		
+</tr><tr>		<td>2022-2023 1</td>
+		<td>ENTD0017</td>
+		<td>0112</td>
+<td>高级英语综合技能2-1		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				79 
+</td><td style="">				79
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>ENTD0010</td>
+		<td>0120</td>
+<td>高级英语综合技能2-2		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				95 
+</td><td style="">				95
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>UPEC1066</td>
+		<td>0094</td>
+<td>基于女大学生（兼顾男生）生理特点的两性关系、恋爱及婚育必修课		
+		</td>
+<td>科学精神与健康生活</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>MATH0134</td>
+		<td>2773</td>
+<td>抽象代数II		
+		</td>
+<td>专业必修课</td>		<td>3</td>
+<td style="">	  				89 
+</td><td style="">				89
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>PETD0137</td>
+		<td>3146</td>
+<td>游泳初级		
+		</td>
+<td>体育</td>		<td>1</td>
+<td style="">	  				89 
+</td><td style="">				89
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>MATH0079</td>
+		<td>2756</td>
+<td>点集拓扑学		
+		</td>
+<td>专业必修课</td>		<td>3</td>
+<td style="">	  				92 
+</td><td style="">				92
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>MATH0065</td>
+		<td>2748</td>
+<td>概率论		
+		</td>
+<td>专业必修课</td>		<td>3.5</td>
+<td style="">	  				87 
+</td><td style="">				87
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>MATH0151</td>
+		<td>2780</td>
+<td>实变函数		
+		</td>
+<td>专业必修课</td>		<td>4</td>
+<td style="">	  				90 
+</td><td style="">				90
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>IPTD0001</td>
+		<td>0304</td>
+<td>毛泽东思想和中国特色社会主义理论体系概论		
+		</td>
+<td>通识必修课</td>		<td>3</td>
+<td style="">	  				90 
+</td><td style="">				90
+</td>		
+</tr><tr>		<td>2022-2023 2</td>
+		<td>MATH0136</td>
+		<td>2775</td>
+<td>Galois 理论		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				99 
+</td><td style="">				99
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>UPEC1154</td>
+		<td>0234</td>
+<td>中国文化英译漫谈		
+		</td>
+<td>世界文明与国际视野</td>		<td>2</td>
+<td style="">	  				93 
+</td><td style="">				93
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>MATH0164</td>
+		<td>2588</td>
+<td>数学前沿导论		
+		</td>
+<td>专业选修课</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>PETD0138</td>
+		<td>2989</td>
+<td>游泳高级		
+		</td>
+<td>体育</td>		<td>1</td>
+<td style="">	  				89 
+</td><td style="">				89
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>MATH0137</td>
+		<td>2575</td>
+<td>动力系统导论（1）		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				92 
+</td><td style="">				92
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>MATH0152</td>
+		<td>2585</td>
+<td>随机过程		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				97 
+</td><td style="">				97
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>MATH0013</td>
+		<td>2547</td>
+<td>图论		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				86 
+</td><td style="">				86
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>PHIL0141</td>
+		<td>3159</td>
+<td>哲学导论		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2023-2024 1</td>
+		<td>IPTD0018</td>
+		<td>0350</td>
+<td>习近平新时代中国特色社会主义思想概论		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				83 
+</td><td style="">				83
+</td>		
+</tr><tr>		<td>2023-2024 2</td>
+		<td>MATH0095</td>
+		<td>2651</td>
+<td>数理方程		
+		</td>
+<td>专业必修课</td>		<td>3.5</td>
+<td style="">	  				60 
+</td><td style="">				60
+</td>		
+</tr><tr>		<td>2023-2024 2</td>
+		<td>MATH0085</td>
+		<td>2645</td>
+<td>数学前沿问题选讲		
+		</td>
+<td>专业必修课</td>		<td>1</td>
+<td style="">	  				86 
+</td><td style="">				86
+</td>		
+</tr><tr>		<td>2024-2025 1</td>
+		<td>MATH0070</td>
+		<td>2207</td>
+<td>数理统计		
+		</td>
+<td>专业选修课</td>		<td>4</td>
+<td style="">	  				87 
+</td><td style="">				87
+</td>		
+</tr><tr>		<td>2024-2025 1</td>
+		<td>UPRC0002</td>
+		<td>3366</td>
+<td>马拉松		
+		</td>
+<td>通识选修课</td>		<td>1</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr><tr>		<td>2024-2025 1</td>
+		<td>MATH0128</td>
+		<td>2217</td>
+<td>C程序设计语言		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				95 
+</td><td style="">				95
+</td>		
+</tr><tr>		<td>2024-2025 1</td>
+		<td>MATH0025</td>
+		<td>2201</td>
+<td>信息论		
+		</td>
+<td>专业选修课</td>		<td>3</td>
+<td style="">	  				97 
+</td><td style="">				97
+</td>		
+</tr><tr>		<td>2024-2025 2</td>
+		<td>IPTD0012</td>
+		<td></td>
+<td>公能实践		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style=""></td><td style="">				通过
+</td>		
+</tr><tr>		<td>2024-2025 2</td>
+		<td>IPTD0016</td>
+		<td>3347</td>
+<td>形势与政策		
+		</td>
+<td>通识必修课</td>		<td>2</td>
+<td style="">	  				通过 
+</td><td style="">				通过
+</td>		
+</tr></tbody>
+</table>
+</div>
+<script type="text/javascript">
+  var clearCheckbox_grid21344342991 = function() {
+    jQuery("#grid21344342991").find(".box:checkbox").removeProp("checked");
+    jQuery("#grid21344342991").find(".gridselect-top :checkbox").removeProp("checked");
+    return true;
+  }
+  
+  page_grid21344342991 = bg.page("/eams/teach/grade/course/person!historyCourseGrade.action","");
+  {
+    var _paramstring = 'projectType=MAJOR';
+    var _params = _paramstring.split('&');
+    for (var i = 0; i < _params.length; i++) {
+      _params[i] = decodeURIComponent(_params[i]);
+    }
+    _paramstring = _params.join('&');
+    page_grid21344342991.target("",'grid21344342991').action("/eams/teach/grade/course/person!historyCourseGrade.action").addParams(_paramstring).orderBy("null");
+  }
+  bg.ui.grid.init('grid21344342991',page_grid21344342991);
+</script>
+</body>
+</html>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" dir="ltr">
+<head>
+  <title></title>
+  <meta http-equiv="content-type" content="text/html;charset=utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta http-equiv="pragma" content="no-cache"/>
+  <meta http-equiv="cache-control" content="no-cache"/>
+  <meta http-equiv="expires" content="0"/>
+  <meta http-equiv="content-style-type" content="text/css"/>
+  <meta http-equiv="content-script-type" content="text/javascript"/>
+  <script>
+      window.$BG_LANG='zh';
+  </script>
+  <script type="text/javascript" src="/eams/static/scripts/jquery/jquery,jquery.ui.core.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/scripts/plugins/jquery-form,jquery-history,jquery-colorbox,jquery-chosen.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/js/plugins/jquery.subscribe,/js/struts2/jquery.struts2,jquery.ui.struts2.js?bg=3.4.3"></script>
+  <script type="text/javascript" src="/eams/static/scripts/beangle/beangle,beangle-ui.js?bg=3.4.3"></script>
+  <script type="text/javascript">var App = {contextPath:"/eams"};jQuery(document).ready(function () {jQuery.struts2_jquery.version="3.6.1";beangle.contextPath=App.contextPath;jQuery.scriptPath = App.contextPath+"/static/";jQuery.struts2_jquerySuffix = "";jQuery.ajaxSettings.traditional = true;jQuery.ajaxSetup ({cache: false});});</script>
+  <script type="text/javascript" src="/eams/static/scripts/my97/WdatePicker-4.72.js?compress=no"></script>
+  <link id="jquery_theme_link" rel="stylesheet" href="/eams/static/themes/smoothness/jquery-ui.css?s2j=3.6.1" type="text/css"/>
+  <link id="beangle_theme_link" href="/eams/static/themes/default/beangle-ui,colorbox,chosen.css" rel="stylesheet" type="text/css" />
+  <link rel="stylesheet" href="/eams/static/css/foundation.css" type="text/css"/>
+  <script type="text/javascript" src="/eams/static/scripts/highcharts.js" ></script>
+	<script src="/eams/static/scripts/require.config.js?v=3"></script>
+	<script>
+	require.baseUrl="/eams/static/scripts";
+	</script>
+	<script src="/eams/static/scripts/require.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/require.js"></script>
+	
+	<!-- backbone & underscore -- fontend MVC framework -->
+	<script type="text/javascript" src="/eams/static/scripts/underscore.min.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/backbone.min.js"></script>
+	<script type="text/javascript" src="/eams/static/scripts/underscore.string.min.js"></script>
+	<script>
+	require(['underscore.string'], function(_s) {
+	        _.str = _s;
+	        _.mixin(_.str.exports());
+	});
+	</script>
+	
+<link href="/eams/static/themes/default/home.css?v2" rel="stylesheet" type="text/css" />
+<script src="/eams/static/scripts/jscroll.js" type="text/javascript"></script>
+<script src="/eams/static/scripts/jquery.cookie.js" type="text/javascript"></script>
+
+<style>
+#_menu_folder {
+	height:100%;
+	width:100%;
+	background-color:rgba(0, 0, 0, 0.2);
+	cursor:pointer;
+	position:relative;
+}
+#_menu_folder:hover {
+	height:100%;
+	width:100%;
+	background-color:rgba(222, 222, 222, 1);
+}
+.arrow-right {
+        width: 0;
+        height: 0;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent;
+        border-left: 6px solid rgba(0, 0, 0, 0.6);
+		top:50%;
+		position:absolute;
+}
+.arrow-left {
+        width: 0;
+        height: 0;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent; 
+        border-right:6px solid rgba(0, 0, 0, 0.6);
+		top:50%;
+		position:absolute;
+}
+.color_theme_selector {display:inline-block;width:10px;height:10px;margin-right:2px;}
+</style>
+
+</head>
+<body>
+
+
+				
+<div class="banner">
+	<div>
+		<div class="banner_area">
+			<table cellpadding="0" cellspacing="0"  class="button_box_1">
+				<tr>
+					<td width="25"></td>
+					<td width="90">
+						<a href="javascript:void(0)" class="a3" onclick="editAccount()">我的账户</a>&nbsp;&nbsp;
+					</td>
+					<td width="90">
+						<a href="/eams/home!welcome.action" onclick="return bg.Go(this,'main')" class="a3">返回首页</a>&nbsp;&nbsp;
+					</td>
+					<td>
+						<a href="/eams/logout.action" target="_top" class="a3">退出</a>
+					</td>
+				</tr>
+			</table>
+		</div>
+		<div class="banner_area">
+<form id="form11754836551" name="form11754836551" action="/eams/home.action" method="post"  >
+
+					<a href="#color_theme_#FFFFFF" id="color_theme_selector_FFFFFF" class="color_theme_selector" style="background-color:#FFFFFF;" title='白色'></a>
+					<a href="#color_theme_#FAF9DE" id="color_theme_selector_FAF9DE" class="color_theme_selector" style="background-color:#FAF9DE;" title='杏仁黄'></a>
+					<a href="#color_theme_#FFF2DE" id="color_theme_selector_FFF2DE" class="color_theme_selector" style="background-color:#FFF2DE;" title='秋叶褐'></a>
+					<a href="#color_theme_#FDE6E0" id="color_theme_selector_FDE6E0" class="color_theme_selector" style="background-color:#FDE6E0;" title='胭脂红'></a>
+					<a href="#color_theme_#E3EDCD" id="color_theme_selector_E3EDCD" class="color_theme_selector" style="background-color:#E3EDCD;" title='青草绿'></a>
+					<a href="#color_theme_#DCE2F1" id="color_theme_selector_DCE2F1" class="color_theme_selector" style="background-color:#DCE2F1;" title='海天蓝'></a>
+					<a href="#color_theme_#E9EBFE" id="color_theme_selector_E9EBFE" class="color_theme_selector" style="background-color:#E9EBFE;" title='葛巾紫'></a>
+					<a href="#color_theme_#EAEAEF" id="color_theme_selector_EAEAEF" class="color_theme_selector" style="background-color:#EAEAEF;" title='极光灰'></a>
+
+          <a href="/eams/security/my.action" target="_blank" style="color:#ffffff" title="查看详情">吴轩泰(2111504)</a>&nbsp;&nbsp;
+          <select  name="session_locale" style="width:80px;margin-right:5px;">
+             <option value="zh_CN">中文</option>
+             <option value="en_US">ENGLISH</option>
+            </select>
+            <span style="padding:0 2px;color:#FFF;font-weight:blod;">学生</span>
+            <input  type="hidden" name="security.userCategoryId" value="1" style="width:70px"/>
+            <input type="submit" value="切换"/>
+
+</form>
+		</div>
+	</div>
+	<br>
+	<br>	
+	<div style="float:right;display:block;clear:both;">
+		<ul class="nav_box" id="nav_box">
+		</ul>
+	</div> 
+</div>
+<script>
+	jQuery('.nav_box li').each(function(index, li) {
+		jQuery(this).focus(function(e) {
+			jQuery(this).blur();
+		});
+		jQuery(this).click(function(e) {
+			jQuery('li', jQuery(this).parent()).each(function(index, li) {
+				jQuery(this).removeClass('current');
+			});
+			jQuery(this).addClass('current');
+		});
+	});
+
+	jQuery(function() {
+		jQuery('#color_theme_selector_FFFFFF').click(function() {
+			jQuery(document.body).css('background-color', '#FFFFFF');
+			jQuery.cookie('_body_color_theme', '#FFFFFF', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_FAF9DE').click(function() {
+			jQuery(document.body).css('background-color', '#FAF9DE');
+			jQuery.cookie('_body_color_theme', '#FAF9DE', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_FFF2DE').click(function() {
+			jQuery(document.body).css('background-color', '#FFF2DE');
+			jQuery.cookie('_body_color_theme', '#FFF2DE', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_FDE6E0').click(function() {
+			jQuery(document.body).css('background-color', '#FDE6E0');
+			jQuery.cookie('_body_color_theme', '#FDE6E0', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_E3EDCD').click(function() {
+			jQuery(document.body).css('background-color', '#E3EDCD');
+			jQuery.cookie('_body_color_theme', '#E3EDCD', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_DCE2F1').click(function() {
+			jQuery(document.body).css('background-color', '#DCE2F1');
+			jQuery.cookie('_body_color_theme', '#DCE2F1', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_E9EBFE').click(function() {
+			jQuery(document.body).css('background-color', '#E9EBFE');
+			jQuery.cookie('_body_color_theme', '#E9EBFE', { expires: 30, path: '/' });
+		});
+		jQuery('#color_theme_selector_EAEAEF').click(function() {
+			jQuery(document.body).css('background-color', '#EAEAEF');
+			jQuery.cookie('_body_color_theme', '#EAEAEF', { expires: 30, path: '/' });
+		});
+		if(jQuery.cookie('_body_color_theme')) {
+			var color = jQuery.cookie('_body_color_theme')
+			jQuery(document.body).css('background-color', color);
+		}
+	});
+</script>
+
+<table id="mainTable" style="width:100%;height:95%;clear:both;float:left;" >
+	<tr>
+	   <td style="height:100%;width:10%" id="leftTD" valign="top">
+<div id="menu_panel" class="ajax_container"></div>
+<script>bg.ready(function(){bg.Go('/eams/home!submenus.action?menu.id=','menu_panel', 'false')});</script>
+	   </td>
+	   <td style="height:100%;width:8px">
+	   		<!-- 折叠菜单栏的bar -->
+			<div id="_menu_folder"><div id="_menu_folder_tri"></div></div>
+	   </td>
+	   <td id="rightTD" valign="top">
+<div id="main" class="ajax_container"></div>
+<script>bg.ready(function(){bg.Go('/eams/home!welcome.action','main', 'false')});</script>
+	   </td>
+	</tr>
+</table>
+<div style="display:none">
+<div id="agencyList" class="modulebody">
+     <table style="font-size:10pt" width="90%">
+       <tbody>
+         <tr>
+          <td width="50%" style="font-weight:700" align="center">待办事项</td>
+          <td width="50%" style="font-weight:700" align="center">条数</td>        
+         </tr>
+       </tbody>
+     </table>
+   </div>
+</div>   
+<script type="text/javascript">
+	function editAccount(){
+        window.open("/eams/security/my.action");
+	}
+	jQuery(function() {
+		jQuery('#_menu_folder_tri').addClass('arrow-left');
+		jQuery('#_menu_folder').click(function() {
+			jQuery('#leftTD').toggle(200);
+			var jq_tri = jQuery('#_menu_folder_tri');
+			if(jq_tri.hasClass('arrow-left')) {
+				jq_tri.removeClass('arrow-left');
+				jq_tri.addClass('arrow-right');
+			} else {
+				jq_tri.removeClass('arrow-right');
+				jq_tri.addClass('arrow-left');
+			}
+		});
+	});
+	
+	function showAgencyList(){
+	    jQuery.colorbox({transition : 'none', title:"待办事项", height:"80%",width:"30%", inline:true, href:"#agencyList"});
+        return;	
+	}
+</script>
+
+</body>
+</html>
