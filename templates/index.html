@@ -144,34 +144,32 @@
                         </div>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small mb-1">生理时段偏好 (支持多选)</label>
-                        <div class="d-flex flex-wrap gap-2 small">
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="like_morning" id="like_morning">
-                                <label class="form-check-label" for="like_morning">早晨高效</label>
+                        <label class="form-label small mb-1">生理时段偏好</label>
+                        <div class="row g-1">
+                            <div class="col-4">
+                                <select id="prefMorning" class="form-select form-select-sm time-pref-select">
+                                    <option value="">早晨常态</option>
+                                    <option value="like_morning">早晨高效</option>
+                                    <option value="dislike_morning">早晨低效</option>
+                                </select>
                             </div>
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="dislike_morning" id="dislike_morning">
-                                <label class="form-check-label" for="dislike_morning">早晨摆烂</label>
+                            <div class="col-4">
+                                <select id="prefAfternoon" class="form-select form-select-sm time-pref-select">
+                                    <option value="">下午常态</option>
+                                    <option value="like_afternoon">下午高效</option>
+                                    <option value="dislike_afternoon">下午低效</option>
+                                </select>
                             </div>
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="like_afternoon" id="like_afternoon">
-                                <label class="form-check-label" for="like_afternoon">下午高效</label>
-                            </div>
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="dislike_afternoon" id="dislike_afternoon">
-                                <label class="form-check-label" for="dislike_afternoon">下午易困</label>
-                            </div>
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="like_evening" id="like_evening">
-                                <label class="form-check-label" for="like_evening">夜晚精神</label>
-                            </div>
-                            <div class="form-check">
-                                <input class="form-check-input time-pref-cb" type="checkbox" value="dislike_evening" id="dislike_evening">
-                                <label class="form-check-label" for="dislike_evening">夜晚降智</label>
+                            <div class="col-4">
+                                <select id="prefEvening" class="form-select form-select-sm time-pref-select">
+                                    <option value="">夜晚常态</option>
+                                    <option value="like_evening">夜晚高效</option>
+                                    <option value="dislike_evening">夜晚低效</option>
+                                </select>
                             </div>
                         </div>
                     </div>
+
                     <button id="saveBtn" class="btn btn-secondary btn-sm w-100">💾 保存并应用偏好</button>
                 </div>
             </div>
@@ -267,7 +265,7 @@
             </div>
 
             <div class="card god-card">
-                <div class="card-header bg-danger text-white"><i class="bi bi-sliders"></i> 上帝之手 (实时注入)</div>
+                <div class="card-header bg-danger text-white"><i class="bi bi-sliders"></i> 操作台调控参数</div>
                 <div class="card-body p-3 bg-danger-subtle">
                     <div class="mb-3">
                         <div class="god-slider-label">
@@ -412,6 +410,12 @@
 
     document.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('simDate').valueAsDate = new Date();
+
+        document.getElementById('simDate').addEventListener('change', () => {
+            mockEvents = []; // 清空数据
+            renderMockList(); // 刷新 UI
+            document.getElementById('mockError').classList.add('d-none'); 
+        });
         
         const godSliders = document.querySelectorAll('.god-slider');
         godSliders.forEach(slider => {
@@ -627,8 +631,11 @@
         if(p.rest_strategy) document.getElementById('restStrategy').value = p.rest_strategy;
         
         if(p.time_preferences) {
-            document.querySelectorAll('.time-pref-cb').forEach(cb => {
-                cb.checked = p.time_preferences.includes(cb.value);
+            document.querySelectorAll('.time-pref-select').forEach(sel => sel.value = "");
+            p.time_preferences.forEach(pref => {
+                if(pref.includes('morning')) document.getElementById('prefMorning').value = pref;
+                if(pref.includes('afternoon')) document.getElementById('prefAfternoon').value = pref;
+                if(pref.includes('evening')) document.getElementById('prefEvening').value = pref;
             });
         }
 
@@ -647,7 +654,9 @@
     }
 
     document.getElementById('saveBtn').addEventListener('click', async () => {
-        const timePrefs = Array.from(document.querySelectorAll('.time-pref-cb:checked')).map(cb => cb.value);
+        const timePrefs = Array.from(document.querySelectorAll('.time-pref-select'))
+                               .map(sel => sel.value)
+                               .filter(val => val !== "");
         const payload = {
             user_id: document.getElementById('userId').value,
             params: {

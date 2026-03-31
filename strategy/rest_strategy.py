@@ -19,6 +19,15 @@ class RestStrategy(BaseStrategy):
         self._last_noise = current_noise
         return current_noise
 
+    def _simulate_homeostasis_fluctuation(self, current_S: float, target_S: float, pull_coeff: float, rho: float, noise_sigma: float) -> float:
+        """
+        [大一统机制] 统一稳态波动函数：弹簧引力 + AR(1)游走
+        接收目标锚点与引力系数，模拟生物体在平衡态下的自然波澜。
+        """
+        delta_trend = max(-0.5, min(0.5, pull_coeff * (target_S - current_S)))
+        noise = self._get_ar1_noise(rho, noise_sigma)
+        return delta_trend + noise
+
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         raise NotImplementedError
     
@@ -70,22 +79,22 @@ class RestStrategy(BaseStrategy):
         
         noise_std = self._get_noise_std(diff, E)
         rho = self.params.get("rest_noise_rho", 0.75) 
-        noise = self._get_ar1_noise(rho, noise_std)
-
+        
         inertia_end, cooldown_end = self.get_phase_thresholds()
 
         if duration <= inertia_end:
+            noise = self._get_ar1_noise(rho, noise_std)
             delta_S = 0.0 + noise * 0.5
             delta_E = self.get_inertia_energy_rate() * (time_step / 5.0)
             return delta_S, delta_E
 
         if duration <= cooldown_end:
+            noise = self._get_ar1_noise(rho, noise_std)
             delta_S = -0.04 * (time_step / 5.0) + noise * 0.8
             delta_E = 0.0
             return delta_S, delta_E
 
-        base_delta_S = self._calculate_dynamics(S, S_star, duration, time_step)
-        
+        # 核心恢复期
         if E < 30.0:
             e_bonus = 0.90  
         elif E <= 70.0:
@@ -96,17 +105,22 @@ class RestStrategy(BaseStrategy):
         
         Z = self.params.get("Z_factor", 0.5)
         Z_mult = 0.8 + 0.4 * Z 
-        
-        if diff > 2.0:
-            current_noise = noise
-        else:
-            current_noise = noise * (0.4 + 0.6 * (diff / 2.0))
-        
-        final_delta_S = base_delta_S * Z_mult * e_bonus + current_noise
 
+        if diff > 2.0:
+            # 远离平衡点：执行具体的策略动力学下降
+            base_delta_S = self._calculate_dynamics(S, S_star, duration, time_step)
+            noise = self._get_ar1_noise(rho, noise_std)
+            final_delta_S = base_delta_S * Z_mult * e_bonus + noise
+        else:
+            # [统一稳态波动机制] 逼近平衡点：接管为自然游走，弹簧引力 + AR(1)噪声
+            pull_coeff = self.params.get("rest_pull_coeff", 0.04) # 日间引力适中
+            final_delta_S = self._simulate_homeostasis_fluctuation(S, S_star, pull_coeff, rho, noise_std * 0.8)
+
+        # 防穿透
         if S + final_delta_S < S_star - 5.0:
             final_delta_S = (S_star - 5.0) - S 
 
+        # --- 以下精力计算部分保持不变 ---
         if E < 20.0 or efficiency <= 0.0:
             conversion_rate = 0.0
         else:

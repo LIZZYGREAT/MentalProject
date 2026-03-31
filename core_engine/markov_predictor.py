@@ -5,20 +5,20 @@ from typing import Dict, Any, Tuple
 
 class MarkovRegimePredictor:
     """
-    [核心引擎] 15分钟情绪区制跳跃预测器 (Context-Aware Markov Chain)
-    引入了非线性疲劳重塑 (Non-linear Fatigue Shaping) 与心流预热红利。
+    [核心引擎] 事件驱动的情绪区制跳跃预测器 (Event-Driven Markov Chain)
+    引入环境场效应(Intensity/Event Type)、底层毒药、性格护盾，以及带温度与截断的柔性 Softmax 博弈。
     """
     def __init__(self, seed: int = 42):
         self.rng = np.random.RandomState(seed + 999)
         self.current_regime = "NORMAL"
         self.regime_duration_steps = 0
-        self.temperature = 1.3  
+        # 高温平滑：数值越大，三者概率越容易均分；数值越小，越容易赢者通吃
+        self.temperature = 1.5  
 
     def predict_next_regime(self, features: Dict[str, Any]) -> Tuple[str, Dict[str, float]]:
         # 1. 提取生态与系统特征
         fatigue = features.get("fatigue", 0.0)
         debt = features.get("debt", 0.0)
-        stress_gap = features.get("stress_gap", 0.0)
         resilience = features.get("resilience", 0.0)
         
         state = features.get("current_state", "DAY_ACTIVE")
@@ -26,92 +26,77 @@ class MarkovRegimePredictor:
         
         f_strat = features.get("f_strategy", "sensitive")
         c_strat = features.get("c_strategy", "high")
-        r_strat = features.get("rest_strategy", "relieved")
-        n_strat = features.get("night_strategy", "normal")
-
-        # 2. 基础 Logits 锚点
-        Z_normal = 0.0
-        Z_flow = -0.5 + 1.2 * resilience
-        Z_friction = -2.0 - 1.5 * resilience
-
-        # === 3. 核心重构：非线性疲劳重塑 (Non-linear Fatigue Shaping) ===
-        capped_debt = min(debt, 3.0)
-
-        if has_high_load or state in ["LATE_NIGHT_ACTIVE", "NIGHT_OVERTIME"]:
-            # A. 策略护盾：计算“有效疲劳”
-            if c_strat == "low":
-                eff_fatigue = max(0.0, fatigue - 0.75) 
-            elif c_strat == "threshold":
-                eff_fatigue = max(0.0, fatigue - 0.7) * 1.25 
-            else: # high
-                eff_fatigue = max(0.0,fatigue-0.65)
-                
-            # B. 下凸惩罚曲面
-            fric_penalty = (eff_fatigue ** 2.0) / 6.0
-            flow_penalty = (eff_fatigue ** 1.5) / 5.0
-            
-            # C. 心流预热红利
-            flow_warmup = 0.0
-            if 0.5 < fatigue < 1.5:
-                flow_warmup = 0.8 * max(0.0, 1.0 - abs(fatigue - 1.25) / 1.0)
-
-            # D. 应用重塑后的参数
-            Z_flow += flow_warmup - flow_penalty - 0.3 * capped_debt
-            Z_friction += fric_penalty + 1.2 * max(0.0, stress_gap - 0.3)
-            
-            # E. 敏感度策略微调
-            if f_strat == "sensitive":
-                Z_friction += 0.8 + 0.3 * eff_fatigue 
-                Z_flow -= 0.5
-            elif f_strat == "dull":
-                Z_friction -= 1.2  
-                Z_flow += 0.2 
-            elif f_strat == "batterydrain":
-                Z_friction += 1.0 * max(0.0, stress_gap) 
-                
-        elif state in ["ROUTINE_MAINTENANCE", "DAY_ACTIVE"]:
-            # [休息态]
-            if r_strat == "relieved":
-                Z_flow += 1.5 + 0.8 * max(0.0, 1.0 - fatigue / 5.0) 
-                Z_friction -= 2.0
-            elif r_strat == "anxious":
-                Z_flow -= 1.0
-                Z_friction += 1.0 + 0.5 * stress_gap 
-            elif r_strat == "warmup":
-                if self.current_regime == "FLOW":
-                    Z_flow += 1.2
-                else:
-                    Z_flow += 0.2
         
-        elif state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
-            # [睡眠态]
-            if n_strat == "anxious":
-                Z_friction += 1.0 
-            elif n_strat == "deep":
-                Z_flow += 1.5
 
-        # 4. 绝地反击与均值回归 (Breakthrough & Mean Reversion)
-        # A. 状态粘性护城河：给予当前所处状态极大的留存权重，消除 15 分钟高频震荡
-        stickiness_bonus = 1.5
-        if self.current_regime == "FLOW":
-            Z_flow += stickiness_bonus
-        elif self.current_regime == "FRICTION":
-            Z_friction += stickiness_bonus
-        elif self.current_regime == "NORMAL":
-            Z_normal += stickiness_bonus
+        intensity = features.get("intensity", 0.0)
+        event_type = features.get("event_type", "rest")
 
-        # B. 均值回归弹簧：拉长忍耐期。
-        if self.current_regime == "FLOW" and self.regime_duration_steps >= 3:
-            Z_flow -= 0.8 * (self.regime_duration_steps / 4.0) 
-        elif self.current_regime == "FRICTION" and self.regime_duration_steps >= 3:
-            Z_friction -= 1.0 * (self.regime_duration_steps / 4.0) 
-            Z_flow += 1.0 * (self.regime_duration_steps / 4.0)
+        # === 绝对静默区 ===
+        # 夜间深度休息时，情绪机制强制挂起，不再做无意义的内耗与心流判定
+        if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
+            self.current_regime = "NORMAL"
+            self.regime_duration_steps += 1
+            return "NORMAL", {"NORMAL": 1.0, "FLOW": 0.0, "FRICTION": 0.0}
 
-        # 5. 终极数值防爆限幅 (Logit Clamping)
-        Z_flow = max(-2.5, min(2.5, Z_flow))
-        Z_friction = max(-2.5, min(2.5, Z_friction))
+        # === 战局 1：内耗推力 (Z_friction) ===
+        # 底层毒药：疲劳与睡眠债的线性压迫
+        base_fric = fatigue * 0.4 + debt * 0.8
+        if c_strat == "high":
+            base_fric *= 1.2
+            
+        # 环境压迫：难度带来的额外推力
+        intensity_push = 0.0
+        if intensity > 0.8:
+            intensity_push = (intensity - 0.85) * 4.0  # T5(0.85)基本无推力, T1(1.1)带来1.0的强推力
+            if f_strat == "sensitive":
+                intensity_push *= 1.5  # 高敏体质在难题面前内耗翻倍
+                
+        # 场效应与护盾抵扣
+        if event_type == "library":
+            intensity_push *= 0.6  # 自主环境极大削弱压迫感
+        elif event_type == "gym":
+            base_fric -= 1.5       # 运动强效阻断焦虑
+        elif not has_high_load:
+            base_fric -= 1.0       # 处于普通休息态时，内耗衰退
+            
+        resilience_shield = max(0.0, resilience) * 0.8
+        Z_friction = base_fric + intensity_push - resilience_shield
 
-        # 6. 带温度的 Softmax 映射
+        # === 战局 2：心流吸力 (Z_flow) ===
+        # 一票否决：熬夜、极度疲劳或欠睡时，心流直接斩断
+        if debt > 1.2 or fatigue > 4.0 or state == "LATE_NIGHT_ACTIVE":
+            Z_flow = -2.0
+        else:
+            # 挑战与技能(韧性)的乘性共鸣
+            challenge_match = (intensity - 0.75) * (resilience + 0.5) * 2.5 if intensity > 0 else -1.0
+            
+            # 环境场效应附加分
+            autonomy_bonus = 0.0
+            if event_type == "library":
+                autonomy_bonus = 0.8   # 图书馆掌控感加成
+            elif event_type == "gym":
+                autonomy_bonus = 1.2   # 运动内啡肽极易产生心流
+            elif not has_high_load:
+                autonomy_bonus = -3.0  # 无所事事时不可能有心流
+                
+            Z_flow = challenge_match + autonomy_bonus
+
+        # === 战局 3：稳态锚点 (Z_normal) ===
+        Z_normal = 1.5
+        if not has_high_load or event_type in ["rest", "meal"]:
+            Z_normal = 3.5  # 回归休息时，极大概率被拉回正常态
+
+        # 惯性加成 (物理学定律：倾向于保持当前状态)
+        if self.current_regime == "NORMAL": Z_normal += 0.5
+        elif self.current_regime == "FLOW": Z_flow += 0.5
+        elif self.current_regime == "FRICTION": Z_friction += 0.5
+
+        # === 终极防线：数值截断 (防止概率坍缩为 0 或 100%) ===
+        Z_normal = max(-1.5, min(3.5, Z_normal))
+        Z_flow = max(-1.5, min(2.5, Z_flow))
+        Z_friction = max(-1.5, min(2.5, Z_friction))
+
+        # === 带温度的 Softmax 概率映射 ===
         logits = {
             "NORMAL": Z_normal / self.temperature,
             "FLOW": Z_flow / self.temperature,
@@ -123,25 +108,23 @@ class MarkovRegimePredictor:
         sum_exp = sum(exp_probs.values())
         probs = {k: v / sum_exp for k, v in exp_probs.items()}
         
-        # 7. 轮盘赌跳跃
+        # 轮盘赌跳跃
         regimes = ["NORMAL", "FLOW", "FRICTION"]
         p_array = [probs["NORMAL"], probs["FLOW"], probs["FRICTION"]]
         next_regime = self.rng.choice(regimes, p=p_array)
         
-        # 8. 维护驻留时长
+        # 维护驻留时长
         if next_regime == self.current_regime:
             self.regime_duration_steps += 1
         else:
             self.regime_duration_steps = 0
             
         self.current_regime = next_regime
-        
         return next_regime, probs
 
-    def apply_regime_modifiers(self, base_ds: float, base_de: float) -> Tuple[float, float]:
-        """输出乘数控制 (微调：让心流的奖励更明显，内耗的惩罚不至于瞬间爆表)"""
-        if self.current_regime == "FRICTION":
-            return base_ds * 1.15, base_de * 1.2  
-        elif self.current_regime == "FLOW":
-            return base_ds * 0.65, base_de * 0.75  # 增强心流的保护力
-        return base_ds, base_de
+    def apply_regime_modifiers(self, delta_S: float, delta_E: float) -> Tuple[float, float]:
+        if self.current_regime == "FLOW":
+            return delta_S * 0.4, delta_E * 0.6
+        elif self.current_regime == "FRICTION":
+            return delta_S * 1.5, delta_E * 1.3
+        return delta_S, delta_E

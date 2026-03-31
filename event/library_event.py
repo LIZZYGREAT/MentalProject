@@ -60,7 +60,6 @@ class LibraryEvent(BaseEvent):
             intensity = max(0.4, 0.95 - (hours * 0.12))
             intensity_type = "时长衰减"
             
-        # [极简调用]：直接获取全局的韧性指数
         resilience = user.get_resilience_index()
         
         trait_str = "坚韧" if resilience > 0.2 else ("焦虑" if resilience < -0.2 else "中性")
@@ -70,7 +69,6 @@ class LibraryEvent(BaseEvent):
         S_star = user.get_param("S_star_init", 50.0)
         diff = current_stress - S_star
         
-        # [配置抽取] 消灭魔法数字
         base_stress_rate = user.get_param("lib_base_stress_rate", 0.15)
         base_stress_increase = base_stress_rate * intensity 
         
@@ -85,14 +83,12 @@ class LibraryEvent(BaseEvent):
         if sleep_debt > 0 and raw_delta_S > 0:
             raw_delta_S *= (1.0 + 0.03 * sleep_debt)
         
-        # [配置抽取] 最大单步限速
         max_s_step = user.get_param("lib_max_s_step", 1.5)
         delta_S = max_s_step * math.tanh(raw_delta_S / max_s_step)
         
         noise_s = rng.normal(0, 0.08)
         delta_S += noise_s
         
-        # [配置抽取 & 耗精提升20%] 换算为每小时的基础速率
         K_resilience = user.get_param("K_resilience", 1.0)
         lib_drain = user.get_param("lib_base_drain_rate", 4.8)  
         drain_rate = (lib_drain * intensity) / K_resilience

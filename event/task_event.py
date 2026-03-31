@@ -70,10 +70,10 @@ class TaskEvent(BaseEvent):
         
         # === Part 1: 精力消耗 (E-Drain) ===
         K_resilience = user.get_param("K_resilience", 1.0)
-        fatigue_accel = user.get_param("fatigue_acceleration", 1.25)
+        fatigue_accel = user.get_param("fatigue_acceleration", 1.20)
         
         # [配置抽取]
-        base_drain = user.get_param("task_base_drain", 8.5)
+        base_drain = user.get_param("task_base_drain", 7.0)
         linear_drain_rate = (base_drain * task_intensity) / K_resilience
         
         energy_ratio = max(0.0, min(100.0, current_energy)) / 100.0

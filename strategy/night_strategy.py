@@ -6,7 +6,7 @@ from strategy.base import BaseStrategy
 
 class NightStrategy(BaseStrategy):
     """
-    夜间恢复策略基类 (V5.5 - 焦虑波形修复与恢复提升版)
+    夜间恢复策略基类 (V5.6 - 强化非线性平衡点引力与动态噪声衰减版)
     包含分阶段动力学、稳态弹簧力，以及用一阶自回归产生的真实、不可导的折线生理电信号。
     """
     def __init__(self, params: Dict[str, Any] = None):
@@ -96,11 +96,13 @@ class NormalNightStrategy(NightStrategy):
             return delta_S, delta_E
         else:
             if diff <= self.params.get("anchor_threshold", 2.5):
-                delta_trend = max(-0.4, min(0.4, 0.01 * (S_star - S)))
+                pull_coeff = 0.035 
+                delta_trend = max(-0.5, min(0.5, pull_coeff * (S_star - S)))
             else:
                 delta_trend = -self.params.get("oscillation_decay_normal", 0.015) * diff
 
             delta_rhythm = self._get_asymmetric_amplitude(S, S_star) * self._get_rhythm_factor(elapsed_minutes, 90.0) * (time_step / 5.0)
+            
             delta_S = delta_trend + delta_rhythm + self._get_ar1_noise(rho, sigma)
             
             delta_E = self._calc_saturated_energy(E, S, time_step, multiplier=1.0)
@@ -122,7 +124,8 @@ class DeepNightStrategy(NightStrategy):
             return delta_S, delta_E
         else:
             if diff <= self.params.get("anchor_threshold", 2.5) + 1.0:
-                delta_trend = max(-0.5, min(0.5, 0.015 * (S_star - S)))
+                pull_coeff = 0.05 
+                delta_trend = max(-0.6, min(0.6, pull_coeff * (S_star - S)))
             else:
                 delta_trend = -self.params.get("oscillation_decay_deep", 0.02) * diff
             
@@ -146,19 +149,14 @@ class AnxiousNightStrategy(NightStrategy):
         min_decay = self.params.get("min_decay_rate", 0.006)
         diff = S - S_star
         
-        # 调优：平滑度略微提升，振幅控制
         rho, sigma = 0.55, 0.22 
-        
-        # 调优：削弱阻尼，让压力能更好地降下去
         resistance = min(1.0 + np.log1p(np.exp(friction * max(0, diff) * 0.4)), 2.2)
         
         # === 阶段一 ===
         if elapsed_minutes < self.params.get("initial_phase_minutes", 60) + 20: 
             decay = max(self.params.get("initial_decay_rate", 0.02) / resistance, 0.012) 
-            # 调优：削减第一阶段过于狂躁的随机尖刺
             delta_S = -decay * diff + self._get_ar1_noise(rho, sigma * 1.3) 
             
-            # 调优：充电提速，上限调高至 96.0
             delta_E = self._calc_saturated_energy(E, S, time_step, multiplier=0.85)
             if E + delta_E > 96.0:
                 delta_E = max(0.0, 96.0 - E)
@@ -167,20 +165,17 @@ class AnxiousNightStrategy(NightStrategy):
         # === 阶段二 ===
         else:
             if diff <= self.params.get("anchor_threshold", 2.5):
-                # 调优：稍微收紧弹簧，防止漂移过远
-                delta_trend = max(-0.35, min(0.35, 0.008 * (S_star - S)))
+                pull_coeff = 0.025 
+                delta_trend = max(-0.4, min(0.4, pull_coeff * (S_star - S)))
             else:
                 decay = max(self.params.get("oscillation_decay_normal", 0.015) / resistance, min_decay * 1.5)
                 delta_trend = -decay * diff
             
             base_amp = self._get_asymmetric_amplitude(S, S_star) * (1.3 if diff <= 0 else 1.0)
-            
-            # [核心修复]：移除每步随机漂移的相位，改为固定的 phase_shift，恢复波形的连续性
             delta_rhythm = base_amp * self._get_rhythm_factor(elapsed_minutes, 75.0, phase_shift=15.0) * (time_step / 5.0)
             
             delta_S = delta_trend + delta_rhythm + self._get_ar1_noise(rho, sigma)
             
-            # 调优：后半夜充电几乎追平正常人
             delta_E = self._calc_saturated_energy(E, S, time_step, multiplier=0.95)
             if E + delta_E > 96.0:
                 delta_E = max(0.0, 96.0 - E)

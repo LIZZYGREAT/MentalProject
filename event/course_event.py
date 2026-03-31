@@ -73,7 +73,8 @@ class CourseEvent(BaseEvent):
         return "course"
 
     def get_fatigue_weight(self) -> float:
-        return 1.0
+        mapped_weight = 0.85 + (self.level_val - 1.0) * (0.25 / 4.0)
+        return round(mapped_weight, 2)
     
     def _compute_cis(self, user, event_start_hour: int) -> float:
         w1 = user.get_param("w1", 0.5)
@@ -124,7 +125,7 @@ class CourseEvent(BaseEvent):
         # ==========================================
         K_resilience = user.get_param("K_resilience", 1.0)
         
-        base_drain_rate = user.get_param("course_base_drain", 8.5)
+        base_drain_rate = user.get_param("course_base_drain", 8.0)
         fatigue_accel = user.get_param("fatigue_acceleration", 1.20)
         
         linear_drain_rate = (base_drain_rate * CIS) / K_resilience
