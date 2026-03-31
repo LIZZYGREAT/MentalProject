@@ -14,11 +14,27 @@ class StressFunctionStrategy:
         raise NotImplementedError
 
     def get_max_delta(self) -> float:
-        # 基类默认后备上限
         return self.params.get("max_delta_base", 3.0)
 
+    def get_allostatic_stress_amplifier(self, E: float) -> float:
+        E_r = max(0.0, min(100.0, E)) / 100.0
+        E_c = self.params.get("allostatic_collapse_point", 0.3)      
+        k = self.params.get("allostatic_collapse_steepness", 10.0)   
+        lambda_penalty = self.params.get("allostatic_max_penalty", 1.5) 
+        
+        try:
+            exponent = max(-50, min(50, -k * (E_r - E_c)))
+            amplifier = 1.0 + lambda_penalty * (1.0 - 1.0 / (1.0 + math.exp(exponent)))
+        except OverflowError:
+            amplifier = 1.0 + lambda_penalty
+            
+        return amplifier
+
     def get_energy_drain_modifier(self, E: float) -> float:
-        return 1.0
+        E_r = max(0.0, min(100.0, E)) / 100.0
+        alpha = self.params.get("allostatic_cost_alpha", 2.0)
+        beta = self.params.get("allostatic_cost_beta", 4.0)
+        return 1.0 + alpha * math.exp(-beta * E_r)
 
     def _add_noise(self, value: float) -> float:
         scale_noise = self.rng.normal(1.0, 0.125)
@@ -27,93 +43,70 @@ class StressFunctionStrategy:
         return max(0.05, result)
 
 
-# ==========================================
-# 1. 敏感型 (Sensitive) - 下凸加速但限速版
-# ==========================================
 class SensitiveFunction(StressFunctionStrategy):
-    """
-    [高敏易破防型 - 快速穿越S型且限速]
-    物理意义：前期隐忍（平缓），压差达到 15 时快速进入破防期（下凸加速），
-    但最高增速被严格锁死，不会无尽飙升。
-    """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("f_strategy_params", {}).get("sensitive", {})
+
     def f_s(self, S: float, E: float, S_star: float) -> float:
         diff = S - S_star
-        base = 0.40
-        
+        base = self.cfg.get("base", 0.40)
         if diff <= 0:
             factor = base + 0.005 * abs(diff) 
         else:
-            max_extra = 0.70 
-            midpoint = 15.0    
-            steepness = 0.20   
-            
+            max_extra = self.cfg.get("max_extra", 0.70)
+            midpoint = self.cfg.get("midpoint", 15.0)
+            steepness = self.cfg.get("steepness", 0.20)
             try:
                 exponent = -steepness * (diff - midpoint)
                 exponent = max(-50, min(50, exponent))
                 factor = base + max_extra / (1.0 + math.exp(exponent))
             except OverflowError:
                 factor = base + max_extra
-        
-        # 精力护盾：满精力略微压制
-        shield = 1.10 - 0.35 * (max(0.0, E) / 100.0) 
-            
-        final_factor = min(factor * shield, 1.5)
+                
+        amp = self.get_allostatic_stress_amplifier(E)
+        final_factor = factor * amp
         return self._add_noise(final_factor)
 
     def get_max_delta(self) -> float:
         return self.params.get("max_delta_sensitive", 2.4)
 
-    def get_energy_drain_modifier(self, E: float) -> float:
-        return 1.1 if E > 50.0 else 0.9
 
-
-# ==========================================
-# 2. 迟钝型 (Dull)
-# ==========================================
 class DullFunction(StressFunctionStrategy):
-    """
-    [迟钝耐受型]
-    """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("f_strategy_params", {}).get("dull", {})
+
     def f_s(self, S: float, E: float, S_star: float) -> float:
         diff = S - S_star
-        threshold = 12.0 
+        threshold = self.cfg.get("threshold", 12.0)
+        base = self.cfg.get("base", 0.28)
+        k = self.cfg.get("k", 0.012)
         
         if diff < threshold:
-            factor = 0.28
+            factor = base
         else:
-            factor = 0.28 + 0.012 * (diff - threshold)
+            factor = base + k * (diff - threshold)
             
-        shield = 1.0
-        safe_zone = 30.0 
-        if E > safe_zone:
-            ratio = (E - safe_zone) / (100.0 - safe_zone)
-            shield = 1.0 - 0.5 * ratio
-            
-        final_factor = min(factor * shield, 1.5)
+        amp = self.get_allostatic_stress_amplifier(E)
+        final_factor = factor * amp
         return self._add_noise(final_factor)
 
     def get_max_delta(self) -> float:
         return self.params.get("max_delta_dull", 2.3)
 
-    def get_energy_drain_modifier(self, E: float) -> float:
-        return 0.9 if E > 50.0 else 1.15
 
-
-# ==========================================
-# 3. 饱和型 (Saturated) - 
-# ==========================================
 class SaturatedFunction(StressFunctionStrategy):
-    """
-    [标准饱和型 - 上凸减速版]
-    物理意义：起步极速上升（1.3倍率），随着压力累计迅速感到“麻木”，
-    增幅断崖式下跌，最终维持在较低的常数。
-    """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("f_strategy_params", {}).get("saturated", {})
+
     def f_s(self, S: float, E: float, S_star: float) -> float:
         diff = S - S_star
-        floor = 0.30           
-        max_capacity = 1.0     
-        decay_midpoint = 25.0  
-        alpha = 0.15           
+        floor = self.cfg.get("floor", 0.30)
+        max_capacity = self.cfg.get("max_capacity", 1.0)
+        decay_midpoint = self.cfg.get("decay_midpoint", 25.0)
+        alpha = self.cfg.get("alpha", 0.15)
         
         if diff <= 0:
             factor = floor + max_capacity
@@ -125,80 +118,111 @@ class SaturatedFunction(StressFunctionStrategy):
             except OverflowError:
                 factor = floor
                 
-        shield = 1.0
-        safe_zone = 40.0
-        if E > safe_zone:
-            ratio = (E - safe_zone) / (100.0 - safe_zone)
-            shield = 1.0 - 0.2 * ratio
-            
-        return self._add_noise(factor * shield)
+        amp = self.get_allostatic_stress_amplifier(E)
+        final_factor = factor * amp
+        return self._add_noise(final_factor)
 
     def get_max_delta(self) -> float:
         return self.params.get("max_delta_saturated", 3.0)
 
-    def get_energy_drain_modifier(self, E: float) -> float:
-        return 1.05
 
-
-# ==========================================
-# 4. 电池耗竭型 (BatteryDrain)
-# ==========================================
 class BatteryDrainFunction(StressFunctionStrategy):
-    """
-    [双变量逻辑斯蒂风险曲面]
-    """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("f_strategy_params", {}).get("batterydrain", {})
+
     def f_s(self, S: float, E: float, S_star: float) -> float:
-        risk = (S - S_star) - (0.5 * E + 5.0)
+        e_k = self.cfg.get("e_k", 0.4)
+        e_b = self.cfg.get("e_b", 5.0)
+        steepness = self.cfg.get("steepness", 0.15)
+        base = self.cfg.get("base", 0.30)
+        max_extra = self.cfg.get("max_extra", 1.85)
+        
+        risk = (S - S_star) - (e_k * E + e_b)
         try:
-            exponent = max(-50, min(50, -0.15 * risk))
-            factor = 0.25 + 2.5 / (1.0 + math.exp(exponent)) 
+            exponent = max(-50, min(50, -steepness * risk))
+            factor = base + max_extra / (1.0 + math.exp(exponent)) 
         except OverflowError:
-            factor = 0.25
+            factor = base
             
-        hard_limit = 3.5 if E < 20.0 else 2.0
-        return self._add_noise(min(factor, hard_limit))
+        amp = self.get_allostatic_stress_amplifier(E)
+        final_factor = factor * amp
+        return self._add_noise(final_factor)
 
     def get_max_delta(self) -> float:
         return self.params.get("max_delta_batterydrain", 3.5)
 
 
 # ========================================================
-# C_strategy (连续惩罚)
+# C_strategy (连续惩罚) - 已全面接入动态参数接口
 # ========================================================
 class ContinuousPenaltyStrategy:
-    def get_threshold(self) -> float: return 3.0
-    def get_recovery_rate(self) -> float: return 1.0
+    def __init__(self, params: Dict[str, Any] = None):
+        self.params = params or {}
+        self.cfg_group = self.params.get("c_strategy_params", {})
+        
+    def get_threshold(self) -> float: raise NotImplementedError
+    def get_recovery_rate(self) -> float: raise NotImplementedError
     def calculate_fatigue_penalty(self, acc_hours, S_star) -> float: raise NotImplementedError
 
 class HighPenalty(ContinuousPenaltyStrategy):
-    def get_threshold(self): return 2.5
-    def get_recovery_rate(self): return 1.1
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.cfg_group.get("high", {"threshold": 2.5, "rec_rate": 1.1, "k": 0.0005, "max_penalty": 0.0025, "exp": 1.5})
+
+    def get_threshold(self): return self.cfg.get("threshold", 2.5)
+    def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.1)
+    
     def calculate_fatigue_penalty(self, acc_hours, S_star):
         threshold = self.get_threshold()
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
-        step_ratio = 0.0005 * (over ** 1.5)  
-        return S_star * min(step_ratio, 0.0025) 
+        
+        k = self.cfg.get("k", 0.0005)
+        exp_val = self.cfg.get("exp", 1.5)
+        max_p = self.cfg.get("max_penalty", 0.0025)
+        
+        step_ratio = k * (over ** exp_val)  
+        return S_star * min(step_ratio, max_p) 
 
 class ThresholdPenalty(ContinuousPenaltyStrategy):
-    def get_threshold(self): return 3.0
-    def get_recovery_rate(self): return 1.2
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.cfg_group.get("threshold", {"threshold": 3.0, "rec_rate": 1.2, "k": 0.0012, "max_penalty": 0.0020, "exp_k": -1.5})
+
+    def get_threshold(self): return self.cfg.get("threshold", 3.0)
+    def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.2)
+    
     def calculate_fatigue_penalty(self, acc_hours, S_star):
         threshold = self.get_threshold()
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
-        step_ratio = 0.0012 * (1.0 - math.exp(-1.5 * over))  
-        return S_star * min(step_ratio, 0.0020) 
+        
+        k = self.cfg.get("k", 0.0012)
+        exp_k = self.cfg.get("exp_k", -1.5)
+        max_p = self.cfg.get("max_penalty", 0.0020)
+        
+        step_ratio = k * (1.0 - math.exp(exp_k * over))  
+        return S_star * min(step_ratio, max_p) 
 
 class LowPenalty(ContinuousPenaltyStrategy):
-    def get_threshold(self): return 3.25
-    def get_recovery_rate(self): return 1.6
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.cfg_group.get("low", {"threshold": 3.25, "rec_rate": 1.6, "k": 0.00025, "max_penalty": 0.0016})
+
+    def get_threshold(self): return self.cfg.get("threshold", 3.25)
+    def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.6)
+    
     def calculate_fatigue_penalty(self, acc_hours, S_star):
         threshold = self.get_threshold()
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
-        step_ratio = 0.00025 * over  
-        return S_star * min(step_ratio, 0.0016) 
+        
+        k = self.cfg.get("k", 0.00025)
+        max_p = self.cfg.get("max_penalty", 0.0016)
+        
+        step_ratio = k * over  
+        return S_star * min(step_ratio, max_p) 
 
 
 # ==========================================
@@ -210,7 +234,7 @@ class CourseStrategy(BaseStrategy):
         super().__init__(params)
         self.params = params or {}
         self.f_strategy = self._create_f_strategy(f_strategy_type, self.params)
-        self.C_strategy = self._create_C_strategy(C_strategy_type)
+        self.C_strategy = self._create_C_strategy(C_strategy_type, self.params)
         self.time_preferences = time_preferences
         self._setup_time_strategy()
     
@@ -223,31 +247,33 @@ class CourseStrategy(BaseStrategy):
         }
         return mapping.get(strategy_type.lower(), SensitiveFunction)(params)
     
-    def _create_C_strategy(self, strategy_type: str):
+    def _create_C_strategy(self, strategy_type: str, params: Dict[str, Any]):
         mapping = {
             "high": HighPenalty,
             "low": LowPenalty,
             "threshold": ThresholdPenalty
         }
-        return mapping.get(strategy_type.lower(), HighPenalty)()
+        return mapping.get(strategy_type.lower(), HighPenalty)(params)
     
     def _setup_time_strategy(self):
+        # 基础兜底权重
         combined = {(8,10):1.0, (10,12):1.0, (12,14):1.0,
                    (14,16):1.0, (16,18):1.0, (18,20):1.0, (20,24):1.0}
         
-        strategy_map = {
-            "like_morning": LikeMorning,
-            "dislike_morning": DislikeMorning,
-            "like_afternoon": LikeAfternoon,
-            "dislike_afternoon": DislikeAfternoon,
-            "like_evening": LikeEvening,
-            "dislike_evening": DislikeEvening
-        }
+        # 从配置字典中拉取映射字典
+        pref_cfg = self.params.get("time_pref_weights", {})
         
         for pref in self.time_preferences:
-            if pref.lower() in strategy_map:
-                for (a, b), v in strategy_map[pref.lower()]().weights().items():
-                    combined[(a, b)] = v
+            pref_key = pref.lower()
+            if pref_key in pref_cfg:
+                for k_str, v in pref_cfg[pref_key].items():
+                    # 动态将 JSON 字符串键 (如 "(8,10)") 解析还原为真实的 Python 元组
+                    if isinstance(k_str, str) and ',' in k_str:
+                        clean_str = k_str.strip('() ')
+                        a, b = map(int, clean_str.split(','))
+                        combined[(a, b)] = v
+                    elif isinstance(k_str, tuple):
+                        combined[k_str] = v
         
         self.params["time_weights"] = combined
     
@@ -284,25 +310,6 @@ class CourseStrategy(BaseStrategy):
     def get_name(self) -> str:
         return f"CourseStrategy({self.f_strategy.__class__.__name__}, {self.C_strategy.__class__.__name__})"
 
-# 辅助类
-class LikeMorning:
-    def weights(self): return {(8,10):0.95, (10,12):0.9}
-
-class DislikeMorning:
-    def weights(self): return {(8,10):1.1, (10,12):1.05}
-
-class LikeAfternoon:
-    def weights(self): return {(12,14):0.95, (14,16):0.95, (16,18):1.0}
-
-class DislikeAfternoon:
-    def weights(self): return {(12,14):1.15, (14,16):1.10, (16,18):1.05}
-
-class LikeEvening:
-    def weights(self): return {(18,20):0.9, (20,24):0.9}
-
-class DislikeEvening:
-    def weights(self): return {(18,20):1.05, (20,24):1.10}
-
 def make_f_strategy(strategy_type: str, params: Dict[str, Any] = None):
     mapping = {
         "sensitive": SensitiveFunction,
@@ -312,22 +319,13 @@ def make_f_strategy(strategy_type: str, params: Dict[str, Any] = None):
     }
     return mapping.get(strategy_type.lower(), SensitiveFunction)(params)
 
-def make_C_strategy(strategy_type: str):
+def make_C_strategy(strategy_type: str, params: Dict[str, Any] = None):
     mapping = {
         "high": HighPenalty,
         "low": LowPenalty,
         "threshold": ThresholdPenalty
     }
-    return mapping.get(strategy_type.lower(), HighPenalty)()
+    return mapping.get(strategy_type.lower(), HighPenalty)(params)
 
 def setup_time_strategy(strategies, params):
-    if not params:
-        return
-    combined = {(8,10):1.0, (10,12):1.0, (12,14):1.0,
-               (14,16):1.0, (16,18):1.0, (18,20):1.0, (20,24):1.0}
-    
-    for strategy in strategies:
-        for (a, b), v in strategy.weights().items():
-            combined[(a, b)] = v
-    
-    params["time_weights"] = combined
+    pass

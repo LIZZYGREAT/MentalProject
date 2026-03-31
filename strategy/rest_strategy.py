@@ -156,11 +156,22 @@ class RelievedRestStrategy(RestStrategy):
     """
     [释然型] - 前期快，随后基于时间与压差双重平滑衰减，全波段下凸着陆 (彻底移除生硬阈值)
     """
-    def get_phase_thresholds(self) -> Tuple[float, float]: return (2.0, 5.0)
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("rest_relieved", {})
+        
+    def get_phase_thresholds(self) -> Tuple[float, float]: 
+        res = self.cfg.get("phase_thresholds", [2.0, 5.0])
+        return (float(res[0]), float(res[1]))
 
-    def get_efficiency(self) -> float: return 1.05
+    def get_efficiency(self) -> float: 
+        return self.cfg.get("efficiency", 1.05)
     
-    def _get_noise_std(self, diff: float, E: float) -> float: return 0.12
+    def _get_noise_std(self, diff: float, E: float) -> float: 
+        return self.cfg.get("noise_std", 0.12)
+        
+    def get_inertia_energy_rate(self) -> float: 
+        return self.cfg.get("inertia_e_rate", -0.05)
 
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         diff = max(0, S - S_star)
@@ -185,11 +196,22 @@ class WarmupRestStrategy(RestStrategy):
     """
     [慢热型] - 时间与压差的彻底解耦 (75分钟超长前摇，四次方极致压制解锁机制)
     """
-    def get_phase_thresholds(self) -> Tuple[float, float]: return (5.0, 15.0)
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("rest_warmup", {})
+        
+    def get_phase_thresholds(self) -> Tuple[float, float]: 
+        res = self.cfg.get("phase_thresholds", [5.0, 15.0])
+        return (float(res[0]), float(res[1]))
     
-    def get_efficiency(self) -> float: return 1.0
+    def get_efficiency(self) -> float: 
+        return self.cfg.get("efficiency", 1.0)
 
-    def _get_noise_std(self, diff: float, E: float) -> float: return 0.10
+    def _get_noise_std(self, diff: float, E: float) -> float: 
+        return self.cfg.get("noise_std", 0.10)
+        
+    def get_inertia_energy_rate(self) -> float: 
+        return self.cfg.get("inertia_e_rate", -0.05)
 
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         diff = max(0, S - S_star)
@@ -215,13 +237,22 @@ class AnxiousRestStrategy(RestStrategy):
     """
     [焦虑型] - 高压死锁，中段皮筋断裂，低压死水残留 (基础速率再次下调50%)
     """
-    def get_phase_thresholds(self) -> Tuple[float, float]: return (10.0, 15.0)
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("rest_anxious", {})
+        
+    def get_phase_thresholds(self) -> Tuple[float, float]: 
+        res = self.cfg.get("phase_thresholds", [10.0, 15.0])
+        return (float(res[0]), float(res[1]))
     
-    def get_inertia_energy_rate(self) -> float: return -0.06
+    def get_inertia_energy_rate(self) -> float: 
+        return self.cfg.get("inertia_e_rate", -0.06)
     
-    def get_efficiency(self) -> float: return 0.85
+    def get_efficiency(self) -> float: 
+        return self.cfg.get("efficiency", 0.85)
 
-    def _get_noise_std(self, diff: float, E: float) -> float: return 0.15 
+    def _get_noise_std(self, diff: float, E: float) -> float: 
+        return self.cfg.get("noise_std", 0.15) 
 
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         diff = max(0, S - S_star)
@@ -244,11 +275,22 @@ class BurnoutRestStrategy(RestStrategy):
     """
     [倦怠型] - 极度平坦的对数死水，全波段缓降 (基础速率再次下调50%)
     """
-    def get_phase_thresholds(self) -> Tuple[float, float]: return (5.0, 10.0)
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("rest_burnout", {})
+        
+    def get_phase_thresholds(self) -> Tuple[float, float]: 
+        res = self.cfg.get("phase_thresholds", [5.0, 10.0])
+        return (float(res[0]), float(res[1]))
     
-    def get_efficiency(self) -> float: return 0.70
+    def get_efficiency(self) -> float: 
+        return self.cfg.get("efficiency", 0.70)
 
-    def _get_noise_std(self, diff: float, E: float) -> float: return 0.04 
+    def _get_noise_std(self, diff: float, E: float) -> float: 
+        return self.cfg.get("noise_std", 0.04) 
+        
+    def get_inertia_energy_rate(self) -> float: 
+        return self.cfg.get("inertia_e_rate", -0.05)
 
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         diff = max(0, S - S_star)

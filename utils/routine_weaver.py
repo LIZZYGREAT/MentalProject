@@ -11,10 +11,14 @@ class RoutineWeaver:
     """
     def __init__(self, user):
         self.user = user
+        self.cfg = self.user.get_param("routine_weaver", {})
+        
         self.default_wake_min = self._time_to_mins(self.user.get_param("default_wake_time", "07:30"))
         self.default_sleep_min = self._time_to_mins(self.user.get_param("default_sleep_time", "23:30"))
-        self.max_delay_wake_min = self._time_to_mins("11:00") 
-        self.ideal_sleep_hours = 8.0
+        
+        # [核心修复] 动态读取边界
+        self.max_delay_wake_min = self._time_to_mins(self.cfg.get("max_delay_wake_time", "11:00")) 
+        self.ideal_sleep_hours = self.cfg.get("ideal_sleep_hours", 8.0)
 
     def _time_to_mins(self, time_str: str) -> int:
         if isinstance(time_str, datetime):
@@ -92,13 +96,10 @@ class RoutineWeaver:
         actual_sleep_mins = 0
         morning_gaps = self._get_free_gaps(0, real_wake_min, occupied_blocks)
         for gs, ge in morning_gaps:
-            
-            # [核心机制：区分“熬夜前摇”与“半夜起夜”]
             if gs == 0 and ge < 150: 
                 continue 
                 
             actual_start = gs
-            # 睡前褪黑素缓冲：紧接任务后的空档，强制退后 15 分钟入睡
             if gs > 0:
                 actual_start = gs + 15
             
@@ -159,14 +160,18 @@ class RoutineWeaver:
 
     def inject_routine_events(self, events: List[BaseEvent], date_str: str) -> List[BaseEvent]:
         occupied_blocks = self._get_occupied_blocks(events)
-        
         final_events = self._inject_sleep_events(events, occupied_blocks)
         all_blocks = self._get_occupied_blocks(final_events)
 
-        # 1. 注入午餐
+        # 1. 注入午餐 (动态读取时空边界)
+        lunch_b_s = self._time_to_mins(self.cfg.get("lunch_window_start", "11:00"))
+        lunch_b_e = self._time_to_mins(self.cfg.get("lunch_window_end", "13:30"))
+        lunch_i_s = self._time_to_mins(self.cfg.get("lunch_ideal_start", "11:40"))
+        lunch_i_e = self._time_to_mins(self.cfg.get("lunch_ideal_end", "12:20"))
+        
         lunch_slot = self._find_best_slot(
-            bound_s=11*60, bound_e=13*60+30, 
-            ideal_s=11*60+40, ideal_e=12*60+20, 
+            bound_s=lunch_b_s, bound_e=lunch_b_e, 
+            ideal_s=lunch_i_s, ideal_e=lunch_i_e, 
             min_dur=20, occupied_blocks=all_blocks
         )
         lunch_end_min = 12*60
@@ -177,15 +182,18 @@ class RoutineWeaver:
             m_type = "normal" if dur >= 30 else "rushed"
             final_events.append(MealEvent("meal_lunch", self._mins_to_str(ls), self._mins_to_str(le), meal_type=m_type, name="午餐"))
 
-        # 2. 注入午睡 (绑定睡眠债补偿)
+        # 2. 注入午睡 (动态读取阈值)
         sleep_debt = self.user.get_sleep_debt()
-        ideal_nap_dur = 90 if sleep_debt > 0.5 else 40
-        min_nap_dur = 20 if sleep_debt > 0.5 else 15
+        debt_thresh = self.cfg.get("nap_debt_threshold", 0.5)
+        ideal_nap_dur = self.cfg.get("nap_ideal_debt", 90) if sleep_debt > debt_thresh else self.cfg.get("nap_ideal_normal", 40)
+        min_nap_dur = self.cfg.get("nap_min_debt", 20) if sleep_debt > debt_thresh else self.cfg.get("nap_min_normal", 15)
         
-        nap_bound_s = lunch_end_min + 10
+        nap_delay = self.cfg.get("nap_delay_after_lunch", 10)
+        nap_bound_s = lunch_end_min + nap_delay
+        nap_bound_e = self._time_to_mins(self.cfg.get("nap_window_end", "13:50"))
         
         nap_slot = self._find_best_slot(
-            bound_s=nap_bound_s, bound_e=13*60+50,
+            bound_s=nap_bound_s, bound_e=nap_bound_e,
             ideal_s=nap_bound_s, ideal_e=nap_bound_s + ideal_nap_dur,
             min_dur=min_nap_dur, occupied_blocks=all_blocks
         )
@@ -193,13 +201,18 @@ class RoutineWeaver:
             ns, ne = nap_slot
             dur = ne - ns
             n_type = "proper" if dur >= 30 else "short"
-            metadata = {"nap_type": n_type, "is_repaying_debt": True if sleep_debt > 0.5 and dur > 30 else False}
+            metadata = {"nap_type": n_type, "is_repaying_debt": True if sleep_debt > debt_thresh and dur > 30 else False}
             final_events.append(NapEvent("nap_noon", self._mins_to_str(ns), self._mins_to_str(ne), nap_type=n_type, name="午睡", metadata=metadata))
 
-        # 3. 注入晚餐
+        # 3. 注入晚餐 (动态读取时空边界)
+        dinner_b_s = self._time_to_mins(self.cfg.get("dinner_window_start", "17:00"))
+        dinner_b_e = self._time_to_mins(self.cfg.get("dinner_window_end", "19:30"))
+        dinner_i_s = self._time_to_mins(self.cfg.get("dinner_ideal_start", "17:40"))
+        dinner_i_e = self._time_to_mins(self.cfg.get("dinner_ideal_end", "18:30"))
+        
         dinner_slot = self._find_best_slot(
-            bound_s=17*60, bound_e=19*60+30,
-            ideal_s=17*60+40, ideal_e=18*60+30,
+            bound_s=dinner_b_s, bound_e=dinner_b_e,
+            ideal_s=dinner_i_s, ideal_e=dinner_i_e,
             min_dur=20, occupied_blocks=all_blocks
         )
         if dinner_slot:

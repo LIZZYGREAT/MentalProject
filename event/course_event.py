@@ -124,20 +124,17 @@ class CourseEvent(BaseEvent):
         # Part 1: 精力消耗 (E-Drain)
         # ==========================================
         K_resilience = user.get_param("K_resilience", 1.0)
-        
         base_drain_rate = user.get_param("course_base_drain", 8.0)
-        fatigue_accel = user.get_param("fatigue_acceleration", 1.20)
         
         linear_drain_rate = (base_drain_rate * CIS) / K_resilience
-        energy_ratio = max(0.0, min(100.0, current_energy)) / 100.0
-        f_fatigue = 1.0 + fatigue_accel * math.pow(1.0 - energy_ratio, 1.5)
         
+        # 使用非稳态负荷理论的边际耗损代替简单的线性疲劳
         f_drain_modifier = 1.0
         if hasattr(user.course_strategy, 'get_energy_drain_modifier'):
             f_drain_modifier = user.course_strategy.get_energy_drain_modifier(current_energy)
         
-        # 叠加昼夜节律惩罚
-        delta_E = -linear_drain_rate * f_fatigue * f_drain_modifier * f_debt_drain * f_circadian_drain * (time_step / 60.0)
+        # 叠加昼夜节律惩罚与非稳态耗能
+        delta_E = -linear_drain_rate * f_drain_modifier * f_debt_drain * f_circadian_drain * (time_step / 60.0)
 
         # ==========================================
         # Part 2: 压力产生 (S-Generation)
@@ -145,6 +142,7 @@ class CourseEvent(BaseEvent):
         D_t = 0.80
         S_star = user.get_param("S_star_init", 50)
         
+        # f_s 内部现在已经集成了 get_allostatic_stress_amplifier 阻尼器
         f_s_val = user.course_strategy.f_s(current_stress, current_energy, S_star)
         
         z_awake = user.get_param("Z_awake", 0.5)

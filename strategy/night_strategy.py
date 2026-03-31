@@ -1,3 +1,4 @@
+# strategy/night_strategy.py
 import math
 import numpy as np
 from typing import Dict, Any, Tuple
@@ -84,10 +85,16 @@ class NormalNightStrategy(NightStrategy):
     """
     [标准型]：平稳充电，无硬性压制。
     """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("night_normal", {})
+
     def calculate_step(self, S: float, E: float, current_time: datetime, time_step: int, elapsed_minutes: float = 0.0) -> Tuple[float, float]:
         S_star = self.params.get("S_star_init", 50.0)
         diff = S - S_star
-        rho, sigma = 0.60, 0.25 
+        
+        rho = self.cfg.get("rho", 0.60)
+        sigma = self.cfg.get("sigma", 0.25)
         
         if elapsed_minutes < self.params.get("initial_phase_minutes", 60):
             decay = self.params.get("initial_decay_rate", 0.02) if diff > 0 else 0.005
@@ -96,7 +103,7 @@ class NormalNightStrategy(NightStrategy):
             return delta_S, delta_E
         else:
             if diff <= self.params.get("anchor_threshold", 2.5):
-                pull_coeff = 0.035 
+                pull_coeff = self.cfg.get("pull_coeff", 0.035) 
                 delta_trend = max(-0.5, min(0.5, pull_coeff * (S_star - S)))
             else:
                 delta_trend = -self.params.get("oscillation_decay_normal", 0.015) * diff
@@ -113,10 +120,16 @@ class DeepNightStrategy(NightStrategy):
     """
     [深度型]：前段暴击恢复，快速补充能量。
     """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("night_deep", {})
+
     def calculate_step(self, S: float, E: float, current_time: datetime, time_step: int, elapsed_minutes: float = 0.0) -> Tuple[float, float]:
         S_star = self.params.get("S_star_init", 50.0)
         diff = S - S_star
-        rho, sigma = 0.80, 0.15 
+        
+        rho = self.cfg.get("rho", 0.80)
+        sigma = self.cfg.get("sigma", 0.15)
         
         if elapsed_minutes < self.params.get("initial_phase_minutes", 60) - 15:
             delta_S = -self.params.get("initial_decay_rate", 0.02) * 1.3 * diff + self._get_ar1_noise(rho, sigma)
@@ -124,7 +137,7 @@ class DeepNightStrategy(NightStrategy):
             return delta_S, delta_E
         else:
             if diff <= self.params.get("anchor_threshold", 2.5) + 1.0:
-                pull_coeff = 0.05 
+                pull_coeff = self.cfg.get("pull_coeff", 0.05) 
                 delta_trend = max(-0.6, min(0.6, pull_coeff * (S_star - S)))
             else:
                 delta_trend = -self.params.get("oscillation_decay_deep", 0.02) * diff
@@ -143,13 +156,18 @@ class AnxiousNightStrategy(NightStrategy):
     """
     [焦虑型]：修复波形撕裂，大幅提升充电倍率。
     """
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.cfg = self.params.get("night_anxious", {})
+
     def calculate_step(self, S: float, E: float, current_time: datetime, time_step: int, elapsed_minutes: float = 0.0) -> Tuple[float, float]:
         S_star = self.params.get("S_star_init", 50.0)
         friction = self.params.get("friction_factor", 0.015)
         min_decay = self.params.get("min_decay_rate", 0.006)
         diff = S - S_star
         
-        rho, sigma = 0.55, 0.22 
+        rho = self.cfg.get("rho", 0.55)
+        sigma = self.cfg.get("sigma", 0.22) 
         resistance = min(1.0 + np.log1p(np.exp(friction * max(0, diff) * 0.4)), 2.2)
         
         # === 阶段一 ===
@@ -165,7 +183,7 @@ class AnxiousNightStrategy(NightStrategy):
         # === 阶段二 ===
         else:
             if diff <= self.params.get("anchor_threshold", 2.5):
-                pull_coeff = 0.025 
+                pull_coeff = self.cfg.get("pull_coeff", 0.025) 
                 delta_trend = max(-0.4, min(0.4, pull_coeff * (S_star - S)))
             else:
                 decay = max(self.params.get("oscillation_decay_normal", 0.015) / resistance, min_decay * 1.5)

@@ -13,7 +13,17 @@ class AlertMonitor:
         self.S_thresh = params.get("S_threshold", 95.0)
         self.S_star = params.get("S_star_init", 50.0)
         
-        self.auc_limit = 100.0     
+        # [核心修复] 动态读取所有双轨引擎的阈值
+        alert_cfg = params.get("alert_thresholds", {})
+        self.auc_limit = alert_cfg.get("auc_limit", 100.0)
+        self.critical_buffer_ratio = alert_cfg.get("critical_buffer_ratio", 0.35)
+        self.warning_buffer_ratio = alert_cfg.get("warning_buffer_ratio", 0.20)
+        self.auc_orange = alert_cfg.get("auc_orange", 80.0)
+        self.auc_yellow = alert_cfg.get("auc_yellow", 50.0)
+        self.E_danger = alert_cfg.get("E_danger", 25.0)
+        self.auc_increase_step = alert_cfg.get("auc_increase_step", 1.5)
+        self.auc_decay_step = alert_cfg.get("auc_decay_step", 2.5)
+        
         # 计算抗压缓冲带
         self.buffer_zone = max(10.0, self.S_thresh - self.S_star)
         
@@ -44,15 +54,14 @@ class AlertMonitor:
             # 2. 状态判定与积分更新
             is_resting_and_recovering = (delta_S < 0 and state not in ["LATE_NIGHT_ACTIVE", "NIGHT_OVERTIME"])
             
-            # 只要压力大于黄警线（消耗了80%可用空间），就开始涨积分（休息时除外）
-            if S > self.S_thresh - 0.20 * self.buffer_zone:
+            # 只要压力大于黄警线（消耗了动态比例的可用空间），就开始涨积分（休息时除外）
+            if S > self.S_thresh - self.warning_buffer_ratio * self.buffer_zone:
                 if is_resting_and_recovering:
                     auc_level = max(0.0, auc_level - 1.0)
                 else:
-                    auc_level = min(self.auc_limit, auc_level + 1.5)
+                    auc_level = min(self.auc_limit, auc_level + self.auc_increase_step)
             else:
-                decay = 2.5
-                auc_level = max(0.0, auc_level - decay)
+                auc_level = max(0.0, auc_level - self.auc_decay_step)
                 
             # ==========================================
             # 3. 双引擎独立判定
@@ -62,13 +71,13 @@ class AlertMonitor:
             intensity_tier = 0
             intensity_zone = "safe"
             
-            if S >= self.S_thresh + 0.35 * self.buffer_zone:
+            if S >= self.S_thresh + self.critical_buffer_ratio * self.buffer_zone:
                 intensity_tier = 3
                 intensity_zone = "critical"
             elif S >= self.S_thresh:
                 intensity_tier = 2
                 intensity_zone = "breached"
-            elif S >= self.S_thresh - 0.20 * self.buffer_zone:
+            elif S >= self.S_thresh - self.warning_buffer_ratio * self.buffer_zone:
                 intensity_tier = 1
                 intensity_zone = "approaching"
                 
@@ -76,9 +85,9 @@ class AlertMonitor:
             duration_tier = 0
             if auc_level >= self.auc_limit:
                 duration_tier = 3
-            elif auc_level >= 80.0 or (auc_level >= 50.0 and E < 25.0):
+            elif auc_level >= self.auc_orange or (auc_level >= self.auc_yellow and E < self.E_danger):
                 duration_tier = 2
-            elif auc_level >= 50.0:
+            elif auc_level >= self.auc_yellow:
                 duration_tier = 1
                 
             # 综合评定：取双引擎的最高危级别
@@ -109,7 +118,7 @@ class AlertMonitor:
                 if duration_tier == 3:
                     alert_text = "[红] 阈值过载 (持续高负荷导致系统崩溃)"
                 elif duration_tier == 2:
-                    if E < 25.0:
+                    if E < self.E_danger:
                         alert_text = "[橙] 残血高危 (精力枯竭且持续承压)"
                     else:
                         alert_text = "[橙] 疲劳积压 (长时间高压未获缓冲)"
@@ -162,7 +171,7 @@ class AlertMonitor:
             last_ds = last_row.get("dominant_stressors", [])
             
             # 检查绝对峰值
-            if last_S >= self.S_thresh + 0.35 * self.buffer_zone:
+            if last_S >= self.S_thresh + self.critical_buffer_ratio * self.buffer_zone:
                 alerts.append({
                     "type": "[红] 极度高压 (日终防线彻底击穿)", "time": last_time, 
                     "S": round(last_S, 2), "E": round(last_E, 2), "state": last_state,
@@ -171,11 +180,11 @@ class AlertMonitor:
                     "dominant_stressors": last_ds, "C": 1.0
                 })
             # 检查疲劳积压情况
-            elif auc_level > 80.0 and current_alert_tier < 2:
+            elif auc_level > self.auc_orange and current_alert_tier < 2:
                 alerts.append({
                     "type": "[橙] 高危积压 (日终带着严重疲劳入睡)", "time": last_time, 
                     "S": round(last_S, 2), "E": round(last_E, 2), "state": last_state,
-                    "trigger_source": "duration_buildup", "intensity_zone": "approaching" if last_S >= self.S_thresh - 0.20 * self.buffer_zone else "safe",
+                    "trigger_source": "duration_buildup", "intensity_zone": "approaching" if last_S >= self.S_thresh - self.warning_buffer_ratio * self.buffer_zone else "safe",
                     "continuous_hours": round(last_ch, 2), "current_events": last_ce, 
                     "dominant_stressors": last_ds, "C": 0.8
                 })
