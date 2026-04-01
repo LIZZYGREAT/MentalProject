@@ -73,7 +73,8 @@ class Simulator:
         wake_s, wake_recorded = S, False
         is_penalizing, energy_exhausted = False, False
 
-        # === 突变平滑控制流水线 ===
+        # === 大一统动力学与突变平滑控制流水线 ===
+        energy_buffer = 0.0           # [新增] 房室消化/吸收缓冲池
         friction_excess_stress = 0.0  
         dopamine_buffer = 0.0         
         momentum_S_1 = 0.0            
@@ -229,8 +230,12 @@ class Simulator:
 
             base_ds = delta_S
             
+            # [新增] 房室缓冲池拦截：拦截进食/午休的锐角回血，使其转为指数平滑释放
+            if routine_ev and routine_ev.get_event_type() in ["meal", "nap"] and delta_E > 0:
+                energy_buffer += delta_E
+                delta_E = 0.0 
+
             # === 🧩 4. 挂载动态区制乘数 (Regime Modifiers) ===
-            # 将环境与特质特征再次打包供乘数约束计算
             modifier_features = {
                 "f_strategy": static_f_strategy,
                 "intensity": intensity,
@@ -270,7 +275,33 @@ class Simulator:
                 momentum_S_2 = delta_S
                 actual_step_S = delta_S
 
-            self._update_profiles(active_high_loads if has_high_load else ([routine_ev] if routine_ev else []), event_profile, delta_S, delta_E, f_pen)
+            # === 7. 缓冲池释放与基底流失 ===
+            # A. 缓冲池指数释放 (平滑血糖吸收)
+            decay_rate = micro_cfg.get("buffer_decay_rate", 0.05)
+            buffer_release = energy_buffer * (1.0 - math.exp(-decay_rate * self.time_step))
+            energy_buffer -= buffer_release
+            
+            # B. 基础维持生命流失
+            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
+                basal_drain = 0.0
+            else:
+                basal_drain_base = micro_cfg.get("basal_drain_rate", 0.415)
+                basal_drain = basal_drain_base * (self.time_step / 5.0)
+                
+            # C. 汇总本 Tick 的理论总精力变化
+            raw_step_E = delta_E + buffer_release - basal_drain
+            
+            # === 8.底线生存阻尼 (Lorentzian Floor) ===
+            if raw_step_E < 0:
+                # 动态读取休克防线阈值
+                critical_E = micro_cfg.get("lorentzian_floor_E", 15.0)
+                # 当 E 逼近 critical_E 时，大脑强制切断后台代谢，流失率极速衰减至 0
+                psi_E = 1.0 / (1.0 + math.exp(-(E - critical_E)))
+                raw_step_E *= psi_E
+                
+            actual_step_E = raw_step_E
+
+            self._update_profiles(active_high_loads if has_high_load else ([routine_ev] if routine_ev else []), event_profile, actual_step_S, actual_step_E, f_pen)
 
             # [疲劳预警监测]
             if f_pen > 0 and not is_penalizing:
@@ -282,14 +313,14 @@ class Simulator:
 
             # [异步耗竭红线同步]
             if E < exhaustion_th and not energy_exhausted:
-                trace_logs.append(f"[{cur_str}] 🪫 精力耗竭 (E < {exhaustion_th})，神经化学防线受损！")
+                trace_logs.append(f"[{cur_str}] 🪫 精力耗竭 (E < {exhaustion_th})，神经化学防线受损，触发强制休克阻尼！")
                 energy_exhausted = True
             elif E >= exhaustion_th and energy_exhausted:
                 energy_exhausted = False
 
             # [数值安全截断]
             S = max(0.0, min(150.0, S + actual_step_S))  
-            E = max(0.0, min(100.0, E + delta_E))
+            E = max(0.0, min(100.0, E + actual_step_E))
             
             dominant_strs = [p["name"] for p in sorted(event_profile.values(), key=lambda x: x["total_S"], reverse=True)[:2] if p["total_S"] > 0]
             curr_names = [ev.name for ev in active_high_loads] if has_high_load else ([routine_ev.name] if routine_ev else [])

@@ -47,7 +47,7 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     "alpha_cis_drain": 1.0,
     "cognitive_weight": 0.65,
-    "fatigue_acceleration": 1.20, # 即将弃用，由非稳态阻尼接管
+    "fatigue_acceleration": 1.20, 
     
     # ==========================================
     # 5. 用户默认策略偏好
@@ -61,11 +61,11 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     # 6. 非稳态负荷理论参数 (Allostatic Load Dynamics) 
     # ==========================================
-    "allostatic_collapse_point": 0.3,      # E_r 崩塌临界点 (30%精力)
+    "allostatic_collapse_point": 0.2,      # E_r 崩塌临界点
     "allostatic_collapse_steepness": 10.0, # Sigmoid 崩塌陡峭度
-    "allostatic_max_penalty": 1.5,         # 彻底破防时的最大乘性放大器
-    "allostatic_cost_alpha": 2.0,          # 边际耗能指数衰减底数
-    "allostatic_cost_beta": 4.0,           # 边际耗能指数衰减速率
+    "allostatic_max_penalty": 0.6,         # 彻底破防时的最大乘性放大器
+    "allostatic_cost_alpha": 0.8,          # 边际耗能指数衰减底数
+    "allostatic_cost_beta": 2.5,           # 边际耗能指数衰减速率
     
     # ==========================================
     # 7. 全局系统性惩罚参数 (Global Penalties) 
@@ -75,7 +75,7 @@ GLOBAL_DEFAULT_CONFIG = {
         "stress_multiplier": 1.2   # 凌晨干活增压倍率
     },
     "penalty_sleep_debt": {
-        "drain_k": 0.05,           # 睡眠债对耗能的线性惩罚斜率 (1.0 + 0.05*debt)
+        "drain_k": 0.05,           # 睡眠债对耗能的线性惩罚斜率 
         "stress_k": 0.04           # 睡眠债对增压的线性惩罚斜率
     },
     
@@ -100,23 +100,35 @@ GLOBAL_DEFAULT_CONFIG = {
     "meal_dinner_recover": 15,       
     "nap_short_recover": 12,         
     "nap_proper_recover": 20,    
+
+    "rest_ode_params": {
+        "R_max_base": 6.06,                  # 单步(5分钟)最大理论恢复功率
+        "deficit_gamma": 2.0,                # 匮乏驱动指数
+        "sympathetic_inhibit_alpha": 0.02,   # 交感神经高压阻尼系数
+        "energy_noise_std": 0.05             # 恢复过程的热力学微噪
+    },
+    "recovery_piecewise_params": {
+        "thresholds": [15.0, 35.0],           # 压力差值 diff 的两道分界线
+        "absorption_rates": [1.0, 0.9, 0.6],  # 对应三阶段的精力吸收率 (alpha)
+        "relief_multipliers": [1.0, 1.3, 0.6] # 对应三阶段的卸压乘数 (beta)
+    },
     
     # ==========================================
-    # 9. 连续负荷惩罚策略参数 (C_Strategy) - 权重已放大，在长任务中接管主导
+    # 9. 连续负荷惩罚策略参数 (C_Strategy)
     # ==========================================
     "c_strategy_params": {
-        "high": {"threshold": 2.5, "rec_rate": 1.1, "k": 0.005, "max_penalty": 0.025, "exp": 1.5},
-        "threshold": {"threshold": 3.0, "rec_rate": 1.2, "k": 0.012, "max_penalty": 0.020, "exp_k": -1.5},
-        "low": {"threshold": 3.25, "rec_rate": 1.6, "k": 0.0025, "max_penalty": 0.016}
+        "high": {"threshold": 2.25, "rec_rate": 1.2, "k": 0.003, "max_penalty": 0.010, "exp": 1.5},
+        "threshold": {"threshold": 2.50, "rec_rate": 1.3, "k": 0.04, "max_penalty": 0.009, "exp_k": -1.5},
+        "low": {"threshold": 2.75, "rec_rate": 1.6, "k": 0.0025, "max_penalty": 0.008}
     },
 
     # ==========================================
     # 10. 事件基础演化系数 (Event Priors & Intensities) 
     # ==========================================
-    "D_t_course": 0.80,
-    "D_t_task": 0.65,
-    "course_base_drain": 8.5,      
-    "task_base_drain": 8.5, 
+    "D_t_course": 0.70,
+    "D_t_task": 0.60,
+    "course_base_drain": 5.5,      
+    "task_base_drain": 5.5, 
     
     "event_task": {
         "T1_exam": 1.1, "T2_ddl": 1.05, "T3_meeting": 1.0,
@@ -149,24 +161,24 @@ GLOBAL_DEFAULT_CONFIG = {
         "trait_weight_k": 0.4      
     },
     "event_meal": {
-        "C_base": 0.04,
-        "K": 5.0,
+        "C_base": 1.2,
+        "K": 10.0,
         "multiplier_normal": 1.15,
         "multiplier_late": 0.85,
         "epoc_injection": 0.5,
         "epoc_max": 20.0,
-        "duration_accel": 1.5
+        "duration_accel": 1.2
     },
     "event_nap": {
-        "C_base": 0.08,
-        "K": 5.0,
+        "C_base": 2.0,
+        "K": 10.0,
         "multiplier_proper": 1.4,
         "multiplier_short": 1.1,
         "debt_reduce_k": 2.0,
         "debt_multiplier": 1.2,
         "epoc_injection": 1.0,
         "epoc_max": 30.0,
-        "duration_accel": 2.0
+        "duration_accel": 1.5
     },
 
     # ==========================================
@@ -237,11 +249,11 @@ GLOBAL_DEFAULT_CONFIG = {
         "lunch_window_start": "11:00",   
         "lunch_window_end": "13:30",     
         "lunch_ideal_start": "11:40",
-        "lunch_ideal_end": "12:20",
+        "lunch_ideal_end": "12:10",
         "dinner_window_start": "17:00",
         "dinner_window_end": "19:30",
         "dinner_ideal_start": "17:40",
-        "dinner_ideal_end": "18:30",
+        "dinner_ideal_end": "18:10",
         "nap_debt_threshold": 0.5,       
         "nap_ideal_debt": 90,            
         "nap_ideal_normal": 40,          
@@ -269,7 +281,15 @@ GLOBAL_DEFAULT_CONFIG = {
         "epoc_abs_s_k": 0.05,                   
         "momentum_beta": 0.40,                  
         "concurrent_log_base": 0.3,             
-        "energy_exhaustion_threshold": 20.0     
+        "energy_exhaustion_threshold": 20.0,   
+
+        "buffer_decay_rate": 0.05,           
+        "basal_drain_rate": 0.415,           
+        "lorentzian_floor_E": 15.0,          
+        
+        "momentum_beta": 0.40,                  
+        "concurrent_log_base": 0.3,             
+        "energy_exhaustion_threshold": 20.0
     },
 
     # ==========================================
@@ -321,11 +341,11 @@ GLOBAL_DEFAULT_CONFIG = {
     # 21. 动态区制乘数边界 (Dynamic Regime Modifiers)
     # ==========================================
     "markov_modifiers": {
-        "friction_s_base": 1.20,         
-        "friction_s_max": 1.35,          
+        "friction_s_base": 1.10,         
+        "friction_s_max": 1.25,          
         "friction_e_base": 1.15,         
-        "flow_s_base": 0.75,             
-        "flow_s_min": 0.65,              
+        "flow_s_base": 0.90,             
+        "flow_s_min": 0.75,              
         "flow_e_base": 0.85              
     }
 }

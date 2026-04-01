@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, Optional
 from event.base import BaseEvent
-from utils.description_score import score_description
+from utils.description_score import score_description, convert_score_to_Flike
 
 from entry.class_info_data import CLASS_INFO_DICT
 class_info_dict = CLASS_INFO_DICT
@@ -53,7 +53,9 @@ class CourseEvent(BaseEvent):
         norm_credit = min(1.0, self.credit / 5.0)
         norm_hours = min(1.0, self.hours / 120.0)
         
-        raw_score, desc_score, F_like = score_description(self.name, self.description)
+        score = score_description(self.description, self.name)
+        F_like = convert_score_to_Flike(score)
+        
         self.metadata["F_like"] = F_like
         
         CIS = w1 * norm_credit + w2 * norm_hours + w3 * L_i

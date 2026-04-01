@@ -40,14 +40,6 @@ class RestStrategy(BaseStrategy):
     def get_inertia_energy_rate(self) -> float:
         return -0.05
 
-    def _get_alpha(self, duration: float) -> float:
-        if duration <= 40.0:
-            return 1.0
-        elif duration <= 120.0:
-            return math.exp(-(duration - 40.0) / 40.0)
-        else:
-            return 0.05
-
     def _get_noise_std(self, diff: float, E: float) -> float:
         """基类默认噪声标准差"""
         return 0.15
@@ -72,69 +64,63 @@ class RestStrategy(BaseStrategy):
 
     def calculate_flow_recovery(self, S: float, E: float, duration: float, 
                               time_step: int, S_star: float) -> Tuple[float, float]:
+        """
+        [全面重构] 双轨阻尼-匮乏驱动恢复模型
+        S与E彻底解耦。E的恢复采用基于真空吸力与交感抑制的常微分方程(ODE)。
+        基底流失(Basal Drain)已移交 Simulator 全局处理，此处仅输出净恢复量。
+        """
         K_resilience = self.params.get("K_resilience", 1.0)
         efficiency = self.get_efficiency()
         
         diff = max(0, S - S_star)
-        
         noise_std = self._get_noise_std(diff, E)
         rho = self.params.get("rest_noise_rho", 0.75) 
-        
-        inertia_end, cooldown_end = self.get_phase_thresholds()
 
-        if duration <= inertia_end:
-            noise = self._get_ar1_noise(rho, noise_std)
-            delta_S = 0.0 + noise * 0.5
-            delta_E = self.get_inertia_energy_rate() * (time_step / 5.0)
-            return delta_S, delta_E
-
-        if duration <= cooldown_end:
-            noise = self._get_ar1_noise(rho, noise_std)
-            delta_S = -0.04 * (time_step / 5.0) + noise * 0.8
-            delta_E = 0.0
-            return delta_S, delta_E
-
-        # 核心恢复期
-        if E < 30.0:
-            e_bonus = 0.90  
-        elif E <= 70.0:
-            e_bonus = 1.00  
-        else:
-            e_bonus = 1.0 + ((E - 70.0) / 10.0) * 0.05
-            e_bonus = min(e_bonus, 1.15)
-        
-        Z = self.params.get("Z_factor", 0.5)
-        Z_mult = 0.8 + 0.4 * Z 
-
+        # ==========================================
+        # 1. 压力动力学 (Stress Dynamics) - 保持原有优良的缓降策略
+        # ==========================================
         if diff > 2.0:
-            # 远离平衡点：执行具体的策略动力学下降
+            # 远离平衡点：执行具体的子类策略动力学下降
             base_delta_S = self._calculate_dynamics(S, S_star, duration, time_step)
             noise = self._get_ar1_noise(rho, noise_std)
-            final_delta_S = base_delta_S * Z_mult * e_bonus + noise
+            Z = self.params.get("Z_factor", 0.5)
+            Z_mult = 0.8 + 0.4 * Z 
+            final_delta_S = base_delta_S * Z_mult + noise
         else:
-            # [统一稳态波动机制] 逼近平衡点：接管为自然游走，弹簧引力 + AR(1)噪声
-            pull_coeff = self.params.get("rest_pull_coeff", 0.04) # 日间引力适中
+            # 逼近平衡点：接管为自然游走，弹簧引力 + AR(1)噪声
+            pull_coeff = self.params.get("rest_pull_coeff", 0.04)
             final_delta_S = self._simulate_homeostasis_fluctuation(S, S_star, pull_coeff, rho, noise_std * 0.8)
 
-        # 防穿透
+        # 防穿透机制：不允许压力单步跌穿稳态基线过多
         if S + final_delta_S < S_star - 5.0:
             final_delta_S = (S_star - 5.0) - S 
 
-        # --- 以下精力计算部分保持不变 ---
-        if E < 20.0 or efficiency <= 0.0:
-            conversion_rate = 0.0
-        else:
-            conversion_rate = 0.75 * K_resilience * efficiency * self._get_alpha(duration)
-            
-        stress_drop = abs(min(0, final_delta_S)) if diff > 0 else 0.0
-        delta_E_conversion = stress_drop * conversion_rate
+        # ==========================================
+        # 2. 认知精力恢复动力学 (Energy Recovery ODE)
+        # ==========================================
+        ode_cfg = self.params.get("rest_ode_params", {})
         
-        delta_E_metabolism = 1.25 * efficiency * (time_step / 5.0) * self._get_alpha(duration)
-        delta_E = delta_E_conversion + delta_E_metabolism
-
-        if duration > 120.0:
-            delta_E -= 0.015 * (time_step / 5.0)
-            
+        # 动态读取超参数，保留默认值作为安全兜底
+        R_max = ode_cfg.get("R_max_base", 6.06) * (time_step / 5.0)  
+        gamma = ode_cfg.get("deficit_gamma", 2.0)                       
+        alpha_inhibit = ode_cfg.get("sympathetic_inhibit_alpha", 0.08)              
+        noise_std = ode_cfg.get("energy_noise_std", 0.05)
+        
+        # A. 真空吸力项 (Deficit Drive)
+        deficit_ratio = max(0.0, min(100.0, 100.0 - E)) / 100.0
+        vacuum_pull = math.pow(deficit_ratio, gamma)
+        
+        # B. 交感高压阻尼项 (Stress Inhibition)
+        inhibition = math.exp(-alpha_inhibit * diff)
+        
+        # C. 基础热力学微噪
+        e_noise = self.rng.normal(0, noise_std)
+        
+        # 核心恢复方程
+        delta_E = R_max * vacuum_pull * inhibition * efficiency * K_resilience + e_noise
+        
+        delta_E = max(0.0, delta_E)
+        
         return final_delta_S, delta_E
 
     @staticmethod
@@ -176,18 +162,18 @@ class RelievedRestStrategy(RestStrategy):
     def _calculate_dynamics(self, S: float, S_star: float, duration: float, time_step: int) -> float:
         diff = max(0, S - S_star)
         
-        time_decay = 0.4 + 0.6 * math.exp(-duration / 30.0)
+        time_decay = 0.15 + 0.85 * math.exp(-duration / 45.0)
         
-        base_speed = 0.015 + 0.035 * math.pow(diff, 0.8)
+        base_speed = 0.01 + 0.025 * math.pow(diff, 1.15)
         
         raw_speed = base_speed * time_decay
         
         if diff < 5.0:
             raw_speed *= (0.2 + 0.8 * (diff / 3.0))
             
-        max_speed = 0.6
+        max_speed = 1.2
         if raw_speed > max_speed:
-            raw_speed = max_speed + 0.2 * math.log1p(raw_speed - max_speed)
+            raw_speed = max_speed + 0.3 * math.log1p(raw_speed - max_speed)
             
         return -raw_speed * (time_step / 5.0)
 
@@ -220,15 +206,15 @@ class WarmupRestStrategy(RestStrategy):
         time_multiplier = 0.15 + 0.85 * (time_ratio ** 3.5)
         
         if diff > 5.0:
-            base_speed = 0.028 + 0.015 * diff
+            base_speed = 0.02 + 0.018 * math.pow(diff, 1.1)
         else:
             base_speed = 0.006 + 0.018 * diff
             
         raw_speed = base_speed * time_multiplier
         
-        max_speed = 0.8
+        max_speed = 1.2
         if raw_speed > max_speed:
-            raw_speed = max_speed + 0.2 * math.log1p(raw_speed - max_speed)
+            raw_speed = max_speed + 0.3 * math.log1p(raw_speed - max_speed)
             
         return -raw_speed * (time_step / 5.0)
 
@@ -263,11 +249,15 @@ class AnxiousRestStrategy(RestStrategy):
         effective_diff = max(0.0, diff - 5.0)
 
         if effective_diff > 5.0:
-            base_speed = 0.012 + 0.006 * effective_diff
+            base_speed = 0.01 + 0.015 * math.pow(effective_diff, 1.05)
         else:
-            base_speed = 0.005 + 0.005 * effective_diff
+            base_speed = 0.005 + 0.008 * effective_diff
             
         raw_speed = base_speed * relaxation
+        
+        if raw_speed > 1.0:
+            raw_speed = 1.0 + 0.2 * math.log1p(raw_speed - 1.0)
+            
         return -raw_speed * (time_step / 5.0)
 
 
@@ -306,6 +296,7 @@ class BurnoutRestStrategy(RestStrategy):
                                time_step: int, S_star: float) -> Tuple[float, float]:
         ds, de = super().calculate_flow_recovery(S, E, duration, time_step, S_star)
         if duration > 60.0:
+            # 倦怠特权：久坐之后开始附带微弱的新陈代谢惩罚
             clamped_dissipation = min(0.01 * math.exp((duration - 60.0) / 120.0), 0.05)
             de -= clamped_dissipation * (time_step / 5.0)
         return ds, de

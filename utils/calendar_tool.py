@@ -66,7 +66,6 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
 
     final_date = None
     
-    # === 核心修复逻辑 ===
     if query_date_str:
         try:
             q_date = datetime.strptime(query_date_str, "%Y-%m-%d")
@@ -74,22 +73,14 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
             if start_timestamp:
                 orig_dt = datetime.fromtimestamp(start_timestamp)
                 
-                # [关键校验] 检查“原始事件”和“查询日期”是否为同一个星期几
-                # weekday(): 0=周一, 6=周日
                 if orig_dt.weekday() != q_date.weekday():
-                    # 如果星期几对不上，说明这是飞书返回的该系列的其他母事件，必须丢弃
-                    # 例如：查周一，API返回了周三的母事件，这里必须过滤掉
                     return None
                 
-                # 如果星期几对上了，说明这是当天的课（或者是该系列的第一节课且恰好也是周几）
-                # 我们信任 API 的返回（因为我们请求了 date_range），进行强制日期校准
                 final_date = query_date_str
                 
-                # 校准开始时间戳
                 new_start_dt = q_date.replace(hour=orig_dt.hour, minute=orig_dt.minute, second=orig_dt.second)
                 start_timestamp = int(new_start_dt.timestamp())
                 
-                # 校准结束时间戳
                 if end_timestamp:
                     orig_end_dt = datetime.fromtimestamp(end_timestamp)
                     days_diff = (orig_end_dt.date() - orig_dt.date()).days
@@ -103,7 +94,6 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
             print(f"  ⚠️ 日期校准出错: {e}")
             
     elif date_range:
-        # 范围查询逻辑暂保持原样
         if start_timestamp:
             final_date = datetime.fromtimestamp(start_timestamp).strftime("%Y-%m-%d")
 
@@ -121,19 +111,15 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
     }
 
 def save_events_to_json(events, filename=None, by_date=True):
+    """ [无状态模式] 仅做控制台记录，不再向本地写入任何 JSON 文件 """
+    if not events:
+        return []
+        
     if not by_date:
-        if filename is None:
-            filename = f"calendar_{datetime.now().strftime('%Y%m%d')}.json"
-        output_dir = "calendar_data"
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, filename)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(events, f, ensure_ascii=False, indent=2)
-        print(f"\n✅ 已保存 {len(events)} 条事件 → {filepath}")
-        return filepath
+        print(f"\n✅ [无状态模式] 内存中已就绪 {len(events)} 条事件 (未落盘)")
+        return ["memory_only"]
     else:
         events_by_date = {}
-        saved_files = []
         for event in events:
             date_s = event.get('date')
             if date_s:
@@ -141,15 +127,8 @@ def save_events_to_json(events, filename=None, by_date=True):
                 events_by_date[date_s].append(event)
         
         for d_str, evs in events_by_date.items():
-            fname = f"calendar_{d_str.replace('-', '')}.json"
-            out_dir = os.path.join("data", "calendar_data") 
-            os.makedirs(out_dir, exist_ok=True)
-            fpath = os.path.join(out_dir, fname)
-            with open(fpath, 'w', encoding='utf-8') as f:
-                json.dump(evs, f, ensure_ascii=False, indent=2)
-            print(f"\n✅ 已保存 {len(evs)} 条 {d_str} 的事件 → {fpath}")
-            saved_files.append(fpath)
-        return saved_files
+            print(f"\n✅ [无状态模式] {d_str} 的 {len(evs)} 条事件已在内存就绪 (未落盘)")
+        return ["memory_only"]
 
 def display_results(events: List[Dict[str, Any]], date_str: Optional[str] = None, date_range: Optional[tuple] = None) -> None:
     print("\n===========================================")
@@ -190,7 +169,6 @@ def get_events_in_date_range(client, token, cal_id, start, end, start_h=8, end_h
         print(f"   收到 {len(resp.data.items)} 个原始事件")
         for item in resp.data.items:
             ev_dict = json.loads(lark.JSON.marshal(item))
-            # 关键修改：单日查询时，query_date_str 设为具体日期，触发 extract_event_data 里的日期对齐逻辑
             q_date = s_str if s_str == e_str else None
             extracted = extract_event_data(ev_dict, query_date_str=q_date, date_range=(s_str, e_str))
             if extracted:

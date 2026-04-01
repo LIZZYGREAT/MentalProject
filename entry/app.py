@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from entity.user import User
 from utils.event_factory import EventFactory
 from utils.get_token import FeishuAPI, get_user_access_token 
-from utils.calendar_tool import get_events_in_date_range
 from visualization.plotter import get_plot_image_base64
 from data_pipeline.orchestrator import inject_routine_events, process_date
 
@@ -23,7 +22,6 @@ static_dir = os.path.join(project_root, 'static')
 
 app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
 current_user = User(user_id="default")
-STRESS_RECORD_FILE = os.path.join("data", "stress_records.json")
 
 @app.route('/')
 def index():
@@ -77,7 +75,7 @@ def handle_config():
         )
         current_user.update_params(new_params)
         current_user.save_config()
-        return jsonify({"status": "success", "message": "配置已更新"})
+        return jsonify({"status": "success", "message": "配置已更新(仅内存生效)"})
 
 @app.route('/api/simulate', methods=['POST'])
 def simulate():
@@ -92,24 +90,21 @@ def simulate():
         current_user.update_params(god_params)
 
     events_json = []
-    file_date_str = date_str.replace('-', '')
-    local_file = os.path.join("data", "calendar_data", f"calendar_{file_date_str}.json")
     
-    if os.path.exists(local_file) and not data.get("force_refresh", False):
-        with open(local_file, 'r', encoding='utf-8') as f:
-            events_json = json.load(f)
-    else:
-        try:
-            from utils.get_token import get_user_access_token
-            from feishu_config import FEISHU_CALENDAR_ID
-            token_info = get_user_access_token(interactive=False)
-            if token_info:
-                client = lark.Client.builder().enable_set_token(True).build()
-                events_json = get_events_in_date_range(
-                    client, token_info["access_token"], FEISHU_CALENDAR_ID, date_str, date_str
-                )
-        except Exception as e:
-            print(f"获取日程失败: {e}")
+    force_refresh = data.get("force_refresh", False)
+    
+    try:
+        from data_pipeline.fetcher import fetch_events_with_timeout
+        from feishu_config import FEISHU_CALENDAR_ID
+        
+        events_json = fetch_events_with_timeout(
+            date_str=date_str, 
+            injected_calendar_id=FEISHU_CALENDAR_ID,
+            timeout=5.0,
+            force_refresh=force_refresh
+        )
+    except Exception as e:
+        print(f"获取飞书日程失败，将回退到纯沙盒事件池: {e}")
 
     app_trace_logs = []
 
@@ -200,22 +195,10 @@ def simulate():
     init_S = data.get("init_S")
     init_E = data.get("init_E")
     
+    # 如果前端没有显式传递 S 和 E，强制回归健康基准线
     if init_S is None or init_E is None:
-        init_S, init_E = 50.0, 100.0
-        history_records = {}
-        if os.path.exists(STRESS_RECORD_FILE):
-            try:
-                with open(STRESS_RECORD_FILE, 'r', encoding='utf-8') as f:
-                    history_records = json.load(f)
-            except: pass
-        try:
-            current_dt = datetime.strptime(date_str, "%Y-%m-%d")
-            prev_date_str = (current_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-            if prev_date_str in history_records:
-                prev_record = history_records[prev_date_str]
-                init_S = prev_record.get("end_S", 50.0)
-                init_E = prev_record.get("end_E", 100.0)
-        except Exception: pass
+        init_S = current_user.get_current_S_star()
+        init_E = 100.0
     else:
         init_S, init_E = float(init_S), float(init_E)
 
@@ -234,25 +217,6 @@ def simulate():
     new_S_star = current_user.get_current_S_star()
     new_threshold = current_user.get_current_threshold()
     
-    history_records = {}
-    if os.path.exists(STRESS_RECORD_FILE):
-        try:
-            with open(STRESS_RECORD_FILE, 'r', encoding='utf-8') as f:
-                history_records = json.load(f)
-        except: pass
-        
-    history_records[date_str] = {
-        "end_S": end_S,
-        "end_E": end_E,
-        "S_star": new_S_star,
-        "S_threshold": new_threshold,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    try:
-        os.makedirs("data", exist_ok=True)
-        with open(STRESS_RECORD_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history_records, f, indent=2)
-    except: pass
 
     img_base64 = get_plot_image_base64(
         results, confidence_series, alerts, 
@@ -291,6 +255,6 @@ def token_status():
         return jsonify({"valid": False})
 
 if __name__ == '__main__':
-    print("🚀 压力建模沙盒 Web 服务 已启动...")
-    print("🔗 访问地址: http://localhost:5000")
+    print("压力建模沙盒 Web 服务 已启动...")
+    print("访问地址: http://localhost:5000")
     app.run(debug=True, port=5000)

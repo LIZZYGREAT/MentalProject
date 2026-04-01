@@ -59,30 +59,60 @@ class MealEvent(BaseEvent):
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
                                    current_time: datetime, time_step: int) -> Tuple[float, float]:
         S_star = user.get_param("S_star_init", 50.0)
-        idle_dur = self.metadata.get("idle_duration", 0.0)
         meal_cfg = user.get_param("event_meal", {})
+        piecewise_cfg = user.get_param("recovery_piecewise_params", {})
         
-        inertia_end, cooldown_end = user.rest_strategy.get_phase_thresholds()
-        accel = meal_cfg.get("duration_accel", 1.5)
-        effective_duration = cooldown_end + (idle_dur * accel)
-        
-        base_ds, base_de = user.rest_strategy.calculate_flow_recovery(
-            current_stress, current_energy, effective_duration, time_step, S_star
-        )
+        # 1. 计算事件总时长
+        try:
+            if isinstance(self.start_time, str):
+                st_h, st_m = map(int, self.start_time[-5:].split(':'))
+                et_h, et_m = map(int, self.end_time[-5:].split(':'))
+                total_mins = (et_h * 60 + et_m) - (st_h * 60 + st_m)
+                if total_mins < 0: total_mins += 24 * 60
+            else:
+                total_mins = (self.end_time - self.start_time).total_seconds() / 60.0
+        except Exception:
+            total_mins = 30.0
+        total_mins = max(5.0, float(total_mins))
 
+        # 2. 状态读取与分段查表
         diff = max(0.0, current_stress - S_star)
+        thresholds = piecewise_cfg.get("thresholds", [15.0, 35.0])
+        alphas = piecewise_cfg.get("absorption_rates", [1.0, 0.9, 0.6])
+        betas = piecewise_cfg.get("relief_multipliers", [1.0, 1.3, 0.6])
+        
+        if diff <= thresholds[0]:
+            alpha_x, beta_x = alphas[0], betas[0]
+        elif diff <= thresholds[1]:
+            alpha_x, beta_x = alphas[1], betas[1]
+        else:
+            alpha_x, beta_x = alphas[2], betas[2]
 
-        C_base = meal_cfg.get("C_base", 0.04)
-        K = meal_cfg.get("K", 5.0)
-        guaranteed_drop = -C_base * (diff / (diff + K))
-
+        # 3. 精力缓冲池匀速注入
+        if "晚" in self.name:
+            total_E_recover = user.get_param("meal_dinner_recover", 15.0)
+        else:
+            total_E_recover = user.get_param("meal_lunch_recover", 12.0)
+            
         mult_normal = meal_cfg.get("multiplier_normal", 1.15)
         mult_late = meal_cfg.get("multiplier_late", 0.85)
         meal_multiplier = mult_normal if self.meal_type in ["normal", "early"] else mult_late
+        
+        delta_E = total_E_recover * meal_multiplier * alpha_x * (time_step / total_mins)
 
-        delta_S = (base_ds + guaranteed_drop) * meal_multiplier
-        delta_E = base_de * meal_multiplier
+        # 4. [新增核心机制] 时间阻尼曲线 (Time-Decay Curve)
+        idle_dur = self.metadata.get("idle_duration", 0.0)
+        time_ratio = min(1.0, idle_dur / total_mins)
+        accel = meal_cfg.get("duration_accel", 1.2)
+        # 算法：让速率从 (1.0 + accel*0.5) 线性滑落至 (1.0 - accel*0.5)，中心点保持 1.0 的期望输出
+        time_curve = max(0.2, 1.0 + accel * (0.5 - time_ratio))
 
+        # 5. 压力流体下降 (米氏底座 * 分段乘数 * 时间衰减曲线)
+        C_base = meal_cfg.get("C_base", 1.2)
+        K = meal_cfg.get("K", 10.0)
+        delta_S = -C_base * (diff / (diff + K)) * meal_multiplier * beta_x * time_curve * (time_step / 5.0)
+
+        # 6. EPOC 注入
         epoc_inj = meal_cfg.get("epoc_injection", 0.5)
         epoc_max = meal_cfg.get("epoc_max", 20.0)
         epoc_step = epoc_inj * (time_step / 5.0)
@@ -111,38 +141,66 @@ class NapEvent(BaseEvent):
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
                                    current_time: datetime, time_step: int) -> Tuple[float, float]:
         S_star = user.get_param("S_star_init", 50.0)
-        idle_dur = self.metadata.get("idle_duration", 0.0)
         nap_cfg = user.get_param("event_nap", {})
+        piecewise_cfg = user.get_param("recovery_piecewise_params", {})
         
-        inertia_end, cooldown_end = user.rest_strategy.get_phase_thresholds()
-        accel = nap_cfg.get("duration_accel", 2.0)
-        effective_duration = cooldown_end + (idle_dur * accel)
-        
-        base_ds, base_de = user.rest_strategy.calculate_flow_recovery(
-            current_stress, current_energy, effective_duration, time_step, S_star
-        )
+        # 1. 计算事件总时长
+        try:
+            if isinstance(self.start_time, str):
+                st_h, st_m = map(int, self.start_time[-5:].split(':'))
+                et_h, et_m = map(int, self.end_time[-5:].split(':'))
+                total_mins = (et_h * 60 + et_m) - (st_h * 60 + st_m)
+                if total_mins < 0: total_mins += 24 * 60
+            else:
+                total_mins = (self.end_time - self.start_time).total_seconds() / 60.0
+        except Exception:
+            total_mins = 30.0
+        total_mins = max(5.0, float(total_mins))
 
+        # 2. 状态读取与分段查表
         diff = max(0.0, current_stress - S_star)
-
-        C_base = nap_cfg.get("C_base", 0.08)
-        K = nap_cfg.get("K", 5.0)
-        guaranteed_drop = -C_base * (diff / (diff + K))
-
-        mult_proper = nap_cfg.get("multiplier_proper", 1.4)
-        mult_short = nap_cfg.get("multiplier_short", 1.1)
-        nap_multiplier = mult_proper if self.nap_type == "proper" else mult_short
-
-        delta_S = (base_ds + guaranteed_drop) * nap_multiplier
-        delta_E = base_de * nap_multiplier
+        thresholds = piecewise_cfg.get("thresholds", [15.0, 35.0])
+        alphas = piecewise_cfg.get("absorption_rates", [1.0, 0.9, 0.6])
+        betas = piecewise_cfg.get("relief_multipliers", [1.0, 1.3, 0.6])
         
+        if diff <= thresholds[0]:
+            alpha_x, beta_x = alphas[0], betas[0]
+        elif diff <= thresholds[1]:
+            alpha_x, beta_x = alphas[1], betas[1]
+        else:
+            alpha_x, beta_x = alphas[2], betas[2]
+
+        # 3. 精力缓冲池匀速注入
+        if self.nap_type == "proper":
+            total_E_recover = user.get_param("nap_proper_recover", 20.0)
+        else:
+            total_E_recover = user.get_param("nap_short_recover", 12.0)
+
+        delta_E = total_E_recover * alpha_x * (time_step / total_mins)
+
         is_repaying = self.metadata.get("is_repaying_debt", False)
+        debt_mult = nap_cfg.get("debt_multiplier", 1.2)
         if is_repaying and user.get_sleep_debt() > 0:
             debt_k = nap_cfg.get("debt_reduce_k", 2.0)
-            debt_mult = nap_cfg.get("debt_multiplier", 1.2)
             user.reduce_sleep_debt((time_step / 60.0) * debt_k)
-            delta_S *= debt_mult
-            delta_E *= debt_mult
+            delta_E *= debt_mult  
 
+        # 4. [新增核心机制] 时间阻尼曲线 (Time-Decay Curve)
+        idle_dur = self.metadata.get("idle_duration", 0.0)
+        time_ratio = min(1.0, idle_dur / total_mins)
+        accel = nap_cfg.get("duration_accel", 1.5)
+        # 午休比吃饭的落差感更大，前期降压极为迅速
+        time_curve = max(0.2, 1.0 + accel * (0.5 - time_ratio))
+
+        # 5. 压力流体下降 (米氏底座 * 分段乘数 * 时间衰减曲线)
+        C_base = nap_cfg.get("C_base", 2.0)
+        K = nap_cfg.get("K", 10.0)
+        delta_S = -C_base * (diff / (diff + K)) * beta_x * time_curve * (time_step / 5.0)
+        
+        if is_repaying and user.get_sleep_debt() > 0:
+            delta_S *= debt_mult
+
+        # 6. EPOC 注入
         epoc_inj = nap_cfg.get("epoc_injection", 1.0)
         epoc_max = nap_cfg.get("epoc_max", 30.0)
         epoc_step = epoc_inj * (time_step / 5.0)

@@ -20,8 +20,10 @@ class User:
     def __init__(self, user_id: str = "default", params: Optional[Dict[str, Any]] = None, load_from_file: bool = True):
         self.user_id = user_id
         
+        # 强制深拷贝 config.py 作为唯一真理来源
         self.params = copy.deepcopy(GLOBAL_DEFAULT_CONFIG)
         
+        # 即使 load_from_file 为 True，内部已被阻断，确保无状态
         if load_from_file:
             saved_params = self._load_config()
             if saved_params:
@@ -233,25 +235,12 @@ class User:
         return out
     
     def save_config(self):
-        config_file = self.get_config_file_path()
-        try:
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(self._params_to_json_safe(self.params), f, ensure_ascii=False, indent=2)
-            print(f"✅ 用户配置已保存到: {config_file}")
-        except OSError as e:
-            print(f"⚠️ 云环境警告：无法写入本地文件，已跳过持久化保存 ({str(e)})")
-        except Exception as e:
-            print(f"❌ 保存用户配置失败: {str(e)}")
+        """ [沙盒模式] 已阻断所有本地文件落盘操作，修改仅存于内存 """
+        print(f"✅ [无状态模式] 用户配置修改已在内存中生效，不会写入本地文件。")
     
     def _load_config(self) -> Optional[Dict[str, Any]]:
-        config_file = self.get_config_file_path()
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                return self._params_from_json_safe(data)
-            except Exception as e:
-                print(f"⚠️ 加载用户配置失败: {str(e)}")
+        """ [沙盒模式] 强制阻断本地读取，确保严格从 config.py 初始化 """
+        print(f"ℹ️ [无状态模式] 忽略本地持久化配置加载，严格使用 config.py 基准。")
         return None
     
     def get_f_strategy(self) -> str:
@@ -277,7 +266,7 @@ class User:
             time_prefs.remove(preference)
         self.params["time_preferences"] = time_prefs
         self._init_strategies()
-        self.save_config()  # 强制落盘
+        self.save_config()  
     
     def update_strategy_config(self, f_strategy: str = None, C_strategy: str = None,
                               night_strategy: str = None, rest_strategy: str = None,
@@ -295,7 +284,7 @@ class User:
         self._init_strategies()
         if self.solver:
             self.solver.update_user(self)
-        self.save_config()  # 强制落盘，彻底解决幽灵状态
+        self.save_config()  
     
     def print_config(self):
         print("\n当前用户配置:")
