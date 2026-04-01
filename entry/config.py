@@ -102,12 +102,12 @@ GLOBAL_DEFAULT_CONFIG = {
     "nap_proper_recover": 20,    
     
     # ==========================================
-    # 9. 连续负荷惩罚策略参数 (C_Strategy) 
+    # 9. 连续负荷惩罚策略参数 (C_Strategy) - 权重已放大，在长任务中接管主导
     # ==========================================
     "c_strategy_params": {
-        "high": {"threshold": 2.5, "rec_rate": 1.1, "k": 0.0005, "max_penalty": 0.0025, "exp": 1.5},
-        "threshold": {"threshold": 3.0, "rec_rate": 1.2, "k": 0.0012, "max_penalty": 0.0020, "exp_k": -1.5},
-        "low": {"threshold": 3.25, "rec_rate": 1.6, "k": 0.00025, "max_penalty": 0.0016}
+        "high": {"threshold": 2.5, "rec_rate": 1.1, "k": 0.005, "max_penalty": 0.025, "exp": 1.5},
+        "threshold": {"threshold": 3.0, "rec_rate": 1.2, "k": 0.012, "max_penalty": 0.020, "exp_k": -1.5},
+        "low": {"threshold": 3.25, "rec_rate": 1.6, "k": 0.0025, "max_penalty": 0.016}
     },
 
     # ==========================================
@@ -213,22 +213,23 @@ GLOBAL_DEFAULT_CONFIG = {
         "like_evening": {"(18,20)": 0.9, "(20,24)": 0.9},
         "dislike_evening": {"(18,20)": 1.05, "(20,24)": 1.10}
     },
+    
     # ==========================================
-    # 15. 预警监控生态阈值 (Alert Thresholds) - 完整双轨引擎版
+    # 15. 预警监控生态阈值 (Alert Thresholds) 
     # ==========================================
     "alert_thresholds": {
-        "auc_limit": 100.0,              # 疲劳积分理论上限
-        "critical_buffer_ratio": 0.35,   # 红警：瞬间击穿缓冲带的比例
-        "warning_buffer_ratio": 0.20,    # 黄警：逼近警戒带的比例
-        "auc_orange": 80.0,              # 橙警：疲劳积分绝对高危线
-        "auc_yellow": 50.0,              # 黄警：疲劳积分警戒线
-        "E_danger": 25.0,                # 残血判定线 (低精力易触发橙警)
-        "auc_increase_step": 1.5,        # 持续高压时的单步积分增量
-        "auc_decay_step": 2.5            # 脱离高压后的单步积分衰减
+        "auc_limit": 100.0,              
+        "critical_buffer_ratio": 0.35,   
+        "warning_buffer_ratio": 0.20,    
+        "auc_orange": 80.0,              
+        "auc_yellow": 50.0,              
+        "E_danger": 25.0,                
+        "auc_increase_step": 1.5,        
+        "auc_decay_step": 2.5            
     },
 
     # ==========================================
-    # 16. 智能日程编织参数 (Routine Weaver Priors) - 完整时空切片版
+    # 16. 智能日程编织参数 (Routine Weaver Priors) 
     # ==========================================
     "routine_weaver": {
         "max_delay_wake_time": "11:00",  
@@ -248,5 +249,83 @@ GLOBAL_DEFAULT_CONFIG = {
         "nap_min_normal": 15,            
         "nap_delay_after_lunch": 10,     
         "nap_window_end": "13:50"        
+    },
+
+    # ==========================================
+    # 17. 引擎微观化学动力学与滤波器常数 (Micro-Dynamics & Chemical Pools)
+    # ==========================================
+    "simulator_micro_params": {
+        "wandering_cooldown_base": 40,          
+        "wandering_cooldown_var": (-10, 15),    
+        "epiphany_refund_ratio": 0.8,           
+        "epiphany_refund_max": 8.0,             
+        "epiphany_base_bonus": 2.0,             
+        "epiphany_resilience_k": 1.5,           
+        "dopamine_leak_rate": 0.15,             
+        "epoc_absorption_rate": 1.5,            
+        "epoc_abs_e_base": 0.6,                 
+        "epoc_abs_e_k": 0.2,                    
+        "epoc_abs_s_base": 0.08,                
+        "epoc_abs_s_k": 0.05,                   
+        "momentum_beta": 0.40,                  
+        "concurrent_log_base": 0.3,             
+        "energy_exhaustion_threshold": 20.0     
+    },
+
+    # ==========================================
+    # 18. 宏观双轨生态演化常数 (Macro Ecological Evolution)
+    # ==========================================
+    "evolution_params": {
+        "alpha_star": 0.015,                    
+        "threshold_wear_malignant": 0.25,       
+        "threshold_growth_benign": 0.10,        
+        "threshold_rust_comfort": 0.05,         
+        "benign_challenge_gap": 10.0,           
+        "malignant_debt_limit": 1.5             
+    },
+    
+    # ==========================================
+    # 19. 任务刺激习惯化参数 (Stimulus Habituation)
+    # ==========================================
+    "habituation_params": {
+        "decay_model": "hyperbolic",  
+        "floor_mu_course": 0.40,       
+        "floor_mu_task": 0.35,         
+        "t_half_hyperbolic": 90.0      
+    },
+
+    # ==========================================
+    # 20. 半马尔可夫情绪状态机与势能参数 (Semi-Markov Dynamics)
+    # ==========================================
+    "markov_semi_params": {
+        "regime_check_interval": 25,     
+        "w_fatigue": 0.15,               
+        "w_debt": 0.30,                  
+        "w_intensity": 0.50,             
+        "w_resilience": 0.40,            
+        "shield_library": 0.20,          
+        "shield_gym": 0.50,              
+        "shield_rest": 0.30,             
+        "k_shape": 1.5,                  
+        "lambda_base_flow": 0.02,        
+        "lambda_base_friction": 0.015,   
+        "lambda_base_normal": 0.01,      
+        "gamma_flow": 2.0,               
+        "gamma_friction": 1.5,           
+        "gamma_normal": 1.2,             
+        "kappa_logit": 3.0,              
+        "poisson_anomaly_prob": 0.01     
+    },
+
+    # ==========================================
+    # 21. 动态区制乘数边界 (Dynamic Regime Modifiers)
+    # ==========================================
+    "markov_modifiers": {
+        "friction_s_base": 1.20,         
+        "friction_s_max": 1.35,          
+        "friction_e_base": 1.15,         
+        "flow_s_base": 0.75,             
+        "flow_s_min": 0.65,              
+        "flow_e_base": 0.85              
     }
 }

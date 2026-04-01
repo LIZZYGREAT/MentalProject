@@ -79,25 +79,30 @@ class User:
         old_threshold = self.get_current_threshold()
         sleep_debt = self.get_sleep_debt()
         
+        evo_cfg = self.params.get("evolution_params", {})
+        
         # === 轨线一：S* 静息底线漂移 (基于清晨唤醒状态) ===
-        alpha_star = 0.015
+        alpha_star = evo_cfg.get("alpha_star", 0.015)
         new_s_star = old_s_star + alpha_star * (wake_s - old_s_star)
         new_s_star = max(40.0, min(70.0, new_s_star))
         
         # === 轨线二：Threshold 破防天花板磨损 (基于全天挑战) ===
         new_threshold = old_threshold
         
-        if has_red_alert or sleep_debt > 1.5:
+        debt_limit = evo_cfg.get("malignant_debt_limit", 1.5)
+        challenge_gap = evo_cfg.get("benign_challenge_gap", 10.0)
+        
+        if has_red_alert or sleep_debt > debt_limit:
             # 恶性磨损：防线击穿或高睡眠债反噬
-            new_threshold -= 0.25
+            new_threshold -= evo_cfg.get("threshold_wear_malignant", 0.25)
             print(f"💔 [生态演化] 恶性磨损：触发红警或睡眠债过高({sleep_debt:.1f}h)，抗压天花板下降")
-        elif daily_mean_stress > old_s_star + 10.0:
+        elif daily_mean_stress > old_s_star + challenge_gap:
             # 良性锻炼：走出舒适区且安全度过
-            new_threshold += 0.10
+            new_threshold += evo_cfg.get("threshold_growth_benign", 0.10)
             print(f"💪 [生态演化] 良性锻炼：抗住高压挑战(日均S={daily_mean_stress:.1f})，抗压天花板抬升")
         else:
             # 舒适区退化：缺乏压力刺激
-            new_threshold -= 0.05
+            new_threshold -= evo_cfg.get("threshold_rust_comfort", 0.05)
             print(f"🛋️ [生态演化] 舒适区生锈：缺乏压力刺激(日均S={daily_mean_stress:.1f})，天花板轻微下降")
             
         new_threshold = max(new_s_star + 20.0, min(110.0, new_threshold))

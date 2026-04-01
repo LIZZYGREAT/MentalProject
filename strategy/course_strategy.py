@@ -31,6 +31,7 @@ class StressFunctionStrategy:
         return amplifier
 
     def get_energy_drain_modifier(self, E: float) -> float:
+        """非稳态负荷耗精加速器 (Allostatic Energy Drain)"""
         E_r = max(0.0, min(100.0, E)) / 100.0
         alpha = self.params.get("allostatic_cost_alpha", 2.0)
         beta = self.params.get("allostatic_cost_beta", 4.0)
@@ -168,7 +169,8 @@ class ContinuousPenaltyStrategy:
 class HighPenalty(ContinuousPenaltyStrategy):
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(params)
-        self.cfg = self.cfg_group.get("high", {"threshold": 2.5, "rec_rate": 1.1, "k": 0.0005, "max_penalty": 0.0025, "exp": 1.5})
+        # 将默认值同步更新为商讨后的10倍系数，确保长任务中能接管主导权
+        self.cfg = self.cfg_group.get("high", {"threshold": 2.5, "rec_rate": 1.1, "k": 0.005, "max_penalty": 0.025, "exp": 1.5})
 
     def get_threshold(self): return self.cfg.get("threshold", 2.5)
     def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.1)
@@ -178,9 +180,9 @@ class HighPenalty(ContinuousPenaltyStrategy):
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
         
-        k = self.cfg.get("k", 0.0005)
+        k = self.cfg.get("k", 0.005)
         exp_val = self.cfg.get("exp", 1.5)
-        max_p = self.cfg.get("max_penalty", 0.0025)
+        max_p = self.cfg.get("max_penalty", 0.025)
         
         step_ratio = k * (over ** exp_val)  
         return S_star * min(step_ratio, max_p) 
@@ -188,7 +190,7 @@ class HighPenalty(ContinuousPenaltyStrategy):
 class ThresholdPenalty(ContinuousPenaltyStrategy):
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(params)
-        self.cfg = self.cfg_group.get("threshold", {"threshold": 3.0, "rec_rate": 1.2, "k": 0.0012, "max_penalty": 0.0020, "exp_k": -1.5})
+        self.cfg = self.cfg_group.get("threshold", {"threshold": 3.0, "rec_rate": 1.2, "k": 0.012, "max_penalty": 0.020, "exp_k": -1.5})
 
     def get_threshold(self): return self.cfg.get("threshold", 3.0)
     def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.2)
@@ -198,9 +200,9 @@ class ThresholdPenalty(ContinuousPenaltyStrategy):
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
         
-        k = self.cfg.get("k", 0.0012)
+        k = self.cfg.get("k", 0.012)
         exp_k = self.cfg.get("exp_k", -1.5)
-        max_p = self.cfg.get("max_penalty", 0.0020)
+        max_p = self.cfg.get("max_penalty", 0.020)
         
         step_ratio = k * (1.0 - math.exp(exp_k * over))  
         return S_star * min(step_ratio, max_p) 
@@ -208,7 +210,7 @@ class ThresholdPenalty(ContinuousPenaltyStrategy):
 class LowPenalty(ContinuousPenaltyStrategy):
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(params)
-        self.cfg = self.cfg_group.get("low", {"threshold": 3.25, "rec_rate": 1.6, "k": 0.00025, "max_penalty": 0.0016})
+        self.cfg = self.cfg_group.get("low", {"threshold": 3.25, "rec_rate": 1.6, "k": 0.0025, "max_penalty": 0.016})
 
     def get_threshold(self): return self.cfg.get("threshold", 3.25)
     def get_recovery_rate(self): return self.cfg.get("rec_rate", 1.6)
@@ -218,8 +220,8 @@ class LowPenalty(ContinuousPenaltyStrategy):
         if acc_hours <= threshold: return 0.0
         over = acc_hours - threshold
         
-        k = self.cfg.get("k", 0.00025)
-        max_p = self.cfg.get("max_penalty", 0.0016)
+        k = self.cfg.get("k", 0.0025)
+        max_p = self.cfg.get("max_penalty", 0.016)
         
         step_ratio = k * over  
         return S_star * min(step_ratio, max_p) 

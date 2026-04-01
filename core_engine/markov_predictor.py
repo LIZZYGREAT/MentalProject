@@ -5,126 +5,168 @@ from typing import Dict, Any, Tuple
 
 class MarkovRegimePredictor:
     """
-    [核心引擎] 事件驱动的情绪区制跳跃预测器 (Event-Driven Markov Chain)
-    引入环境场效应(Intensity/Event Type)、底层毒药、性格护盾，以及带温度与截断的柔性 Softmax 博弈。
+    [核心引擎] 半马尔可夫情绪区制跳跃预测器 (Semi-Markov Regime-Switching Predictor)
+    基于离散时间风险函数 (Discrete-time Hazard Rate) 与 系统承压势能方程 (Phi)。
+    消除了魔法常数，实现了特质与环境的严格闭环响应。
     """
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, params: Dict[str, Any] = None):
         self.rng = np.random.RandomState(seed + 999)
         self.current_regime = "NORMAL"
-        self.regime_duration_steps = 0
-        # 高温平滑：数值越大，三者概率越容易均分；数值越小，越容易赢者通吃
-        self.temperature = 1.5  
-
-    def predict_next_regime(self, features: Dict[str, Any]) -> Tuple[str, Dict[str, float]]:
-        # 1. 提取生态与系统特征
+        self.regime_duration_minutes = 0.0
+        self.params = params or {}
+        
+    def _calculate_system_potential(self, features: Dict[str, Any], cfg: Dict[str, Any]) -> float:
+        """
+        计算大一统标量：系统承压势能 (System Stress Potential, Phi)
+        范围严格收敛于 [-1.0, 1.0]。
+        """
         fatigue = features.get("fatigue", 0.0)
         debt = features.get("debt", 0.0)
-        resilience = features.get("resilience", 0.0)
-        
-        state = features.get("current_state", "DAY_ACTIVE")
-        has_high_load = features.get("has_high_load", False)
-        
-        f_strat = features.get("f_strategy", "sensitive")
-        c_strat = features.get("c_strategy", "high")
-        
-
         intensity = features.get("intensity", 0.0)
+        resilience = features.get("resilience", 0.0)
         event_type = features.get("event_type", "rest")
-
-        # === 绝对静默区 ===
-        # 夜间深度休息时，情绪机制强制挂起，不再做无意义的内耗与心流判定
-        if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
-            self.current_regime = "NORMAL"
-            self.regime_duration_steps += 1
-            return "NORMAL", {"NORMAL": 1.0, "FLOW": 0.0, "FRICTION": 0.0}
-
-        # === 战局 1：内耗推力 (Z_friction) ===
-        # 底层毒药：疲劳与睡眠债的线性压迫
-        base_fric = fatigue * 0.4 + debt * 0.8
-        if c_strat == "high":
-            base_fric *= 1.2
-            
-        # 环境压迫：难度带来的额外推力
-        intensity_push = 0.0
-        if intensity > 0.8:
-            intensity_push = (intensity - 0.85) * 4.0  # T5(0.85)基本无推力, T1(1.1)带来1.0的强推力
-            if f_strat == "sensitive":
-                intensity_push *= 1.5  # 高敏体质在难题面前内耗翻倍
-                
-        # 场效应与护盾抵扣
+        
+        w_fatigue = cfg.get("w_fatigue", 0.15)
+        w_debt = cfg.get("w_debt", 0.30)
+        w_intensity = cfg.get("w_intensity", 0.50)
+        w_resilience = cfg.get("w_resilience", 0.40)
+        
+        # 计算场效应护盾
+        delta_shield = 0.0
         if event_type == "library":
-            intensity_push *= 0.6  # 自主环境极大削弱压迫感
+            delta_shield = cfg.get("shield_library", 0.20)
         elif event_type == "gym":
-            base_fric -= 1.5       # 运动强效阻断焦虑
-        elif not has_high_load:
-            base_fric -= 1.0       # 处于普通休息态时，内耗衰退
+            delta_shield = cfg.get("shield_gym", 0.50)
+        elif event_type in ["rest", "meal", "sleep", "nap"]:
+            delta_shield = cfg.get("shield_rest", 0.30)
             
-        resilience_shield = max(0.0, resilience) * 0.8
-        Z_friction = base_fric + intensity_push - resilience_shield
+        # 线性融合
+        linear_combination = (w_fatigue * fatigue + 
+                              w_debt * debt + 
+                              w_intensity * intensity - 
+                              w_resilience * resilience - 
+                              delta_shield)
+                              
+        # tanh 映射至有界空间
+        return math.tanh(linear_combination)
 
-        # === 战局 2：心流吸力 (Z_flow) ===
-        # 一票否决：熬夜、极度疲劳或欠睡时，心流直接斩断
-        if debt > 1.2 or fatigue > 4.0 or state == "LATE_NIGHT_ACTIVE":
-            Z_flow = -2.0
-        else:
-            # 挑战与技能(韧性)的乘性共鸣
-            challenge_match = (intensity - 0.75) * (resilience + 0.5) * 2.5 if intensity > 0 else -1.0
-            
-            # 环境场效应附加分
-            autonomy_bonus = 0.0
-            if event_type == "library":
-                autonomy_bonus = 0.8   # 图书馆掌控感加成
-            elif event_type == "gym":
-                autonomy_bonus = 1.2   # 运动内啡肽极易产生心流
-            elif not has_high_load:
-                autonomy_bonus = -3.0  # 无所事事时不可能有心流
-                
-            Z_flow = challenge_match + autonomy_bonus
-
-        # === 战局 3：稳态锚点 (Z_normal) ===
-        Z_normal = 1.5
-        if not has_high_load or event_type in ["rest", "meal"]:
-            Z_normal = 3.5  # 回归休息时，极大概率被拉回正常态
-
-        # 惯性加成 (物理学定律：倾向于保持当前状态)
-        if self.current_regime == "NORMAL": Z_normal += 0.5
-        elif self.current_regime == "FLOW": Z_flow += 0.5
-        elif self.current_regime == "FRICTION": Z_friction += 0.5
-
-        # === 终极防线：数值截断 (防止概率坍缩为 0 或 100%) ===
-        Z_normal = max(-1.5, min(3.5, Z_normal))
-        Z_flow = max(-1.5, min(2.5, Z_flow))
-        Z_friction = max(-1.5, min(2.5, Z_friction))
-
-        # === 带温度的 Softmax 概率映射 ===
-        logits = {
-            "NORMAL": Z_normal / self.temperature,
-            "FLOW": Z_flow / self.temperature,
-            "FRICTION": Z_friction / self.temperature
-        }
+    def predict_next_regime(self, features: Dict[str, Any], elapsed_minutes: float) -> Tuple[str, Dict[str, float]]:
+        """
+        评估是否发生状态跃迁。
+        返回：(新状态, 用于日志的可视化概率指标)
+        """
+        self.regime_duration_minutes += elapsed_minutes
+        cfg = self.params.get("markov_semi_params", {})
         
-        max_logit = max(logits.values()) 
-        exp_probs = {k: math.exp(v - max_logit) for k, v in logits.items()}
-        sum_exp = sum(exp_probs.values())
-        probs = {k: v / sum_exp for k, v in exp_probs.items()}
+        # 1. 计算系统承压势能 Phi
+        phi = self._calculate_system_potential(features, cfg)
         
-        # 轮盘赌跳跃
-        regimes = ["NORMAL", "FLOW", "FRICTION"]
-        p_array = [probs["NORMAL"], probs["FLOW"], probs["FRICTION"]]
-        next_regime = self.rng.choice(regimes, p=p_array)
+        # 2. 将绝对时间转换为宏观驻留步数 (d)
+        interval = cfg.get("regime_check_interval", 25)
+        d_steps = max(0.1, self.regime_duration_minutes / interval)
+        k_shape = cfg.get("k_shape", 1.5)
         
-        # 维护驻留时长
-        if next_regime == self.current_regime:
-            self.regime_duration_steps += 1
-        else:
-            self.regime_duration_steps = 0
-            
-        self.current_regime = next_regime
-        return next_regime, probs
-
-    def apply_regime_modifiers(self, delta_S: float, delta_E: float) -> Tuple[float, float]:
+        # 3. 基于当前状态计算动态风险率 (Lambda)
+        lam = 0.0
         if self.current_regime == "FLOW":
-            return delta_S * 0.4, delta_E * 0.6
+            lam_base = cfg.get("lambda_base_flow", 0.02)
+            gamma = cfg.get("gamma_flow", 2.0)
+            lam = lam_base * math.exp(gamma * phi)
+            
         elif self.current_regime == "FRICTION":
-            return delta_S * 1.5, delta_E * 1.3
+            lam_base = cfg.get("lambda_base_friction", 0.015)
+            gamma = cfg.get("gamma_friction", 1.5)
+            lam = lam_base * math.exp(-gamma * phi)
+            
+        else: # NORMAL
+            lam_base = cfg.get("lambda_base_normal", 0.01)
+            gamma = cfg.get("gamma_normal", 1.2)
+            lam = lam_base * math.cosh(gamma * phi)
+            
+        # 4. 计算本周期的破裂/跳跃概率 (Weibull Hazard Rate)
+        p_jump = 1.0 - math.exp(-lam * (d_steps ** k_shape))
+        p_jump = max(0.0, min(0.99, p_jump))
+        
+        probs_log = {"P_jump": p_jump, "Phi": phi}
+        
+        # 5. 泊松异常跳跃通道 (处理顿悟或极端崩溃的量子隧穿)
+        poisson_prob = cfg.get("poisson_anomaly_prob", 0.01)
+        if self.rng.random() < poisson_prob:
+            self.regime_duration_minutes = 0.0
+            if self.current_regime == "FLOW":
+                self.current_regime = "FRICTION"
+            elif self.current_regime == "FRICTION":
+                self.current_regime = "FLOW"
+            else:
+                self.current_regime = "FLOW" if phi < 0 else "FRICTION"
+            return self.current_regime, probs_log
+
+        # 6. 常规拓扑跳跃判定
+        is_jumping = self.rng.random() < p_jump
+        
+        if is_jumping:
+            self.regime_duration_minutes = 0.0
+            # 从两极跌落，必须回归 NORMAL
+            if self.current_regime in ["FLOW", "FRICTION"]:
+                self.current_regime = "NORMAL"
+            # 从 NORMAL 分发，依据 Phi 决定方向
+            else:
+                kappa = cfg.get("kappa_logit", 3.0)
+                p_friction = 1.0 / (1.0 + math.exp(-kappa * phi))
+                if self.rng.random() < p_friction:
+                    self.current_regime = "FRICTION"
+                else:
+                    self.current_regime = "FLOW"
+                    
+        return self.current_regime, probs_log
+
+    def apply_regime_modifiers(self, delta_S: float, delta_E: float, features: Dict[str, Any]) -> Tuple[float, float]:
+        """
+        [动力学注入层] 根据当前区制，向引擎的增量应用动态乘数。
+        基于环境变量与特质进行调整，引入严格的矢量方向性，防止恢复反常。
+        """
+        if self.current_regime == "NORMAL":
+            return delta_S, delta_E
+            
+        mod_cfg = self.params.get("markov_modifiers", {})
+        f_strat = features.get("f_strategy", "sensitive")
+        intensity = features.get("intensity", 0.0)
+        resilience = features.get("resilience", 0.0)
+        continuous_hours = features.get("fatigue", 0.0)
+        
+        if self.current_regime == "FRICTION":
+            base_s_mod = mod_cfg.get("friction_s_base", 1.20)
+            offset = 0.0
+            if f_strat == "sensitive": offset += 0.10
+            elif f_strat == "dull": offset -= 0.05
+            if intensity > 0.8: offset += 0.05
+            
+            final_s_mod = base_s_mod + offset
+            max_s_mod = mod_cfg.get("friction_s_max", 1.35)
+            final_s_mod = max(1.0, min(max_s_mod, final_s_mod))
+            final_e_mod = mod_cfg.get("friction_e_base", 1.15)
+            
+            # 矢量方向性判断：内耗会放大增压/耗能，阻尼减压/恢复
+            new_delta_S = delta_S * final_s_mod if delta_S > 0 else delta_S / final_s_mod
+            new_delta_E = delta_E * final_e_mod if delta_E < 0 else delta_E / final_e_mod
+            
+            return new_delta_S, new_delta_E
+            
+        elif self.current_regime == "FLOW":
+            base_s_mod = mod_cfg.get("flow_s_base", 0.75)
+            offset = -0.10 * resilience
+            if continuous_hours > 2.0:
+                offset += 0.05 * (continuous_hours - 2.0)
+                
+            final_s_mod = base_s_mod + offset
+            min_s_mod = mod_cfg.get("flow_s_min", 0.65)
+            final_s_mod = max(min_s_mod, min(1.0, final_s_mod))
+            final_e_mod = mod_cfg.get("flow_e_base", 0.85)
+            
+            # 矢量方向性判断：心流会阻尼增压/耗能，放大减压/恢复
+            new_delta_S = delta_S * final_s_mod if delta_S > 0 else delta_S / final_s_mod
+            new_delta_E = delta_E * final_e_mod if delta_E < 0 else delta_E / final_e_mod
+            
+            return new_delta_S, new_delta_E
+
         return delta_S, delta_E
