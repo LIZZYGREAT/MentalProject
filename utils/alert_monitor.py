@@ -3,17 +3,17 @@ from typing import List, Dict, Tuple
 
 class AlertMonitor:
     """
-    [阶梯式分级预警系统 - 生态化双引擎版]
-    引入了基于 (S_thresh - S_star) 的动态百分比缓冲带。
-    采用“绝对水位引擎”与“疲劳积分引擎”双轨判定，并具备精准的休息期静默拦截机制。
-    向大模型输出多维度的报警现场画像。
+    双引擎：绝对水位（S 与阈值的相对位置）与 AUC 式持续高负荷积分；
+    睡眠态降积分并重置阶梯。阈值来自 params['alert_thresholds'] 与 S_threshold/S_star_init。
     """
     def __init__(self, params: Dict):
+        """
+        参数 params: 全局配置字典，需含 S_threshold、S_star_init、alert_thresholds 等。
+        """
         self.params = params
         self.S_thresh = params.get("S_threshold", 95.0)
         self.S_star = params.get("S_star_init", 50.0)
         
-        # [核心修复] 动态读取所有双轨引擎的阈值
         alert_cfg = params.get("alert_thresholds", {})
         self.auc_limit = alert_cfg.get("auc_limit", 100.0)
         self.critical_buffer_ratio = alert_cfg.get("critical_buffer_ratio", 0.35)
@@ -28,6 +28,10 @@ class AlertMonitor:
         self.buffer_zone = max(10.0, self.S_thresh - self.S_star)
         
     def analyze(self, results: List[Dict]) -> Tuple[List[Dict], List[float]]:
+        """
+        参数 results: simulate_day 输出的每步字典列表（含 S,E,state,delta_S,continuous_hours 等）。
+        返回: (alerts, confidence_series)，后者与 results 对齐供绘图。
+        """
         alerts = []
         confidence_series = []
         

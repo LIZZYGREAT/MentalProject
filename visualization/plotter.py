@@ -165,7 +165,7 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
     ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     plt.xticks(rotation=45)
     
-    plt.suptitle("🧠 心理压力(S)与精力(E)双变量演化模型 - 生态分析视图", fontsize=16, weight='bold')
+    plt.suptitle("心理压力(S)与精力(E)双变量演化模型", fontsize=16, weight='bold')
     plt.tight_layout()
     
     return fig
@@ -178,6 +178,7 @@ def plot_stress_with_alerts(results, confidence_series, alerts, params=None, S_s
     plt.show()
 
 def get_plot_image_base64(results, confidence_series, alerts, params=None, S_star=None, events=None):
+    """将推演序列与告警绘成 PNG，返回 base64 字符串供 Web 嵌入。"""
     if not results:
         return None
     try:
@@ -188,5 +189,5 @@ def get_plot_image_base64(results, confidence_series, alerts, params=None, S_sta
         img.seek(0)
         return base64.b64encode(img.getvalue()).decode('utf-8')
     except Exception as e:
-        print(f"❌ 绘图失败: {e}")
+        print(f"绘图失败: {e}")
         return None

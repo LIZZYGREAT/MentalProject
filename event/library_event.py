@@ -7,12 +7,7 @@ from event.base import BaseEvent
 
 class LibraryEvent(BaseEvent):
     """
-    图书馆自习事件 (Library) - 特质焦虑与心流交互版 (带时空底噪)
-    特点：
-    1. 动态专注度：沙盒注入使用给定值，真实日程基于时长衰减。
-    2. 性格绑定：直接拉取全局 User 缓存的特质韧性指数。
-    3. 心流动力学：高压状态下，坚韧者通过行动获得掌控感，焦虑者陷入书本恐慌。
-    4. 非稳态崩溃：接入全局压力放大器，精力空仓时学习压力指数级爆发。
+    图书馆自习事件 (Library) - 特质焦虑与心流交互版
     """
     def __init__(self, event_id: str, start_time: str, end_time: str, 
                  name: str = "自习", description: str = "", 
@@ -47,17 +42,17 @@ class LibraryEvent(BaseEvent):
         return base + k * intensity
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, 5)
+        time_step = user.get_param("time_step", 5)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
-                                   current_time: datetime, time_step: int) -> Tuple[float, float]:
+                                   current_time: datetime, time_step: int, 
+                                   step_noise_s: float = 0.0, step_noise_e: float = 0.0,
+                                   is_substep: bool = False) -> Tuple[float, float]:
+                                   
         self._cached_user = user
         lib_cfg = user.get_param("event_library", {})
-        
-        seed_val = int(user.get_param("random_seed", 42))
-        time_hash = current_time.hour * 60 + current_time.minute + sum(ord(c) for c in self.event_id)
-        rng = np.random.RandomState((seed_val + time_hash) % (2**32 - 1))
         
         if "mock" in self.event_id.lower():
             intensity = self.provided_intensity
@@ -65,24 +60,25 @@ class LibraryEvent(BaseEvent):
         else:
             hours = self.total_duration_mins / 60.0
             focus_base = lib_cfg.get("focus_base", 0.95)
-            focus_decay = lib_cfg.get("focus_decay_rate", 0.12)
-            focus_min = lib_cfg.get("focus_min", 0.40)
+            focus_decay = lib_cfg.get("focus_decay_rate", 0.15)
+            focus_min = lib_cfg.get("focus_min", 0.45)
             intensity = max(focus_min, focus_base - (hours * focus_decay))
             intensity_type = "时长衰减"
             
         resilience = user.get_resilience_index()
-        
         trait_str = "坚韧" if resilience > 0.2 else ("焦虑" if resilience < -0.2 else "中性")
-        self.metadata["detail"] = f"专注度:{intensity:.2f}({intensity_type}) | 特质:{trait_str}({resilience:.2f})"
-        self.metadata["weight_factor"] = f"打折注水({self.get_fatigue_weight():.2f})"
+        
+        if not is_substep:
+            self.metadata["detail"] = f"专注度:{intensity:.2f}({intensity_type}) | 特质:{trait_str}({resilience:.2f})"
+            self.metadata["weight_factor"] = f"打折注水({self.get_fatigue_weight():.2f})"
 
         S_star = user.get_param("S_star_init", 50.0)
         diff = current_stress - S_star
         
-        base_stress_rate = lib_cfg.get("base_stress_rate", 0.15)
+        base_stress_rate = lib_cfg.get("base_stress_rate", 0.60)
         base_stress_increase = base_stress_rate * intensity 
         
-        flow_relief_k = lib_cfg.get("flow_relief_k", 0.008)
+        flow_relief_k = lib_cfg.get("flow_relief_k", 0.020)
         flow_relief = 0.0
         if diff > 0:
             flow_relief = flow_relief_k * resilience * diff * intensity
@@ -99,14 +95,14 @@ class LibraryEvent(BaseEvent):
             stress_k = penalty_sleep.get("stress_k", 0.04)
             raw_delta_S *= (1.0 + stress_k * sleep_debt)
         
-        max_s_step = lib_cfg.get("max_s_step", 1.5)
+        max_s_step = lib_cfg.get("max_s_step", 1)
         delta_S = max_s_step * math.tanh(raw_delta_S / max_s_step)
         
-        noise_s = rng.normal(0, 0.08)
+        noise_s = step_noise_s * 0.05
         delta_S += noise_s
         
         K_resilience = user.get_param("K_resilience", 1.0)
-        lib_drain = lib_cfg.get("base_drain_rate", 0.72)  
+        lib_drain = lib_cfg.get("base_drain_rate", 0.75)  
         drain_rate = (lib_drain * intensity) / K_resilience
         
         f_drain_modifier = 1.0
@@ -118,7 +114,23 @@ class LibraryEvent(BaseEvent):
             drain_k = penalty_sleep.get("drain_k", 0.05)
             drain_rate *= (1.0 + drain_k * sleep_debt)
             
-        noise_e = rng.normal(0, 0.05)
+        noise_e = step_noise_e * 0.05
         delta_E = -drain_rate * f_drain_modifier * (time_step / 60.0) + noise_e
+
+
+        if not is_substep:
+            if "math_trace" not in self.metadata:
+                if flow_relief >= 0:
+                    flow_str = f" - Flow({flow_relief:.3f})"
+                else:
+                    flow_str = f" + Friction({abs(flow_relief):.3f})"
+
+                # 最终组装公式
+                trace_str = (
+                    f"$$S_{{raw}} = (Base({base_stress_increase:.3f}){flow_str}) \\cdot Amp({amp:.2f}) = {raw_delta_S:.3f}$$"
+                    f"$$\\Delta S = Limit({max_s_step:.1f}) \\cdot \\tanh\\left(\\frac{{{raw_delta_S:.3f}}}{{{max_s_step:.1f}}}\\right) + Noise({noise_s:.2f}) = {delta_S:.3f}$$<br>"
+                    f"$$\\Delta E = -Drain({drain_rate:.3f}) \\cdot f_{{drain}}({f_drain_modifier:.2f}) \\cdot \\left(\\frac{{{time_step}}}{{60.0}}\\right) + Noise({noise_e:.2f}) = {delta_E:.3f}$$"
+                )
+                self.metadata["math_trace"] = trace_str
         
         return delta_S, delta_E

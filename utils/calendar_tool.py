@@ -10,7 +10,6 @@ from lark_oapi.api.calendar.v4 import *
 from utils.get_token import get_user_access_token
 
 def calculate_today_time_range(start_hour: int = 8, end_hour: int = 23) -> tuple:
-    print("\n2. 计算查询时间范围...")
     if not 0 <= start_hour <= 23:
         raise ValueError(f"开始小时必须在0-23之间，当前值: {start_hour}")
     if not 0 <= end_hour <= 23:
@@ -21,26 +20,21 @@ def calculate_today_time_range(start_hour: int = 8, end_hour: int = 23) -> tuple
     start_ts = int(datetime.combine(today, time(start_hour, 0)).timestamp())
     end_ts = int(datetime.combine(today, time(end_hour, 59)).timestamp())
     
-    print(f"   📅 今天日期: {date_str}")
+    print(f"今天日期: {date_str}")
     return start_ts, end_ts, date_str
 
 def calculate_date_range(start_date: str, end_date: str, start_hour: int = 8, end_hour: int = 23) -> tuple:
-    print("\n2. 计算查询时间范围...")
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
     
     start_ts = int(datetime.combine(start_dt.date(), time(start_hour, 0)).timestamp())
     end_ts = int(datetime.combine(end_dt.date(), time(end_hour, 59)).timestamp())
     
-    print(f"   📅 查询日期范围: {start_date} 至 {end_date}")
+    print(f"查询日期范围: {start_date} 至 {end_date}")
     return start_ts, end_ts, start_date, end_date
 
 def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = None, date_range: Optional[tuple] = None) -> Dict[str, Any] or None:
-    """
-    [修复版] 提取事件数据。
-    1. 增加星期几校验，过滤非当天的周期性母事件。
-    2. 对符合星期几的事件，强制校准日期。
-    """
+    """解析飞书日历事件为统一字段；周期性事件按 query_date_str 校验星期并校准日期。"""
     summary = event.get('summary', '').strip()
     if not summary:
         return None
@@ -89,9 +83,9 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
                     )
                     end_timestamp = int(new_end_dt.timestamp())
                 
-                print(f"  🔄 [周期性修正] 校准事件: {summary} ({orig_dt.date()} -> {q_date.date()})")
+                print(f"  [周期性修正] {summary} ({orig_dt.date()} -> {q_date.date()})")
         except Exception as e:
-            print(f"  ⚠️ 日期校准出错: {e}")
+            print(f"  日期校准出错: {e}")
             
     elif date_range:
         if start_timestamp:
@@ -111,12 +105,12 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
     }
 
 def save_events_to_json(events, filename=None, by_date=True):
-    """ [无状态模式] 仅做控制台记录，不再向本地写入任何 JSON 文件 """
+    """仅做控制台记录，不再向本地写入任何 JSON 文件"""
     if not events:
         return []
         
     if not by_date:
-        print(f"\n✅ [无状态模式] 内存中已就绪 {len(events)} 条事件 (未落盘)")
+        print(f"内存中已就绪 {len(events)} 条事件")
         return ["memory_only"]
     else:
         events_by_date = {}
@@ -127,56 +121,53 @@ def save_events_to_json(events, filename=None, by_date=True):
                 events_by_date[date_s].append(event)
         
         for d_str, evs in events_by_date.items():
-            print(f"\n✅ [无状态模式] {d_str} 的 {len(evs)} 条事件已在内存就绪 (未落盘)")
+            print(f"{d_str} 的 {len(evs)} 条事件已在内存就绪")
         return ["memory_only"]
 
 def display_results(events: List[Dict[str, Any]], date_str: Optional[str] = None, date_range: Optional[tuple] = None) -> None:
-    print("\n===========================================")
     print(f"最终结果统计:")
     if date_str:
-        print(f"- 查询日期: {date_str}")
+        print(f"查询日期: {date_str}")
     elif date_range:
         start_date, end_date = date_range
-        print(f"- 查询日期范围: {start_date} 至 {end_date}")
+        print(f"查询日期范围: {start_date} 至 {end_date}")
     
-    print(f"- 总共保留 {len(events)} 个有效事件")
-    print("===========================================")
+    print(f"总共保留 {len(events)} 个有效事件")
     
     if events:
         save_events_to_json(events, by_date=True)
-        print(f"\n✅ 任务完成！")
+        print("任务完成。")
     else:
-        print("\n⚠️ 没有找到任何事件")
-        print("===========================================")
+        print("没有找到任何事件")
 
 def get_events_in_date_range(client, token, cal_id, start, end, start_h=8, end_h=23):
     start_ts, end_ts, s_str, e_str = calculate_date_range(start, end, start_h, end_h)
     
-    print("\n3. 开始查询日程事件...")
+    print("开始查询日程事件...")
     req = ListCalendarEventRequest.builder().calendar_id(cal_id).page_size(100)\
         .start_time(str(start_ts)).end_time(str(end_ts)).user_id_type("open_id").build()
     
-    print("   发送API请求...")
+    print("发送API请求...")
     opt = lark.RequestOption.builder().user_access_token(token).build()
     resp = client.calendar.v4.calendar_event.list(req, opt)
     
     if not resp.success():
-        print(f"❌ API Error: {resp.msg}")
+        print(f"API Error: {resp.msg}")
         return []
     
     res_list = []
     if hasattr(resp.data, 'items') and resp.data.items:
-        print(f"   收到 {len(resp.data.items)} 个原始事件")
+        print(f"收到 {len(resp.data.items)} 个原始事件")
         for item in resp.data.items:
             ev_dict = json.loads(lark.JSON.marshal(item))
             q_date = s_str if s_str == e_str else None
             extracted = extract_event_data(ev_dict, query_date_str=q_date, date_range=(s_str, e_str))
             if extracted:
                 res_list.append(extracted)
-                print(f"  ✅ 保留: {extracted['summary']}")
+                print(f"保留: {extracted['summary']}")
             else:
-                print(f"  ❌ 过滤: {ev_dict.get('summary', '未知')}")
+                print(f"过滤: {ev_dict.get('summary', '未知')}")
     else:
-        print(f"ℹ️ 无事件")
+        print("无事件")
         
     return res_list

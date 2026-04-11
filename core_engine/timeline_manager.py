@@ -4,12 +4,14 @@ from typing import List, Dict, Optional
 from event.base import BaseEvent
 
 class TimelineManager:
+    """封装单日事件列表，提供作息边界解析与当前时刻活跃事件查询。"""
     def __init__(self, events: List[BaseEvent], date_str: str):
         self.events = events
         self.date_str = date_str
         self.base_date = datetime.strptime(date_str, "%Y-%m-%d")
 
     def _parse_time_robust(self, time_obj, current_time: datetime) -> datetime:
+        """将事件的 start/end 转为当日 datetime，供区间包含判断。"""
         if isinstance(time_obj, str):
             t_str = time_obj.split(' ')[-1]
             if len(t_str.split(':')) == 3:
@@ -19,7 +21,10 @@ class TimelineManager:
             return time_obj.replace(year=current_time.year, month=current_time.month, day=current_time.day)
 
     def analyze_schedule(self) -> Dict[str, datetime]:
-        """提取作息边界：何时起床，何时入睡，熬夜到何时"""
+        """
+        从 sleep 事件推断 wake_time、night_sleep_start；再由高负荷事件结束时刻得 late_night_active_end。
+        返回键: late_night_active_end, wake_time, night_sleep_start（均为当日 datetime）。
+        """
         sleep_events = [e for e in self.events if e.get_event_type() == "sleep"]
         morning_sleeps, night_sleeps = [], []
         
@@ -59,6 +64,7 @@ class TimelineManager:
         }
 
     def get_active_high_load_events(self, current_time: datetime) -> List[BaseEvent]:
+        """当前时刻处于区间内的 course/task/gym/library 事件列表。"""
         active = []
         for ev in self.events:
             if ev.get_event_type() not in ["course", "task", "gym", "library"]: continue 
@@ -70,6 +76,7 @@ class TimelineManager:
         return active
 
     def get_active_routine(self, current_time: datetime) -> Optional[BaseEvent]:
+        """当前时刻处于区间内的 meal/nap/sleep/rest 之一，若无则 None。"""
         for ev in self.events:
             if ev.get_event_type() in ["meal", "nap", "sleep", "rest"]: 
                 try:

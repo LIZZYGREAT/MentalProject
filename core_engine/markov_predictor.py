@@ -4,22 +4,19 @@ import numpy as np
 from typing import Dict, Any, Tuple
 
 class MarkovRegimePredictor:
-    """
-    [核心引擎] 半马尔可夫情绪区制跳跃预测器 (Semi-Markov Regime-Switching Predictor)
-    基于离散时间风险函数 (Discrete-time Hazard Rate) 与 系统承压势能方程 (Phi)。
-    消除了魔法常数，实现了特质与环境的严格闭环响应。
-    """
+    """半马尔可夫区制（NORMAL/FLOW/FRICTION）：用 Phi 与风险率更新区制，并对 dS、dE 施加方向性乘子。"""
     def __init__(self, seed: int = 42, params: Dict[str, Any] = None):
+        """
+        参数 seed: 随机数种子；params: 含 markov_semi_params、markov_modifiers 的全局配置。
+        """
         self.rng = np.random.RandomState(seed + 999)
         self.current_regime = "NORMAL"
         self.regime_duration_minutes = 0.0
         self.params = params or {}
+        self.last_s_mod = 1.0  
         
     def _calculate_system_potential(self, features: Dict[str, Any], cfg: Dict[str, Any]) -> float:
-        """
-        计算大一统标量：系统承压势能 (System Stress Potential, Phi)
-        范围严格收敛于 [-1.0, 1.0]。
-        """
+        """承压势能 Phi，融合疲劳、债、强度、韧性与事件护盾，tanh 压到 [-1,1]。"""
         fatigue = features.get("fatigue", 0.0)
         debt = features.get("debt", 0.0)
         intensity = features.get("intensity", 0.0)
@@ -52,8 +49,12 @@ class MarkovRegimePredictor:
 
     def predict_next_regime(self, features: Dict[str, Any], elapsed_minutes: float) -> Tuple[str, Dict[str, float]]:
         """
-        评估是否发生状态跃迁。
-        返回：(新状态, 用于日志的可视化概率指标)
+        根据疲劳、债、强度等算 Phi，再按当前区制算风险率并抽样是否跳变；含少量泊松异常跳变。
+        参数:
+            features: fatigue/debt/resilience/f_strategy/intensity/event_type；
+            elapsed_minutes: 距上次区制检查的分钟数，用于累加驻留时间。
+        返回:
+            (current_regime, {"P_jump": float, "Phi": float})。
         """
         self.regime_duration_minutes += elapsed_minutes
         cfg = self.params.get("markov_semi_params", {})
@@ -120,12 +121,16 @@ class MarkovRegimePredictor:
                     
         return self.current_regime, probs_log
 
-    def apply_regime_modifiers(self, delta_S: float, delta_E: float, features: Dict[str, Any]) -> Tuple[float, float]:
+    # 扩展 is_substep 参数，并在非子步截取乘数赋值给 self.last_s_mod
+    def apply_regime_modifiers(self, delta_S: float, delta_E: float, features: Dict[str, Any], is_substep: bool = False) -> Tuple[float, float]:
         """
-        [动力学注入层] 根据当前区制，向引擎的增量应用动态乘数。
-        基于环境变量与特质进行调整，引入严格的矢量方向性，防止恢复反常。
+        NORMAL 不变；FRICTION 放大增压与耗能、削弱减压与恢复；FLOW 相反。
+        参数 features: f_strategy/intensity/resilience/fatigue（连续小时）。
+        返回修正后的 (delta_S, delta_E)。
         """
         if self.current_regime == "NORMAL":
+            if not is_substep:
+                self.last_s_mod = 1.0
             return delta_S, delta_E
             
         mod_cfg = self.params.get("markov_modifiers", {})
@@ -150,6 +155,8 @@ class MarkovRegimePredictor:
             new_delta_S = delta_S * final_s_mod if delta_S > 0 else delta_S / final_s_mod
             new_delta_E = delta_E * final_e_mod if delta_E < 0 else delta_E / final_e_mod
             
+            if not is_substep:
+                self.last_s_mod = final_s_mod
             return new_delta_S, new_delta_E
             
         elif self.current_regime == "FLOW":
@@ -167,6 +174,10 @@ class MarkovRegimePredictor:
             new_delta_S = delta_S * final_s_mod if delta_S > 0 else delta_S / final_s_mod
             new_delta_E = delta_E * final_e_mod if delta_E < 0 else delta_E / final_e_mod
             
+            if not is_substep:
+                self.last_s_mod = final_s_mod
             return new_delta_S, new_delta_E
 
+        if not is_substep:
+            self.last_s_mod = 1.0
         return delta_S, delta_E

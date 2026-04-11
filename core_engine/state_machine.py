@@ -4,6 +4,7 @@ from typing import Tuple, List, Optional
 from event.base import BaseEvent
 
 class PhysiologyStateMachine:
+    """据日程与当前事件判定日/夜/睡眠等状态，并给出睡眠打断惯性增量与睡眠效率。"""
     def __init__(self, schedule: dict, params: dict = None):
         self.t_wake = schedule["wake_time"]
         self.t_sleep_2 = schedule["night_sleep_start"]
@@ -16,7 +17,7 @@ class PhysiologyStateMachine:
         self.fines_cfg = self.params.get("state_machine_fines", {})
 
     def determine_state(self, current_time: datetime, has_high_load: bool, routine_ev: Optional[BaseEvent]) -> Tuple[str, float, float, List[str]]:
-        """返回：当前状态, 突发S增量(如起夜), 突发E增量, 日志列表"""
+        """返回状态名、状态切换引起的惯性 dS/dE、以及睡眠相关日志。"""
         logs = []
         
         # 1. 判定当前基准状态
@@ -42,7 +43,7 @@ class PhysiologyStateMachine:
         
         if self.prev_state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] and state in ["LATE_NIGHT_ACTIVE", "NIGHT_OVERTIME"]:
             self.sleep_interruptions += 1
-            logs.append(f"[{current_time.strftime('%H:%M')}] ⏰ 睡眠被打断 (第 {self.sleep_interruptions} 次)！触发起夜开机惩罚 (E{de_pen}, S+{ds_pen})")
+            logs.append(f"[{current_time.strftime('%H:%M')}] 睡眠被打断 (第 {self.sleep_interruptions} 次)，起夜惩罚 (E{de_pen}, S+{ds_pen})")
             inertia_ds, inertia_de = ds_pen, de_pen
             
         # 3. 睡眠效率折损 (提取折损基线与底座)
@@ -53,7 +54,7 @@ class PhysiologyStateMachine:
         if self.sleep_interruptions > 0:
             self.sleep_eff = max(eff_min, eff_base - eff_drop * (self.sleep_interruptions - 1))
             if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] and self.prev_state != state:
-                logs.append(f"[{current_time.strftime('%H:%M')}] 📉 碎片化睡眠预警：当前入睡效率已降至 {self.sleep_eff:.2f}")
+                logs.append(f"[{current_time.strftime('%H:%M')}] 碎片化睡眠预警：入睡效率降至 {self.sleep_eff:.2f}")
 
         self.prev_state = state
         return state, inertia_ds, inertia_de, logs

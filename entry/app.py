@@ -25,10 +25,12 @@ current_user = User(user_id="default")
 
 @app.route('/')
 def index():
+    """Web 首页。"""
     return render_template('index.html')
 
 @app.route('/api/feishu/get_url', methods=['GET'])
 def feishu_get_url():
+    """返回飞书 OAuth 授权跳转 URL（JSON: url）。"""
     try:
         api = FeishuAPI() 
         url = api.generate_authorize_url()
@@ -38,6 +40,7 @@ def feishu_get_url():
 
 @app.route('/api/feishu/submit_code', methods=['POST'])
 def feishu_submit_code():
+    """POST JSON: code，换 user_access_token 并落盘。"""
     code = request.json.get('code', '').strip()
     if not code:
         return jsonify({"status": "error", "message": "请输入授权码"})
@@ -56,6 +59,7 @@ def feishu_submit_code():
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
+    """GET 返回当前用户参数；POST 更新策略与 params（内存）。"""
     global current_user
     if request.method == 'GET':
         safe_params = User._params_to_json_safe(current_user.params)
@@ -79,6 +83,11 @@ def handle_config():
 
 @app.route('/api/simulate', methods=['POST'])
 def simulate():
+    """
+    拉取或注入日程、过滤、织入例行、调用 Simulator.simulate_day；
+    请求体可含 date、mock_events、shield_keywords、init_S/E、force_refresh 等。
+    返回 JSON：图像 base64、告警、轨迹日志、事件画像等。
+    """
     data = request.json
     date_str = data.get("date", datetime.now().strftime("%Y-%m-%d"))
     
@@ -116,7 +125,7 @@ def simulate():
         for ev in events_json:
             name = ev.get("summary", ev.get("name", "")).strip()
             if any(kw == name for kw in shield_kws):
-                app_trace_logs.append(f"🗑️ [事件移除] 真实日程 '{name}' 命中名称屏蔽。")
+                app_trace_logs.append(f"[事件移除] 真实日程 '{name}' 命中名称屏蔽。")
                 continue
                 
             st_raw = ev.get("start_time", "")
@@ -133,7 +142,7 @@ def simulate():
                     break
             
             if is_time_blocked:
-                app_trace_logs.append(f"🗑️ [时空移除] 真实日程 '{name}' ({ev_start}-{ev_end}) 命中时段屏蔽。")
+                app_trace_logs.append(f"[时空移除] 真实日程 '{name}' ({ev_start}-{ev_end}) 命中时段屏蔽。")
                 continue
 
             filtered_events_json.append(ev)
@@ -158,7 +167,7 @@ def simulate():
         for (obs, obe, ob_name) in occupied_blocks:
             if me['start'] < obe and me['end'] > obs:
                 overlap = True
-                app_trace_logs.append(f"❌ [时空防御] 沙盒注入事件 '{me['name']}' 与 '{ob_name}' 重叠，已拒绝！")
+                app_trace_logs.append(f"[时空防御] 沙盒注入事件 '{me['name']}' 与 '{ob_name}' 重叠，已拒绝。")
                 break
         
         if overlap: continue
@@ -186,16 +195,15 @@ def simulate():
     try:
         final_events = inject_routine_events(events, date_str, current_user)
     except Exception as e:
-        print(f"❌ 注入生态日程失败: {e}")
+        print(f"注入生态日程失败: {e}")
         import traceback
         traceback.print_exc()
-        app_trace_logs.append(f"❌ 生态日程织入异常，回退到原始事件: {e}")
+        app_trace_logs.append(f"生态日程织入异常，回退到原始事件: {e}")
         final_events = events
     
     init_S = data.get("init_S")
     init_E = data.get("init_E")
     
-    # 如果前端没有显式传递 S 和 E，强制回归健康基准线
     if init_S is None or init_E is None:
         init_S = current_user.get_current_S_star()
         init_E = 100.0
@@ -244,6 +252,7 @@ def simulate():
       
 @app.route('/api/token_status', methods=['GET'])
 def token_status():
+    """检查本地飞书 token 是否存在且未过期。"""
     try:
         api = FeishuAPI()
         token = api.load_token_from_file()

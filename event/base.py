@@ -3,8 +3,14 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 
 class BaseEvent(ABC):
+    """单日日程中一条事件的抽象基类；仿真器只关心时间段与双变量冲击接口。"""
     def __init__(self, event_id: str, start_time: str, end_time: str, 
                  name: str = "", description: str = "", metadata: Dict[str, Any] = None):
+        """
+        参数:
+            event_id: 事件唯一键；start_time/end_time: 含日期的时刻字符串或可被解析的时间；
+            name/description: 展示与情感打分；metadata: 子类扩展字段（如 idle_duration、credits）。
+        """
         self.event_id = event_id
         self.start_time = start_time
         self.end_time = end_time
@@ -15,21 +21,19 @@ class BaseEvent(ABC):
         self._end_dt = None
     
     def get_start_datetime(self) -> datetime:
+        """解析 start_time 中 HH:MM 为 datetime（仅时间轴比较用，仿真里由外层拼真实日期）。"""
         if self._start_dt is None:
-            # 注意：这里仅解析 HH:MM，日期部分默认为 1900-01-01
-            # 实际仿真中由 Solver 赋予具体日期
             self._start_dt = datetime.strptime(self.start_time, "%H:%M")
         return self._start_dt
     
     def get_end_datetime(self) -> datetime:
+        """同 get_start_datetime，解析结束时刻。"""
         if self._end_dt is None:
             self._end_dt = datetime.strptime(self.end_time, "%H:%M")
         return self._end_dt
     
     def is_active_at(self, current_time: datetime) -> bool:
-        """
-        判断当前时间是否处于事件时间段内 (忽略日期，仅比较 HH:MM)
-        """
+        """判断 current_time 是否落在 [start, end)（支持跨午夜）。"""
         start = self.get_start_datetime()
         end = self.get_end_datetime()
         
@@ -52,34 +56,30 @@ class BaseEvent(ABC):
         pass
 
     def get_fatigue_weight(self) -> float:
-        """
-        [新增] 获取该事件在计算连轴转疲劳时的时长折算权重。
-        默认返回 1.0 (等同于标准课程)。
-        """
+        """连续负荷时长加权；课程/任务为正，运动可为负用于冷却累计。"""
         return 1.0
     
     @abstractmethod
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        """
-        旧接口：仅计算压力变化 (保留以兼容旧代码)
-        """
+        """仅返回压力增量 dS（兼容旧调用）；新逻辑请用 calculate_stress_impact_dual。"""
         pass
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
                                    current_time: datetime, time_step: int) -> Tuple[float, float]:
         """
-        [新增] 新接口：双变量耦合计算 (压力 S, 精力 E)
-        默认实现：调用旧接口计算 S，精力变化默认为 0
-        子类 (CourseEvent, GymEvent 等) 必须覆盖此方法以实现具体逻辑
-        
-        Returns:
-            (delta_S, delta_E)
+        计算本积分步的压力、精力增量。子类应覆盖。
+        参数:
+            user: User（读参数与策略）；current_stress/current_energy: 当前 S、E；
+            current_time: 仿真时刻；time_step: 步长（分钟）。
+        返回:
+            (delta_S, delta_E)。默认实现仅调 calculate_stress_impact 且 dE=0。
         """
         delta_s = self.calculate_stress_impact(user, current_stress, current_time)
         delta_e = 0.0
         return delta_s, delta_e
     
     def to_dict(self) -> Dict[str, Any]:
+        """序列化为前端/API 可用的扁平字典。"""
         return {
             "event_id": self.event_id,
             "type": self.get_event_type(),

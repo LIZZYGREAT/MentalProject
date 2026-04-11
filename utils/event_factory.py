@@ -10,11 +10,14 @@ from event.library_event import LibraryEvent
 from entry.class_info_data import CLASS_INFO_DICT
 
 class EventFactory:
-    """
-    智能事件装配工厂：将飞书泛型日程动态路由到精确的领域模型
-    """
+    """将飞书/Agent 的 JSON 行映射为 Course/Task/Gym/Library/Rest/Meal/Nap 等具体事件类。"""
     @staticmethod
     def create_from_json(events_data: List[Dict[str, Any]]) -> List[BaseEvent]:
+        """
+        参数 events_data: 每项含 id/summary/start_time/end_time/description，可选 event_type 强制类型。
+        路由顺序：显式 event_type -> 名称关键词（餐/睡/健身/自习…）-> 考试 ddl 等 -> 课表字典或「课」-> 默认 general 任务。
+        返回: BaseEvent 实例列表。
+        """
         events = []
         for idx, data in enumerate(events_data):
             ev_id = data.get("id", f"ev_{idx}")

@@ -17,13 +17,17 @@ BASE_DATA_DIR = "data"
 USER_CONFIG_DIR = os.path.join(BASE_DATA_DIR, "user_configs")
 
 class User:
+    """承载 params 深拷贝、三类策略、Simulator、睡眠债与 EPOC；配置默认不落盘。"""
     def __init__(self, user_id: str = "default", params: Optional[Dict[str, Any]] = None, load_from_file: bool = True):
+        """
+        参数:
+            user_id: 标识；params: 覆盖 GLOBAL_DEFAULT_CONFIG 的键值；
+            load_from_file: 为 True 时仍可能走 _load_config（当前实现返回 None）。
+        """
         self.user_id = user_id
         
-        # 强制深拷贝 config.py 作为唯一真理来源
         self.params = copy.deepcopy(GLOBAL_DEFAULT_CONFIG)
         
-        # 即使 load_from_file 为 True，内部已被阻断，确保无状态
         if load_from_file:
             saved_params = self._load_config()
             if saved_params:
@@ -49,12 +53,15 @@ class User:
     # === 睡眠债状态管理 (Sleep Debt Ecosystem) ===
     # =======================================================
     def set_sleep_debt(self, debt_hours: float):
+        """睡眠债（小时），影响 drain/增压与部分事件逻辑。"""
         self.current_sleep_debt = max(0.0, float(debt_hours))
         
     def reduce_sleep_debt(self, hours: float):
+        """偿还 hours 小时睡眠债，下限 0。"""
         self.current_sleep_debt = max(0.0, self.current_sleep_debt - hours)
         
     def get_sleep_debt(self) -> float:
+        """当前睡眠债（小时）。"""
         return self.current_sleep_debt
 
     # =======================================================
@@ -62,21 +69,28 @@ class User:
     # =======================================================
     
     def get_current_S_star(self) -> float:
+        """压力稳态锚 S*（与 config 中 S_star_init 一致）。"""
         return float(self.params.get("S_star_init", 50.0))
         
     def get_current_threshold(self) -> float:
+        """报警阈值 S_threshold。"""
         return float(self.params.get("S_threshold", 90.0))
         
     def set_stress_baseline(self, s_star: float, threshold: float = None):
+        """外部强制设定 S* 与可选阈值（会 save_config）。"""
         self.params["S_star_init"] = max(30.0, min(70.0, float(s_star)))
         if threshold is not None:
             self.params["S_threshold"] = min(110.0, float(threshold))
         
         self.save_config()
-        print(f"🔧 [干预] 用户 S* 被强制设定为: {self.params['S_star_init']:.2f}, 阈值: {self.params['S_threshold']:.2f}")
+        print(f"用户 S* 被设定为: {self.params['S_star_init']:.2f}, 阈值: {self.params['S_threshold']:.2f}")
 
     def evolve_daily_baseline(self, wake_s: float, daily_mean_stress: float, has_red_alert: bool):
-        """核心演进接口：极慢速异位稳态演算"""
+        """
+        一日结束后更新 S_star_init 与 S_threshold（evolution_params）。
+        参数:
+            wake_s: 清晨唤醒时压力；daily_mean_stress: 当日 S 均值；has_red_alert: 是否出现最高级告警。
+        """
         old_s_star = self.get_current_S_star()
         old_threshold = self.get_current_threshold()
         sleep_debt = self.get_sleep_debt()
@@ -97,22 +111,22 @@ class User:
         if has_red_alert or sleep_debt > debt_limit:
             # 恶性磨损：防线击穿或高睡眠债反噬
             new_threshold -= evo_cfg.get("threshold_wear_malignant", 0.25)
-            print(f"💔 [生态演化] 恶性磨损：触发红警或睡眠债过高({sleep_debt:.1f}h)，抗压天花板下降")
+            print(f"恶性磨损：红警或睡眠债过高({sleep_debt:.1f}h)，抗压天花板下降")
         elif daily_mean_stress > old_s_star + challenge_gap:
             # 良性锻炼：走出舒适区且安全度过
             new_threshold += evo_cfg.get("threshold_growth_benign", 0.10)
-            print(f"💪 [生态演化] 良性锻炼：抗住高压挑战(日均S={daily_mean_stress:.1f})，抗压天花板抬升")
+            print(f"良性锻炼：日均S={daily_mean_stress:.1f}，抗压天花板抬升")
         else:
             # 舒适区退化：缺乏压力刺激
             new_threshold -= evo_cfg.get("threshold_rust_comfort", 0.05)
-            print(f"🛋️ [生态演化] 舒适区生锈：缺乏压力刺激(日均S={daily_mean_stress:.1f})，天花板轻微下降")
+            print(f"舒适区退化：日均S={daily_mean_stress:.1f}，天花板轻微下降")
             
         new_threshold = max(new_s_star + 20.0, min(110.0, new_threshold))
         
         self.params["S_star_init"] = round(new_s_star, 3)
         self.params["S_threshold"] = round(new_threshold, 3)
         
-        print(f"🌱 [双轨演化结算] S* 底线: {old_s_star:.2f} -> {new_s_star:.2f} | 报警阈值: {old_threshold:.2f} -> {new_threshold:.2f}")
+        print(f"S* {old_s_star:.2f} -> {new_s_star:.2f} | 阈值 {old_threshold:.2f} -> {new_threshold:.2f}")
         self.save_config()
 
     # =======================================================
@@ -120,6 +134,7 @@ class User:
     # =======================================================
 
     def _init_strategies(self):
+        """按 params 重建 night/course/rest 策略并刷新 resilience_index。"""
         night_type = self.params.get("night_strategy", "normal")
         course_f_type = self.params.get("f_strategy", "sensitive")
         course_C_type = self.params.get("C_strategy", "high")
@@ -133,13 +148,13 @@ class User:
         self._calculate_resilience_index()
     
     def _init_solver(self):
+        """构造 Simulator(self)。"""
         from core_engine.simulator import Simulator
         self.solver = Simulator(self)
 
     def _calculate_resilience_index(self):
         """
-        [全局性格提取] 提取用户的“特质韧性指数” (范围大致在 -1.0 到 1.0)
-        供全系统(LibraryEvent, 运动EPOC吸收等)直接调用
+        由四类策略枚举组合成 [-1,1] 标量，供 Library、EPOC、马尔可夫等读取。
         """
         score = 0.0
         
@@ -168,9 +183,11 @@ class User:
         self.resilience_index = max(-1.0, min(1.0, score))
 
     def get_resilience_index(self) -> float:
+        """特质韧性指数。"""
         return self.resilience_index
     
     def update_params(self, new_params: Dict[str, Any]):
+        """合并 new_params，重建策略并同步 solver。"""
         self.params.update(new_params)
         self._init_strategies()
         if self.solver:
@@ -178,6 +195,7 @@ class User:
         self.save_config()  
     
     def get_param(self, key: str, default: Any = None):
+        """读取合并后的参数字典项。"""
         return self.params.get(key, default)
     
     def set_night_strategy(self, strategy_type: str):
@@ -235,12 +253,11 @@ class User:
         return out
     
     def save_config(self):
-        """ [沙盒模式] 已阻断所有本地文件落盘操作，修改仅存于内存 """
-        print(f"✅ [无状态模式] 用户配置修改已在内存中生效，不会写入本地文件。")
+        """已阻断所有本地文件落盘操作，修改仅存于内存"""
+        return None
     
     def _load_config(self) -> Optional[Dict[str, Any]]:
-        """ [沙盒模式] 强制阻断本地读取，确保严格从 config.py 初始化 """
-        print(f"ℹ️ [无状态模式] 忽略本地持久化配置加载，严格使用 config.py 基准。")
+        """强制阻断本地读取，确保严格从 config.py 初始化"""
         return None
     
     def get_f_strategy(self) -> str:
@@ -271,6 +288,7 @@ class User:
     def update_strategy_config(self, f_strategy: str = None, C_strategy: str = None,
                               night_strategy: str = None, rest_strategy: str = None,
                               time_preferences: List[str] = None):
+        """仅更新策略相关键并 _init_strategies；与 update_params 可配合使用。"""
         if f_strategy:
             self.params["f_strategy"] = f_strategy
         if C_strategy:

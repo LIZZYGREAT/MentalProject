@@ -21,7 +21,7 @@ def load_calendar_events(date_str):
             with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"❌ 读取日历文件出错: {str(e)}")
+            print(f"读取日历文件出错: {str(e)}")
     return None
 
 def save_calendar_events(date_str, events):

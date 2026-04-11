@@ -7,6 +7,7 @@ from data_pipeline.fetcher import fetch_events_with_timeout
 from visualization.plotter import get_plot_image_base64  
 
 def inject_routine_events(base_events, date_str, user):
+    """委托 RoutineWeaver 织入睡眠/三餐/午睡等例行事件。"""
     weaver = RoutineWeaver(user)
     if hasattr(weaver, 'weave'):
         return weaver.weave(base_events, date_str)
@@ -24,8 +25,8 @@ def process_date(
     force_refresh: bool = False, 
     open_id: str = None
 ) -> dict:
-    """标准编排管道入口"""
-    print(f"\n{'='*50}\n🚀 开始推演日期: {date_str}\n{'='*50}")
+    """拉取或注入日程、织入例行、用 User 推演一日并可选出图。"""
+    print(f"开始推演日期: {date_str}")
 
     # 1. 初始化用户
     user_params = injected_user_profile if injected_user_profile else {}
@@ -34,10 +35,10 @@ def process_date(
     # 2. 获取日前日程
     events_json = None
     if injected_events is not None:
-        print("✅ 接收到 Agent 注入的事件，跳过所有网络/本地拉取。")
+        print("接收到注入的事件，跳过网络/本地拉取。")
         events_json = injected_events
     else:
-        print(f"🌐 [无状态模式] 尝试获取日程 (force_refresh={force_refresh})...")
+        print(f"尝试获取日程 (force_refresh={force_refresh})...")
         events_json = fetch_events_with_timeout(
             date_str, open_id, injected_token, injected_calendar_id, timeout=5.0, force_refresh=force_refresh
         )
@@ -57,7 +58,7 @@ def process_date(
         user.set_stress_baseline(injected_yesterday_state.get("S_star", 50.0), injected_yesterday_state.get("S_threshold", 90.0))
         user.set_sleep_debt(injected_yesterday_state.get("sleep_debt", 0.0))
     else:
-        print("ℹ️ [无状态模式] 未注入昨日状态，采用当前配置的 S* 基准与满精力启动。")
+        print("未注入昨日状态，采用当前 S* 与满精力启动。")
         prev_S = user.get_current_S_star()
         prev_E = 100.0
 

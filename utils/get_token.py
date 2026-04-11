@@ -371,7 +371,7 @@ def interactive_get_user_access_token():
         token_info = feishu_api.get_user_access_token(code)
         
         # 显示获取到的令牌信息
-        print("\n✅ 恭喜！成功获取用户访问令牌")
+        print("\n成功获取用户访问令牌")
         print(f"访问令牌: {token_info['access_token']}")
         print(f"令牌有效期: {token_info['expires_in']} 秒")
         if token_info.get('refresh_token'):
@@ -391,7 +391,7 @@ def interactive_get_user_access_token():
         
     except Exception as e:
         logger.error(f"获取用户访问令牌过程中发生错误: {str(e)}")
-        print(f"❌ 错误: {str(e)}")
+        print(f"错误: {str(e)}")
         return None
 
 
@@ -425,7 +425,7 @@ def refresh_existing_token():
         new_token_info = feishu_api.refresh_user_access_token(refresh_token)
         
         # 显示刷新后的令牌信息
-        print("\n✅ 恭喜！成功刷新用户访问令牌")
+        print("\n成功刷新用户访问令牌")
         print(f"新的访问令牌: {new_token_info['access_token']}")
         print(f"令牌有效期: {new_token_info['expires_in']} 秒")
         print(f"新的刷新令牌: {new_token_info['refresh_token']}")
@@ -444,7 +444,7 @@ def refresh_existing_token():
         
     except Exception as e:
         logger.error(f"刷新用户访问令牌过程中发生错误: {str(e)}")
-        print(f"❌ 错误: {str(e)}")
+        print(f"错误: {str(e)}")
         return None
 
 

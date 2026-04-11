@@ -16,7 +16,6 @@ class RoutineWeaver:
         self.default_wake_min = self._time_to_mins(self.user.get_param("default_wake_time", "07:30"))
         self.default_sleep_min = self._time_to_mins(self.user.get_param("default_sleep_time", "23:30"))
         
-        # [核心修复] 动态读取边界
         self.max_delay_wake_min = self._time_to_mins(self.cfg.get("max_delay_wake_time", "11:00")) 
         self.ideal_sleep_hours = self.cfg.get("ideal_sleep_hours", 8.0)
 
@@ -159,6 +158,7 @@ class RoutineWeaver:
         return best_slot
 
     def inject_routine_events(self, events: List[BaseEvent], date_str: str) -> List[BaseEvent]:
+        """在已有日程上插入睡眠、午餐、午睡、晚餐等例行块。"""
         occupied_blocks = self._get_occupied_blocks(events)
         final_events = self._inject_sleep_events(events, occupied_blocks)
         all_blocks = self._get_occupied_blocks(final_events)

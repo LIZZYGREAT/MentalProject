@@ -1,10 +1,3 @@
-# config.py
-"""
-全局默认配置中心 (Memory-based Configuration)
-为云端 Agent 部署优化，消除所有本地 JSON 强依赖。
-包含了系统所有底层算法常数、策略基线与默认参数。
-"""
-
 GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     # 1. 基础权重参数 (CIS 课程强度评估)
@@ -35,7 +28,7 @@ GLOBAL_DEFAULT_CONFIG = {
     # 3. 核心物理常数 & 仿真控制
     # ==========================================
     "S_star_init": 50.0,  # 初始压力平衡点
-    "S_threshold": 90.0,  # 报警阈值
+    "S_threshold": 100.0,  # 报警阈值
     "E_critical": 20.0,   # 精力耗竭线
     "time_step": 5,       # 仿真步长
     "random_seed": 42,
@@ -47,7 +40,7 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     "alpha_cis_drain": 1.0,
     "cognitive_weight": 0.65,
-    "fatigue_acceleration": 1.20, 
+    "fatigue_acceleration": 1.15, 
     
     # ==========================================
     # 5. 用户默认策略偏好
@@ -61,22 +54,22 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     # 6. 非稳态负荷理论参数 (Allostatic Load Dynamics) 
     # ==========================================
-    "allostatic_collapse_point": 0.2,      # E_r 崩塌临界点
-    "allostatic_collapse_steepness": 10.0, # Sigmoid 崩塌陡峭度
-    "allostatic_max_penalty": 0.6,         # 彻底破防时的最大乘性放大器
-    "allostatic_cost_alpha": 0.8,          # 边际耗能指数衰减底数
-    "allostatic_cost_beta": 2.5,           # 边际耗能指数衰减速率
+    "allostatic_collapse_point": 0.35,     
+    "allostatic_collapse_steepness": 10.0, 
+    "allostatic_max_penalty": 0.25,         
+    "allostatic_cost_alpha": 0.75,         
+    "allostatic_cost_beta": 1.5,          
     
     # ==========================================
     # 7. 全局系统性惩罚参数 (Global Penalties) 
     # ==========================================
     "penalty_circadian": {
-        "drain_multiplier": 1.4,   # 凌晨干活耗能倍率
-        "stress_multiplier": 1.2   # 凌晨干活增压倍率
+        "drain_multiplier": 1.4,   
+        "stress_multiplier": 1.2  
     },
     "penalty_sleep_debt": {
-        "drain_k": 0.05,           # 睡眠债对耗能的线性惩罚斜率 
-        "stress_k": 0.04           # 睡眠债对增压的线性惩罚斜率
+        "drain_k": 0.05,           
+        "stress_k": 0.04           
     },
     
     # ==========================================
@@ -102,33 +95,40 @@ GLOBAL_DEFAULT_CONFIG = {
     "nap_proper_recover": 20,    
 
     "rest_ode_params": {
-        "R_max_base": 6.06,                  # 单步(5分钟)最大理论恢复功率
-        "deficit_gamma": 2.0,                # 匮乏驱动指数
-        "sympathetic_inhibit_alpha": 0.02,   # 交感神经高压阻尼系数
-        "energy_noise_std": 0.05             # 恢复过程的热力学微噪
+        "R_max_base": 6.0,                  
+        "deficit_gamma": 2.0,                
+        "sympathetic_inhibit_alpha": 0.02,  
+        "energy_noise_std": 0.05            
     },
     "recovery_piecewise_params": {
-        "thresholds": [15.0, 35.0],           # 压力差值 diff 的两道分界线
-        "absorption_rates": [1.0, 0.9, 0.6],  # 对应三阶段的精力吸收率 (alpha)
-        "relief_multipliers": [1.0, 1.3, 0.6] # 对应三阶段的卸压乘数 (beta)
+        "thresholds": [10.0, 40.0],           
+        "absorption_rates": [1.0, 0.9, 0.7], 
+        "relief_multipliers": [1.0, 1.3, 0.7] 
+    },
+    "rest_trait_modifiers": {
+        "relieved": {"eta": 1.05, "tau": 0.7},   
+        "warmup":   {"eta": 1.00, "tau": 1.5},  
+        "anxious":  {"eta": 0.90, "tau": 1.0},   
+        "burnout":  {"eta": 0.80, "tau": 1.0},   
+        "default":  {"eta": 1.00, "tau": 1.0}
     },
     
     # ==========================================
     # 9. 连续负荷惩罚策略参数 (C_Strategy)
     # ==========================================
     "c_strategy_params": {
-        "high": {"threshold": 2.25, "rec_rate": 1.2, "k": 0.003, "max_penalty": 0.010, "exp": 1.5},
-        "threshold": {"threshold": 2.50, "rec_rate": 1.3, "k": 0.04, "max_penalty": 0.009, "exp_k": -1.5},
-        "low": {"threshold": 2.75, "rec_rate": 1.6, "k": 0.0025, "max_penalty": 0.008}
+        "high": {"threshold": 2.75, "rec_rate": 1.25, "k": 0.0025, "max_penalty": 0.0040, "exp": 1.35},
+        "threshold": {"threshold": 3.0, "rec_rate": 1.5, "k": 0.0275, "max_penalty": 0.0040, "exp_k": -1.5},
+        "low": {"threshold": 3.5, "rec_rate": 1.6, "k": 0.0020, "max_penalty": 0.0035}
     },
 
     # ==========================================
     # 10. 事件基础演化系数 (Event Priors & Intensities) 
     # ==========================================
-    "D_t_course": 0.70,
-    "D_t_task": 0.60,
+    "D_t_course": 0.80,
+    "D_t_task": 0.55,
     "course_base_drain": 5.5,      
-    "task_base_drain": 5.5, 
+    "task_base_drain": 5.0, 
     
     "event_task": {
         "T1_exam": 1.1, "T2_ddl": 1.05, "T3_meeting": 1.0,
@@ -150,35 +150,48 @@ GLOBAL_DEFAULT_CONFIG = {
     },
     
     "event_library": {
-        "base_drain_rate": 0.72,
-        "base_stress_rate": 0.15,
-        "flow_relief_k": 0.008,
-        "max_s_step": 1.5,
+        "base_drain_rate": 0.75,
+        "base_stress_rate": 0.60,
+        "flow_relief_k": 0.020,
+        "max_s_step": 1.2,
         "focus_base": 0.95,        
-        "focus_decay_rate": 0.12,  
-        "focus_min": 0.40,         
+        "focus_decay_rate": 0.125,  
+        "focus_min": 0.45,         
         "trait_weight_base": 0.4,  
         "trait_weight_k": 0.4      
     },
+
+
     "event_meal": {
-        "C_base": 1.2,
-        "K": 10.0,
+        "A_max": 1.0,              
+        "K_half": 15.0,             
+        "hill_n": 2.0,              
+        "logistic_k": 0.15,         
+        "logistic_mid": 25.0,       
+        "logistic_min": 0.75,       
+        "time_damp_b": 0.3,         
+        "time_damp_lambda": 2.0,    
         "multiplier_normal": 1.15,
         "multiplier_late": 0.85,
         "epoc_injection": 0.5,
-        "epoc_max": 20.0,
-        "duration_accel": 1.2
+        "epoc_max": 20.0
     },
+    
     "event_nap": {
-        "C_base": 2.0,
-        "K": 10.0,
+        "A_max": 1.25,             
+        "K_half": 15.0,             
+        "hill_n": 2.0,              
+        "logistic_k": 0.15,         
+        "logistic_mid": 25.0,       
+        "logistic_min": 0.75,       
+        "time_damp_b": 0.3,         
+        "time_damp_lambda": 2.0,    
         "multiplier_proper": 1.4,
         "multiplier_short": 1.1,
         "debt_reduce_k": 2.0,
         "debt_multiplier": 1.2,
         "epoc_injection": 1.0,
-        "epoc_max": 30.0,
-        "duration_accel": 1.5
+        "epoc_max": 30.0
     },
 
     # ==========================================
@@ -195,11 +208,11 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     # 12. 细分策略统计学先验参数 (Strategy Statistical Priors)
     # ==========================================
-    "night_normal": {"rho": 0.60, "sigma": 0.25, "pull_coeff": 0.035},
-    "night_deep": {"rho": 0.80, "sigma": 0.15, "pull_coeff": 0.05},
-    "night_anxious": {"rho": 0.55, "sigma": 0.22, "pull_coeff": 0.025},
+    "night_normal": {"rho": 0.70, "sigma": 0.090, "pull_coeff": 0.035},
+    "night_deep": {"rho": 0.80, "sigma": 0.075, "pull_coeff": 0.05},
+    "night_anxious": {"rho": 0.65, "sigma": 0.10, "pull_coeff": 0.025},
     
-    "rest_relieved": {"phase_thresholds": [2.0, 5.0], "efficiency": 1.05, "noise_std": 0.12, "inertia_e_rate": -0.05},
+    "rest_relieved": {"phase_thresholds": [2.0,10.0], "efficiency": 1.05, "noise_std": 0.12, "inertia_e_rate": -0.05},
     "rest_warmup": {"phase_thresholds": [5.0, 15.0], "efficiency": 1.0, "noise_std": 0.10, "inertia_e_rate": -0.05},
     "rest_anxious": {"phase_thresholds": [10.0, 15.0], "efficiency": 0.85, "noise_std": 0.15, "inertia_e_rate": -0.06},
     "rest_burnout": {"phase_thresholds": [5.0, 10.0], "efficiency": 0.70, "noise_std": 0.04, "inertia_e_rate": -0.05},
@@ -208,10 +221,10 @@ GLOBAL_DEFAULT_CONFIG = {
     # 13. 压力敏感度曲线基准参数 (f_strategy_params)
     # ==========================================
     "f_strategy_params": {
-        "sensitive": {"base": 0.40, "max_extra": 0.70, "midpoint": 15.0, "steepness": 0.20},
-        "dull": {"base": 0.28, "threshold": 12.0, "k": 0.012},
-        "saturated": {"floor": 0.30, "max_capacity": 1.0, "decay_midpoint": 25.0, "alpha": 0.15},
-        "batterydrain": {"e_k": 0.4, "e_b": 5.0, "steepness": 0.15, "base": 0.30, "max_extra": 1.85}
+        "sensitive": {"base": 0.80, "max_extra": 0.30, "midpoint": 17.5, "steepness": 0.15},
+        "dull": {"base": 0.50, "threshold": 12.0, "k": 0.012},
+        "saturated": {"floor": 0.65, "max_capacity": 1.0, "decay_midpoint": 15.0, "alpha": 0.15},
+        "batterydrain": {"e_k": 0.15, "e_b": 2, "steepness": 0.4, "base": 0.45, "max_extra": 0.8}
     },
     
     # ==========================================
@@ -279,17 +292,13 @@ GLOBAL_DEFAULT_CONFIG = {
         "epoc_abs_e_k": 0.2,                    
         "epoc_abs_s_base": 0.08,                
         "epoc_abs_s_k": 0.05,                   
-        "momentum_beta": 0.40,                  
+        "momentum_beta": 0.10,                  
         "concurrent_log_base": 0.3,             
         "energy_exhaustion_threshold": 20.0,   
 
         "buffer_decay_rate": 0.05,           
         "basal_drain_rate": 0.415,           
-        "lorentzian_floor_E": 15.0,          
-        
-        "momentum_beta": 0.40,                  
-        "concurrent_log_base": 0.3,             
-        "energy_exhaustion_threshold": 20.0
+        "lorentzian_floor_E": 15.0,
     },
 
     # ==========================================
@@ -309,9 +318,9 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     "habituation_params": {
         "decay_model": "hyperbolic",  
-        "floor_mu_course": 0.40,       
+        "floor_mu_course": 0.35,       
         "floor_mu_task": 0.35,         
-        "t_half_hyperbolic": 90.0      
+        "t_half_hyperbolic": 40.0      
     },
 
     # ==========================================
@@ -341,11 +350,11 @@ GLOBAL_DEFAULT_CONFIG = {
     # 21. 动态区制乘数边界 (Dynamic Regime Modifiers)
     # ==========================================
     "markov_modifiers": {
-        "friction_s_base": 1.10,         
-        "friction_s_max": 1.25,          
+        "friction_s_base": 1.05,         
+        "friction_s_max": 1.15,          
         "friction_e_base": 1.15,         
-        "flow_s_base": 0.90,             
-        "flow_s_min": 0.75,              
+        "flow_s_base": 0.95,             
+        "flow_s_min": 0.85,              
         "flow_e_base": 0.85              
     }
 }

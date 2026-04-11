@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>心理压力建模沙盒 (硬核调试版)</title>
@@ -378,11 +381,9 @@
 
 <script>
     let mockEvents = []; 
-    // 多维度屏蔽状态变量
     let shieldKeywords = []; 
-    let shieldTimeRanges = []; // 格式: [{start: "HH:MM", end: "HH:MM"}]
+    let shieldTimeRanges = []; 
 
-    // 切换前端 Mock 面板
     function toggleMockDetails() {
         const type = document.getElementById('mockType').value;
         document.getElementById('courseDetails').classList.toggle('d-none', type !== 'course');
@@ -393,13 +394,11 @@
         document.getElementById('mockError').classList.add('d-none');
     }
 
-    // 切换屏蔽类型面板
     function toggleShieldInput() {
         const type = document.getElementById('shieldType').value;
         if (type === 'keyword') {
             document.getElementById('shieldKeywordDiv').classList.remove('d-none');
             document.getElementById('shieldTimeDiv').classList.remove('d-none');
-            // 注意：上方逻辑有误，现修复为互斥
             document.getElementById('shieldTimeDiv').classList.add('d-none');
         } else {
             document.getElementById('shieldKeywordDiv').classList.add('d-none');
@@ -412,8 +411,8 @@
         document.getElementById('simDate').valueAsDate = new Date();
 
         document.getElementById('simDate').addEventListener('change', () => {
-            mockEvents = []; // 清空数据
-            renderMockList(); // 刷新 UI
+            mockEvents = []; 
+            renderMockList();
             document.getElementById('mockError').classList.add('d-none'); 
         });
         
@@ -426,7 +425,6 @@
             slider.addEventListener('change', runSimulation);
         });
 
-        // 注册：添加名称屏蔽
         document.getElementById('addShieldKeywordBtn').addEventListener('click', () => {
             const kw = document.getElementById('shieldKeyword').value.trim();
             const errBox = document.getElementById('shieldError');
@@ -444,7 +442,6 @@
             }
         });
 
-        // 注册：添加时间段屏蔽
         document.getElementById('addShieldTimeBtn').addEventListener('click', () => {
             const start = document.getElementById('shieldStart').value;
             const end = document.getElementById('shieldEnd').value;
@@ -521,12 +518,10 @@
         await loadConfig();
     });
 
-    // 渲染多维度拦截列表
     function renderShieldList() {
         const list = document.getElementById('shieldList');
         list.innerHTML = '';
         
-        // 渲染名称拦截
         shieldKeywords.forEach((kw, index) => {
             list.innerHTML += `
                 <li class="list-group-item d-flex justify-content-between align-items-center px-1 py-1 bg-transparent border-bottom border-secondary border-opacity-25">
@@ -536,7 +531,6 @@
             `;
         });
 
-        // 渲染时间段拦截
         shieldTimeRanges.forEach((tr, index) => {
             list.innerHTML += `
                 <li class="list-group-item d-flex justify-content-between align-items-center px-1 py-1 bg-transparent border-bottom border-secondary border-opacity-25">
@@ -547,7 +541,6 @@
         });
     }
 
-    // 删除拦截规则
     window.removeShield = function(type, index) {
         if(type === 'keyword') {
             shieldKeywords.splice(index, 1);
@@ -754,9 +747,14 @@
                             ? `学分: ${item.credits} | 学时: ${item.hours} | 类别: ${item.level_str}` 
                             : (item.detail && item.detail !== '-' ? item.detail : (item.weight_factor !== undefined && item.weight_factor !== '无' ? `权重: ${item.weight_factor}` : '无'));
 
+                        const collapseId = `math_${Math.random().toString(36).substr(2, 6)}`;
+                        const mathBtn = item.math_trace 
+                            ? `<button class="btn btn-sm btn-outline-secondary py-0 px-1 ms-2" type="button" data-bs-toggle="collapse" data-bs-target="#${collapseId}" title="查看动力学展开"><i class="bi bi-calculator"></i></button>` 
+                            : '';
+
                         pBody.innerHTML += `
                             <tr>
-                                <td><span class="fw-bold">${item.name}</span></td>
+                                <td><span class="fw-bold">${item.name}</span>${mathBtn}</td>
                                 <td>${typeBadge}</td>
                                 <td>${item.time}</td>
                                 <td><code class="small text-muted">${detailHtml}</code></td>
@@ -767,7 +765,26 @@
                                     ${item.e_impact > 0 ? '+' : ''}${item.e_impact.toFixed(2)}
                                 </td>
                             </tr>`;
+                            
+                            if(item.math_trace) {
+                                pBody.innerHTML += `
+                                    <tr>
+                                        <td colspan="8" class="p-0 border-0">
+                                            <div class="collapse" id="${collapseId}">
+                                                <div class="card card-body bg-light mx-2 my-1" style="font-size: 0.85rem; overflow-x: auto;">
+                                                    ${item.math_trace}
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>`;
+                            }
                     });
+
+                    if (window.MathJax) {
+                        MathJax.typesetPromise().catch(function (err) {
+                            console.error('MathJax 渲染失败:', err.message);
+                        });
+                    }
                 }
 
                 consoleBox.innerHTML = '';
