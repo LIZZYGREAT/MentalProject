@@ -2,6 +2,7 @@
 from datetime import datetime
 from typing import Tuple, List, Optional
 from event.base import BaseEvent
+from settings.model_defaults import ACTIVE_NIGHT_STATES, RECOVERY_STATES
 
 class PhysiologyStateMachine:
     """据日程与当前事件判定日/夜/睡眠等状态，并给出睡眠打断惯性增量与睡眠效率。"""
@@ -41,7 +42,7 @@ class PhysiologyStateMachine:
         ds_pen = self.fines_cfg.get("interrupt_S_penalty", 2.0)
         de_pen = self.fines_cfg.get("interrupt_E_penalty", -5.0)
         
-        if self.prev_state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] and state in ["LATE_NIGHT_ACTIVE", "NIGHT_OVERTIME"]:
+        if self.prev_state in RECOVERY_STATES and state in ACTIVE_NIGHT_STATES:
             self.sleep_interruptions += 1
             logs.append(f"[{current_time.strftime('%H:%M')}] 睡眠被打断 (第 {self.sleep_interruptions} 次)，起夜惩罚 (E{de_pen}, S+{ds_pen})")
             inertia_ds, inertia_de = ds_pen, de_pen
@@ -53,7 +54,7 @@ class PhysiologyStateMachine:
         
         if self.sleep_interruptions > 0:
             self.sleep_eff = max(eff_min, eff_base - eff_drop * (self.sleep_interruptions - 1))
-            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] and self.prev_state != state:
+            if state in RECOVERY_STATES and self.prev_state != state:
                 logs.append(f"[{current_time.strftime('%H:%M')}] 碎片化睡眠预警：入睡效率降至 {self.sleep_eff:.2f}")
 
         self.prev_state = state

@@ -2,6 +2,13 @@
 from datetime import datetime
 from typing import List, Dict, Optional
 from event.base import BaseEvent
+from algorithm.time_utils import extract_hhmm, parse_datetime_on_date, time_to_minutes
+from settings.model_defaults import (
+    DEFAULT_WAKE_TIME,
+    DEFAULT_SLEEP_TIME,
+    HIGH_LOAD_EVENT_TYPES,
+    ROUTINE_EVENT_TYPES,
+)
 
 class TimelineManager:
     """封装单日事件列表，提供作息边界解析与当前时刻活跃事件查询。"""
@@ -12,13 +19,7 @@ class TimelineManager:
 
     def _parse_time_robust(self, time_obj, current_time: datetime) -> datetime:
         """将事件的 start/end 转为当日 datetime，供区间包含判断。"""
-        if isinstance(time_obj, str):
-            t_str = time_obj.split(' ')[-1]
-            if len(t_str.split(':')) == 3:
-                t_str = t_str[:5] 
-            return datetime.strptime(f"{self.date_str} {t_str}", "%Y-%m-%d %H:%M")
-        else:
-            return time_obj.replace(year=current_time.year, month=current_time.month, day=current_time.day)
+        return parse_datetime_on_date(time_obj, self.date_str)
 
     def analyze_schedule(self) -> Dict[str, datetime]:
         """
@@ -29,31 +30,27 @@ class TimelineManager:
         morning_sleeps, night_sleeps = [], []
         
         for se in sleep_events:
-            st_str = se.start_time if isinstance(se.start_time, str) else se.start_time.strftime("%H:%M")
-            if ' ' in st_str: st_str = st_str.split(' ')[-1]
-            if int(st_str.split(':')[0]) < 12: morning_sleeps.append(se)
-            else: night_sleeps.append(se)
+            if time_to_minutes(se.start_time) < 12 * 60:
+                morning_sleeps.append(se)
+            else:
+                night_sleeps.append(se)
         
-        actual_wake_time = self.base_date.replace(hour=7, minute=30)
+        wake_h, wake_m = map(int, DEFAULT_WAKE_TIME.split(":"))
+        actual_wake_time = self.base_date.replace(hour=wake_h, minute=wake_m)
         if morning_sleeps:
-            last_se = max(morning_sleeps, key=lambda x: x.end_time if not isinstance(x.end_time, str) else x.end_time)
-            et = last_se.end_time if isinstance(last_se.end_time, str) else last_se.end_time.strftime("%H:%M")
-            if ' ' in et: et = et.split(' ')[-1]
-            actual_wake_time = datetime.strptime(f"{self.date_str} {et}", "%Y-%m-%d %H:%M")
+            last_se = max(morning_sleeps, key=lambda x: time_to_minutes(x.end_time))
+            actual_wake_time = parse_datetime_on_date(last_se.end_time, self.date_str)
             
-        actual_sleep_start = self.base_date.replace(hour=23, minute=30)
+        sleep_h, sleep_m = map(int, DEFAULT_SLEEP_TIME.split(":"))
+        actual_sleep_start = self.base_date.replace(hour=sleep_h, minute=sleep_m)
         if night_sleeps:
-            first_se = min(night_sleeps, key=lambda x: x.start_time if not isinstance(x.start_time, str) else x.start_time)
-            st = first_se.start_time if isinstance(first_se.start_time, str) else first_se.start_time.strftime("%H:%M")
-            if ' ' in st: st = st.split(' ')[-1]
-            actual_sleep_start = datetime.strptime(f"{self.date_str} {st}", "%Y-%m-%d %H:%M")
+            first_se = min(night_sleeps, key=lambda x: time_to_minutes(x.start_time))
+            actual_sleep_start = parse_datetime_on_date(first_se.start_time, self.date_str)
 
         late_night_active_end = self.base_date
-        active_loads = [e for e in self.events if e.get_event_type() in ["course", "task", "gym", "library"]]
+        active_loads = [e for e in self.events if e.get_event_type() in HIGH_LOAD_EVENT_TYPES]
         for al in active_loads:
-            et_str = al.end_time if isinstance(al.end_time, str) else al.end_time.strftime("%H:%M")
-            if ' ' in et_str: et_str = et_str.split(' ')[-1]
-            dt_et = datetime.strptime(f"{self.date_str} {et_str}", "%Y-%m-%d %H:%M")
+            dt_et = parse_datetime_on_date(al.end_time, self.date_str)
             if dt_et <= actual_wake_time:
                 late_night_active_end = max(late_night_active_end, dt_et)
 
@@ -67,7 +64,7 @@ class TimelineManager:
         """当前时刻处于区间内的 course/task/gym/library 事件列表。"""
         active = []
         for ev in self.events:
-            if ev.get_event_type() not in ["course", "task", "gym", "library"]: continue 
+            if ev.get_event_type() not in HIGH_LOAD_EVENT_TYPES: continue
             try:
                 s_dt = self._parse_time_robust(ev.start_time, current_time)
                 e_dt = self._parse_time_robust(ev.end_time, current_time)
@@ -78,7 +75,7 @@ class TimelineManager:
     def get_active_routine(self, current_time: datetime) -> Optional[BaseEvent]:
         """当前时刻处于区间内的 meal/nap/sleep/rest 之一，若无则 None。"""
         for ev in self.events:
-            if ev.get_event_type() in ["meal", "nap", "sleep", "rest"]: 
+            if ev.get_event_type() in ROUTINE_EVENT_TYPES:
                 try:
                     s_dt = self._parse_time_robust(ev.start_time, current_time)
                     e_dt = self._parse_time_robust(ev.end_time, current_time)

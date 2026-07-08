@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, Optional
 from event.base import BaseEvent
 from utils.description_score import score_description, convert_score_to_Flike
+from algorithm.high_load import HighLoadProfile, calculate_high_load_impact
+from settings.model_defaults import DEFAULT_COURSE_PROFILE, DEFAULT_INITIAL_ENERGY
 
 from entry.class_info_data import CLASS_INFO_DICT
 class_info_dict = CLASS_INFO_DICT
@@ -28,13 +30,13 @@ class CourseEvent(BaseEvent):
         
         if self.course_name and self.course_name in class_info_dict:
             course_data = class_info_dict[self.course_name]
-            if credit is None: credit = course_data.get('credits', 2.5)
-            if hours is None: hours = course_data.get('hours', 60.0)
-            if level is None: level = course_data.get('level', 'C') 
+            if credit is None: credit = course_data.get('credits', DEFAULT_COURSE_PROFILE["credits"])
+            if hours is None: hours = course_data.get('hours', DEFAULT_COURSE_PROFILE["hours"])
+            if level is None: level = course_data.get('level', DEFAULT_COURSE_PROFILE["level"])
         else:
-            if credit is None: credit = 2.5
-            if hours is None: hours = 60.0
-            if level is None: level = 'C'
+            if credit is None: credit = DEFAULT_COURSE_PROFILE["credits"]
+            if hours is None: hours = DEFAULT_COURSE_PROFILE["hours"]
+            if level is None: level = DEFAULT_COURSE_PROFILE["level"]
             
         self.credit = float(credit)
         self.hours = float(hours)
@@ -43,9 +45,7 @@ class CourseEvent(BaseEvent):
         self.metadata["hours"] = self.hours
         self.metadata["level_str"] = self.level_str
 
-        self.desc_score = score_description(self.description)
-        if self.desc_score == 5.0 and self.name:
-            self.desc_score = score_description(self.name)
+        self.desc_score = score_description(self.description, self.name)
         self.F_like = convert_score_to_Flike(self.desc_score)
         
         try:
@@ -83,12 +83,15 @@ class CourseEvent(BaseEvent):
         ratio = self.credit / max(1.0, self.hours)
         I_basic = math.sqrt(ratio) * L_value * 2.5
         
-        time_weights = user.get_param("time_weights", {})
-        T_weight = 1.0
-        for (start_h, end_h), weight in time_weights.items():
-            if start_h <= self.start_hour < end_h:
-                T_weight = weight
-                break
+        if hasattr(user.course_strategy, "get_time_weight"):
+            T_weight = user.course_strategy.get_time_weight(self.start_hour)
+        else:
+            time_weights = user.get_param("time_weights", {})
+            T_weight = 1.0
+            for (start_h, end_h), weight in time_weights.items():
+                if start_h <= self.start_hour < end_h:
+                    T_weight = weight
+                    break
                 
         time_prefs = user.get_time_preferences()
         P_weight = 1.0
@@ -109,7 +112,7 @@ class CourseEvent(BaseEvent):
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
         """兼容接口：内部用 time_step 调 dual 仅取 dS。"""
         time_step = user.get_param("time_step", 5)
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, time_step)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -124,68 +127,34 @@ class CourseEvent(BaseEvent):
             self.metadata["detail"] = f"CIS:{cis_score:.1f}|Flike:{self.F_like:.1f}|E:{current_energy:.1f}"
             self.metadata["weight_factor"] = f"({self.get_fatigue_weight():.2f})"
 
-        K_resilience = user.get_param("K_resilience", 1.0)
-        # [修改点] 修复键名，读取真实的 7.5 基准耗能
-        base_course_drain = user.get_param("course_base_drain", 7.5)
-        
-        f_debt_drain = 1.0 + 0.1 * user.get_sleep_debt()
-        f_circadian_drain = 1.0
-        if current_time.hour >= 22 or current_time.hour < 6:
-            f_circadian_drain = 1.5
-            
-        # [修改点] 将经过时间 t_elapsed 提前计算，用于生成疲劳加速系数
-        try:
-            if isinstance(self.start_time, str):
-                st_time_str = self.start_time.split(' ')[-1]
-                if len(st_time_str.split(':')) == 3: st_time_str = st_time_str[:5]
-                st_dt = datetime.strptime(f"{current_time.strftime('%Y-%m-%d')} {st_time_str}", "%Y-%m-%d %H:%M")
-            else:
-                st_dt = self.start_time
-            t_elapsed = (current_time - st_dt).total_seconds() / 60.0
-            t_elapsed = max(0.0, t_elapsed)
-        except Exception:
-            t_elapsed = 0.0
-
-        # 每小时增加一定比例的精力消耗
-        fatigue_acc_k = user.get_param("fatigue_acceleration_k", 0.15)
-        acc_multiplier = 1.0 + fatigue_acc_k * (t_elapsed / 60.0)
-        
-        # 叠加加速系数计算线性消耗率
-        linear_drain_rate = (base_course_drain * cis_score * acc_multiplier) / K_resilience
-        
-        f_drain_modifier = 1.0
-        if hasattr(user.course_strategy, 'get_energy_drain_modifier'):
-            f_drain_modifier = user.course_strategy.get_energy_drain_modifier(current_energy)
-        
-        delta_E = -linear_drain_rate * f_drain_modifier * f_debt_drain * f_circadian_drain * (time_step / 60.0)
-
-        D_t = user.get_param("D_t_course", 0.80)
-        S_star = user.get_param("S_star_init", 50.0)
-        
-        f_s_val = user.course_strategy.f_s(current_stress, current_energy, S_star, step_noise_s=step_noise_s)
-        
-        z_awake = user.get_param("Z_awake", 0.5)
-        z_factor = user.get_param("Z_factor", 0.5)
-        z_raw = z_awake * z_factor
-        z_log_mapped = 0.8 + 0.4 * (math.log1p(z_raw) / math.log(2.0))
-        
-        habit_cfg = user.get_param("habituation_params", {})
-        mu = habit_cfg.get("floor_mu_course", 0.40)
-        t_half = habit_cfg.get("t_half_hyperbolic", 90.0)
-
-        Theta_t = mu + (1.0 - mu) * (t_half / (t_half + t_elapsed))
-        
-        S_dot = f_s_val * cis_score * D_t * z_log_mapped * Theta_t
-        delta_S = S_dot * (time_step / 5.0)
+        profile = HighLoadProfile(
+            load_weight=cis_score,
+            d_t_key="D_t_course",
+            d_t_default=0.80,
+            base_drain_key="course_base_drain",
+            base_drain_default=5.5,
+            habit_floor_key="floor_mu_course",
+            trace_label="CIS",
+        )
+        delta_S, delta_E, trace = calculate_high_load_impact(
+            user=user,
+            current_stress=current_stress,
+            current_energy=current_energy,
+            current_time=current_time,
+            time_step=time_step,
+            event_start_time=self.start_time,
+            profile=profile,
+            step_noise_s=step_noise_s,
+        )
 
         if not is_substep:
             if "math_trace" not in self.metadata:
                 trace_str = (
-                    f"$$S_{{dot}} = D_t({D_t:.2f}) \\cdot CIS({cis_score:.2f}) \\cdot f_s({f_s_val:.2f}) "
-                    f"\\cdot Z_{{env}}({z_log_mapped:.2f}) \\cdot \\Theta({Theta_t:.2f}) = {S_dot:.3f}$$<br>"
+                    f"$$S_{{dot}} = D_t({trace['D_t']:.2f}) \\cdot CIS({cis_score:.2f}) \\cdot f_s({trace['f_s']:.2f}) "
+                    f"\\cdot Z_{{env}}({trace['Z_env']:.2f}) \\cdot \\Theta({trace['Theta']:.2f}) \\cdot f_{{debtS}}({trace['f_debt_stress']:.2f}) = {trace['S_dot']:.3f}$$<br>"
                     f"$$\\Delta S = S_{{dot}} \\cdot \\left(\\frac{{{time_step}}}{{5.0}}\\right) = {delta_S:.3f}$$<br>"
-                    f"$$E_{{dot}} = -\\frac{{Base({base_course_drain:.1f}) \\cdot CIS({cis_score:.2f}) \\cdot Acc({acc_multiplier:.2f})}}{{K_{{res}}({K_resilience:.1f})}} "
-                    f"\\cdot f_{{drain}}({f_drain_modifier:.2f}) \\cdot f_{{debt}}({f_debt_drain:.2f}) \\cdot f_{{cir}}({f_circadian_drain:.2f})$$<br>"
+                    f"$$E_{{dot}} = -\\frac{{Base({trace['base_drain']:.1f}) \\cdot CIS({cis_score:.2f}) \\cdot Acc({trace['acc_multiplier']:.2f})}}{{K_{{res}}({trace['K_resilience']:.1f})}} "
+                    f"\\cdot f_{{drain}}({trace['f_drain_modifier']:.2f}) \\cdot f_{{debt}}({trace['f_debt_drain']:.2f}) \\cdot f_{{cir}}({trace['f_circadian_drain']:.2f})$$<br>"
                     f"$$\\Delta E = E_{{dot}} \\cdot \\left(\\frac{{{time_step}}}{{60.0}}\\right) = {delta_E:.3f}$$"
                 )
                 self.metadata["math_trace"] = trace_str

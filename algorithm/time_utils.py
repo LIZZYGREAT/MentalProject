@@ -1,0 +1,96 @@
+"""Shared time parsing and interval helpers for event and schedule logic."""
+
+from datetime import datetime
+from typing import Any, Optional, Tuple
+
+from settings.model_defaults import (
+    DEFAULT_DATE_FORMAT,
+    DEFAULT_TIME_FORMAT,
+    MIN_EVENT_DURATION_MINUTES,
+)
+
+
+def extract_hhmm(value: Any, fallback: str = "00:00") -> str:
+    """Extract an ``HH:MM`` string from a datetime-like value."""
+    if isinstance(value, datetime):
+        return value.strftime(DEFAULT_TIME_FORMAT)
+    if value is None:
+        return fallback
+
+    text = str(value).strip()
+    if not text:
+        return fallback
+    text = text.split(" ")[-1]
+    parts = text.split(":")
+    if len(parts) >= 2:
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    return fallback
+
+
+def time_to_minutes(value: Any, fallback: str = "00:00") -> int:
+    """Convert a time value to minutes from midnight."""
+    hhmm = extract_hhmm(value, fallback=fallback)
+    hour, minute = map(int, hhmm.split(":"))
+    return hour * 60 + minute
+
+
+def minutes_to_hhmm(minutes: int) -> str:
+    """Convert minutes from midnight to a normalized ``HH:MM`` string."""
+    minutes = int(minutes) % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def parse_datetime_on_date(value: Any, date_str: str, fallback: str = "00:00") -> datetime:
+    """Parse a datetime or time string on the requested simulation date."""
+    if isinstance(value, datetime):
+        base = datetime.strptime(date_str, DEFAULT_DATE_FORMAT)
+        return value.replace(year=base.year, month=base.month, day=base.day)
+    hhmm = extract_hhmm(value, fallback=fallback)
+    return datetime.strptime(f"{date_str} {hhmm}", f"{DEFAULT_DATE_FORMAT} {DEFAULT_TIME_FORMAT}")
+
+
+def interval_minutes(start: Any, end: Any, default: float = 30.0) -> float:
+    """Return duration in minutes, treating negative spans as crossing midnight."""
+    try:
+        if isinstance(start, datetime) and isinstance(end, datetime):
+            minutes = (end - start).total_seconds() / 60.0
+        else:
+            minutes = time_to_minutes(end) - time_to_minutes(start)
+        if minutes < 0:
+            minutes += 24 * 60
+        return max(MIN_EVENT_DURATION_MINUTES, float(minutes))
+    except Exception:
+        return max(MIN_EVENT_DURATION_MINUTES, float(default))
+
+
+def elapsed_minutes(start: Any, current_time: datetime, default: float = 0.0) -> float:
+    """Return minutes elapsed from event start to current time on the same day."""
+    try:
+        if isinstance(start, datetime):
+            start_dt = start.replace(
+                year=current_time.year,
+                month=current_time.month,
+                day=current_time.day,
+            )
+        else:
+            start_dt = datetime.strptime(
+                f"{current_time.strftime(DEFAULT_DATE_FORMAT)} {extract_hhmm(start)}",
+                f"{DEFAULT_DATE_FORMAT} {DEFAULT_TIME_FORMAT}",
+            )
+        minutes = (current_time - start_dt).total_seconds() / 60.0
+        if minutes < 0:
+            minutes += 24 * 60
+        return max(0.0, minutes)
+    except Exception:
+        return default
+
+
+def overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    """Return whether two same-day time intervals overlap."""
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def normalize_interval(start: Any, end: Any) -> Tuple[str, str]:
+    """Return normalized start and end ``HH:MM`` strings."""
+    return extract_hhmm(start), extract_hhmm(end)
+

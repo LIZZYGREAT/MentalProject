@@ -4,6 +4,8 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from event.base import BaseEvent
+from algorithm.physiology import clamp_delta_to_stress_floor, hourly_scale, step_scale
+from settings.model_defaults import DEFAULT_INITIAL_ENERGY
 
 class GymEvent(BaseEvent):
     """
@@ -31,7 +33,7 @@ class GymEvent(BaseEvent):
     
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
         time_step = user.get_param("time_step", 5)
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, time_step)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -57,7 +59,7 @@ class GymEvent(BaseEvent):
         stress_gap = max(0.0, current_stress - S_star)
         
         relief_factor = gym_cfg.get("relief_factor", 0.02) * self.intensity 
-        delta_S = -relief_factor * stress_gap * (time_step / 5.0) + noise_s
+        delta_S = -relief_factor * stress_gap * step_scale(time_step) + noise_s
         
         base_gym_drain = gym_cfg.get("drain_rate", 5.5)
         drain_rate = base_gym_drain * self.intensity / K_resilience
@@ -66,17 +68,16 @@ class GymEvent(BaseEvent):
         if hasattr(user.course_strategy, 'get_energy_drain_modifier'):
             f_drain_modifier = user.course_strategy.get_energy_drain_modifier(current_energy)
             
-        delta_E = -drain_rate * f_drain_modifier * (time_step / 60.0) + noise_e
+        delta_E = -drain_rate * f_drain_modifier * hourly_scale(time_step) + noise_e
 
-        if current_stress + delta_S < S_star - 5.0:
-            delta_S = max(delta_S, (S_star - 5.0) - current_stress)
+        delta_S = clamp_delta_to_stress_floor(current_stress, delta_S, S_star)
             
         if not is_substep:
             epoc_base = gym_cfg.get("epoc_base", 1.5)
             epoc_k = gym_cfg.get("epoc_k", 2.0)
-            epoc_rate = user.get_param("gym_epoc_rate", 0.05)
+            epoc_rate = gym_cfg.get("epoc_rate", user.get_param("gym_epoc_rate", 0.05))
             
-            buff_add = (epoc_base + epoc_k * self.intensity + epoc_rate) * (time_step / 5.0)
+            buff_add = (epoc_base + epoc_k * self.intensity + epoc_rate) * step_scale(time_step)
             user.epoc_level = min(100.0, getattr(user, 'epoc_level', 0.0) + buff_add)
 
             if "math_trace" not in self.metadata:

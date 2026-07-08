@@ -299,6 +299,7 @@ class CourseStrategy(BaseStrategy):
         self.C_strategy = self._create_C_strategy(C_strategy_type, self.params)
         self.time_preferences = time_preferences
         self.last_penalty_trace = ""
+        self.time_weights = {}
         self._setup_time_strategy()
     
     def _create_f_strategy(self, strategy_type: str, params: Dict[str, Any]):
@@ -319,7 +320,10 @@ class CourseStrategy(BaseStrategy):
         return mapping.get(strategy_type.lower(), HighPenalty)(params)
     
     def _setup_time_strategy(self):
-        combined = {(8,10):1.0, (10,12):1.0, (12,14):1.0, (14,16):1.0, (16,18):1.0, (18,20):1.0, (20,24):1.0}
+        combined = dict(self.params.get("time_weights", {
+            (8, 10): 1.0, (10, 12): 1.0, (12, 14): 1.0,
+            (14, 16): 1.0, (16, 18): 1.0, (18, 20): 1.0, (20, 24): 1.0,
+        }))
         pref_cfg = self.params.get("time_pref_weights", {})
         for pref in self.time_preferences:
             pref_key = pref.lower()
@@ -331,7 +335,14 @@ class CourseStrategy(BaseStrategy):
                         combined[(a, b)] = v
                     elif isinstance(k_str, tuple):
                         combined[k_str] = v
-        self.params["time_weights"] = combined
+        self.time_weights = combined
+
+    def get_time_weight(self, hour: int) -> float:
+        """Return the preference-adjusted time weight for an event start hour."""
+        for (start_h, end_h), weight in self.time_weights.items():
+            if start_h <= hour < end_h:
+                return weight
+        return 1.0
     
     def f_s(self, S: float, E: float, S_star: float = None, step_noise_s: float = 0.0) -> float:
         """

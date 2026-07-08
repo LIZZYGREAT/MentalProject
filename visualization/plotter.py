@@ -9,6 +9,20 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 from entry.config import GLOBAL_DEFAULT_CONFIG
+from settings.model_defaults import (
+    DEFAULT_ENERGY_CRITICAL,
+    DEFAULT_INITIAL_ENERGY,
+    DEFAULT_STRESS_THRESHOLD,
+    MIN_PLOT_Y_RANGE,
+)
+from settings.visual_defaults import (
+    EVENT_COLOR_MAP,
+    EVENT_LABEL_Y_OFFSETS,
+    E_PANEL_HEIGHT_RATIO,
+    FIGSIZE,
+    PLOT_DPI,
+    S_PANEL_HEIGHT_RATIO,
+)
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei']
@@ -21,16 +35,22 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
     params = params or GLOBAL_DEFAULT_CONFIG
     times = [datetime.strptime(r["time"], "%H:%M") for r in results]
     S_values = [r["S"] for r in results]
-    E_values = [r.get("E", 100.0) for r in results] 
+    E_values = [r.get("E", DEFAULT_INITIAL_ENERGY) for r in results]
 
-    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(14, 9), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+    fig, (ax1, ax3) = plt.subplots(
+        2,
+        1,
+        figsize=FIGSIZE,
+        sharex=True,
+        gridspec_kw={'height_ratios': [S_PANEL_HEIGHT_RATIO, E_PANEL_HEIGHT_RATIO]},
+    )
     
     # === 上图：压力 S ===
     ax1.plot(times, S_values, color="royalblue", linewidth=2.5, label="压力值 S(t)")
     if S_star:
         ax1.axhline(y=S_star, color="gray", linestyle=":", linewidth=1.5, label=f"平衡值 S*={S_star}")
     
-    S_thresh = params.get("S_threshold", 85.0)
+    S_thresh = params.get("S_threshold", DEFAULT_STRESS_THRESHOLD)
     ax1.axhline(y=S_thresh, color="red", linestyle="--", linewidth=1.5, label=f"报警阈值={S_thresh}")
     
     min_s_val = min(S_values) if S_values else 0
@@ -38,7 +58,7 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
     
     y_lower_limit = max(0, min_s_val - 10)
     y_range = max_s_val - y_lower_limit
-    if y_range < 10: y_range = 10
+    if y_range < MIN_PLOT_Y_RANGE: y_range = MIN_PLOT_Y_RANGE
     
     y_upper_limit = max_s_val + y_range * 0.45
     if y_upper_limit < S_thresh + 10:
@@ -54,18 +74,6 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
 
     # === 事件色块渲染 ===
     if events:
-        color_map = {
-            "course": ("#4169E1", "课程"),   # 皇家蓝
-            "task": ("#DC143C", "任务"),     # 猩红色
-            "sleep": ("#191970", "睡眠"),    # 午夜蓝
-            "nap": ("#20B2AA", "午休"),      # 浅海绿
-            "meal": ("#3CB371", "就餐"),     # 中海绿
-            "rest": ("#BDB76B", "休息"),     # 暗卡其
-            "gym": ("#FF8C00", "运动"),      # 深橙色
-            "library": ("#8A2BE2", "自习")   # 蓝紫色
-        }
-        relative_y_offsets = [0.95, 0.86]  
-        
         for i, ev in enumerate(events):
             try:
                 st_str = ev.start_time if isinstance(ev.start_time, str) else ev.start_time.strftime("%H:%M")
@@ -87,14 +95,14 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
                 if not name or name == "未知": 
                     name = "常规事件"
                 
-                color, type_name = color_map.get(ev_type, ("#7f7f7f", "其他"))
+                color, type_name = EVENT_COLOR_MAP.get(ev_type, ("#7f7f7f", "其他"))
                 alpha_val = 0.3 if ev_type == "sleep" else 0.2
                 
                 ax1.axvspan(st, et, color=color, alpha=alpha_val)
                 ax3.axvspan(st, et, color=color, alpha=alpha_val)
                 
                 mid_time = st + (et - st) / 2
-                y_pos = relative_y_offsets[i % 2]
+                y_pos = EVENT_LABEL_Y_OFFSETS[i % len(EVENT_LABEL_Y_OFFSETS)]
                 label = f"[{type_name}] {name}\n{st_str}-{et_str}"
                 
                 ax1.text(mid_time, y_pos, label, transform=trans, ha='center', va='top', fontsize=9,
@@ -152,7 +160,7 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
 
     # === 下图：精力 E ===
     ax3.plot(times, E_values, color="mediumseagreen", linewidth=2.5, label="认知精力 E(t)")
-    E_crit = params.get("E_critical", 20.0)
+    E_crit = params.get("E_critical", DEFAULT_ENERGY_CRITICAL)
     ax3.axhline(y=E_crit, color="crimson", linestyle="-.", linewidth=1.5, label=f"耗竭阈值={E_crit}")
     ax3.fill_between(times, 0, E_crit, color="red", alpha=0.1)
     
@@ -184,7 +192,7 @@ def get_plot_image_base64(results, confidence_series, alerts, params=None, S_sta
     try:
         fig = _draw_core_plot(results, confidence_series, alerts, params, S_star, events, is_web=True)
         img = io.BytesIO()
-        plt.savefig(img, format='png', bbox_inches='tight', dpi=120)
+        plt.savefig(img, format='png', bbox_inches='tight', dpi=PLOT_DPI)
         plt.close(fig) 
         img.seek(0)
         return base64.b64encode(img.getvalue()).decode('utf-8')

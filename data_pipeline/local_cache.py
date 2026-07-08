@@ -1,10 +1,14 @@
 # data_pipeline/local_cache.py
 import os
 import json
+from settings.model_defaults import (
+    BASE_DATA_DIR,
+    CALENDAR_DATA_DIR_NAME,
+    STRESS_RECORDS_FILE,
+)
 
-BASE_DATA_DIR = "data"
-STRESS_DATA_FILE = os.path.join(BASE_DATA_DIR, "stress_records.json")
-CALENDAR_DATA_DIR = os.path.join(BASE_DATA_DIR, "calendar_data")
+STRESS_DATA_FILE = os.path.join(BASE_DATA_DIR, STRESS_RECORDS_FILE)
+CALENDAR_DATA_DIR = os.path.join(BASE_DATA_DIR, CALENDAR_DATA_DIR_NAME)
 
 def ensure_directory(directory):
     if not os.path.exists(directory):

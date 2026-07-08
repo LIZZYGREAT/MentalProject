@@ -1,5 +1,12 @@
 # alert_monitor.py
 from typing import List, Dict, Tuple
+from settings.model_defaults import (
+    DEFAULT_ENERGY_CRITICAL,
+    DEFAULT_INITIAL_ENERGY,
+    DEFAULT_INITIAL_STRESS,
+    DEFAULT_STRESS_THRESHOLD,
+    RECOVERY_STATES,
+)
 
 class AlertMonitor:
     """
@@ -11,8 +18,8 @@ class AlertMonitor:
         参数 params: 全局配置字典，需含 S_threshold、S_star_init、alert_thresholds 等。
         """
         self.params = params
-        self.S_thresh = params.get("S_threshold", 95.0)
-        self.S_star = params.get("S_star_init", 50.0)
+        self.S_thresh = params.get("S_threshold", DEFAULT_STRESS_THRESHOLD)
+        self.S_star = params.get("S_star_init", DEFAULT_INITIAL_STRESS)
         
         alert_cfg = params.get("alert_thresholds", {})
         self.auc_limit = alert_cfg.get("auc_limit", 100.0)
@@ -20,9 +27,10 @@ class AlertMonitor:
         self.warning_buffer_ratio = alert_cfg.get("warning_buffer_ratio", 0.20)
         self.auc_orange = alert_cfg.get("auc_orange", 80.0)
         self.auc_yellow = alert_cfg.get("auc_yellow", 50.0)
-        self.E_danger = alert_cfg.get("E_danger", 25.0)
+        self.E_danger = alert_cfg.get("E_danger", DEFAULT_ENERGY_CRITICAL)
         self.auc_increase_step = alert_cfg.get("auc_increase_step", 1.5)
         self.auc_decay_step = alert_cfg.get("auc_decay_step", 2.5)
+        self.sleep_auc_decay_step = alert_cfg.get("sleep_auc_decay_step", 5.0)
         
         # 计算抗压缓冲带
         self.buffer_zone = max(10.0, self.S_thresh - self.S_star)
@@ -40,7 +48,7 @@ class AlertMonitor:
         
         for row in results:
             S = row.get("S", 0.0)
-            E = row.get("E", 100.0)
+            E = row.get("E", DEFAULT_INITIAL_ENERGY)
             state = row.get("state", "UNKNOWN")
             time_str = row.get("time", "00:00")
             delta_S = row.get("delta_S", 0.0)
@@ -49,8 +57,8 @@ class AlertMonitor:
             dominant_stressors = row.get("dominant_stressors", [])
             
             # 1. 睡眠状态：降温并重置报警阶梯
-            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
-                auc_level = max(0.0, auc_level - 5.0) 
+            if state in RECOVERY_STATES:
+                auc_level = max(0.0, auc_level - self.sleep_auc_decay_step)
                 current_alert_tier = 0  
                 confidence_series.append(0.0)
                 continue
@@ -167,7 +175,7 @@ class AlertMonitor:
         if results and current_alert_tier < 3:
             last_row = results[-1]
             last_S = last_row.get("S", 0.0)
-            last_E = last_row.get("E", 100.0)
+            last_E = last_row.get("E", DEFAULT_INITIAL_ENERGY)
             last_state = last_row.get("state", "UNKNOWN")
             last_time = last_row.get("time", "00:00")
             last_ch = last_row.get("continuous_hours", 0.0)

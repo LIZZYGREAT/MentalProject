@@ -10,6 +10,19 @@ from utils.alert_monitor import AlertMonitor
 from core_engine.timeline_manager import TimelineManager
 from core_engine.state_machine import PhysiologyStateMachine
 from core_engine.markov_predictor import MarkovRegimePredictor
+from algorithm.integration import rk4_step
+from algorithm.micro_dynamics import (
+    MicroDynamicState,
+    apply_micro_dynamics,
+    trigger_epiphany_refund,
+)
+from algorithm.physiology import clamp_energy, clamp_stress
+from settings.model_defaults import (
+    DEFAULT_INITIAL_ENERGY,
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_TIME_STEP_MINUTES,
+    RECOVERY_STATES,
+)
 
 class RestSession:
     """跟踪离开高负荷后的连续休息时长，供连续负荷惩罚恢复率使用。"""
@@ -27,13 +40,13 @@ class RestSession:
 
 class Simulator:
     """按 time_step 分钟推进一日，RK4 积分 S/E，叠加热区制、微观缓冲池与事件画像聚合。"""
-    def __init__(self, user: User, time_step: int = 5):
+    def __init__(self, user: User, time_step: int = DEFAULT_TIME_STEP_MINUTES):
         """
         参数 user: 提供参数与策略；time_step: 积分步长（分钟），缺省读 user.params['time_step']。
         """
         self.user = user
-        self.time_step = time_step or self.user.get_param("time_step", 5)
-        seed = int(self.user.get_param("random_seed", 42))
+        self.time_step = time_step or self.user.get_param("time_step", DEFAULT_TIME_STEP_MINUTES)
+        seed = int(self.user.get_param("random_seed", DEFAULT_RANDOM_SEED))
         self.predictor = MarkovRegimePredictor(seed=seed, params=self.user.params)
 
     def update_user(self, user: User) -> None:
@@ -93,7 +106,7 @@ class Simulator:
             components.append((routine_ev.event_id, ds, de))
             
         else:
-            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
+            if state in RECOVERY_STATES:
                 # 睡眠策略锁定噪声应用
                 ds, de = self.user.night_strategy.calculate_step(
                     S_temp, E_temp, current_time, self.time_step, elapsed_mins, 
@@ -146,13 +159,13 @@ class Simulator:
         macro_interval = macro_cfg.get("regime_check_interval", 25)
             
         if prev_S_end is None:
-            seed_val = int(self.user.get_param("random_seed", 42))
+            seed_val = int(self.user.get_param("random_seed", DEFAULT_RANDOM_SEED))
             rng_start = np.random.RandomState((seed_val + sum(ord(c) for c in date_str)) % (2**32 - 1))
             S = S_star + abs(rng_start.normal(0.0, S_star * 0.2))
         else:
             S = prev_S_end
 
-        E = prev_E_end if prev_E_end is not None else 100.0
+        E = prev_E_end if prev_E_end is not None else DEFAULT_INITIAL_ENERGY
 
         timeline = TimelineManager(events, date_str)
         schedule = timeline.analyze_schedule()
@@ -170,13 +183,8 @@ class Simulator:
         wake_s, wake_recorded = S, False
         is_penalizing, energy_exhausted = False, False
 
-        # 微观化学离散状态池
-        energy_buffer = 0.0           
-        friction_excess_stress = 0.0  
-        dopamine_buffer = 0.0         
-        momentum_S_1 = 0.0            
-        momentum_S_2 = 0.0            
-        beta_momentum = micro_cfg.get("momentum_beta", 0.40)
+        # 微观化学离散状态池，具体释放/吸收规则在 algorithm.micro_dynamics。
+        micro_state = MicroDynamicState()
         exhaustion_th = micro_cfg.get("energy_exhaustion_threshold", 20.0)
 
         prev_active_event_ids = set()
@@ -184,7 +192,7 @@ class Simulator:
         
         # 统一由 Predictor 的 RNG 负责生成所有随机源，确保可复现性
         date_hash = sum(ord(c) for c in date_str)
-        rng_seed_val = int(self.user.get_param("random_seed", 42))
+        rng_seed_val = int(self.user.get_param("random_seed", DEFAULT_RANDOM_SEED))
         self.predictor.rng = np.random.RandomState((rng_seed_val + date_hash + 999) % (2**32 - 1))
 
         static_f_strategy = self.user.get_f_strategy()
@@ -224,7 +232,7 @@ class Simulator:
 
             # 马尔可夫预测触发判定
             trigger_reason = None
-            if state not in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
+            if state not in RECOVERY_STATES:
                 if prev_active_event_ids != current_active_ids:
                     trigger_reason = "任务切变中断"
                 elif E < exhaustion_th and not energy_exhausted:
@@ -253,11 +261,11 @@ class Simulator:
                     trace_logs.append(f"[{cur_str}] [{new_regime}] 区制跳跃: {old_regime} -> {new_regime} (Φ={phi_val:.2f}, 风险={p_jump_val:.1f}%)")
                     
                     if old_regime == "FRICTION" and new_regime == "FLOW":
-                        refund_ratio = micro_cfg.get("epiphany_refund_ratio", 0.8)
-                        refund = min(friction_excess_stress * refund_ratio, 8.0) 
-                        total_dopamine = micro_cfg.get("epiphany_base_bonus", 2.0) + refund + max(0.0, static_resilience) * 1.5
-                        dopamine_buffer += total_dopamine
-                        friction_excess_stress = 0.0 
+                        total_dopamine = trigger_epiphany_refund(
+                            micro_state,
+                            micro_cfg,
+                            static_resilience,
+                        )
                         trace_logs.append(f"[{cur_str}] [认知破局] 顿悟触发，释放 {total_dopamine:.1f} 入池")
             else:
                 minutes_since_last_macro_check += self.time_step
@@ -272,100 +280,77 @@ class Simulator:
                 self._init_profiles(active_high_loads, event_profile)
             else:
                 if state == "DAY_ACTIVE":
-                    if (current_time - last_load_end_time).total_seconds() / 60.0 >= 5.0:
+                    rest_delay = micro_cfg.get("rest_penalty_recovery_delay", 5.0)
+                    if (current_time - last_load_end_time).total_seconds() / 60.0 >= rest_delay:
                         continuous_load_hours = max(0.0, continuous_load_hours - (self.time_step / 60.0) * self.user.course_strategy.get_penalty_recovery_rate())
                     rest_session.tick(self.time_step)
                 
                 if routine_ev:
                     self._init_profiles([routine_ev], event_profile)
 
-            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] or (routine_ev and routine_ev.get_event_type() == "sleep"):
+            if state in RECOVERY_STATES or (routine_ev and routine_ev.get_event_type() == "sleep"):
                 sleep_elapsed_minutes += self.time_step
             else:
                 sleep_elapsed_minutes = 0.0
 
             # --- RK4 积分，全子步共享相同的锁定噪声 ---
-            k1_S, k1_E, base_ds_k1, f_pen_k1, k1_comp = self._evaluate_derivatives(
-                S, E, current_time, active_high_loads, routine_ev, state, 
-                sleep_elapsed_minutes, continuous_load_hours, state_machine.sleep_eff, 
-                micro_cfg, step_noise_s=current_step_noise_s, step_noise_e=current_step_noise_e, is_substep=False
-            )
-            
-            mid_time = current_time + timedelta(minutes=self.time_step/2.0)
-            k2_S, k2_E, _, _, _ = self._evaluate_derivatives(
-                S + k1_S/2, E + k1_E/2, mid_time, active_high_loads, routine_ev, state, 
-                sleep_elapsed_minutes + self.time_step/2.0, continuous_load_hours, 
-                state_machine.sleep_eff, micro_cfg, step_noise_s=current_step_noise_s, step_noise_e=current_step_noise_e, is_substep=True
-            )
-            
-            k3_S, k3_E, _, _, _ = self._evaluate_derivatives(
-                S + k2_S/2, E + k2_E/2, mid_time, active_high_loads, routine_ev, state, 
-                sleep_elapsed_minutes + self.time_step/2.0, continuous_load_hours, 
-                state_machine.sleep_eff, micro_cfg, step_noise_s=current_step_noise_s, step_noise_e=current_step_noise_e, is_substep=True
-            )
-            
-            end_time = current_time + timedelta(minutes=self.time_step)
-            k4_S, k4_E, _, _, _ = self._evaluate_derivatives(
-                S + k3_S, E + k3_E, end_time, active_high_loads, routine_ev, state, 
-                sleep_elapsed_minutes + self.time_step, continuous_load_hours, 
-                state_machine.sleep_eff, micro_cfg, step_noise_s=current_step_noise_s, step_noise_e=current_step_noise_e, is_substep=True
-            )
-            
-            delta_S = (k1_S + 2*k2_S + 2*k3_S + k4_S) / 6.0
-            delta_E = (k1_E + 2*k2_E + 2*k3_E + k4_E) / 6.0
-
-            # 离散微观池处理
-            if routine_ev and routine_ev.get_event_type() in ["meal", "nap"] and delta_E > 0:
-                energy_buffer += delta_E
-                delta_E = 0.0 
-
-            if self.predictor.current_regime == "FRICTION":
-                friction_excess_stress += max(0.0, delta_S - base_ds_k1)
-            else:
-                friction_excess_stress = max(0.0, friction_excess_stress - 0.2 * (self.time_step / 5.0))
-
-            if dopamine_buffer > 0:
-                release = min(dopamine_buffer, 0.15 * (self.time_step / 5.0)) 
-                dopamine_buffer -= release
-                delta_S -= release         
-                delta_E += release * 0.4   
-                if dopamine_buffer <= 0.01: trace_logs.append(f"[{cur_str}] 多巴胺代谢完毕。")
-
-            delta_S, delta_E = self._apply_epoc_absorption(state, has_high_load, delta_S, delta_E, trace_logs, cur_str, static_resilience)
-            delta_S += inertia_ds
-            delta_E += inertia_de
-
-            # AR(1) 平滑滤波器
-            is_physiological_rest = state in ["RECOVERY_SLEEP", "NIGHT_SLEEP", "ROUTINE_MAINTENANCE"] or (state == "DAY_ACTIVE" and not has_high_load)
-            if not is_physiological_rest:
-                momentum_S_1 = beta_momentum * momentum_S_1 + (1.0 - beta_momentum) * delta_S
-                momentum_S_2 = beta_momentum * momentum_S_2 + (1.0 - beta_momentum) * momentum_S_1
-                final_S_step = momentum_S_2  
-                momentum_trace = (
-                    f"$$ AR1(Filter): S'_{{m1}} = {beta_momentum:.2f}S_{{m1}} + {1.0-beta_momentum:.2f}\\Delta S_{{in}} = {momentum_S_1:.3f} $$<br>"
-                    f"$$ S'_{{m2}} = {beta_momentum:.2f}S_{{m2}} + {1.0-beta_momentum:.2f}S'_{{m1}} = {final_S_step:.3f} $$"
+            def evaluate_for_rk4(stress_temp, energy_temp, sample_time, elapsed_for_step, is_substep):
+                return self._evaluate_derivatives(
+                    stress_temp,
+                    energy_temp,
+                    sample_time,
+                    active_high_loads,
+                    routine_ev,
+                    state,
+                    elapsed_for_step,
+                    continuous_load_hours,
+                    state_machine.sleep_eff,
+                    micro_cfg,
+                    step_noise_s=current_step_noise_s,
+                    step_noise_e=current_step_noise_e,
+                    is_substep=is_substep,
                 )
-            else:
-                momentum_S_1 = momentum_S_2 = final_S_step = delta_S
-                momentum_trace = ""
 
-            # 精力池与高度耦合的基础代谢更新
-            decay_rate = micro_cfg.get("buffer_decay_rate", 0.05)
-            buffer_release = energy_buffer * (1.0 - math.exp(-decay_rate * self.time_step))
-            energy_buffer -= buffer_release
-            
-            if state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"]:
-                basal_drain = 0.0
-            else:
-                base_basal = micro_cfg.get("basal_drain_rate", 0.05) # 基础代谢大幅下调
-                stress_gap = max(0.0, S - S_star)
-                basal_drain = base_basal * (1.0 + 0.02 * stress_gap) * (self.time_step / 5.0)
-                
-            raw_step_E = delta_E + buffer_release - basal_drain
-            if raw_step_E < 0:
-                psi_E = 1.0 / (1.0 + math.exp(-(E - 15.0)))
-                raw_step_E *= psi_E
-            final_E_step = raw_step_E
+            rk4_result = rk4_step(
+                evaluate_for_rk4,
+                S,
+                E,
+                current_time,
+                self.time_step,
+                sleep_elapsed_minutes,
+            )
+            delta_S = rk4_result.delta_s
+            delta_E = rk4_result.delta_e
+            base_ds_k1 = rk4_result.base_delta_s
+            f_pen_k1 = rk4_result.fatigue_penalty
+
+            routine_event_type = routine_ev.get_event_type() if routine_ev else None
+            micro_result = apply_micro_dynamics(
+                pools=micro_state,
+                cfg=micro_cfg,
+                time_step=self.time_step,
+                state=state,
+                has_high_load=has_high_load,
+                routine_event_type=routine_event_type,
+                current_regime=self.predictor.current_regime,
+                current_stress=S,
+                current_energy=E,
+                stress_anchor=S_star,
+                raw_delta_s=delta_S,
+                raw_delta_e=delta_E,
+                base_delta_s=base_ds_k1,
+                inertia_delta_s=inertia_ds,
+                inertia_delta_e=inertia_de,
+                epoc_level=getattr(self.user, "epoc_level", 0.0),
+                resilience=static_resilience,
+                cur_str=cur_str,
+            )
+            self.user.epoc_level = micro_result.epoc_level
+            trace_logs.extend(micro_result.logs)
+
+            final_S_step = micro_result.final_s_step
+            final_E_step = micro_result.final_e_step
+            momentum_trace = micro_result.momentum_trace
 
             self._update_profiles(active_high_loads if has_high_load else ([routine_ev] if routine_ev else []), event_profile, final_S_step, final_E_step, f_pen_k1, momentum_trace)
 
@@ -381,8 +366,8 @@ class Simulator:
             elif E >= exhaustion_th and energy_exhausted:
                 energy_exhausted = False
 
-            S = max(0.0, min(150.0, S + final_S_step))  
-            E = max(0.0, min(100.0, E + final_E_step))
+            S = clamp_stress(S + final_S_step)
+            E = clamp_energy(E + final_E_step)
             
             dominant_strs = [p["name"] for p in sorted(event_profile.values(), key=lambda x: x["total_S"], reverse=True)[:2] if p["total_S"] > 0]
             curr_names = [ev.name for ev in active_high_loads] if has_high_load else ([routine_ev.name] if routine_ev else [])
@@ -399,19 +384,6 @@ class Simulator:
         profile_list = [{"name": d["name"], "type": d["type"], "time": d["time"], "detail": d["detail"], "s_impact": round(d["total_S"], 2), "base_s": round(d["base_S"], 2), "penalty_s": round(d["penalty_S"], 2), "e_impact": round(d["total_E"], 2), "weight_factor": d.get("weight_factor", "无"), "credits": d.get("credits", "N/A"), "hours": d.get("hours", "N/A"), "level_str": d.get("level_str", "N/A"), "math_trace": d.get("math_trace", "")} for d in event_profile.values()]
 
         return results, S, E, schedule["wake_time"], [schedule["late_night_active_end"], schedule["night_sleep_start"]], alerts, confidence_series, trace_logs, profile_list, wake_s
-
-    def _apply_epoc_absorption(self, state, has_high_load, delta_S, delta_E, trace_logs, cur_str, res_idx):
-        """后燃 Buff 吸收逻辑。"""
-        is_resting = state in ["RECOVERY_SLEEP", "NIGHT_SLEEP"] or (state == "DAY_ACTIVE" and not has_high_load)
-        epoc_level = getattr(self.user, 'epoc_level', 0.0)
-        if is_resting and epoc_level > 0:
-            consume = min(epoc_level, 1.5 * (self.time_step / 5.0))
-            self.user.epoc_level -= consume
-            delta_E += consume * (0.6 + 0.2 * res_idx)
-            delta_S += -consume * (0.08 + 0.05 * res_idx)
-            if self.user.epoc_level <= 0.01 and epoc_level > 0.01:
-                trace_logs.append(f"[{cur_str}] EPOC 已吸收完毕。")
-        return delta_S, delta_E
 
     def _init_profiles(self, events, profile_dict):
         """初始化画像条目，避免重复创建。"""

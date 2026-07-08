@@ -3,6 +3,14 @@ import requests
 import json
 import logging
 import time
+from settings.model_defaults import (
+    APP_DEFAULT_HOST,
+    APP_DEFAULT_PORT,
+    BASE_DATA_DIR,
+    DEFAULT_CALLBACK_PATH,
+    TOKEN_EXPIRY_BUFFER_SECONDS,
+    USER_TOKEN_FILE,
+)
 # 加载.env文件中的环境变量
 try:
     from dotenv import load_dotenv
@@ -22,13 +30,18 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
+def _default_token_path() -> str:
+    """Return the local token file path from centralized settings."""
+    return os.path.join(BASE_DATA_DIR, USER_TOKEN_FILE)
+
+
 class FeishuAPI:
     """
     飞书API客户端类，用于处理与飞书开放平台的交互
     主要实现获取授权码、获取用户访问令牌以及刷新令牌的功能
     """
     
-    def __init__(self, app_id="cli_a74daa9319ff500c", app_secret="3IwKblhV29gurCoAj37oQcInvczvgEx7", redirect_uri=None):
+    def __init__(self, app_id=None, app_secret=None, redirect_uri=None):
         """
         初始化飞书API客户端
         从环境变量加载配置信息，如果提供了参数则优先使用参数值
@@ -205,14 +218,14 @@ class FeishuAPI:
             file_path: 保存文件路径，默认为data/user_token.json
         """
         # 确保data目录存在
-        data_dir = "data"
+        data_dir = BASE_DATA_DIR
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
             logger.info(f"创建数据目录: {data_dir}")
         
         # 设置默认文件路径
         if file_path is None:
-            file_path = os.path.join(data_dir, "user_token.json")
+            file_path = _default_token_path()
         
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -234,7 +247,7 @@ class FeishuAPI:
         """
         # 设置默认文件路径
         if file_path is None:
-            file_path = os.path.join("data", "user_token.json")
+            file_path = _default_token_path()
         
         try:
             if not os.path.exists(file_path):
@@ -251,7 +264,7 @@ class FeishuAPI:
             logger.error(f"从文件加载令牌信息时发生异常: {str(e)}")
             return None
     
-    def is_token_expired(self, token_info, buffer_seconds=300):
+    def is_token_expired(self, token_info, buffer_seconds=TOKEN_EXPIRY_BUFFER_SECONDS):
         """
         检查令牌是否已过期
         
@@ -292,7 +305,7 @@ class FeishuAPI:
         # 如果你后台配的是 http://127.0.0.1:5000/callback，这里就得传这个
         params = {
             "app_id": self.app_id,
-            "redirect_uri": self.redirect_uri or "http://127.0.0.1:5000/callback" 
+            "redirect_uri": self.redirect_uri or f"http://{APP_DEFAULT_HOST}:{APP_DEFAULT_PORT}{DEFAULT_CALLBACK_PATH}"
         }
         return f"{base_url}?{urllib.parse.urlencode(params)}"
 
@@ -381,8 +394,8 @@ def interactive_get_user_access_token():
         # 询问是否保存令牌信息
         save_token = input("\n是否将令牌信息保存到文件？(y/n，默认为y): ").strip().lower()
         if save_token != 'n':
-            file_path = input("请输入保存文件路径（默认: data/user_token.json）: ").strip()
-            file_path = file_path or os.path.join("data", "user_token.json")
+            file_path = input(f"请输入保存文件路径（默认: {_default_token_path()}）: ").strip()
+            file_path = file_path or _default_token_path()
             feishu_api.save_token_to_file(token_info, file_path)
             print(f"令牌信息已保存到: {file_path}")
         
@@ -409,8 +422,8 @@ def refresh_existing_token():
         refresh_token = None
         
         if load_from_file != 'n':
-            file_path = input("请输入令牌文件路径（默认: data/user_token.json）: ").strip()
-            file_path = file_path or os.path.join("data", "user_token.json")
+            file_path = input(f"请输入令牌文件路径（默认: {_default_token_path()}）: ").strip()
+            file_path = file_path or _default_token_path()
             token_info = feishu_api.load_token_from_file(file_path)
             if token_info:
                 refresh_token = token_info.get("refresh_token")
@@ -434,8 +447,8 @@ def refresh_existing_token():
         # 询问是否保存新的令牌信息
         save_token = input("\n是否将新的令牌信息保存到文件？(y/n，默认为y): ").strip().lower()
         if save_token != 'n':
-            file_path = input("请输入保存文件路径（默认: data/user_token.json）: ").strip()
-            file_path = file_path or os.path.join("data", "user_token.json")
+            file_path = input(f"请输入保存文件路径（默认: {_default_token_path()}）: ").strip()
+            file_path = file_path or _default_token_path()
             feishu_api.save_token_to_file(new_token_info, file_path)
             print(f"新的令牌信息已保存到: {file_path}")
         

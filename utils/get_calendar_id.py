@@ -10,6 +10,13 @@ from lark_oapi.api.calendar.v4 import *
 
 # 导入获取令牌的模块
 from utils.get_token import FeishuAPI, interactive_get_user_access_token
+from settings.model_defaults import BASE_DATA_DIR, CALENDAR_INFO_FILE
+
+
+def _default_calendar_info_path() -> str:
+    """Return the local calendar-info file path from centralized settings."""
+    import os
+    return os.path.join(BASE_DATA_DIR, CALENDAR_INFO_FILE)
 
 # 配置日志（只输出到文件，不在控制台显示）
 logging.basicConfig(level=logging.INFO,
@@ -186,14 +193,14 @@ class CalendarIDFetcher:
         import os
         
         # 确保data目录存在
-        data_dir = "data"
+        data_dir = BASE_DATA_DIR
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
             logger.info(f"创建数据目录: {data_dir}")
         
         # 设置默认文件路径
         if file_path is None:
-            file_path = os.path.join(data_dir, "calendar_info.json")
+            file_path = _default_calendar_info_path()
             
         try:
             # 只保存必要的信息
@@ -259,7 +266,7 @@ def get_calendar_id_by_open_id(open_id=None):
     
     # 首先尝试从本地文件获取
     try:
-        calendar_file_path = os.path.join("data", "calendar_info.json")
+        calendar_file_path = _default_calendar_info_path()
         if os.path.exists(calendar_file_path):
             with open(calendar_file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)

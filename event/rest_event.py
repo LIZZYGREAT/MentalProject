@@ -4,6 +4,9 @@ from typing import Dict, Any, Tuple
 import math
 import numpy as np  
 from event.base import BaseEvent
+from algorithm.recovery import boosted_recovery_delta_s, recovery_alpha, trait_parameters
+from algorithm.time_utils import elapsed_minutes, interval_minutes
+from settings.model_defaults import DEFAULT_INITIAL_ENERGY
 
 def _get_deterministic_rng(user, current_time: datetime) -> np.random.RandomState:
     """按用户种子与日历时刻构造可复现的 RandomState（供需要时扩展随机模块）。"""
@@ -19,15 +22,7 @@ def _get_trait_parameters(user, strategy_name: str) -> Tuple[float, float]:
     从 rest_trait_modifiers 匹配 strategy_name 子串，返回 (eta, tau)。
     eta：就餐/小睡里放大 Hill 减压；tau：进入时间阻尼指数。
     """
-    trait_cfg = user.get_param("rest_trait_modifiers", {})
-    s_name = strategy_name.lower()
-    
-    for key, vals in trait_cfg.items():
-        if key in s_name:
-            return vals.get("eta", 1.0), vals.get("tau", 1.0)
-            
-    default = trait_cfg.get("default", {"eta": 1.0, "tau": 1.0})
-    return default.get("eta", 1.0), default.get("tau", 1.0)
+    return trait_parameters(user, strategy_name)
 
 class RestEvent(BaseEvent):
     """泛休息：完全委托 user.rest_strategy.calculate_flow_recovery，idle_duration 累计停留时长。"""
@@ -43,7 +38,8 @@ class RestEvent(BaseEvent):
         return "rest"
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, 5)
+        time_step = user.get_param("time_step", 5)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
         
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -81,7 +77,8 @@ class MealEvent(BaseEvent):
         return "meal"
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, 5)
+        time_step = user.get_param("time_step", 5)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -101,31 +98,14 @@ class MealEvent(BaseEvent):
             step_noise_s=step_noise_s, step_noise_e=step_noise_e, is_substep=is_substep
         )
         
-        try:
-            if isinstance(self.start_time, str):
-                st_h, st_m = map(int, self.start_time[-5:].split(':'))
-                et_h, et_m = map(int, self.end_time[-5:].split(':'))
-                total_mins = (et_h * 60 + et_m) - (st_h * 60 + st_m)
-                if total_mins < 0: total_mins += 24 * 60
-            else:
-                total_mins = (self.end_time - self.start_time).total_seconds() / 60.0
-        except Exception:
-            total_mins = 30.0
-        total_mins = max(5.0, float(total_mins))
+        total_mins = interval_minutes(self.start_time, self.end_time, default=30.0)
 
         time_ratio = min(1.0, idle_dur / total_mins)
         diff = max(0.0, current_stress - S_star)
 
         rest_strat_name = user.get_rest_strategy()
-        eta_strategy, tau_trait = _get_trait_parameters(user, rest_strat_name)
-
-        logistic_min = meal_cfg.get("logistic_min", 0.75)
-        logistic_mid = meal_cfg.get("logistic_mid", 25.0)
-        logistic_k = meal_cfg.get("logistic_k", 0.15)
-        try:
-            alpha_x = logistic_min + (1.0 - logistic_min) / (1.0 + math.exp(logistic_k * (diff - logistic_mid)))
-        except OverflowError:
-            alpha_x = logistic_min
+        eta_strategy, tau_trait = trait_parameters(user, rest_strat_name)
+        alpha_x = recovery_alpha(diff, meal_cfg)
 
         if "晚" in self.name:
             total_E_recover = user.get_param("meal_dinner_recover", 15.0)
@@ -138,24 +118,9 @@ class MealEvent(BaseEvent):
         
         delta_E = total_E_recover * meal_multiplier * alpha_x * (time_step / total_mins)
 
-        A_max = meal_cfg.get("A_max", 1.0)
-        K_half = meal_cfg.get("K_half", 20.0)
-        hill_n = meal_cfg.get("hill_n", 2.0)
-        
-        if diff > 0:
-            hill_factor = (diff ** hill_n) / (K_half ** hill_n + diff ** hill_n)
-        else:
-            hill_factor = 0.0
-        
-        time_b = meal_cfg.get("time_damp_b", 0.3)
-        time_lambda = meal_cfg.get("time_damp_lambda", 2.0)
-        time_curve = time_b + (1.0 - time_b) * math.exp(-time_lambda * (time_ratio ** tau_trait))
-
-        if ds_base < 0:
-            multiplier = 1.0 + (A_max * eta_strategy) * hill_factor * time_curve
-            delta_S = ds_base * multiplier
-        else:
-            delta_S = ds_base
+        delta_S, hill_factor, time_curve, _ = boosted_recovery_delta_s(
+            ds_base, diff, time_ratio, meal_cfg, eta_strategy, tau_trait
+        )
 
         if not is_substep:
             epoc_inj = meal_cfg.get("epoc_injection", 0.5)
@@ -167,7 +132,7 @@ class MealEvent(BaseEvent):
             if "math_trace" not in self.metadata:
                 trace_str = (
                     f"$$\\Delta S_{{base}} = {ds_base:.3f}, \\quad \\Delta S_{{final}} = {delta_S:.3f}$$<br>"
-                    f"$$Hill = \\frac{{Gap^{{{hill_n:.1f}}}}}{{K_{{half}}^{{{hill_n:.1f}}} + Gap^{{{hill_n:.1f}}}}} = {hill_factor:.3f}$$<br>"
+                    f"$$Hill = {hill_factor:.3f}, \\quad TimeCurve = {time_curve:.3f}$$<br>"
                     f"$$\\Delta E = Total({total_E_recover:.1f}) \\cdot M_{{time}}({meal_multiplier:.2f}) \\cdot \\alpha_{{logistic}}({alpha_x:.2f}) \\cdot \\left(\\frac{{{time_step}}}{{{total_mins:.1f}}}\\right) = {delta_E:.3f}$$"
                 )
                 self.metadata["math_trace"] = trace_str
@@ -190,7 +155,8 @@ class NapEvent(BaseEvent):
         return "nap"
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, 5)
+        time_step = user.get_param("time_step", 5)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -209,38 +175,23 @@ class NapEvent(BaseEvent):
             step_noise_s=step_noise_s, step_noise_e=step_noise_e, is_substep=is_substep
         )
         
-        try:
-            if isinstance(self.start_time, str):
-                st_h, st_m = map(int, self.start_time[-5:].split(':'))
-                et_h, et_m = map(int, self.end_time[-5:].split(':'))
-                total_mins = (et_h * 60 + et_m) - (st_h * 60 + st_m)
-                if total_mins < 0: total_mins += 24 * 60
-            else:
-                total_mins = (self.end_time - self.start_time).total_seconds() / 60.0
-        except Exception:
-            total_mins = 30.0
-        total_mins = max(5.0, float(total_mins))
+        total_mins = interval_minutes(self.start_time, self.end_time, default=30.0)
 
         time_ratio = min(1.0, idle_dur / total_mins)
         diff = max(0.0, current_stress - S_star)
 
         rest_strat_name = user.get_rest_strategy()
-        eta_strategy, tau_trait = _get_trait_parameters(user, rest_strat_name)
-
-        logistic_min = nap_cfg.get("logistic_min", 0.75)
-        logistic_mid = nap_cfg.get("logistic_mid", 25.0)
-        logistic_k = nap_cfg.get("logistic_k", 0.15)
-        try:
-            alpha_x = logistic_min + (1.0 - logistic_min) / (1.0 + math.exp(logistic_k * (diff - logistic_mid)))
-        except OverflowError:
-            alpha_x = logistic_min
+        eta_strategy, tau_trait = trait_parameters(user, rest_strat_name)
+        alpha_x = recovery_alpha(diff, nap_cfg)
 
         if self.nap_type == "proper":
             total_E_recover = user.get_param("nap_proper_recover", 20.0)
         else:
             total_E_recover = user.get_param("nap_short_recover", 12.0)
 
-        delta_E = total_E_recover * alpha_x * (time_step / total_mins)
+        nap_multiplier_key = "multiplier_proper" if self.nap_type == "proper" else "multiplier_short"
+        nap_multiplier = nap_cfg.get(nap_multiplier_key, 1.0)
+        delta_E = total_E_recover * nap_multiplier * alpha_x * (time_step / total_mins)
 
         is_repaying = self.metadata.get("is_repaying_debt", False)
         debt_mult = nap_cfg.get("debt_multiplier", 1.2)
@@ -250,24 +201,9 @@ class NapEvent(BaseEvent):
                 user.reduce_sleep_debt((time_step / 60.0) * debt_k)
             delta_E *= debt_mult  
 
-        A_max = nap_cfg.get("A_max", 1.25)
-        K_half = nap_cfg.get("K_half", 20.0)
-        hill_n = nap_cfg.get("hill_n", 2.0)
-        
-        if diff > 0:
-            hill_factor = (diff ** hill_n) / (K_half ** hill_n + diff ** hill_n)
-        else:
-            hill_factor = 0.0
-        
-        time_b = nap_cfg.get("time_damp_b", 0.3)
-        time_lambda = nap_cfg.get("time_damp_lambda", 2.0)
-        time_curve = time_b + (1.0 - time_b) * math.exp(-time_lambda * (time_ratio ** tau_trait))
-
-        if ds_base < 0:
-            multiplier = 1.0 + (A_max * eta_strategy) * hill_factor * time_curve
-            delta_S = ds_base * multiplier
-        else:
-            delta_S = ds_base
+        delta_S, hill_factor, time_curve, _ = boosted_recovery_delta_s(
+            ds_base, diff, time_ratio, nap_cfg, eta_strategy, tau_trait
+        )
         
         if is_repaying and user.get_sleep_debt() > 0:
             if delta_S < 0:
@@ -283,8 +219,8 @@ class NapEvent(BaseEvent):
             if "math_trace" not in self.metadata:
                 trace_str = (
                     f"$$\\Delta S_{{base}} = {ds_base:.3f}, \\quad \\Delta S_{{final}} = {delta_S:.3f}$$<br>"
-                    f"$$Hill_{{factor}} = {hill_factor:.3f}, \\quad Debt_{{mult}} = {debt_mult if (is_repaying and user.get_sleep_debt() > 0) else 1.0:.2f}$$<br>"
-                    f"$$\\Delta E = Total({total_E_recover:.1f}) \\cdot \\alpha_{{logistic}}({alpha_x:.2f}) \\cdot Debt_{{mult}} \\cdot \\left(\\frac{{{time_step}}}{{{total_mins:.1f}}}\\right) = {delta_E:.3f}$$"
+                    f"$$Hill_{{factor}} = {hill_factor:.3f}, \\quad TimeCurve = {time_curve:.3f}, \\quad Debt_{{mult}} = {debt_mult if (is_repaying and user.get_sleep_debt() > 0) else 1.0:.2f}$$<br>"
+                    f"$$\\Delta E = Total({total_E_recover:.1f}) \\cdot M_{{nap}}({nap_multiplier:.2f}) \\cdot \\alpha_{{logistic}}({alpha_x:.2f}) \\cdot Debt_{{mult}} \\cdot \\left(\\frac{{{time_step}}}{{{total_mins:.1f}}}\\right) = {delta_E:.3f}$$"
                 )
                 self.metadata["math_trace"] = trace_str
             
@@ -301,7 +237,8 @@ class SleepEvent(BaseEvent):
         return "sleep"
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, 5)
+        time_step = user.get_param("time_step", 5)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -311,19 +248,7 @@ class SleepEvent(BaseEvent):
         """
         [接口修改]：透传步长锁定噪声。
         """
-        try:
-            if isinstance(self.start_time, str):
-                st_h, st_m = map(int, self.start_time[-5:].split(':'))
-                st_mins = st_h * 60 + st_m
-                ct_mins = current_time.hour * 60 + current_time.minute
-                elapsed = ct_mins - st_mins
-                if elapsed < 0: elapsed += 24 * 60
-            else:
-                elapsed = (current_time - self.start_time).total_seconds() / 60.0
-        except Exception:
-            elapsed = 0.0
-
-        elapsed = max(0.0, elapsed)
+        elapsed = elapsed_minutes(self.start_time, current_time)
         ds, de = user.night_strategy.calculate_step(
             current_stress, current_energy, current_time, time_step, elapsed, 
             step_noise_s=step_noise_s, step_noise_e=step_noise_e, is_substep=is_substep

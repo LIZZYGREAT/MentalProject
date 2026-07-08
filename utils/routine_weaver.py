@@ -3,6 +3,8 @@ from datetime import datetime
 from typing import List, Tuple
 from event.base import BaseEvent
 from event.rest_event import MealEvent, NapEvent, SleepEvent
+from algorithm.time_utils import minutes_to_hhmm, time_to_minutes
+from settings.model_defaults import DEFAULT_SLEEP_TIME, DEFAULT_WAKE_TIME, HIGH_LOAD_EVENT_TYPES
 
 class RoutineWeaver:
     """
@@ -13,32 +15,33 @@ class RoutineWeaver:
         self.user = user
         self.cfg = self.user.get_param("routine_weaver", {})
         
-        self.default_wake_min = self._time_to_mins(self.user.get_param("default_wake_time", "07:30"))
-        self.default_sleep_min = self._time_to_mins(self.user.get_param("default_sleep_time", "23:30"))
+        self.default_wake_min = self._time_to_mins(self.user.get_param("default_wake_time", DEFAULT_WAKE_TIME))
+        self.default_sleep_min = self._time_to_mins(self.user.get_param("default_sleep_time", DEFAULT_SLEEP_TIME))
         
         self.max_delay_wake_min = self._time_to_mins(self.cfg.get("max_delay_wake_time", "11:00")) 
         self.ideal_sleep_hours = self.cfg.get("ideal_sleep_hours", 8.0)
 
     def _time_to_mins(self, time_str: str) -> int:
-        if isinstance(time_str, datetime):
-            return time_str.hour * 60 + time_str.minute
-        h, m = map(int, time_str[-5:].split(':'))
-        return h * 60 + m
+        """Convert configured or event time to minutes from midnight."""
+        return time_to_minutes(time_str)
 
     def _mins_to_str(self, mins: int) -> str:
-        return f"{int(mins // 60):02d}:{int(mins % 60):02d}"
+        """Convert minutes from midnight to normalized HH:MM."""
+        return minutes_to_hhmm(mins)
 
     def _get_occupied_blocks(self, events: List[BaseEvent]) -> List[Tuple[int, int]]:
         occupied_blocks = []
         for ev in events:
-            if ev.get_event_type() not in ["course", "task", "gym", "library"]:
+            if ev.get_event_type() not in HIGH_LOAD_EVENT_TYPES:
                 continue
             try:
-                st_str = ev.start_time if isinstance(ev.start_time, str) else ev.start_time.strftime("%H:%M")
-                et_str = ev.end_time if isinstance(ev.end_time, str) else ev.end_time.strftime("%H:%M")
-                s_min = self._time_to_mins(st_str)
-                e_min = self._time_to_mins(et_str)
-                occupied_blocks.append((s_min, e_min))
+                s_min = self._time_to_mins(ev.start_time)
+                e_min = self._time_to_mins(ev.end_time)
+                if e_min <= s_min:
+                    occupied_blocks.append((s_min, 1440))
+                    occupied_blocks.append((0, e_min))
+                else:
+                    occupied_blocks.append((s_min, e_min))
             except Exception:
                 continue
         
@@ -89,18 +92,21 @@ class RoutineWeaver:
                     next_event_start = min(next_event_start, bs)
                     break
             
-            real_wake_min = min(ideal_wake, next_event_start - 30, self.max_delay_wake_min)
+            next_event_buffer = self.cfg.get("next_event_buffer", 30)
+            real_wake_min = min(ideal_wake, next_event_start - next_event_buffer, self.max_delay_wake_min)
             real_wake_min = max(real_wake_min, late_night_end)
 
         actual_sleep_mins = 0
         morning_gaps = self._get_free_gaps(0, real_wake_min, occupied_blocks)
+        transition_buffer = self.cfg.get("sleep_transition_buffer", 15)
+        ignore_before = self.cfg.get("ignore_early_midnight_before", 150)
         for gs, ge in morning_gaps:
-            if gs == 0 and ge < 150: 
+            if gs == 0 and ge < ignore_before:
                 continue 
                 
             actual_start = gs
             if gs > 0:
-                actual_start = gs + 15
+                actual_start = gs + transition_buffer
             
             if actual_start < ge:
                 actual_sleep_mins += (ge - actual_start)
@@ -119,7 +125,7 @@ class RoutineWeaver:
         for gs, ge in night_gaps:
             actual_start = gs
             if gs > self.default_sleep_min: 
-                actual_start = gs + 15 
+                actual_start = gs + transition_buffer
                 
             if actual_start < ge:
                 final_events.append(SleepEvent(
@@ -172,14 +178,14 @@ class RoutineWeaver:
         lunch_slot = self._find_best_slot(
             bound_s=lunch_b_s, bound_e=lunch_b_e, 
             ideal_s=lunch_i_s, ideal_e=lunch_i_e, 
-            min_dur=20, occupied_blocks=all_blocks
+            min_dur=self.cfg.get("meal_min_duration", 20), occupied_blocks=all_blocks
         )
         lunch_end_min = 12*60
         if lunch_slot:
             ls, le = lunch_slot
             lunch_end_min = le
             dur = le - ls
-            m_type = "normal" if dur >= 30 else "rushed"
+            m_type = "normal" if dur >= self.cfg.get("meal_normal_min_duration", 30) else "rushed"
             final_events.append(MealEvent("meal_lunch", self._mins_to_str(ls), self._mins_to_str(le), meal_type=m_type, name="午餐"))
 
         # 2. 注入午睡 (动态读取阈值)
@@ -213,12 +219,12 @@ class RoutineWeaver:
         dinner_slot = self._find_best_slot(
             bound_s=dinner_b_s, bound_e=dinner_b_e,
             ideal_s=dinner_i_s, ideal_e=dinner_i_e,
-            min_dur=20, occupied_blocks=all_blocks
+            min_dur=self.cfg.get("meal_min_duration", 20), occupied_blocks=all_blocks
         )
         if dinner_slot:
             ds, de = dinner_slot
             dur = de - ds
-            m_type = "normal" if dur >= 30 else "rushed"
+            m_type = "normal" if dur >= self.cfg.get("meal_normal_min_duration", 30) else "rushed"
             final_events.append(MealEvent("meal_dinner", self._mins_to_str(ds), self._mins_to_str(de), meal_type=m_type, name="晚餐"))
 
         return final_events

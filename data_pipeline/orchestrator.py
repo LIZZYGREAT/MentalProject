@@ -5,6 +5,12 @@ from utils.event_factory import EventFactory
 from utils.routine_weaver import RoutineWeaver
 from data_pipeline.fetcher import fetch_events_with_timeout
 from visualization.plotter import get_plot_image_base64  
+from settings.model_defaults import (
+    DEFAULT_INITIAL_ENERGY,
+    DEFAULT_INITIAL_STRESS,
+    DEFAULT_USER_ID,
+    FEISHU_REQUEST_TIMEOUT_SECONDS,
+)
 
 def inject_routine_events(base_events, date_str, user):
     """委托 RoutineWeaver 织入睡眠/三餐/午睡等例行事件。"""
@@ -30,7 +36,7 @@ def process_date(
 
     # 1. 初始化用户
     user_params = injected_user_profile if injected_user_profile else {}
-    user = User(user_id="default", params=user_params, load_from_file=False)
+    user = User(user_id=DEFAULT_USER_ID, params=user_params, load_from_file=False)
 
     # 2. 获取日前日程
     events_json = None
@@ -40,7 +46,7 @@ def process_date(
     else:
         print(f"尝试获取日程 (force_refresh={force_refresh})...")
         events_json = fetch_events_with_timeout(
-            date_str, open_id, injected_token, injected_calendar_id, timeout=5.0, force_refresh=force_refresh
+            date_str, open_id, injected_token, injected_calendar_id, timeout=FEISHU_REQUEST_TIMEOUT_SECONDS, force_refresh=force_refresh
         )
             
     if not events_json:
@@ -55,12 +61,15 @@ def process_date(
     if injected_yesterday_state:
         prev_S = injected_yesterday_state.get("S_end")
         prev_E = injected_yesterday_state.get("E_end")
-        user.set_stress_baseline(injected_yesterday_state.get("S_star", 50.0), injected_yesterday_state.get("S_threshold", 90.0))
+        user.set_stress_baseline(
+            injected_yesterday_state.get("S_star", DEFAULT_INITIAL_STRESS),
+            injected_yesterday_state.get("S_threshold", user.get_current_threshold()),
+        )
         user.set_sleep_debt(injected_yesterday_state.get("sleep_debt", 0.0))
     else:
         print("未注入昨日状态，采用当前 S* 与满精力启动。")
         prev_S = user.get_current_S_star()
-        prev_E = 100.0
+        prev_E = DEFAULT_INITIAL_ENERGY
 
     # 5. 执行核心推演
     solver = user.solver

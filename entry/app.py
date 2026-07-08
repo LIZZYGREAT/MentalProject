@@ -14,6 +14,18 @@ from utils.event_factory import EventFactory
 from utils.get_token import FeishuAPI, get_user_access_token 
 from visualization.plotter import get_plot_image_base64
 from data_pipeline.orchestrator import inject_routine_events, process_date
+from algorithm.time_utils import normalize_interval, overlaps
+from calibration.calibrator import calibrate_parameters
+from calibration.metrics import evaluate_simulation
+from calibration.parameter_validation import validate_params
+from calibration.simulation_runner import run_simulation_for_calibration
+from calibration.storage import CalibrationStore
+from settings.model_defaults import (
+    APP_DEFAULT_PORT,
+    DEFAULT_INITIAL_ENERGY,
+    DEFAULT_USER_ID,
+    FEISHU_REQUEST_TIMEOUT_SECONDS,
+)
 
 import lark_oapi as lark
 
@@ -21,7 +33,16 @@ template_dir = os.path.join(project_root, 'templates')
 static_dir = os.path.join(project_root, 'static')
 
 app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
-current_user = User(user_id="default")
+current_user = User(user_id=DEFAULT_USER_ID)
+
+
+def _json_safe(value):
+    """Convert tuple-keyed config dictionaries into JSON-safe payloads."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 @app.route('/')
 def index():
@@ -81,6 +102,115 @@ def handle_config():
         current_user.save_config()
         return jsonify({"status": "success", "message": "配置已更新(仅内存生效)"})
 
+@app.route('/api/params/validate', methods=['POST'])
+def validate_runtime_params():
+    """Validate a params payload before simulation or calibration."""
+    data = request.json or {}
+    params = data.get("params", current_user.params)
+    return jsonify({"status": "success", "validation": validate_params(params)})
+
+@app.route('/api/feedback/daily', methods=['POST'])
+def save_daily_feedback():
+    """Store one day's lightweight self-report feedback in SQLite."""
+    data = request.json or {}
+    if not data.get("date"):
+        return jsonify({"status": "error", "message": "date is required"}), 400
+    row_id = CalibrationStore().record_daily_feedback(data, user_id=data.get("user_id", DEFAULT_USER_ID))
+    return jsonify({"status": "success", "id": row_id})
+
+@app.route('/api/feedback/event', methods=['POST'])
+def save_event_feedback():
+    """Store event-level correction feedback for classification and intensity."""
+    data = request.json or {}
+    if not data.get("date"):
+        return jsonify({"status": "error", "message": "date is required"}), 400
+    row_id = CalibrationStore().record_event_feedback(data, user_id=data.get("user_id", DEFAULT_USER_ID))
+    return jsonify({"status": "success", "id": row_id})
+
+@app.route('/api/evaluate', methods=['POST'])
+def evaluate_curve():
+    """Evaluate simulated or supplied curve results against feedback anchors."""
+    data = request.json or {}
+    feedback = data.get("feedback", {})
+    if not feedback:
+        return jsonify({"status": "error", "message": "feedback is required"}), 400
+
+    if data.get("results") is not None:
+        results = data.get("results", [])
+        alerts = data.get("alerts", [])
+        simulation = None
+    else:
+        date_str = data.get("date")
+        if not date_str:
+            return jsonify({"status": "error", "message": "date is required when results are not supplied"}), 400
+        simulation = run_simulation_for_calibration(
+            date_str=date_str,
+            events_json=data.get("events", []),
+            user_params=data.get("user_profile", current_user.params),
+            yesterday_state=data.get("yesterday_state"),
+            weave_routines=data.get("weave_routines", True),
+        )
+        results = simulation["results"]
+        alerts = simulation["alerts"]
+
+    metrics = evaluate_simulation(results, alerts, feedback)
+    if data.get("store"):
+        store = CalibrationStore()
+        store.record_evaluation(metrics, user_id=data.get("user_id", DEFAULT_USER_ID), notes=data.get("notes"))
+        if simulation is not None:
+            store.record_model_run(
+                date=data.get("date"),
+                results=simulation["results"],
+                final_state=simulation["final_state"],
+                alerts=simulation["alerts"],
+                user_id=data.get("user_id", DEFAULT_USER_ID),
+                input_payload={"events": data.get("events", []), "feedback": feedback},
+            )
+
+    payload = {"status": "success", "metrics": metrics}
+    if simulation is not None:
+        payload["final_state"] = simulation["final_state"]
+        payload["alerts"] = simulation["alerts"]
+        if data.get("include_results"):
+            payload["results"] = simulation["results"]
+    return jsonify(_json_safe(payload))
+
+@app.route('/api/calibrate', methods=['POST'])
+def calibrate_curve_params():
+    """Run lightweight local parameter calibration against feedback samples."""
+    data = request.json or {}
+    samples = data.get("samples", [])
+    if not samples:
+        return jsonify({"status": "error", "message": "samples is required"}), 400
+    iterations = max(1, min(300, int(data.get("iterations", 60))))
+    base_params = data.get("base_params", current_user.params)
+    report = calibrate_parameters(
+        samples=samples,
+        base_params=base_params,
+        search_space=data.get("search_space"),
+        iterations=iterations,
+        seed=int(data.get("seed", 42)),
+    )
+
+    if data.get("store"):
+        store = CalibrationStore()
+        version_name = data.get("version_name", f"calibrated_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        store.record_parameter_version(
+            report["best_params"],
+            version_name=version_name,
+            user_id=data.get("user_id", DEFAULT_USER_ID),
+            parent_version=data.get("base_params_version"),
+            notes=data.get("notes"),
+        )
+        store.record_calibration_job(
+            report,
+            user_id=data.get("user_id", DEFAULT_USER_ID),
+            base_params_version=data.get("base_params_version"),
+            best_params_version=version_name,
+        )
+
+    return jsonify(_json_safe({"status": "success", "report": report}))
+
 @app.route('/api/simulate', methods=['POST'])
 def simulate():
     """
@@ -104,12 +234,15 @@ def simulate():
     
     try:
         from data_pipeline.fetcher import fetch_events_with_timeout
-        from feishu_config import FEISHU_CALENDAR_ID
+        try:
+            from entry.feishu_config import FEISHU_CALENDAR_ID
+        except ImportError:
+            from feishu_config import FEISHU_CALENDAR_ID
         
         events_json = fetch_events_with_timeout(
             date_str=date_str, 
             injected_calendar_id=FEISHU_CALENDAR_ID,
-            timeout=5.0,
+            timeout=FEISHU_REQUEST_TIMEOUT_SECONDS,
             force_refresh=force_refresh
         )
     except Exception as e:
@@ -130,14 +263,13 @@ def simulate():
                 
             st_raw = ev.get("start_time", "")
             et_raw = ev.get("end_time", "")
-            ev_start = st_raw.split(' ')[-1][:5] if st_raw else "00:00"
-            ev_end = et_raw.split(' ')[-1][:5] if et_raw else "00:00"
+            ev_start, ev_end = normalize_interval(st_raw, et_raw)
             
             is_time_blocked = False
             for tr in shield_time_ranges:
                 s_limit = tr.get("start", "23:59")
                 e_limit = tr.get("end", "00:00")
-                if max(ev_start, s_limit) < min(ev_end, e_limit):
+                if overlaps(ev_start, ev_end, s_limit, e_limit):
                     is_time_blocked = True
                     break
             
@@ -154,8 +286,7 @@ def simulate():
     occupied_blocks = []
     for ev in events:
         try:
-            st_str = ev.start_time.split(' ')[-1][:5] if isinstance(ev.start_time, str) else ev.start_time.strftime("%H:%M")
-            et_str = ev.end_time.split(' ')[-1][:5] if isinstance(ev.end_time, str) else ev.end_time.strftime("%H:%M")
+            st_str, et_str = normalize_interval(ev.start_time, ev.end_time)
             occupied_blocks.append((st_str, et_str, ev.name))
         except: pass
 
@@ -165,7 +296,7 @@ def simulate():
         
         overlap = False
         for (obs, obe, ob_name) in occupied_blocks:
-            if me['start'] < obe and me['end'] > obs:
+            if overlaps(me['start'], me['end'], obs, obe):
                 overlap = True
                 app_trace_logs.append(f"[时空防御] 沙盒注入事件 '{me['name']}' 与 '{ob_name}' 重叠，已拒绝。")
                 break
@@ -206,7 +337,7 @@ def simulate():
     
     if init_S is None or init_E is None:
         init_S = current_user.get_current_S_star()
-        init_E = 100.0
+        init_E = DEFAULT_INITIAL_ENERGY
     else:
         init_S, init_E = float(init_S), float(init_E)
 
@@ -265,5 +396,5 @@ def token_status():
 
 if __name__ == '__main__':
     print("压力建模沙盒 Web 服务 已启动...")
-    print("访问地址: http://localhost:5000")
-    app.run(debug=True, port=5000)
+    print(f"访问地址: http://localhost:{APP_DEFAULT_PORT}")
+    app.run(debug=True, port=APP_DEFAULT_PORT)

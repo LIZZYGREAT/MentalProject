@@ -32,6 +32,8 @@ GLOBAL_DEFAULT_CONFIG = {
     "E_critical": 20.0,   # 精力耗竭线
     "time_step": 5,       # 仿真步长
     "random_seed": 42,
+    "default_wake_time": "07:30",
+    "default_sleep_time": "23:30",
     "noise_scale_factor": 0.2,
     "max_delta_base": 3.0,
     
@@ -40,7 +42,8 @@ GLOBAL_DEFAULT_CONFIG = {
     # ==========================================
     "alpha_cis_drain": 1.0,
     "cognitive_weight": 0.65,
-    "fatigue_acceleration": 1.15, 
+    "fatigue_acceleration": 0.15,
+    "fatigue_acceleration_k": 0.15,
     
     # ==========================================
     # 5. 用户默认策略偏好
@@ -85,6 +88,8 @@ GLOBAL_DEFAULT_CONFIG = {
     "amplitude_growth_k": 0.04,  
     "low_stress_dampen": 0.5,    
     "max_amplitude": 3.5,        
+    "rhythm_jitter_amplitude": 1.5,
+    "rhythm_jitter_period": 37.0,
     "friction_factor": 0.015,    
     "min_decay_rate": 0.006,
     "theta": 0.002,           
@@ -129,10 +134,16 @@ GLOBAL_DEFAULT_CONFIG = {
     "D_t_task": 0.55,
     "course_base_drain": 5.5,      
     "task_base_drain": 5.0, 
+    "base_task_drain": 5.0,
     
     "event_task": {
         "T1_exam": 1.1, "T2_ddl": 1.05, "T3_meeting": 1.0,
         "T4_homework": 0.95, "T5_general": 0.90,
+        "weight_exam": 1.10,
+        "weight_ddl": 1.05,
+        "weight_meeting": 0.85,
+        "weight_homework": 0.95,
+        "weight_general": 0.90,
         "emotion_noise_low": 0.95,
         "emotion_noise_high": 1.05
     },
@@ -142,6 +153,7 @@ GLOBAL_DEFAULT_CONFIG = {
         "fatigue_weight_k": -2.0,  
         "epoc_base": 1.5,          
         "epoc_k": 2.0,             
+        "epoc_rate": 0.05,
         "relief_factor": 0.02,
         "noise_s_base": 0.15,      
         "noise_s_k": 0.10,         
@@ -250,7 +262,8 @@ GLOBAL_DEFAULT_CONFIG = {
         "auc_yellow": 50.0,              
         "E_danger": 25.0,                
         "auc_increase_step": 1.5,        
-        "auc_decay_step": 2.5            
+        "auc_decay_step": 2.5,
+        "sleep_auc_decay_step": 5.0
     },
 
     # ==========================================
@@ -273,7 +286,12 @@ GLOBAL_DEFAULT_CONFIG = {
         "nap_min_debt": 20,              
         "nap_min_normal": 15,            
         "nap_delay_after_lunch": 10,     
-        "nap_window_end": "13:50"        
+        "nap_window_end": "13:50",
+        "meal_min_duration": 20,
+        "meal_normal_min_duration": 30,
+        "sleep_transition_buffer": 15,
+        "next_event_buffer": 30,
+        "ignore_early_midnight_before": 150
     },
 
     # ==========================================
@@ -295,6 +313,11 @@ GLOBAL_DEFAULT_CONFIG = {
         "momentum_beta": 0.10,                  
         "concurrent_log_base": 0.3,             
         "energy_exhaustion_threshold": 20.0,   
+        "rest_penalty_recovery_delay": 5.0,
+        "friction_decay_rate": 0.2,
+        "dopamine_release_rate": 0.15,
+        "dopamine_energy_ratio": 0.4,
+        "basal_stress_gap_k": 0.02,
 
         "buffer_decay_rate": 0.05,           
         "basal_drain_rate": 0.415,           

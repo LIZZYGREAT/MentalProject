@@ -45,11 +45,16 @@ class NightStrategy(BaseStrategy):
     def _get_rhythm_factor(self, elapsed_minutes: float, base_period: float = 90.0, phase_shift: float = 0.0) -> float:
         """
         动态拉伸与呼吸扰动长周期节律。
+
+        节律抖动使用确定性正弦项，避免在 RK4 子步中重复采样导致同一
+        时间步内导数不一致；真正的随机波动由外层 step_noise 锁定源提供。
         """
         stretched_period = base_period + (elapsed_minutes / 60.0) * 3.0
-        random_jitter = self.rng.uniform(-1.5, 1.5)
+        jitter_amp = self.params.get("rhythm_jitter_amplitude", 1.5)
+        jitter_period = max(1.0, self.params.get("rhythm_jitter_period", 37.0))
+        deterministic_jitter = jitter_amp * math.sin((elapsed_minutes + phase_shift) / jitter_period)
         period_jitter = stretched_period * 0.05 * math.sin(elapsed_minutes / 200.0)
-        final_period = max(40.0, stretched_period + random_jitter + period_jitter)
+        final_period = max(40.0, stretched_period + deterministic_jitter + period_jitter)
         
         return math.sin(2 * math.pi * (elapsed_minutes + phase_shift) / final_period)
 

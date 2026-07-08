@@ -1,0 +1,2 @@
+"""Project-wide settings helpers."""
+

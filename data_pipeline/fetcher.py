@@ -1,13 +1,13 @@
 # data_pipeline/fetcher.py
 import concurrent.futures
 import time
+from settings.model_defaults import CACHE_EXPIRY_SECONDS, FEISHU_REQUEST_TIMEOUT_SECONDS
 
 # ==========================================
 # 轻量级 TTL (Time-To-Live) 内存缓存
 # 结构: { "YYYY-MM-DD": {"timestamp": float, "events": list} }
 # ==========================================
 _TTL_CACHE = {}
-CACHE_EXPIRY_SECONDS = 300  # 缓存存活时间：5分钟
 
 def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=None, injected_calendar_id=None):
     from utils.get_token import get_user_access_token
@@ -36,7 +36,7 @@ def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=N
     
     return events
 
-def fetch_events_with_timeout(date_str, open_id=None, injected_token=None, injected_calendar_id=None, timeout=5.0, force_refresh=False):
+def fetch_events_with_timeout(date_str, open_id=None, injected_token=None, injected_calendar_id=None, timeout=FEISHU_REQUEST_TIMEOUT_SECONDS, force_refresh=False):
     """带 TTL 缓存与超时的日历拉取；超时或异常返回空列表。"""
     global _TTL_CACHE
     

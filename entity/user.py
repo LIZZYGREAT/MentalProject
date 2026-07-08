@@ -12,9 +12,11 @@ from strategy.course_strategy import CourseStrategy
 from strategy.rest_strategy import RestStrategy
 
 from entry.config import GLOBAL_DEFAULT_CONFIG
+from algorithm.mental_models import calculate_resilience_index
+from settings.model_defaults import BASE_DATA_DIR, USER_CONFIG_DIR_NAME
+from settings.parameter_store import get_param as resolve_param
 
-BASE_DATA_DIR = "data"
-USER_CONFIG_DIR = os.path.join(BASE_DATA_DIR, "user_configs")
+USER_CONFIG_DIR = os.path.join(BASE_DATA_DIR, USER_CONFIG_DIR_NAME)
 
 class User:
     """承载 params 深拷贝、三类策略、Simulator、睡眠债与 EPOC；配置默认不落盘。"""
@@ -154,33 +156,18 @@ class User:
 
     def _calculate_resilience_index(self):
         """
-        由四类策略枚举组合成 [-1,1] 标量，供 Library、EPOC、马尔可夫等读取。
+        Recompute the bounded trait-resilience score from strategy selections.
+
+        The mapping lives in ``algorithm.mental_models`` so psychology-facing
+        scoring can be reviewed and tuned independently from persistence and
+        strategy lifecycle concerns.
         """
-        score = 0.0
-        
-        f_strat = self.get_f_strategy()
-        if f_strat == "dull": score += 0.3
-        elif f_strat == "saturated": score += 0.2
-        elif f_strat == "sensitive": score -= 0.3
-        elif f_strat == "batterydrain": score -= 0.2
-            
-        c_strat = self.get_C_strategy()
-        if c_strat == "low": score += 0.2
-        elif c_strat == "threshold": score += 0.1
-        elif c_strat == "high": score -= 0.2
-            
-        n_strat = self.get_night_strategy()
-        if n_strat == "deep": score += 0.3
-        elif n_strat == "normal": score += 0.0
-        elif n_strat == "anxious": score -= 0.3
-            
-        r_strat = self.get_rest_strategy()
-        if r_strat == "relieved": score += 0.2
-        elif r_strat == "warmup": score += 0.1
-        elif r_strat == "burnout": score -= 0.1
-        elif r_strat == "anxious": score -= 0.2
-            
-        self.resilience_index = max(-1.0, min(1.0, score))
+        self.resilience_index = calculate_resilience_index(
+            self.get_f_strategy(),
+            self.get_C_strategy(),
+            self.get_night_strategy(),
+            self.get_rest_strategy(),
+        )
 
     def get_resilience_index(self) -> float:
         """特质韧性指数。"""
@@ -195,8 +182,8 @@ class User:
         self.save_config()  
     
     def get_param(self, key: str, default: Any = None):
-        """读取合并后的参数字典项。"""
-        return self.params.get(key, default)
+        """Read a merged parameter with alias and central fallback support."""
+        return resolve_param(self.params, key, default)
     
     def set_night_strategy(self, strategy_type: str):
         self.night_strategy = NightStrategy.create(strategy_type, self.params)

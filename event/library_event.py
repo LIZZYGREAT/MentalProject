@@ -4,6 +4,9 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from event.base import BaseEvent
+from algorithm.physiology import bounded_stress_step, hourly_scale, step_scale
+from algorithm.time_utils import interval_minutes
+from settings.model_defaults import DEFAULT_INITIAL_ENERGY
 
 class LibraryEvent(BaseEvent):
     """
@@ -15,17 +18,7 @@ class LibraryEvent(BaseEvent):
         super().__init__(event_id, start_time, end_time, name, description, metadata or {})
         self.provided_intensity = max(0.1, min(1.0, float(study_intensity)))
         
-        try:
-            if isinstance(self.start_time, str):
-                st_dt = datetime.strptime(self.start_time[-5:], "%H:%M")
-                et_dt = datetime.strptime(self.end_time[-5:], "%H:%M")
-                dur = (et_dt - st_dt).total_seconds() / 60.0
-                if dur < 0: dur += 24 * 60
-                self.total_duration_mins = dur
-            else:
-                self.total_duration_mins = (self.end_time - self.start_time).total_seconds() / 60.0
-        except Exception:
-            self.total_duration_mins = 120.0
+        self.total_duration_mins = interval_minutes(self.start_time, self.end_time, default=120.0)
             
         self.metadata["detail"] = "推演中..." 
     
@@ -43,7 +36,7 @@ class LibraryEvent(BaseEvent):
 
     def calculate_stress_impact(self, user, current_stress: float, current_time: datetime) -> float:
         time_step = user.get_param("time_step", 5)
-        ds, _ = self.calculate_stress_impact_dual(user, current_stress, 100.0, current_time, time_step)
+        ds, _ = self.calculate_stress_impact_dual(user, current_stress, DEFAULT_INITIAL_ENERGY, current_time, time_step)
         return ds
 
     def calculate_stress_impact_dual(self, user, current_stress: float, current_energy: float, 
@@ -87,7 +80,7 @@ class LibraryEvent(BaseEvent):
         if hasattr(user.course_strategy, 'get_allostatic_stress_amplifier'):
             amp = user.course_strategy.get_allostatic_stress_amplifier(current_energy)
             
-        raw_delta_S = (base_stress_increase - flow_relief) * amp * (time_step / 5.0)
+        raw_delta_S = (base_stress_increase - flow_relief) * amp * step_scale(time_step)
         
         sleep_debt = user.get_sleep_debt()
         if sleep_debt > 0 and raw_delta_S > 0:
@@ -96,7 +89,7 @@ class LibraryEvent(BaseEvent):
             raw_delta_S *= (1.0 + stress_k * sleep_debt)
         
         max_s_step = lib_cfg.get("max_s_step", 1)
-        delta_S = max_s_step * math.tanh(raw_delta_S / max_s_step)
+        delta_S = bounded_stress_step(raw_delta_S, max_s_step)
         
         noise_s = step_noise_s * 0.05
         delta_S += noise_s
@@ -115,7 +108,7 @@ class LibraryEvent(BaseEvent):
             drain_rate *= (1.0 + drain_k * sleep_debt)
             
         noise_e = step_noise_e * 0.05
-        delta_E = -drain_rate * f_drain_modifier * (time_step / 60.0) + noise_e
+        delta_E = -drain_rate * f_drain_modifier * hourly_scale(time_step) + noise_e
 
 
         if not is_substep:
