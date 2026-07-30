@@ -1,0 +1,16 @@
+.git
+.agents
+.codex
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+*.sqlite3
+*.sqlite3-*
+.env
+info/.env
+data/
+.pytest_cache
+.ruff_cache
+info/prompt.md

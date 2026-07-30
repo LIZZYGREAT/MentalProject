@@ -5,8 +5,7 @@ from datetime import datetime, time, timedelta
 from typing import List, Dict, Any, Optional
 
 warnings.filterwarnings("ignore", category=UserWarning)
-import lark_oapi as lark
-from lark_oapi.api.calendar.v4 import *
+import requests
 from utils.get_token import get_user_access_token
 
 def calculate_today_time_range(start_hour: int = 8, end_hour: int = 23) -> tuple:
@@ -35,6 +34,9 @@ def calculate_date_range(start_date: str, end_date: str, start_hour: int = 8, en
 
 def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = None, date_range: Optional[tuple] = None) -> Dict[str, Any] or None:
     """解析飞书日历事件为统一字段；周期性事件按 query_date_str 校验星期并校准日期。"""
+    if event.get("status") == "cancelled":
+        return None
+
     summary = event.get('summary', '').strip()
     if not summary:
         return None
@@ -140,34 +142,71 @@ def display_results(events: List[Dict[str, Any]], date_str: Optional[str] = None
     else:
         print("没有找到任何事件")
 
-def get_events_in_date_range(client, token, cal_id, start, end, start_h=8, end_h=23):
+def get_events_in_date_range(token, cal_id, start, end, start_h=8, end_h=23, request_timeout=4.0):
+    """Fetch calendar events with direct HTTP requests.
+
+    This avoids importing the heavy lark_oapi SDK inside the 5s fetch timeout.
+    """
     start_ts, end_ts, s_str, e_str = calculate_date_range(start, end, start_h, end_h)
     
     print("开始查询日程事件...")
-    req = ListCalendarEventRequest.builder().calendar_id(cal_id).page_size(100)\
-        .start_time(str(start_ts)).end_time(str(end_ts)).user_id_type("open_id").build()
-    
-    print("发送API请求...")
-    opt = lark.RequestOption.builder().user_access_token(token).build()
-    resp = client.calendar.v4.calendar_event.list(req, opt)
-    
-    if not resp.success():
-        print(f"API Error: {resp.msg}")
+    if not token:
+        print("缺少 user_access_token")
         return []
-    
+    if not cal_id:
+        print("缺少 calendar_id")
+        return []
+
     res_list = []
-    if hasattr(resp.data, 'items') and resp.data.items:
-        print(f"收到 {len(resp.data.items)} 个原始事件")
-        for item in resp.data.items:
-            ev_dict = json.loads(lark.JSON.marshal(item))
+    url = f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{cal_id}/events"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "start_time": str(start_ts),
+        "end_time": str(end_ts),
+        "page_size": 100,
+        "user_id_type": "open_id",
+    }
+
+    page_count = 0
+    while True:
+        print("发送API请求...")
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=request_timeout)
+            payload = resp.json()
+        except requests.Timeout:
+            raise TimeoutError(f"飞书日历事件请求超时(>{request_timeout}s)")
+        except Exception as e:
+            print(f"飞书日历事件请求失败: {e}")
+            return []
+
+        if resp.status_code != 200 or payload.get("code") != 0:
+            print(f"API Error: http={resp.status_code}, code={payload.get('code')}, msg={payload.get('msg')}")
+            return []
+
+        data = payload.get("data") or {}
+        items = data.get("items") or []
+        page_count += 1
+        print(f"第 {page_count} 页收到 {len(items)} 个原始事件")
+        for ev_dict in items:
             q_date = s_str if s_str == e_str else None
             extracted = extract_event_data(ev_dict, query_date_str=q_date, date_range=(s_str, e_str))
             if extracted:
                 res_list.append(extracted)
                 print(f"保留: {extracted['summary']}")
             else:
-                print(f"过滤: {ev_dict.get('summary', '未知')}")
-    else:
+                if ev_dict.get("status") == "cancelled":
+                    print("跳过取消事件")
+                else:
+                    print(f"过滤: {ev_dict.get('summary', '未知')}")
+
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+        if not page_token:
+            break
+        params["page_token"] = page_token
+
+    if not res_list:
         print("无事件")
         
     return res_list

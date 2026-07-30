@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 import time
+from urllib.parse import urlencode
 from settings.model_defaults import (
     APP_DEFAULT_HOST,
     APP_DEFAULT_PORT,
@@ -11,13 +12,64 @@ from settings.model_defaults import (
     TOKEN_EXPIRY_BUFFER_SECONDS,
     USER_TOKEN_FILE,
 )
-# 加载.env文件中的环境变量
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    logging.info("成功加载.env文件")
-except ImportError:
-    logging.warning("未安装dotenv库，无法加载.env文件，请确保已设置环境变量")
+
+
+def _project_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+
+def _candidate_env_paths():
+    root = _project_root()
+    return [
+        os.path.join(root, ".env"),
+        os.path.join(root, "info", ".env"),
+    ]
+
+
+def _load_env_fallback(path: str) -> bool:
+    """Load simple KEY=VALUE lines without requiring python-dotenv."""
+    if not os.path.exists(path):
+        return False
+    loaded = False
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+                loaded = True
+    return loaded
+
+
+def load_feishu_env() -> None:
+    """Load Feishu credentials from project .env locations.
+
+    The project historically stores secrets under ``info/.env``. ``load_dotenv()``
+    only searches from the current working directory, so the web app could miss
+    credentials and return an empty auth link. This function checks both common
+    locations and has a tiny fallback parser when python-dotenv is absent.
+    """
+    loaded_any = False
+    try:
+        from dotenv import load_dotenv
+        for path in _candidate_env_paths():
+            if os.path.exists(path):
+                loaded_any = load_dotenv(path, override=False) or loaded_any
+    except ImportError:
+        for path in _candidate_env_paths():
+            loaded_any = _load_env_fallback(path) or loaded_any
+
+    if loaded_any:
+        logging.info("成功加载飞书环境变量")
+    else:
+        logging.warning("未发现可加载的 .env 文件，请确认根目录 .env 或 info/.env 存在")
+
+
+load_feishu_env()
 
 
 # 配置日志
@@ -41,7 +93,7 @@ class FeishuAPI:
     主要实现获取授权码、获取用户访问令牌以及刷新令牌的功能
     """
     
-    def __init__(self, app_id=None, app_secret=None, redirect_uri=None):
+    def __init__(self, app_id=None, app_secret=None, redirect_uri=None, require_secret=True):
         """
         初始化飞书API客户端
         从环境变量加载配置信息，如果提供了参数则优先使用参数值
@@ -55,15 +107,16 @@ class FeishuAPI:
         # 支持两种环境变量命名方式：直接命名和FEISHU前缀命名
         self.app_id = app_id or os.getenv("FEISHU_APP_ID") or os.getenv("APP_ID")
         self.app_secret = app_secret or os.getenv("FEISHU_APP_SECRET") or os.getenv("APP_SECRET")
-        self.redirect_uri = redirect_uri or os.getenv("REDIRECT_URI", "https://open.feishu.cn/api-explorer/loading")
+        default_redirect = f"http://{APP_DEFAULT_HOST}:{APP_DEFAULT_PORT}{DEFAULT_CALLBACK_PATH}"
+        self.redirect_uri = redirect_uri or os.getenv("FEISHU_REDIRECT_URI") or os.getenv("REDIRECT_URI") or default_redirect
         
         # 验证必要的配置信息
         if not self.app_id:
             raise ValueError("APP_ID或FEISHU_APP_ID必须通过环境变量设置或作为参数传入")
-        if not self.app_secret:
+        if require_secret and not self.app_secret:
             raise ValueError("APP_SECRET或FEISHU_APP_SECRET必须通过环境变量设置或作为参数传入")
     
-    def generate_authorize_url(self, scope="auth:user.id:read", state=None):
+    def generate_authorize_url(self, scope="auth:user.id:read offline_access", state=None):
         """
         生成授权URL，用户需要访问此URL进行授权
         
@@ -90,15 +143,9 @@ class FeishuAPI:
         if state:
             params["state"] = state
         
-        # 构建完整的URL
-        query_string = ""
-        for key, value in params.items():
-            if query_string:  # 如果不是第一个参数，添加&符号
-                query_string += "&"
-            query_string += f"{key}={value}"
-        
+        query_string = urlencode(params)
         full_url = f"{authorize_url}?{query_string}"
-        logger.info(f"生成授权URL成功: {full_url}")
+        logger.info("生成授权URL成功")
         return full_url
     
     def get_user_access_token(self, code):
@@ -140,12 +187,14 @@ class FeishuAPI:
                 raise Exception(f"获取用户访问令牌失败: {error_msg}")
             
             # 保存令牌信息
+            token_data = response_data.get("data", response_data)
             token_info = {
-                "access_token": response_data.get("access_token"),
-                "expires_in": response_data.get("expires_in"),
-                "refresh_token": response_data.get("refresh_token"),
-                "token_type": "Bearer",
-                "scope": response_data.get("scope"),
+                "access_token": token_data.get("access_token"),
+                "expires_in": token_data.get("expires_in"),
+                "refresh_token": token_data.get("refresh_token"),
+                "refresh_expires_in": token_data.get("refresh_expires_in"),
+                "token_type": token_data.get("token_type", "Bearer"),
+                "scope": token_data.get("scope"),
                 "timestamp": int(time.time())  # 记录获取时间，用于判断是否过期
             }
             
@@ -193,12 +242,14 @@ class FeishuAPI:
                 raise Exception(f"刷新用户访问令牌失败: {error_msg}")
             
             # 保存新的令牌信息
+            token_data = response_data.get("data", response_data)
             new_token_info = {
-                "access_token": response_data.get("access_token"),
-                "expires_in": response_data.get("expires_in"),
-                "refresh_token": response_data.get("refresh_token"),
-                "token_type": "Bearer",
-                "scope": response_data.get("scope"),
+                "access_token": token_data.get("access_token"),
+                "expires_in": token_data.get("expires_in"),
+                "refresh_token": token_data.get("refresh_token"),
+                "refresh_expires_in": token_data.get("refresh_expires_in"),
+                "token_type": token_data.get("token_type", "Bearer"),
+                "scope": token_data.get("scope"),
                 "timestamp": int(time.time())  # 记录获取时间
             }
             
@@ -294,52 +345,13 @@ class FeishuAPI:
         
         return is_expired
     
-    # =====================================================
-    # [新增] Web 端专用方法 (请复制到 FeishuAPI 类中)
-    # =====================================================
     def get_auth_url(self):
-        """生成授权页 URL"""
-        import urllib.parse
-        base_url = "https://open.feishu.cn/open-apis/authen/v1/index"
-        # 这里的 redirect_uri 必须与飞书后台配置的回调地址一致
-        # 如果你后台配的是 http://127.0.0.1:5000/callback，这里就得传这个
-        params = {
-            "app_id": self.app_id,
-            "redirect_uri": self.redirect_uri or f"http://{APP_DEFAULT_HOST}:{APP_DEFAULT_PORT}{DEFAULT_CALLBACK_PATH}"
-        }
-        return f"{base_url}?{urllib.parse.urlencode(params)}"
+        """兼容旧调用：生成授权页 URL。"""
+        return self.generate_authorize_url()
 
     def get_user_access_token_by_code(self, code):
-        """核心：通过手动输入的 Code 换取 Token"""
-        # 复用你原有的获取 tenant_token 方法
-        app_token = self.get_tenant_access_token() 
-        if not app_token:
-            return None
-            
-        url = "https://open.feishu.cn/open-apis/authen/v1/access_token"
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {app_token}"
-        }
-        payload = {
-            "grant_type": "authorization_code",
-            "code": code
-        }
-        
-        try:
-            resp = requests.post(url, headers=headers, json=payload)
-            data = resp.json()
-            if data.get("code") == 0:
-                token_info = data["data"]
-                # 补全时间戳，方便后续判断过期
-                token_info["timestamp"] = int(time.time())
-                return token_info
-            else:
-                logger.error(f"换取 Token 失败: {data}")
-                return None
-        except Exception as e:
-            logger.error(f"请求异常: {e}")
-            return None
+        """兼容旧调用：通过授权码换取 Token。"""
+        return self.get_user_access_token(code)
 
 
 def interactive_get_user_access_token():

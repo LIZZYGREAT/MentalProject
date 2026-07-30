@@ -1,16 +1,14 @@
 import json
 import logging
 import warnings
+import requests
 
 # 忽略pkg_resources的警告
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
 
-import lark_oapi as lark
-from lark_oapi.api.calendar.v4 import *
-
 # 导入获取令牌的模块
 from utils.get_token import FeishuAPI, interactive_get_user_access_token
-from settings.model_defaults import BASE_DATA_DIR, CALENDAR_INFO_FILE
+from settings.model_defaults import BASE_DATA_DIR, CALENDAR_INFO_FILE, FEISHU_REQUEST_TIMEOUT_SECONDS
 
 
 def _default_calendar_info_path() -> str:
@@ -86,81 +84,33 @@ class CalendarIDFetcher:
         Returns:
             dict: 包含日历ID和用户ID信息的字典
         """
-        # 创建飞书SDK客户端
-        client = lark.Client.builder() \
-            .enable_set_token(True) \
-            .log_level(lark.LogLevel.ERROR) \
-            .build()
-        
-        # 构造获取主日历的请求对象
-        request: PrimaryCalendarRequest = PrimaryCalendarRequest.builder() \
-            .user_id_type("open_id") \
-            .build()
-        
-        # 发起请求，使用获取到的用户令牌
-        option = lark.RequestOption.builder().user_access_token(user_token).build()
-        response: PrimaryCalendarResponse = client.calendar.v4.calendar.primary(request, option)
-        
-        # 处理失败返回
-        if not response.success():
-            logger.error(
-                f"获取主日历失败，代码: {response.code}, 消息: {response.msg}")
-            raise Exception(f"获取主日历失败: {response.msg}")
-        
-        # 检查响应数据是否为None
-        if response.data is None:
-            logger.error("响应数据(data)为None")
-            # 尝试直接从原始响应中获取数据
-            if hasattr(response, 'raw') and hasattr(response.raw, 'content'):
-                try:
-                    raw_content = json.loads(response.raw.content)
-                    # 从原始响应中尝试提取日历信息
-                    calendar_info = {
-                        "calendar_id": None,
-                        "owner_id": None
-                    }
-                    
-                    # 直接从原始响应中提取可能的字段
-                    if isinstance(raw_content, dict):
-                        # 检查各种可能的数据结构
-                        if "data" in raw_content and isinstance(raw_content["data"], dict):
-                            data = raw_content["data"]
-                            if "calendar" in data:
-                                calendar_info["calendar_id"] = data["calendar"].get("calendar_id")
-                                calendar_info["owner_id"] = data["calendar"].get("owner_id")
-                            elif "calendars" in data:
-                                for item in data["calendars"]:
-                                    if "calendar" in item:
-                                        calendar_info["calendar_id"] = item["calendar"].get("calendar_id")
-                                        calendar_info["owner_id"] = item.get("user_id")
-                                        break
-                        else:
-                            calendar_info["calendar_id"] = raw_content.get("calendar_id")
-                            calendar_info["owner_id"] = raw_content.get("owner_id")
-                    
-                    return calendar_info
-                except Exception as e:
-                    logger.error(f"尝试从原始响应提取数据失败: {str(e)}")
-            
-            # 如果所有尝试都失败，返回默认值
-            return {
-                "calendar_id": None,
-                "owner_id": None
-            }
-        
-        # 使用SDK的序列化方法
         try:
-            calendar_data = lark.JSON.marshal(response.data)
-            result = json.loads(calendar_data)
+            url = "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary"
+            headers = {"Authorization": f"Bearer {user_token}"}
+            params = {"user_id_type": "open_id"}
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=max(1.0, FEISHU_REQUEST_TIMEOUT_SECONDS - 1.0),
+            )
+            payload = response.json()
         except Exception as e:
-            logger.error(f"序列化或解析数据时出错: {str(e)}")
-            result = {}
+            logger.error(f"获取主日历请求失败: {str(e)}")
+            raise
+
+        if response.status_code != 200 or payload.get("code") != 0:
+            msg = payload.get("msg", "未知错误")
+            logger.error(f"获取主日历失败，HTTP: {response.status_code}, code: {payload.get('code')}, msg: {msg}")
+            raise Exception(f"获取主日历失败: {msg}")
         
         # 尝试多种可能的数据结构解析
         calendar_info = {
             "calendar_id": None,
             "owner_id": None
         }
+
+        result = payload.get("data") or {}
         
         # 尝试从可能的结构中提取calendar_id和owner_id
         if result.get("calendar"):
@@ -180,6 +130,11 @@ class CalendarIDFetcher:
         logger.info(f"解析后的日历信息: {json.dumps(calendar_info)}")
         
         return calendar_info
+
+    def get_calendar_id(self, open_id=None):
+        """Return calendar_id from local cache or the primary calendar API."""
+        calendar_id = get_calendar_id_by_open_id(open_id)
+        return calendar_id
     
     def save_calendar_info(self, calendar_info, file_path=None):
         """

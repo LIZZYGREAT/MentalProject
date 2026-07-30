@@ -1,4 +1,8 @@
 import os
+from utils.get_token import load_feishu_env
+
+load_feishu_env()
+
 # ==========================================
 # 1. 飞书应用核心凭证 (App ID & App Secret)
 # ==========================================

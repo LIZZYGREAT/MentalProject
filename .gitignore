@@ -5,4 +5,8 @@ data/
 */__pycache__/
 *.env
 *.md
+!info/project_code_full_guide.md
+!info/deployment_auth_guide.md
+!info/project_mechanism_review_and_intelligent_roadmap.md
 my_done_work/
+.agents/

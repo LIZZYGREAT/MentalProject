@@ -7,5 +7,13 @@ numpy==1.26.4
 # 数据可视化库
 matplotlib==3.8.3
 
+# 本地Web服务与HTTP请求
+Flask==3.0.2
+requests==2.31.0
+python-dotenv==1.0.1
+
+# 文本情绪分析，可缺省回退到关键词规则
+snownlp==0.12.3
+
 # 飞书API调用库
 lark-oapi==1.4.10

@@ -1,7 +1,14 @@
 # data_pipeline/fetcher.py
 import concurrent.futures
+import json
+import os
 import time
-from settings.model_defaults import CACHE_EXPIRY_SECONDS, FEISHU_REQUEST_TIMEOUT_SECONDS
+from settings.model_defaults import (
+    CACHE_EXPIRY_SECONDS,
+    FEISHU_REQUEST_TIMEOUT_SECONDS,
+    BASE_DATA_DIR,
+    CALENDAR_INFO_FILE,
+)
 
 # ==========================================
 # 轻量级 TTL (Time-To-Live) 内存缓存
@@ -9,10 +16,50 @@ from settings.model_defaults import CACHE_EXPIRY_SECONDS, FEISHU_REQUEST_TIMEOUT
 # ==========================================
 _TTL_CACHE = {}
 
+
+def _mask(value):
+    if not value:
+        return "empty"
+    if len(value) <= 12:
+        return value
+    return f"{value[:6]}...{value[-4:]}"
+
+
+def _load_calendar_id_from_file(open_id=None):
+    path = os.path.join(BASE_DATA_DIR, CALENDAR_INFO_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if open_id and data.get("open_id") and data.get("open_id") != open_id:
+            return None
+        return data.get("calendar_id")
+    except Exception as e:
+        print(f"读取本地 calendar_info 失败: {e}")
+        return None
+
+
+def _resolve_calendar_id(open_id=None, injected_calendar_id=None):
+    from utils.get_token import load_feishu_env
+
+    load_feishu_env()
+    calendar_id = injected_calendar_id or os.getenv("FEISHU_CALENDAR_ID") or _load_calendar_id_from_file(open_id)
+    if calendar_id:
+        print(f"使用 calendar_id: {_mask(calendar_id)}")
+        return calendar_id
+
+    print("未配置 FEISHU_CALENDAR_ID，尝试通过主日历接口获取 calendar_id...")
+    from utils.get_calendar_id import CalendarIDFetcher
+    fetcher = CalendarIDFetcher()
+    calendar_id = fetcher.get_calendar_id(open_id)
+    if calendar_id:
+        print(f"主日历 calendar_id 获取成功: {_mask(calendar_id)}")
+    return calendar_id
+
 def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=None, injected_calendar_id=None):
     from utils.get_token import get_user_access_token
     from utils.calendar_tool import get_events_in_date_range
-    import lark_oapi as lark
     
     access_token = injected_token
     if not access_token:
@@ -22,17 +69,13 @@ def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=N
             return []
         access_token = token_info["access_token"]
         
-    calendar_id = injected_calendar_id
+    calendar_id = _resolve_calendar_id(open_id=open_id, injected_calendar_id=injected_calendar_id)
     if not calendar_id:
-        from utils.get_calendar_id import CalendarIDFetcher
-        fetcher = CalendarIDFetcher()
-        calendar_id = fetcher.get_calendar_id(open_id)
-        if not calendar_id:
-            print("无法获取主日历 ID")
-            return []
-            
-    client = lark.Client.builder().enable_set_token(True).build()
-    events = get_events_in_date_range(client, access_token, calendar_id, date_str, date_str)
+        print("无法获取 calendar_id")
+        return []
+
+    request_timeout = max(1.0, FEISHU_REQUEST_TIMEOUT_SECONDS - 1.0)
+    events = get_events_in_date_range(access_token, calendar_id, date_str, date_str, request_timeout=request_timeout)
     
     return events
 
