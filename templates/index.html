@@ -1,869 +1,516 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>心理压力建模沙盒 (硬核调试版)</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .card { border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 1rem; }
-        .card-header { font-weight: bold; background-color: #f8f9fa; border-bottom: 1px solid #eee; }
-        
-        .chart-container { 
-            min-height: 500px; 
-            border: 1px dashed #ccc; 
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
-            background-color: #fff;
-            border-radius: 4px;
-        }
-        .chart-container img { max-width: 100%; height: auto; object-fit: contain; }
-        
-        .token-card { border-left: 4px solid #ffc107; }
-        .god-card { border-left: 4px solid #dc3545; }
-        .sandbox-card { border-left: 4px solid #0dcaf0; }
-        .shield-card { border-left: 4px solid #212529; }
-        .strategy-card { border-left: 4px solid #6c757d; }
-
-        .god-slider-label { display: flex; justify-content: space-between; font-weight: 600; font-size: 0.85rem; }
-        .slider-value { color: #dc3545; font-family: 'Courier New', Courier, monospace; }
-
-        .console-container {
-            background-color: #1e1e1e;
-            color: #4af626;
-            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-            height: 300px;
-            overflow-y: auto;
-            padding: 15px;
-            border-radius: 0 0 8px 8px;
-            font-size: 0.85rem;
-            line-height: 1.5;
-            box-shadow: inset 0 0 12px rgba(0,0,0,0.8);
-        }
-        .console-line { margin-bottom: 3px; border-bottom: 1px solid #2a2a2a; padding-bottom: 2px; }
-        .console-line:hover { background-color: #2a2a2a; }
-        
-        .table-profile { font-size: 0.85rem; }
-        .table-profile thead { background-color: #f8f9fa; }
-        .impact-positive { color: #dc3545; font-weight: bold; }
-        .impact-negative { color: #198754; font-weight: bold; }
-        
-        .left-panel { max-height: 98vh; overflow-y: auto; padding-right: 8px; }
-        .main-panel { height: 98vh; overflow-y: auto; }
-        
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: #f1f1f1; }
-        ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #999; }
-    </style>
+    <meta name="theme-color" content="#f4f2eb">
+    <title>心序 MindFlow · 日程压力趋势</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
-<body class="bg-light">
+<body class="app-page">
+<div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+        <a class="brand" href="#" data-view-link="dashboard">
+            <span class="brand-mark" aria-hidden="true">
+                <span></span><span></span><span></span>
+            </span>
+            <span>
+                <strong>心序</strong>
+                <small>MindFlow</small>
+            </span>
+        </a>
 
-<div class="container-fluid py-3">
-    <div class="row">
-        <div class="col-md-3 left-panel">
-            <div class="d-flex justify-content-between align-items-center mb-3">
-                <h4 class="text-primary mb-0"><i class="bi bi-cpu"></i> 模型调试台</h4>
-                <div class="text-end">
-                    <div class="small text-secondary">{{ auth_user.username if auth_user else '' }}</div>
-                    <button type="button" id="logoutBtn" class="btn btn-link btn-sm text-danger p-0">退出登录</button>
-                </div>
-            </div>
+        <nav class="side-nav" aria-label="主导航">
+            <p>我的空间</p>
+            <button class="nav-item active" data-view="dashboard" type="button">
+                <span class="nav-icon home-icon"></span><b>今日概览</b>
+            </button>
+            <button class="nav-item" data-view="profile" type="button">
+                <span class="nav-icon profile-icon"></span><b>我的画像</b>
+            </button>
+            <button class="nav-item" data-view="prediction" type="button">
+                <span class="nav-icon trend-icon"></span><b>趋势预测</b>
+            </button>
+            <button class="nav-item" data-view="feedback" type="button">
+                <span class="nav-icon pulse-icon"></span><b>轻量反馈</b>
+            </button>
+            <p>连接与偏好</p>
+            <button class="nav-item" data-view="settings" type="button">
+                <span class="nav-icon settings-icon"></span><b>设置</b>
+            </button>
+        </nav>
 
-            <div class="card token-card">
-                <div class="card-header"><i class="bi bi-key"></i> 飞书 API 授权</div>
-                <div class="card-body p-3">
-                    <div class="d-grid gap-2 mb-2">
-                        <a href="#" id="authLink" target="_blank" class="btn btn-outline-primary btn-sm disabled">1. 获取授权链接</a>
-                    </div>
-                    <div class="input-group input-group-sm">
-                        <input type="text" id="manualCode" class="form-control" placeholder="输入 Code...">
-                        <button class="btn btn-success" id="submitCodeBtn">提交</button>
-                    </div>
-                    <div class="mt-2 text-center">
-                        <span id="tokenStatus" class="badge bg-secondary">检查 Token...</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header"><i class="bi bi-person-badge"></i> 基础生理状态</div>
-                <div class="card-body p-3">
-                    <div class="row g-2">
-                        <div class="col-12 mb-2">
-                            <label class="form-label small mb-1">User ID</label>
-                            <input type="text" class="form-control form-control-sm" id="userId" value="default">
-                        </div>
-                        <div class="col-6">
-                            <label class="form-label small mb-1">初始压力 S</label>
-                            <input type="number" class="form-control form-control-sm" id="initS" value="50">
-                        </div>
-                        <div class="col-6">
-                            <label class="form-label small mb-1">初始精力 E</label>
-                            <input type="number" class="form-control form-control-sm" id="initE" value="100">
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card strategy-card">
-                <div class="card-header"><i class="bi bi-gear-wide-connected"></i> 核心策略偏好</div>
-                <div class="card-body p-3">
-                    <div class="mb-2">
-                        <label class="form-label small mb-1">敏感函数 (f_strategy)</label>
-                        <select id="f_strategy" class="form-select form-select-sm">
-                            <option value="sensitive">高敏破防</option>
-                            <option value="dull">迟钝耐压</option>
-                            <option value="saturated">饱和稳定</option>
-                            <option value="batterydrain">精力耗竭</option>
-                        </select>
-                    </div>
-                    <div class="mb-2">
-                        <label class="form-label small mb-1">连轴惩罚 (C_strategy)</label>
-                        <select id="cStrategy" class="form-select form-select-sm">
-                            <option value="high">高惩罚</option>
-                            <option value="low">低惩罚</option>
-                            <option value="threshold">饱和惩罚</option>
-                        </select>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label small mb-1">睡眠/日间休息策略</label>
-                        <div class="row g-1">
-                            <div class="col-6">
-                                <select id="nightStrategy" class="form-select form-select-sm">
-                                    <option value="normal">标准睡眠</option>
-                                    <option value="deep">深度睡眠</option>
-                                    <option value="anxious">焦虑浅睡</option>
-                                </select>
-                            </div>
-                            <div class="col-6">
-                                <select id="restStrategy" class="form-select form-select-sm">
-                                    <option value="relieved">释然型</option>
-                                    <option value="warmup">慢热型</option>
-                                    <option value="anxious">焦虑内耗</option>
-                                    <option value="burnout">倦怠失效</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label small mb-1">生理时段偏好</label>
-                        <div class="row g-1">
-                            <div class="col-4">
-                                <select id="prefMorning" class="form-select form-select-sm time-pref-select">
-                                    <option value="">早晨常态</option>
-                                    <option value="like_morning">早晨高效</option>
-                                    <option value="dislike_morning">早晨低效</option>
-                                </select>
-                            </div>
-                            <div class="col-4">
-                                <select id="prefAfternoon" class="form-select form-select-sm time-pref-select">
-                                    <option value="">下午常态</option>
-                                    <option value="like_afternoon">下午高效</option>
-                                    <option value="dislike_afternoon">下午低效</option>
-                                </select>
-                            </div>
-                            <div class="col-4">
-                                <select id="prefEvening" class="form-select form-select-sm time-pref-select">
-                                    <option value="">夜晚常态</option>
-                                    <option value="like_evening">夜晚高效</option>
-                                    <option value="dislike_evening">夜晚低效</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <button id="saveBtn" class="btn btn-secondary btn-sm w-100">💾 保存并应用偏好</button>
-                </div>
-            </div>
-
-            <div class="card shield-card">
-                <div class="card-header bg-dark text-white fw-bold"><i class="bi bi-shield-x"></i> 屏蔽/删除真实日程</div>
-                <div class="card-body p-3 bg-light">
-                    <div class="mb-2">
-                        <select id="shieldType" class="form-select form-select-sm fw-bold text-danger" onchange="toggleShieldInput()">
-                            <option value="keyword">按事件名称完全匹配拦截</option>
-                            <option value="time">按时间段重叠覆盖拦截</option>
-                        </select>
-                    </div>
-                    
-                    <div class="input-group input-group-sm mb-2" id="shieldKeywordDiv">
-                        <input type="text" id="shieldKeyword" class="form-control" placeholder="输入需完全匹配的日程名称...">
-                        <button class="btn btn-outline-dark fw-bold" id="addShieldKeywordBtn">添加名称</button>
-                    </div>
-                    
-                    <div class="input-group input-group-sm mb-2 d-none" id="shieldTimeDiv">
-                        <span class="input-group-text">屏蔽时间段</span>
-                        <input type="time" id="shieldStart" class="form-control" value="08:00">
-                        <input type="time" id="shieldEnd" class="form-control" value="10:00">
-                        <button class="btn btn-outline-dark fw-bold" id="addShieldTimeBtn">添加时段</button>
-                    </div>
-                    
-                    <div id="shieldError" class="text-danger fw-bold small text-center mb-2 d-none"></div>
-
-                    <ul class="list-group list-group-flush small" id="shieldList" style="max-height: 120px; overflow-y: auto;"></ul>
-                </div>
-            </div>
-
-            <div class="card sandbox-card">
-                <div class="card-header bg-info text-dark fw-bold"><i class="bi bi-plus-square"></i> 深度生态事件注入</div>
-                <div class="card-body p-3">
-                    <div class="mb-2">
-                        <label class="form-label small mb-1">事件大类</label>
-                        <select id="mockType" class="form-select form-select-sm" onchange="toggleMockDetails()">
-                            <option value="course">授课 (Course)</option>
-                            <option value="task">高压任务 (Task)</option>
-                            <option value="gym">体育馆 (Gym) 🏃</option>
-                            <option value="library">图书馆 (Library) 📚</option>
-                            <option value="rest">生态恢复 (Rest)</option>
-                        </select>
-                    </div>
-                    
-                    <div id="courseDetails" class="row g-2 mb-2">
-                        <div class="col-6"><input type="number" id="mockCredit" class="form-control form-control-sm" placeholder="学分 (如 2.0)"></div>
-                        <div class="col-6"><input type="number" id="mockHours" class="form-control form-control-sm" placeholder="学时 (如 32)"></div>
-                    </div>
-                    
-                    <div id="taskDetails" class="mb-2 d-none">
-                        <select id="mockTaskLevel" class="form-select form-select-sm">
-                            <option value="exam">T1 极限负载 (考试/比赛)</option>
-                            <option value="ddl">T2 重度负载 (DDL/熬夜)</option>
-                            <option value="meeting">T3 中度被动 (会议/讲座)</option>
-                            <option value="homework">T4 轻度输出 (作业/小测)</option>
-                            <option value="general">T5 兜底日常</option>
-                        </select>
-                    </div>
-
-                    <div id="gymDetails" class="row g-2 mb-2 d-none">
-                        <div class="col-12"><input type="number" id="mockGymIntensity" class="form-control form-control-sm" placeholder="运动强度 (0.1-1.0，如 0.8)" min="0.1" max="1.0" step="0.1"></div>
-                    </div>
-
-                    <div id="libraryDetails" class="row g-2 mb-2 d-none">
-                        <div class="col-12"><input type="number" id="mockLibraryIntensity" class="form-control form-control-sm" placeholder="自习专注度 (0.1-1.0，如 0.7)" min="0.1" max="1.0" step="0.1"></div>
-                    </div>
-                    
-                    <div id="restDetails" class="mb-2 d-none">
-                        <select id="mockRestType" class="form-select form-select-sm">
-                            <option value="nap">深度午休 (Nap)</option>
-                            <option value="meal">就餐 (Meal)</option>
-                            <option value="rest">间歇放空 (General Rest)</option>
-                        </select>
-                    </div>
-                    
-                    <div class="input-group input-group-sm mb-2">
-                        <input type="text" id="mockName" class="form-control" placeholder="输入事件名称...">
-                    </div>
-                    
-                    <div class="input-group input-group-sm mb-2">
-                        <span class="input-group-text">起止</span>
-                        <input type="time" id="mockStart" class="form-control" value="14:00">
-                        <input type="time" id="mockEnd" class="form-control" value="16:00">
-                    </div>
-                    
-                    <button class="btn btn-sm btn-info w-100 mb-2 fw-bold" id="addMockBtn">➕ 无缝编织入时间线</button>
-                    <div id="mockError" class="text-danger fw-bold small text-center mb-2 d-none"></div>
-                    
-                    <ul class="list-group list-group-flush small border-top" id="mockList" style="max-height: 150px; overflow-y: auto;"></ul>
-                </div>
-            </div>
-
-            <div class="card god-card">
-                <div class="card-header bg-danger text-white"><i class="bi bi-sliders"></i> 操作台调控参数</div>
-                <div class="card-body p-3 bg-danger-subtle">
-                    <div class="mb-3">
-                        <div class="god-slider-label">
-                            <span>心理韧性 (Resilience)</span>
-                            <span class="slider-value" id="valK">1.00</span>
-                        </div>
-                        <input type="range" class="form-range god-slider" id="kResilience" min="0.5" max="1.5" step="0.05" value="1.0">
-                    </div>
-                    <div class="mb-3">
-                        <div class="god-slider-label">
-                            <span>疲劳加速因子</span>
-                            <span class="slider-value" id="valF">1.25</span>
-                        </div>
-                        <input type="range" class="form-range god-slider" id="fatigueAccel" min="1.0" max="2.0" step="0.05" value="1.25">
-                    </div>
-                    <div class="mb-0">
-                        <div class="god-slider-label">
-                            <span>环境压迫 (Z_factor)</span>
-                            <span class="slider-value" id="valZ">0.50</span>
-                        </div>
-                        <input type="range" class="form-range god-slider" id="zFactor" min="0.0" max="1.0" step="0.1" value="0.5">
-                    </div>
-                </div>
-            </div>
-
+        <div class="sidebar-principle">
+            <span>今日一句</span>
+            <p>不必把所有事情都安排妥当，给变化留一点余地。</p>
         </div>
 
-        <div class="col-md-9 main-panel">
-            <div class="card shadow-sm border-0">
-                <div class="card-header d-flex justify-content-between align-items-center bg-white border-bottom py-2">
-                    <span class="fs-5 fw-bold text-dark"><i class="bi bi-graph-up"></i> 生态推演全景视图</span>
-                    <div class="d-flex align-items-center gap-2 flex-nowrap">
-                        <div class="input-group input-group-sm flex-nowrap" style="min-width: 180px;">
-                            <span class="input-group-text">推演日期</span>
-                            <input type="date" class="form-control" id="simDate">
-                        </div>
-                        <button class="btn btn-success btn-sm px-4 fw-bold text-nowrap" id="simBtn"><i class="bi bi-play-fill"></i> 仿真模拟</button>
-                    </div>
+        <div class="sidebar-user">
+            <div class="avatar">{{ (auth_user.login_id[:1] if auth_user else '心') | upper }}</div>
+            <div>
+                <strong>{{ auth_user.login_id if auth_user else '用户' }}</strong>
+                <span>{{ '邮箱账号' if auth_user and auth_user.login_type == 'email' else '学号账号' }}</span>
+            </div>
+            <button id="logoutBtn" type="button" title="退出登录" aria-label="退出登录">↗</button>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <header class="topbar">
+            <button class="mobile-menu" id="mobileMenu" type="button" aria-label="打开导航">☰</button>
+            <div>
+                <p id="todayDate">今天</p>
+                <h1 id="pageTitle">今日概览</h1>
+            </div>
+            <div class="topbar-actions">
+                <span class="sync-state" id="syncState"><i></i> 本地数据已就绪</span>
+                <button class="quiet-button" id="quickFeedbackButton" type="button">记录此刻</button>
+            </div>
+        </header>
+
+        <section class="view active" id="dashboardView" data-view-panel="dashboard">
+            <div class="onboarding-banner" id="onboardingBanner" hidden>
+                <div class="banner-art" aria-hidden="true"><span></span><span></span><span></span></div>
+                <div>
+                    <p class="eyebrow light">建立你的初始节律</p>
+                    <h2>先花 3 分钟，让建议更贴近你</h2>
+                    <p>回答一组简单问题，系统会生成可查看、可修改的初始画像。</p>
                 </div>
+                <button class="light-button" id="startOnboardingButton" type="button">
+                    开始问卷 <b>→</b>
+                </button>
+            </div>
 
-                <div class="card-body p-0">
-                    <div id="chartArea" class="chart-container">
-                        <div class="text-center">
-                            <i class="bi bi-activity text-muted" style="font-size: 3rem;"></i>
-                            <p class="text-muted mt-2">就绪：等待仿真信号输入...</p>
-                        </div>
-                    </div>
-
-                    <div class="row m-0 p-3 bg-white border-top border-bottom d-none" id="resultStats">
-                        <div class="col-md-3 border-end text-center">
-                            <div class="small text-muted">日终压力 (S)</div>
-                            <div id="endS" class="h4 fw-bold text-danger">--</div>
-                        </div>
-                        <div class="col-md-3 border-end text-center">
-                            <div class="small text-muted">日终精力 (E)</div>
-                            <div id="endE" class="h4 fw-bold text-success">--</div>
-                        </div>
-                        <div class="col-md-3 border-end text-center">
-                            <div class="small text-muted">演化平衡点 S*</div>
-                            <div id="newSStar" class="h4 fw-bold text-primary">--</div>
-                        </div>
-                        <div class="col-md-3 text-center">
-                            <div class="small text-muted">当前报警阈值</div>
-                            <div id="newThreshold" class="h4 fw-bold text-warning">--</div>
-                        </div>
-                    </div>
-
-                    <div class="p-3 bg-white border-bottom d-none" id="profileCard">
-                        <h6 class="fw-bold mb-3"><i class="bi bi-table text-primary"></i> 全天事件画像 (事件级生理贡献度)</h6>
-                        <div class="table-responsive">
-                            <table class="table table-sm table-hover align-middle table-profile mb-0">
-                                <thead>
-                                    <tr>
-                                        <th>事件名称</th>
-                                        <th>路由分类</th>
-                                        <th>时间段</th>
-                                        <th>事件具体信息</th>
-                                        <th class="text-end">基础压力贡献</th>
-                                        <th class="text-end text-warning">连轴疲劳惩罚</th>
-                                        <th class="text-end">累计压力 (ΣΔS)</th>
-                                        <th class="text-end">累计精力贡献 (ΣΔE)</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="profileTableBody">
-                                    </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div class="p-3 bg-light border-bottom d-none" id="alertBox">
-                        <h6 class="fw-bold text-warning mb-2"><i class="bi bi-exclamation-triangle"></i> 自动识别系统预警</h6>
-                        <div id="alertList" class="row g-2">
-                            </div>
-                    </div>
-
-                    <div class="bg-dark">
-                        <div class="px-3 py-2 border-bottom border-secondary d-flex justify-content-between align-items-center">
-                            <span class="text-info small fw-bold"><i class="bi bi-terminal"></i> Diagnostic Trace Log (底层状态机诊断)</span>
-                            <span class="badge bg-outline-info text-info border border-info" style="font-size: 0.65rem;">STEP: 5MIN</span>
-                        </div>
-                        <div id="traceLogConsole" class="console-container">
-                            <div class="text-muted italic">等待计算节点上行数据...</div>
-                        </div>
-                    </div>
+            <div class="welcome-row">
+                <div>
+                    <p class="eyebrow">WELCOME BACK</p>
+                    <h2>早上好，<span>{{ auth_user.login_id if auth_user else '朋友' }}</span></h2>
+                    <p id="welcomeMessage">今天也从理解自己的节奏开始。</p>
+                </div>
+                <div class="model-note">
+                    <span>模型说明</span>
+                    <p>结果表示日程负荷趋势，不等同于真实心理状态或诊断。</p>
                 </div>
             </div>
-        </div>
-    </div>
+
+            <div class="metric-grid">
+                <article class="metric-card calm-card">
+                    <div class="metric-top">
+                        <span>今日趋势</span>
+                        <i class="metric-symbol">∿</i>
+                    </div>
+                    <strong id="trendLabel">等待首次预测</strong>
+                    <p id="trendDescription">连接日历或添加日程后查看</p>
+                    <div class="soft-meter"><span id="trendMeter" style="width: 18%"></span></div>
+                </article>
+                <article class="metric-card energy-card">
+                    <div class="metric-top">
+                        <span>恢复空间</span>
+                        <i class="metric-symbol">◒</i>
+                    </div>
+                    <strong id="energyLabel">尚未估计</strong>
+                    <p id="energyDescription">完成问卷后生成作息建议</p>
+                    <div class="soft-meter"><span id="energyMeter" style="width: 32%"></span></div>
+                </article>
+                <article class="metric-card profile-card-mini">
+                    <div class="metric-top">
+                        <span>画像状态</span>
+                        <i class="metric-symbol">◎</i>
+                    </div>
+                    <strong id="profileStatusLabel">待初始化</strong>
+                    <p id="profileStatusDescription">初始画像不会自动覆盖你的参数</p>
+                    <button class="text-button" data-open-profile type="button">查看依据 →</button>
+                </article>
+            </div>
+
+            <div class="dashboard-grid">
+                <article class="surface-card rhythm-card">
+                    <div class="card-heading">
+                        <div>
+                            <p class="eyebrow">TODAY'S RHYTHM</p>
+                            <h3>今天的节律安排</h3>
+                        </div>
+                        <button class="text-button" data-view-jump="prediction" type="button">调整与预测 →</button>
+                    </div>
+                    <div id="routineTimeline" class="routine-timeline">
+                        <div class="empty-state compact">
+                            <span>○</span>
+                            <p>完成问卷后，这里会显示午餐、午睡与晚餐的建议时间。</p>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="surface-card care-card">
+                    <div class="care-orb" aria-hidden="true"></div>
+                    <p class="eyebrow">GENTLE NOTE</p>
+                    <h3>留一点缓冲，<br>也是一种前进。</h3>
+                    <p id="careMessage">
+                        系统会在发现可能的高负荷时段后，给出一条简短、可忽略的建议。
+                    </p>
+                    <small>你随时可以在设置里关闭关怀提示</small>
+                </article>
+            </div>
+
+            <article class="surface-card recent-card">
+                <div class="card-heading">
+                    <div>
+                        <p class="eyebrow">RECENT RUNS</p>
+                        <h3>最近的趋势记录</h3>
+                    </div>
+                    <span class="version-chip" id="modelVersionChip">基线模型</span>
+                </div>
+                <div id="recentRuns" class="recent-runs">
+                    <div class="empty-state">
+                        <span>⌁</span>
+                        <h4>还没有趋势记录</h4>
+                        <p>运行一次今日预测后，结果会以可重放版本保存在这里。</p>
+                    </div>
+                </div>
+            </article>
+        </section>
+
+        <section class="view" id="profileView" data-view-panel="profile">
+            <div class="page-intro">
+                <p class="eyebrow">YOUR PATTERN</p>
+                <h2>我的初始画像</h2>
+                <p>画像来自多题规则推断，不是人格标签，也不会被当作真实心理状态。</p>
+            </div>
+            <div id="profileEmpty" class="surface-card empty-state tall">
+                <span>◎</span>
+                <h3>先认识一下你的日常节律</h3>
+                <p>完成约 3 分钟的初始化问卷，即可查看画像维度与每项依据。</p>
+                <button class="primary-button" data-start-onboarding type="button">开始问卷</button>
+            </div>
+            <div id="profileContent" hidden>
+                <article class="profile-hero">
+                    <div>
+                        <p class="eyebrow light">PROFILE SNAPSHOT</p>
+                        <h3 id="profileSummaryTitle">你的节律画像</h3>
+                        <p id="profileSummary"></p>
+                    </div>
+                    <div class="profile-quality">
+                        <span>规则推断</span>
+                        <strong id="mappingVersion">v1</strong>
+                        <small>可审计 · 可重新填写</small>
+                    </div>
+                </article>
+                <div id="traitGrid" class="trait-grid"></div>
+                <article class="surface-card">
+                    <div class="card-heading">
+                        <div>
+                            <p class="eyebrow">PARAMETER PRIORS</p>
+                            <h3>模型先验建议</h3>
+                        </div>
+                        <span class="status-pill safe">仅建议，未自动应用</span>
+                    </div>
+                    <div id="priorList" class="prior-list"></div>
+                </article>
+                <button class="outline-button profile-retake" data-start-onboarding type="button">
+                    重新填写问卷
+                </button>
+            </div>
+        </section>
+
+        <section class="view" id="predictionView" data-view-panel="prediction">
+            <div class="page-intro prediction-intro">
+                <div>
+                    <p class="eyebrow">TREND ESTIMATE</p>
+                    <h2>日程趋势预测</h2>
+                    <p>曲线是内部模型的展示副本；原始状态点会按运行版本完整保存。</p>
+                </div>
+                <span class="status-pill safe">非诊断性趋势</span>
+            </div>
+
+            <div class="prediction-layout">
+                <aside class="surface-card prediction-controls">
+                    <div class="control-section">
+                        <span class="step-label">日期</span>
+                        <input class="clean-input" id="simDate" type="date">
+                    </div>
+                    <div class="control-section">
+                        <span class="step-label">起始状态</span>
+                        <label for="initS">主观压力参考 <b id="initSValue">50</b></label>
+                        <input id="initS" type="range" min="0" max="100" value="50">
+                        <label for="initE">精力参考 <b id="initEValue">80</b></label>
+                        <input id="initE" type="range" min="0" max="100" value="80">
+                    </div>
+                    <div class="control-section">
+                        <span class="step-label">添加一个日程</span>
+                        <input class="clean-input" id="eventName" placeholder="例如：毕业答辩">
+                        <div class="two-fields">
+                            <select class="clean-input" id="eventType">
+                                <option value="task">任务</option>
+                                <option value="course">课程</option>
+                                <option value="gym">运动</option>
+                                <option value="library">自习</option>
+                                <option value="rest">休息</option>
+                            </select>
+                            <select class="clean-input" id="eventLevel">
+                                <option value="general">一般</option>
+                                <option value="ddl">截止任务</option>
+                                <option value="exam">考试/答辩</option>
+                                <option value="meeting">会议</option>
+                            </select>
+                        </div>
+                        <div class="two-fields">
+                            <input class="clean-input" id="eventStart" type="time" value="14:00">
+                            <input class="clean-input" id="eventEnd" type="time" value="15:30">
+                        </div>
+                        <button class="outline-button full-button" id="addEventButton" type="button">＋ 加入日程</button>
+                        <div id="eventList" class="event-list"></div>
+                    </div>
+                    <button class="primary-button full-button" id="runPredictionButton" type="button">
+                        <span>生成今日趋势</span><b>→</b>
+                    </button>
+                </aside>
+
+                <div class="prediction-results">
+                    <article class="surface-card chart-card">
+                        <div class="card-heading">
+                            <div>
+                                <p class="eyebrow">MODEL TRAJECTORY</p>
+                                <h3>压力与精力趋势</h3>
+                            </div>
+                            <span class="version-chip" id="runFingerprint">尚未运行</span>
+                        </div>
+                        <div id="chartArea" class="chart-area">
+                            <div class="empty-state">
+                                <span>∿</span>
+                                <h4>准备好后，生成今天的趋势</h4>
+                                <p>同一输入、参数和种子会得到相同结果，重放不会修改你的画像。</p>
+                            </div>
+                        </div>
+                    </article>
+
+                    <div id="resultMetrics" class="result-metrics" hidden>
+                        <article><span>日终压力参考</span><strong id="endS">--</strong></article>
+                        <article><span>日终精力参考</span><strong id="endE">--</strong></article>
+                        <article><span>风险提示</span><strong id="alertCount">--</strong></article>
+                    </div>
+
+                    <article class="surface-card" id="alertsCard" hidden>
+                        <div class="card-heading">
+                            <div>
+                                <p class="eyebrow">RISK WINDOWS</p>
+                                <h3>值得留意的时段</h3>
+                            </div>
+                        </div>
+                        <div id="alertList" class="alert-list"></div>
+                    </article>
+
+                    <details class="surface-card technical-details">
+                        <summary>查看研究与复现信息</summary>
+                        <div class="technical-grid">
+                            <div><span>模型版本</span><strong id="detailModel">—</strong></div>
+                            <div><span>参数版本</span><strong id="detailParams">—</strong></div>
+                            <div><span>特征版本</span><strong id="detailFeatures">—</strong></div>
+                            <div><span>运行 ID</span><strong id="detailRun">—</strong></div>
+                        </div>
+                    </details>
+                </div>
+            </div>
+        </section>
+
+        <section class="view" id="feedbackView" data-view-panel="feedback">
+            <div class="page-intro">
+                <p class="eyebrow">LIGHT CHECK-IN</p>
+                <h2>今天，此刻怎么样？</h2>
+                <p>只需几秒。时点反馈会与预测版本关联，用于后续校准，而不是自动改变画像。</p>
+            </div>
+            <div class="feedback-grid">
+                <article class="feedback-form surface-card">
+                    <div class="feedback-period" role="group" aria-label="反馈时间段">
+                        <button class="active" data-period="morning" type="button">早晨</button>
+                        <button data-period="noon" type="button">中午</button>
+                        <button data-period="evening" type="button">晚上</button>
+                    </div>
+                    <label class="scale-question" for="feedbackStress">
+                        <span>此刻的压力感受</span><b id="feedbackStressValue">5</b>
+                    </label>
+                    <input id="feedbackStress" type="range" min="0" max="10" value="5">
+                    <div class="scale-ends"><span>很轻松</span><span>非常紧绷</span></div>
+
+                    <label class="scale-question" for="feedbackEnergy">
+                        <span>此刻的精力状态</span><b id="feedbackEnergyValue">6</b>
+                    </label>
+                    <input id="feedbackEnergy" type="range" min="0" max="10" value="6">
+                    <div class="scale-ends"><span>几乎耗尽</span><span>精力充足</span></div>
+
+                    <label class="field-label" for="feedbackNote">想补充一句吗？（选填）</label>
+                    <textarea class="clean-input" id="feedbackNote" rows="3"
+                              placeholder="例如：刚结束一场汇报，正在慢慢放松。"></textarea>
+                    <button class="primary-button full-button" id="submitFeedbackButton" type="button">
+                        保存此刻感受
+                    </button>
+                </article>
+                <aside class="surface-card feedback-guide">
+                    <div class="guide-orb">○</div>
+                    <h3>少一点打扰，<br>多一点有效信息。</h3>
+                    <p>早、中、晚各一次已经足够。系统会记录填写时间，回顾性反馈也会明确标记。</p>
+                    <ul>
+                        <li><span></span>0–10 量表统一保存</li>
+                        <li><span></span>关联最近一次预测运行</li>
+                        <li><span></span>原始反馈不会被静默覆盖</li>
+                    </ul>
+                </aside>
+            </div>
+            <article class="surface-card review-card">
+                <div class="card-heading">
+                    <div>
+                        <p class="eyebrow">AFTERWARD REVIEW</p>
+                        <h3>补充一次事件或预测复盘</h3>
+                    </div>
+                    <span class="status-pill">选填 · 约 30 秒</span>
+                </div>
+                <div class="review-form">
+                    <label>
+                        <span>复盘内容</span>
+                        <select class="clean-input" id="reviewType">
+                            <option value="peak_review">今天的实际峰值</option>
+                            <option value="event_impact">关键事件影响 / 纠错</option>
+                            <option value="prediction_review">预警是否准确</option>
+                            <option value="care_review">关怀是否有帮助</option>
+                            <option value="routine_correction">实际作息纠错</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>相关时间</span>
+                        <input class="clean-input" id="reviewTime" type="time">
+                    </label>
+                    <label>
+                        <span id="reviewScoreLabel">实际峰值（0–10）</span>
+                        <input class="clean-input" id="reviewScore" type="number" min="0" max="10" value="5">
+                    </label>
+                    <label class="review-note-field">
+                        <span>补充说明 / 事件名称 / 纠错内容</span>
+                        <input class="clean-input" id="reviewNote" placeholder="例如：答辩比预期轻松；该事件应归为会议">
+                    </label>
+                    <button class="outline-button" id="submitReviewButton" type="button">保存复盘</button>
+                </div>
+            </article>
+        </section>
+
+        <section class="view" id="settingsView" data-view-panel="settings">
+            <div class="page-intro">
+                <p class="eyebrow">SETTINGS</p>
+                <h2>连接与偏好</h2>
+                <p>账号连接、开发者密钥和模型版本集中在这里，避免与日常界面混在一起。</p>
+            </div>
+
+            <div class="settings-grid">
+                <article class="surface-card settings-card">
+                    <div class="settings-icon connection">⌁</div>
+                    <div class="settings-copy">
+                        <h3>飞书日历</h3>
+                        <p>连接后读取你的日程，用于生成当天的负荷趋势。</p>
+                        <span class="status-pill" id="tokenStatus">正在检查…</span>
+                    </div>
+                    <button class="outline-button" id="connectFeishuButton" type="button">连接日历</button>
+                </article>
+
+                <article class="surface-card settings-card">
+                    <div class="settings-icon key">◇</div>
+                    <div class="settings-copy">
+                        <h3>开发者 API Key</h3>
+                        <p>用于脚本或研究客户端调用。密钥只在创建时显示一次。</p>
+                        <span class="status-pill safe" id="apiKeyCount">0 个有效密钥</span>
+                    </div>
+                    <button class="outline-button" id="manageKeysButton" type="button">管理密钥</button>
+                </article>
+
+                <article class="surface-card version-panel">
+                    <div class="card-heading">
+                        <div>
+                            <p class="eyebrow">BASELINE</p>
+                            <h3>当前模型基线</h3>
+                        </div>
+                        <span class="status-pill safe">阶段 0 已冻结</span>
+                    </div>
+                    <div class="version-rows">
+                        <div><span>模型</span><strong id="settingsModelVersion">—</strong></div>
+                        <div><span>参数</span><strong id="settingsParameterVersion">—</strong></div>
+                        <div><span>事件特征</span><strong id="settingsFeatureVersion">—</strong></div>
+                    </div>
+                    <div class="baseline-note">
+                        半马尔可夫、泊松异常、顿悟/多巴胺、压力动量与日际自动演进默认关闭。
+                    </div>
+                </article>
+            </div>
+        </section>
+    </main>
 </div>
 
+<dialog class="onboarding-dialog" id="onboardingDialog">
+    <form method="dialog" class="dialog-shell" id="onboardingForm">
+        <header class="dialog-header">
+            <a class="brand" href="#" tabindex="-1">
+                <span class="brand-mark" aria-hidden="true">
+                    <span></span><span></span><span></span>
+                </span>
+                <span><strong>心序</strong><small>初始画像</small></span>
+            </a>
+            <div class="question-progress">
+                <span id="questionProgressLabel">第 1 / 3 步</span>
+                <div><i id="questionProgressBar" style="width: 33.33%"></i></div>
+            </div>
+            <button class="dialog-close" id="closeOnboardingButton" value="cancel"
+                    type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="dialog-body">
+            <aside class="question-aside">
+                <p class="eyebrow light">ABOUT THIS</p>
+                <h2>不是测试，<br>只是一次认识。</h2>
+                <p>没有标准答案。我们只用这些信息建立初始作息与敏感度先验。</p>
+                <div class="question-promise">
+                    <span>01</span><p>原始答案独立保存</p>
+                    <span>02</span><p>每项推断都可查看依据</p>
+                    <span>03</span><p>不会自动生成诊断标签</p>
+                </div>
+            </aside>
+            <section class="question-main">
+                <div id="questionContainer"></div>
+                <div class="question-actions">
+                    <button class="outline-button" id="previousQuestionButton" type="button">上一步</button>
+                    <button class="primary-button" id="nextQuestionButton" type="button">下一步 <b>→</b></button>
+                    <button class="primary-button" id="submitQuestionnaireButton" type="button" hidden>
+                        生成我的画像 <b>→</b>
+                    </button>
+                </div>
+            </section>
+        </div>
+    </form>
+</dialog>
+
+<dialog class="key-dialog" id="keyDialog">
+    <div class="key-dialog-inner">
+        <div class="card-heading">
+            <div><p class="eyebrow">DEVELOPER ACCESS</p><h3>API Key 管理</h3></div>
+            <button class="dialog-close" id="closeKeyDialog" type="button">×</button>
+        </div>
+        <div class="key-create-row">
+            <input class="clean-input" id="keyName" placeholder="密钥名称，例如：研究脚本">
+            <select class="clean-input" id="keyExpiry">
+                <option value="30">30 天</option>
+                <option value="90">90 天</option>
+                <option value="365">1 年</option>
+            </select>
+            <button class="primary-button" id="createKeyButton" type="button">创建</button>
+        </div>
+        <div id="newKeyReveal" class="new-key-reveal" hidden>
+            <span>请立即复制，关闭后将不再显示</span>
+            <code id="newKeyValue"></code>
+            <button class="outline-button" id="copyKeyButton" type="button">复制密钥</button>
+        </div>
+        <div id="apiKeyList" class="api-key-list"></div>
+    </div>
+</dialog>
+
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+<div class="page-loading" id="pageLoading"><span></span><p>正在整理你的空间…</p></div>
+
 <script>
-    let mockEvents = []; 
-    let shieldKeywords = []; 
-    let shieldTimeRanges = []; 
-
-    function toggleMockDetails() {
-        const type = document.getElementById('mockType').value;
-        document.getElementById('courseDetails').classList.toggle('d-none', type !== 'course');
-        document.getElementById('taskDetails').classList.toggle('d-none', type !== 'task');
-        document.getElementById('restDetails').classList.toggle('d-none', type !== 'rest');
-        document.getElementById('gymDetails').classList.toggle('d-none', type !== 'gym');
-        document.getElementById('libraryDetails').classList.toggle('d-none', type !== 'library');
-        document.getElementById('mockError').classList.add('d-none');
-    }
-
-    function toggleShieldInput() {
-        const type = document.getElementById('shieldType').value;
-        if (type === 'keyword') {
-            document.getElementById('shieldKeywordDiv').classList.remove('d-none');
-            document.getElementById('shieldTimeDiv').classList.remove('d-none');
-            document.getElementById('shieldTimeDiv').classList.add('d-none');
-        } else {
-            document.getElementById('shieldKeywordDiv').classList.add('d-none');
-            document.getElementById('shieldTimeDiv').classList.remove('d-none');
-        }
-        document.getElementById('shieldError').classList.add('d-none');
-    }
-
-    document.addEventListener('DOMContentLoaded', async () => {
-        document.getElementById('simDate').valueAsDate = new Date();
-
-        document.getElementById('simDate').addEventListener('change', () => {
-            mockEvents = []; 
-            renderMockList();
-            document.getElementById('mockError').classList.add('d-none'); 
-        });
-        
-        const godSliders = document.querySelectorAll('.god-slider');
-        godSliders.forEach(slider => {
-            slider.addEventListener('input', (e) => {
-                const valId = e.target.id === 'kResilience' ? 'valK' : (e.target.id === 'fatigueAccel' ? 'valF' : 'valZ');
-                document.getElementById(valId).innerText = parseFloat(e.target.value).toFixed(2);
-            });
-            slider.addEventListener('change', runSimulation);
-        });
-
-        document.getElementById('addShieldKeywordBtn').addEventListener('click', () => {
-            const kw = document.getElementById('shieldKeyword').value.trim();
-            const errBox = document.getElementById('shieldError');
-            if(kw) {
-                if(!shieldKeywords.includes(kw)) {
-                    shieldKeywords.push(kw);
-                    renderShieldList();
-                    document.getElementById('shieldKeyword').value = '';
-                    errBox.classList.add('d-none');
-                    runSimulation();
-                } else {
-                    errBox.innerText = "❌ 该名称已在拦截列表中";
-                    errBox.classList.remove('d-none');
-                }
-            }
-        });
-
-        document.getElementById('addShieldTimeBtn').addEventListener('click', () => {
-            const start = document.getElementById('shieldStart').value;
-            const end = document.getElementById('shieldEnd').value;
-            const errBox = document.getElementById('shieldError');
-
-            if(!start || !end) { errBox.innerText = "❌ 请填写完整的时间段"; errBox.classList.remove('d-none'); return; }
-            if(start >= end) { errBox.innerText = "❌ 结束时间必须晚于开始时间"; errBox.classList.remove('d-none'); return; }
-
-            const isDup = shieldTimeRanges.some(tr => tr.start === start && tr.end === end);
-            if(isDup) {
-                errBox.innerText = "❌ 该时间段已在拦截列表中";
-                errBox.classList.remove('d-none');
-                return;
-            }
-
-            shieldTimeRanges.push({start, end});
-            renderShieldList();
-            errBox.classList.add('d-none');
-            runSimulation();
-        });
-
-        document.getElementById('addMockBtn').addEventListener('click', () => {
-            const name = document.getElementById('mockName').value.trim();
-            const type = document.getElementById('mockType').value;
-            const start = document.getElementById('mockStart').value;
-            const end = document.getElementById('mockEnd').value;
-            const errBox = document.getElementById('mockError');
-            
-            if(!name || !start || !end) { errBox.innerText = "❌ 请补全事件信息"; errBox.classList.remove('d-none'); return; }
-            if(start >= end) { errBox.innerText = "❌ 结束时间必须晚于开始时间"; errBox.classList.remove('d-none'); return; }
-            
-            const sm = parseInt(start.split(':')[0])*60 + parseInt(start.split(':')[1]);
-            const em = parseInt(end.split(':')[0])*60 + parseInt(end.split(':')[1]);
-            for(let me of mockEvents) {
-                let ms = parseInt(me.start.split(':')[0])*60 + parseInt(me.start.split(':')[1]);
-                let me_end = parseInt(me.end.split(':')[0])*60 + parseInt(me.end.split(':')[1]);
-                if (sm < me_end && em > ms) {
-                    errBox.innerText = "❌ 与已有沙盒事件重叠，请修改时间！";
-                    errBox.classList.remove('d-none');
-                    return;
-                }
-            }
-            errBox.classList.add('d-none');
-            
-            let eventPayload = { name, type, start, end };
-            if(type === 'course') {
-                eventPayload.credit = document.getElementById('mockCredit').value;
-                eventPayload.hours = document.getElementById('mockHours').value;
-            } else if (type === 'task') {
-                eventPayload.level = document.getElementById('mockTaskLevel').value;
-            } else if (type === 'rest') {
-                eventPayload.subtype = document.getElementById('mockRestType').value;
-            } else if (type === 'gym') {
-                eventPayload.intensity = document.getElementById('mockGymIntensity').value || 0.7;
-            } else if (type === 'library') {
-                eventPayload.study_intensity = document.getElementById('mockLibraryIntensity').value || 0.7;
-            }
-
-            mockEvents.push(eventPayload);
-            renderMockList();
-            document.getElementById('mockName').value = '';
-            runSimulation(); 
-        });
-
-        document.getElementById('simBtn').addEventListener('click', runSimulation);
-        document.getElementById('logoutBtn').addEventListener('click', async () => {
-            try {
-                await fetch('/api/auth/logout', {method: 'POST'});
-            } finally {
-                window.location.assign('/login');
-            }
-        });
-
-        await loadAuthLink();
-        document.getElementById('authLink').addEventListener('click', async (event) => {
-            const link = event.currentTarget;
-            if (!link.href || link.getAttribute('href') === '#') {
-                event.preventDefault();
-                await loadAuthLink(true);
-            }
-        });
-        
-        checkToken();
-        await loadConfig();
-    });
-
-    async function loadAuthLink(showAlert = false) {
-        const link = document.getElementById('authLink');
-        const badge = document.getElementById('tokenStatus');
-        try {
-            badge.className = 'badge bg-secondary';
-            badge.innerText = '正在生成授权链接...';
-            const res = await fetch('/api/feishu/get_url');
-            const data = await res.json();
-            if(data.status === 'success') {
-                link.href = data.url;
-                link.classList.remove('disabled');
-                badge.dataset.configError = 'false';
-                const missing = data.missing || [];
-                if(missing.length > 0) {
-                    badge.className = 'badge bg-warning text-dark';
-                    badge.innerText = `授权链接可用，但缺少: ${missing.join(', ')}`;
-                } else {
-                    badge.className = 'badge bg-info text-dark';
-                    badge.innerText = '授权链接已就绪';
-                }
-                if(showAlert) window.open(data.url, '_blank');
-                return true;
-            }
-            throw new Error(data.message || '生成授权链接失败');
-        } catch(e) {
-            link.href = '#';
-            link.classList.add('disabled');
-            badge.dataset.configError = 'true';
-            badge.className = 'badge bg-danger';
-            badge.innerText = `授权配置错误: ${e.message}`;
-            if(showAlert) alert(`无法生成飞书授权链接: ${e.message}`);
-            return false;
-        }
-    }
-
-    function renderShieldList() {
-        const list = document.getElementById('shieldList');
-        list.innerHTML = '';
-        
-        shieldKeywords.forEach((kw, index) => {
-            list.innerHTML += `
-                <li class="list-group-item d-flex justify-content-between align-items-center px-1 py-1 bg-transparent border-bottom border-secondary border-opacity-25">
-                    <span class="small fw-bold text-dark"><i class="bi bi-fonts text-danger"></i> 名称: ${kw}</span>
-                    <button class="btn btn-link text-muted p-0" onclick="removeShield('keyword', ${index})"><i class="bi bi-x-lg"></i></button>
-                </li>
-            `;
-        });
-
-        shieldTimeRanges.forEach((tr, index) => {
-            list.innerHTML += `
-                <li class="list-group-item d-flex justify-content-between align-items-center px-1 py-1 bg-transparent border-bottom border-secondary border-opacity-25">
-                    <span class="small fw-bold text-dark"><i class="bi bi-clock-history text-danger"></i> 时段: ${tr.start} - ${tr.end}</span>
-                    <button class="btn btn-link text-muted p-0" onclick="removeShield('time', ${index})"><i class="bi bi-x-lg"></i></button>
-                </li>
-            `;
-        });
-    }
-
-    window.removeShield = function(type, index) {
-        if(type === 'keyword') {
-            shieldKeywords.splice(index, 1);
-        } else if (type === 'time') {
-            shieldTimeRanges.splice(index, 1);
-        }
-        renderShieldList();
-        runSimulation();
-    }
-
-    function renderMockList() {
-        const list = document.getElementById('mockList');
-        list.innerHTML = '';
-        mockEvents.forEach((me, index) => {
-            let badgeInfo = "";
-            let badgeClass = "bg-secondary";
-            if(me.type === 'course') { badgeClass = 'bg-primary'; badgeInfo = '课'; }
-            if(me.type === 'task') { badgeClass = 'bg-danger'; badgeInfo = '任'; }
-            if(me.type === 'rest') { badgeClass = 'bg-success'; badgeInfo = '息'; }
-            if(me.type === 'gym') { badgeClass = 'bg-warning text-dark'; badgeInfo = '运'; }
-            if(me.type === 'library') { badgeClass = 'bg-dark'; badgeInfo = '读'; }
-
-            list.innerHTML += `
-                <li class="list-group-item d-flex justify-content-between align-items-center px-1 py-2 bg-transparent">
-                    <div>
-                        <span class="badge ${badgeClass} me-1">${badgeInfo}</span>
-                        <span class="small fw-bold">${me.name}</span>
-                        <div class="text-muted" style="font-size: 0.75rem;">${me.start}-${me.end}</div>
-                    </div>
-                    <button class="btn btn-link text-danger p-0" onclick="removeMock(${index})"><i class="bi bi-trash"></i></button>
-                </li>
-            `;
-        });
-    }
-
-    window.removeMock = function(index) {
-        mockEvents.splice(index, 1);
-        renderMockList();
-        runSimulation();
-    }
-
-    async function checkToken() {
-        const res = await fetch('/api/token_status');
-        const data = await res.json();
-        const badge = document.getElementById('tokenStatus');
-        if(badge.dataset.configError === 'true') return;
-        if(data.valid) {
-            badge.className = 'badge bg-success';
-            badge.innerText = 'Token 有效 (连线成功)';
-        } else {
-            badge.className = 'badge bg-danger';
-            badge.innerText = 'Token 无效 (请重新授权)';
-        }
-    }
-
-    document.getElementById('submitCodeBtn').addEventListener('click', async () => {
-        const codeInput = document.getElementById('manualCode');
-        const code = codeInput.value.trim();
-        if(!code) return;
-        try {
-            const res = await fetch('/api/feishu/submit_code', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ code: code })
-            });
-            const data = await res.json();
-            alert(data.message);
-            checkToken();
-            codeInput.value = '';
-        } catch(e) { alert("提交失败"); }
-    });
-
-    async function loadConfig() {
-        const res = await fetch('/api/config');
-        const data = await res.json();
-        const p = data.params;
-        document.getElementById('userId').value = data.user_id;
-        
-        if(p.f_strategy) document.getElementById('f_strategy').value = p.f_strategy;
-        if(p.C_strategy) document.getElementById('cStrategy').value = p.C_strategy;
-        if(p.night_strategy) document.getElementById('nightStrategy').value = p.night_strategy;
-        if(p.rest_strategy) document.getElementById('restStrategy').value = p.rest_strategy;
-        
-        if(p.time_preferences) {
-            document.querySelectorAll('.time-pref-select').forEach(sel => sel.value = "");
-            p.time_preferences.forEach(pref => {
-                if(pref.includes('morning')) document.getElementById('prefMorning').value = pref;
-                if(pref.includes('afternoon')) document.getElementById('prefAfternoon').value = pref;
-                if(pref.includes('evening')) document.getElementById('prefEvening').value = pref;
-            });
-        }
-
-        if(p.K_resilience) {
-            document.getElementById('kResilience').value = p.K_resilience;
-            document.getElementById('valK').innerText = parseFloat(p.K_resilience).toFixed(2);
-        }
-        if(p.fatigue_acceleration) {
-            document.getElementById('fatigueAccel').value = p.fatigue_acceleration;
-            document.getElementById('valF').innerText = parseFloat(p.fatigue_acceleration).toFixed(2);
-        }
-        if(p.Z_factor !== undefined) {
-            document.getElementById('zFactor').value = p.Z_factor;
-            document.getElementById('valZ').innerText = parseFloat(p.Z_factor).toFixed(2);
-        }
-    }
-
-    document.getElementById('saveBtn').addEventListener('click', async () => {
-        const timePrefs = Array.from(document.querySelectorAll('.time-pref-select'))
-                               .map(sel => sel.value)
-                               .filter(val => val !== "");
-        const payload = {
-            user_id: document.getElementById('userId').value,
-            params: {
-                f_strategy: document.getElementById('f_strategy').value,
-                C_strategy: document.getElementById('cStrategy').value,
-                night_strategy: document.getElementById('nightStrategy').value,
-                rest_strategy: document.getElementById('restStrategy').value,
-                time_preferences: timePrefs
-            }
-        };
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload)
-        });
-        const resp = await res.json();
-        alert(resp.message);
-    });
-
-    async function runSimulation() {
-        const btn = document.getElementById('simBtn');
-        const chartArea = document.getElementById('chartArea');
-        const consoleBox = document.getElementById('traceLogConsole');
-        
-        try {
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 计算中';
-            chartArea.innerHTML = '<div class="spinner-border text-primary" style="width: 3rem; height: 3rem;"></div>';
-            consoleBox.innerHTML = '<div class="text-info">>> 正在同步时空数据，初始化推演内核...</div>';
-
-            const payload = {
-                date: document.getElementById('simDate').value,
-                init_S: document.getElementById('initS').value,
-                init_E: document.getElementById('initE').value,
-                K_resilience: document.getElementById('kResilience').value,
-                fatigue_accel: document.getElementById('fatigueAccel').value,
-                Z_factor: document.getElementById('zFactor').value,
-                mock_events: mockEvents,
-                shield_keywords: shieldKeywords,
-                shield_time_ranges: shieldTimeRanges // 将时间段拦截配置传给后端
-            };
-
-            const res = await fetch('/api/simulate', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-
-            if(data.status === 'success') {
-                chartArea.innerHTML = `<img src="data:image/png;base64,${data.image}" alt="仿真曲线图" />`;
-                
-                document.getElementById('resultStats').classList.remove('d-none');
-                document.getElementById('endS').innerText = data.end_S.toFixed(1);
-                document.getElementById('endE').innerText = data.end_E.toFixed(1);
-                document.getElementById('newSStar').innerText = data.new_S_star.toFixed(2);
-                document.getElementById('newThreshold').innerText = data.new_threshold.toFixed(2);
-
-                const alertBox = document.getElementById('alertBox');
-                const alist = document.getElementById('alertList');
-                alist.innerHTML = '';
-                if(data.alerts && data.alerts.length > 0) {
-                    alertBox.classList.remove('d-none');
-                    data.alerts.forEach(a => {
-                        const isRed = a.type.includes('红') || a.type.includes('严重');
-                        alist.innerHTML += `
-                            <div class="col-md-4">
-                                <div class="alert ${isRed ? 'alert-danger' : 'alert-warning'} p-2 mb-0 small">
-                                    <strong>[${a.time}]</strong> ${a.type}
-                                </div>
-                            </div>`;
-                    });
-                } else {
-                    alertBox.classList.add('d-none');
-                }
-
-                document.getElementById('profileCard').classList.remove('d-none');
-                const pBody = document.getElementById('profileTableBody');
-                pBody.innerHTML = '';
-                if(data.event_profile) {
-                    data.event_profile.forEach(item => {
-                        const sClass = item.s_impact > 0 ? 'impact-positive' : 'impact-negative';
-                        const eClass = item.e_impact > 0 ? 'impact-negative' : 'impact-positive';
-                        
-                        let typeBadge = `<span class="badge bg-secondary">${item.type}</span>`;
-                        if(item.type === 'course') typeBadge = `<span class="badge" style="background-color: #4169E1;">课程</span>`;
-                        if(item.type === 'task') typeBadge = `<span class="badge" style="background-color: #DC143C;">任务</span>`;
-                        if(item.type === 'meal') typeBadge = `<span class="badge" style="background-color: #3CB371;">就餐</span>`;
-                        if(item.type === 'nap') typeBadge = `<span class="badge" style="background-color: #20B2AA;">午休</span>`;
-                        if(item.type === 'sleep') typeBadge = `<span class="badge" style="background-color: #191970;">睡眠</span>`;
-                        if(item.type === 'gym') typeBadge = `<span class="badge" style="background-color: #FF8C00;">运动</span>`;
-                        if(item.type === 'library') typeBadge = `<span class="badge" style="background-color: #8A2BE2;">自习</span>`;
-
-                        const detailHtml = item.type === 'course' 
-                            ? `学分: ${item.credits} | 学时: ${item.hours} | 类别: ${item.level_str}` 
-                            : (item.detail && item.detail !== '-' ? item.detail : (item.weight_factor !== undefined && item.weight_factor !== '无' ? `权重: ${item.weight_factor}` : '无'));
-
-                        const collapseId = `math_${Math.random().toString(36).substr(2, 6)}`;
-                        const mathBtn = item.math_trace 
-                            ? `<button class="btn btn-sm btn-outline-secondary py-0 px-1 ms-2" type="button" data-bs-toggle="collapse" data-bs-target="#${collapseId}" title="查看动力学展开"><i class="bi bi-calculator"></i></button>` 
-                            : '';
-
-                        pBody.innerHTML += `
-                            <tr>
-                                <td><span class="fw-bold">${item.name}</span>${mathBtn}</td>
-                                <td>${typeBadge}</td>
-                                <td>${item.time}</td>
-                                <td><code class="small text-muted">${detailHtml}</code></td>
-                                <td class="text-end">${item.base_s > 0 ? '+' : ''}${item.base_s.toFixed(2)}</td>
-                                <td class="text-end text-warning fw-bold">${item.penalty_s > 0 ? '+' : ''}${item.penalty_s.toFixed(2)}</td>
-                                <td class="text-end ${sClass} fw-bold">${item.s_impact > 0 ? '+' : ''}${item.s_impact.toFixed(2)}</td>
-                                <td class="text-end ${item.e_impact > 0 ? 'text-success' : 'text-danger'} fw-bold">
-                                    ${item.e_impact > 0 ? '+' : ''}${item.e_impact.toFixed(2)}
-                                </td>
-                            </tr>`;
-                            
-                            if(item.math_trace) {
-                                pBody.innerHTML += `
-                                    <tr>
-                                        <td colspan="8" class="p-0 border-0">
-                                            <div class="collapse" id="${collapseId}">
-                                                <div class="card card-body bg-light mx-2 my-1" style="font-size: 0.85rem; overflow-x: auto;">
-                                                    ${item.math_trace}
-                                                </div>
-                                            </div>
-                                        </td>
-                                    </tr>`;
-                            }
-                    });
-
-                    if (window.MathJax) {
-                        MathJax.typesetPromise().catch(function (err) {
-                            console.error('MathJax 渲染失败:', err.message);
-                        });
-                    }
-                }
-
-                consoleBox.innerHTML = '';
-                if(data.trace_logs) {
-                    data.trace_logs.forEach(log => {
-                        let colorStyle = "";
-                        if(log.includes("❌") || log.includes("🗑️")) colorStyle = "color: #ff4d4d; font-weight: bold;";
-                        else if(log.includes("⚠️")) colorStyle = "color: #ffc107;"; 
-                        else if(log.includes("🪫") || log.includes("严重")) colorStyle = "color: #ff4d4d; font-weight: bold;"; 
-                        else if(log.includes("🔋") || log.includes("♻️") || log.includes("🛡️")) colorStyle = "color: #2ecc71;"; 
-                        else if(log.includes("🌟") || log.includes("🏁") || log.includes("🛌")) colorStyle = "color: #3498db; font-weight: bold;"; 
-                        
-                        consoleBox.innerHTML += `<div class="console-line" style="${colorStyle}">${log}</div>`;
-                    });
-                    consoleBox.scrollTop = consoleBox.scrollHeight;
-                }
-
-            } else {
-                chartArea.innerHTML = `<div class="alert alert-danger">仿真引擎抛出错误: ${data.message}</div>`;
-            }
-        } catch(e) {
-            chartArea.innerHTML = `<div class="alert alert-danger">前端异常/后端崩溃: ${e}</div>`;
-            console.error(e);
-        } finally {
-            btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-play-fill"></i> 仿真模拟';
-        }
-    }
+    window.__AUTH_USER__ = {{ auth_user | tojson }};
 </script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

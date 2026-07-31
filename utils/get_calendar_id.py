@@ -88,7 +88,7 @@ class CalendarIDFetcher:
             url = "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary"
             headers = {"Authorization": f"Bearer {user_token}"}
             params = {"user_id_type": "open_id"}
-            response = requests.get(
+            response = requests.post(
                 url,
                 headers=headers,
                 params=params,
@@ -107,24 +107,35 @@ class CalendarIDFetcher:
         # 尝试多种可能的数据结构解析
         calendar_info = {
             "calendar_id": None,
-            "owner_id": None
+            "owner_id": None,
+            "summary": None,
+            "role": None,
+            "type": None,
         }
 
         result = payload.get("data") or {}
+        calendar_payload = None
         
         # 尝试从可能的结构中提取calendar_id和owner_id
         if result.get("calendar"):
-            calendar_info["calendar_id"] = result.get("calendar", {}).get("calendar_id")
-            calendar_info["owner_id"] = result.get("calendar", {}).get("owner_id")
+            calendar_payload = result.get("calendar", {})
         elif result.get("calendars"):
             for item in result.get("calendars", []):
                 if item.get("calendar"):
-                    calendar_info["calendar_id"] = item.get("calendar", {}).get("calendar_id")
+                    calendar_payload = item.get("calendar", {})
                     calendar_info["owner_id"] = item.get("user_id")
                     break
         else:
-            calendar_info["calendar_id"] = result.get("calendar_id")
-            calendar_info["owner_id"] = result.get("owner_id")
+            calendar_payload = result
+
+        calendar_payload = calendar_payload or {}
+        calendar_info["calendar_id"] = calendar_payload.get("calendar_id")
+        calendar_info["owner_id"] = (
+            calendar_info["owner_id"] or calendar_payload.get("owner_id")
+        )
+        calendar_info["summary"] = calendar_payload.get("summary")
+        calendar_info["role"] = calendar_payload.get("role")
+        calendar_info["type"] = calendar_payload.get("type")
         
         # 记录解析结果
         logger.info(f"解析后的日历信息: {json.dumps(calendar_info)}")

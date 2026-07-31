@@ -55,6 +55,11 @@ class Simulator:
         self.time_step = self.user.get_param("time_step", self.time_step)
         self.predictor.params = self.user.params
 
+    def _feature_enabled(self, name: str) -> bool:
+        """Read one opt-in mechanism flag from the versioned Phase 0 baseline."""
+        flags = self.user.get_param("feature_flags", {})
+        return bool(flags.get(name, False)) if isinstance(flags, dict) else False
+
     def _evaluate_derivatives(self, S_temp: float, E_temp: float, current_time: datetime, 
                             active_events: list, routine_ev, state: str, 
                             elapsed_mins: float, continuous_hours: float, 
@@ -142,8 +147,17 @@ class Simulator:
             "fatigue": continuous_hours
         }
         
-        # 马尔可夫拦截器：根据区制对导数进行缩放
-        final_ds, final_de = self.predictor.apply_regime_modifiers(delta_S, delta_E, modifier_features, is_substep=is_substep)
+        # Phase 0 keeps the stochastic regime layer frozen. It can be enabled
+        # later for a named ablation run without changing the baseline path.
+        if self._feature_enabled("enable_regime_switching"):
+            final_ds, final_de = self.predictor.apply_regime_modifiers(
+                delta_S,
+                delta_E,
+                modifier_features,
+                is_substep=is_substep,
+            )
+        else:
+            final_ds, final_de = delta_S, delta_E
         
         return final_ds, final_de, base_ds, f_pen, components
 
@@ -151,6 +165,7 @@ class Simulator:
                      prev_E_end: Optional[float] = None, date_str: str = None):
         """核心仿真主循环：RK4 积分结合离散状态切换。"""
         self.user._init_strategies()
+        self.user.epoc_level = 0.0
         S_star = self.user.get_current_S_star()
         date_str = date_str or datetime.now().strftime("%Y-%m-%d")
         
@@ -240,7 +255,9 @@ class Simulator:
                 elif minutes_since_last_macro_check >= macro_interval:
                     trigger_reason = f"宏观巡检({macro_interval}m)"
 
-            if trigger_reason or current_time == base_date:
+            if self._feature_enabled("enable_regime_switching") and (
+                trigger_reason or current_time == base_date
+            ):
                 user_features = {
                     "fatigue": continuous_load_hours, 
                     "debt": self.user.get_sleep_debt(), 
@@ -260,7 +277,11 @@ class Simulator:
                     p_jump_val = probs_log.get('P_jump', 0.0) * 100
                     trace_logs.append(f"[{cur_str}] [{new_regime}] 区制跳跃: {old_regime} -> {new_regime} (Φ={phi_val:.2f}, 风险={p_jump_val:.1f}%)")
                     
-                    if old_regime == "FRICTION" and new_regime == "FLOW":
+                    if (
+                        old_regime == "FRICTION"
+                        and new_regime == "FLOW"
+                        and self._feature_enabled("enable_epiphany_refund")
+                    ):
                         total_dopamine = trigger_epiphany_refund(
                             micro_state,
                             micro_cfg,
@@ -325,32 +346,36 @@ class Simulator:
             f_pen_k1 = rk4_result.fatigue_penalty
 
             routine_event_type = routine_ev.get_event_type() if routine_ev else None
-            micro_result = apply_micro_dynamics(
-                pools=micro_state,
-                cfg=micro_cfg,
-                time_step=self.time_step,
-                state=state,
-                has_high_load=has_high_load,
-                routine_event_type=routine_event_type,
-                current_regime=self.predictor.current_regime,
-                current_stress=S,
-                current_energy=E,
-                stress_anchor=S_star,
-                raw_delta_s=delta_S,
-                raw_delta_e=delta_E,
-                base_delta_s=base_ds_k1,
-                inertia_delta_s=inertia_ds,
-                inertia_delta_e=inertia_de,
-                epoc_level=getattr(self.user, "epoc_level", 0.0),
-                resilience=static_resilience,
-                cur_str=cur_str,
-            )
-            self.user.epoc_level = micro_result.epoc_level
-            trace_logs.extend(micro_result.logs)
-
-            final_S_step = micro_result.final_s_step
-            final_E_step = micro_result.final_e_step
-            momentum_trace = micro_result.momentum_trace
+            if self._feature_enabled("enable_micro_dynamics"):
+                micro_result = apply_micro_dynamics(
+                    pools=micro_state,
+                    cfg=micro_cfg,
+                    time_step=self.time_step,
+                    state=state,
+                    has_high_load=has_high_load,
+                    routine_event_type=routine_event_type,
+                    current_regime=self.predictor.current_regime,
+                    current_stress=S,
+                    current_energy=E,
+                    stress_anchor=S_star,
+                    raw_delta_s=delta_S,
+                    raw_delta_e=delta_E,
+                    base_delta_s=base_ds_k1,
+                    inertia_delta_s=inertia_ds,
+                    inertia_delta_e=inertia_de,
+                    epoc_level=getattr(self.user, "epoc_level", 0.0),
+                    resilience=static_resilience,
+                    cur_str=cur_str,
+                )
+                self.user.epoc_level = micro_result.epoc_level
+                trace_logs.extend(micro_result.logs)
+                final_S_step = micro_result.final_s_step
+                final_E_step = micro_result.final_e_step
+                momentum_trace = micro_result.momentum_trace
+            else:
+                final_S_step = delta_S + inertia_ds
+                final_E_step = delta_E + inertia_de
+                momentum_trace = ""
 
             self._update_profiles(active_high_loads if has_high_load else ([routine_ev] if routine_ev else []), event_profile, final_S_step, final_E_step, f_pen_k1, momentum_trace)
 

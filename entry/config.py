@@ -32,6 +32,19 @@ GLOBAL_DEFAULT_CONFIG = {
     "E_critical": 20.0,   # 精力耗竭线
     "time_step": 5,       # 仿真步长
     "random_seed": 42,
+    # Phase 0 baseline: keep the model deterministic and identifiable.
+    # Disabled mechanisms stay available for later ablation experiments, but
+    # cannot influence the production baseline unless explicitly enabled.
+    "feature_flags": {
+        "enable_regime_switching": False,
+        "enable_poisson_anomaly": False,
+        "enable_friction_pool": False,
+        "enable_epiphany_refund": False,
+        "enable_dopamine_buffer": False,
+        "enable_stress_momentum": False,
+        "enable_daily_baseline_evolution": False,
+        "enable_micro_dynamics": False,
+    },
     "default_wake_time": "07:30",
     "default_sleep_time": "23:30",
     "noise_scale_factor": 0.2,

@@ -40,11 +40,19 @@ def _load_calendar_id_from_file(open_id=None):
         return None
 
 
-def _resolve_calendar_id(open_id=None, injected_calendar_id=None):
+def _resolve_calendar_id(
+    open_id=None,
+    injected_calendar_id=None,
+    injected_token=None,
+):
     from utils.get_token import load_feishu_env
 
     load_feishu_env()
-    calendar_id = injected_calendar_id or os.getenv("FEISHU_CALENDAR_ID") or _load_calendar_id_from_file(open_id)
+    calendar_id = injected_calendar_id
+    if not calendar_id and not injected_token:
+        calendar_id = os.getenv("FEISHU_CALENDAR_ID") or _load_calendar_id_from_file(
+            open_id
+        )
     if calendar_id:
         print(f"使用 calendar_id: {_mask(calendar_id)}")
         return calendar_id
@@ -52,7 +60,11 @@ def _resolve_calendar_id(open_id=None, injected_calendar_id=None):
     print("未配置 FEISHU_CALENDAR_ID，尝试通过主日历接口获取 calendar_id...")
     from utils.get_calendar_id import CalendarIDFetcher
     fetcher = CalendarIDFetcher()
-    calendar_id = fetcher.get_calendar_id(open_id)
+    if injected_token:
+        calendar_info = fetcher.get_calendar_info(injected_token)
+        calendar_id = calendar_info.get("calendar_id")
+    else:
+        calendar_id = fetcher.get_calendar_id(open_id)
     if calendar_id:
         print(f"主日历 calendar_id 获取成功: {_mask(calendar_id)}")
     return calendar_id
@@ -69,7 +81,11 @@ def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=N
             return []
         access_token = token_info["access_token"]
         
-    calendar_id = _resolve_calendar_id(open_id=open_id, injected_calendar_id=injected_calendar_id)
+    calendar_id = _resolve_calendar_id(
+        open_id=open_id,
+        injected_calendar_id=injected_calendar_id,
+        injected_token=access_token,
+    )
     if not calendar_id:
         print("无法获取 calendar_id")
         return []
@@ -79,15 +95,24 @@ def fetch_events_from_calendar_internal(date_str, open_id=None, injected_token=N
     
     return events
 
-def fetch_events_with_timeout(date_str, open_id=None, injected_token=None, injected_calendar_id=None, timeout=FEISHU_REQUEST_TIMEOUT_SECONDS, force_refresh=False):
+def fetch_events_with_timeout(
+    date_str,
+    open_id=None,
+    injected_token=None,
+    injected_calendar_id=None,
+    timeout=FEISHU_REQUEST_TIMEOUT_SECONDS,
+    force_refresh=False,
+    cache_namespace=None,
+):
     """带 TTL 缓存与超时的日历拉取；超时或异常返回空列表。"""
     global _TTL_CACHE
     
     current_time = time.time()
     
     # 1. 拦截层：检查 TTL 缓存 (附带 force_refresh 主动击穿)
-    if not force_refresh and date_str in _TTL_CACHE:
-        cached_data = _TTL_CACHE[date_str]
+    cache_key = f"{cache_namespace or 'default'}:{date_str}"
+    if not force_refresh and cache_key in _TTL_CACHE:
+        cached_data = _TTL_CACHE[cache_key]
         age = current_time - cached_data["timestamp"]
         if age < CACHE_EXPIRY_SECONDS:
             print(f"缓存命中: 获取 {date_str} 的日程 (剩余 {int(CACHE_EXPIRY_SECONDS - age)}s)")
@@ -106,7 +131,7 @@ def fetch_events_with_timeout(date_str, open_id=None, injected_token=None, injec
             events = future.result(timeout=timeout)
             
             # 3. 缓存更新：成功返回后刷新内存字典
-            _TTL_CACHE[date_str] = {
+            _TTL_CACHE[cache_key] = {
                 "timestamp": current_time,
                 "events": events
             }

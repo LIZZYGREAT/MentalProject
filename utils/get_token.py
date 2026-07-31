@@ -2,13 +2,17 @@ import os
 import requests
 import json
 import logging
+import tempfile
+import threading
 import time
-from urllib.parse import urlencode
+from contextlib import contextmanager
+from urllib.parse import urlencode, urlparse
 from settings.model_defaults import (
     APP_DEFAULT_HOST,
     APP_DEFAULT_PORT,
     BASE_DATA_DIR,
     DEFAULT_CALLBACK_PATH,
+    FEISHU_REQUEST_TIMEOUT_SECONDS,
     TOKEN_EXPIRY_BUFFER_SECONDS,
     USER_TOKEN_FILE,
 )
@@ -81,10 +85,120 @@ logging.basicConfig(level=logging.INFO,
                     ])
 logger = logging.getLogger(__name__)
 
+DEFAULT_FEISHU_OAUTH_SCOPES = (
+    "auth:user.id:read",
+    "offline_access",
+    "calendar:calendar:readonly",
+)
+REAUTHORIZE_ERROR_CODES = {20026, 20037, 20064, 20073}
+REFRESH_CONFIGURATION_ERROR_CODES = {20024, 20074}
+_TOKEN_LOCKS = {}
+_TOKEN_LOCKS_GUARD = threading.Lock()
+
+
+class FeishuAPIError(RuntimeError):
+    """Feishu OAuth error with a machine-readable error code."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class FeishuAuthorizationRequired(RuntimeError):
+    """The saved authorization cannot be reused or refreshed."""
+
+
+def _token_file_lock(file_path):
+    normalized_path = os.path.abspath(file_path)
+    with _TOKEN_LOCKS_GUARD:
+        return _TOKEN_LOCKS.setdefault(normalized_path, threading.Lock())
+
+
+@contextmanager
+def _interprocess_token_file_lock(file_path, timeout_seconds=None):
+    """Serialize one-time refresh-token rotation across server processes."""
+    absolute_path = os.path.abspath(file_path)
+    lock_path = f"{absolute_path}.lock"
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+    timeout_seconds = float(
+        timeout_seconds or max(30.0, FEISHU_REQUEST_TIMEOUT_SECONDS * 2)
+    )
+    lock_file = open(lock_path, "a+b")
+    acquired = False
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+
+        if os.name == "nt":
+            import msvcrt
+
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("等待飞书 token 刷新锁超时")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            acquired = True
+
+        yield
+    finally:
+        if acquired:
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
 
 def _default_token_path() -> str:
     """Return the local token file path from centralized settings."""
     return os.path.join(BASE_DATA_DIR, USER_TOKEN_FILE)
+
+
+def _validate_redirect_uri(redirect_uri: str) -> str:
+    """Reject OAuth callbacks that cannot return to this application's route."""
+    value = str(redirect_uri or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "FEISHU_REDIRECT_URI 必须是完整的 http(s) 回调地址，例如 "
+            "http://127.0.0.1:5000/callback"
+        )
+    if parsed.hostname in {"open.feishu.cn", "accounts.feishu.cn"}:
+        raise ValueError(
+            "FEISHU_REDIRECT_URI 不能指向飞书 API 调试台；它必须指向本项目的 "
+            f"{DEFAULT_CALLBACK_PATH} 回调接口"
+        )
+    if (
+        os.getenv("APP_ENV", "development").strip().lower() == "production"
+        and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    ):
+        raise ValueError(
+            "生产环境的 FEISHU_REDIRECT_URI 必须使用用户可访问的公网 HTTPS 域名，"
+            "不能使用 localhost 或 127.0.0.1"
+        )
+    if parsed.path != DEFAULT_CALLBACK_PATH or parsed.query or parsed.fragment:
+        raise ValueError(
+            "FEISHU_REDIRECT_URI 必须精确指向本项目回调路径 "
+            f"{DEFAULT_CALLBACK_PATH}，且不能包含查询参数或 # 片段"
+        )
+    return value
 
 
 class FeishuAPI:
@@ -108,7 +222,13 @@ class FeishuAPI:
         self.app_id = app_id or os.getenv("FEISHU_APP_ID") or os.getenv("APP_ID")
         self.app_secret = app_secret or os.getenv("FEISHU_APP_SECRET") or os.getenv("APP_SECRET")
         default_redirect = f"http://{APP_DEFAULT_HOST}:{APP_DEFAULT_PORT}{DEFAULT_CALLBACK_PATH}"
-        self.redirect_uri = redirect_uri or os.getenv("FEISHU_REDIRECT_URI") or os.getenv("REDIRECT_URI") or default_redirect
+        configured_redirect = (
+            redirect_uri
+            or os.getenv("FEISHU_REDIRECT_URI")
+            or os.getenv("REDIRECT_URI")
+            or default_redirect
+        )
+        self.redirect_uri = _validate_redirect_uri(configured_redirect)
         
         # 验证必要的配置信息
         if not self.app_id:
@@ -116,7 +236,7 @@ class FeishuAPI:
         if require_secret and not self.app_secret:
             raise ValueError("APP_SECRET或FEISHU_APP_SECRET必须通过环境变量设置或作为参数传入")
     
-    def generate_authorize_url(self, scope="auth:user.id:read offline_access", state=None):
+    def generate_authorize_url(self, scope=None, state=None):
         """
         生成授权URL，用户需要访问此URL进行授权
         
@@ -128,6 +248,12 @@ class FeishuAPI:
         Returns:
             str: 完整的授权URL
         """
+        if scope is None:
+            scope = os.getenv("FEISHU_OAUTH_SCOPES", "").strip()
+        if not scope:
+            scope = " ".join(DEFAULT_FEISHU_OAUTH_SCOPES)
+        scope = " ".join(dict.fromkeys(scope.split()))
+
         # 飞书授权页面URL
         authorize_url = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
         
@@ -177,26 +303,30 @@ class FeishuAPI:
         try:
             # 发送请求获取令牌
             logger.info("开始获取用户访问令牌...")
-            response = requests.post(token_url, json=data)
+            response = requests.post(
+                token_url,
+                json=data,
+                timeout=FEISHU_REQUEST_TIMEOUT_SECONDS,
+            )
             response_data = response.json()
             
             # 检查请求是否成功
             if response.status_code != 200 or response_data.get("code") != 0:
-                error_msg = response_data.get("msg", "未知错误")
+                error_msg = (
+                    response_data.get("error_description")
+                    or response_data.get("msg")
+                    or response_data.get("error")
+                    or "未知错误"
+                )
+                error_code = response_data.get("code") or response_data.get("error")
                 logger.error(f"获取用户访问令牌失败: {error_msg}")
-                raise Exception(f"获取用户访问令牌失败: {error_msg}")
+                raise FeishuAPIError(f"获取用户访问令牌失败: {error_msg}", error_code)
             
             # 保存令牌信息
             token_data = response_data.get("data", response_data)
-            token_info = {
-                "access_token": token_data.get("access_token"),
-                "expires_in": token_data.get("expires_in"),
-                "refresh_token": token_data.get("refresh_token"),
-                "refresh_expires_in": token_data.get("refresh_expires_in"),
-                "token_type": token_data.get("token_type", "Bearer"),
-                "scope": token_data.get("scope"),
-                "timestamp": int(time.time())  # 记录获取时间，用于判断是否过期
-            }
+            token_info = self._normalize_token_info(token_data)
+            if not token_info.get("access_token"):
+                raise FeishuAPIError("获取用户访问令牌失败: 响应中缺少 access_token")
             
             logger.info("获取用户访问令牌成功")
             return token_info
@@ -217,6 +347,8 @@ class FeishuAPI:
         """
         if not refresh_token:
             raise ValueError("刷新令牌不能为空")
+        if not self.app_secret:
+            raise ValueError("刷新令牌需要配置 FEISHU_APP_SECRET")
         
         # 刷新用户访问令牌的API地址
         refresh_url = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
@@ -232,26 +364,32 @@ class FeishuAPI:
         try:
             # 发送请求刷新令牌
             logger.info("开始刷新用户访问令牌...")
-            response = requests.post(refresh_url, json=data)
+            response = requests.post(
+                refresh_url,
+                json=data,
+                timeout=FEISHU_REQUEST_TIMEOUT_SECONDS,
+            )
             response_data = response.json()
             
             # 检查请求是否成功
             if response.status_code != 200 or response_data.get("code") != 0:
-                error_msg = response_data.get("msg", "未知错误")
+                error_msg = (
+                    response_data.get("error_description")
+                    or response_data.get("msg")
+                    or response_data.get("error")
+                    or "未知错误"
+                )
+                error_code = response_data.get("code") or response_data.get("error")
                 logger.error(f"刷新用户访问令牌失败: {error_msg}")
-                raise Exception(f"刷新用户访问令牌失败: {error_msg}")
+                raise FeishuAPIError(f"刷新用户访问令牌失败: {error_msg}", error_code)
             
             # 保存新的令牌信息
             token_data = response_data.get("data", response_data)
-            new_token_info = {
-                "access_token": token_data.get("access_token"),
-                "expires_in": token_data.get("expires_in"),
-                "refresh_token": token_data.get("refresh_token"),
-                "refresh_expires_in": token_data.get("refresh_expires_in"),
-                "token_type": token_data.get("token_type", "Bearer"),
-                "scope": token_data.get("scope"),
-                "timestamp": int(time.time())  # 记录获取时间
-            }
+            new_token_info = self._normalize_token_info(token_data)
+            if not new_token_info.get("access_token"):
+                raise FeishuAPIError("刷新用户访问令牌失败: 响应中缺少 access_token")
+            if not new_token_info.get("refresh_token"):
+                raise FeishuAPIError("刷新用户访问令牌失败: 响应中缺少新的 refresh_token")
             
             logger.info("刷新用户访问令牌成功")
             return new_token_info
@@ -260,6 +398,31 @@ class FeishuAPI:
             logger.error(f"刷新用户访问令牌时发生异常: {str(e)}")
             raise
     
+    @staticmethod
+    def _normalize_token_info(token_data):
+        """Normalize v2 OAuth fields and record absolute expiry timestamps."""
+        timestamp = int(time.time())
+        expires_in = int(token_data.get("expires_in") or 0)
+        refresh_expires_in = int(
+            token_data.get("refresh_token_expires_in")
+            or token_data.get("refresh_expires_in")
+            or 0
+        )
+        token_info = {
+            "access_token": token_data.get("access_token"),
+            "expires_in": expires_in,
+            "refresh_token": token_data.get("refresh_token"),
+            "refresh_token_expires_in": refresh_expires_in,
+            "token_type": token_data.get("token_type", "Bearer"),
+            "scope": token_data.get("scope") or "",
+            "timestamp": timestamp,
+            "expires_at": timestamp + expires_in if expires_in else 0,
+            "refresh_token_expires_at": (
+                timestamp + refresh_expires_in if refresh_expires_in else 0
+            ),
+        }
+        return token_info
+
     def save_token_to_file(self, token_info, file_path=None):
         """
         将令牌信息保存到文件
@@ -268,23 +431,42 @@ class FeishuAPI:
             token_info: 令牌信息字典
             file_path: 保存文件路径，默认为data/user_token.json
         """
-        # 确保data目录存在
-        data_dir = BASE_DATA_DIR
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir)
-            logger.info(f"创建数据目录: {data_dir}")
-        
         # 设置默认文件路径
         if file_path is None:
             file_path = _default_token_path()
-        
+
+        absolute_path = os.path.abspath(file_path)
+        data_dir = os.path.dirname(absolute_path)
+        os.makedirs(data_dir, exist_ok=True)
+        temp_path = None
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=data_dir,
+                prefix=".feishu-token-",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                temp_path = f.name
                 json.dump(token_info, f, ensure_ascii=False, indent=2)
-            logger.info(f"令牌信息已保存到 {file_path}")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, absolute_path)
+            logger.info(f"令牌信息已保存到 {absolute_path}")
         except Exception as e:
             logger.error(f"保存令牌信息到文件时发生异常: {str(e)}")
             raise
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
     
     def load_token_from_file(self, file_path=None):
         """
@@ -307,6 +489,14 @@ class FeishuAPI:
             
             with open(file_path, "r", encoding="utf-8") as f:
                 token_info = json.load(f)
+
+            if (
+                "refresh_token_expires_in" not in token_info
+                and "refresh_expires_in" in token_info
+            ):
+                token_info["refresh_token_expires_in"] = token_info.get(
+                    "refresh_expires_in", 0
+                )
             
             logger.info(f"从 {file_path} 加载令牌信息成功")
             return token_info
@@ -344,6 +534,127 @@ class FeishuAPI:
             logger.info(f"令牌剩余有效期: {remaining} 秒")
         
         return is_expired
+
+    def is_refresh_token_expired(
+        self,
+        token_info,
+        buffer_seconds=TOKEN_EXPIRY_BUFFER_SECONDS,
+    ):
+        if not token_info or not token_info.get("refresh_token"):
+            return True
+        timestamp = int(token_info.get("timestamp") or 0)
+        expires_in = int(
+            token_info.get("refresh_token_expires_in")
+            or token_info.get("refresh_expires_in")
+            or 0
+        )
+        if not expires_in:
+            return False
+        return (int(time.time()) - timestamp) + buffer_seconds >= expires_in
+
+    def ensure_valid_token(self, file_path=None):
+        """Load and rotate a user token once across threads and worker processes."""
+        file_path = file_path or _default_token_path()
+        with _token_file_lock(file_path):
+            with _interprocess_token_file_lock(file_path):
+                # Reload only after acquiring both locks. Another worker may have
+                # rotated the one-time refresh token while this worker waited.
+                token_info = self.load_token_from_file(file_path)
+                if not token_info or not token_info.get("access_token"):
+                    raise FeishuAuthorizationRequired("尚未完成飞书授权")
+                if not self.is_token_expired(token_info):
+                    return token_info, "connected"
+                if self.is_refresh_token_expired(token_info):
+                    raise FeishuAuthorizationRequired("飞书授权已失效，需要重新授权")
+
+                refreshed_token = self.refresh_user_access_token(
+                    token_info.get("refresh_token")
+                )
+                self.save_token_to_file(refreshed_token, file_path)
+                return refreshed_token, "refreshed"
+
+    def get_connection_status(self, file_path=None, refresh=True):
+        """Return connection metadata without exposing either OAuth token."""
+        file_path = file_path or _default_token_path()
+        token_info = self.load_token_from_file(file_path)
+        if not token_info or not token_info.get("access_token"):
+            return {
+                "valid": False,
+                "connected": False,
+                "status": "missing",
+                "needs_reauthorization": False,
+                "refreshable": False,
+            }
+
+        state = "connected"
+        if self.is_token_expired(token_info):
+            if not refresh:
+                state = "expired"
+            else:
+                try:
+                    token_info, state = self.ensure_valid_token(file_path)
+                except FeishuAuthorizationRequired as exc:
+                    return {
+                        "valid": False,
+                        "connected": True,
+                        "status": "reauthorization_required",
+                        "needs_reauthorization": True,
+                        "refreshable": False,
+                        "message": str(exc),
+                    }
+                except FeishuAPIError as exc:
+                    needs_reauthorization = exc.code in REAUTHORIZE_ERROR_CODES
+                    configuration_error = (
+                        exc.code in REFRESH_CONFIGURATION_ERROR_CODES
+                    )
+                    return {
+                        "valid": False,
+                        "connected": True,
+                        "status": (
+                            "reauthorization_required"
+                            if needs_reauthorization
+                            else (
+                                "refresh_configuration_error"
+                                if configuration_error
+                                else "refresh_failed"
+                            )
+                        ),
+                        "needs_reauthorization": (
+                            needs_reauthorization or exc.code == 20024
+                        ),
+                        "refreshable": (
+                            not needs_reauthorization and exc.code != 20024
+                        ),
+                        "provider_error_code": exc.code,
+                        "message": str(exc),
+                    }
+                except Exception as exc:
+                    logger.warning("自动刷新飞书 token 失败: %s", exc)
+                    return {
+                        "valid": False,
+                        "connected": True,
+                        "status": "refresh_failed",
+                        "needs_reauthorization": False,
+                        "refreshable": True,
+                        "message": "暂时无法自动刷新，请稍后重试",
+                    }
+
+        timestamp = int(token_info.get("timestamp") or 0)
+        expires_in = int(token_info.get("expires_in") or 0)
+        expires_at = int(
+            token_info.get("expires_at")
+            or (timestamp + expires_in if timestamp and expires_in else 0)
+        )
+        return {
+            "valid": state in {"connected", "refreshed"},
+            "connected": True,
+            "status": state,
+            "needs_reauthorization": False,
+            "refreshable": bool(token_info.get("refresh_token")),
+            "authorized_at": timestamp or None,
+            "expires_at": expires_at or None,
+            "scope": token_info.get("scope") or "",
+        }
     
     def get_auth_url(self):
         """兼容旧调用：生成授权页 URL。"""
@@ -473,7 +784,7 @@ def refresh_existing_token():
         return None
 
 
-def get_user_access_token(interactive=True):
+def get_user_access_token(interactive=True, file_path=None):
     """
     获取用户访问令牌的函数，提供给其他模块调用的接口
     
@@ -487,24 +798,15 @@ def get_user_access_token(interactive=True):
         # 创建飞书API客户端实例
         feishu_api = FeishuAPI()
         
-        # 检查是否有已保存的令牌文件
-        token_info = feishu_api.load_token_from_file()
-        
-        # 如果有令牌且未过期，直接返回
-        if token_info and not feishu_api.is_token_expired(token_info):
-            logger.info("使用有效的缓存令牌")
+        try:
+            token_info, state = feishu_api.ensure_valid_token(file_path)
+            logger.info(
+                "使用%s缓存令牌",
+                "自动刷新后的" if state == "refreshed" else "有效的",
+            )
             return token_info
-        
-        # 如果有刷新令牌，尝试刷新
-        if token_info and "refresh_token" in token_info:
-            try:
-                logger.info("尝试刷新过期的令牌")
-                refreshed_token = feishu_api.refresh_user_access_token(token_info["refresh_token"])
-                # 保存刷新后的令牌
-                feishu_api.save_token_to_file(refreshed_token)
-                return refreshed_token
-            except Exception as e:
-                logger.warning(f"刷新令牌失败，需要重新获取: {str(e)}")
+        except Exception as e:
+            logger.warning(f"未找到可复用的用户令牌: {str(e)}")
         
         # 交互式获取新的令牌
         if interactive:

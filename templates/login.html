@@ -3,82 +3,108 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>登录 - 心理压力建模平台</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        body {
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-            background: linear-gradient(135deg, #eef4ff 0%, #f8f9fa 55%, #effaf6 100%);
-        }
-        .login-card {
-            width: min(92vw, 420px);
-            border: 0;
-            border-radius: 14px;
-            box-shadow: 0 18px 50px rgba(38, 68, 120, 0.13);
-        }
-    </style>
+    <meta name="theme-color" content="#173f38">
+    <title>登录 · 心序 MindFlow</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
-<body>
-<main class="card login-card">
-    <div class="card-body p-4 p-md-5">
-        <div class="mb-4">
-            <h1 class="h4 mb-2">心理压力建模平台</h1>
-            <p class="text-secondary mb-0">使用数据库账号登录调试台</p>
+<body class="login-page">
+<main class="auth-shell">
+    <section class="auth-story" aria-label="产品介绍">
+        <a class="brand brand-light" href="/">
+            <span class="brand-mark" aria-hidden="true">
+                <span></span><span></span><span></span>
+            </span>
+            <span>
+                <strong>心序</strong>
+                <small>MindFlow</small>
+            </span>
+        </a>
+
+        <div class="story-copy">
+            <p class="eyebrow light">把一天，放回自己的节奏里</p>
+            <h1>看见压力的趋势，<br>也看见恢复的空间。</h1>
+            <p>
+                从日程与轻量反馈中提前识别可能的高负荷时段，
+                给你克制、温和、可以忽略的支持。
+            </p>
         </div>
 
-        <form id="loginForm">
-            <div class="mb-3">
-                <label for="username" class="form-label">用户名</label>
-                <input id="username" name="username" class="form-control" autocomplete="username" required autofocus>
+        <div class="story-preview" aria-hidden="true">
+            <div class="preview-orbit orbit-one"></div>
+            <div class="preview-orbit orbit-two"></div>
+            <div class="preview-card">
+                <span class="preview-label">今日节律</span>
+                <div class="preview-line">
+                    <i style="height: 34%"></i><i style="height: 48%"></i>
+                    <i style="height: 42%"></i><i style="height: 68%"></i>
+                    <i style="height: 57%"></i><i style="height: 38%"></i>
+                    <i style="height: 28%"></i>
+                </div>
+                <p><span></span> 下午 14:00 前后，给自己留一点缓冲</p>
             </div>
-            <div class="mb-3">
-                <label for="password" class="form-label">密码</label>
-                <input id="password" name="password" type="password" class="form-control" autocomplete="current-password" required>
-            </div>
-            <div id="loginError" class="alert alert-danger py-2 d-none" role="alert"></div>
-            <button id="loginButton" class="btn btn-primary w-100" type="submit">登录</button>
-        </form>
+        </div>
 
-        <p class="small text-secondary mt-4 mb-0">
-            首个管理员账号请在服务器上通过管理命令创建。
-        </p>
-    </div>
+        <p class="story-footnote">趋势参考，不用于诊断或替代专业帮助</p>
+    </section>
+
+    <section class="auth-panel">
+        <div class="auth-panel-inner">
+            <div class="mobile-brand">
+                <span class="brand-mark" aria-hidden="true">
+                    <span></span><span></span><span></span>
+                </span>
+                <strong>心序 MindFlow</strong>
+            </div>
+
+            <div class="auth-heading">
+                <p class="eyebrow">欢迎回来</p>
+                <h2 id="authTitle">登录你的空间</h2>
+                <p id="authSubtitle">继续查看今天的节律与支持建议。</p>
+            </div>
+
+            <div class="auth-tabs" role="tablist" aria-label="账号操作">
+                <button class="auth-tab active" id="loginTab" type="button">登录</button>
+                <button class="auth-tab" id="registerTab" type="button">创建账号</button>
+            </div>
+
+            <form id="authForm" novalidate>
+                <label class="field-label" for="loginId">邮箱或学号</label>
+                <div class="field-shell">
+                    <span class="field-icon" aria-hidden="true">ID</span>
+                    <input id="loginId" name="login_id" autocomplete="username"
+                           maxlength="254" placeholder="name@school.edu.cn 或学号" required autofocus>
+                </div>
+
+                <div class="password-label">
+                    <label class="field-label" for="password">密码</label>
+                    <span id="passwordHint">至少 10 个字符</span>
+                </div>
+                <div class="field-shell">
+                    <span class="field-icon lock-icon" aria-hidden="true"></span>
+                    <input id="password" name="password" type="password"
+                           autocomplete="current-password" minlength="10"
+                           placeholder="输入密码" required>
+                    <button class="reveal-button" id="revealPassword" type="button"
+                            aria-label="显示密码">显示</button>
+                </div>
+
+                <div id="authError" class="inline-alert error" role="alert" hidden></div>
+
+                <button id="authButton" class="primary-button auth-submit" type="submit">
+                    <span>登录</span><b aria-hidden="true">→</b>
+                </button>
+            </form>
+
+            <div class="privacy-note">
+                <span aria-hidden="true">◇</span>
+                <p>
+                    你的问卷原答与模型推断分层保存。预测只提供趋势参考，
+                    不会给出医学诊断。
+                </p>
+            </div>
+        </div>
+    </section>
 </main>
-
-<script>
-    const form = document.getElementById('loginForm');
-    const button = document.getElementById('loginButton');
-    const errorBox = document.getElementById('loginError');
-
-    form.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        errorBox.classList.add('d-none');
-        button.disabled = true;
-        button.textContent = '登录中...';
-        try {
-            const response = await fetch('/api/auth/login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    username: document.getElementById('username').value,
-                    password: document.getElementById('password').value
-                })
-            });
-            const payload = await response.json();
-            if (!response.ok) {
-                throw new Error(payload.message || '登录失败');
-            }
-            window.location.assign('/');
-        } catch (error) {
-            errorBox.textContent = error.message;
-            errorBox.classList.remove('d-none');
-        } finally {
-            button.disabled = false;
-            button.textContent = '登录';
-        }
-    });
-</script>
+<script src="{{ url_for('static', filename='login.js') }}"></script>
 </body>
 </html>

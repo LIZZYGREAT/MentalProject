@@ -1599,3 +1599,311 @@ Agent、LLM API 和 RAG 也不应取代数值模型。推荐的最终形态是�
 1. **能够上线**：模型稳定、结果可解释、用户数据可治理；
 2. **能够优化**：参数有观测依据，内部轨迹、风险窗口和关怀效果均可评价；
 3. **能够写论文**：有清晰研究问题、强基线、机制消融和可复现实验。
+
+---
+
+## 12. 阶段 0 与阶段 1 实施记录（2026-07-30）
+
+本节记录本轮已经进入代码并通过验证的内容。它描述的是当前实现状态，不替代前文的研究路线；未完成的研究性验收条件会明确列在最后。
+
+### 12.1 阶段 0：已完成的可信基线改造
+
+1. 在 `entry/config.py` 增加统一的 `feature_flags`，当前基线默认关闭：
+   - `enable_regime_switching`；
+   - `enable_poisson_anomaly`；
+   - `enable_friction_pool`；
+   - `enable_epiphany_refund`；
+   - `enable_dopamine_buffer`；
+   - `enable_stress_momentum`；
+   - `enable_daily_baseline_evolution`；
+   - `enable_micro_dynamics`。
+2. `Simulator` 已按特性开关切断半马尔可夫区制修正、顿悟返还和微观缓冲池；泊松异常还在 `MarkovRegimePredictor` 内单独受开关约束，便于后续做显式消融实验。
+3. 公共压力量纲统一为 `0–100`，精力量纲继续使用 `0–100`；API 的初始状态输入也增加了范围校验。
+4. `/api/simulate` 已改为无用户画像副作用：
+   - 不再调用 `evolve_daily_baseline`；
+   - 不再因一次仿真自动保存新的 `S*` 或阈值；
+   - 同一用户重放相同输入不会修改其参数档案。
+5. 每次预测现在都会保存：
+   - `prediction_run_id`；
+   - `model_version`、`parameter_version`、`feature_version`；
+   - `random_seed`；
+   - 规范化运行输入；
+   - 结果摘要和 SHA-256 输入/结果指纹；
+   - 完整的原始 `state_points`，包含每个时点的 `S`、`E`、状态和结构化轨迹。
+6. 展示图仍由原始状态点生成，但数据库保存的是未被展示层覆盖的完整结构化状态点，因此原始轨迹和展示副本已分层。
+7. 模拟日期、初始状态和沙盒事件增加了类型、范围、时间格式及结束时间校验，避免无效输入进入模型。
+8. 新增自动化回归用例，验证：
+   - 同一日期、事件、参数和种子连续运行产生相同指纹与相同日终结果；
+   - 两次运行具有不同运行 ID；
+   - 重放前后用户参数档案完全一致。
+
+当前阶段 0 版本标识：
+
+```text
+model_version     = se-baseline.v1
+parameter_version = phase0-defaults.v1
+feature_version   = event_features.v1
+```
+
+### 12.2 阶段 1：问卷、画像、作息与反馈闭环
+
+#### 账号与用户入口
+
+- 保留原有会话登录、管理员用户和 Bearer API Key 鉴权；
+- 增加普通用户自助注册接口 `POST /api/auth/register`；
+- 重做登录/注册页面，增加主题说明、非诊断声明、密码显示切换、错误状态和移动端布局；
+- 登录后的界面从“模型调试台”重构为普通用户空间，主导航划分为：
+  - 今日概览；
+  - 我的画像；
+  - 趋势预测；
+  - 轻量反馈；
+  - 设置。
+
+#### 版本化问卷
+
+- 新增 `services/onboarding.py`，当前题库版本为 `2026-07-30.v1`；
+- 问卷由后端定义、前端动态渲染，后续调整题目时只需新增题库版本，不需要重写页面结构；
+- 当前问卷共 3 个步骤、14 个简单问题：
+  - 日常节律：入睡、起床、午餐、晚餐和午睡习惯；
+  - 压力与恢复：变化敏感度、恢复能力、连续负荷和评价场景；
+  - 支持偏好：支持方式、文字语气和可选补充文本；
+- 题目定义与用户原始回答分表保存；
+- Likert 题统一为 `1–5`，前端时点反馈统一为 `0–10`；
+- 所有必填项、选项白名单、时间格式和文本长度均在服务端再次校验。
+
+相关接口：
+
+```text
+GET  /api/onboarding/questionnaire
+GET  /api/onboarding/status
+POST /api/onboarding/responses
+GET  /api/profile
+```
+
+#### 可审计画像推断
+
+- 已实现确定性规则链：`原始答案 → 正/反向标准化 → 构念分数 → 置信度 → 参数先验`；
+- 当前画像维度包括：
+  - `uncertainty_sensitivity`；
+  - `recovery_capacity`；
+  - `load_sensitivity`；
+  - `evaluation_sensitivity`；
+- 每个画像维度保存来源题目、正反向角色、标准化值、置信度和质量标记；
+- 只允许生成白名单参数先验：
+  - `K_resilience`；
+  - `fatigue_acceleration`；
+  - `event_sensitivity.uncertainty`；
+  - `event_sensitivity.evaluation`；
+- 参数先验只作为建议保存，当前不会自动写回用户模型参数；
+- 可选文本当前采用纯规则回退，不调用外部大模型；因此没有外部传输用户问卷文本。
+
+#### 作息计划与日上下文
+
+- 问卷事实项会生成画像中的 `routine` 和 `care_preferences`；
+- 新增确定性作息排程器，支持午餐、午睡和晚餐：
+  - 优先理想时间；
+  - 在允许窗口内以 10 分钟步长避开已有日程；
+  - 输出 `scheduled`、`shifted`、`unavailable` 或 `not_expected`；
+  - 无合法时间时不创建虚假恢复事件，而是保存 `unavailable` 及原因；
+- 在趋势预测时，会使用实际/沙盒日程重新生成避让后的作息计划；
+- 已建立 `routine_plan` 和 `daily_context_snapshot`，并将画像快照、作息计划和预测运行串联。
+
+相关接口：
+
+```text
+GET /api/routine-plan?date=YYYY-MM-DD
+GET /api/dashboard
+```
+
+#### 反馈闭环
+
+- 新增统一反馈接口 `POST /api/feedback`；
+- 支持以下反馈类型：
+  - `momentary_state`：早/中/晚时点压力与精力；
+  - `peak_review`：实际峰值与时间；
+  - `event_impact`：关键事件影响和纠错说明；
+  - `prediction_review`：预警准确性；
+  - `care_review`：关怀帮助程度；
+  - `routine_correction`：实际作息纠错；
+- 前端已提供早/中/晚快速记录和事后复盘表单；
+- 反馈可关联最近一次 `prediction_run_id`，后端会验证预测运行属于当前用户，阻止跨用户关联；
+- 原始反馈包含上报时间、目标时间、是否回顾性填写和结构化原答，不会静默覆盖。
+
+#### 新增数据实体
+
+应用数据库 Schema 已升级为版本 2，新增：
+
+```text
+questionnaire_definitions
+questionnaire_responses
+profile_inference_runs
+profile_snapshots
+routine_plans
+daily_context_snapshots
+prediction_runs
+state_points
+feedback_observations
+```
+
+问卷提交时，原答、推断运行、画像快照、当天作息计划和日上下文使用同一个数据库事务保存。
+
+### 12.3 前端视觉与信息架构优化
+
+- 视觉主题由通用 Bootstrap 调试台改为低刺激的深绿、米白和鼠尾草色系统；
+- 所有主要页面已进一步迁移为 Vue 3 + Vite 组件，继续使用本地 CSS，不依赖外部字体请求；
+- 优化了字号层级、留白、卡片密度、按钮语气、空状态、加载状态、错误提示与移动端响应式布局；
+- 普通用户界面隐藏“上帝参数”“破防”“内耗池”等研究调试措辞，改用：
+  - 趋势；
+  - 恢复空间；
+  - 日程节律；
+  - 风险时段；
+  - 轻量反馈；
+- 研究版本、运行 ID 和输入指纹被收进可展开的“研究与复现信息”，不干扰日常使用；
+- Token 与连接配置统一移动到“设置”：
+  - 飞书 OAuth 状态与连接入口；
+  - API Key 创建、一次性显示、复制、到期时间和撤销；
+  - 当前模型/参数/特征版本；
+- 飞书 token 文件已从全局 `data/user_token.json` 改为按应用用户隔离的 `data/user_tokens/user_{id}.json`，旧的全局 token 不再作为新界面的状态来源。
+- Vue 开发环境由 Vite `5173` 提供，并将 `/api` 代理到 Flask `5000`；生产构建由 Flask/Waitress 在 `8000` 同端口托管。
+- 完整 npm 安装、开发、构建、生产启动和用户操作流程记录在 `info/frontend_vue_deployment_guide.md`。
+
+### 12.4 验证结果
+
+本轮完成以下验证：
+
+```text
+Python compileall 通过
+JavaScript node --check 通过
+Vue Vite 生产构建通过
+unittest 10 / 10 通过
+git diff --check 通过
+```
+
+浏览器视觉验收使用真实 Edge 无头渲染完成，覆盖：
+
+- 登录/注册页；
+- 今日概览；
+- 初始化问卷弹窗；
+- 1440px 桌面布局。
+
+视觉检查中发现并修复了两项仅靠接口测试无法发现的问题：
+
+1. 固定侧栏导致主内容落入错误网格列、页面被压缩；
+2. 问卷入口上方装饰伪元素拦截按钮点击。
+
+### 12.5 当前仍需后续推进的边界
+
+以下内容不应被表述为已经完成：
+
+1. 阶段 1 的“连续获得一批用户 2–3 周有效纵向数据”是运营和研究验收条件，代码已具备采集链路，但尚未产生真实纵向样本；
+2. `daily_context_snapshot` 实体已建立，前日与近 7 日统计目前仍为空值，需在获得纵向反馈后补充滚动聚合；
+3. 画像问卷目前是可替换的工程初版，不是已经完成信效度验证的正式量表；
+4. 画像参数先验目前只保存不激活，后续需要结合真实反馈确定激活、覆盖、衰减和回滚规则；
+5. 飞书 token 已实现按用户文件隔离，但尚未完成生产级静态加密和数据库托管；正式多用户上线前仍需引入密钥管理；
+6. 当前图表仍同步生成 Matplotlib base64，异步图表任务和前端原生结构化绘图属于后续性能优化；
+7. 风险概率、预测区间、提前量和滚动验证属于阶段 2，当前界面不会伪装成已经具备这些能力。
+
+### 12.6 飞书一次授权与自动续期优化（2026-07-30）
+
+本轮根据飞书开放平台 OAuth v2、日历 v4 官方文档检查并修复了授权与日程读取链路。
+
+#### 原实现问题
+
+1. OAuth 回调将 token 保存到 `data/user_tokens/user_{id}.json`，但趋势预测拉取日程时仍读取旧的全局 `data/user_token.json`，两条链路没有使用同一份凭证；
+2. `/api/token_status` 只判断 access token 是否过期，不会使用 refresh token 自动续期；
+3. token 响应仍兼容旧字段 `refresh_expires_in`，没有正确优先处理 OAuth v2 的 `refresh_token_expires_in`；
+4. 日程 TTL 缓存只以日期为键，多用户在同一天读取日历时存在缓存串用风险；
+5. 前端授权完成后无法自动收到结果，需要用户手工刷新状态。
+
+#### 已完成修改
+
+- OAuth 默认申请以下权限：
+
+```text
+auth:user.id:read
+offline_access
+calendar:calendar:readonly
+```
+
+- 回调自动使用授权码换取 `user_access_token` 与 `refresh_token`，用户无需复制或填写 token；
+- access token 临近过期时，状态检查和实际日程读取都会自动刷新；
+- 按飞书“一次性 refresh token”规则，在刷新成功后立即原子覆盖保存新的 access/refresh token；
+- token 换取与刷新请求增加明确超时；
+- token 状态接口只返回连接状态、过期时间与权限范围，不向前端暴露完整 access token 或 refresh token；
+- 趋势预测统一读取当前登录应用用户的 token，不再回退到旧的全局 token；
+- Vue 多用户流程始终使用当前用户 token 查询其主日历，不复用全局 `FEISHU_CALENDAR_ID` 或旧的全局日历缓存；
+- 日程内存缓存增加应用用户命名空间，避免不同用户共享同一天的缓存结果；
+- OAuth 回调页会通知 Vue 主窗口、自动更新连接状态并关闭；
+- 设置页会区分“已连接并自动续期”“续期暂时失败”“授权已失效”等状态；
+- 保留“重新授权”入口，用于更换账号、权限变化或 refresh token 失效后的恢复。
+
+#### 仍需在飞书开放平台完成的配置
+
+代码已经具备自动续期能力，但应用管理员仍需在飞书开放平台：
+
+1. 开通 `offline_access`；
+2. 开通“获取日历、日程及忙闲信息（`calendar:calendar:readonly`）”；
+3. 在安全设置中开启刷新 `user_access_token`（如果后台显示该开关）；
+4. 发布应用版本使权限与安全设置生效；
+5. 确保重定向 URL 与 `FEISHU_REDIRECT_URI` 完全一致。
+
+如果没有完成 `offline_access` 配置，首次授权仍可取得短期 access token，但无法长期自动续期，过期后仍需重新授权。
+
+#### 验证结果
+
+```text
+Python py_compile：通过
+pytest：18 / 18 通过
+Vue Vite 生产构建：通过
+git diff --check：通过
+```
+
+新增测试覆盖 OAuth scope、v2 token 字段归一化、refresh token 单次轮换保存、状态接口不泄露 token，以及多用户日程缓存隔离。
+
+### 12.7 邮箱/学号账号与飞书连接可见性优化（2026-07-30）
+
+#### 账号体系
+
+- 用户表由 `username` 改为：
+
+```text
+login_id
+login_type = email | student_id
+```
+
+- 注册和登录统一使用 `login_id`；
+- 邮箱会统一转为小写，并按不区分大小写匹配；
+- 学号支持 5–32 位字母、数字、下划线和连字符，必须至少包含一个数字；
+- 登录、注册、管理员接口、命令行管理工具、Vue 页面和后备模板均已移除“用户名”输入；
+- Bootstrap 管理员变量改为 `BOOTSTRAP_ADMIN_LOGIN_ID`；
+- 数据库 Schema 升级为版本 3。
+
+按用户要求执行了精确清理：删除旧 `users` 表中的 1 个用户，并通过外键级联清理 API Key、用户参数、问卷回答、画像、作息计划、预测和反馈。保留问卷定义、Schema 记录等非用户公共数据。清理完成后用户及全部用户关联表计数均为 0，`PRAGMA foreign_key_check` 无异常。
+
+#### 飞书连接状态
+
+- 设置页继续以“连接日历”作为首次授权入口；
+- token 有效时按钮会变为“重新授权”；
+- 页面显示以下明确状态：
+  - 未连接；
+  - 已连接且自动续期已开启；
+  - 已连接但仅本次有效；
+  - 自动续期暂时失败；
+  - 授权已失效；
+- 新增“检测连接”按钮和 `GET /api/feishu/verify`；
+- 检测操作会实际使用当前用户 token 调用飞书主日历接口；
+- 检测成功后显示“已验证：主日历可正常读取”，而不是只依据本地 token 文件判断；
+- OAuth 弹窗关闭或回调消息返回后，Vue 会自动重新读取连接状态并执行验证。
+
+飞书回调 URL 中的 `code` 和 `state` 均由浏览器与后端自动处理，用户不需要也不应手工复制到页面。`code` 是一次性临时授权码；`state` 用于回调请求校验。
+
+本轮最终验证：
+
+```text
+活动数据库用户数：0
+数据库 Schema：3
+SQLite 外键检查：0 个问题
+pytest：18 / 18 通过
+Vue Vite 生产构建：通过
+应用健康检查：HTTP 200
+```

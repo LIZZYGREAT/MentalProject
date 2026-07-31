@@ -335,6 +335,85 @@ class CalibrationStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def admin_reliability_overview(self) -> Dict[str, Any]:
+        """Return evidence actually recorded by evaluation and calibration jobs."""
+        self.init_schema()
+        with self._connect() as conn:
+            counts = {
+                "daily_feedback": int(
+                    conn.execute("SELECT COUNT(*) FROM daily_feedback").fetchone()[0]
+                ),
+                "event_feedback": int(
+                    conn.execute("SELECT COUNT(*) FROM event_feedback").fetchone()[0]
+                ),
+                "evaluations": int(
+                    conn.execute("SELECT COUNT(*) FROM evaluation_runs").fetchone()[0]
+                ),
+                "calibration_jobs": int(
+                    conn.execute("SELECT COUNT(*) FROM calibration_jobs").fetchone()[0]
+                ),
+                "model_runs": int(
+                    conn.execute("SELECT COUNT(*) FROM model_runs").fetchone()[0]
+                ),
+            }
+            latest = conn.execute(
+                """
+                SELECT id, user_id, params_version, sample_count, stress_mae,
+                       energy_mae, trend_accuracy, peak_time_error_min,
+                       alert_score, total_loss, metrics_json, notes, created_at
+                FROM evaluation_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            recent_evaluations = conn.execute(
+                """
+                SELECT id, user_id, params_version, sample_count, stress_mae,
+                       energy_mae, trend_accuracy, peak_time_error_min,
+                       alert_score, total_loss, created_at
+                FROM evaluation_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT 20
+                """
+            ).fetchall()
+            recent_jobs = conn.execute(
+                """
+                SELECT id, user_id, base_params_version, best_params_version,
+                       status, best_loss, started_at, ended_at
+                FROM calibration_jobs
+                ORDER BY started_at DESC, id DESC
+                LIMIT 10
+                """
+            ).fetchall()
+
+        latest_payload = dict(latest) if latest else None
+        if latest_payload:
+            try:
+                latest_payload["metrics"] = json.loads(
+                    latest_payload.pop("metrics_json") or "{}"
+                )
+            except json.JSONDecodeError:
+                latest_payload["metrics"] = {}
+
+        sample_count = int(latest_payload["sample_count"]) if latest_payload else 0
+        if sample_count >= 30:
+            evidence_level = "sufficient"
+        elif sample_count >= 7:
+            evidence_level = "limited"
+        else:
+            evidence_level = "insufficient"
+
+        return {
+            "counts": counts,
+            "latest_evaluation": latest_payload,
+            "recent_evaluations": [dict(row) for row in recent_evaluations],
+            "recent_jobs": [dict(row) for row in recent_jobs],
+            "evidence_level": evidence_level,
+            "evidence_note": (
+                "样本量表示已参与误差评估的日级样本数；它不是医学置信度。"
+            ),
+        }
+
     def _insert(self, table: str, row: Dict[str, Any]) -> int:
         keys = list(row.keys())
         placeholders = ", ".join("?" for _ in keys)

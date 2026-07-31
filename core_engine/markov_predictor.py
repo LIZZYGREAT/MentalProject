@@ -91,7 +91,11 @@ class MarkovRegimePredictor:
         probs_log = {"P_jump": p_jump, "Phi": phi}
         
         # 5. 泊松异常跳跃通道 (处理顿悟或极端崩溃的量子隧穿)
-        poisson_prob = cfg.get("poisson_anomaly_prob", 0.01)
+        feature_flags = self.params.get("feature_flags", {})
+        poisson_enabled = bool(
+            feature_flags.get("enable_poisson_anomaly", False)
+        ) if isinstance(feature_flags, dict) else False
+        poisson_prob = cfg.get("poisson_anomaly_prob", 0.01) if poisson_enabled else 0.0
         if self.rng.random() < poisson_prob:
             self.regime_duration_minutes = 0.0
             if self.current_regime == "FLOW":

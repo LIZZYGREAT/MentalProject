@@ -6,7 +6,7 @@
 
 ### 用户与权限
 
-- 用户名 + 密码登录，密码只保存 Werkzeug 安全哈希；
+- 邮箱或学号 + 密码登录，密码只保存 Werkzeug 安全哈希；
 - 浏览器登录后使用 Flask 签名 Session；
 - 外部服务器使用 Bearer API Key；
 - API Key 原文只在创建时返回一次，数据库只保存 SHA-256 哈希；
@@ -126,7 +126,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 ```powershell
 python -m auth.manage init-db
-python -m auth.manage create-user --username admin --role admin
+python -m auth.manage create-user --login-id admin@school.edu.cn --role admin
 ```
 
 命令会安全提示输入密码。密码至少 10 个字符。
@@ -134,7 +134,7 @@ python -m auth.manage create-user --username admin --role admin
 创建普通用户：
 
 ```powershell
-python -m auth.manage create-user --username alice --role user
+python -m auth.manage create-user --login-id 20260001 --role user
 ```
 
 ### 方法二：首次启动环境变量
@@ -142,11 +142,11 @@ python -m auth.manage create-user --username alice --role user
 在 `.env` 设置：
 
 ```text
-BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_LOGIN_ID=admin@school.edu.cn
 BOOTSTRAP_ADMIN_PASSWORD=一个足够长的初始密码
 ```
 
-应用首次启动且用户名不存在时会创建管理员。创建成功后应删除 `BOOTSTRAP_ADMIN_PASSWORD` 并重启，避免初始密码长期留在环境配置中。
+应用首次启动且邮箱/学号不存在时会创建管理员。创建成功后应删除 `BOOTSTRAP_ADMIN_PASSWORD` 并重启，避免初始密码长期留在环境配置中。
 
 ## 4. 数据库管理命令
 
@@ -159,19 +159,19 @@ python -m auth.manage list-users
 重置密码：
 
 ```powershell
-python -m auth.manage reset-password --username alice
+python -m auth.manage reset-password --login-id 20260001
 ```
 
 停用用户：
 
 ```powershell
-python -m auth.manage set-user-active --username alice --active false
+python -m auth.manage set-user-active --login-id 20260001 --active false
 ```
 
 重新启用：
 
 ```powershell
-python -m auth.manage set-user-active --username alice --active true
+python -m auth.manage set-user-active --login-id 20260001 --active true
 ```
 
 查看数据库状态：
@@ -194,7 +194,7 @@ python -m auth.manage backup --output backups/app-20260730.sqlite3
 
 ```powershell
 python -m auth.manage create-api-key `
-  --username alice `
+  --login-id 20260001 `
   --name server-a `
   --expires-days 90
 ```
@@ -204,7 +204,7 @@ python -m auth.manage create-api-key `
 查看密钥元数据：
 
 ```powershell
-python -m auth.manage list-api-keys --username alice
+python -m auth.manage list-api-keys --login-id 20260001
 ```
 
 撤销：
@@ -297,7 +297,7 @@ print(response.json())
 | `GET` | `/api/admin/database/stats` | admin |
 | `GET` | `/api/health` | 公共 |
 
-原有 `/api/config`、`/api/simulate`、反馈、评价、校准、飞书状态等接口现在都要求 Session 或 API Key。飞书浏览器 OAuth 发起和手工 code 提交要求浏览器 Session。
+原有 `/api/config`、`/api/simulate`、反馈、评价、校准、飞书状态等接口现在都要求 Session 或 API Key。飞书浏览器 OAuth 由登录 Session 发起，回调会校验 `state` 并在服务端自动换取 token；手工提交 code 的旧流程已停用。
 
 ## 7. 不使用 Docker的服务器部署
 
@@ -309,7 +309,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 python -m auth.manage init-db
-python -m auth.manage create-user --username admin --role admin
+python -m auth.manage create-user --login-id admin@school.edu.cn --role admin
 gunicorn --config gunicorn.conf.py wsgi:app
 ```
 
@@ -353,7 +353,7 @@ APP_ENV=production
 FLASK_SECRET_KEY=随机长密钥
 SESSION_COOKIE_SECURE=true
 TRUST_PROXY_HEADERS=true
-BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_LOGIN_ID=admin@school.edu.cn
 BOOTSTRAP_ADMIN_PASSWORD=初始管理员密码
 FEISHU_REDIRECT_URI=https://api.example.com/callback
 APP_PORT=8000
@@ -465,7 +465,7 @@ SQLite 数据文件不能放在多个容器跨主机共享的普通网络文件�
 
 ## 12. 当前仍需注意
 
-1. 飞书 Token 仍沿用项目原有的单个本地文件，尚未按用户隔离。多用户分别绑定飞书账号前，需要增加加密的 per-user OAuth Token 存储。
+1. 飞书 Token 已按应用用户隔离并支持自动刷新；正式多用户上线前仍需把本地文件升级为数据库或密钥服务托管的静态加密存储。
 2. API Key 当前按用户授权，没有细分 `simulate/read/calibrate/admin` scope。对更多外部合作方开放前应增加权限范围。
 3. 密码登录没有验证码、速率限制和账户锁定。公网部署应在 Nginx/API Gateway 增加限流，并考虑应用级失败次数策略。
 4. 长时间校准仍是同步请求。后续应使用 Celery/RQ 等任务队列。
