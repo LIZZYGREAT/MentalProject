@@ -1,4 +1,4 @@
-"""User-facing strategy metadata and deterministic function diagnostics."""
+"""Legacy-only deterministic function diagnostics for the retired S/E engine."""
 
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ def strategy_payload(params: Dict[str, Any]) -> Dict[str, Any]:
         "schema_version": "strategy_preferences.v1",
         "current": current,
         "families": [catalog[key] | {"key": key} for key in FAMILY_ORDER],
-        "notice": "这些选项只改变趋势模型的计算方式，不是心理诊断或人格标签。",
+        "notice": "历史 S/E 引擎诊断数据；这些离散类型不进入 CTSSM，也不再向用户开放。",
     }
 
 

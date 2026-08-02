@@ -12,13 +12,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import uuid
 
 
-QUESTIONNAIRE_VERSION = "2026-07-30.v1"
-MAPPING_VERSION = "profile_mapping.v1"
+QUESTIONNAIRE_VERSION = "2026-07-31.v2"
+MAPPING_VERSION = "ctssm_prior_mapping.v2"
 QUESTIONNAIRE_SCHEMA_VERSION = "questionnaire_definition.v1"
 ONBOARDING_SCHEMA_VERSION = "onboarding.v1"
-MODEL_VERSION = "se-baseline.v1"
-PARAMETER_VERSION = "phase0-defaults.v1"
-FEATURE_VERSION = "event_features.v1"
+MODEL_VERSION = "nested-stress-ctssm.v3"
+PARAMETER_VERSION = "paper-aligned-semantic-defaults.v3"
+FEATURE_VERSION = "bounded-api-semantics-trajectory-care.v3"
 
 
 QUESTIONNAIRE_DEFINITION: Dict[str, Any] = {
@@ -200,10 +200,11 @@ QUESTIONNAIRE_DEFINITION: Dict[str, Any] = {
         "5": "非常符合",
     },
     "parameter_whitelist": [
-        "K_resilience",
-        "fatigue_acceleration",
-        "event_sensitivity.uncertainty",
-        "event_sensitivity.evaluation",
+        "S_star_init",
+        "ctssm_params.vitality_baseline",
+        "ctssm_params.stress_recovery_per_hour",
+        "ctssm_params.event_stress_gain",
+        "ctssm_params.cognition_decay_per_hour",
     ],
 }
 
@@ -339,21 +340,40 @@ def infer_profile(response: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
     uncertainty = by_trait.get("uncertainty_sensitivity", 0.5)
     evaluation = by_trait.get("evaluation_sensitivity", 0.5)
     parameter_priors = [
-        _prior("K_resilience", 0.75 + recovery * 0.5, 0.65, 1.35, ["recovery_capacity"]),
-        _prior("fatigue_acceleration", 0.10 + load * 0.12, 0.08, 0.25, ["load_sensitivity"]),
         _prior(
-            "event_sensitivity.uncertainty",
-            0.8 + uncertainty * 0.45,
-            0.75,
-            1.35,
-            ["uncertainty_sensitivity"],
+            "S_star_init",
+            47.0 + 3.0 * uncertainty + 3.0 * evaluation,
+            40.0,
+            60.0,
+            ["uncertainty_sensitivity", "evaluation_sensitivity"],
         ),
         _prior(
-            "event_sensitivity.evaluation",
-            0.8 + evaluation * 0.45,
-            0.75,
-            1.35,
-            ["evaluation_sensitivity"],
+            "ctssm_params.vitality_baseline",
+            68.0 + 8.0 * recovery - 4.0 * load,
+            58.0,
+            82.0,
+            ["recovery_capacity", "load_sensitivity"],
+        ),
+        _prior(
+            "ctssm_params.stress_recovery_per_hour",
+            0.45 + 0.55 * recovery,
+            0.30,
+            1.20,
+            ["recovery_capacity"],
+        ),
+        _prior(
+            "ctssm_params.event_stress_gain",
+            22.0 + 5.0 * uncertainty + 7.0 * evaluation,
+            18.0,
+            40.0,
+            ["uncertainty_sensitivity", "evaluation_sensitivity"],
+        ),
+        _prior(
+            "ctssm_params.cognition_decay_per_hour",
+            0.72 + 0.58 * recovery - 0.22 * uncertainty,
+            0.45,
+            1.55,
+            ["recovery_capacity", "uncertainty_sensitivity"],
         ),
     ]
 
