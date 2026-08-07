@@ -13,6 +13,7 @@ from strategy.rest_strategy import RestStrategy
 
 from entry.config import GLOBAL_DEFAULT_CONFIG
 from algorithm.mental_models import calculate_resilience_index
+from algorithm.dynamic_state_model import MODEL_VARIANTS, normalize_model_variant
 from settings.model_defaults import BASE_DATA_DIR, USER_CONFIG_DIR_NAME
 from settings.parameter_store import get_param as resolve_param
 
@@ -37,6 +38,24 @@ class User:
                 
         if params:
             self.params.update(params)
+
+        selection = self.params.get("model_selection", {})
+        if not isinstance(selection, dict):
+            selection = {}
+        selection_status = str(selection.get("status") or "")
+        if selection_status not in {
+            "retained_from_empirical_evidence",
+            "research_candidate_run",
+        }:
+            active_variant = "m0"
+        else:
+            active_variant = normalize_model_variant(
+                selection.get("active_variant", "m0")
+            )
+        self.params["model_family"] = MODEL_VARIANTS[active_variant]["canonical"]
+        self.params.setdefault("model_selection", {}).update(
+            {"active_variant": active_variant}
+        )
             
         self.solver: Optional['StressSolver'] = None
         self.night_strategy: Optional[NightStrategy] = None
@@ -48,7 +67,7 @@ class User:
         self.resilience_index = 0.0
         self.epoc_level = 0.0
         
-        self._init_strategies()
+        self._refresh_strategy_runtime()
         self._init_solver()
     
     # =======================================================
@@ -75,7 +94,14 @@ class User:
         return float(self.params.get("S_star_init", 50.0))
         
     def get_current_threshold(self) -> float:
-        """报警阈值 S_threshold。"""
+        """Return the current care observation line for the active model."""
+        if "ctssm" in str(self.params.get("model_family", "")).lower():
+            alert_cfg = self.params.get("alert_thresholds", {})
+            if isinstance(alert_cfg, dict) and "yellow_stress" in alert_cfg:
+                return max(
+                    float(alert_cfg["yellow_stress"]),
+                    self.get_current_S_star() + 12.0,
+                )
         return float(self.params.get("S_threshold", 90.0))
         
     def set_stress_baseline(self, s_star: float, threshold: float = None):
@@ -137,11 +163,24 @@ class User:
 
     def _init_strategies(self):
         """按 params 重建 night/course/rest 策略并刷新 resilience_index。"""
-        night_type = self.params.get("night_strategy", "normal")
-        course_f_type = self.params.get("f_strategy", "sensitive")
-        course_C_type = self.params.get("C_strategy", "high")
-        rest_type = self.params.get("rest_strategy", "relieved")
-        time_prefs = self.params.get("time_preferences", [])
+        legacy = self.params.get("legacy_model", {})
+        if not isinstance(legacy, dict):
+            legacy = {}
+        night_type = legacy.get(
+            "night_strategy", self.params.get("night_strategy", "normal")
+        )
+        course_f_type = legacy.get(
+            "f_strategy", self.params.get("f_strategy", "sensitive")
+        )
+        course_C_type = legacy.get(
+            "C_strategy", self.params.get("C_strategy", "high")
+        )
+        rest_type = legacy.get(
+            "rest_strategy", self.params.get("rest_strategy", "relieved")
+        )
+        time_prefs = legacy.get(
+            "time_preferences", self.params.get("time_preferences", [])
+        )
         
         self.night_strategy = NightStrategy.create(night_type, self.params)
         self.course_strategy = CourseStrategy.create(course_f_type, course_C_type, time_prefs, self.params)
@@ -149,6 +188,16 @@ class User:
         
         self._calculate_resilience_index()
     
+    def _refresh_strategy_runtime(self):
+        """Keep legacy strategy objects out of the paper-aligned CTSSM path."""
+        if "ctssm" not in str(self.params.get("model_family", "")).lower():
+            self._init_strategies()
+            return
+        self.night_strategy = None
+        self.course_strategy = None
+        self.rest_strategy = None
+        self.resilience_index = 0.0
+
     def _init_solver(self):
         """构造 Simulator(self)。"""
         from core_engine.simulator import Simulator
@@ -176,7 +225,7 @@ class User:
     def update_params(self, new_params: Dict[str, Any]):
         """合并 new_params，重建策略并同步 solver。"""
         self.params.update(new_params)
-        self._init_strategies()
+        self._refresh_strategy_runtime()
         if self.solver:
             self.solver.update_user(self)
         self.save_config()  
@@ -187,22 +236,23 @@ class User:
     
     def set_night_strategy(self, strategy_type: str):
         self.night_strategy = NightStrategy.create(strategy_type, self.params)
-        self.params["night_strategy"] = strategy_type
+        self.params.setdefault("legacy_model", {})["night_strategy"] = strategy_type
         self._calculate_resilience_index()
         self.save_config()  
     
     def set_course_strategy(self, f_type: str, C_type: str, time_prefs: list = None):
         time_prefs = time_prefs or self.params.get("time_preferences", [])
         self.course_strategy = CourseStrategy.create(f_type, C_type, time_prefs, self.params)
-        self.params["f_strategy"] = f_type
-        self.params["C_strategy"] = C_type
+        legacy = self.params.setdefault("legacy_model", {})
+        legacy["f_strategy"] = f_type
+        legacy["C_strategy"] = C_type
         self.params["time_preferences"] = time_prefs
         self._calculate_resilience_index()
         self.save_config()  
     
     def set_rest_strategy(self, strategy_type: str):
         self.rest_strategy = RestStrategy.create(strategy_type, self.params)
-        self.params["rest_strategy"] = strategy_type
+        self.params.setdefault("legacy_model", {})["rest_strategy"] = strategy_type
         self._calculate_resilience_index()
         self.save_config()  
     
@@ -248,16 +298,24 @@ class User:
         return None
     
     def get_f_strategy(self) -> str:
-        return self.params.get("f_strategy", "sensitive")
+        return self.params.get("legacy_model", {}).get(
+            "f_strategy", self.params.get("f_strategy", "sensitive")
+        )
     
     def get_C_strategy(self) -> str:
-        return self.params.get("C_strategy", "high")
+        return self.params.get("legacy_model", {}).get(
+            "C_strategy", self.params.get("C_strategy", "high")
+        )
     
     def get_night_strategy(self) -> str:
-        return self.params.get("night_strategy", "normal")
+        return self.params.get("legacy_model", {}).get(
+            "night_strategy", self.params.get("night_strategy", "normal")
+        )
     
     def get_rest_strategy(self) -> str:
-        return self.params.get("rest_strategy", "relieved")
+        return self.params.get("legacy_model", {}).get(
+            "rest_strategy", self.params.get("rest_strategy", "relieved")
+        )
     
     def get_time_preferences(self) -> List[str]:
         return self.params.get("time_preferences", [])
@@ -269,24 +327,27 @@ class User:
         elif not enabled and preference in time_prefs:
             time_prefs.remove(preference)
         self.params["time_preferences"] = time_prefs
-        self._init_strategies()
+        self._refresh_strategy_runtime()
         self.save_config()  
     
     def update_strategy_config(self, f_strategy: str = None, C_strategy: str = None,
                               night_strategy: str = None, rest_strategy: str = None,
                               time_preferences: List[str] = None):
         """仅更新策略相关键并 _init_strategies；与 update_params 可配合使用。"""
+        legacy = self.params.setdefault("legacy_model", {})
         if f_strategy:
-            self.params["f_strategy"] = f_strategy
+            legacy["f_strategy"] = f_strategy
         if C_strategy:
-            self.params["C_strategy"] = C_strategy
+            legacy["C_strategy"] = C_strategy
         if night_strategy:
-            self.params["night_strategy"] = night_strategy
+            legacy["night_strategy"] = night_strategy
         if rest_strategy:
-            self.params["rest_strategy"] = rest_strategy
+            legacy["rest_strategy"] = rest_strategy
+        if time_preferences is not None:
+            legacy["time_preferences"] = time_preferences
         if time_preferences is not None:
             self.params["time_preferences"] = time_preferences
-        self._init_strategies()
+        self._refresh_strategy_runtime()
         if self.solver:
             self.solver.update_user(self)
         self.save_config()  

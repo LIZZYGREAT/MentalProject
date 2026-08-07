@@ -18,24 +18,24 @@ from calibration.simulation_runner import run_simulation_for_calibration
 
 
 DEFAULT_SEARCH_SPACE: Dict[str, Tuple[float, float]] = {
-    "S_star_init": (40.0, 70.0),
-    "S_threshold": (70.0, 115.0),
-    "D_t_course": (0.25, 1.60),
-    "D_t_task": (0.20, 1.40),
-    "course_base_drain": (2.0, 12.0),
-    "task_base_drain": (2.0, 12.0),
-    "fatigue_acceleration": (0.0, 0.35),
-    "K_resilience": (0.5, 2.0),
-    "penalty_sleep_debt.drain_k": (0.0, 0.20),
-    "penalty_sleep_debt.stress_k": (0.0, 0.20),
-    "habituation_params.floor_mu_course": (0.15, 0.75),
-    "habituation_params.floor_mu_task": (0.15, 0.75),
-    "habituation_params.t_half_hyperbolic": (15.0, 120.0),
-    "rest_ode_params.R_max_base": (2.0, 10.0),
-    "simulator_micro_params.basal_drain_rate": (0.05, 0.80),
-    "simulator_micro_params.buffer_decay_rate": (0.01, 0.20),
-    "simulator_micro_params.basal_stress_gap_k": (0.0, 0.08),
-    "simulator_micro_params.momentum_beta": (0.02, 0.45),
+    "S_star_init": (40.0, 57.5),
+    "ctssm_params.stress_reactivity_per_hour": (0.60, 3.00),
+    "ctssm_params.stress_recovery_per_hour": (0.25, 1.50),
+    "ctssm_params.event_stress_gain": (15.0, 45.0),
+    "ctssm_params.cognition_stress_gain": (5.0, 28.0),
+    "ctssm_params.fatigue_stress_gain": (5.0, 30.0),
+    "ctssm_params.sleep_debt_stress_per_hour": (0.0, 3.0),
+    "ctssm_params.vitality_baseline": (58.0, 86.0),
+    "ctssm_params.vitality_regulation_per_hour": (0.20, 1.25),
+    "ctssm_params.demand_vitality_drain_per_hour": (5.0, 24.0),
+    "ctssm_params.recovery_vitality_gain_per_hour": (4.0, 22.0),
+    "ctssm_params.fatigue_vitality_gain": (8.0, 42.0),
+    "ctssm_params.sleep_debt_vitality_per_hour": (0.0, 4.0),
+    "ctssm_params.cognition_decay_per_hour": (0.40, 2.50),
+    "ctssm_params.anticipation_gain_per_hour": (0.20, 1.80),
+    "ctssm_params.aftermath_gain_per_hour": (0.20, 2.00),
+    "ctssm_params.fatigue_accumulation_per_hour": (0.10, 1.00),
+    "ctssm_params.fatigue_recovery_per_hour": (0.25, 2.00),
 }
 
 
@@ -137,6 +137,8 @@ def evaluate_candidate(params: Dict[str, Any], samples: List[Dict[str, Any]]) ->
             user_params=sample_params,
             yesterday_state=sample.get("yesterday_state"),
             weave_routines=sample.get("weave_routines", True),
+            observations=sample.get("online_observations", []),
+            sleep_context=sample.get("sleep_context"),
         )
         metrics.append(
             evaluate_simulation(

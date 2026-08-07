@@ -1,15 +1,30 @@
 <script setup>
 import { onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
 
 const router = useRouter();
+const route = useRoute();
 const mode = ref("login");
 const loginId = ref("");
 const password = ref("");
 const revealPassword = ref(false);
 const loading = ref(false);
 const errorMessage = ref("");
+
+function safeNextPath() {
+  const next = typeof route.query.next === "string" ? route.query.next : "/";
+  return next.startsWith("/") && !next.startsWith("//") ? next : "/";
+}
+
+async function continueAfterAuth() {
+  const next = safeNextPath();
+  if (next.startsWith("/feishu/bind?")) {
+    window.location.assign(next);
+    return;
+  }
+  await router.replace(next);
+}
 
 function setMode(nextMode) {
   mode.value = nextMode;
@@ -40,7 +55,7 @@ async function submit() {
         password: password.value
       })
     });
-    await router.replace("/");
+    await continueAfterAuth();
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
@@ -51,7 +66,7 @@ async function submit() {
 onMounted(async () => {
   try {
     await api("/api/auth/me");
-    await router.replace("/");
+    await continueAfterAuth();
   } catch {
     // A missing session is the normal state for the login screen.
   }

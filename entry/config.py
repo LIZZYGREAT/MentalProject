@@ -28,10 +28,22 @@ GLOBAL_DEFAULT_CONFIG = {
     # 3. 核心物理常数 & 仿真控制
     # ==========================================
     "S_star_init": 50.0,  # 初始压力平衡点
-    "S_threshold": 100.0,  # 报警阈值
-    "E_critical": 20.0,   # 精力耗竭线
+    "S_threshold": 70.0,  # 关怀观察线；仍需满足持续时间，不是临床阈值
+    "E_critical": 25.0,   # 主观活力偏低参考线
     "time_step": 5,       # 仿真步长
     "random_seed": 42,
+    # M0 remains active until out-of-time EMA comparison justifies a richer
+    # candidate.  M1/M2/M3 are available to the research evaluation pipeline.
+    "model_family": "stress-ctssm.m0",
+    "model_selection": {
+        "active_variant": "m0",
+        "status": "insufficient_real_world_evidence",
+        "minimum_test_days": 7,
+        "minimum_relative_mae_improvement": 0.03,
+        "minimum_interval_coverage": 0.80,
+        "require_care_frequency_validation": True,
+        "target_interval_coverage": 0.90,
+    },
     # Phase 0 baseline: keep the model deterministic and identifiable.
     # Disabled mechanisms stay available for later ablation experiments, but
     # cannot influence the production baseline unless explicitly enabled.
@@ -59,13 +71,16 @@ GLOBAL_DEFAULT_CONFIG = {
     "fatigue_acceleration_k": 0.15,
     
     # ==========================================
-    # 5. 用户默认策略偏好
+    # 5. 旧模型兼容参数（不会进入 CTSSM）
     # ==========================================
-    "f_strategy": "sensitive", 
-    "C_strategy": "high",        
-    "night_strategy": "normal",  
-    "rest_strategy": "relieved",
-    "time_preferences": [],
+    "legacy_model": {
+        "enabled": False,
+        "f_strategy": "sensitive",
+        "C_strategy": "high",
+        "night_strategy": "normal",
+        "rest_strategy": "relieved",
+        "time_preferences": [],
+    },
     
     # ==========================================
     # 6. 非稳态负荷理论参数 (Allostatic Load Dynamics) 
@@ -268,19 +283,89 @@ GLOBAL_DEFAULT_CONFIG = {
     # 15. 预警监控生态阈值 (Alert Thresholds) 
     # ==========================================
     "alert_thresholds": {
-        "auc_limit": 100.0,              
-        "critical_buffer_ratio": 0.35,   
-        "warning_buffer_ratio": 0.20,    
-        "auc_orange": 80.0,              
-        "auc_yellow": 50.0,              
-        "E_danger": 25.0,                
-        "auc_increase_step": 1.5,        
-        "auc_decay_step": 2.5,
-        "sleep_auc_decay_step": 5.0
+        "yellow_stress": 70.0,
+        "orange_stress": 80.0,
+        "red_stress": 88.0,
+        "extreme_stress": 94.0,
+        "recovery_stress": 62.0,
+        "yellow_confirm_minutes": 40.0,
+        "orange_confirm_minutes": 20.0,
+        "red_confirm_minutes": 10.0,
+        "rearm_minutes": 45.0,
+        "cooldown_minutes": 180.0,
+        "escalation_cooldown_minutes": 90.0,
+        "critical_cooldown_minutes": 90.0,
+        "max_daily_care": 2,
+        "max_daily_critical_override": 1,
+        "elevated_auc_yellow": 2.2,
+        "elevated_auc_orange": 3.6,
+        "elevated_auc_red": 5.5,
+        "E_danger": 25.0,
     },
 
     # ==========================================
-    # 16. 智能日程编织参数 (Routine Weaver Priors) 
+    # 16. 理论引导连续时间潜在状态候选 (M0-M3；默认仅 M0)
+    # 所有速率统一使用“每小时”量纲；日历评价是先验，不是测量值。
+    # ==========================================
+    "ctssm_params": {
+        "stress_reactivity_per_hour": 1.55,
+        "stress_recovery_per_hour": 0.68,
+        "event_stress_gain": 30.0,
+        "m0_anticipation_stress_gain": 5.0,
+        "m0_post_event_stress_gain": 8.0,
+        "cognition_stress_gain": 15.0,
+        "fatigue_stress_gain": 17.0,
+        "sleep_debt_stress_per_hour": 1.2,
+        "vitality_baseline": 72.0,
+        "vitality_regulation_per_hour": 0.58,
+        "demand_vitality_drain_per_hour": 13.0,
+        "recovery_vitality_gain_per_hour": 10.0,
+        "fatigue_vitality_gain": 27.0,
+        "sleep_debt_vitality_per_hour": 1.8,
+        "cognition_decay_per_hour": 1.05,
+        "anticipation_gain_per_hour": 0.90,
+        "aftermath_gain_per_hour": 1.00,
+        "fatigue_accumulation_per_hour": 0.42,
+        "fatigue_recovery_per_hour": 0.95,
+        "stress_vitality_coupling": "none",
+        "vitality_to_stress_gain": 0.10,
+        "stress_to_vitality_gain": 0.08,
+        "cross_day_stress_persistence": 0.42,
+        "cross_day_vitality_persistence": 0.38,
+        "cross_day_cognition_persistence": 0.15,
+        "cross_day_fatigue_persistence": 0.62,
+        "cross_day_fatigue_stress_gain": 6.0,
+        "cross_day_unfinished_decay_hours": 18.0,
+        "cross_day_unfinished_input_floor": 0.18,
+        "cross_day_unfinished_sleep_multiplier": 0.25,
+        "sleep_quality_initial_stress_gain": 5.0,
+        "sleep_quality_initial_vitality_gain": 7.0,
+        "sleep_quality_event_appraisal_gain": 0.08,
+        "stress_process_sd_per_sqrt_hour": 3.0,
+        "vitality_process_sd_per_sqrt_hour": 3.5,
+        "cognition_process_sd_per_sqrt_hour": 0.08,
+        "fatigue_process_sd_per_sqrt_hour": 0.05,
+        "initial_stress_variance": 100.0,
+        "initial_vitality_variance": 100.0,
+        "initial_cognition_variance": 0.04,
+        "initial_fatigue_variance": 0.04,
+        "stress_observation_sd": 8.0,
+        "vitality_observation_sd": 9.0,
+        "cognition_observation_sd": 0.18,
+        "observation_delay_variance_per_hour": 0.55,
+        "retrospective_variance_multiplier": 0.75,
+        "stress_time_of_day": [
+            (0, -2.0), (7, -1.0), (10, 0.0), (14, 1.5),
+            (18, 2.0), (22, 1.0), (24, -2.0),
+        ],
+        "vitality_time_of_day": [
+            (0, -8.0), (7, 1.0), (10, 5.0), (14, 1.0),
+            (18, -2.0), (22, -7.0), (24, -9.0),
+        ],
+    },
+
+    # ==========================================
+    # 17. 智能日程编织参数 (Routine Weaver Priors)
     # ==========================================
     "routine_weaver": {
         "max_delay_wake_time": "11:00",  
@@ -308,7 +393,7 @@ GLOBAL_DEFAULT_CONFIG = {
     },
 
     # ==========================================
-    # 17. 引擎微观化学动力学与滤波器常数 (Micro-Dynamics & Chemical Pools)
+    # 18. 引擎微观化学动力学与滤波器常数 (Micro-Dynamics & Chemical Pools)
     # ==========================================
     "simulator_micro_params": {
         "wandering_cooldown_base": 40,          
@@ -338,7 +423,7 @@ GLOBAL_DEFAULT_CONFIG = {
     },
 
     # ==========================================
-    # 18. 宏观双轨生态演化常数 (Macro Ecological Evolution)
+    # 19. 宏观双轨生态演化常数 (Macro Ecological Evolution)
     # ==========================================
     "evolution_params": {
         "alpha_star": 0.015,                    
@@ -350,7 +435,7 @@ GLOBAL_DEFAULT_CONFIG = {
     },
     
     # ==========================================
-    # 19. 任务刺激习惯化参数 (Stimulus Habituation)
+    # 20. 任务刺激习惯化参数 (Stimulus Habituation)
     # ==========================================
     "habituation_params": {
         "decay_model": "hyperbolic",  
@@ -360,7 +445,7 @@ GLOBAL_DEFAULT_CONFIG = {
     },
 
     # ==========================================
-    # 20. 半马尔可夫情绪状态机与势能参数 (Semi-Markov Dynamics)
+    # 21. 半马尔可夫情绪状态机与势能参数 (Semi-Markov Dynamics)
     # ==========================================
     "markov_semi_params": {
         "regime_check_interval": 25,     
@@ -383,7 +468,7 @@ GLOBAL_DEFAULT_CONFIG = {
     },
 
     # ==========================================
-    # 21. 动态区制乘数边界 (Dynamic Regime Modifiers)
+    # 22. 动态区制乘数边界 (Dynamic Regime Modifiers)
     # ==========================================
     "markov_modifiers": {
         "friction_s_base": 1.05,         

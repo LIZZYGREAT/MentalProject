@@ -24,5 +24,37 @@ services:
       retries: 3
       start_period: 20s
 
+  feishu_bot:
+    build:
+      context: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_DATABASE_PATH: /app/data/app.sqlite3
+    command: python -m entry.feishu_bot
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      app:
+        condition: service_healthy
+
+  care_worker:
+    build:
+      context: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_DATABASE_PATH: /app/data/app.sqlite3
+    command: python -m entry.care_worker
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      app:
+        condition: service_healthy
+
 volumes:
   app_data:

@@ -36,22 +36,49 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
     times = [datetime.strptime(r["time"], "%H:%M") for r in results]
     S_values = [r["S"] for r in results]
     E_values = [r.get("E", DEFAULT_INITIAL_ENERGY) for r in results]
-
-    fig, (ax1, ax3) = plt.subplots(
-        2,
-        1,
-        figsize=FIGSIZE,
-        sharex=True,
-        gridspec_kw={'height_ratios': [S_PANEL_HEIGHT_RATIO, E_PANEL_HEIGHT_RATIO]},
-    )
+    active_states = set(results[0].get("active_states", ["S", "V"]))
+    vitality_active = "V" in active_states
+    if vitality_active:
+        fig, (ax1, ax3) = plt.subplots(
+            2,
+            1,
+            figsize=FIGSIZE,
+            sharex=True,
+            gridspec_kw={'height_ratios': [S_PANEL_HEIGHT_RATIO, E_PANEL_HEIGHT_RATIO]},
+        )
+    else:
+        fig, ax1 = plt.subplots(1, 1, figsize=FIGSIZE)
+        ax3 = None
     
     # === 上图：压力 S ===
     ax1.plot(times, S_values, color="royalblue", linewidth=2.5, label="压力值 S(t)")
+    stress_intervals = [row.get("stress_interval_90") for row in results]
+    if stress_intervals and all(isinstance(item, dict) for item in stress_intervals):
+        ax1.fill_between(
+            times,
+            [float(item["lower"]) for item in stress_intervals],
+            [float(item["upper"]) for item in stress_intervals],
+            color="royalblue",
+            alpha=0.12,
+            label="90% 预测区间（待真实数据校准）",
+        )
     if S_star:
         ax1.axhline(y=S_star, color="gray", linestyle=":", linewidth=1.5, label=f"平衡值 S*={S_star}")
     
-    S_thresh = params.get("S_threshold", DEFAULT_STRESS_THRESHOLD)
-    ax1.axhline(y=S_thresh, color="red", linestyle="--", linewidth=1.5, label=f"报警阈值={S_thresh}")
+    alert_cfg = params.get("alert_thresholds", {})
+    S_thresh = alert_cfg.get(
+        "yellow_stress",
+        params.get("S_threshold", DEFAULT_STRESS_THRESHOLD),
+    )
+    if S_star is not None:
+        S_thresh = max(float(S_thresh), float(S_star) + 12.0)
+    ax1.axhline(
+        y=S_thresh,
+        color="#c58b2a",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"关怀观察线={S_thresh}（需持续确认）",
+    )
     
     min_s_val = min(S_values) if S_values else 0
     max_s_val = max(S_values) if S_values else 100
@@ -99,7 +126,8 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
                 alpha_val = 0.3 if ev_type == "sleep" else 0.2
                 
                 ax1.axvspan(st, et, color=color, alpha=alpha_val)
-                ax3.axvspan(st, et, color=color, alpha=alpha_val)
+                if ax3 is not None:
+                    ax3.axvspan(st, et, color=color, alpha=alpha_val)
                 
                 mid_time = st + (et - st) / 2
                 y_pos = EVENT_LABEL_Y_OFFSETS[i % len(EVENT_LABEL_Y_OFFSETS)]
@@ -149,31 +177,38 @@ def _draw_core_plot(results, confidence_series, alerts, params=None, S_star=None
 
     ax1.legend(loc="center left", bbox_to_anchor=(0.01, 0.75), fontsize=10)
 
-    # === 双轴绘制置信度 ===
+    # === 双轴绘制关怀风险指数（不是统计置信度） ===
     ax2 = ax1.twinx()
     ax2.fill_between(times, confidence_series, color="orange", alpha=0.1)
-    ax2.plot(times, confidence_series, color="orange", linestyle="--", linewidth=1.5, alpha=0.6, label="警报置信度")
+    ax2.plot(times, confidence_series, color="orange", linestyle="--", linewidth=1.5, alpha=0.6, label="关怀风险指数")
     ax2.set_ylim(0, 1.05)
-    ax2.set_ylabel("置信度 (0-1)", color="orange", fontsize=11)
+    ax2.set_ylabel("关怀风险 (0-1)", color="orange", fontsize=11)
     ax2.tick_params(axis="y", labelcolor="orange")
     ax2.legend(loc="center left", bbox_to_anchor=(0.01, 0.65), fontsize=10)
 
-    # === 下图：精力 E ===
-    ax3.plot(times, E_values, color="mediumseagreen", linewidth=2.5, label="认知精力 E(t)")
-    E_crit = params.get("E_critical", DEFAULT_ENERGY_CRITICAL)
-    ax3.axhline(y=E_crit, color="crimson", linestyle="-.", linewidth=1.5, label=f"耗竭阈值={E_crit}")
-    ax3.fill_between(times, 0, E_crit, color="red", alpha=0.1)
-    
-    ax3.set_ylabel("精力值 (E)", color="mediumseagreen", fontsize=13, weight='bold')
-    ax3.set_ylim(0, 105)
-    ax3.grid(True, linestyle="--", alpha=0.3)
-    ax3.legend(loc="lower left", fontsize=10)
+    # === 下图：主观活力 V（E 为兼容字段） ===
+    if ax3 is not None:
+        ax3.plot(times, E_values, color="mediumseagreen", linewidth=2.5, label="主观活力 V(t)")
+        E_crit = params.get("E_critical", DEFAULT_ENERGY_CRITICAL)
+        ax3.axhline(y=E_crit, color="crimson", linestyle="-.", linewidth=1.5, label=f"活力偏低参考线={E_crit}")
+        ax3.fill_between(times, 0, E_crit, color="red", alpha=0.1)
+        ax3.set_ylabel("主观活力 (V)", color="mediumseagreen", fontsize=13, weight='bold')
+        ax3.set_ylim(0, 105)
+        ax3.grid(True, linestyle="--", alpha=0.3)
+        ax3.legend(loc="lower left", fontsize=10)
+        x_axis = ax3
+    else:
+        x_axis = ax1
 
-    ax3.set_xlabel("时间 (24h)", fontsize=12)
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    x_axis.set_xlabel("时间 (24h)", fontsize=12)
+    x_axis.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     plt.xticks(rotation=45)
     
-    plt.suptitle("心理压力(S)与精力(E)双变量演化模型", fontsize=16, weight='bold')
+    plt.suptitle(
+        "主观压力与主观活力动态预测" if vitality_active else "主观压力动态预测（M0）",
+        fontsize=16,
+        weight='bold',
+    )
     plt.tight_layout()
     
     return fig

@@ -1,0 +1,4 @@
+interface:
+  display_name: "心理关怀工具编排"
+  short_description: "使用可信身份与白名单工具完成安全、非临床的日常心理关怀交互"
+  default_prompt: "Use $mental-health-care to handle a private, non-clinical care request with trusted tools."

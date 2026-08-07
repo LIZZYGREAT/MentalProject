@@ -1,204 +1,395 @@
-# alert_monitor.py
-from typing import List, Dict, Tuple
-from settings.model_defaults import (
-    DEFAULT_ENERGY_CRITICAL,
-    DEFAULT_INITIAL_ENERGY,
-    DEFAULT_INITIAL_STRESS,
-    DEFAULT_STRESS_THRESHOLD,
-    RECOVERY_STATES,
-)
+"""Burden-aware care policy for predicted subjective stress.
+
+The monitor separates *state estimation* from *intervention delivery*.  A
+high predicted point does not automatically create a user-facing message:
+ordinary elevations require persistence, messages have a cooldown, and the
+day has a small care budget.  A very high sustained state may override the
+regular budget once so a conservative policy does not become silent exactly
+when support is most relevant.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from algorithm.time_utils import time_to_minutes
+from settings.model_defaults import DEFAULT_ENERGY_CRITICAL, RECOVERY_STATES
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, float(value)))
+
 
 class AlertMonitor:
-    """
-    双引擎：绝对水位（S 与阈值的相对位置）与 AUC 式持续高负荷积分；
-    睡眠态降积分并重置阶梯。阈值来自 params['alert_thresholds'] 与 S_threshold/S_star_init。
-    """
-    def __init__(self, params: Dict):
-        """
-        参数 params: 全局配置字典，需含 S_threshold、S_star_init、alert_thresholds 等。
-        """
-        self.params = params
-        self.S_thresh = params.get("S_threshold", DEFAULT_STRESS_THRESHOLD)
-        self.S_star = params.get("S_star_init", DEFAULT_INITIAL_STRESS)
-        
-        alert_cfg = params.get("alert_thresholds", {})
-        self.auc_limit = alert_cfg.get("auc_limit", 100.0)
-        self.critical_buffer_ratio = alert_cfg.get("critical_buffer_ratio", 0.35)
-        self.warning_buffer_ratio = alert_cfg.get("warning_buffer_ratio", 0.20)
-        self.auc_orange = alert_cfg.get("auc_orange", 80.0)
-        self.auc_yellow = alert_cfg.get("auc_yellow", 50.0)
-        self.E_danger = alert_cfg.get("E_danger", DEFAULT_ENERGY_CRITICAL)
-        self.auc_increase_step = alert_cfg.get("auc_increase_step", 1.5)
-        self.auc_decay_step = alert_cfg.get("auc_decay_step", 2.5)
-        self.sleep_auc_decay_step = alert_cfg.get("sleep_auc_decay_step", 5.0)
-        
-        # 计算抗压缓冲带
-        self.buffer_zone = max(10.0, self.S_thresh - self.S_star)
-        
-    def analyze(self, results: List[Dict]) -> Tuple[List[Dict], List[float]]:
-        """
-        参数 results: simulate_day 输出的每步字典列表（含 S,E,state,delta_S,continuous_hours 等）。
-        返回: (alerts, confidence_series)，后者与 results 对齐供绘图。
-        """
-        alerts = []
-        confidence_series = []
-        
-        auc_level = 0.0
-        current_alert_tier = 0  # 状态机：0: 无, 1: 黄, 2: 橙, 3: 红
-        
-        for row in results:
-            S = row.get("S", 0.0)
-            E = row.get("E", DEFAULT_INITIAL_ENERGY)
-            state = row.get("state", "UNKNOWN")
-            time_str = row.get("time", "00:00")
-            delta_S = row.get("delta_S", 0.0)
-            continuous_hours = row.get("continuous_hours", 0.0)
-            current_events = row.get("current_events", [])
-            dominant_stressors = row.get("dominant_stressors", [])
-            
-            # 1. 睡眠状态：降温并重置报警阶梯
-            if state in RECOVERY_STATES:
-                auc_level = max(0.0, auc_level - self.sleep_auc_decay_step)
-                current_alert_tier = 0  
-                confidence_series.append(0.0)
-                continue
-                
-            # 2. 状态判定与积分更新
-            is_resting_and_recovering = (delta_S < 0 and state not in ["LATE_NIGHT_ACTIVE", "NIGHT_OVERTIME"])
-            
-            # 只要压力大于黄警线（消耗了动态比例的可用空间），就开始涨积分（休息时除外）
-            if S > self.S_thresh - self.warning_buffer_ratio * self.buffer_zone:
-                if is_resting_and_recovering:
-                    auc_level = max(0.0, auc_level - 1.0)
-                else:
-                    auc_level = min(self.auc_limit, auc_level + self.auc_increase_step)
-            else:
-                auc_level = max(0.0, auc_level - self.auc_decay_step)
-                
-            # ==========================================
-            # 3. 双引擎独立判定
-            # ==========================================
-            
-            # 引擎一：绝对值水位引擎 (Intensity Engine)
-            intensity_tier = 0
-            intensity_zone = "safe"
-            
-            if S >= self.S_thresh + self.critical_buffer_ratio * self.buffer_zone:
-                intensity_tier = 3
-                intensity_zone = "critical"
-            elif S >= self.S_thresh:
-                intensity_tier = 2
-                intensity_zone = "breached"
-            elif S >= self.S_thresh - self.warning_buffer_ratio * self.buffer_zone:
-                intensity_tier = 1
-                intensity_zone = "approaching"
-                
-            # 引擎二：疲劳积分引擎 (Duration Engine)
-            duration_tier = 0
-            if auc_level >= self.auc_limit:
-                duration_tier = 3
-            elif auc_level >= self.auc_orange or (auc_level >= self.auc_yellow and E < self.E_danger):
-                duration_tier = 2
-            elif auc_level >= self.auc_yellow:
-                duration_tier = 1
-                
-            # 综合评定：取双引擎的最高危级别
-            target_tier = max(intensity_tier, duration_tier)
-            
-            # 如果没有报警，直接记录置信度并进入下一步
-            if target_tier == 0:
-                confidence_series.append(0.0)
-                continue
-                
-            # ==========================================
-            # 4. 生成报警话术与归因
-            # ==========================================
-            alert_text = ""
-            trigger_source = ""
-            
-            # 优先判定是否由强度瞬间刺穿触发
-            if intensity_tier >= duration_tier and intensity_tier > 0:
-                trigger_source = "intensity_spike"
-                if intensity_tier == 3:
-                    alert_text = "[红] 极度高压 (瞬间峰值穿透绝对底线)"
-                elif intensity_tier == 2:
-                    alert_text = "[橙] 防线击穿 (高压突破当前容忍阈值)"
-                else:
-                    alert_text = "[黄] 承压预警 (压力逼近警戒带)"
-            else:
-                trigger_source = "duration_buildup"
-                if duration_tier == 3:
-                    alert_text = "[红] 阈值过载 (持续高负荷导致系统崩溃)"
-                elif duration_tier == 2:
-                    if E < self.E_danger:
-                        alert_text = "[橙] 残血高危 (精力枯竭且持续承压)"
-                    else:
-                        alert_text = "[橙] 疲劳积压 (长时间高压未获缓冲)"
-                else:
-                    alert_text = "[黄] 慢性高压 (处于警戒区时间过长)"
+    """Convert a predicted trajectory into a restrained daily care schedule."""
 
-            # ==========================================
-            # 5. 静默期拦截机制 与 报警输出
-            # ==========================================
-            if target_tier > current_alert_tier:
-                # 判定是否拦截
-                intercepted = False
-                if is_resting_and_recovering:
-                    # 休息回血中：如果绝对值没真正破防(< Tier 2)，只是疲劳积分触发报警，予以拦截静默
-                    if intensity_tier < 2:
-                        intercepted = True
-                        
-                if not intercepted:
-                    alerts.append({
-                        "type": alert_text, 
-                        "time": time_str, 
-                        "S": round(S, 2),
-                        "E": round(E, 2),
-                        "state": state,
-                        "trigger_source": trigger_source,
-                        "intensity_zone": intensity_zone,
-                        "continuous_hours": round(continuous_hours, 2),
-                        "current_events": current_events,
-                        "dominant_stressors": dominant_stressors,
-                        "C": target_tier / 3.0 
-                    })
-                    current_alert_tier = target_tier
-                
-            # 6. 计算置信度 
-            ratio = auc_level / self.auc_limit
-            C_t = ratio ** 1.8 
-            confidence_series.append(C_t)
-            
-        # ==========================================
-        # 7. 日终兜底复查
-        # ==========================================
-        if results and current_alert_tier < 3:
-            last_row = results[-1]
-            last_S = last_row.get("S", 0.0)
-            last_E = last_row.get("E", DEFAULT_INITIAL_ENERGY)
-            last_state = last_row.get("state", "UNKNOWN")
-            last_time = last_row.get("time", "00:00")
-            last_ch = last_row.get("continuous_hours", 0.0)
-            last_ce = last_row.get("current_events", [])
-            last_ds = last_row.get("dominant_stressors", [])
-            
-            # 检查绝对峰值
-            if last_S >= self.S_thresh + self.critical_buffer_ratio * self.buffer_zone:
-                alerts.append({
-                    "type": "[红] 极度高压 (日终防线彻底击穿)", "time": last_time, 
-                    "S": round(last_S, 2), "E": round(last_E, 2), "state": last_state,
-                    "trigger_source": "intensity_spike", "intensity_zone": "critical",
-                    "continuous_hours": round(last_ch, 2), "current_events": last_ce, 
-                    "dominant_stressors": last_ds, "C": 1.0
-                })
-            # 检查疲劳积压情况
-            elif auc_level > self.auc_orange and current_alert_tier < 2:
-                alerts.append({
-                    "type": "[橙] 高危积压 (日终带着严重疲劳入睡)", "time": last_time, 
-                    "S": round(last_S, 2), "E": round(last_E, 2), "state": last_state,
-                    "trigger_source": "duration_buildup", "intensity_zone": "approaching" if last_S >= self.S_thresh - self.warning_buffer_ratio * self.buffer_zone else "safe",
-                    "continuous_hours": round(last_ch, 2), "current_events": last_ce, 
-                    "dominant_stressors": last_ds, "C": 0.8
-                })
-            
+    def __init__(self, params: Dict[str, Any]):
+        self.params = params
+        cfg = params.get("alert_thresholds", {})
+        baseline = float(params.get("S_star_init", 50.0))
+        self.yellow_stress = min(
+            85.0,
+            max(float(cfg.get("yellow_stress", 70.0)), baseline + 12.0),
+        )
+        self.orange_stress = min(
+            93.0,
+            max(float(cfg.get("orange_stress", 80.0)), self.yellow_stress + 8.0),
+        )
+        self.red_stress = min(
+            98.0,
+            max(float(cfg.get("red_stress", 88.0)), self.orange_stress + 8.0),
+        )
+        self.extreme_stress = min(
+            100.0,
+            max(float(cfg.get("extreme_stress", 94.0)), self.red_stress + 2.0),
+        )
+        self.recovery_stress = min(
+            self.yellow_stress - 3.0,
+            max(float(cfg.get("recovery_stress", 62.0)), baseline + 8.0),
+        )
+        self.confirm_minutes = {
+            1: float(cfg.get("yellow_confirm_minutes", 40.0)),
+            2: float(cfg.get("orange_confirm_minutes", 20.0)),
+            3: float(cfg.get("red_confirm_minutes", 10.0)),
+        }
+        self.rearm_minutes = float(cfg.get("rearm_minutes", 45.0))
+        self.cooldown_minutes = float(cfg.get("cooldown_minutes", 180.0))
+        self.escalation_cooldown_minutes = float(
+            cfg.get("escalation_cooldown_minutes", 90.0)
+        )
+        self.critical_cooldown_minutes = float(
+            cfg.get("critical_cooldown_minutes", 90.0)
+        )
+        self.max_daily_care = max(0, int(cfg.get("max_daily_care", 2)))
+        self.max_daily_critical_override = max(
+            0, int(cfg.get("max_daily_critical_override", 1))
+        )
+        self.auc_thresholds = {
+            1: float(cfg.get("elevated_auc_yellow", 2.2)),
+            2: float(cfg.get("elevated_auc_orange", 3.6)),
+            3: float(cfg.get("elevated_auc_red", 5.5)),
+        }
+        self.vitality_danger = float(
+            cfg.get("E_danger", params.get("E_critical", DEFAULT_ENERGY_CRITICAL))
+        )
+        self.default_step = max(1.0, float(params.get("time_step", 5.0)))
+
+    def analyze(self, results: List[Dict[str, Any]]) -> Tuple[List[Dict], List[float]]:
+        alerts: List[Dict[str, Any]] = []
+        confidence_series: List[float] = []
+        if not results:
+            return alerts, confidence_series
+
+        elevated_auc = 0.0
+        candidate_tier = 0
+        candidate_minutes = 0.0
+        episode_tier = 0
+        recovery_minutes = 0.0
+        last_alert_minute: Optional[float] = None
+        regular_count = 0
+        critical_override_count = 0
+        previous_minute: Optional[int] = None
+
+        for row in results:
+            minute = time_to_minutes(row.get("time", "00:00"))
+            if previous_minute is None:
+                dt_minutes = self.default_step
+            else:
+                dt_minutes = float((minute - previous_minute) % 1440)
+                if dt_minutes <= 0.0:
+                    dt_minutes = self.default_step
+            previous_minute = minute
+            dt_hours = dt_minutes / 60.0
+
+            stress = float(row.get("S", 0.0))
+            vitality = float(row.get("V", row.get("E", 72.0)))
+            fatigue = _clamp(row.get("F", row.get("recovery_debt", 0.0)))
+            delta_stress = float(row.get("delta_S", 0.0))
+            state = str(row.get("state", "UNKNOWN"))
+            sleeping = state in RECOVERY_STATES
+            recovering = bool(
+                row.get("recovery_input", 0.0) >= 0.35 and delta_stress < 0.0
+            )
+
+            if sleeping:
+                elevated_auc = max(0.0, elevated_auc - 1.8 * dt_hours)
+            elif stress > self.recovery_stress:
+                # Unit: hours at ten points above the recovery line.
+                elevated_auc += (
+                    (stress - self.recovery_stress) / 10.0
+                ) * dt_hours
+            else:
+                recovery_strength = 0.8 + max(
+                    0.0, (self.recovery_stress - stress) / 10.0
+                )
+                elevated_auc = max(
+                    0.0, elevated_auc - recovery_strength * dt_hours
+                )
+
+            intensity_tier = self._intensity_tier(stress)
+            burden_tier = self._burden_tier(elevated_auc)
+            vulnerability_tier = 0
+            if stress >= self.recovery_stress + 3.0 and (
+                fatigue >= 0.68 or vitality <= self.vitality_danger
+            ):
+                vulnerability_tier = 2 if (
+                    fatigue >= 0.82 or vitality <= self.vitality_danger - 8.0
+                ) else 1
+
+            # Accumulated burden can justify a stronger check-in, but a red
+            # user-facing label is reserved for a genuinely red current
+            # pressure estimate.  This keeps wording aligned with the value.
+            target_tier = max(
+                intensity_tier,
+                min(burden_tier, 2),
+                vulnerability_tier,
+            )
+            # Burden is useful for internal risk tracking, but a user-facing
+            # message should not be emitted merely because the three-hour
+            # cooldown elapsed while pressure is already falling below the
+            # yellow band.  This was the cause of mechanically repeated care
+            # after short meal/recovery windows.
+            burden_only = (
+                burden_tier > 0
+                and intensity_tier == 0
+                and vulnerability_tier == 0
+            )
+            if burden_only and (
+                stress < self.yellow_stress - 1.0 or delta_stress <= 0.0
+            ):
+                target_tier = 0
+            # Do not interrupt sleep, and let an explicitly restorative period
+            # finish unless the predicted intensity is already high.
+            if sleeping or (recovering and intensity_tier < 2):
+                target_tier = 0
+
+            risk = self._risk_score(
+                stress=stress,
+                vitality=vitality,
+                fatigue=fatigue,
+                elevated_auc=elevated_auc,
+                delta_stress=delta_stress,
+            )
+            if sleeping:
+                risk = 0.0
+            elif recovering and intensity_tier < 2:
+                risk *= 0.40
+            confidence_series.append(risk)
+
+            if target_tier <= 0:
+                candidate_tier = 0
+                candidate_minutes = 0.0
+                # A short dip or a restorative event above the recovery line
+                # does not start a new pressure episode.  Rearm only after a
+                # genuine sustained return to the user's recovery zone.
+                if sleeping or stress <= self.recovery_stress:
+                    recovery_minutes += dt_minutes
+                else:
+                    recovery_minutes = 0.0
+                if recovery_minutes >= self.rearm_minutes:
+                    episode_tier = 0
+                continue
+
+            recovery_minutes = 0.0
+            if target_tier != candidate_tier:
+                candidate_tier = target_tier
+                candidate_minutes = dt_minutes
+            else:
+                candidate_minutes += dt_minutes
+
+            extreme_override = stress >= self.extreme_stress
+            confirmed = (
+                extreme_override
+                or candidate_minutes >= self.confirm_minutes[target_tier]
+            )
+            if not confirmed or target_tier <= episode_tier:
+                continue
+
+            # One supportive nudge is enough for a single uninterrupted
+            # moderate-load episode.  A second message in that episode is only
+            # justified by a genuinely higher current stress band (or a clear
+            # combined low-vitality/high-debt escalation), not by the passage
+            # of time alone.
+            if episode_tier > 0 and target_tier > episode_tier:
+                escalation_supported = (
+                    intensity_tier > episode_tier
+                    or (
+                        vulnerability_tier > episode_tier
+                        and intensity_tier >= 1
+                    )
+                )
+                if not escalation_supported:
+                    continue
+
+            elapsed_since_alert = (
+                None
+                if last_alert_minute is None
+                else float((minute - int(last_alert_minute)) % 1440)
+            )
+            is_escalation = episode_tier > 0 and target_tier > episode_tier
+            required_cooldown = (
+                self.critical_cooldown_minutes
+                if target_tier == 3
+                else (
+                    self.escalation_cooldown_minutes
+                    if is_escalation
+                    else self.cooldown_minutes
+                )
+            )
+            if (
+                elapsed_since_alert is not None
+                and elapsed_since_alert < required_cooldown
+            ):
+                continue
+
+            use_critical_override = False
+            if regular_count >= self.max_daily_care:
+                use_critical_override = (
+                    target_tier == 3
+                    and intensity_tier == 3
+                    and critical_override_count
+                    < self.max_daily_critical_override
+                )
+                if not use_critical_override:
+                    continue
+
+            trigger_source = self._trigger_source(
+                extreme_override,
+                intensity_tier,
+                burden_tier,
+                vulnerability_tier,
+            )
+            alert = self._build_alert(
+                row=row,
+                tier=target_tier,
+                risk=risk,
+                trigger_source=trigger_source,
+                elevated_auc=elevated_auc,
+                fatigue=fatigue,
+                vitality=vitality,
+            )
+            alerts.append(alert)
+            if use_critical_override:
+                critical_override_count += 1
+            else:
+                regular_count += 1
+            last_alert_minute = float(minute)
+            episode_tier = target_tier
+
         return alerts, confidence_series
+
+    def _intensity_tier(self, stress: float) -> int:
+        if stress >= self.red_stress:
+            return 3
+        if stress >= self.orange_stress:
+            return 2
+        if stress >= self.yellow_stress:
+            return 1
+        return 0
+
+    def _burden_tier(self, elevated_auc: float) -> int:
+        if elevated_auc >= self.auc_thresholds[3]:
+            return 3
+        if elevated_auc >= self.auc_thresholds[2]:
+            return 2
+        if elevated_auc >= self.auc_thresholds[1]:
+            return 1
+        return 0
+
+    def _risk_score(
+        self,
+        *,
+        stress: float,
+        vitality: float,
+        fatigue: float,
+        elevated_auc: float,
+        delta_stress: float,
+    ) -> float:
+        stress_component = _clamp(
+            (stress - (self.recovery_stress - 6.0))
+            / max(1.0, self.red_stress - (self.recovery_stress - 6.0))
+        )
+        exposure_component = _clamp(
+            elevated_auc / max(0.1, self.auc_thresholds[3])
+        )
+        vitality_component = _clamp(
+            (55.0 - vitality) / 40.0
+        )
+        trend_component = _clamp(delta_stress / 2.0)
+        return _clamp(
+            0.56 * stress_component
+            + 0.18 * exposure_component
+            + 0.14 * fatigue
+            + 0.08 * vitality_component
+            + 0.04 * trend_component
+        )
+
+    @staticmethod
+    def _trigger_source(
+        extreme: bool,
+        intensity_tier: int,
+        burden_tier: int,
+        vulnerability_tier: int,
+    ) -> str:
+        if extreme:
+            return "extreme_spike"
+        if vulnerability_tier >= max(intensity_tier, burden_tier):
+            return "combined_vulnerability"
+        if burden_tier > intensity_tier:
+            return "load_buildup"
+        return "sustained_intensity"
+
+    def _build_alert(
+        self,
+        *,
+        row: Dict[str, Any],
+        tier: int,
+        risk: float,
+        trigger_source: str,
+        elevated_auc: float,
+        fatigue: float,
+        vitality: float,
+    ) -> Dict[str, Any]:
+        if tier == 3:
+            title = "[红] 很高压力趋势"
+            message = "建议先暂停手头任务，确认自己的感受，并考虑联系可信任的人获得支持。"
+            action = "pause_and_seek_support"
+        elif tier == 2:
+            title = "[橙] 持续高压提醒"
+            message = "如果条件允许，安排 10–15 分钟真正脱离任务的休息，再决定下一步。"
+            action = "protected_break"
+        else:
+            title = "[黄] 压力偏高提醒"
+            message = "可以用几分钟检查任务优先级、补水或活动一下；若不需要，也可忽略本次提示。"
+            action = "brief_check_in"
+
+        current_events = list(row.get("current_events", []))
+        dominant_stressors = list(row.get("dominant_stressors", []))
+        return {
+            "type": title,
+            "message": message,
+            "care_action": action,
+            "time": row.get("time", "00:00"),
+            "S": round(float(row.get("S", 0.0)), 2),
+            "V": round(vitality, 2),
+            "E": round(vitality, 2),
+            "P": round(float(row.get("P", 0.0)), 3),
+            "F": round(fatigue, 3),
+            "state": row.get("state", "UNKNOWN"),
+            "trigger_source": trigger_source,
+            "intensity_zone": ("critical" if tier == 3 else "high" if tier == 2 else "elevated"),
+            "continuous_hours": round(
+                float(row.get("continuous_hours", 0.0)), 2
+            ),
+            "elevated_auc": round(elevated_auc, 3),
+            "current_events": current_events,
+            "dominant_stressors": dominant_stressors,
+            "C": round(risk, 3),
+            "tier": tier,
+            "policy": {
+                "persistence_confirmed": True,
+                "daily_budgeted": True,
+                "episode_deduplicated": True,
+                "clinical_alert": False,
+            },
+        }

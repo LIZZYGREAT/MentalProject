@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { api } from "../api";
 
 const emit = defineEmits(["notify"]);
@@ -9,53 +9,25 @@ const activeTab = ref("overview");
 const overview = ref(null);
 const runs = ref([]);
 const auditLogs = ref([]);
-const curves = ref(null);
-const curveLoading = ref(false);
 const runLoading = ref(false);
 const selectedRun = ref(null);
 const selectedPointIndex = ref(0);
-const curvePointIndex = ref(0);
-const curveMetric = ref("response");
-const curveForm = reactive({
-  family: "f_strategy",
-  stress: 65,
-  energy: 55,
-  baseline: 50,
-  userId: ""
-});
-
 const tabs = [
   { key: "overview", label: "运营概览" },
-  { key: "curves", label: "函数实验室" },
+  { key: "models", label: "候选模型证据" },
   { key: "runs", label: "运行剖析" },
   { key: "users", label: "用户与审计" }
 ];
-const familyOptions = [
-  { value: "f_strategy", label: "压力响应函数" },
-  { value: "C_strategy", label: "连续负荷惩罚" },
-  { value: "rest_strategy", label: "日间休息恢复" },
-  { value: "night_strategy", label: "夜间恢复" }
-];
-const palette = ["#245d52", "#bd7b52", "#6d7fa8", "#8f6b91"];
 
 const appData = computed(() => overview.value?.application || {});
 const appCounts = computed(() => appData.value.counts || {});
 const reliability = computed(() => overview.value?.reliability || {});
 const latestEvaluation = computed(() => reliability.value.latest_evaluation || null);
+const latestComparison = computed(() => reliability.value.latest_model_comparison || null);
+const latestM4 = computed(
+  () => latestComparison.value?.report?.model_sequence?.m4_hierarchical || null
+);
 const users = computed(() => appData.value.users || []);
-const curveMetrics = computed(() => curves.value?.metrics || []);
-const curvePointMax = computed(() =>
-  Math.max(0, (curves.value?.series?.[0]?.points?.length || 1) - 1)
-);
-const curvePointRows = computed(() =>
-  (curves.value?.series || []).map((series) => ({
-    id: series.id,
-    label: series.label,
-    point: series.points?.[
-      Math.min(Number(curvePointIndex.value), Math.max(0, (series.points?.length || 1) - 1))
-    ] || null
-  }))
-);
 const selectedPoint = computed(() => {
   const points = selectedRun.value?.points || [];
   return points[Math.min(Number(selectedPointIndex.value), Math.max(0, points.length - 1))] || null;
@@ -110,14 +82,6 @@ function makePath(points, metric, width = 720, height = 280, fixedRange = null) 
   }).join(" ");
 }
 
-const functionPaths = computed(() =>
-  (curves.value?.series || []).map((series, index) => ({
-    ...series,
-    color: palette[index % palette.length],
-    path: makePath(series.points, curveMetric.value)
-  }))
-);
-
 const runPaths = computed(() => {
   const points = (selectedRun.value?.points || []).map((point, index) => ({
     ...point,
@@ -125,7 +89,7 @@ const runPaths = computed(() => {
   }));
   return [
     { label: "压力", color: "#a45c4a", path: makePath(points, "S", 720, 280, [0, 100]) },
-    { label: "精力", color: "#245d52", path: makePath(points, "E", 720, 280, [0, 100]) }
+    { label: "主观活力", color: "#245d52", path: makePath(points, "E", 720, 280, [0, 100]) }
   ];
 });
 
@@ -141,32 +105,6 @@ async function loadRuns() {
 async function loadAudit() {
   const result = await api("/api/admin/audit-logs?limit=50");
   auditLogs.value = result.audit_logs || [];
-}
-
-async function loadCurve() {
-  curveLoading.value = true;
-  try {
-    const query = new URLSearchParams({
-      family: curveForm.family,
-      stress: String(curveForm.stress),
-      energy: String(curveForm.energy),
-      baseline: String(curveForm.baseline)
-    });
-    if (curveForm.userId) query.set("user_id", curveForm.userId);
-    const result = await api(`/api/admin/model/curves?${query.toString()}`);
-    curves.value = result.curves;
-    const allowedMetrics = (result.curves.metrics || []).map((metric) => metric.key);
-    if (!allowedMetrics.includes(curveMetric.value)) {
-      curveMetric.value = allowedMetrics[0] || "";
-    }
-    curvePointIndex.value = Math.floor(
-      Math.max(0, (result.curves.series?.[0]?.points?.length || 1) - 1) / 2
-    );
-  } catch (error) {
-    emit("notify", { message: error.message, type: "error" });
-  } finally {
-    curveLoading.value = false;
-  }
 }
 
 async function inspectRun(runId) {
@@ -204,7 +142,6 @@ async function refreshAll() {
   loading.value = true;
   try {
     await Promise.all([loadOverview(), loadRuns(), loadAudit()]);
-    await loadCurve();
   } catch (error) {
     emit("notify", { message: error.message, type: "error" });
   } finally {
@@ -280,7 +217,7 @@ onMounted(refreshAll);
             <div v-if="latestEvaluation" class="evidence-metrics">
               <div><span>评估样本</span><strong>{{ latestEvaluation.sample_count }}</strong></div>
               <div><span>压力 MAE</span><strong>{{ formatNumber(latestEvaluation.stress_mae) }}</strong></div>
-              <div><span>精力 MAE</span><strong>{{ formatNumber(latestEvaluation.energy_mae) }}</strong></div>
+              <div><span>主观活力 MAE</span><strong>{{ formatNumber(latestEvaluation.energy_mae) }}</strong></div>
               <div><span>趋势命中</span><strong>{{ formatPercent(latestEvaluation.trend_accuracy) }}</strong></div>
               <div><span>峰值时间误差</span><strong>{{ formatNumber(latestEvaluation.peak_time_error_min, 0) }} 分</strong></div>
               <div><span>综合损失</span><strong>{{ formatNumber(latestEvaluation.total_loss) }}</strong></div>
@@ -319,103 +256,39 @@ onMounted(refreshAll);
         </div>
       </div>
 
-      <div v-show="activeTab === 'curves'" class="admin-panel-stack">
-        <article class="surface-card curve-controls">
-          <div class="curve-control-grid">
-            <label>
-              <span>函数族</span>
-              <select v-model="curveForm.family" class="clean-input" @change="loadCurve">
-                <option v-for="item in familyOptions" :key="item.value" :value="item.value">
-                  {{ item.label }}
-                </option>
-              </select>
-            </label>
-            <label>
-              <span>参数来源</span>
-              <select v-model="curveForm.userId" class="clean-input" @change="loadCurve">
-                <option value="">当前管理员参数</option>
-                <option v-for="item in users" :key="item.id" :value="String(item.id)">
-                  {{ item.login_id }}
-                </option>
-              </select>
-            </label>
-            <label>
-              <span>压力 {{ curveForm.stress }}</span>
-              <input v-model.number="curveForm.stress" type="range" min="0" max="100" @change="loadCurve">
-            </label>
-            <label>
-              <span>精力 {{ curveForm.energy }}</span>
-              <input v-model.number="curveForm.energy" type="range" min="0" max="100" @change="loadCurve">
-            </label>
-            <label>
-              <span>基线 S* {{ curveForm.baseline }}</span>
-              <input v-model.number="curveForm.baseline" type="range" min="0" max="100" @change="loadCurve">
-            </label>
-          </div>
-        </article>
-
-        <article v-if="curves" class="surface-card function-chart-card">
+      <div v-show="activeTab === 'models'" class="admin-panel-stack">
+        <article class="surface-card evidence-card">
           <div class="card-heading">
             <div>
-              <p class="eyebrow">FUNCTION EXPLORER</p>
-              <h3>{{ curves.label }}</h3>
-              <p>{{ curves.description }}</p>
+              <p class="eyebrow">NESTED MODEL EVIDENCE</p>
+              <h3>M0–M4 候选模型保留证据</h3>
+              <p>旧的人格策略不再参与新模型。新增状态只能通过完整日期的时间外验证逐层保留。</p>
             </div>
-            <select v-model="curveMetric" class="clean-input metric-select">
-              <option v-for="metric in curveMetrics" :key="metric.key" :value="metric.key">
-                {{ metric.label }}
-              </option>
-            </select>
           </div>
-          <div class="diagnostic-chart" :class="{ loading: curveLoading }">
-            <svg viewBox="0 0 720 280" role="img" :aria-label="`${curves.label}函数对比图`">
-              <line x1="44" y1="256" x2="676" y2="256" />
-              <line x1="44" y1="24" x2="44" y2="256" />
-              <path
-                v-for="item in functionPaths"
-                :key="item.id"
-                :d="item.path"
-                :stroke="item.color"
-              />
-            </svg>
+          <div v-if="latestComparison" class="evidence-metrics">
+            <div><span>训练日期</span><strong>{{ latestComparison.train_day_count }}</strong></div>
+            <div><span>测试日期</span><strong>{{ latestComparison.test_day_count }}</strong></div>
+            <div><span>当前建议</span><strong>{{ latestComparison.selected_variant.toUpperCase() }}</strong></div>
+            <div><span>允许发布升级</span><strong>{{ latestComparison.promotion_allowed ? "是" : "否" }}</strong></div>
           </div>
-          <div class="chart-legend">
-            <span v-for="item in functionPaths" :key="item.id">
-              <i :style="{ background: item.color }"></i>{{ item.label }}
-            </span>
+          <div v-else class="evidence-empty">
+            <strong>尚无嵌套模型比较</strong>
+            <p>在真实 EMA 达到要求前，生产模型保持 M0；不会因为合成场景表现而自动启用 P 或 F。</p>
           </div>
-          <div class="curve-point-inspector">
-            <label>
-              <span>
-                精确取值 · {{ curves.x_axis.label }}
-                {{ curvePointRows[0]?.point?.x ?? "—" }} {{ curves.x_axis.unit }}
-              </span>
-              <input
-                v-model.number="curvePointIndex"
-                type="range"
-                min="0"
-                :max="curvePointMax"
-              >
-            </label>
+          <div class="readiness-list">
+            <div><span>M0</span><strong>压力时变平衡</strong></div>
+            <div><span>M1</span><strong>检验主观活力增益</strong></div>
+            <div><span>M2</span><strong>检验持续性认知增益</strong></div>
+            <div><span>M3</span><strong>检验恢复债增益</strong></div>
             <div>
-              <span v-for="item in curvePointRows" :key="item.id">
-                <b>{{ item.label }}</b>
-                {{ formatNumber(item.point?.[curveMetric], 4) }}
-              </span>
+              <span>M4</span>
+              <strong v-if="latestM4">
+                {{ latestM4.eligible_for_hierarchical_fit ? "可进入离线层级拟合" : "跨用户纵向数据不足" }}
+              </strong>
+              <strong v-else>等待跨用户层级数据</strong>
             </div>
           </div>
-          <div class="curve-notes">
-            <span>横轴：{{ curves.x_axis.label }}（{{ curves.x_axis.unit }}）</span>
-            <span v-for="note in curves.assumptions" :key="note">{{ note }}</span>
-          </div>
-          <div class="formula-grid">
-            <details v-for="item in functionPaths" :key="item.id">
-              <summary>{{ item.label }} · 计算说明</summary>
-              <p>{{ item.summary }}</p>
-              <code v-if="item.trace">{{ item.trace }}</code>
-              <small v-else>该策略当前没有额外公式日志，曲线仍由真实实现逐点计算。</small>
-            </details>
-          </div>
+          <p class="evidence-note">必须同时检查预测误差、90% 区间覆盖、相应 EMA、跨折稳定性与可辨识性。</p>
         </article>
       </div>
 
@@ -435,7 +308,7 @@ onMounted(refreshAll);
           >
             <span><b>{{ run.local_date }}</b><small>{{ run.login_id }}</small></span>
             <span>压力 {{ formatNumber(run.result?.end_S, 0) }}</span>
-            <span>精力 {{ formatNumber(run.result?.end_E, 0) }}</span>
+            <span>主观活力 {{ formatNumber(run.result?.end_E, 0) }}</span>
             <em :class="{ ready: run.has_diagnostics }">{{ run.has_diagnostics ? "可分解" : "仅轨迹" }}</em>
           </button>
           <div v-if="!runs.length" class="evidence-empty">尚无预测运行。</div>
@@ -458,7 +331,7 @@ onMounted(refreshAll);
               <code class="fingerprint">{{ selectedRun.result?.fingerprint?.slice(0, 12) }}…</code>
             </div>
             <div class="diagnostic-chart compact">
-              <svg viewBox="0 0 720 280" role="img" aria-label="运行压力和精力曲线">
+              <svg viewBox="0 0 720 280" role="img" aria-label="运行压力和主观活力曲线">
                 <line x1="44" y1="256" x2="676" y2="256" />
                 <line x1="44" y1="24" x2="44" y2="256" />
                 <path v-for="item in runPaths" :key="item.label" :d="item.path" :stroke="item.color" />
@@ -482,7 +355,7 @@ onMounted(refreshAll);
               </label>
               <div class="point-metrics">
                 <div><span>压力 S</span><strong>{{ formatNumber(selectedPoint.S) }}</strong></div>
-                <div><span>精力 E</span><strong>{{ formatNumber(selectedPoint.E) }}</strong></div>
+                <div><span>主观活力 V</span><strong>{{ formatNumber(selectedPoint.V ?? selectedPoint.E) }}</strong></div>
                 <div><span>本步 ΔS</span><strong>{{ formatNumber(selectedPoint.delta_S, 4) }}</strong></div>
                 <div><span>基础 ΔS</span><strong>{{ formatNumber(Number(selectedPoint.delta_S || 0) - Number(selectedPoint.f_pen || 0), 4) }}</strong></div>
                 <div><span>疲劳惩罚</span><strong>{{ formatNumber(selectedPoint.f_pen, 4) }}</strong></div>
@@ -502,7 +375,7 @@ onMounted(refreshAll);
               </div>
               <div v-if="selectedRunProfiles.length" class="admin-table-wrap">
                 <table>
-                  <thead><tr><th>事件</th><th>总压力</th><th>基础压力</th><th>疲劳惩罚</th><th>精力影响</th><th>公式</th></tr></thead>
+                  <thead><tr><th>事件</th><th>压力驱动</th><th>基础压力</th><th>恢复债</th><th>活力影响</th><th>公式</th></tr></thead>
                   <tbody>
                     <tr v-for="item in selectedRunProfiles" :key="`${item.name}-${item.time}`">
                       <td><b>{{ item.name }}</b><small>{{ item.time }}</small></td>

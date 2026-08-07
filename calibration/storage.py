@@ -155,6 +155,18 @@ class CalibrationStore:
                     started_at TEXT NOT NULL,
                     ended_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS model_comparison_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    train_day_count INTEGER NOT NULL,
+                    test_day_count INTEGER NOT NULL,
+                    selected_variant TEXT NOT NULL,
+                    promotion_allowed INTEGER NOT NULL DEFAULT 0,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -321,6 +333,32 @@ class CalibrationStore:
             },
         )
 
+    def record_model_comparison(
+        self,
+        report: Dict[str, Any],
+        user_id: str = DEFAULT_USER_ID,
+    ) -> int:
+        self.init_schema()
+        split = report.get("split", {})
+        recommendation = report.get("recommendation", {})
+        return self._insert(
+            "model_comparison_runs",
+            {
+                "user_id": user_id,
+                "schema_version": report.get(
+                    "schema_version", "nested_model_comparison.v2"
+                ),
+                "train_day_count": len(split.get("train_dates", [])),
+                "test_day_count": len(split.get("test_dates", [])),
+                "selected_variant": recommendation.get("active_variant", "m0"),
+                "promotion_allowed": int(
+                    bool(recommendation.get("automatic_promotion_allowed", False))
+                ),
+                "report_json": _json_dumps(report),
+                "created_at": report.get("created_at", _utc_now()),
+            },
+        )
+
     def list_daily_feedback(self, user_id: str = DEFAULT_USER_ID, limit: int = 30) -> list:
         self.init_schema()
         with self._connect() as conn:
@@ -355,6 +393,9 @@ class CalibrationStore:
                 "model_runs": int(
                     conn.execute("SELECT COUNT(*) FROM model_runs").fetchone()[0]
                 ),
+                "model_comparisons": int(
+                    conn.execute("SELECT COUNT(*) FROM model_comparison_runs").fetchone()[0]
+                ),
             }
             latest = conn.execute(
                 """
@@ -385,6 +426,15 @@ class CalibrationStore:
                 LIMIT 10
                 """
             ).fetchall()
+            latest_comparison = conn.execute(
+                """
+                SELECT id, user_id, train_day_count, test_day_count,
+                       selected_variant, promotion_allowed, report_json, created_at
+                FROM model_comparison_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
 
         latest_payload = dict(latest) if latest else None
         if latest_payload:
@@ -394,6 +444,15 @@ class CalibrationStore:
                 )
             except json.JSONDecodeError:
                 latest_payload["metrics"] = {}
+
+        latest_comparison_payload = dict(latest_comparison) if latest_comparison else None
+        if latest_comparison_payload:
+            try:
+                latest_comparison_payload["report"] = json.loads(
+                    latest_comparison_payload.pop("report_json") or "{}"
+                )
+            except json.JSONDecodeError:
+                latest_comparison_payload["report"] = {}
 
         sample_count = int(latest_payload["sample_count"]) if latest_payload else 0
         if sample_count >= 30:
@@ -408,6 +467,7 @@ class CalibrationStore:
             "latest_evaluation": latest_payload,
             "recent_evaluations": [dict(row) for row in recent_evaluations],
             "recent_jobs": [dict(row) for row in recent_jobs],
+            "latest_model_comparison": latest_comparison_payload,
             "evidence_level": evidence_level,
             "evidence_note": (
                 "样本量表示已参与误差评估的日级样本数；它不是医学置信度。"

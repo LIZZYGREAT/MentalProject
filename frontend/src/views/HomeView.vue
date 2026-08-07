@@ -4,7 +4,6 @@ import { useRouter } from "vue-router";
 import { api, currentLocalDate } from "../api";
 import OnboardingDialog from "../components/OnboardingDialog.vue";
 import ApiKeyDialog from "../components/ApiKeyDialog.vue";
-import StrategyPreferences from "../components/StrategyPreferences.vue";
 import AdminView from "../components/AdminView.vue";
 
 const router = useRouter();
@@ -24,6 +23,10 @@ const tokenStatus = ref({
 const feishuConnecting = ref(false);
 const feishuChecking = ref(false);
 const feishuVerification = ref(null);
+const botBinding = ref({ bound: false, status: "unbound" });
+const carePreferences = ref(null);
+const carePreferencesSaving = ref(false);
+const botBindingRemoving = ref(false);
 const activeKeyCount = ref(0);
 const toasts = ref([]);
 const mockEvents = ref([]);
@@ -32,6 +35,8 @@ const prediction = ref(null);
 const chartSource = ref("");
 const feedbackLoading = ref(false);
 const reviewLoading = ref(false);
+const semanticAgentStatus = ref(null);
+const completionSaving = reactive({});
 
 const predictionForm = reactive({
   date: currentLocalDate(),
@@ -41,12 +46,37 @@ const predictionForm = reactive({
   eventType: "task",
   eventLevel: "general",
   eventStart: "14:00",
-  eventEnd: "15:30"
+  eventEnd: "15:30",
+  threat: 5,
+  challenge: 5,
+  control: 5,
+  importance: 5,
+  uncertainty: 5,
+  expectedEffort: 5,
+  completed: "yes",
+  detach: 5,
+  relax: 5,
+  recoveryControl: 5,
+  mastery: 5,
+  autoCrossDay: true
 });
 const feedbackForm = reactive({
   period: "morning",
   stress: 5,
   energy: 6,
+  cognition: 3,
+  activity: "日常活动",
+  stressEventSinceLast: "no",
+  eventOngoing: "no",
+  importance: 5,
+  control: 5,
+  worry: 5,
+  threatChallenge: 5,
+  eventCompleted: "yes",
+  detach: 5,
+  relax: 5,
+  autonomy: 5,
+  mastery: 5,
   note: ""
 });
 const reviewForm = reactive({
@@ -92,7 +122,16 @@ const routinePlan = computed(() => dashboard.value?.routine_plan || prediction.v
 const recentRuns = computed(() => dashboard.value?.recent_runs || []);
 const latestRun = computed(() => recentRuns.value[0] || null);
 const latestResult = computed(() => latestRun.value?.result || null);
+const activeStates = computed(() =>
+  prediction.value?.active_states || latestResult.value?.active_states || ["S"]
+);
+const vitalityActive = computed(() => activeStates.value.includes("V"));
 const versions = computed(() => dashboard.value?.versions || {});
+const eventTrajectory = computed(() =>
+  (prediction.value?.event_trajectory || []).filter(
+    item => !["rest", "meal", "nap", "sleep"].includes(item.event_type)
+  )
+);
 const onboardingCompleted = computed(() => Boolean(dashboard.value?.onboarding_completed));
 const tokenValid = computed(() => Boolean(tokenStatus.value.valid));
 const feishuRedirectUri = computed(() => tokenStatus.value.redirect_uri || "");
@@ -142,6 +181,10 @@ const feishuVerificationLabel = computed(() => {
   if (tokenValid.value) return "授权凭证有效，可点击“检测连接”验证日历读取权限";
   return "完成授权后，这里会显示连接结果";
 });
+const botBindingLabel = computed(() => {
+  if (!botBinding.value?.bound) return "尚未绑定机器人";
+  return `已绑定 ${botBinding.value.open_id_masked || "飞书账号"}`;
+});
 const pageTitle = computed(() => viewLabels[activeView.value]);
 const greeting = computed(() => {
   const hour = new Date().getHours();
@@ -168,11 +211,35 @@ const energyPresentation = computed(() => {
   if (!latestResult.value) return { label: "尚未估计", description: "完成问卷后生成作息建议", width: 32 };
   const score = Number(latestResult.value.end_E || 0);
   return {
-    label: score < 30 ? "恢复空间较少" : score < 60 ? "需要留意" : "相对充足",
-    description: `最近一次精力参考 ${score.toFixed(0)} / 100`,
+    label: score < 30 ? "主观活力很低" : score < 60 ? "主观活力偏低" : "主观活力相对充足",
+    description: `最近一次主观活力参考 ${score.toFixed(0)} / 100`,
     width: Math.max(8, Math.min(100, score))
   };
 });
+
+function signedChange(value) {
+  const number = Number(value || 0);
+  return `${number >= 0 ? "+" : ""}${number.toFixed(1)}`;
+}
+
+function trajectoryLabel(item) {
+  const labels = {
+    rising: "持续上升",
+    plateau: "高位或稳定",
+    declining: "持续下降",
+    rise_then_recover: "先升后回落",
+    mixed: "波动调整"
+  };
+  return labels[item?.trend] || "待判断";
+}
+
+function semanticSourceLabel(source) {
+  if (source === "api_fused") return "规则 + DeepSeek Agent";
+  if (source === "api_cache") return "已冻结 DeepSeek 判定";
+  if (source === "provided_external_fused") return "规则 + 外部判定";
+  if (String(source || "").includes("fallback")) return "API 回退到规则";
+  return "确定性规则";
+}
 
 function notify(payload) {
   const message = typeof payload === "string" ? payload : payload.message;
@@ -197,6 +264,14 @@ async function loadDashboard() {
     dashboard.value = await api("/api/dashboard");
   } catch (error) {
     handleApiError(error);
+  }
+}
+
+async function loadSemanticAgentStatus() {
+  try {
+    semanticAgentStatus.value = await api("/api/semantic-agent/status");
+  } catch (error) {
+    if (error.status === 401) handleApiError(error);
   }
 }
 
@@ -259,7 +334,24 @@ function addEvent() {
     credit: 2,
     hours: 32,
     intensity: 0.7,
-    study_intensity: 0.7
+    study_intensity: 0.7,
+    objective: {
+      unfinished: predictionForm.completed === "yes" ? 0 : 1
+    },
+    appraisal: {
+      threat: Number(predictionForm.threat),
+      challenge: Number(predictionForm.challenge),
+      control: Number(predictionForm.control),
+      importance: Number(predictionForm.importance),
+      uncertainty: Number(predictionForm.uncertainty),
+      expected_effort: Number(predictionForm.expectedEffort)
+    },
+    recovery: {
+      detach: Number(predictionForm.detach),
+      relax: Number(predictionForm.relax),
+      control: Number(predictionForm.recoveryControl),
+      mastery: Number(predictionForm.mastery)
+    }
   });
   predictionForm.eventName = "";
 }
@@ -274,6 +366,7 @@ async function runPrediction() {
         date: predictionForm.date,
         init_S: Number(predictionForm.initS),
         init_E: Number(predictionForm.initE),
+        auto_cross_day_context: Boolean(predictionForm.autoCrossDay),
         mock_events: mockEvents.value,
         shield_keywords: [],
         shield_time_ranges: []
@@ -291,6 +384,34 @@ async function runPrediction() {
   }
 }
 
+async function saveEventCompletion(item, completed) {
+  const eventName = item.name || item.event_name || null;
+  const key = String(item.event_id || eventName || "event");
+  completionSaving[key] = true;
+  try {
+    await api("/api/feedback", {
+      method: "POST",
+      body: JSON.stringify({
+        feedback_type: "event_completion",
+        prediction_run_id: prediction.value?.prediction_run_id || latestRun.value?.prediction_run_id || null,
+        target_time: `${predictionForm.date}T${String(item.time || "00:00").slice(-5)}:00`,
+        retrospective: true,
+        payload: {
+          event_id: item.event_id || null,
+          event_name: eventName,
+          completed: Boolean(completed)
+        }
+      })
+    });
+    item.completion_feedback = completed ? "completed" : "unfinished";
+    notify(completed ? "已记录完成，下一天不会继续携带该任务" : "已记录未完成，下一天会有界继承该情境");
+  } catch (error) {
+    handleApiError(error);
+  } finally {
+    completionSaving[key] = false;
+  }
+}
+
 async function submitFeedback() {
   feedbackLoading.value = true;
   try {
@@ -299,12 +420,29 @@ async function submitFeedback() {
       body: JSON.stringify({
         feedback_type: "momentary_state",
         prediction_run_id: prediction.value?.prediction_run_id || latestRun.value?.prediction_run_id || null,
-        target_time: new Date().toISOString(),
+        target_time: `${currentLocalDate()}T${new Date().toTimeString().slice(0, 5)}:00`,
         retrospective: false,
         payload: {
           period: feedbackForm.period,
           stress_0_10: Number(feedbackForm.stress),
-          energy_0_10: Number(feedbackForm.energy),
+          vitality_0_10: Number(feedbackForm.energy),
+          perseverative_cognition_0_10: Number(feedbackForm.cognition),
+          activity: feedbackForm.activity.trim(),
+          stress_event_since_last: feedbackForm.stressEventSinceLast === "yes",
+          event_ongoing: feedbackForm.eventOngoing === "yes",
+          event_appraisal: {
+            importance_0_10: Number(feedbackForm.importance),
+            control_0_10: Number(feedbackForm.control),
+            worry_0_10: Number(feedbackForm.worry),
+            threat_challenge_0_10: Number(feedbackForm.threatChallenge),
+            completed: feedbackForm.eventCompleted === "yes"
+          },
+          recovery_experience: {
+            detach_0_10: Number(feedbackForm.detach),
+            relax_0_10: Number(feedbackForm.relax),
+            autonomy_0_10: Number(feedbackForm.autonomy),
+            mastery_0_10: Number(feedbackForm.mastery)
+          },
           note: feedbackForm.note.trim()
         }
       })
@@ -350,13 +488,57 @@ async function submitReview() {
 
 async function loadConnections() {
   try {
-    const [token] = await Promise.all([
+    const [token, bindingPayload, preferencesPayload] = await Promise.all([
       api("/api/token_status"),
-      apiKeyDialog.value?.load()
+      api("/api/feishu/bindings/status"),
+      api("/api/care/preferences"),
+      apiKeyDialog.value?.load(),
+      loadSemanticAgentStatus()
     ]);
     tokenStatus.value = token;
+    botBinding.value = bindingPayload.binding;
+    carePreferences.value = preferencesPayload.preferences;
   } catch (error) {
     handleApiError(error);
+  }
+}
+
+async function removeBotBinding() {
+  botBindingRemoving.value = true;
+  try {
+    await api("/api/feishu/bindings/current", { method: "DELETE" });
+    botBinding.value = { bound: false, status: "unbound" };
+    notify("已解除飞书机器人绑定");
+  } catch (error) {
+    handleApiError(error);
+  } finally {
+    botBindingRemoving.value = false;
+  }
+}
+
+async function saveCarePreferences() {
+  if (!carePreferences.value) return;
+  carePreferencesSaving.value = true;
+  try {
+    const payload = await api("/api/care/preferences", {
+      method: "PATCH",
+      body: JSON.stringify({
+        feishu_proactive_enabled: Boolean(carePreferences.value.feishu_proactive_enabled),
+        quiet_start: carePreferences.value.quiet_start,
+        quiet_end: carePreferences.value.quiet_end,
+        max_daily_messages: Number(carePreferences.value.max_daily_messages),
+        tone: carePreferences.value.tone,
+        preferred_support: carePreferences.value.preferred_support,
+        allow_personal_history_reference: Boolean(carePreferences.value.allow_personal_history_reference),
+        allow_external_llm: Boolean(carePreferences.value.allow_external_llm)
+      })
+    });
+    carePreferences.value = payload.preferences;
+    notify("关怀偏好已保存");
+  } catch (error) {
+    handleApiError(error);
+  } finally {
+    carePreferencesSaving.value = false;
   }
 }
 
@@ -433,7 +615,7 @@ async function handleFeishuOAuthMessage(event) {
 
 onMounted(async () => {
   window.addEventListener("message", handleFeishuOAuthMessage);
-  await loadDashboard();
+  await Promise.all([loadDashboard(), loadSemanticAgentStatus()]);
   loading.value = false;
 });
 
@@ -591,7 +773,7 @@ onUnmounted(() => {
               <div v-for="run in recentRuns" :key="run.prediction_run_id" class="recent-run-item">
                 <time>{{ run.local_date }}</time><strong>{{ run.model_version }}</strong>
                 <span>压力 {{ Number(run.result?.end_S || 0).toFixed(0) }}</span>
-                <span>精力 {{ Number(run.result?.end_E || 0).toFixed(0) }}</span>
+                <span>主观活力 {{ Number(run.result?.end_E || 0).toFixed(0) }}</span>
                 <span>{{ run.result?.alerts?.length || 0 }} 条提示</span>
               </div>
             </div>
@@ -614,8 +796,15 @@ onUnmounted(() => {
                 <p class="eyebrow light">PROFILE SNAPSHOT</p><h3>你的节律画像</h3><p>{{ profile.summary }}</p>
               </div>
               <div class="profile-quality">
-                <span>规则推断</span><strong>{{ profile.mapping_version }}</strong><small>可审计 · 可重新填写</small>
+                <span>{{ profile.mapping_is_current === false ? "旧版画像" : "规则推断" }}</span>
+                <strong>{{ profile.mapping_version }}</strong>
+                <small>{{ profile.mapping_is_current === false ? `当前版本 ${profile.current_mapping_version}` : "可审计 · 可重新填写" }}</small>
               </div>
+            </article>
+            <article v-if="profile.mapping_is_current === false" class="surface-card profile-mapping-notice">
+              <strong>旧版参数已停止参与当前压力模型</strong>
+              <p>{{ profile.mapping_notice }}</p>
+              <button class="outline-button" type="button" @click="openOnboarding">更新画像</button>
             </article>
             <div class="trait-grid">
               <article v-for="trait in profile.traits" :key="trait.trait" class="trait-card">
@@ -641,7 +830,6 @@ onUnmounted(() => {
             </article>
             <button class="outline-button profile-retake" type="button" @click="openOnboarding">重新填写问卷</button>
           </template>
-          <StrategyPreferences @notify="notify" @updated="loadDashboard" />
         </section>
 
         <section v-show="activeView === 'prediction'" class="view active">
@@ -662,8 +850,16 @@ onUnmounted(() => {
                 <span class="step-label">起始状态</span>
                 <label>主观压力参考 <b>{{ predictionForm.initS }}</b></label>
                 <input v-model="predictionForm.initS" type="range" min="0" max="100">
-                <label>精力参考 <b>{{ predictionForm.initE }}</b></label>
-                <input v-model="predictionForm.initE" type="range" min="0" max="100">
+                <template v-if="vitalityActive">
+                  <label>主观活力参考 <b>{{ predictionForm.initE }}</b></label>
+                  <input v-model="predictionForm.initE" type="range" min="0" max="100">
+                </template>
+                <p v-else class="field-hint">当前保留模型为 M0，只预测压力；主观活力仍作为 EMA 收集，用于检验 M1 是否值得启用。</p>
+                <label class="cross-day-toggle">
+                  <input v-model="predictionForm.autoCrossDay" type="checkbox">
+                  <span>自动接续前一天状态与明确未完成任务</span>
+                </label>
+                <p class="field-hint">只读取紧邻前一天；未完成任务必须由你明确标记，并会逐日衰减。</p>
               </div>
               <div class="control-section">
                 <span class="step-label">添加一个日程</span>
@@ -682,6 +878,21 @@ onUnmounted(() => {
                   <input v-model="predictionForm.eventStart" class="clean-input" type="time">
                   <input v-model="predictionForm.eventEnd" class="clean-input" type="time">
                 </div>
+                <details class="event-appraisal-fields">
+                  <summary>补充你对这件事的评价（推荐）</summary>
+                  <label>更像威胁 <b>{{ predictionForm.threat }}</b><input v-model="predictionForm.threat" type="range" min="0" max="10"></label>
+                  <label>更像挑战 <b>{{ predictionForm.challenge }}</b><input v-model="predictionForm.challenge" type="range" min="0" max="10"></label>
+                  <label>主观可控 <b>{{ predictionForm.control }}</b><input v-model="predictionForm.control" type="range" min="0" max="10"></label>
+                  <label>重要程度 <b>{{ predictionForm.importance }}</b><input v-model="predictionForm.importance" type="range" min="0" max="10"></label>
+                  <label>结果不确定 <b>{{ predictionForm.uncertainty }}</b><input v-model="predictionForm.uncertainty" type="range" min="0" max="10"></label>
+                  <label>预期投入 <b>{{ predictionForm.expectedEffort }}</b><input v-model="predictionForm.expectedEffort" type="range" min="0" max="10"></label>
+                  <label><span>是否已完成</span><select v-model="predictionForm.completed" class="clean-input"><option value="yes">已完成</option><option value="no">尚未完成</option></select></label>
+                  <p class="field-hint">休息或活动的恢复效果也取决于体验，而不是活动名称本身。</p>
+                  <label>暂时不想任务 <b>{{ predictionForm.detach }}</b><input v-model="predictionForm.detach" type="range" min="0" max="10"></label>
+                  <label>感到放松 <b>{{ predictionForm.relax }}</b><input v-model="predictionForm.relax" type="range" min="0" max="10"></label>
+                  <label>能自主决定 <b>{{ predictionForm.recoveryControl }}</b><input v-model="predictionForm.recoveryControl" type="range" min="0" max="10"></label>
+                  <label>获得成长或掌控 <b>{{ predictionForm.mastery }}</b><input v-model="predictionForm.mastery" type="range" min="0" max="10"></label>
+                </details>
                 <button class="outline-button full-button" type="button" @click="addEvent">＋ 加入日程</button>
                 <div class="event-list">
                   <div v-for="(event, index) in mockEvents" :key="`${event.name}-${index}`" class="event-chip">
@@ -698,11 +909,11 @@ onUnmounted(() => {
             <div class="prediction-results">
               <article class="surface-card chart-card">
                 <div class="card-heading">
-                  <div><p class="eyebrow">MODEL TRAJECTORY</p><h3>压力与精力趋势</h3></div>
+                  <div><p class="eyebrow">MODEL TRAJECTORY</p><h3>压力与主观活力趋势</h3></div>
                   <span class="version-chip">{{ prediction ? `指纹 ${prediction.input_fingerprint.slice(0, 10)}` : "尚未运行" }}</span>
                 </div>
                 <div class="chart-area">
-                  <img v-if="chartSource" :src="chartSource" alt="当天压力与精力趋势图">
+                  <img v-if="chartSource" :src="chartSource" alt="当天压力与主观活力趋势图">
                   <div v-else class="empty-state">
                     <span>∿</span><h4>{{ predictionLoading ? "正在整理日程与节律" : "准备好后，生成今天的趋势" }}</h4>
                     <p>同一输入、参数和种子会得到相同结果，重放不会修改你的画像。</p>
@@ -711,9 +922,57 @@ onUnmounted(() => {
               </article>
               <div v-if="prediction" class="result-metrics">
                 <article><span>日终压力参考</span><strong>{{ Number(prediction.end_S).toFixed(1) }}</strong></article>
-                <article><span>日终精力参考</span><strong>{{ Number(prediction.end_E).toFixed(1) }}</strong></article>
+                <article v-if="vitalityActive"><span>日终主观活力</span><strong>{{ Number(prediction.end_E).toFixed(1) }}</strong></article>
                 <article><span>风险提示</span><strong>{{ prediction.alerts?.length || 0 }} 条</strong></article>
+                <article><span>当前候选</span><strong>{{ prediction.model_variant || "M0" }}</strong></article>
               </div>
+              <article v-if="prediction?.cross_day_context" class="surface-card cross-day-summary">
+                <div class="card-heading">
+                  <div><p class="eyebrow">CROSS-DAY CONTEXT</p><h3>已接续前一天情境</h3></div>
+                  <span class="version-chip">{{ prediction.cross_day_context.source_date || "手动提供" }}</span>
+                </div>
+                <p>前一日压力区间：{{ prediction.cross_day_context.previous_day_end_stress_band }}；明确未完成任务 {{ prediction.cross_day_context.unfinished_tasks?.length || 0 }} 项。</p>
+                <div v-for="task in prediction.cross_day_context.unfinished_tasks || []" :key="task.event_id || task.event_name" class="cross-day-task">
+                  <span>{{ task.event_name }} · 已有界衰减 {{ task.age_days }} 天</span>
+                  <button type="button" :disabled="completionSaving[String(task.event_id || task.event_name)]" @click="saveEventCompletion(task, true)">标记已完成</button>
+                </div>
+              </article>
+              <article v-if="eventTrajectory.length" class="surface-card trajectory-card">
+                <div class="card-heading">
+                  <div>
+                    <p class="eyebrow">EVENT TRAJECTORY CHECK</p>
+                    <h3>逐事件压力走势验收</h3>
+                  </div>
+                  <span class="version-chip">{{ eventTrajectory.filter(item => item.status === "warning").length }} 项需复核</span>
+                </div>
+                <p class="trajectory-note">分别比较进入前、段内峰值和结束值。高难任务允许在“进入时已处高位”时趋稳，但不会把无依据的连续下降当成正常。</p>
+                <div class="trajectory-list">
+                  <div v-for="item in eventTrajectory" :key="item.event_id" class="trajectory-item" :class="{ warning: item.status === 'warning' }">
+                    <div class="trajectory-event">
+                      <strong>{{ item.name }}</strong>
+                      <span>{{ item.time }} · 难度 {{ Math.round(Number(item.semantic_difficulty) * 100) }}</span>
+                      <small v-if="item.semantic_reasoning_summary">Agent：{{ item.semantic_reasoning_summary }}</small>
+                      <small v-else-if="item.matched_rules?.length">规则依据：{{ item.matched_rules.join("、") }}</small>
+                      <div class="event-completion-actions">
+                        <button type="button" :class="{ selected: item.completion_feedback === 'completed' }"
+                                :disabled="completionSaving[String(item.event_id || item.name)]"
+                                @click="saveEventCompletion(item, true)">已完成</button>
+                        <button type="button" :class="{ selected: item.completion_feedback === 'unfinished' }"
+                                :disabled="completionSaving[String(item.event_id || item.name)]"
+                                @click="saveEventCompletion(item, false)">尚未完成</button>
+                      </div>
+                    </div>
+                    <div><span>进入前</span><strong>{{ Number(item.stress_before).toFixed(1) }}</strong></div>
+                    <div><span>段内峰值</span><strong>{{ Number(item.stress_peak).toFixed(1) }}</strong></div>
+                    <div><span>峰值增幅</span><strong :class="{ negative: Number(item.peak_change) < 0 }">{{ signedChange(item.peak_change) }}</strong></div>
+                    <div><span>结束变化</span><strong :class="{ negative: Number(item.end_change) < 0 }">{{ signedChange(item.end_change) }}</strong></div>
+                    <div class="trajectory-verdict">
+                      <strong>{{ trajectoryLabel(item) }}</strong>
+                      <span>{{ semanticSourceLabel(item.semantic_source) }}</span>
+                    </div>
+                  </div>
+                </div>
+              </article>
               <article v-if="prediction?.alerts?.length" class="surface-card">
                 <div class="card-heading"><div><p class="eyebrow">RISK WINDOWS</p><h3>值得留意的时段</h3></div></div>
                 <div class="alert-list">
@@ -730,6 +989,9 @@ onUnmounted(() => {
                   <div><span>参数版本</span><strong>{{ prediction.versions.parameters }}</strong></div>
                   <div><span>特征版本</span><strong>{{ prediction.versions.features }}</strong></div>
                   <div><span>运行 ID</span><strong>{{ prediction.prediction_run_id }}</strong></div>
+                  <div><span>语义复现策略</span><strong>{{ prediction.semantic_inference?.replay_policy || "确定性规则" }}</strong></div>
+                  <div><span>语义 Agent</span><strong>{{ prediction.semantic_inference?.agent?.configured ? `${prediction.semantic_inference.agent.model} 已启用` : "等待 DeepSeek Key · 当前规则模式" }}</strong></div>
+                  <div><span>跨日来源</span><strong>{{ prediction.cross_day_context?.source_prediction_run_id || "无" }}</strong></div>
                 </div>
               </details>
             </div>
@@ -751,9 +1013,28 @@ onUnmounted(() => {
               <label class="scale-question"><span>此刻的压力感受</span><b>{{ feedbackForm.stress }}</b></label>
               <input v-model="feedbackForm.stress" type="range" min="0" max="10">
               <div class="scale-ends"><span>很轻松</span><span>非常紧绷</span></div>
-              <label class="scale-question"><span>此刻的精力状态</span><b>{{ feedbackForm.energy }}</b></label>
+              <label class="scale-question"><span>此刻的主观活力</span><b>{{ feedbackForm.energy }}</b></label>
               <input v-model="feedbackForm.energy" type="range" min="0" max="10">
-              <div class="scale-ends"><span>几乎耗尽</span><span>精力充足</span></div>
+              <div class="scale-ends"><span>很难投入</span><span>活力充足</span></div>
+              <label class="scale-question"><span>仍在反复想过去或接下来的压力事件</span><b>{{ feedbackForm.cognition }}</b></label>
+              <input v-model="feedbackForm.cognition" type="range" min="0" max="10">
+              <div class="two-fields">
+                <label><span>当前主要活动</span><input v-model="feedbackForm.activity" class="clean-input" placeholder="例如：上课、通勤、休息"></label>
+                <label><span>自上次反馈后有压力事件吗</span><select v-model="feedbackForm.stressEventSinceLast" class="clean-input"><option value="no">没有</option><option value="yes">有</option></select></label>
+              </div>
+              <label><span>相关事件现在仍在持续吗</span><select v-model="feedbackForm.eventOngoing" class="clean-input"><option value="no">没有 / 已结束</option><option value="yes">仍在持续</option></select></label>
+              <details class="event-appraisal-fields">
+                <summary>事件评价与恢复体验（推荐）</summary>
+                <label>事件重要性 <b>{{ feedbackForm.importance }}</b><input v-model="feedbackForm.importance" type="range" min="0" max="10"></label>
+                <label>主观可控性 <b>{{ feedbackForm.control }}</b><input v-model="feedbackForm.control" type="range" min="0" max="10"></label>
+                <label>担心结果 <b>{{ feedbackForm.worry }}</b><input v-model="feedbackForm.worry" type="range" min="0" max="10"></label>
+                <label>威胁 0 — 挑战 10 <b>{{ feedbackForm.threatChallenge }}</b><input v-model="feedbackForm.threatChallenge" type="range" min="0" max="10"></label>
+                <label><span>事件是否完成</span><select v-model="feedbackForm.eventCompleted" class="clean-input"><option value="yes">已完成</option><option value="no">尚未完成</option></select></label>
+                <label>心理脱离 <b>{{ feedbackForm.detach }}</b><input v-model="feedbackForm.detach" type="range" min="0" max="10"></label>
+                <label>放松 <b>{{ feedbackForm.relax }}</b><input v-model="feedbackForm.relax" type="range" min="0" max="10"></label>
+                <label>自主决定 <b>{{ feedbackForm.autonomy }}</b><input v-model="feedbackForm.autonomy" type="range" min="0" max="10"></label>
+                <label>成长或掌控 <b>{{ feedbackForm.mastery }}</b><input v-model="feedbackForm.mastery" type="range" min="0" max="10"></label>
+              </details>
               <label class="field-label">想补充一句吗？（选填）</label>
               <textarea v-model="feedbackForm.note" class="clean-input" rows="3" placeholder="例如：刚结束一场汇报，正在慢慢放松。"></textarea>
               <button class="primary-button full-button" type="button" :disabled="feedbackLoading" @click="submitFeedback">
@@ -818,12 +1099,76 @@ onUnmounted(() => {
               </div>
             </article>
             <article class="surface-card settings-card">
+              <div class="settings-icon connection">BOT</div>
+              <div class="settings-copy">
+                <h3>飞书关怀机器人</h3>
+                <p>机器人绑定与日历授权彼此独立；绑定不会自动开启主动关怀。</p>
+                <span class="status-pill" :class="botBinding?.bound ? 'safe' : 'warning'">{{ botBindingLabel }}</span>
+                <small v-if="botBinding?.bound && botBinding.bound_at" class="connection-check-copy verified">
+                  绑定时间：{{ new Date(botBinding.bound_at).toLocaleString() }}
+                </small>
+              </div>
+              <button
+                v-if="botBinding?.bound"
+                class="outline-button subtle"
+                type="button"
+                :disabled="botBindingRemoving"
+                @click="removeBotBinding"
+              >
+                {{ botBindingRemoving ? "解绑中…" : "解除绑定" }}
+              </button>
+            </article>
+            <article v-if="carePreferences" class="surface-card settings-card care-preferences-card">
+              <div class="settings-icon connection">♡</div>
+              <div class="settings-copy">
+                <h3>关怀偏好与同意</h3>
+                <p>主动关怀、个人历史引用与外部模型授权分别记录，互不隐含。</p>
+                <div class="compact-preference-grid">
+                  <label><span>安静时段开始</span><input v-model="carePreferences.quiet_start" type="time"></label>
+                  <label><span>安静时段结束</span><input v-model="carePreferences.quiet_end" type="time"></label>
+                  <label><span>每日上限</span><input v-model.number="carePreferences.max_daily_messages" type="number" min="0" max="10"></label>
+                  <label><span>提醒语气</span>
+                    <select v-model="carePreferences.tone">
+                      <option value="brief_warm">简短温和</option>
+                      <option value="calm_practical">冷静实用</option>
+                      <option value="minimal">只说重点</option>
+                    </select>
+                  </label>
+                  <label><span>优先支持</span>
+                    <select v-model="carePreferences.preferred_support[0]">
+                      <option value="task_breakdown">拆小任务</option>
+                      <option value="short_break">短暂休息</option>
+                      <option value="breathing">呼吸放松</option>
+                      <option value="quiet_companionship">安静陪伴</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="consent-line"><input v-model="carePreferences.feishu_proactive_enabled" type="checkbox">允许主动关怀（定时推送功能尚未启用）</label>
+                <label class="consent-line"><input v-model="carePreferences.allow_personal_history_reference" type="checkbox">允许建议引用最少必要的个人历史</label>
+                <label class="consent-line"><input v-model="carePreferences.allow_external_llm" type="checkbox">允许外部 LLM 使用最少必要上下文</label>
+              </div>
+              <button class="outline-button" type="button" :disabled="carePreferencesSaving" @click="saveCarePreferences">
+                {{ carePreferencesSaving ? "保存中…" : "保存偏好" }}
+              </button>
+            </article>
+            <article class="surface-card settings-card">
               <div class="settings-icon key">◇</div>
               <div class="settings-copy">
                 <h3>开发者 API Key</h3><p>用于脚本或研究客户端调用。密钥只在创建时显示一次。</p>
                 <span class="status-pill safe">{{ activeKeyCount }} 个有效密钥</span>
               </div>
               <button class="outline-button" type="button" @click="apiKeyDialog.open()">管理密钥</button>
+            </article>
+            <article class="surface-card settings-card">
+              <div class="settings-icon connection">AI</div>
+              <div class="settings-copy">
+                <h3>事件语义 Agent</h3>
+                <p>DeepSeek V4 Flash 只分析事件难度、时限、评价性和未完成语义；规则与用户自评保留最终控制。</p>
+                <span class="status-pill" :class="semanticAgentStatus?.configured ? 'safe' : 'warning'">
+                  {{ semanticAgentStatus?.configured ? "已启用并缓存" : "等待服务端填写 Key" }}
+                </span>
+                <small v-if="semanticAgentStatus?.model">模型：{{ semanticAgentStatus.model }} · 提示词 {{ semanticAgentStatus.prompt_version }}</small>
+              </div>
             </article>
             <article class="surface-card version-panel">
               <div class="card-heading">

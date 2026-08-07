@@ -137,8 +137,12 @@ class CalendarIDFetcher:
         calendar_info["role"] = calendar_payload.get("role")
         calendar_info["type"] = calendar_payload.get("type")
         
-        # 记录解析结果
-        logger.info(f"解析后的日历信息: {json.dumps(calendar_info)}")
+        # 仅记录非敏感元数据；calendar_id/owner_id 不进入日志。
+        logger.info(
+            "主日历信息解析成功: role=%s type=%s",
+            calendar_info.get("role"),
+            calendar_info.get("type"),
+        )
         
         return calendar_info
 

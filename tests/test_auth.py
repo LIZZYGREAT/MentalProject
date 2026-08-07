@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
+import uuid
 
 
 TEST_DIR = Path(tempfile.mkdtemp(prefix="mental_project_auth_"))
@@ -13,6 +16,7 @@ TEST_DB = TEST_DIR / "app.sqlite3"
 os.environ["APP_ENV"] = "development"
 os.environ["FLASK_SECRET_KEY"] = "test-only-secret-key-with-sufficient-length"
 os.environ["APP_DATABASE_PATH"] = str(TEST_DB)
+os.environ["SEMANTIC_API_ENABLED"] = "false"
 
 from auth.database import AppDatabase  # noqa: E402
 from entry.app import app, application_database  # noqa: E402
@@ -149,7 +153,11 @@ class AuthenticationApiTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {raw_key}"},
         )
         self.assertEqual(api_response.status_code, 200)
-        self.assertIn("params", api_response.get_json())
+        params = api_response.get_json()["params"]
+        self.assertNotIn("legacy_model", params)
+        self.assertNotIn("f_strategy", params)
+        self.assertNotIn("f_strategy_params", params)
+        self.assertNotIn("night_deep", params)
 
     def test_invalid_password_is_rejected(self):
         response = self.client.post(
@@ -157,6 +165,81 @@ class AuthenticationApiTests(unittest.TestCase):
             json={"login_id": "api-user@school.edu.cn", "password": "invalid"},
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_semantic_status_never_exposes_key(self):
+        self.assertEqual(self.login().status_code, 200)
+        response = self.client.get("/api/semantic-agent/status")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["model"], "deepseek-v4-flash")
+        self.assertIn("key_present", payload)
+        self.assertNotIn("api_key", payload)
+        self.assertNotIn("DEEPSEEK_API_KEY", payload)
+
+    def test_frozen_replay_uses_stored_points_without_external_api(self):
+        self.assertEqual(self.login().status_code, 200)
+        run_id = f"replay-{uuid.uuid4()}"
+        run_input = {
+            "date": "2026-08-01",
+            "semantic_snapshot": [{"fingerprint": "frozen-semantic"}],
+        }
+        summary = {
+            "end_S": 61.5,
+            "end_E": 72.0,
+            "point_count": 1,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                {"input": run_input, "result": summary},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        application_database.save_prediction_run(
+            self.user["id"],
+            {
+                "prediction_run_id": run_id,
+                "local_date": "2026-08-01",
+                "schema_version": "prediction_run.v1",
+                "model_version": "test-model",
+                "parameter_version": "test-params",
+                "feature_version": "test-features",
+                "random_seed": 42,
+                "input": run_input,
+                "result": {**summary, "fingerprint": digest},
+                "created_at": "2026-08-01T12:00:00+00:00",
+            },
+            [
+                {
+                    "time": "12:00",
+                    "S": 61.5,
+                    "E": 72.0,
+                    "state": "DAY_ACTIVE",
+                }
+            ],
+        )
+        response = self.client.post(f"/api/prediction-runs/{run_id}/replay")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["replay_mode"], "frozen_stored_trajectory")
+        self.assertFalse(payload["external_api_called"])
+        self.assertTrue(payload["fingerprint_verified"])
+        self.assertEqual(payload["results"][0]["S"], 61.5)
+
+        completion = self.client.post(
+            "/api/feedback",
+            json={
+                "feedback_type": "event_completion",
+                "prediction_run_id": run_id,
+                "payload": {
+                    "event_id": "ddl-1",
+                    "event_name": "项目DDL",
+                    "completed": False,
+                },
+            },
+        )
+        self.assertEqual(completion.status_code, 201)
 
     def test_feishu_connection_can_be_verified_against_primary_calendar(self):
         self.assertEqual(self.login().status_code, 200)
@@ -258,11 +341,11 @@ class AuthenticationApiTests(unittest.TestCase):
         self.assertEqual(forbidden.status_code, 403)
         self.assertEqual(forbidden.get_json()["code"], "admin_required")
 
-    def test_user_can_manage_only_supported_model_strategies(self):
+    def test_ctssm_rejects_legacy_personality_strategy_controls(self):
         self.assertEqual(self.login().status_code, 200)
         current = self.client.get("/api/profile/strategies")
-        self.assertEqual(current.status_code, 200)
-        self.assertEqual(len(current.get_json()["strategies"]["families"]), 4)
+        self.assertEqual(current.status_code, 410)
+        self.assertTrue(current.get_json()["replacement"]["event_appraisal"])
 
         updated = self.client.patch(
             "/api/profile/strategies",
@@ -275,30 +358,56 @@ class AuthenticationApiTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(updated.status_code, 200)
-        self.assertEqual(
-            updated.get_json()["strategies"]["current"]["rest_strategy"],
-            "warmup",
-        )
+        self.assertEqual(updated.status_code, 410)
         stored = application_database.load_user_params(self.user["id"])
-        self.assertEqual(stored["f_strategy"], "dull")
+        self.assertNotIn("f_strategy", stored)
 
-        rejected = self.client.patch(
-            "/api/profile/strategies",
-            json={"strategies": {"S_star_init": 99}},
+        hidden_parameter_update = self.client.post(
+            "/api/config",
+            json={"params": {"f_strategy_params": {"sensitive": {"base": 1.0}}}},
         )
-        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(hidden_parameter_update.status_code, 410)
 
-        self.client.patch(
-            "/api/profile/strategies",
+    def test_momentary_feedback_enforces_and_stores_paper_minimum_ema(self):
+        self.assertEqual(self.login().status_code, 200)
+        missing = self.client.post(
+            "/api/feedback",
             json={
-                "strategies": {
-                    "f_strategy": "sensitive",
-                    "C_strategy": "high",
-                    "night_strategy": "normal",
-                    "rest_strategy": "relieved",
-                }
+                "feedback_type": "momentary_state",
+                "target_time": "2026-12-30T10:00:00",
+                "payload": {"stress_0_10": 6},
             },
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("vitality_0_10", missing.get_json()["fields"])
+        self.assertIn("activity", missing.get_json()["fields"])
+
+        complete = self.client.post(
+            "/api/feedback",
+            json={
+                "feedback_type": "momentary_state",
+                "target_time": "2026-12-30T10:00:00",
+                "retrospective": False,
+                "payload": {
+                    "stress_0_10": 6,
+                    "vitality_0_10": 5,
+                    "perseverative_cognition_0_10": 4,
+                    "activity": "study",
+                    "stress_event_since_last": True,
+                    "event_ongoing": True,
+                },
+            },
+        )
+        self.assertEqual(complete.status_code, 201)
+        observations = application_database.list_feedback_observations(
+            self.user["id"],
+            target_date="2026-12-30",
+        )
+        self.assertTrue(
+            any(
+                item["payload"].get("vitality_0_10") == 5
+                for item in observations
+            )
         )
 
     def test_admin_diagnostics_expose_evidence_and_real_function_curves(self):
@@ -316,8 +425,12 @@ class AuthenticationApiTests(unittest.TestCase):
         self.assertIn("reliability", overview.get_json())
         self.assertIn("users", overview.get_json()["application"]["counts"])
 
-        curves = self.client.get(
+        hidden_curves = self.client.get(
             "/api/admin/model/curves?family=rest_strategy&stress=70&energy=40"
+        )
+        self.assertEqual(hidden_curves.status_code, 410)
+        curves = self.client.get(
+            "/api/admin/model/curves?family=rest_strategy&stress=70&energy=40&legacy=true"
         )
         self.assertEqual(curves.status_code, 200)
         curve_payload = curves.get_json()["curves"]
@@ -370,8 +483,10 @@ class AuthenticationApiTests(unittest.TestCase):
         self.assertIsNotNone(stored_run)
         self.assertEqual(
             stored_run["diagnostics"]["schema_version"],
-            "prediction_diagnostics.v1",
+            "prediction_diagnostics.v2",
         )
+        self.assertIn("event_trajectory", stored_run["diagnostics"])
+        self.assertIn("semantic_inference", stored_run["diagnostics"])
         self.assertGreater(len(stored_run["points"]), 0)
 
     def test_registration_and_versioned_onboarding_flow(self):
@@ -463,6 +578,66 @@ class AuthenticationApiTests(unittest.TestCase):
             second_payload["prediction_run_id"],
         )
         self.assertEqual(before, application_database.load_user_params(user_id))
+
+    def test_simulation_automatically_uses_exact_previous_day_and_unfinished_task(self):
+        self.assertEqual(self.login().status_code, 200)
+        first_payload = {
+            "date": "2035-01-10",
+            "init_S": 50,
+            "init_E": 80,
+            "mock_events": [
+                {
+                    "type": "task",
+                    "name": "跨日项目DDL",
+                    "start": "18:00",
+                    "end": "22:00",
+                    "level": "ddl",
+                    "objective": {"unfinished": 1.0},
+                }
+            ],
+        }
+        with patch(
+            "data_pipeline.fetcher.fetch_events_with_timeout",
+            return_value=[],
+        ):
+            first = self.client.post("/api/simulate", json=first_payload)
+            second = self.client.post(
+                "/api/simulate",
+                json={
+                    "date": "2035-01-11",
+                    "init_S": 50,
+                    "init_E": 80,
+                    "mock_events": [],
+                },
+            )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        first_data = first.get_json()
+        second_data = second.get_json()
+        context = second_data["cross_day_context"]
+        self.assertEqual(
+            context["source_prediction_run_id"],
+            first_data["prediction_run_id"],
+        )
+        self.assertEqual(context["source_date"], "2035-01-10")
+        self.assertEqual(
+            [item["event_name"] for item in context["unfinished_tasks"]],
+            ["跨日项目DDL"],
+        )
+        self.assertAlmostEqual(
+            second_data["used_init_S"],
+            first_data["end_S"],
+            delta=0.001,
+        )
+        replay = self.client.post(
+            f"/api/prediction-runs/{second_data['prediction_run_id']}/replay"
+        ).get_json()
+        self.assertTrue(
+            any(
+                float(point.get("cross_day_unfinished_input", 0.0)) > 0.0
+                for point in replay["results"]
+            )
+        )
 
 
 def tearDownModule():

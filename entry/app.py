@@ -7,13 +7,14 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from flask import Flask, g, render_template, request, jsonify, session, send_from_directory, redirect
+from flask import Flask, g, render_template, request, jsonify, session, send_from_directory, redirect, url_for
 from markupsafe import escape
 import hmac
 import hashlib
 import json
 import secrets
 from datetime import date, datetime, timedelta
+from typing import Any
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from auth.database import AppDatabase
@@ -32,7 +33,11 @@ from data_pipeline.orchestrator import inject_routine_events
 from algorithm.time_utils import normalize_interval, overlaps
 from calibration.calibrator import calibrate_parameters
 from calibration.metrics import evaluate_simulation
-from calibration.parameter_validation import validate_params
+from calibration.model_comparison import run_nested_model_comparison
+from calibration.care_frequency_validation import run_synthetic_care_frequency_check
+from calibration.semantic_validation import run_numerical_semantic_check
+from calibration.validation_protocol import run_engineering_validation_protocol
+from calibration.parameter_validation import get_nested, set_nested, validate_params
 from calibration.simulation_runner import run_simulation_for_calibration
 from calibration.storage import CalibrationStore
 from settings.model_defaults import (
@@ -43,6 +48,7 @@ from settings.model_defaults import (
 )
 from services.onboarding import (
     FEATURE_VERSION,
+    MAPPING_VERSION,
     MODEL_VERSION,
     PARAMETER_VERSION,
     QUESTIONNAIRE_DEFINITION,
@@ -58,6 +64,13 @@ from services.strategy_catalog import (
     strategy_payload,
     validate_strategy_selection,
 )
+from services.cross_day_context import (
+    build_automatic_cross_day_context,
+    semantic_context_from_cross_day,
+)
+from services.event_semantics import semantic_agent_status
+from integrations.feishu.identity import FeishuIdentityService
+from services.care_service import CareService
 
 template_dir = os.path.join(project_root, 'templates')
 static_dir = os.path.join(project_root, 'static')
@@ -92,6 +105,16 @@ if os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true":
 application_database = AppDatabase()
 application_database.init_schema()
 application_database.save_questionnaire_definition(QUESTIONNAIRE_DEFINITION)
+care_service = CareService(
+    application_database,
+    token_path_factory=lambda user_id: _feishu_token_path(user_id),
+)
+feishu_identity_service = FeishuIdentityService(
+    application_database,
+    app_id=os.getenv("FEISHU_APP_ID", ""),
+    bind_base_url=os.getenv("FEISHU_BIND_BASE_URL", ""),
+    token_ttl_seconds=int(os.getenv("FEISHU_BIND_TOKEN_TTL_SECONDS", "900")),
+)
 
 bootstrap_login_id = os.getenv("BOOTSTRAP_ADMIN_LOGIN_ID")
 bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
@@ -164,8 +187,59 @@ def _apply_profile_routine(user: User, profile: dict | None) -> None:
     if routine.get("weekday_sleep_start"):
         user.params["default_sleep_time"] = routine["weekday_sleep_start"]
     user.params["routine_weaver"] = cfg
-    user._init_strategies()
+    applied_priors = []
+    mapping_is_current = profile.get("mapping_version") == MAPPING_VERSION
+    allowed_prior_paths = set(
+        QUESTIONNAIRE_DEFINITION.get("parameter_whitelist", [])
+    )
+    for prior in profile.get("parameter_priors", []):
+        if not isinstance(prior, dict):
+            continue
+        path = str(prior.get("parameter") or "")
+        if not mapping_is_current or path not in allowed_prior_paths:
+            continue
+        current = get_nested(user.params, path)
+        if not path or current is None:
+            continue
+        try:
+            group_mean = float(current)
+            questionnaire_mean = float(prior["mean"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        # The questionnaire is a weak prior mean correction, not a permanent
+        # direct assignment.  The request-scoped runtime value remains mostly
+        # shrunk toward the versioned group parameter.
+        runtime_value = 0.65 * group_mean + 0.35 * questionnaire_mean
+        set_nested(user.params, path, runtime_value)
+        applied_priors.append(
+            {
+                "parameter": path,
+                "group_mean": group_mean,
+                "questionnaire_prior_mean": questionnaire_mean,
+                "runtime_prior_mean": runtime_value,
+                "prior_strength": "weak",
+            }
+        )
+    user.params["individual_parameter_priors"] = applied_priors
+    if "ctssm" not in str(user.params.get("model_family", "")).lower():
+        user._init_strategies()
     user.solver.update_user(user)
+
+
+def _profile_for_response(profile: dict | None) -> dict | None:
+    """Do not present or apply retired parameter priors as current CTSSM facts."""
+    if not profile:
+        return None
+    presented = dict(profile)
+    is_current = profile.get("mapping_version") == MAPPING_VERSION
+    presented["mapping_is_current"] = is_current
+    presented["current_mapping_version"] = MAPPING_VERSION
+    if not is_current:
+        presented["parameter_priors"] = []
+        presented["mapping_notice"] = (
+            "该画像来自旧版映射，仅保留历史参考；请重新填写以生成当前模型先验。"
+        )
+    return presented
 
 
 def _event_windows(events) -> list:
@@ -177,6 +251,59 @@ def _event_windows(events) -> list:
         except (AttributeError, TypeError, ValueError):
             continue
     return windows
+
+
+def _stored_ema_observations(user_id: int, target_date: str) -> list[dict]:
+    observations = []
+    for item in application_database.list_feedback_observations(
+        user_id,
+        target_date=target_date,
+        limit=200,
+    ):
+        if item.get("feedback_type") != "momentary_state":
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        target_time = item.get("target_time") or item.get("reported_at")
+        recall_delay = 0.0
+        try:
+            target_dt = datetime.fromisoformat(str(target_time).replace("Z", "+00:00"))
+            reported_dt = datetime.fromisoformat(
+                str(item.get("reported_at") or target_time).replace("Z", "+00:00")
+            )
+            if target_dt.tzinfo is None and reported_dt.tzinfo is not None:
+                reported_dt = reported_dt.replace(tzinfo=None)
+            elif target_dt.tzinfo is not None and reported_dt.tzinfo is None:
+                target_dt = target_dt.replace(tzinfo=None)
+            recall_delay = max(0.0, (reported_dt - target_dt).total_seconds() / 60.0)
+        except (TypeError, ValueError):
+            recall_delay = 60.0 if item.get("retrospective") else 0.0
+        observations.append(
+            {
+                "target_time": target_time,
+                "stress": payload.get("stress_0_10"),
+                "vitality": payload.get(
+                    "vitality_0_10", payload.get("energy_0_10")
+                ),
+                "perseverative_cognition": payload.get(
+                    "perseverative_cognition_0_10"
+                ),
+                "retrospective": bool(item.get("retrospective")),
+                "recall_delay_minutes": recall_delay,
+                "feedback_id": item.get("feedback_id"),
+            }
+        )
+    return observations
+
+
+def _is_legacy_strategy_config_key(key: Any) -> bool:
+    normalized = str(key or "").lower()
+    return (
+        normalized == "legacy_model"
+        or "strategy" in normalized
+        or normalized.startswith("night_")
+        or normalized.startswith("rest_")
+        or normalized in {"time_pref_weights"}
+    )
 
 
 def _validate_mock_events(value) -> list:
@@ -240,6 +367,10 @@ def _feishu_callback_page(success: bool, title: str, message: str, status_code=2
         },
         ensure_ascii=False,
     ).replace("<", "\\u003c")
+    frontend_origin = (
+        os.getenv("FEISHU_FRONTEND_ORIGIN") or request.host_url.rstrip("/")
+    )
+    frontend_origin_json = json.dumps(frontend_origin).replace("<", "\\u003c")
     tone = "#315c4b" if success else "#9a4f43"
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -259,7 +390,7 @@ def _feishu_callback_page(success: bool, title: str, message: str, status_code=2
   <main><b>{escape(title)}</b><p>{escape(message)}</p><p>此窗口将自动关闭。</p></main>
   <script>
     if (window.opener) {{
-      window.opener.postMessage({event_payload}, "*");
+      window.opener.postMessage({event_payload}, {frontend_origin_json});
     }}
     window.setTimeout(() => window.close(), 1200);
   </script>
@@ -594,6 +725,13 @@ def admin_audit_logs():
 @admin_required
 def admin_model_curves():
     """Compare real strategy functions with deterministic diagnostic inputs."""
+    if str(request.args.get("legacy") or "").lower() not in {"1", "true", "yes"}:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "旧策略函数不属于 CTSSM；仅显式 legacy=true 时可作历史基线诊断",
+            }
+        ), 410
     family = str(request.args.get("family") or "f_strategy")
     target_user_id = request.args.get("user_id")
     if target_user_id not in (None, ""):
@@ -725,6 +863,192 @@ def feishu_submit_code():
     }), 410
 
 
+@app.route('/feishu/bind', methods=['GET'])
+@auth_required
+def feishu_bind_page():
+    """Render an explicit, session-authenticated one-time binding confirmation."""
+    identity = get_identity()
+    if not identity or identity.get("auth_type") != "session":
+        return redirect(url_for("login_page", next=request.full_path))
+    raw_token = str(request.args.get("token") or "")
+    token_json = json.dumps(raw_token, ensure_ascii=False).replace("<", "\\u003c")
+    if len(raw_token) < 32:
+        return _feishu_callback_page(
+            False,
+            "绑定链接无效",
+            "请回到飞书机器人重新获取绑定卡片。",
+            400,
+        )
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>确认绑定飞书机器人</title>
+  <style>
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:#f4f0e7;
+      color:#20352d; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }}
+    main {{ width:min(460px,calc(100% - 40px)); padding:34px; border:1px solid #d8d2c4;
+      border-radius:24px; background:#fffdf8; box-shadow:0 18px 60px rgba(35,56,47,.12); }}
+    h1 {{ font-size:1.4rem; }} p {{ line-height:1.75; color:#66746e; }}
+    button {{ border:0; border-radius:999px; padding:12px 20px; background:#315c4b; color:white;
+      font:inherit; cursor:pointer; }} button:disabled {{ opacity:.55; cursor:wait; }}
+    #result {{ min-height:1.5em; color:#315c4b; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>确认绑定飞书机器人</h1>
+    <p>确认后，当前登录的 Mental_project 账号会与刚才发消息的飞书账号绑定。机器人随后只能读取这个项目账号自己的状态、预测和日历授权；你可以随时在 Web 设置中解绑。</p>
+    <p>绑定飞书身份不会自动开启主动关怀，也不会自动同意外部 LLM 使用个人历史。</p>
+    <button id="confirm" type="button">确认绑定</button>
+    <p id="result" role="status"></p>
+  </main>
+  <script>
+    const token = {token_json};
+    const button = document.getElementById("confirm");
+    const result = document.getElementById("result");
+    button.addEventListener("click", async () => {{
+      button.disabled = true;
+      result.textContent = "正在确认…";
+      try {{
+        const response = await fetch("/api/feishu/bindings/confirm", {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          credentials: "same-origin",
+          body: JSON.stringify({{token}}),
+        }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || "绑定失败");
+        result.textContent = "绑定成功。现在可以回到飞书继续使用。";
+        button.remove();
+      }} catch (error) {{
+        result.textContent = error.message || "绑定失败，请重新获取绑定卡片。";
+        button.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route('/api/feishu/bindings/confirm', methods=['POST'])
+@session_required
+def feishu_binding_confirm():
+    data = request.get_json(silent=True) or {}
+    try:
+        binding = feishu_identity_service.confirm_binding(
+            str(data.get("token") or ""),
+            int(get_identity()["id"]),
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    application_database.record_audit(
+        "feishu_bot_binding_confirmed",
+        user_id=int(get_identity()["id"]),
+        ip_address=request.remote_addr,
+        details={"binding_id": binding["id"], "app_id": binding["app_id"]},
+    )
+    return jsonify({
+        "status": "success",
+        "binding": feishu_identity_service.status_for_user(int(get_identity()["id"])),
+    })
+
+
+@app.route('/api/feishu/bindings/status', methods=['GET'])
+@auth_required
+def feishu_binding_status():
+    return jsonify({
+        "status": "success",
+        "configured": bool(feishu_identity_service.app_id),
+        "binding": feishu_identity_service.status_for_user(int(get_identity()["id"])),
+    })
+
+
+@app.route('/api/feishu/bindings/current', methods=['DELETE'])
+@session_required
+def feishu_binding_delete():
+    user_id = int(get_identity()["id"])
+    revoked = feishu_identity_service.revoke_binding(user_id)
+    if revoked:
+        application_database.record_audit(
+            "feishu_bot_binding_revoked",
+            user_id=user_id,
+            ip_address=request.remote_addr,
+            details={},
+        )
+    return jsonify({"status": "success", "revoked": revoked})
+
+
+@app.route('/api/care/preferences', methods=['GET', 'PATCH'])
+@auth_required
+def care_preferences():
+    user_id = int(get_identity()["id"])
+    if request.method == 'GET':
+        return jsonify({
+            "status": "success",
+            "preferences": care_service.get_preferences(user_id),
+        })
+    changes = request.get_json(silent=True) or {}
+    if not isinstance(changes, dict):
+        return jsonify({"status": "error", "message": "请求体必须是对象"}), 400
+    before = care_service.get_preferences(user_id)
+    try:
+        preferences = care_service.update_preferences(user_id, changes)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    audited_keys = {
+        "feishu_proactive_enabled",
+        "allow_personal_history_reference",
+        "allow_external_llm",
+    }
+    changed_audited = sorted(
+        key for key in audited_keys
+        if key in changes and before.get(key) != preferences.get(key)
+    )
+    if changed_audited:
+        application_database.record_audit(
+            "care_preferences_consent_changed",
+            user_id=user_id,
+            ip_address=request.remote_addr,
+            details={"fields": changed_audited},
+        )
+    return jsonify({"status": "success", "preferences": preferences})
+
+
+@app.route('/api/admin/feishu-bot/status', methods=['GET'])
+@admin_required
+def admin_feishu_bot_status():
+    return jsonify({"status": "success", **application_database.feishu_bot_status()})
+
+
+@app.route('/api/admin/feishu-bot/failures', methods=['GET'])
+@admin_required
+def admin_feishu_bot_failures():
+    return jsonify({
+        "status": "success",
+        "failures": application_database.feishu_bot_failures(
+            limit=request.args.get("limit", 50, type=int)
+        ),
+    })
+
+
+@app.route('/api/admin/feishu-bot/failures/<event_id>/retry', methods=['POST'])
+@admin_required
+def admin_retry_feishu_bot_failure(event_id):
+    retried = application_database.retry_failed_feishu_event(str(event_id))
+    if not retried:
+        return jsonify({"status": "error", "message": "失败事件不存在或当前不可重试"}), 404
+    application_database.record_audit(
+        "feishu_bot_failure_retried",
+        user_id=int(get_identity()["id"]),
+        ip_address=request.remote_addr,
+        details={"event_id": str(event_id)},
+    )
+    return jsonify({"status": "success", "retried": True})
+
+
 @app.route('/api/onboarding/questionnaire', methods=['GET'])
 @auth_required
 def onboarding_questionnaire():
@@ -809,14 +1133,26 @@ def current_profile():
                 "message": "请先完成初始化问卷",
             }
         ), 404
-    return jsonify({"status": "success", "profile": profile})
+    return jsonify({"status": "success", "profile": _profile_for_response(profile)})
 
 
 @app.route('/api/profile/strategies', methods=['GET', 'PATCH'])
 @auth_required
 def profile_strategies():
-    """Expose only the four safe, user-selectable model strategy switches."""
+    """Keep the historical endpoint from masquerading as CTSSM personalization."""
     current_user = _get_model_user()
+    if "ctssm" in str(current_user.params.get("model_family", "")).lower():
+        return jsonify(
+            {
+                "status": "error",
+                "message": "新模型不使用离散人格策略；请通过事件评价和 EMA 提供个体信息",
+                "replacement": {
+                    "event_appraisal": True,
+                    "momentary_feedback": True,
+                    "questionnaire_priors": "weak_bounded_priors",
+                },
+            }
+        ), 410
     if request.method == "GET":
         return jsonify(
             {
@@ -889,7 +1225,7 @@ def dashboard():
             "status": "success",
             "user": get_identity(),
             "onboarding_completed": profile is not None,
-            "profile": profile,
+            "profile": _profile_for_response(profile),
             "routine_plan": plan,
             "recent_runs": application_database.recent_prediction_runs(user_id),
             "versions": {
@@ -914,12 +1250,59 @@ def feedback_observation():
         "prediction_review",
         "care_review",
         "routine_correction",
+        "event_completion",
     }
     if feedback_type not in allowed_types:
         return jsonify({"status": "error", "message": "unsupported feedback_type"}), 400
     payload = data.get("payload")
     if not isinstance(payload, dict) or not payload:
         return jsonify({"status": "error", "message": "payload is required"}), 400
+    if feedback_type == "momentary_state":
+        required = {
+            "stress_0_10",
+            "activity",
+            "stress_event_since_last",
+            "event_ongoing",
+        }
+        missing = sorted(
+            key for key in required if key not in payload or payload.get(key) in (None, "")
+        )
+        if "vitality_0_10" not in payload and "energy_0_10" not in payload:
+            missing.append("vitality_0_10")
+        if missing:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "momentary_state 缺少论文最低 EMA 字段",
+                    "fields": sorted(set(missing)),
+                }
+            ), 400
+        for key in (
+            "stress_0_10",
+            "vitality_0_10",
+            "energy_0_10",
+            "perseverative_cognition_0_10",
+        ):
+            if key not in payload:
+                continue
+            try:
+                value = float(payload[key])
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": f"{key} must be numeric"}), 400
+            if not 0.0 <= value <= 10.0:
+                return jsonify({"status": "error", "message": f"{key} must be 0-10"}), 400
+    if feedback_type == "event_completion":
+        if not isinstance(payload.get("completed"), bool):
+            return jsonify(
+                {"status": "error", "message": "event_completion.completed must be boolean"}
+            ), 400
+        if not str(payload.get("event_id") or payload.get("event_name") or "").strip():
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "event_completion requires event_id or event_name",
+                }
+            ), 400
     prediction_run_id = data.get("prediction_run_id")
     if prediction_run_id and not application_database.user_owns_prediction_run(
         authenticated_user_id,
@@ -930,7 +1313,7 @@ def feedback_observation():
         ), 400
     feedback = {
         "feedback_id": new_id(),
-        "schema_version": "feedback_observation.v1",
+        "schema_version": "feedback_observation.v2",
         "prediction_run_id": prediction_run_id,
         "feedback_type": feedback_type,
         "target_time": data.get("target_time"),
@@ -950,19 +1333,104 @@ def feedback_observation():
     return jsonify({"status": "success", "feedback_id": feedback["feedback_id"]}), 201
 
 
+@app.route('/api/semantic-agent/status', methods=['GET'])
+@auth_required
+def event_semantic_agent_status():
+    """Expose readiness and version metadata without ever returning the key."""
+
+    return jsonify({"status": "success", **semantic_agent_status()})
+
+
+@app.route('/api/prediction-runs/<prediction_run_id>/replay', methods=['POST'])
+@auth_required
+def replay_prediction_run(prediction_run_id):
+    """Return the exact stored trajectory without API calls or re-inference."""
+
+    authenticated_user_id = int(get_identity()["id"])
+    run = application_database.prediction_run_detail_for_user(
+        authenticated_user_id,
+        prediction_run_id,
+    )
+    if run is None:
+        return jsonify({"status": "error", "message": "预测运行不存在"}), 404
+    frozen_result = dict(run.get("result") or {})
+    stored_fingerprint = frozen_result.pop("fingerprint", None)
+    fingerprint_payload = json.dumps(
+        {"input": run.get("input") or {}, "result": frozen_result},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    verified_fingerprint = hashlib.sha256(fingerprint_payload).hexdigest()
+    return jsonify(
+        _json_safe(
+            {
+                "status": "success",
+                "replay_mode": "frozen_stored_trajectory",
+                "source_prediction_run_id": prediction_run_id,
+                "local_date": run.get("local_date"),
+                "versions": {
+                    "schema": run.get("schema_version"),
+                    "model": run.get("model_version"),
+                    "parameters": run.get("parameter_version"),
+                    "features": run.get("feature_version"),
+                },
+                "random_seed": run.get("random_seed"),
+                "input": run.get("input"),
+                "result": run.get("result"),
+                "results": run.get("points", []),
+                "diagnostics": run.get("diagnostics"),
+                "stored_fingerprint": stored_fingerprint,
+                "fingerprint_verified": bool(
+                    stored_fingerprint
+                    and hmac.compare_digest(
+                        str(stored_fingerprint),
+                        verified_fingerprint,
+                    )
+                ),
+                "external_api_called": False,
+            }
+        )
+    )
+
+
 @app.route('/api/config', methods=['GET', 'POST'])
 @auth_required
 def handle_config():
-    """GET 返回当前用户参数；POST 更新策略与 params（内存）。"""
+    """Read or update paper-aligned parameters; legacy strategies stay hidden."""
     current_user = _get_model_user()
     if request.method == 'GET':
-        safe_params = User._params_to_json_safe(current_user.params)
+        safe_params = User._params_to_json_safe(
+            {
+                key: value
+                for key, value in current_user.params.items()
+                if not _is_legacy_strategy_config_key(key)
+            }
+        )
         return jsonify({"user_id": current_user.user_id, "params": safe_params})
     elif request.method == 'POST':
         data = request.get_json(silent=True) or {}
         new_params = data.get("params", {})
         if not isinstance(new_params, dict):
             return jsonify({"status": "error", "message": "params must be an object"}), 400
+        deprecated = sorted(
+            key for key in new_params if _is_legacy_strategy_config_key(key)
+        )
+        if deprecated:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "CTSSM 不接受旧离散策略配置",
+                    "fields": deprecated,
+                }
+            ), 410
+        if "model_family" in new_params or "model_selection" in new_params:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "候选模型只能通过版本化的时间外验证流程发布",
+                }
+            ), 403
         validation = validate_params({**current_user.params, **new_params})
         if not validation["valid"]:
             return jsonify(
@@ -972,13 +1440,6 @@ def handle_config():
                     "validation": validation,
                 }
             ), 400
-        current_user.update_strategy_config(
-            f_strategy=new_params.get("f_strategy"),
-            C_strategy=new_params.get("C_strategy"),
-            night_strategy=new_params.get("night_strategy"),
-            rest_strategy=new_params.get("rest_strategy"),
-            time_preferences=new_params.get("time_preferences", [])
-        )
         current_user.update_params(new_params)
         _save_model_user(current_user)
         return jsonify({"status": "success", "message": "配置已保存到当前用户档案"})
@@ -1112,6 +1573,97 @@ def calibrate_curve_params():
 
     return jsonify(_json_safe({"status": "success", "report": report}))
 
+
+@app.route('/api/models/compare', methods=['POST'])
+@auth_required
+def compare_nested_models():
+    """Run the complete-date M0 baseline through M4-readiness comparison."""
+
+    data = request.get_json(silent=True) or {}
+    samples = data.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "samples must contain dated longitudinal observations",
+            }
+        ), 400
+    current_user = _get_model_user()
+    try:
+        report = run_nested_model_comparison(
+            samples,
+            current_user.params,
+            holdout_fraction=float(data.get("holdout_fraction", 0.30)),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    CalibrationStore().record_model_comparison(
+        report,
+        user_id=str(get_identity()["id"]),
+    )
+    return jsonify(
+        _json_safe(
+            {
+                "status": "success",
+                "report": report,
+                "model_changed": False,
+                "note": "结果已保存；只有全部保留门槛通过后才允许另行发布模型版本。",
+            }
+        )
+    )
+
+
+@app.route('/api/models/validate-engineering', methods=['POST'])
+@auth_required
+def validate_model_engineering_protocol():
+    """Run required counterfactual checks without calling them empirical proof."""
+
+    data = request.get_json(silent=True) or {}
+    sample = data.get("sample")
+    if not isinstance(sample, dict) or not sample.get("date"):
+        return jsonify(
+            {"status": "error", "message": "sample with date and events is required"}
+        ), 400
+    try:
+        report = run_engineering_validation_protocol(
+            sample,
+            _get_model_user().params,
+            model_variant=data.get("model_variant", "m0"),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    return jsonify(_json_safe({"status": "success", "report": report}))
+
+
+@app.route('/api/models/validate-numerics', methods=['POST'])
+@auth_required
+def validate_model_numerics():
+    """Run reproducible semantic and care-burden engineering checks."""
+
+    data = request.get_json(silent=True) or {}
+    days = max(20, min(500, int(data.get("days", 160))))
+    seed = int(data.get("seed", 20260731))
+    params = _get_model_user().params
+    semantic_report = run_numerical_semantic_check(params)
+    care_report = run_synthetic_care_frequency_check(
+        params,
+        days=days,
+        seed=seed,
+    )
+    return jsonify(
+        _json_safe(
+            {
+                "status": "success",
+                "semantic_report": semantic_report,
+                "care_frequency_report": care_report,
+                "passed": bool(
+                    semantic_report.get("passed") and care_report.get("passed")
+                ),
+                "note": "Engineering checks are not population or clinical validation.",
+            }
+        )
+    )
+
 @app.route('/api/simulate', methods=['POST'])
 @auth_required
 def simulate():
@@ -1206,6 +1758,15 @@ def simulate():
     for me in mock_events:
         st = f"{date_str} {me['start']}"
         et = f"{date_str} {me['end']}"
+        raw_mock_metadata = me.get("metadata")
+        mock_metadata = (
+            dict(raw_mock_metadata)
+            if isinstance(raw_mock_metadata, dict)
+            else {}
+        )
+        for field in ("objective", "appraisal", "recovery"):
+            if field in me:
+                mock_metadata[field] = me[field]
         
         overlap = False
         for (obs, obe, ob_name) in occupied_blocks:
@@ -1219,22 +1780,40 @@ def simulate():
         
         if me['type'] == 'course':
             from event.course_event import CourseEvent
-            events.append(CourseEvent(f"mock_{me['name']}", st, et, name=me['name'], credit=float(me.get('credit', 2.0)), hours=float(me.get('hours', 32.0))))
+            events.append(CourseEvent(
+                f"mock_{me['name']}",
+                st,
+                et,
+                name=me['name'],
+                description=str(me.get("description") or ""),
+                credit=float(me.get('credit', 2.0)),
+                hours=float(me.get('hours', 32.0)),
+                level=me.get("level"),
+                metadata=mock_metadata,
+            ))
         elif me['type'] == 'task':
             from event.task_event import TaskEvent
-            events.append(TaskEvent(f"mock_{me['name']}", st, et, name=me['name'], task_type=me.get('level', 'general')))
+            events.append(TaskEvent(
+                f"mock_{me['name']}",
+                st,
+                et,
+                name=me['name'],
+                description=str(me.get("description") or ""),
+                task_type=me.get('level', 'general'),
+                metadata=mock_metadata,
+            ))
         elif me['type'] == 'rest':
             from event.rest_event import MealEvent, NapEvent, RestEvent
             subtype = me.get('subtype', 'rest')
-            if subtype == 'meal': events.append(MealEvent(f"m_{me['name']}", st, et, name=me['name']))
-            elif subtype == 'nap': events.append(NapEvent(f"m_{me['name']}", st, et, name=me['name']))
-            else: events.append(RestEvent(f"m_{me['name']}", st, et, name=me['name']))
+            if subtype == 'meal': events.append(MealEvent(f"m_{me['name']}", st, et, name=me['name'], metadata=mock_metadata))
+            elif subtype == 'nap': events.append(NapEvent(f"m_{me['name']}", st, et, name=me['name'], metadata=mock_metadata))
+            else: events.append(RestEvent(f"m_{me['name']}", st, et, name=me['name'], metadata=mock_metadata))
         elif me['type'] == 'gym':
             from event.gym_event import GymEvent
-            events.append(GymEvent(f"mock_{me['name']}", st, et, name=me['name'], intensity=float(me.get('intensity', 0.7))))
+            events.append(GymEvent(f"mock_{me['name']}", st, et, name=me['name'], intensity=float(me.get('intensity', 0.7)), metadata=mock_metadata))
         elif me['type'] == 'library':
             from event.library_event import LibraryEvent
-            events.append(LibraryEvent(f"mock_{me['name']}", st, et, name=me['name'], study_intensity=float(me.get('study_intensity', 0.7))))
+            events.append(LibraryEvent(f"mock_{me['name']}", st, et, name=me['name'], study_intensity=float(me.get('study_intensity', 0.7)), metadata=mock_metadata))
 
     routine_plan_record = None
     context_record = None
@@ -1252,8 +1831,76 @@ def simulate():
         app_trace_logs.append(f"生态日程织入异常，回退到原始事件: {e}")
         final_events = events
     
-    init_S = data.get("init_S")
-    init_E = data.get("init_E")
+    previous_day_state = data.get("previous_day_state")
+    if previous_day_state is not None and not isinstance(previous_day_state, dict):
+        return jsonify({"status": "error", "message": "previous_day_state must be an object"}), 400
+    cross_day_context = None
+    auto_cross_day_context = bool(data.get("auto_cross_day_context", True))
+    if not previous_day_state and auto_cross_day_context:
+        try:
+            cross_day_context = build_automatic_cross_day_context(
+                application_database,
+                authenticated_user_id,
+                date_str,
+                max_carry_days=int(
+                    os.getenv("CROSS_DAY_UNFINISHED_MAX_DAYS", "3")
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            app_trace_logs.append(f"[跨日上下文] 无法构建，已回退到当日基线: {exc}")
+        if cross_day_context:
+            previous_day_state = dict(
+                cross_day_context.get("previous_day_state") or {}
+            )
+            app_trace_logs.append(
+                "[跨日上下文] 已接入前一日运行 "
+                f"{cross_day_context.get('source_prediction_run_id')}；"
+                f"明确未完成任务={len(cross_day_context.get('unfinished_tasks', []))}。"
+            )
+    previous_day_state = previous_day_state or {}
+    if cross_day_context is None and previous_day_state:
+        cross_day_context = {
+            "schema_version": "cross_day_context.manual.v1",
+            "target_date": date_str,
+            "source_date": None,
+            "source_prediction_run_id": None,
+            "previous_day_state": dict(previous_day_state),
+            "previous_day_end_stress_band": "manual",
+            "unfinished_tasks": [],
+            "unfinished_load": 0.0,
+            "chain_depth": 1,
+            "policy": {"source": "request_supplied"},
+        }
+
+    if context_record and context_record.get("context_snapshot_id"):
+        updated_context = application_database.update_daily_context_previous_day(
+            authenticated_user_id,
+            context_record["context_snapshot_id"],
+            cross_day_context,
+        )
+        if updated_context:
+            context_record = updated_context
+
+    event_semantic_context = semantic_context_from_cross_day(cross_day_context)
+    if event_semantic_context:
+        for event in final_events:
+            if not isinstance(getattr(event, "metadata", None), dict):
+                event.metadata = {}
+            event.metadata.setdefault(
+                "semantic_context",
+                dict(event_semantic_context),
+            )
+    init_S = previous_day_state.get("S_end", data.get("init_S"))
+    init_E = previous_day_state.get(
+        "V_end", previous_day_state.get("E_end", data.get("init_E"))
+    )
+    init_P = previous_day_state.get("P_end", data.get("init_P"))
+    init_F = previous_day_state.get("F_end", data.get("init_F"))
+    if previous_day_state.get("sleep_debt") is not None:
+        try:
+            current_user.set_sleep_debt(float(previous_day_state["sleep_debt"]))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "sleep_debt must be numeric"}), 400
     
     if init_S is None or init_E is None:
         init_S = current_user.get_current_S_star()
@@ -1269,11 +1916,112 @@ def simulate():
             return jsonify(
                 {"status": "error", "message": "init_S and init_E must be between 0 and 100"}
             ), 400
+    try:
+        init_P = None if init_P is None else float(init_P)
+        init_F = None if init_F is None else float(init_F)
+    except (TypeError, ValueError):
+        return jsonify(
+            {"status": "error", "message": "init_P and init_F must be numbers"}
+        ), 400
+    if (
+        (init_P is not None and not 0 <= init_P <= 1)
+        or (init_F is not None and not 0 <= init_F <= 1)
+    ):
+        return jsonify(
+            {"status": "error", "message": "init_P and init_F must be between 0 and 1"}
+        ), 400
 
+    request_observations = data.get("observations", [])
+    if not isinstance(request_observations, list):
+        return jsonify({"status": "error", "message": "observations must be a list"}), 400
+    stored_observations = _stored_ema_observations(
+        authenticated_user_id,
+        date_str,
+    )
+    all_observations = [*stored_observations, *request_observations]
+    sleep_context = data.get("sleep_context") or {}
+    if not isinstance(sleep_context, dict):
+        return jsonify({"status": "error", "message": "sleep_context must be an object"}), 400
+    try:
+        sleep_quality_deviation = float(
+            sleep_context.get("quality_deviation", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            {"status": "error", "message": "sleep_context.quality_deviation must be numeric"}
+        ), 400
+    if not -1.0 <= sleep_quality_deviation <= 1.0:
+        return jsonify(
+            {"status": "error", "message": "sleep quality deviation must be within [-1, 1]"}
+        ), 400
+
+    use_cross_day_transition = bool(previous_day_state) or bool(
+        data.get("cross_day_transition", False)
+    )
     solver = current_user.solver
-    result_tuple = solver.simulate_day(final_events, init_S, init_E, date_str)
+    result_tuple = solver.simulate_day(
+        final_events,
+        init_S,
+        init_E,
+        date_str,
+        observations=all_observations,
+        prev_P_end=init_P,
+        prev_F_end=init_F,
+        cross_day_transition=use_cross_day_transition,
+        sleep_quality_deviation=sleep_quality_deviation,
+        cross_day_context=cross_day_context,
+    )
     
     results, end_S, end_E, _, _, alerts, confidence_series, solver_logs, profile_list, wake_s = result_tuple
+    event_trajectory = [
+        profile["trajectory"]
+        for profile in profile_list
+        if profile.get("trajectory") is not None
+    ]
+    semantic_snapshot = []
+    semantic_run_info = []
+    for profile in profile_list:
+        semantic = (profile.get("assessment") or {}).get("semantic") or {}
+        if not semantic:
+            continue
+        semantic_snapshot.append(
+            {
+                "name": profile.get("name"),
+                "time": profile.get("time"),
+                "fingerprint": semantic.get("fingerprint"),
+                "values": semantic.get("values"),
+                "rule_values": semantic.get("rule_values"),
+                "external_values": semantic.get("external_values"),
+                "rule_version": semantic.get("rule_version"),
+                "prompt_version": semantic.get("prompt_version"),
+                "fusion_policy_version": semantic.get("fusion_policy_version"),
+                "provider": semantic.get("provider"),
+                "model": semantic.get("model"),
+                "prompt_sha256": semantic.get("prompt_sha256"),
+                "evidence_tags": semantic.get("evidence_tags", []),
+                "reasoning_summary": semantic.get("reasoning_summary", ""),
+            }
+        )
+        semantic_run_info.append(
+            {
+                "name": profile.get("name"),
+                "time": profile.get("time"),
+                "source": semantic.get("source"),
+                "cache_hit": bool(semantic.get("cache_hit")),
+                "external_error": semantic.get("external_error"),
+                "matched_rules": semantic.get("matched_rules", []),
+                "constraints_applied": semantic.get("constraints_applied", []),
+                "evidence_tags": semantic.get("evidence_tags", []),
+                "reasoning_summary": semantic.get("reasoning_summary", ""),
+            }
+        )
+    semantic_snapshot.sort(
+        key=lambda item: (
+            str(item.get("time") or ""),
+            str(item.get("name") or ""),
+            str(item.get("fingerprint") or ""),
+        )
+    )
     
     final_logs = app_trace_logs + solver_logs
     
@@ -1302,6 +2050,15 @@ def simulate():
         "shield_time_ranges": shield_time_ranges,
         "init_S": init_S,
         "init_E": init_E,
+        "init_P": init_P,
+        "init_F": init_F,
+        "observations": all_observations,
+        "stored_observation_count": len(stored_observations),
+        "sleep_context": sleep_context,
+        "cross_day_transition": use_cross_day_transition,
+        "auto_cross_day_context": auto_cross_day_context,
+        "previous_day_state": previous_day_state,
+        "cross_day_context": cross_day_context,
         "random_seed": seed,
         "profile_snapshot_id": (
             profile_snapshot.get("profile_snapshot_id")
@@ -1313,14 +2070,25 @@ def simulate():
             if routine_plan_record
             else None
         ),
+        # This frozen semantic decision set is part of the replay contract.
+        # Operational fields such as cache_hit are deliberately excluded.
+        "semantic_snapshot": semantic_snapshot,
     }
     result_summary = {
         "end_S": round(float(end_S), 4),
         "end_E": round(float(end_E), 4),
+        "end_V": round(float(end_E), 4),
+        "end_P": round(float(results[-1].get("P", 0.0)), 4) if results else 0.0,
+        "end_F": round(float(results[-1].get("F", 0.0)), 4) if results else 0.0,
         "alerts": alerts,
         "point_count": len(results),
         "baseline_S": new_S_star,
         "stress_threshold": new_threshold,
+        "model_variant": results[-1].get("model_variant") if results else None,
+        "active_states": results[-1].get("active_states", ["S"]) if results else ["S"],
+        "trajectory_warning_count": sum(
+            item.get("status") == "warning" for item in event_trajectory
+        ),
     }
     fingerprint_payload = json.dumps(
         {"input": run_input, "result": result_summary},
@@ -1348,8 +2116,10 @@ def simulate():
             "result": {**result_summary, "fingerprint": input_fingerprint},
             "created_at": utc_now(),
             "diagnostics": {
-                "schema_version": "prediction_diagnostics.v1",
+                "schema_version": "prediction_diagnostics.v2",
                 "event_profiles": profile_list,
+                "event_trajectory": event_trajectory,
+                "semantic_inference": semantic_run_info,
                 "trace_logs": final_logs,
             },
         },
@@ -1369,11 +2139,25 @@ def simulate():
         "chart_markdown": chart_markdown,
         "end_S": end_S,
         "end_E": end_E,
+        "end_V": end_E,
+        "end_P": results[-1].get("P", 0.0) if results else 0.0,
+        "end_F": results[-1].get("F", 0.0) if results else 0.0,
+        "model_variant": results[-1].get("model_variant") if results else None,
+        "active_states": results[-1].get("active_states", ["S"]) if results else ["S"],
+        "stored_observation_count": len(stored_observations),
         "new_S_star": new_S_star,
         "new_threshold": new_threshold,
         "alerts": alerts,
         "trace_logs": final_logs,
         "event_profile": profile_list,
+        "event_trajectory": event_trajectory,
+        "semantic_inference": {
+            "schema_version": "semantic_run_info.v1",
+            "replay_policy": "stored_trajectory_or_frozen_semantic_cache_then_rules",
+            "agent": semantic_agent_status(),
+            "items": semantic_run_info,
+        },
+        "cross_day_context": cross_day_context,
         "routine_plan": routine_plan_record,
         "used_init_S": init_S, 
         "used_init_E": init_E

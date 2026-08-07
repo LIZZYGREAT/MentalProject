@@ -10,7 +10,9 @@ ROUTINE_PATTERNS = {
 }
 
 TASK_PATTERNS = {
-    "exam": r"考|测验|期末|期中|竞赛|比赛|面试|答辩",
+    # Include common abbreviations.  In particular, 数竞 is not tokenized as
+    # 竞赛 by a plain substring rule and was previously routed as a general task.
+    "exam": r"考|测验|期末|期中|数竞|奥赛|竞赛|比赛|面试|答辩",
     "ddl": r"ddl|截止|提交|汇报|大作业|实验|攻关",
     "meeting": r"会|讨论|例会|面谈|讲座|编程",
     "homework": r"作业|报告|项目|练习|培训",

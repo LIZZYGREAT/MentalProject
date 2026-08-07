@@ -34,7 +34,7 @@ def evaluate_simulation(
     alerts: Iterable[Dict[str, Any]],
     feedback: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Compare a simulated curve with one day's user feedback."""
+    """Compare stress/subjective-vitality predictions with daily feedback."""
 
     if not results:
         return {
