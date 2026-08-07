@@ -11,6 +11,7 @@ from auth.database import AppDatabase
 from integrations.feishu.client import FeishuBotClient, FeishuSendError
 from services.care_delivery import CareDeliveryPolicy
 from services.feishu_message_processor import FeishuMessageProcessor
+from services.proactive_care import ProactiveCareScheduler
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ class CareWorker:
         poll_seconds: float = 1.0,
         max_attempts: int = 5,
         lease_seconds: int = 120,
+        proactive_scheduler: Optional[ProactiveCareScheduler] = None,
+        proactive_interval_seconds: float = 60.0,
     ):
         self.database = database
         self.processor = processor
@@ -36,6 +39,9 @@ class CareWorker:
         self.max_attempts = max(1, int(max_attempts))
         self.lease_seconds = max(5, int(lease_seconds))
         self.deliveries = CareDeliveryPolicy(database)
+        self.proactive_scheduler = proactive_scheduler
+        self.proactive_interval_seconds = max(15.0, float(proactive_interval_seconds))
+        self._next_proactive_check = 0.0
 
     def run_once(self) -> bool:
         self.database.update_bot_heartbeat(
@@ -49,7 +55,7 @@ class CareWorker:
             max_attempts=self.max_attempts,
         )
         if event is None:
-            return False
+            return self._run_proactive_once()
         try:
             outbound = self.processor.process(event)
             if outbound.ignored:
@@ -69,6 +75,7 @@ class CareWorker:
                 self.deliveries.mark_sent(outbound.delivery_id, provider_message_id)
             self.database.complete_feishu_event(event["event_id"])
             return True
+
         except FeishuSendError as exc:
             delay = min(60, 2 ** max(0, int(event["attempts"]) - 1))
             status = self.database.retry_feishu_event(
@@ -106,6 +113,29 @@ class CareWorker:
                 retryable=True,
             )
             return True
+
+    def _run_proactive_once(self) -> bool:
+        if self.proactive_scheduler is None or time.monotonic() < self._next_proactive_check:
+            return False
+        self._next_proactive_check = time.monotonic() + self.proactive_interval_seconds
+        candidate = self.proactive_scheduler.next_candidate()
+        if candidate is None:
+            return False
+        try:
+            provider_message_id = self.bot_client.send_card(
+                candidate.chat_id,
+                candidate.content,
+            )
+            self.deliveries.mark_sent(candidate.delivery_id, provider_message_id)
+        except FeishuSendError as exc:
+            self.deliveries.mark_failed(
+                candidate.delivery_id,
+                f"send_error code={exc.code}",
+            )
+        except Exception as exc:
+            logger.exception("Proactive Feishu delivery failed kind=%s", candidate.kind)
+            self.deliveries.mark_failed(candidate.delivery_id, type(exc).__name__)
+        return True
 
     def run_forever(self, stop_event: Optional[threading.Event] = None) -> None:
         stop_event = stop_event or threading.Event()

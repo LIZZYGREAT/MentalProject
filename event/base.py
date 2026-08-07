@@ -80,7 +80,7 @@ class BaseEvent(ABC):
     
     def to_dict(self) -> Dict[str, Any]:
         """序列化为前端/API 可用的扁平字典。"""
-        return {
+        item = {
             "event_id": self.event_id,
             "type": self.get_event_type(),
             "name": self.name,
@@ -89,3 +89,6 @@ class BaseEvent(ABC):
             "description": self.description,
             "metadata": self.metadata
         }
+        if hasattr(self, "task_type"):
+            item["task_type"] = getattr(self, "task_type")
+        return item

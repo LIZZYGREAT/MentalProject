@@ -11,6 +11,7 @@ from integrations.feishu.identity import FeishuIdentityService
 from services.care_service import CareService
 from services.care_worker import CareWorker
 from services.feishu_message_processor import FeishuMessageProcessor
+from services.proactive_care import ProactiveCareScheduler
 
 
 def build_worker() -> CareWorker:
@@ -26,6 +27,11 @@ def build_worker() -> CareWorker:
         token_ttl_seconds=int(os.getenv("FEISHU_BIND_TOKEN_TTL_SECONDS", "900")),
     )
     care_service = CareService(database)
+    proactive_scheduler = ProactiveCareScheduler(
+        database,
+        care_service,
+        lead_minutes=int(os.getenv("CARE_PROACTIVE_LEAD_MINUTES", "90")),
+    )
     processor = FeishuMessageProcessor(
         database,
         identity,
@@ -42,6 +48,10 @@ def build_worker() -> CareWorker:
         poll_seconds=float(os.getenv("CARE_WORKER_POLL_SECONDS", "1")),
         max_attempts=int(os.getenv("CARE_WORKER_MAX_ATTEMPTS", "5")),
         lease_seconds=int(os.getenv("CARE_EVENT_LEASE_SECONDS", "120")),
+        proactive_scheduler=proactive_scheduler,
+        proactive_interval_seconds=float(
+            os.getenv("CARE_PROACTIVE_INTERVAL_SECONDS", "60")
+        ),
     )
 
 

@@ -1638,6 +1638,42 @@ class AppDatabase:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_proactive_feishu_users(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """Return active, opted-in bot bindings without exposing credentials."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT b.user_id, b.chat_id, b.app_id, b.tenant_key,
+                       p.quiet_start, p.quiet_end, p.max_daily_messages,
+                       p.tone, p.preferred_support_json,
+                       p.allow_personal_history_reference
+                FROM feishu_user_bindings AS b
+                JOIN users AS u ON u.id = b.user_id AND u.is_active = 1
+                JOIN care_channel_preferences AS p ON p.user_id = b.user_id
+                WHERE b.binding_status = 'active'
+                  AND b.chat_id IS NOT NULL AND b.chat_id != ''
+                  AND p.feishu_proactive_enabled = 1
+                ORDER BY b.updated_at ASC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["preferred_support"] = json.loads(
+                    item.pop("preferred_support_json") or "[]"
+                )
+            except json.JSONDecodeError:
+                item["preferred_support"] = []
+            item["allow_personal_history_reference"] = bool(
+                item["allow_personal_history_reference"]
+            )
+            result.append(item)
+        return result
+
     def revoke_feishu_binding(
         self,
         user_id: int,
@@ -2055,6 +2091,30 @@ class AppDatabase:
                 (str(delivery_id), int(user_id)),
             ).fetchone()
         return dict(row) if row else None
+
+    def sent_care_delivery_count(self, user_id: int, local_date: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM care_deliveries
+                WHERE user_id = ? AND local_date = ? AND status = 'sent'
+                """,
+                (int(user_id), str(local_date)),
+            ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def mark_care_delivery_suppressed(self, delivery_id: str, reason: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE care_deliveries
+                SET status = 'suppressed', failure_reason = ?, updated_at = ?
+                WHERE delivery_id = ? AND status IN ('candidate', 'scheduled')
+                """,
+                (str(reason)[:120], utc_now(), str(delivery_id)),
+            )
+        return cursor.rowcount == 1
 
     def mark_care_delivery_sent(
         self,

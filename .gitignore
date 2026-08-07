@@ -18,6 +18,8 @@ data/
 !info/mental_health_feishu_full_project_blueprint_2026-08-02.md
 !info/project_concepts_technical_model_handbook.md
 !info/deepseek_semantic_assistance_design.md
+!info/co_worker_feishu_bot_handoff_guide.md
+!deliverables/mindflow-feishu-handoff/**/*.md
 node_modules/
 frontend_dist/
 .agents/

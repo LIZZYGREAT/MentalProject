@@ -75,9 +75,14 @@ class EventFactory:
                 "semantic_inference",
                 "external_semantic_inference",
                 "semantic_context",
+                "lifecycle",
+                "completion_policy",
+                "outcome_status",
             ):
                 if key in data and key not in metadata:
                     metadata[key] = data[key]
+            if "task_type" in data and "task_type" not in metadata:
+                metadata["task_type"] = data["task_type"]
             
             # 1. 强力提示优先 (通常来自沙盒强行注入)
             if ev_type_hint == "course":

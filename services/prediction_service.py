@@ -16,6 +16,7 @@ from services.cross_day_context import (
     build_automatic_cross_day_context,
     semantic_context_from_cross_day,
 )
+from services.event_lifecycle import apply_user_appraisals, prepare_event_instances
 from services.onboarding import (
     FEATURE_VERSION,
     MAPPING_VERSION,
@@ -130,6 +131,7 @@ class PredictionService:
         target_date: str,
         force_calendar_refresh: bool = False,
         observations: Optional[list] = None,
+        as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
         user_id = int(user_id)
         user_record = self.database.get_user(user_id)
@@ -169,6 +171,30 @@ class PredictionService:
         except Exception as exc:  # calendar is an explicitly supported degradation path
             calendar_error = type(exc).__name__
 
+        outcome_feedback = self.database.list_feedback_observations(
+            user_id,
+            target_date=str(target_date),
+            limit=500,
+        )
+        calendar_events = prepare_event_instances(
+            calendar_events,
+            str(target_date),
+            outcome_feedback=outcome_feedback,
+        )
+        calendar_events = apply_user_appraisals(
+            calendar_events,
+            self.database.list_feedback_observations(user_id, limit=1000),
+        )
+        preferences = self.database.get_care_preferences(user_id)
+        allow_external_semantics = bool(preferences.get("allow_external_llm", False))
+        for item in calendar_events:
+            metadata = dict(item.get("metadata") or {})
+            metadata["allow_external_semantics"] = allow_external_semantics
+            item["metadata"] = metadata
+        previous_run = self.database.latest_prediction_run_for_date(
+            user_id,
+            str(target_date),
+        ) if as_of else None
         events = EventFactory.create_from_json(calendar_events)
         plan = build_routine_plan(
             profile,
@@ -214,6 +240,18 @@ class PredictionService:
         )
         init_p = previous_day_state.get("P_end")
         init_f = previous_day_state.get("F_end")
+        source_gap_days = int((cross_day_context or {}).get("source_gap_days") or 1)
+        if previous_day_state and source_gap_days > 1:
+            persistence = 0.55 ** (source_gap_days - 1)
+            baseline_s = float(model_user.get_current_S_star())
+            init_s = baseline_s + (float(init_s) - baseline_s) * persistence
+            init_e = DEFAULT_INITIAL_ENERGY + (
+                float(init_e) - DEFAULT_INITIAL_ENERGY
+            ) * persistence
+            if init_p is not None:
+                init_p = float(init_p) * persistence
+            if init_f is not None:
+                init_f = float(init_f) * persistence
         if previous_day_state.get("sleep_debt") is not None:
             model_user.set_sleep_debt(float(previous_day_state["sleep_debt"]))
 
@@ -232,6 +270,15 @@ class PredictionService:
             cross_day_context=cross_day_context,
         )
         results, end_s, end_e, _, _, alerts, _, solver_logs, profiles, _ = result_tuple
+        if as_of and previous_run and previous_run.get("points"):
+            results = self._splice_forward_points(
+                previous_run["points"],
+                results,
+                str(as_of),
+            )
+            if results:
+                end_s = float(results[-1].get("S", end_s))
+                end_e = float(results[-1].get("E", end_e))
         prediction_run_id = new_id()
         seed = int(model_user.get_param("random_seed", 42))
         result_summary = {
@@ -249,8 +296,12 @@ class PredictionService:
         }
         run_input = {
             "date": str(target_date),
+            "schema_version": "prediction_input.v4",
+            "forecast_as_of": str(as_of or f"{target_date}T00:00:00"),
+            "forecast_mode": "forward_update" if as_of else "prospective",
             "calendar_event_count": len(calendar_events),
             "calendar_connected": calendar_connected,
+            "events": calendar_events,
             "observations": all_observations,
             "stored_observation_count": len(stored_observations),
             "cross_day_context": cross_day_context,
@@ -285,6 +336,15 @@ class PredictionService:
                     "event_profiles": profiles,
                     "trace_logs": solver_logs,
                     "calendar_error_type": calendar_error,
+                    "temporal_causality": {
+                        "past_points_frozen": bool(as_of and previous_run),
+                        "forward_from": as_of,
+                        "outcome_feedback_count": sum(
+                            1
+                            for item in outcome_feedback
+                            if item.get("feedback_type") == "event_completion"
+                        ),
+                    },
                 },
             },
             results,
@@ -295,7 +355,46 @@ class PredictionService:
             "result": result_summary,
             "calendar_connected": calendar_connected,
             "calendar_degraded": not calendar_connected,
+            "forecast_as_of": str(as_of or f"{target_date}T00:00:00"),
         }
+
+    def reforecast_after_outcome(
+        self,
+        user_id: int,
+        target_date: str,
+        *,
+        observed_at: str,
+    ) -> Dict[str, Any]:
+        """Create a new immutable run while freezing all pre-feedback points."""
+
+        return self.run_daily_prediction(
+            int(user_id),
+            str(target_date),
+            force_calendar_refresh=False,
+            as_of=str(observed_at),
+        )
+
+    @staticmethod
+    def _splice_forward_points(
+        previous: list[Dict[str, Any]],
+        candidate: list[Dict[str, Any]],
+        as_of: str,
+    ) -> list[Dict[str, Any]]:
+        try:
+            cutoff = datetime.fromisoformat(str(as_of).replace("Z", "+00:00")).strftime("%H:%M")
+        except ValueError:
+            cutoff = str(as_of)[-5:]
+        old_by_time = {str(item.get("time")): dict(item) for item in previous}
+        new_by_time = {str(item.get("time")): dict(item) for item in candidate}
+        times = sorted(set(old_by_time) | set(new_by_time))
+        return [
+            old_by_time[point_time]
+            if point_time < cutoff and point_time in old_by_time
+            else new_by_time.get(point_time, old_by_time.get(point_time, {}))
+            for point_time in times
+            if point_time < cutoff and point_time in old_by_time
+            or point_time >= cutoff and point_time in new_by_time
+        ]
 
     def _stored_observations(self, user_id: int, target_date: str) -> list[Dict[str, Any]]:
         observations = []

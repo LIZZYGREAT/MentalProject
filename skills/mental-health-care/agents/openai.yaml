@@ -1,4 +1,4 @@
 interface:
-  display_name: "心理关怀工具编排"
-  short_description: "使用可信身份与白名单工具完成安全、非临床的日常心理关怀交互"
-  default_prompt: "Use $mental-health-care to handle a private, non-clinical care request with trusted tools."
+  display_name: "MindFlow 飞书预测关怀"
+  short_description: "基于可信身份、事件反馈和前向压力预测提供安全的飞书关怀闭环"
+  default_prompt: "Use $mental-health-care to handle a private Feishu forecast, event outcome, appraisal, or proactive-care request with trusted tools."

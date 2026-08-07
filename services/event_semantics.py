@@ -592,6 +592,7 @@ class EventSemanticEngine:
         duration_minutes: float,
         context: Optional[Mapping[str, Any]] = None,
         supplied_external: Optional[Mapping[str, Any]] = None,
+        allow_external: bool = True,
     ) -> SemanticAssessment:
         raw_context = context if isinstance(context, Mapping) else {}
         raw_unfinished_names = raw_context.get("unfinished_task_names") or []
@@ -638,7 +639,7 @@ class EventSemanticEngine:
             key: safe_payload[key]
             for key in ("name", "description", "event_type", "task_type", "duration_minutes")
         })
-        api_eligible = safe_payload["event_type"] not in {
+        api_eligible = bool(allow_external) and safe_payload["event_type"] not in {
             "rest",
             "meal",
             "nap",
@@ -816,6 +817,7 @@ def assess_event_semantics(
     duration_minutes: float,
     context: Optional[Mapping[str, Any]] = None,
     supplied_external: Optional[Mapping[str, Any]] = None,
+    allow_external: bool = True,
 ) -> Dict[str, Any]:
     return default_semantic_engine().assess(
         name=name,
@@ -825,6 +827,7 @@ def assess_event_semantics(
         duration_minutes=duration_minutes,
         context=context,
         supplied_external=supplied_external,
+        allow_external=allow_external,
     ).to_dict()
 
 

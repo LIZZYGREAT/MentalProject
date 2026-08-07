@@ -88,6 +88,17 @@ def _profile_index(run: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
 
 def _explicit_completion(item: Mapping[str, Any]) -> Optional[bool]:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+    lifecycle = item.get("lifecycle")
+    if not isinstance(lifecycle, Mapping):
+        lifecycle = metadata.get("lifecycle") if isinstance(metadata.get("lifecycle"), Mapping) else {}
+    completion_policy = str(lifecycle.get("completion_policy") or "").casefold()
+    if completion_policy == "none":
+        return True
+    outcome_status = str(lifecycle.get("outcome_status") or "").casefold()
+    if outcome_status in {"confirmed_completed", "assumed_completed", "not_applicable"}:
+        return True
+    if outcome_status in {"confirmed_incomplete", "partial", "rescheduled"}:
+        return False
     status = str(
         item.get("status")
         or item.get("event_status")
@@ -130,6 +141,7 @@ def _task_from_input(
     run: Mapping[str, Any],
     profiles: Mapping[str, Mapping[str, Any]],
     overrides: Mapping[str, bool],
+    source_age_days: int = 1,
 ) -> Optional[Dict[str, Any]]:
     event_type = str(item.get("event_type") or item.get("type") or "task").lower()
     if event_type in RECOVERY_TYPES:
@@ -168,7 +180,7 @@ def _task_from_input(
         "event_name": name[:120],
         "source_date": str(run.get("local_date") or "")[:10],
         "source_prediction_run_id": run.get("prediction_run_id"),
-        "age_days": 1,
+        "age_days": max(1, int(source_age_days)),
         "carry_strength": round(strength, 6),
         "explicitly_unfinished": True,
         "time_pressure": round(time_pressure, 6),
@@ -181,6 +193,7 @@ def _inherited_tasks(
     run: Mapping[str, Any],
     overrides: Mapping[str, bool],
     max_carry_days: int,
+    source_gap_days: int = 1,
 ) -> list[Dict[str, Any]]:
     run_input = run.get("input")
     prior_context = run_input.get("cross_day_context") if isinstance(run_input, Mapping) else {}
@@ -201,7 +214,7 @@ def _inherited_tasks(
         )
         if completion is True:
             continue
-        age_days = max(1, int(raw.get("age_days") or 1)) + 1
+        age_days = max(1, int(raw.get("age_days") or 1)) + max(1, int(source_gap_days))
         if age_days > max_carry_days:
             continue
         strength = _clamp(raw.get("carry_strength", 0.5)) * 0.68
@@ -226,11 +239,20 @@ def build_automatic_cross_day_context(
     *,
     max_carry_days: int = 3,
 ) -> Optional[Dict[str, Any]]:
-    """Use only the immediately preceding date and preserve full provenance."""
+    """Use the nearest prior run within the bounded carry window."""
 
     target = datetime.strptime(str(target_date), "%Y-%m-%d").date()
-    source_date = (target - timedelta(days=1)).isoformat()
-    run = database.latest_prediction_run_for_date(int(user_id), source_date)
+    run = None
+    source_date = ""
+    source_gap_days = 0
+    for gap in range(1, max(1, int(max_carry_days)) + 1):
+        candidate_date = (target - timedelta(days=gap)).isoformat()
+        candidate = database.latest_prediction_run_for_date(int(user_id), candidate_date)
+        if candidate:
+            run = candidate
+            source_date = candidate_date
+            source_gap_days = gap
+            break
     if not run:
         return None
 
@@ -253,10 +275,18 @@ def build_automatic_cross_day_context(
                 run=run,
                 profiles=profiles,
                 overrides=overrides,
+                source_age_days=source_gap_days,
             )
         )
     ]
-    tasks.extend(_inherited_tasks(run, overrides, max(1, int(max_carry_days))))
+    tasks.extend(
+        _inherited_tasks(
+            run,
+            overrides,
+            max(1, int(max_carry_days)),
+            source_gap_days=source_gap_days,
+        )
+    )
 
     deduplicated: Dict[str, Dict[str, Any]] = {}
     for task in tasks:
@@ -311,6 +341,7 @@ def build_automatic_cross_day_context(
         "target_date": str(target_date),
         "source_date": source_date,
         "source_prediction_run_id": run.get("prediction_run_id"),
+        "source_gap_days": source_gap_days,
         "previous_day_state": state,
         "previous_day_end_stress_band": _stress_band(state.get("S_end")),
         "previous_day_high_load_events": [
@@ -326,7 +357,8 @@ def build_automatic_cross_day_context(
         "unfinished_load": round(unfinished_load, 6),
         "chain_depth": chain_depth,
         "policy": {
-            "exact_previous_date_only": True,
+            "exact_previous_date_only": source_gap_days == 1,
+            "nearest_prior_within_window": True,
             "explicit_completion_required": True,
             "max_unconfirmed_carry_days": max(1, int(max_carry_days)),
             "inherited_daily_decay": 0.68,

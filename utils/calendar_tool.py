@@ -97,11 +97,15 @@ def extract_event_data(event: Dict[str, Any], query_date_str: Optional[str] = No
         final_date = datetime.fromtimestamp(start_timestamp).strftime("%Y-%m-%d")
 
     return {
+        'id': event.get('event_id') or event.get('id'),
+        'event_id': event.get('event_id') or event.get('id'),
         'date': final_date,
         'start_time': start_time_str,
         'end_time': end_time_str,
         'summary': summary,
         'description': description,
+        'status': event.get('status') or 'confirmed',
+        'recurrence': event.get('recurrence'),
         'actual_start_timestamp': start_timestamp,
         'actual_end_timestamp': end_timestamp
     }

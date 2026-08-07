@@ -1,0 +1,20 @@
+{
+  "name": "mindflow-team",
+  "interface": {
+    "displayName": "Mindflow Team"
+  },
+  "plugins": [
+    {
+      "name": "mindflow-feishu-bot-ops",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mindflow-feishu-bot-ops"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -196,6 +196,7 @@ def assess_event(event: Any) -> EventAssessment:
         supplied_external=(
             supplied_semantic if isinstance(supplied_semantic, Mapping) else None
         ),
+        allow_external=bool(metadata.get("allow_external_semantics", False)),
     )
     semantic_values = semantic["values"]
 
@@ -313,6 +314,34 @@ def assess_event(event: Any) -> EventAssessment:
     if explicit_control is not None:
         objective["uncontrollability"] = 1.0 - _unit(explicit_control, 0.5)
     objective["duration"] = duration_load
+
+    # Completion is a post-event observation, not something the forecast can
+    # know in advance.  Keep the semantic work-remaining prior for audit, but
+    # make the primary pre-event trajectory assume completion.  Only explicit
+    # incomplete/partial feedback may create unfinished carry-over.
+    lifecycle = metadata.get("lifecycle") if isinstance(metadata.get("lifecycle"), Mapping) else {}
+    lifecycle = dict(lifecycle)
+    if lifecycle:
+        lifecycle.setdefault("work_remaining_prior", objective["unfinished"])
+        outcome_status = str(lifecycle.get("outcome_status") or "pending").lower()
+        completion_policy = str(lifecycle.get("completion_policy") or "none").lower()
+        if completion_policy == "none" or outcome_status in {
+            "pending",
+            "assumed_completed",
+            "confirmed_completed",
+            "completed",
+            "done",
+            "not_applicable",
+        }:
+            objective["unfinished"] = 0.0
+        elif outcome_status in {
+            "confirmed_incomplete",
+            "incomplete",
+            "partial",
+            "rescheduled",
+        }:
+            objective["unfinished"] = max(0.65, objective["unfinished"])
+        metadata["lifecycle"] = lifecycle
 
     description_score = score_description(
         str(getattr(event, "description", "") or ""),

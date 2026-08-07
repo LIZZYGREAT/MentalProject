@@ -129,6 +129,56 @@ def feedback_card(text: str, delivery_id: str) -> Dict[str, Any]:
     }
 
 
+def event_completion_card(
+    prediction_run_id: str,
+    events: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    elements = []
+    for event in events[:5]:
+        due_note = ""
+        if event.get("due_at"):
+            due_note = f"\n关联截止：{str(event['due_at'])[:16].replace('T', ' ')}"
+        elements.extend(
+            [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**{event['event_name']}**（计划结束 {event['end_time']}）{due_note}",
+                    },
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "type": "primary" if status == "confirmed_completed" else "default",
+                            "text": _plain(label),
+                            "value": {
+                                "action": "care_event_outcome",
+                                "prediction_run_id": str(prediction_run_id),
+                                "event_id": str(event["event_id"]),
+                                "event_name": str(event["event_name"])[:120],
+                                "outcome_status": status,
+                            },
+                        }
+                        for label, status in (
+                            ("已完成", "confirmed_completed"),
+                            ("部分完成", "partial"),
+                            ("未完成", "confirmed_incomplete"),
+                            ("已改期", "rescheduled"),
+                        )
+                    ],
+                },
+            ]
+        )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": _plain("确认计划完成情况")},
+        "elements": elements,
+    }
+
+
 def calendar_connection_card(connect_url: str) -> Dict[str, Any]:
     return {
         "config": {"wide_screen_mode": True},
@@ -163,6 +213,7 @@ def help_card() -> Dict[str, Any]:
         ("查看今天状态", "care_get_today"),
         ("运行今日评估", "care_run_assessment"),
         ("给我一点支持", "care_get_support"),
+        ("确认任务完成", "care_get_event_confirmations"),
     ):
         actions.append(
             {

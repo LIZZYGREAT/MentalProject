@@ -1,0 +1,4 @@
+interface:
+  display_name: "MindFlow 飞书预测关怀检查部署"
+  short_description: "检查事件生命周期、完成反馈、前向预测和主动关怀后安全部署飞书机器人"
+  default_prompt: "Use $mindflow-feishu-bot-ops to inspect the event lifecycle, outcome cards, forward-only forecasting, and proactive delivery before deploying this MindFlow Feishu bot."

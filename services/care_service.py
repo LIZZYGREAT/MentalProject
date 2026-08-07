@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import os
 import re
 from typing import Any, Dict, Optional
@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from auth.database import AppDatabase
 from services.onboarding import new_id, utc_now
 from services.prediction_service import PredictionService
+from services.event_lifecycle import completion_relevant
 from settings.model_defaults import BASE_DATA_DIR
 from utils.get_token import FeishuAPI
 
@@ -101,6 +102,157 @@ class CareService:
             str(local_date or date.today().isoformat()),
         )
 
+    def get_event_confirmations(
+        self,
+        user_id: int,
+        local_date: Optional[str] = None,
+        *,
+        as_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return ended, completion-relevant events with no explicit outcome."""
+
+        local_date = str(local_date or date.today().isoformat())
+        run = self.database.latest_prediction_run_for_date(int(user_id), local_date)
+        if not run:
+            return {"local_date": local_date, "prediction_run_id": None, "events": []}
+        feedback = self.database.list_feedback_observations(
+            int(user_id), target_date=local_date, limit=500
+        )
+        observed_keys = set()
+        for item in feedback:
+            if item.get("feedback_type") != "event_completion":
+                continue
+            payload = item.get("payload") or {}
+            for value in (payload.get("event_id"), payload.get("event_name")):
+                if str(value or "").strip():
+                    observed_keys.add(str(value).strip().casefold())
+        now_value = as_of or datetime.now().isoformat(timespec="minutes")
+        try:
+            cutoff = datetime.fromisoformat(str(now_value).replace("Z", "+00:00")).strftime("%H:%M")
+        except ValueError:
+            cutoff = str(now_value)[-5:]
+        raw_events = (run.get("input") or {}).get("events") or []
+        events = []
+        for event in raw_events:
+            if not isinstance(event, dict) or not completion_relevant(event):
+                continue
+            event_id = str(event.get("id") or event.get("event_id") or "").strip()
+            event_name = str(event.get("summary") or event.get("name") or "").strip()
+            if event_id.casefold() in observed_keys or event_name.casefold() in observed_keys:
+                continue
+            end_time = str(event.get("end_time") or "23:59")[-5:]
+            if local_date >= date.today().isoformat() and end_time > cutoff:
+                continue
+            lifecycle = event.get("lifecycle") or (event.get("metadata") or {}).get("lifecycle") or {}
+            obligation = lifecycle.get("obligation") or {}
+            events.append(
+                {
+                    "event_id": event_id,
+                    "event_name": event_name[:120],
+                    "end_time": end_time,
+                    "completion_policy": lifecycle.get("completion_policy"),
+                    "due_at": obligation.get("due_at"),
+                }
+            )
+        return {
+            "local_date": local_date,
+            "prediction_run_id": run.get("prediction_run_id"),
+            "events": events[:5],
+        }
+
+    def record_event_outcome(
+        self,
+        user_id: int,
+        *,
+        prediction_run_id: str,
+        event_id: str,
+        outcome_status: str,
+        event_name: Optional[str] = None,
+        observed_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        allowed = {
+            "confirmed_completed": True,
+            "partial": False,
+            "confirmed_incomplete": False,
+            "rescheduled": False,
+        }
+        outcome_status = str(outcome_status or "").strip().lower()
+        if outcome_status not in allowed:
+            raise ValueError("不支持的事件完成状态")
+        run = self.database.prediction_run_detail_for_user(
+            int(user_id), str(prediction_run_id)
+        )
+        if not run:
+            raise ValueError("预测运行不存在或不属于当前用户")
+        matched = None
+        for event in (run.get("input") or {}).get("events") or []:
+            if str(event.get("id") or event.get("event_id") or "") == str(event_id):
+                matched = event
+                break
+        if not matched or not completion_relevant(matched):
+            raise ValueError("事件不存在或不需要完成反馈")
+        resolved_name = str(
+            matched.get("summary") or matched.get("name") or event_name or ""
+        )[:120]
+        prior = self.database.list_feedback_observations(
+            int(user_id), target_date=str(run["local_date"]), limit=500
+        )
+        for item in reversed(prior):
+            payload = item.get("payload") or {}
+            if (
+                item.get("feedback_type") == "event_completion"
+                and str(payload.get("event_id") or "") == str(event_id)
+                and str(payload.get("outcome_status") or "") == outcome_status
+            ):
+                return {
+                    "feedback_id": item["feedback_id"],
+                    "outcome_status": outcome_status,
+                    "event_name": resolved_name,
+                    "idempotent": True,
+                    "reforecasted": False,
+                }
+        timestamp = str(observed_at or datetime.now().astimezone().isoformat(timespec="seconds"))
+        feedback = {
+            "feedback_id": new_id(),
+            "schema_version": "feedback_observation.v2",
+            "prediction_run_id": str(prediction_run_id),
+            "feedback_type": "event_completion",
+            "target_time": timestamp,
+            "payload": {
+                "event_id": str(event_id),
+                "event_name": resolved_name,
+                "completed": allowed[outcome_status],
+                "outcome_status": outcome_status,
+                "outcome_schema_version": "event_outcome.v1",
+                "source": "feishu_bot",
+            },
+            "reported_at": utc_now(),
+            "retrospective": False,
+        }
+        self.database.save_feedback_observation(int(user_id), feedback)
+        reforecasted = False
+        new_run_id = None
+        if hasattr(self.prediction_service, "reforecast_after_outcome"):
+            try:
+                updated = self.prediction_service.reforecast_after_outcome(
+                    int(user_id),
+                    str(run["local_date"]),
+                    observed_at=timestamp,
+                )
+                new_run_id = updated.get("prediction_run_id")
+                reforecasted = bool(new_run_id)
+            except Exception:
+                # The observation is authoritative even if a refresh is temporarily unavailable.
+                reforecasted = False
+        return {
+            "feedback_id": feedback["feedback_id"],
+            "outcome_status": outcome_status,
+            "event_name": resolved_name,
+            "idempotent": False,
+            "reforecasted": reforecasted,
+            "prediction_run_id": new_run_id,
+        }
+
     def get_support(
         self,
         user_id: int,
@@ -136,6 +288,49 @@ class CareService:
             "support_type": support_type,
             "prediction_run_id": context.get("prediction_run_id"),
         }
+
+    def record_event_appraisal(
+        self,
+        user_id: int,
+        *,
+        topic: str,
+        perceived_difficulty: Optional[float] = None,
+        dislike: Optional[float] = None,
+        threat: Optional[float] = None,
+        control: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        topic = str(topic or "").strip()[:80]
+        if not topic:
+            raise ValueError("需要说明是哪类课程或任务")
+        payload: Dict[str, Any] = {"topic": topic, "source": "feishu_bot"}
+        for key, raw in {
+            "perceived_difficulty": perceived_difficulty,
+            "dislike": dislike,
+            "threat": threat,
+            "control": control,
+        }.items():
+            if raw is None:
+                continue
+            value = float(raw)
+            if value > 1.0:
+                value /= 10.0
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{key} 必须在 0–1 或 0–10 之间")
+            payload[key] = value
+        if len(payload) <= 2:
+            raise ValueError("至少需要提供一项主观感受")
+        feedback = {
+            "feedback_id": new_id(),
+            "schema_version": "feedback_observation.v2",
+            "prediction_run_id": None,
+            "feedback_type": "event_appraisal",
+            "target_time": utc_now(),
+            "payload": payload,
+            "reported_at": utc_now(),
+            "retrospective": False,
+        }
+        self.database.save_feedback_observation(int(user_id), feedback)
+        return {"feedback_id": feedback["feedback_id"], **payload}
 
     def submit_review(
         self,

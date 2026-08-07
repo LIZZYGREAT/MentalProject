@@ -183,6 +183,34 @@ class FeishuMessageProcessor:
                 cards.feedback_card(safe_text, delivery["delivery_id"]),
                 delivery_id=delivery["delivery_id"],
             )
+        if intent.name == "get_event_confirmations":
+            result = toolbox.execute("care_get_event_confirmations")
+            if not result["events"]:
+                return self._text(chat_id, "目前没有需要确认完成情况的计划。")
+            return OutboundMessage(
+                chat_id,
+                "interactive",
+                cards.event_completion_card(
+                    result["prediction_run_id"], result["events"]
+                ),
+            )
+        if intent.name == "record_event_outcome":
+            result = toolbox.execute("care_record_event_outcome", **intent.arguments)
+            messages = {
+                "confirmed_completed": "已记录为完成。后续预测不会把它作为未完成任务延续。",
+                "partial": "已记录为部分完成，我会从现在起把剩余任务纳入后续预测。",
+                "confirmed_incomplete": "已记录为未完成，我会从现在起更新后续预测和跨日上下文。",
+                "rescheduled": "已记录为改期；在获得新时间前，只保留有界的未完成影响。",
+            }
+            suffix = " 已生成从当前时点开始的新预测。" if result.get("reforecasted") else ""
+            return self._text(chat_id, messages[result["outcome_status"]] + suffix, personal=True)
+        if intent.name == "record_event_appraisal":
+            result = toolbox.execute("care_record_event_appraisal", **intent.arguments)
+            return self._text(
+                chat_id,
+                f"已记住你对“{result['topic']}”的感受；后续同类日程会优先采用你的明确评价。",
+                personal=True,
+            )
         if intent.name == "submit_review":
             result = toolbox.execute(
                 "care_submit_review",
@@ -211,7 +239,7 @@ class FeishuMessageProcessor:
                 changes=intent.arguments["changes"],
             )
             state = "开启" if result["feishu_proactive_enabled"] else "关闭"
-            return self._text(chat_id, f"已{state}主动关怀偏好。主动定时推送将在后续阶段启用。")
+            return self._text(chat_id, f"已{state}主动关怀偏好。开启后会依据未来预测、安静时段和每日上限发送。")
         if intent.name == "revoke_help":
             return self._text(chat_id, "为避免误操作，请登录 Web 设置页解除飞书机器人绑定。")
         return OutboundMessage(chat_id, "interactive", cards.help_card())
