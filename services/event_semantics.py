@@ -9,6 +9,7 @@ is applied later by the psychological state model.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -532,8 +533,17 @@ class SemanticInferenceCache:
         )
         return connection
 
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def get(self, fingerprint: str) -> Optional[Dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT assessment_json FROM semantic_inference_cache WHERE fingerprint = ?",
                 (fingerprint,),
@@ -549,7 +559,7 @@ class SemanticInferenceCache:
         provider: str,
         model: str,
     ) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO semantic_inference_cache(

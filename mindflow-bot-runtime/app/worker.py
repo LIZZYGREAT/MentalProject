@@ -1,0 +1,254 @@
+"""Small bounded worker pool consuming normalized in-memory BotEvents."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+
+from app.agent.context import AgentContext
+from app.agent.runtime import AgentRuntime, FALLBACK_TEMPORARY
+from app.agent.skill_loader import SkillLoader
+from app.identity.service import BindingError, IdentityService
+from app.integrations.feishu.client import FeishuClient, FeishuSendError
+from app.integrations.feishu.gateway import BotEvent
+from app.integrations.feishu.oauth import DeviceFlowService
+from app.repositories import AgentRunRepository, BotEventRepository
+
+
+logger = logging.getLogger(__name__)
+BIND_PATTERN = re.compile(r"^/bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
+CALENDAR_CONNECT_PATTERN = re.compile(
+    r"^/(?:calendar|connect-calendar)\s*$", re.IGNORECASE
+)
+
+
+def _log(status: str, **fields: object) -> None:
+    safe = {
+        "status": status,
+        "participant_id": fields.get("participant_id"),
+        "message_id": fields.get("message_id"),
+        "event_id": fields.get("event_id"),
+        "agent_run_id": fields.get("agent_run_id"),
+        "tool_name": fields.get("tool_name"),
+        "latency_ms": fields.get("latency_ms"),
+    }
+    logger.info(json.dumps(safe, ensure_ascii=False))
+
+
+class BotWorker:
+    def __init__(
+        self,
+        queue: asyncio.Queue[BotEvent],
+        identity: IdentityService,
+        events: BotEventRepository,
+        runs: AgentRunRepository,
+        skill_loader: SkillLoader,
+        runtime: AgentRuntime,
+        sender: FeishuClient,
+        device_flows: DeviceFlowService | None = None,
+        *,
+        model: str,
+        max_retries: int = 1,
+    ):
+        self.queue = queue
+        self.identity = identity
+        self.events = events
+        self.runs = runs
+        self.skill_loader = skill_loader
+        self.runtime = runtime
+        self.sender = sender
+        self.device_flows = device_flows
+        self.model = model
+        self.max_retries = max_retries
+        self._participant_locks: dict[str, asyncio.Lock] = {}
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def resume_device_flow(self, participant_id) -> None:
+        if self.device_flows is None:
+            return
+        task = asyncio.create_task(
+            self.device_flows.poll_until_complete(participant_id),
+            name=f"calendar-device-flow-{participant_id}",
+        )
+        self._background_tasks.add(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            self._background_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.warning(
+                    "calendar_device_flow_failed",
+                    extra={"participant_id": str(participant_id)},
+                )
+
+        task.add_done_callback(finished)
+
+    async def run_forever(self) -> None:
+        while True:
+            event = await self.queue.get()
+            try:
+                await self.process(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "worker_event_unhandled",
+                    extra={"event_id": event.event_id, "message_id": event.message_id},
+                )
+                self.events.finish(
+                    event.event_id,
+                    status="failed",
+                    error_code="unhandled_worker_failure",
+                )
+            finally:
+                self.queue.task_done()
+
+    async def process(self, event: BotEvent) -> None:
+        participant = self.identity.resolve(event.app_id, event.open_id)
+        lock_key = (
+            str(participant.id)
+            if participant is not None
+            else f"{event.app_id}:{event.open_id}"
+        )
+        lock = self._participant_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            await self._process_serial(event, participant)
+
+    async def _process_serial(self, event: BotEvent, participant) -> None:
+        started = time.monotonic()
+        pending_reply = self.events.pending_reply(event.event_id)
+        if pending_reply is not None:
+            await self._deliver(event, pending_reply)
+            return
+        self.events.set_processing(
+            event.event_id, participant.id if participant is not None else None
+        )
+        if event.chat_type.lower() not in {"p2p", "private", "single"}:
+            await self._deliver(event, "为了保护隐私，请在机器人单聊中使用 MindFlow。")
+            return
+        bind_match = BIND_PATTERN.match(event.text)
+        if participant is None:
+            if bind_match is None:
+                await self._deliver(event, "尚未绑定。请发送：/bind 你的绑定码")
+                return
+            raw_token = bind_match.group(1)
+            if not raw_token:
+                await self._deliver(event, "请在 /bind 后填写一次性绑定码。")
+                return
+            try:
+                participant = self.identity.bind(
+                    raw_token=raw_token,
+                    app_id=event.app_id,
+                    open_id=event.open_id,
+                    chat_id=event.chat_id,
+                )
+            except BindingError:
+                await self._deliver(event, "绑定码无效、已使用或已过期。")
+                return
+            except Exception:
+                await self._deliver(event, "绑定服务暂时不可用，请稍后重试。")
+                return
+            self.events.assign_participant(event.event_id, participant.id)
+            await self._deliver(event, f"绑定成功：{participant.participant_code}")
+            return
+        if bind_match is not None:
+            await self._deliver(event, "当前飞书账号已经绑定。")
+            return
+        if CALENDAR_CONNECT_PATTERN.match(event.text):
+            if self.device_flows is None:
+                await self._deliver(event, "日历授权暂时不可用。")
+                return
+            try:
+                details = await self.device_flows.start(participant.id)
+            except Exception:
+                await self._deliver(event, "日历授权暂时无法启动，请稍后重试。")
+                return
+            await self._deliver(
+                event,
+                "请打开以下飞书授权地址并输入验证码：\n"
+                f"{details['verification_url']}\n"
+                f"验证码：{details['user_code']}",
+            )
+            self.resume_device_flow(participant.id)
+            return
+        if participant.external_llm_consent_at is None:
+            await self._deliver(
+                event,
+                "尚未记录将本次对话发送给外部模型的实验授权，请先联系研究者。",
+            )
+            return
+
+        skill = self.skill_loader.current()
+        run_id = self.runs.start(
+            participant.id,
+            event.message_id,
+            self.model,
+            skill.version,
+        )
+        ctx = AgentContext(
+            participant_id=participant.id,
+            participant_code=participant.participant_code,
+            open_id=event.open_id,
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            agent_run_id=run_id,
+        )
+        try:
+            answer = await self.runtime.handle_message(
+                ctx, event.text, chat_type=event.chat_type
+            )
+            self.runs.finish(run_id, "succeeded")
+            delivered = await self._deliver(event, answer)
+            status = "completed" if delivered else "reply_pending"
+        except Exception:
+            logger.exception(
+                "bot_event_failed",
+                extra={
+                    "participant_id": str(participant.id),
+                    "event_id": event.event_id,
+                    "message_id": event.message_id,
+                    "agent_run_id": str(run_id),
+                },
+            )
+            self.runs.finish(run_id, "failed")
+            delivered = await self._deliver(event, FALLBACK_TEMPORARY)
+            status = "failed_replied" if delivered else "reply_pending"
+        _log(
+            status,
+            participant_id=str(participant.id),
+            message_id=event.message_id,
+            event_id=event.event_id,
+            agent_run_id=str(run_id),
+            latency_ms=round((time.monotonic() - started) * 1000, 1),
+        )
+
+    async def _deliver(self, event: BotEvent, text: str) -> bool:
+        """Persist the final reply before sending so restart can finish delivery."""
+
+        self.events.stage_reply(event.event_id, text)
+        try:
+            message_id = await self._send(event.chat_id, text)
+        except FeishuSendError:
+            self.events.note_reply_failure(event.event_id)
+            return False
+        self.events.finish(
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
+    async def _send(self, chat_id: str, text: str) -> str:
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await asyncio.to_thread(self.sender.send_text, chat_id, text)
+            except FeishuSendError as exc:
+                if not exc.retryable or attempt >= self.max_retries:
+                    raise
+                await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+        raise FeishuSendError(FALLBACK_TEMPORARY)

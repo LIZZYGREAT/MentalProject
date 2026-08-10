@@ -1,28 +1,28 @@
-*.log
-file_dictionary
+# Secrets and local credentials
+.env
+**/.env
+*.pem
+*.key
+
+# Runtime data
 data/
-*.pyc
-*/__pycache__/
-*.env
-*.md
-!info/project_code_full_guide.md
-!info/deployment_auth_guide.md
-!info/project_mechanism_review_and_intelligent_roadmap.md
-!info/frontend_vue_deployment_guide.md
-!info/paper_aligned_stress_model.md
-!info/numerical_validation_report.md
-!info/event_semantic_api_protocol.md
-!info/model_refactor_change_audit_2026-08-01.md
-!info/feishu_calendar_integration_review_2026-08-02.md
-!info/feishu_bot_care_service_requirements_2026-08-02.md
-!info/mental_health_feishu_full_project_blueprint_2026-08-02.md
-!info/project_concepts_technical_model_handbook.md
-!info/deepseek_semantic_assistance_design.md
-!info/co_worker_feishu_bot_handoff_guide.md
-!deliverables/mindflow-feishu-handoff/**/*.md
-node_modules/
-frontend_dist/
+*.sqlite3
+*.sqlite3-*
+*.log
+
+# Python
+*.py[cod]
+**/__pycache__/
+**/.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local tooling and generated output
 .agents/
-yet-another-lark-mcp-main/*
-paper/*
-output/*
+.codex/
+node_modules/
+dist/
+build/
+tmp/
