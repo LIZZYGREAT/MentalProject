@@ -73,7 +73,7 @@ class Settings:
             deepseek_base_url=values.get(
                 "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
             ).strip().rstrip("/"),
-            deepseek_model=values.get("DEEPSEEK_MODEL", "deepseek-chat").strip(),
+            deepseek_model=values.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
             database_url=values.get("DATABASE_URL", "").strip(),
             token_encryption_key=values.get("TOKEN_ENCRYPTION_KEY", "").strip(),
             care_skill_path=skill_path,
