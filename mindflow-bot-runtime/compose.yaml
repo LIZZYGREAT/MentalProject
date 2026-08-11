@@ -4,20 +4,25 @@ services:
       context: ..
       dockerfile: mindflow-bot-runtime/Dockerfile
     env_file:
-      - ../.env
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
     command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
+    environment:
+      CLAUDE_WORKDIR: /srv/claude-workspace
+      CLAUDE_SETTINGS_PATH: /srv/claude-workspace/.claude/settings.json
+      HOME: /home/mindflow
+    volumes:
+      - claude_state:/home/mindflow/.claude
     restart: unless-stopped
 
   postgres:
     image: postgres:16.4-alpine
-    env_file:
-      - ../.env
     environment:
       POSTGRES_DB: mindflow
       POSTGRES_USER: mindflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mindflow -d mindflow"]
       interval: 5s
@@ -29,3 +34,4 @@ services:
 
 volumes:
   postgres_data:
+  claude_state:

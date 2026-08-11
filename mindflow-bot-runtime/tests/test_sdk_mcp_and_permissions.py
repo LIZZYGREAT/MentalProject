@@ -1,0 +1,213 @@
+import asyncio
+import json
+import uuid
+from pathlib import Path
+
+from app.agent.context import AgentContext
+from app.agent.sdk_adapter import (
+    DISALLOWED_TOOLS,
+    SKILL_NAME,
+    ClaudeSDKInvocationError,
+    ProductionClaudeClient,
+    ProductionClaudeClientFactory,
+    isolate_process_environment,
+)
+from app.agent.sdk_mcp import TurnContextBinding, build_sdk_mcp_server
+from app.agent.tool_registry import FORBIDDEN_FIELDS, ToolRegistry
+from app.tools.care import CareTools
+
+
+class FakeSDK:
+    class PermissionResultAllow:
+        pass
+
+    class PermissionResultDeny:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class ClaudeSDKClient:
+        def __init__(self, options):
+            self.options = options
+
+    @staticmethod
+    def tool(name, description, parameters):
+        def decorate(handler):
+            handler.tool_name = name
+            handler.description = description
+            handler.parameters = parameters
+            return handler
+
+        return decorate
+
+    @staticmethod
+    def create_sdk_mcp_server(name, version, tools):
+        return {"type": "sdk", "name": name, "version": version, "tools": tools}
+
+
+def test_sdk_mcp_uses_registry_schema_and_backend_context_only():
+    seen = []
+    registry = ToolRegistry()
+
+    async def handler(ctx, args):
+        seen.append((ctx.participant_id, args))
+        return {"ok": True, "value": args["value"]}
+
+    registry.register(
+        "safe_tool",
+        "safe",
+        {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        handler,
+    )
+    binding = TurnContextBinding(
+        AgentContext(uuid.uuid4(), "P001", "ou", "oc", "msg", uuid.uuid4())
+    )
+    server = build_sdk_mcp_server(registry, binding, sdk=FakeSDK)
+    tool = server["tools"][0]
+    response = asyncio.run(tool({"value": "ok"}))
+    assert seen == [(binding.current.participant_id, {"value": "ok"})]
+    assert json.loads(response["content"][0]["text"])["value"] == "ok"
+    schema_text = json.dumps(tool.parameters).lower()
+    assert not any(field in schema_text for field in FORBIDDEN_FIELDS)
+
+
+def test_all_six_production_tool_schemas_are_closed_and_identity_free():
+    registry = ToolRegistry()
+    CareTools(None, None, None, None, None, None, "Asia/Shanghai").register(registry)
+
+    assert set(registry.names) == {
+        "care_get_today_context",
+        "care_record_checkin",
+        "care_get_recent_state",
+        "care_run_today_assessment",
+        "care_get_support",
+        "calendar_connection_status",
+    }
+    for spec in registry.specs:
+        assert spec.parameters["type"] == "object"
+        assert spec.parameters["additionalProperties"] is False
+        properties = set(spec.parameters.get("properties", {}))
+        assert properties.isdisjoint(FORBIDDEN_FIELDS)
+
+
+def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):
+    registry = ToolRegistry()
+    registry.register(
+        "safe_tool",
+        "safe",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        lambda _ctx, _args: {"ok": True},
+    )
+    root = Path(__file__).resolve().parents[2] / "claude-runtime"
+    factory = ProductionClaudeClientFactory(
+        registry,
+        workdir=root,
+        plugin_path=root / "plugins" / "mindflow-care",
+        settings_path=root / ".claude" / "settings.json",
+        model="deepseek-model",
+        fast_model="deepseek-fast",
+        base_url="https://api.deepseek.com/anthropic",
+        auth_token="top-secret-token",
+        max_turns=8,
+    )
+    monkeypatch.setattr("app.agent.sdk_adapter._load_sdk", lambda: FakeSDK)
+    adapter = factory.create(TurnContextBinding(), resume_session_id="session-1")
+    options = adapter.client.options
+    assert options.tools == ["Skill"]
+    assert options.skills == [SKILL_NAME]
+    assert options.allowed_tools == ["mcp__mindflow__safe_tool"]
+    assert set(options.disallowed_tools) == set(DISALLOWED_TOOLS)
+    assert options.strict_mcp_config is True
+    assert options.setting_sources == []
+    assert options.plugins == [
+        {"type": "local", "path": str(root / "plugins" / "mindflow-care")}
+    ]
+    assert options.permission_mode == "dontAsk"
+    assert options.fallback_model is None
+    assert options.resume == "session-1"
+    assert options.env["ANTHROPIC_AUTH_TOKEN"] == "top-secret-token"
+    assert "top-secret-token" not in str(options.allowed_tools)
+
+    async def permission_results():
+        return (
+            await options.can_use_tool("Skill", {}, None),
+            await options.can_use_tool("mcp__mindflow__safe_tool", {}, None),
+            await options.can_use_tool("Bash", {}, None),
+            await options.can_use_tool("SkillInjected", {}, None),
+        )
+
+    skill, mcp, bash, fake_skill = asyncio.run(permission_results())
+    assert isinstance(skill, FakeSDK.PermissionResultAllow)
+    assert isinstance(mcp, FakeSDK.PermissionResultAllow)
+    assert isinstance(bash, FakeSDK.PermissionResultDeny)
+    assert isinstance(fake_skill, FakeSDK.PermissionResultDeny)
+
+
+def test_parent_environment_is_reduced_to_runtime_allowlist():
+    environment = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/mindflow",
+        "FEISHU_APP_SECRET": "feishu-secret",
+        "DATABASE_URL": "postgresql://secret",
+        "TOKEN_ENCRYPTION_KEY": "encryption-secret",
+        "DEEPSEEK_API_KEY": "model-secret",
+        "AWS_SECRET_ACCESS_KEY": "ambient-secret",
+    }
+
+    isolate_process_environment(environment)
+
+    assert environment == {"PATH": "/usr/bin", "HOME": "/home/mindflow"}
+
+
+def test_client_fails_closed_when_the_required_skill_is_not_initialized():
+    class SDK:
+        class SystemMessage:
+            def __init__(self, skills):
+                self.subtype = "init"
+                self.data = {"skills": skills}
+
+        class AssistantMessage:
+            pass
+
+        class ToolUseBlock:
+            pass
+
+        class ResultMessage:
+            def __init__(self):
+                self.is_error = False
+                self.result = "ok"
+                self.session_id = "session-1"
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.skills = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, _text):
+                return None
+
+            async def receive_response(self):
+                yield SDK.SystemMessage(self.skills)
+                yield SDK.ResultMessage()
+
+            async def disconnect(self):
+                return None
+
+    async def scenario():
+        allowed = ProductionClaudeClient(SDK, [SKILL_NAME], expected_skill=SKILL_NAME)
+        assert (await allowed.run_turn("hello")).text == "ok"
+        denied = ProductionClaudeClient(SDK, ["other:skill"], expected_skill=SKILL_NAME)
+        with __import__("pytest").raises(ClaudeSDKInvocationError):
+            await denied.run_turn("hello")
+
+    asyncio.run(scenario())

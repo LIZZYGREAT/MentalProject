@@ -20,6 +20,11 @@ FORBIDDEN_FIELDS = {
     "access_token",
     "refresh_token",
     "app_secret",
+    "secret",
+    "token",
+    "sql",
+    "path",
+    "url",
 }
 
 ToolHandler = Callable[[AgentContext, dict[str, Any]], Any | Awaitable[Any]]
@@ -95,6 +100,10 @@ class ToolRegistry:
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(self._tools)
+
+    @property
+    def specs(self) -> tuple[ToolSpec, ...]:
+        return tuple(self._tools.values())
 
     def schemas(self) -> list[dict[str, Any]]:
         return [

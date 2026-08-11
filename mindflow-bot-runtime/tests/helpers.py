@@ -17,4 +17,12 @@ def participant(database: Database, code: str):
 
 
 def skill_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "skills" / "mental-health-care" / "SKILL.md"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "claude-runtime"
+        / "plugins"
+        / "mindflow-care"
+        / "skills"
+        / "mental-health-care"
+        / "SKILL.md"
+    )

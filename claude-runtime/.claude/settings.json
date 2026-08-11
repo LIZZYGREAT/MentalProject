@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Skill(mindflow-care:mental-health-care)",
+      "mcp__mindflow__*"
+    ],
+    "deny": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Task",
+      "TaskOutput",
+      "TaskStop"
+    ]
+  },
+  "enableAllProjectMcpServers": false,
+  "disableAllHooks": true
+}

@@ -1,4 +1,4 @@
-"""Production entry point: python -m app.main."""
+"""Production entry point: BotWorker -> ClaudeSDKClient -> DeepSeek -> MCP."""
 
 from __future__ import annotations
 
@@ -7,40 +7,32 @@ import logging
 
 from sqlalchemy import text
 
-from app.agent.runtime import AgentRuntime
+from app.agent.claude_runtime import ClaudeAgentRuntime
+from app.agent.sdk_adapter import (
+    ProductionClaudeClientFactory,
+    isolate_process_environment,
+)
+from app.agent.session_manager import ParticipantSessionManager
 from app.agent.skill_loader import SkillLoader
-from app.agent.tool_registry import ToolRegistry
+from app.bootstrap import build_business_services
 from app.config import Settings
 from app.db import Database, build_engine
 from app.identity.service import IdentityService
-from app.integrations.deepseek import DeepSeekClient
-from app.integrations.feishu.calendar import CalendarService
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.gateway import BotEvent, FeishuGateway
-from app.integrations.feishu.oauth import DeviceFlowService, FeishuOAuthClient
 from app.repositories import (
     AgentRunRepository,
     BindingRepository,
     BotEventRepository,
-    ConversationRepository,
-    ObservationRepository,
-    PredictionRepository,
-    ProfileRepository,
+    ClaudeSessionRepository,
 )
-from app.services.prediction_service import PredictionService
 from app.services.safety_service import SafetyService
-from app.services.token_service import (
-    TokenEncryptionService,
-    TokenRefreshService,
-    TokenRepository,
-)
-from app.tools.care import CareTools
 from app.worker import BotWorker
-from mindflow_core.assessment import AssessmentModel
 
 
 async def run() -> None:
     settings = Settings.from_env()
+    isolate_process_environment()
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -53,48 +45,36 @@ async def run() -> None:
     identity = IdentityService(database, bindings)
     events = BotEventRepository(database)
     runs = AgentRunRepository(database)
-    profiles = ProfileRepository(database)
-    observations = ObservationRepository(database)
-    predictions = PredictionRepository(database)
-    conversations = ConversationRepository(database)
-
-    encryption = TokenEncryptionService(settings.token_encryption_key)
-    token_repo = TokenRepository(database, encryption)
-    oauth = FeishuOAuthClient(settings.feishu_app_id, settings.feishu_app_secret)
-    device_flows = DeviceFlowService(database, encryption, token_repo, oauth)
-    refresh = TokenRefreshService(database, encryption, oauth.refresh_token)
-    calendar = CalendarService(refresh)
-    prediction_service = PredictionService(AssessmentModel(), predictions)
+    business = build_business_services(database, settings, runs)
 
     skill_loader = SkillLoader(settings.care_skill_path)
     skill_loader.load()
-    registry = ToolRegistry(runs)
-    CareTools(
-        profiles,
-        observations,
-        predictions,
-        prediction_service,
-        calendar,
-        token_repo,
-        settings.timezone_name,
-    ).register(registry)
-    deepseek = DeepSeekClient(
-        settings.deepseek_api_key,
-        settings.deepseek_base_url,
-        settings.deepseek_model,
-        timeout_seconds=settings.agent_timeout_seconds,
+    factory = ProductionClaudeClientFactory(
+        business.registry,
+        workdir=settings.claude_workdir,
+        plugin_path=settings.claude_plugin_path,
+        settings_path=settings.claude_settings_path,
+        model=settings.claude_model,
+        fast_model=settings.claude_default_haiku_model,
+        base_url=settings.claude_anthropic_base_url,
+        auth_token=settings.deepseek_api_key,
+        max_turns=settings.claude_max_turns,
     )
-    runtime = AgentRuntime(
-        deepseek,
-        skill_loader,
-        registry,
-        conversations,
+    factory.validate()
+    sessions = ParticipantSessionManager(
+        factory,
+        ClaudeSessionRepository(database),
+        max_active_sessions=settings.max_active_agent_sessions,
+        idle_timeout_seconds=settings.agent_session_idle_seconds,
+        turn_timeout_seconds=settings.claude_timeout_seconds,
+        input_queue_size=settings.participant_input_queue_size,
+    )
+    runtime = ClaudeAgentRuntime(
+        sessions,
+        business.conversations,
         SafetyService(),
-        history_limit=settings.history_limit,
-        max_tool_steps=settings.max_tool_steps,
-        timeout_seconds=settings.agent_timeout_seconds,
-        max_retries=settings.max_retries,
     )
+
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(maxsize=settings.queue_max_size)
     sender = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     worker = BotWorker(
@@ -105,9 +85,12 @@ async def run() -> None:
         skill_loader,
         runtime,
         sender,
-        device_flows,
-        model=settings.deepseek_model,
-        max_retries=settings.max_retries,
+        business.device_flows,
+        model=f"claude-code/{settings.claude_model}",
+        max_retries=settings.feishu_send_max_retries,
+        progress_delay_seconds=settings.progress_delay_seconds,
+        progress_cooldown_seconds=settings.progress_cooldown_seconds,
+        progress_max_messages=settings.progress_max_messages,
     )
     gateway = FeishuGateway(
         settings.feishu_app_id,
@@ -116,10 +99,6 @@ async def run() -> None:
         events,
         queue,
     )
-    workers = [
-        asyncio.create_task(worker.run_forever(), name=f"agent-worker-{index}")
-        for index in range(settings.agent_workers)
-    ]
     for saved in events.recoverable():
         await queue.put(
             BotEvent(
@@ -133,14 +112,17 @@ async def run() -> None:
                 chat_type=saved.chat_type,
             )
         )
-    for participant_id in device_flows.pending_participants():
+    for participant_id in business.device_flows.pending_participants():
         worker.resume_device_flow(participant_id)
+
+    dispatcher = asyncio.create_task(worker.run_forever(), name="bot-dispatcher")
     try:
         await gateway.start()
     finally:
-        for task in workers:
-            task.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        dispatcher.cancel()
+        await asyncio.gather(dispatcher, return_exceptions=True)
+        await worker.close()
+        await runtime.close()
 
 
 def main() -> None:

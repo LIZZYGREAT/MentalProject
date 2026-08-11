@@ -1,59 +1,93 @@
 # MindFlow 生产飞书 Runtime
 
-这是面向约 20 名实验参与者的独立生产后端。生产消息链路不依赖旧 MCP、Claude Session、`feishu_im_watch`、SQLite 或 `tokens.json`。
-
-## 架构
+这是面向约 20 名实验参与者的独立生产后端。生产 Agent 路径固定为：
 
 ```text
-一个飞书 App / 一条 WebSocket
-  -> PostgreSQL 事件幂等与可恢复载荷
-  -> participant 级顺序执行
-  -> DeepSeek 有界 Tool Calling
-  -> 六个 participant-bound 业务工具
-  -> Backend 统一发送回复
+FeishuChannel
+  -> durable BotEvent
+  -> BotWorker（binding / consent / calendar / reliable delivery）
+  -> ParticipantSessionManager（queue / interrupt / bounded warm pool）
+  -> ClaudeSDKClient / Claude Code Harness
+  -> DeepSeek Anthropic-compatible API
+  -> participant-bound MindFlow SDK MCP
+  -> CareTools / AssessmentModel / Calendar / PostgreSQL
+  -> Backend final delivery
 ```
 
-PostgreSQL 保存 participant、一次性绑定、画像、打卡、完整预测输入/输出、有限对话历史、事件恢复状态、Agent 审计以及 AES-256-GCM 加密的 participant OAuth Token。
+Claude Code 是 Agent Harness，DeepSeek 是模型提供方，MCP 是业务能力边界，
+PostgreSQL 保存 identity、状态、审计和 Claude session metadata。生产代码中没有
+Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code。
 
-## 代码边界
+## 安全边界
 
-- `app/`：飞书 Gateway、身份、Agent、Tool、OAuth、数据库和 Worker。
-- `mindflow_core/`：生产 Tool 到现有压力/活力模型的结构化适配。
-- 根目录的 `algorithm/`、`core_engine/`、`entity/`、`event/` 等：经测试保留的模型依赖闭包。
-- `skills/mental-health-care/SKILL.md`：只作为模型指令读取，不执行其中代码。
-- `migrations/`：唯一生产 Schema 来源；生产拒绝 SQLite。
+- 未绑定用户只能执行 `/bind`；仅允许私聊。
+- `external_llm_consent_at` 为空时不会创建 Claude SDK client。
+- `/calendar` 由 Backend Device Flow 处理。
+- `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
+- Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
+- 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
+- SDK MCP 只暴露六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
+- 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
+- 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
+- `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
-## 人工联调前配置
+## 六个业务 Tool
 
-项目保留根目录 `.env` 作为唯一真实配置文件。把
-`mindflow-bot-runtime/.env.example` 中缺少的变量合并到根目录 `.env`，然后执行：
+1. `care_get_today_context`
+2. `care_record_checkin`
+3. `care_get_recent_state`
+4. `care_run_today_assessment`
+5. `care_get_support`
+6. `calendar_connection_status`
 
-```powershell
-cd mindflow-bot-runtime
-python -c "from app.services.token_service import TokenEncryptionService; print(TokenEncryptionService.generate_key())"
-```
+所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
+身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
+校验、安全摘要和 AgentRun 审计。
 
-将生成值和下列真实配置写入 `.env`：
+## 配置
+
+`mindflow-bot-runtime/.env` 是唯一真实配置文件。把 `.env.example` 中的新变量合并进去：
 
 - `FEISHU_APP_ID`、`FEISHU_APP_SECRET`
 - `DEEPSEEK_API_KEY`
+- `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
+- `CLAUDE_MODEL`、`CLAUDE_DEFAULT_HAIKU_MODEL`（填写云端已验证的模型名）
 - `POSTGRES_PASSWORD`、`DATABASE_URL`
 - `TOKEN_ENCRYPTION_KEY`
+- session pool、timeout 和 progress policy 参数
 
-飞书应用需要开启机器人长连接并订阅 `im.message.receive_v1`；日历权限至少包含 `offline_access calendar:calendar:readonly`。已在旧环境中出现过的 Secret 必须先旋转。
+不要保留旧的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BOT_HISTORY_LIMIT`、
+`AGENT_MAX_TOOL_STEPS` 或 Direct API retry 配置。
 
-## 启动
+生成 Token 加密 Key：
 
 ```powershell
+cd mindflow-bot-runtime
+conda activate MentalProject
+python -c "from app.services.token_service import TokenEncryptionService; print(TokenEncryptionService.generate_key())"
+```
+
+## 容器启动
+
+```powershell
+cd mindflow-bot-runtime
 docker compose up --build -d
+docker compose ps
 docker compose logs -f bot
 ```
 
-Compose 仅包含 `bot` 和 `postgres`。PostgreSQL 不映射宿主机端口；bot 启动前自动执行 Alembic migration。
+Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
+`claude`。Compose 把 `/home/mindflow/.claude` 挂到 `claude_state` volume，确保
+container recreate 后 transcript 仍可用于 `resume=session_id`。
+
+容器内检查：
+
+```powershell
+docker compose exec bot python -c "import claude_agent_sdk; print('sdk ok')"
+docker compose exec bot python -c "from app.config import Settings; s=Settings.from_env(); print(s.claude_model, s.claude_workdir)"
+```
 
 ## 创建参与者
-
-先把 `profiles/profile.example.json` 复制为每名参与者各自的画像文件，只填写研究所需的去标识化字段；`model_params` 留空时使用当前已审查的默认模型参数。
 
 ```powershell
 Copy-Item .\profiles\profile.example.json .\profiles\P001.json
@@ -63,41 +97,30 @@ docker compose exec bot python -m app.admin set-profile P001 /tmp/P001.json
 docker compose exec bot python -m app.admin set-llm-consent P001
 ```
 
-第一条命令只显示一次 `/bind <code>`。数据库只保存绑定码 Hash。只有研究者明确记录外部 LLM 实验授权后，参与者消息才会发送给 DeepSeek；撤回命令为：
+第一条命令只显示一次 `/bind <code>`；数据库仅保存绑定码 Hash。撤回外部 LLM
+授权：
 
 ```powershell
 docker compose exec bot python -m app.admin set-llm-consent P001 --revoke
 ```
 
-绑定后，参与者可发送 `/calendar` 启动自己的飞书 Device Flow。Pending Device Flow 和待发送回复均可在进程重启后恢复。
-
-## Agent 工具
-
-1. `care_get_today_context`
-2. `care_record_checkin`
-3. `care_get_recent_state`
-4. `care_run_today_assessment`
-5. `care_get_support`
-6. `calendar_connection_status`
-
-所有 Tool Schema 均禁止额外字段以及 participant、飞书身份、Token、Secret、SQL、路径或任意 URL。participant 只来自 Backend 创建的 frozen `AgentContext`。
-
 ## 自动验证
 
-在项目根目录执行：
-
 ```powershell
-D:\Miniconda\envs\MentalProject\python.exe -m pytest -q mindflow-bot-runtime\tests
+conda activate MentalProject
+cd mindflow-bot-runtime
+python -m pytest -q tests
 ```
 
-测试使用 SQLite 内存后端和 Fake 外部服务，只验证代码语义。进入实验前仍必须人工完成：
+本地测试使用 SQLite、Fake SDK client 和 Fake 外部服务，不需要安装系统级 Claude
+Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以下证据：
 
-1. 真实 PostgreSQL upgrade、重启恢复和跨连接 Token 刷新竞争；
-2. 两个真实飞书账号同时绑定、打卡、评估和查询历史；
-3. 真实 DeepSeek Tool Calling、超时、429/5xx 和安全 fallback；
-4. 两名参与者的真实 Device Flow、重复日程读取和 Token 隔离；
-5. 容器重启、待发送回复恢复、日志脱敏和原文保留策略确认。
+1. `FeishuChannel` 长连接稳定，bot restart count 为 0；
+2. 容器内 Claude Agent SDK 能通过 DeepSeek 返回结果；
+3. 连续消息按 participant 排队，`/stop` 能中断 active turn；
+4. 六个 MCP Tool 真实调用、审计和身份隔离正确；
+5. container recreate 后 session resume、pending reply 和 OAuth Token 均可恢复；
+6. 日志不含 Secret、Token、完整 Prompt 或 MCP 身份上下文。
 
-以上五项没有形成证据前，结论仍是 **NO-GO**。
-
-后续人工配置、联调和上线任务统一在 [`PROJECT_TASKS.md`](PROJECT_TASKS.md) 维护。不要另建同类进度文档。
+这些证据完成前，实验上线结论仍是 **NO-GO**。人工任务统一维护在
+[`PROJECT_TASKS.md`](PROJECT_TASKS.md)。

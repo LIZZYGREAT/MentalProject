@@ -22,7 +22,7 @@ Use only these tools:
 - `calendar_connection_status` for calendar connection questions.
 
 The infrastructure command `/calendar` starts this participant's own Feishu
-Device Flow. Never ask the model to construct OAuth URLs or handle tokens.
+Device Flow. Never construct OAuth URLs or handle tokens.
 
 Use only facts returned by tools. Distinguish a recorded observation from a
 model result. If calendar data is unavailable, state that the assessment used a

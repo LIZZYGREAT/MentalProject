@@ -174,14 +174,17 @@ def test_same_participant_messages_are_processed_serially():
             super().__init__()
             self.active = 0
             self.max_active = 0
+            self.locks = {}
 
         async def handle_message(self, ctx, text, **_kwargs):
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-            await asyncio.sleep(0.02)
-            self.seen.append((ctx.participant_id, ctx.participant_code, text))
-            self.active -= 1
-            return text
+            lock = self.locks.setdefault(ctx.participant_id, asyncio.Lock())
+            async with lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.02)
+                self.seen.append((ctx.participant_id, ctx.participant_code, text))
+                self.active -= 1
+                return text
 
     runtime = SerialRuntime()
     worker = BotWorker(
@@ -239,3 +242,101 @@ def test_external_llm_is_blocked_until_research_consent_is_recorded():
     asyncio.run(scenario())
     assert runtime.seen == []
     assert "实验授权" in sender.sent[-1][1]
+
+
+def test_stop_bypasses_running_turn_and_interrupts_runtime():
+    from app.agent.claude_runtime import ClaudeRuntimeInterrupted
+
+    database = memory_database()
+    p1 = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(p1.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue(maxsize=10)
+    gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
+
+    class InterruptRuntime:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def handle_message(self, _ctx, _text, **_kwargs):
+            self.started.set()
+            await self.stopped.wait()
+            raise ClaudeRuntimeInterrupted("stopped")
+
+        async def interrupt(self, participant_id):
+            assert participant_id == p1.id
+            self.stopped.set()
+            return True
+
+    runtime = InterruptRuntime()
+    sender = FakeSender()
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        runtime,
+        sender,
+        model="fake",
+        progress_delay_seconds=60,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(payload("x1", "xm1", "ou_1", "oc_1", f"/bind {code}"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(payload("x2", "xm2", "ou_1", "oc_1", "long"))
+        running = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(payload("x3", "xm3", "ou_1", "oc_1", "/stop"))
+        await worker.process(await queue.get())
+        await running
+
+    asyncio.run(scenario())
+    texts = [text for _chat, text in sender.sent]
+    assert "已请求停止当前处理。" in texts
+    assert "当前处理已停止。" in texts
+
+
+def test_progress_is_backend_controlled_and_final_reply_remains_separate():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(p1.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue(maxsize=10)
+    gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
+
+    class ProgressRuntime:
+        async def handle_message(self, _ctx, _text, *, on_tool_use, **_kwargs):
+            await on_tool_use("care_run_today_assessment")
+            return "final assessment"
+
+    sender = FakeSender()
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        ProgressRuntime(),
+        sender,
+        model="fake",
+        progress_delay_seconds=60,
+        progress_cooldown_seconds=1,
+        progress_max_messages=2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(payload("p1", "pm1", "ou_1", "oc_1", f"/bind {code}"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(payload("p2", "pm2", "ou_1", "oc_1", "assess"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert sender.sent[-2:] == [
+        ("oc_1", "正在读取今天的数据并进行评估……"),
+        ("oc_1", "final assessment"),
+    ]

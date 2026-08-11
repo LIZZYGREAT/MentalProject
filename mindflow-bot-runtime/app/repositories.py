@@ -15,6 +15,7 @@ from app.models import (
     AgentRun,
     AgentToolCall,
     BotEvent,
+    ClaudeSession,
     ConversationMessage,
     FeishuBinding,
     Participant,
@@ -46,6 +47,16 @@ class RecoverableBotEvent:
     chat_type: str
     text: str
     create_time: datetime
+
+
+@dataclass(frozen=True)
+class ClaudeSessionView:
+    participant_id: uuid.UUID
+    session_id: str
+    status: str
+    last_message_id: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ParticipantRepository:
@@ -356,6 +367,64 @@ class ConversationRepository:
             )
             rows.reverse()
             return [{"role": row.role, "content": row.content} for row in rows]
+
+
+class ClaudeSessionRepository:
+    """Durable one-to-one mapping between a participant and Claude session."""
+
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: ClaudeSession) -> ClaudeSessionView:
+        return ClaudeSessionView(
+            participant_id=row.participant_id,
+            session_id=row.session_id,
+            status=row.status,
+            last_message_id=row.last_message_id,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    def get(self, participant_id: uuid.UUID) -> Optional[ClaudeSessionView]:
+        with self.database.session() as session:
+            row = session.get(ClaudeSession, participant_id)
+            return self._view(row) if row is not None else None
+
+    def save(
+        self,
+        participant_id: uuid.UUID,
+        session_id: str,
+        *,
+        last_message_id: Optional[str],
+    ) -> ClaudeSessionView:
+        value = str(session_id).strip()
+        if not value:
+            raise ValueError("Claude session_id cannot be empty")
+        with self.database.session() as session:
+            row = session.get(ClaudeSession, participant_id, with_for_update=True)
+            if row is None:
+                row = ClaudeSession(
+                    participant_id=participant_id,
+                    session_id=value,
+                    status="active",
+                    last_message_id=last_message_id,
+                )
+                session.add(row)
+            else:
+                row.session_id = value
+                row.status = "active"
+                row.last_message_id = last_message_id
+                row.updated_at = utc_now()
+            session.flush()
+            return self._view(row)
+
+    def mark_stale(self, participant_id: uuid.UUID) -> None:
+        with self.database.session() as session:
+            row = session.get(ClaudeSession, participant_id, with_for_update=True)
+            if row is not None:
+                row.status = "stale"
+                row.updated_at = utc_now()
 
 
 class BotEventRepository:
