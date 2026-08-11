@@ -99,3 +99,5 @@ D:\Miniconda\envs\MentalProject\python.exe -m pytest -q mindflow-bot-runtime\tes
 5. 容器重启、待发送回复恢复、日志脱敏和原文保留策略确认。
 
 以上五项没有形成证据前，结论仍是 **NO-GO**。
+
+后续人工配置、联调和上线任务统一在 [`PROJECT_TASKS.md`](PROJECT_TASKS.md) 维护。不要另建同类进度文档。
