@@ -233,7 +233,10 @@ class ProductionClaudeClientFactory:
         plugin_path: Path,
         settings_path: Path,
         model: str,
-        fast_model: str,
+        opus_model: str,
+        sonnet_model: str,
+        haiku_model: str,
+        subagent_model: str,
         base_url: str,
         auth_token: str,
         max_turns: int,
@@ -243,7 +246,10 @@ class ProductionClaudeClientFactory:
         self.plugin_path = Path(plugin_path)
         self.settings_path = Path(settings_path)
         self.model = model
-        self.fast_model = fast_model
+        self.opus_model = opus_model
+        self.sonnet_model = sonnet_model
+        self.haiku_model = haiku_model
+        self.subagent_model = subagent_model
         self.base_url = base_url
         self.auth_token = auth_token
         self.max_turns = max_turns
@@ -280,8 +286,10 @@ class ProductionClaudeClientFactory:
                 "ANTHROPIC_AUTH_TOKEN": self.auth_token,
                 "ANTHROPIC_BASE_URL": self.base_url,
                 "ANTHROPIC_MODEL": self.model,
-                "ANTHROPIC_SMALL_FAST_MODEL": self.fast_model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.fast_model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": self.opus_model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": self.sonnet_model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.haiku_model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": self.subagent_model,
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
                 "CLAUDE_AGENT_SDK_CLIENT_APP": "mindflow/1.0",
             }

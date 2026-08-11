@@ -28,7 +28,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 
 | 项目 | 当前值 |
 |---|---|
-| 代码与自动测试 | `READY`（27 项测试通过） |
+| 代码与自动测试 | `READY`（29 项测试通过） |
 | 真实环境配置 | `TODO` |
 | 两人真实飞书联调 | `TODO` |
 | 20 人实验启动 | `NO_GO` |
@@ -39,7 +39,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 
 | ID | 优先级 | 任务 | 状态 | 验收标准 | 完成日期 | 证据/备注 |
 |---|---|---|---|---|---|---|
-| ENV-01 | P0 | 补齐 `mindflow-bot-runtime/.env` | TODO | 数据库、加密 Key、`CLAUDE_ANTHROPIC_BASE_URL` 和两个已验证 DeepSeek 模型名均已配置；真实值未进入 Git | — | 使用 `.env.example`；删除旧 Direct Agent 配置，不在本文件记录秘密值 |
+| ENV-01 | P0 | 补齐 `mindflow-bot-runtime/.env` | TODO | 数据库、加密 Key、`CLAUDE_ANTHROPIC_BASE_URL`、主模型以及 Opus/Sonnet/Haiku/Subagent 的 DeepSeek 映射均已配置；真实值未进入 Git | — | Opus/Sonnet 使用 v4-pro，Haiku/Subagent 使用 v4-flash；不在本文件记录真实 ID 或 Secret |
 | SEC-01 | P0 | 轮换曾在旧环境或聊天记录中出现过的飞书与 DeepSeek Secret | TODO | 新 Secret 生效，旧 Secret 已失效，仓库敏感信息扫描无命中 | — | 只记录轮换完成，不记录 Secret |
 | DEP-01 | P0 | 首次构建并启动生产容器 | TODO | `docker compose up --build -d` 成功；`bot`、`postgres` 健康；0002 migration 与 Agent SDK import 成功 | — | 保存脱敏后的 `docker compose ps` 和启动日志 |
 | SDK-01 | P0 | 云端 Claude Agent SDK -> DeepSeek smoke | TODO | 容器内 `ClaudeSDKClient` 使用 DeepSeek Anthropic endpoint 返回结果；没有 Anthropic 官方模型 fallback | — | 保存模型名、状态和脱敏延迟，不保存 Prompt/Key |

@@ -112,8 +112,11 @@ def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):
         workdir=root,
         plugin_path=root / "plugins" / "mindflow-care",
         settings_path=root / ".claude" / "settings.json",
-        model="deepseek-model",
-        fast_model="deepseek-fast",
+        model="deepseek-primary",
+        opus_model="deepseek-v4-pro",
+        sonnet_model="deepseek-v4-pro",
+        haiku_model="deepseek-v4-flash",
+        subagent_model="deepseek-v4-flash",
         base_url="https://api.deepseek.com/anthropic",
         auth_token="top-secret-token",
         max_turns=8,
@@ -134,6 +137,11 @@ def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):
     assert options.fallback_model is None
     assert options.resume == "session-1"
     assert options.env["ANTHROPIC_AUTH_TOKEN"] == "top-secret-token"
+    assert options.env["ANTHROPIC_MODEL"] == "deepseek-primary"
+    assert options.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "deepseek-v4-pro"
+    assert options.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "deepseek-v4-pro"
+    assert options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "deepseek-v4-flash"
+    assert options.env["CLAUDE_CODE_SUBAGENT_MODEL"] == "deepseek-v4-flash"
     assert "top-secret-token" not in str(options.allowed_tools)
 
     async def permission_results():

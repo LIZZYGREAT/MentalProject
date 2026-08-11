@@ -51,7 +51,9 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `FEISHU_APP_ID`、`FEISHU_APP_SECRET`
 - `DEEPSEEK_API_KEY`
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
-- `CLAUDE_MODEL`、`CLAUDE_DEFAULT_HAIKU_MODEL`（填写云端已验证的模型名）
+- `CLAUDE_MODEL`：主会话模型或 Claude Code alias。
+- `CLAUDE_DEFAULT_OPUS_MODEL`、`CLAUDE_DEFAULT_SONNET_MODEL`：都填写云端已验证的 DeepSeek `v4-pro` 模型 ID。
+- `CLAUDE_DEFAULT_HAIKU_MODEL`、`CLAUDE_CODE_SUBAGENT_MODEL`：都填写云端已验证的 DeepSeek `v4-flash` 模型 ID；两者不一致时启动会拒绝配置。当前生产权限仍禁止 `Agent/Task`，不会因此开放子代理能力。
 - `POSTGRES_PASSWORD`、`DATABASE_URL`
 - `TOKEN_ENCRYPTION_KEY`
 - session pool、timeout 和 progress policy 参数

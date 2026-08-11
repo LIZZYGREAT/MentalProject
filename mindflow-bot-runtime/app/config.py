@@ -32,7 +32,10 @@ class Settings:
     claude_settings_path: Path
     claude_anthropic_base_url: str
     claude_model: str
+    claude_default_opus_model: str
+    claude_default_sonnet_model: str
     claude_default_haiku_model: str
+    claude_code_subagent_model: str
     timezone_name: str = "Asia/Shanghai"
     queue_max_size: int = 100
     participant_input_queue_size: int = 20
@@ -103,8 +106,17 @@ class Settings:
                 "CLAUDE_ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"
             ).strip().rstrip("/"),
             claude_model=values.get("CLAUDE_MODEL", "").strip(),
+            claude_default_opus_model=values.get(
+                "CLAUDE_DEFAULT_OPUS_MODEL", ""
+            ).strip(),
+            claude_default_sonnet_model=values.get(
+                "CLAUDE_DEFAULT_SONNET_MODEL", ""
+            ).strip(),
             claude_default_haiku_model=values.get(
                 "CLAUDE_DEFAULT_HAIKU_MODEL", ""
+            ).strip(),
+            claude_code_subagent_model=values.get(
+                "CLAUDE_CODE_SUBAGENT_MODEL", ""
             ).strip(),
             timezone_name=values.get("APP_TIMEZONE", "Asia/Shanghai").strip(),
             queue_max_size=_int(values, "BOT_QUEUE_MAX_SIZE", 100),
@@ -140,11 +152,18 @@ class Settings:
             "DATABASE_URL": self.database_url,
             "TOKEN_ENCRYPTION_KEY": self.token_encryption_key,
             "CLAUDE_MODEL": self.claude_model,
+            "CLAUDE_DEFAULT_OPUS_MODEL": self.claude_default_opus_model,
+            "CLAUDE_DEFAULT_SONNET_MODEL": self.claude_default_sonnet_model,
             "CLAUDE_DEFAULT_HAIKU_MODEL": self.claude_default_haiku_model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": self.claude_code_subagent_model,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise ValueError("Missing required environment values: " + ", ".join(missing))
+        if self.claude_code_subagent_model != self.claude_default_haiku_model:
+            raise ValueError(
+                "CLAUDE_CODE_SUBAGENT_MODEL must match CLAUDE_DEFAULT_HAIKU_MODEL"
+            )
         if self.app_env == "production" and not self.database_url.startswith(
             ("postgresql://", "postgresql+psycopg://")
         ):
