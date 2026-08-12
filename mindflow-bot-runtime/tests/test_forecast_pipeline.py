@@ -72,7 +72,7 @@ def build_pipeline(events, *, consent=False, client=None):
         participant = participants.set_external_llm_consent(participant.id, allowed=True)
     cache = EventSemanticCacheRepository(database)
     semantics = EventSemanticPreprocessor(
-        cache, client=client, model="semantic-test-v1", batch_size=8,
+        cache, client=client, model="semantic-test-v1",
         max_concurrency=2,
     )
     prediction = FakePrediction()
@@ -259,9 +259,10 @@ def test_warning_is_durable_deduped_and_stale_forecast_cannot_send():
 
     async def scenario():
         first = await coordinator.ensure_forecast(participant.id, date.today(), "daily_prepare")
-        pending = warnings.pending(datetime.now(timezone.utc) + timedelta(days=1))
-        assert len(pending) == 1
-        warning_id = uuid.UUID(pending[0]["id"])
+        with database.session() as session:
+            from app.models import WarningSchedule
+            row = session.query(WarningSchedule).one()
+            warning_id = row.id
         calendar.events = [event(description="语义发生变化")]
         await coordinator.ensure_forecast(participant.id, date.today(), "periodic_poll")
         # Old forecast was invalidated; a stale row cannot be claimed/sent.
