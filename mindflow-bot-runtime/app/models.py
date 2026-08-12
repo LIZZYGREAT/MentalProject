@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import uuid
 
 from sqlalchemy import (
+    Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -251,4 +253,97 @@ class FeishuDeviceFlow(Base):
     interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class CalendarSnapshot(Base):
+    __tablename__ = "calendar_snapshots"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "local_date", name="uq_calendar_snapshot_day"),
+        Index("ix_calendar_snapshot_participant_day", "participant_id", "local_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    calendar_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    events_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class EventSemanticCache(Base):
+    __tablename__ = "event_semantic_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "fingerprint", "schema_version", "prompt_version", "model",
+            name="uq_semantic_participant_fingerprint",
+        ),
+        Index("ix_semantic_cache_participant_fingerprint", "participant_id", "fingerprint"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    assessment_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="complete")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ForecastSnapshot(Base):
+    __tablename__ = "forecast_snapshots"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "local_date", "forecast_version", name="uq_forecast_version"),
+        Index("ix_forecast_participant_day", "participant_id", "local_date", "generated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    calendar_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    semantic_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    semantic_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    semantic_input_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    curve_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    peaks_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    warning_windows_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    output_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class WarningSchedule(Base):
+    __tablename__ = "warning_schedules"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "local_date", "warning_identity", name="uq_warning_identity"),
+        Index("ix_warning_pending_target", "status", "target_time"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    forecast_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("forecast_snapshots.id", ondelete="CASCADE"), nullable=False
+    )
+    forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    warning_identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    warning_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

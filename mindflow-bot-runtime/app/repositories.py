@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import uuid
 from typing import Any, Optional
 
@@ -15,13 +15,17 @@ from app.models import (
     AgentRun,
     AgentToolCall,
     BotEvent,
+    CalendarSnapshot,
     ClaudeSession,
     ConversationMessage,
+    EventSemanticCache,
     FeishuBinding,
     Participant,
     ParticipantProfile,
+    ForecastSnapshot,
     PredictionRun,
     StateObservation,
+    WarningSchedule,
 )
 
 
@@ -105,6 +109,12 @@ class ParticipantRepository:
             return ParticipantView(
                 row.id, row.participant_code, row.status, row.external_llm_consent_at
             )
+
+    def active_ids(self) -> list[uuid.UUID]:
+        with self.database.session() as session:
+            return list(session.execute(
+                select(Participant.id).where(Participant.status == "active")
+            ).scalars().all())
 
 
 class BindingRepository:
@@ -303,6 +313,300 @@ class PredictionRepository:
                 "output": dict(row.output_json),
                 "created_at": row.created_at.isoformat(),
             }
+
+
+class CalendarSnapshotRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: CalendarSnapshot) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "participant_id": str(row.participant_id),
+            "local_date": row.local_date.isoformat(),
+            "calendar_revision": row.calendar_revision,
+            "events": list(row.events_json),
+            "degraded": row.degraded,
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    def get(self, participant_id: uuid.UUID, local_date: date) -> Optional[dict[str, Any]]:
+        with self.database.session() as session:
+            row = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                )
+            ).scalar_one_or_none()
+            return self._view(row) if row else None
+
+    def upsert(
+        self, participant_id: uuid.UUID, local_date: date, *, revision: str,
+        events: list[dict[str, Any]], degraded: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        with self.database.session() as session:
+            row = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            changed = row is None or row.calendar_revision != revision
+            if row is None:
+                row = CalendarSnapshot(
+                    participant_id=participant_id, local_date=local_date,
+                    calendar_revision=revision, events_json=list(events), degraded=degraded,
+                )
+                session.add(row)
+            elif changed or row.degraded != degraded:
+                row.calendar_revision = revision
+                row.events_json = list(events)
+                row.degraded = degraded
+                row.updated_at = utc_now()
+            session.flush()
+            return self._view(row), changed
+
+
+class EventSemanticCacheRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    def get(
+        self, participant_id: uuid.UUID, fingerprint: str, *,
+        schema_version: str, prompt_version: str, model: str,
+    ) -> Optional[dict[str, Any]]:
+        with self.database.session() as session:
+            row = session.execute(
+                select(EventSemanticCache).where(
+                    EventSemanticCache.participant_id == participant_id,
+                    EventSemanticCache.fingerprint == fingerprint,
+                    EventSemanticCache.schema_version == schema_version,
+                    EventSemanticCache.prompt_version == prompt_version,
+                    EventSemanticCache.model == model,
+                    EventSemanticCache.status == "complete",
+                )
+            ).scalar_one_or_none()
+            return dict(row.assessment_json) if row else None
+
+    def put(
+        self, participant_id: uuid.UUID, fingerprint: str, assessment: dict[str, Any], *,
+        schema_version: str, prompt_version: str, model: str,
+    ) -> None:
+        with self.database.session() as session:
+            row = session.execute(
+                select(EventSemanticCache).where(
+                    EventSemanticCache.participant_id == participant_id,
+                    EventSemanticCache.fingerprint == fingerprint,
+                    EventSemanticCache.schema_version == schema_version,
+                    EventSemanticCache.prompt_version == prompt_version,
+                    EventSemanticCache.model == model,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(EventSemanticCache(
+                    participant_id=participant_id, fingerprint=fingerprint,
+                    schema_version=schema_version, prompt_version=prompt_version,
+                    model=model, assessment_json=dict(assessment), status="complete",
+                ))
+            else:
+                row.assessment_json = dict(assessment)
+                row.status = "complete"
+                row.updated_at = utc_now()
+
+
+class ForecastSnapshotRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: ForecastSnapshot) -> dict[str, Any]:
+        return {
+            "id": str(row.id), "participant_id": str(row.participant_id),
+            "local_date": row.local_date.isoformat(),
+            "calendar_revision": row.calendar_revision,
+            "semantic_revision": row.semantic_revision,
+            "algorithm_version": row.algorithm_version,
+            "forecast_version": row.forecast_version,
+            "semantic_status": row.semantic_status,
+            "semantic_input": list(row.semantic_input_json),
+            "curve": list(row.curve_json), "peaks": list(row.peaks_json),
+            "warning_windows": list(row.warning_windows_json),
+            "output": dict(row.output_json), "valid": row.valid,
+            "generated_at": row.generated_at.isoformat(),
+        }
+
+    def latest(self, participant_id: uuid.UUID, local_date: date) -> Optional[dict[str, Any]]:
+        with self.database.session() as session:
+            row = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.valid.is_(True),
+                ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)
+            ).scalar_one_or_none()
+            return self._view(row) if row else None
+
+    def save(
+        self, participant_id: uuid.UUID, local_date: date, *,
+        calendar_revision: str, semantic_revision: str, algorithm_version: str,
+        forecast_version: str, semantic_status: str, semantic_input: list[dict[str, Any]],
+        curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
+        warning_windows: list[dict[str, Any]], output: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.database.session() as session:
+            existing = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.forecast_version == forecast_version,
+                )
+            ).scalar_one_or_none()
+            if existing:
+                return self._view(existing)
+            stale = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.valid.is_(True),
+                )
+            ).scalars().all()
+            for row in stale:
+                row.valid = False
+            row = ForecastSnapshot(
+                participant_id=participant_id, local_date=local_date,
+                calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+                algorithm_version=algorithm_version, forecast_version=forecast_version,
+                semantic_status=semantic_status, semantic_input_json=list(semantic_input),
+                curve_json=list(curve), peaks_json=list(peaks),
+                warning_windows_json=list(warning_windows), output_json=dict(output), valid=True,
+            )
+            session.add(row)
+            session.flush()
+            return self._view(row)
+
+
+class WarningScheduleRepository:
+    ACTIVE = {"pending", "claimed"}
+
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _aware(value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+    @staticmethod
+    def _view(row: WarningSchedule) -> dict[str, Any]:
+        return {
+            "id": str(row.id), "participant_id": str(row.participant_id),
+            "local_date": row.local_date.isoformat(), "forecast_id": str(row.forecast_id),
+            "forecast_version": row.forecast_version, "warning_identity": row.warning_identity,
+            "target_time": row.target_time.isoformat(), "warning_level": row.warning_level,
+            "status": row.status, "payload": dict(row.payload_json),
+            "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        }
+
+    def sync(
+        self, participant_id: uuid.UUID, local_date: date, *, forecast_id: uuid.UUID,
+        forecast_version: str, warnings: list[dict[str, Any]], now: datetime,
+    ) -> dict[str, int]:
+        counts = {"kept": 0, "created": 0, "rescheduled": 0, "cancelled": 0}
+        now = self._aware(now)
+        desired = {
+            item["warning_identity"]: item for item in warnings
+            if self._aware(item["target_time"]) > now
+        }
+        with self.database.session() as session:
+            rows = session.execute(
+                select(WarningSchedule).where(
+                    WarningSchedule.participant_id == participant_id,
+                    WarningSchedule.local_date == local_date,
+                ).with_for_update()
+            ).scalars().all()
+            existing = {row.warning_identity: row for row in rows}
+            for identity, row in existing.items():
+                item = desired.pop(identity, None)
+                if item is None:
+                    if row.status in self.ACTIVE and self._aware(row.target_time) > now:
+                        row.status = "cancelled"
+                        row.updated_at = utc_now()
+                        counts["cancelled"] += 1
+                    continue
+                if row.status == "sent":
+                    counts["kept"] += 1
+                    continue
+                changed = row.target_time != item["target_time"] or row.warning_level != item["warning_level"]
+                row.forecast_id = forecast_id
+                row.forecast_version = forecast_version
+                row.payload_json = dict(item["payload"])
+                row.target_time = item["target_time"]
+                row.warning_level = item["warning_level"]
+                row.status = "pending"
+                row.updated_at = utc_now()
+                counts["rescheduled" if changed else "kept"] += 1
+            for identity, item in desired.items():
+                session.add(WarningSchedule(
+                    participant_id=participant_id, local_date=local_date,
+                    forecast_id=forecast_id, forecast_version=forecast_version,
+                    warning_identity=identity, target_time=item["target_time"],
+                    warning_level=item["warning_level"], status="pending",
+                    payload_json=dict(item["payload"]),
+                ))
+                counts["created"] += 1
+        return counts
+
+    def pending(self, now: datetime, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(WarningSchedule).join(
+                    ForecastSnapshot, ForecastSnapshot.id == WarningSchedule.forecast_id
+                ).where(
+                    WarningSchedule.status == "pending",
+                    WarningSchedule.target_time <= now,
+                    ForecastSnapshot.valid.is_(True),
+                    ForecastSnapshot.forecast_version == WarningSchedule.forecast_version,
+                ).order_by(WarningSchedule.target_time).limit(limit)
+            ).scalars().all()
+            return [self._view(row) for row in rows]
+
+    def mark_sent_if_current(self, warning_id: uuid.UUID, now: datetime) -> bool:
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if row is None or row.status != "pending":
+                return False
+            forecast = session.get(ForecastSnapshot, row.forecast_id)
+            if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
+                row.status = "cancelled"
+                row.updated_at = utc_now()
+                return False
+            row.status = "sent"
+            row.sent_at = now
+            row.updated_at = now
+            return True
+
+    def claim_if_current(self, warning_id: uuid.UUID) -> Optional[dict[str, Any]]:
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if row is None or row.status != "pending":
+                return None
+            forecast = session.get(ForecastSnapshot, row.forecast_id)
+            if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
+                row.status = "cancelled"
+                row.updated_at = utc_now()
+                return None
+            row.status = "claimed"
+            row.updated_at = utc_now()
+            return self._view(row)
+
+    def finish_claim(self, warning_id: uuid.UUID, *, sent: bool, now: datetime) -> None:
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if row is None or row.status != "claimed":
+                return
+            row.status = "sent" if sent else "pending"
+            row.sent_at = now if sent else None
+            row.updated_at = now
 
 
 class ConversationRepository:
