@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 import inspect
 import subprocess
 import sys
+import threading
 import uuid
 
 from app import main as app_main
@@ -58,16 +59,21 @@ class FakePrediction:
         }
 
 
-def event(summary="汇报", description="准备正式汇报", start="10:00", end="11:00"):
+def event(
+    summary="汇报", description="准备正式汇报", start="10:00", end="11:00",
+    event_id="event-1",
+):
     target = TEST_LOCAL_DATE.isoformat()
     return {
-        "id": "event-1", "summary": summary, "description": description,
+        "id": event_id, "summary": summary, "description": description,
         "start_time": f"{target}T{start}:00+08:00",
         "end_time": f"{target}T{end}:00+08:00",
     }
 
 
-def build_pipeline(events, *, consent=False, client=None):
+def build_pipeline(
+    events, *, consent=False, client=None, semantic_max_concurrency=2,
+):
     database = memory_database()
     participants = ParticipantRepository(database)
     participant = participants.create("FORECAST-TEST")
@@ -76,7 +82,7 @@ def build_pipeline(events, *, consent=False, client=None):
     cache = EventSemanticCacheRepository(database)
     semantics = EventSemanticPreprocessor(
         cache, client=client, model="semantic-test-v1",
-        max_concurrency=2,
+        max_concurrency=semantic_max_concurrency,
     )
     prediction = FakePrediction()
     warnings = WarningScheduleRepository(database)
@@ -216,6 +222,185 @@ def test_invalid_external_response_opens_circuit_and_rules_remain_available():
         assert prepared[0]["metadata"]["semantic"]["values"]
 
     asyncio.run(scenario())
+
+
+def test_circuit_recheck_after_semaphore_stops_queued_request_storm():
+    class FailingClient:
+        provider = "deepseek"
+        model = "fake"
+
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+            self.first_batch = threading.Barrier(2)
+
+        def infer(self, _payload):
+            with self.lock:
+                self.calls += 1
+            self.first_batch.wait()
+            raise RuntimeError("429")
+
+    events = [
+        event(summary=f"任务 {index}", event_id=f"event-{index}")
+        for index in range(20)
+    ]
+    client = FailingClient()
+    _, participant, _, semantics, _, _, _ = build_pipeline(
+        events, consent=True, client=client
+    )
+
+    async def scenario():
+        prepared, _, status, misses = semantics.prepare(
+            participant.id, events, consent=True
+        )
+        completed = 0
+
+        async def done():
+            nonlocal completed
+            completed += 1
+
+        await semantics.enqueue(participant.id, misses, done)
+        await semantics.close()
+        assert status == "rules_only"
+        assert all(item["metadata"]["semantic"]["source"] == "rules" for item in prepared)
+        assert completed == 0
+        assert len(semantics.prepare(participant.id, events, consent=True)[3]) == 20
+
+    asyncio.run(scenario())
+    assert client.calls == 2
+
+
+def test_completion_watcher_absorbs_new_fingerprint_without_duplicate_callback():
+    class BlockingClient:
+        provider = "deepseek"
+        model = "fake"
+
+        def __init__(self):
+            self.calls = []
+            self.started_a = threading.Event()
+            self.release_a = threading.Event()
+
+        def infer(self, payload):
+            self.calls.append(payload["summary"])
+            if payload["summary"] == "A":
+                self.started_a.set()
+                self.release_a.wait()
+            return {
+                "values": {key: 0.8 for key in (
+                    "difficulty", "cognitive_demand", "stakes", "time_pressure",
+                    "social_evaluation", "uncontrollability", "novelty",
+                    "expected_effort", "uncertainty", "unfinished",
+                )},
+                "appraisal_score_1_10": 6.0,
+                "confidence": 0.8,
+                "evidence_tags": [],
+                "reasoning_summary": "ok",
+            }
+
+    event_a = event(summary="A", event_id="event-a")
+    event_b = event(summary="B", event_id="event-b")
+    client = BlockingClient()
+    _, participant, _, semantics, _, _, _ = build_pipeline(
+        [event_a], consent=True, client=client, semantic_max_concurrency=1
+    )
+
+    async def scenario():
+        completed = 0
+
+        async def done():
+            nonlocal completed
+            completed += 1
+
+        misses_a = semantics.prepare(participant.id, [event_a], consent=True)[3]
+        await semantics.enqueue(
+            participant.id, misses_a, done,
+            completion_key=(participant.id, TEST_LOCAL_DATE),
+        )
+        assert await asyncio.to_thread(client.started_a.wait, 2)
+        misses_ab = semantics.prepare(
+            participant.id, [event_a, event_b], consent=True
+        )[3]
+        await semantics.enqueue(
+            participant.id, misses_ab, done,
+            completion_key=(participant.id, TEST_LOCAL_DATE),
+        )
+        client.release_a.set()
+        await semantics.close()
+        prepared, _, status, misses = semantics.prepare(
+            participant.id, [event_a, event_b], consent=True
+        )
+        assert misses == []
+        assert status == "hybrid_complete"
+        assert all(item["metadata"]["semantic"]["source"] == "hybrid" for item in prepared)
+        assert completed == 1
+
+    asyncio.run(scenario())
+    assert sorted(client.calls) == ["A", "B"]
+
+
+def test_dynamic_calendar_addition_is_enriched_and_latest_forecast_uses_it():
+    class BlockingClient:
+        provider = "deepseek"
+        model = "fake"
+
+        def __init__(self):
+            self.calls = []
+            self.started_a = threading.Event()
+            self.release_a = threading.Event()
+
+        def infer(self, payload):
+            self.calls.append(payload["summary"])
+            if payload["summary"] == "A":
+                self.started_a.set()
+                self.release_a.wait()
+            return {
+                "values": {
+                    "difficulty": 0.9, "cognitive_demand": 0.9, "stakes": 0.8,
+                    "time_pressure": 0.8, "social_evaluation": 0.7,
+                    "uncontrollability": 0.6, "novelty": 0.6,
+                    "expected_effort": 0.9, "uncertainty": 0.7, "unfinished": 0.6,
+                },
+                "appraisal_score_1_10": 2.0,
+                "confidence": 0.9,
+                "evidence_tags": [],
+                "reasoning_summary": "material enrichment",
+            }
+
+    event_a = event(summary="A", event_id="event-a")
+    event_b = event(summary="B", event_id="event-b", start="12:00", end="13:00")
+    client = BlockingClient()
+    database, participant, calendar, semantics, _, _, coordinator = build_pipeline(
+        [event_a], consent=True, client=client, semantic_max_concurrency=1
+    )
+
+    async def scenario():
+        first = await coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "daily_prepare"
+        )
+        assert await asyncio.to_thread(client.started_a.wait, 2)
+        calendar.events = [event_a, event_b]
+        second = await coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "user_curve_request"
+        )
+        assert second["calendar_revision"] != first["calendar_revision"]
+        client.release_a.set()
+        await semantics.close()
+
+    asyncio.run(scenario())
+    latest = ForecastSnapshotRepository(database).latest(
+        participant.id, TEST_LOCAL_DATE
+    )
+    prepared, _, status, misses = semantics.prepare(
+        participant.id, [event_a, event_b], consent=True
+    )
+    assert sorted(client.calls) == ["A", "B"]
+    assert misses == []
+    assert status == "hybrid_complete"
+    assert {item["event_id"] for item in latest["semantic_input"]} == {"event-a", "event-b"}
+    assert all(
+        item["metadata"]["semantic"]["source"] == "hybrid"
+        for item in prepared
+    )
 
 
 def test_on_demand_forecast_is_immediate_rules_baseline_and_fast_path():

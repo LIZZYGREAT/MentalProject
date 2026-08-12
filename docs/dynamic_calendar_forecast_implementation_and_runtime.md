@@ -490,14 +490,26 @@ WARNING_EPISODE_DRIFT_MINUTES=15
 
 ```text
 1. 检查并补全 .env
-2. alembic upgrade head
-3. docker compose config
-4. 重启 bot/postgres 服务
-5. 检查 settings/database/business/gateway/scheduler 分阶段 RSS 日志
-6. 验证 daily_prepare、periodic_poll、user_curve_request
-7. 验证无 consent 时 0 次 semantic API 调用
-8. 验证重复周期课程命中 event_semantic_cache
+2. 在 ECS 数据库执行 alembic current
+3. 执行 warning_schedules 状态计数；表不存在或为空可直接继续
+4. alembic upgrade head
+5. docker compose config
+6. 重启 bot/postgres 服务
+7. 检查 settings/database/business/gateway/scheduler 分阶段 RSS 日志
+8. 验证 daily_prepare、periodic_poll、user_curve_request
+9. 验证无 consent 时 0 次 semantic API 调用
+10. 验证重复周期课程命中 event_semantic_cache
 ```
+
+升级前的数据检查：
+
+```sql
+SELECT status, COUNT(*)
+FROM warning_schedules
+GROUP BY status;
+```
+
+`0005_fix_legacy_warning_times` 会修正 `0004` 旧数据回填产生的精确签名：活跃 warning 同时满足 `risk_time = target_time` 与 `valid_until = target_time + 30 minutes`。修正后 legacy risk 为 `target_time + 20 minutes`，最晚发送时间为 `target_time + 10 minutes`。它不会宽泛更新不满足该签名的记录。ECS 当前 Alembic version 和旧 warning 数量仍须在部署主机实际查询，本地 SQLite 测试不能代替该确认。
 
 ---
 
@@ -506,7 +518,8 @@ WARNING_EPISODE_DRIFT_MINUTES=15
 在 `MentalProject` Conda 环境运行：
 
 ```text
-pytest: 64 passed
+pytest: 85 passed
+TZ=UTC pytest: 85 passed
 compileall: passed
 git diff --check: passed
 docker compose config --quiet: passed

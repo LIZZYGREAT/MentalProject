@@ -69,7 +69,7 @@ class EventSemanticPreprocessor:
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
         self._completion_tasks: set[asyncio.Task] = set()
-        self._completion_by_key: dict[Hashable, asyncio.Task] = {}
+        self._completion_states: dict[Hashable, dict[str, Any]] = {}
         self._closing = False
         self._circuit_until = 0.0
         self._circuit_seconds = max(1.0, circuit_seconds)
@@ -210,11 +210,8 @@ class EventSemanticPreprocessor:
             str(participant_id),
             tuple(sorted(miss["fingerprint"] for miss in misses)),
         )
-        tasks = []
+        tasks: set[asyncio.Task] = set()
         async with self._inflight_lock:
-            existing = self._completion_by_key.get(callback_key)
-            if existing is not None and not existing.done():
-                return
             for miss in misses:
                 key = (str(participant_id), miss["fingerprint"])
                 task = self._inflight.get(key)
@@ -224,26 +221,43 @@ class EventSemanticPreprocessor:
                         name=f"semantic-{miss['fingerprint'][:10]}",
                     )
                     self._inflight[key] = task
-                tasks.append(task)
+                tasks.add(task)
             if not tasks:
                 return
+            state = self._completion_states.get(callback_key)
+            if state is None:
+                state = {"pending": set(), "on_complete": on_complete}
+                completion = asyncio.create_task(
+                    self._watch_completion(callback_key, state),
+                    name="semantic-enrichment-completion",
+                )
+                state["watcher"] = completion
+                self._completion_states[callback_key] = state
+                self._completion_tasks.add(completion)
+                completion.add_done_callback(self._completion_done)
+            state["pending"].update(tasks)
 
-            async def finish() -> None:
-                try:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    if any(result is True for result in results):
-                        await on_complete()
-                finally:
-                    async with self._inflight_lock:
-                        if self._completion_by_key.get(callback_key) is asyncio.current_task():
-                            self._completion_by_key.pop(callback_key, None)
-
-            completion = asyncio.create_task(
-                finish(), name="semantic-enrichment-completion"
-            )
-            self._completion_by_key[callback_key] = completion
-            self._completion_tasks.add(completion)
-            completion.add_done_callback(self._completion_done)
+    async def _watch_completion(
+        self, callback_key: Hashable, state: dict[str, Any],
+    ) -> None:
+        any_success = False
+        try:
+            while True:
+                async with self._inflight_lock:
+                    pending = set(state["pending"])
+                    state["pending"].clear()
+                    if not pending:
+                        if self._completion_states.get(callback_key) is state:
+                            self._completion_states.pop(callback_key, None)
+                        break
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                any_success = any_success or any(result is True for result in results)
+            if any_success:
+                await state["on_complete"]()
+        finally:
+            async with self._inflight_lock:
+                if self._completion_states.get(callback_key) is state:
+                    self._completion_states.pop(callback_key, None)
 
     def _completion_done(self, task: asyncio.Task) -> None:
         self._completion_tasks.discard(task)
@@ -288,6 +302,8 @@ class EventSemanticPreprocessor:
         if time.monotonic() < self._circuit_until:
             return False
         async with self._semaphore:
+            if time.monotonic() < self._circuit_until:
+                return False
             try:
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
                 values, confidence, tags, reasoning = validate_external_semantics(raw)

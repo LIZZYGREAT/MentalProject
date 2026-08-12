@@ -251,15 +251,10 @@ class ForecastCoordinator:
         })
         if enqueue_enrichment and misses and consent:
             async def recompute() -> None:
-                before = semantic_revision
-                refreshed_events, after, _, _ = await asyncio.to_thread(
-                    self.semantics.prepare, participant_id, events, consent=True
+                await self.ensure_forecast(
+                    participant_id, target, "semantic_enrichment_completion",
+                    refresh_calendar=False, enqueue_enrichment=False,
                 )
-                if self._semantic_delta(semantic_events, refreshed_events) >= self.materiality_threshold and after != before:
-                    await self.ensure_forecast(
-                        participant_id, target, "semantic_enrichment_completion",
-                        refresh_calendar=False, enqueue_enrichment=False,
-                    )
             await self.semantics.enqueue(
                 participant_id, misses, recompute,
                 completion_key=(participant_id, target),
