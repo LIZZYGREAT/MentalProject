@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16.4-alpine
+    image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/postgres
     environment:
       POSTGRES_DB: mindflow
       POSTGRES_USER: mindflow

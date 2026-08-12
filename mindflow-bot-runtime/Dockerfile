@@ -1,5 +1,4 @@
-FROM python:3.11.15-slim
-
+FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/srv/runtime:/srv/project \
@@ -8,7 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install \
+    --no-cache-dir \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    --trusted-host pypi.tuna.tsinghua.edu.cn \
+    -r requirements.txt
 RUN python -c "import claude_agent_sdk; print('claude-agent-sdk import ok')"
 
 COPY mindflow-bot-runtime/ /srv/runtime/
