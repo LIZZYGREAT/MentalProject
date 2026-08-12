@@ -49,6 +49,7 @@ class Settings:
     feishu_send_max_retries: int = 1
     feishu_gateway_start_timeout_seconds: int = 30
     feishu_gateway_stop_timeout_seconds: int = 8
+    feishu_gateway_device_flow_close_timeout_seconds: int = 8
 
     @property
     def care_skill_path(self) -> Path:
@@ -146,6 +147,11 @@ class Settings:
             ),
             feishu_gateway_stop_timeout_seconds=_int(
                 values, "FEISHU_GATEWAY_STOP_TIMEOUT_SECONDS", 8
+            ),
+            feishu_gateway_device_flow_close_timeout_seconds=_int(
+                values,
+                "FEISHU_GATEWAY_DEVICE_FLOW_CLOSE_TIMEOUT_SECONDS",
+                8,
             ),
         )
         if validate:

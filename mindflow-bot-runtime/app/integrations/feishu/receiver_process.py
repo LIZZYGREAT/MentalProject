@@ -30,6 +30,8 @@ def receiver_process_main(
     output_queue: Any,
     stop_event: Any,
     channel_factory: Callable[..., Any] | None = None,
+    device_flow_close_timeout_seconds: float = 8.0,
+    channel_sdk_version: str | None = None,
 ) -> None:
     """Run FeishuChannel in a fresh interpreter with a process-local loop."""
 
@@ -47,6 +49,7 @@ def receiver_process_main(
         FeishuChannelMessageAdapter,
         InvalidBotEvent,
     )
+    from app.integrations.feishu.channel_shutdown import stop_feishu_channel_cleanly
 
     adapter = FeishuChannelMessageAdapter(app_id)
     channel: Any | None = None
@@ -69,9 +72,13 @@ def receiver_process_main(
                 stop_started = True
         if owns_stop:
             try:
-                stop = getattr(channel, "stop", None)
-                if callable(stop):
-                    stop()
+                stop_feishu_channel_cleanly(
+                    channel,
+                    device_flow_close_timeout_seconds=(
+                        device_flow_close_timeout_seconds
+                    ),
+                    sdk_version=channel_sdk_version,
+                )
             except BaseException as exc:
                 stop_errors.append(exc)
             finally:

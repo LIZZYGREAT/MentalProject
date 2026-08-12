@@ -149,6 +149,9 @@ async def run() -> None:
         queue,
         start_timeout_seconds=settings.feishu_gateway_start_timeout_seconds,
         stop_timeout_seconds=settings.feishu_gateway_stop_timeout_seconds,
+        device_flow_close_timeout_seconds=(
+            settings.feishu_gateway_device_flow_close_timeout_seconds
+        ),
     )
     for saved in events.recoverable():
         await queue.put(

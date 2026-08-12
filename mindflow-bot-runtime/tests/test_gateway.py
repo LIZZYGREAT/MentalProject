@@ -146,8 +146,68 @@ class StopErrorFakeChannel:
         raise RuntimeError("STOP_BROKEN")
 
 
+class ControlledDeviceFlow:
+    def __init__(self, close_started, close_allowed, close_finished, unblock_start):
+        self.close_started = close_started
+        self.close_allowed = close_allowed
+        self.close_finished = close_finished
+        self.unblock_start = unblock_start
+
+    async def close(self):
+        self.close_started.set()
+        try:
+            while not self.close_allowed.is_set():
+                await asyncio.sleep(0.01)
+        finally:
+            self.close_finished.set()
+            self.unblock_start.set()
+
+
+class DeviceFlowFakeChannel:
+    """Model the SDK background loop and its private DeviceFlow client."""
+
+    def __init__(
+        self,
+        close_started,
+        close_allowed,
+        close_finished,
+        public_stop_called,
+        **_kwargs,
+    ):
+        self.is_ready = False
+        self._start_unblocked = threading.Event()
+        self._bg_loop = asyncio.new_event_loop()
+        self._bg_thread = threading.Thread(
+            target=self._bg_loop.run_forever,
+            name="fake-lark-channel-bg",
+            daemon=True,
+        )
+        self._device_flow = ControlledDeviceFlow(
+            close_started,
+            close_allowed,
+            close_finished,
+            self._start_unblocked,
+        )
+        self.public_stop_called = public_stop_called
+
+    def on(self, name, _handler):
+        assert name == "message"
+
+    def start(self):
+        self._bg_thread.start()
+        self.is_ready = True
+        self._start_unblocked.wait(5.0)
+
+    def stop(self):
+        self.public_stop_called.set()
+        self._start_unblocked.set()
+        self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+        self._bg_thread.join(2.0)
+        self._bg_loop.close()
+
+
 def receiver_exits_after_ready(
-    _app_id, _app_secret, output_queue, _stop_event, _channel_factory
+    _app_id, _app_secret, output_queue, _stop_event, _channel_factory, *_args
 ):
     output_queue.put({"kind": "ready"})
     time.sleep(0.1)
@@ -255,6 +315,99 @@ def test_gateway_stop_propagates_receiver_stop_failure_without_unretrieved_futur
             with pytest.raises(FeishuReceiverError, match="STOP_BROKEN"):
                 await gateway.stop()
             assert process is not None and not process.is_alive()
+            await asyncio.sleep(0)
+            assert not any(
+                "Future exception was never retrieved"
+                in str(context.get("message") or "")
+                for context in unhandled
+            )
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    asyncio.run(scenario())
+
+
+def test_gateway_precloses_sdk_device_flow_before_public_stop():
+    context = multiprocessing.get_context("spawn")
+    close_started = context.Event()
+    close_allowed = context.Event()
+    close_finished = context.Event()
+    public_stop_called = context.Event()
+    database = memory_database()
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        asyncio.Queue(maxsize=2),
+        channel_factory=partial(
+            DeviceFlowFakeChannel,
+            close_started,
+            close_allowed,
+            close_finished,
+            public_stop_called,
+        ),
+        process_context=context,
+        start_timeout_seconds=5,
+        stop_timeout_seconds=3,
+        device_flow_close_timeout_seconds=1,
+        channel_sdk_version="1.2.0",
+    )
+
+    async def scenario():
+        await gateway.start()
+        stop_task = asyncio.create_task(gateway.stop())
+        assert await asyncio.to_thread(close_started.wait, 2.0)
+        assert not public_stop_called.is_set()
+        close_allowed.set()
+        await stop_task
+        assert close_finished.is_set()
+        assert public_stop_called.is_set()
+        assert not gateway.is_running
+
+    asyncio.run(scenario())
+
+
+def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
+    context = multiprocessing.get_context("spawn")
+    close_started = context.Event()
+    close_allowed = context.Event()
+    close_finished = context.Event()
+    public_stop_called = context.Event()
+    database = memory_database()
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        asyncio.Queue(maxsize=2),
+        channel_factory=partial(
+            DeviceFlowFakeChannel,
+            close_started,
+            close_allowed,
+            close_finished,
+            public_stop_called,
+        ),
+        process_context=context,
+        start_timeout_seconds=5,
+        stop_timeout_seconds=3,
+        device_flow_close_timeout_seconds=0.1,
+        channel_sdk_version="1.2.0",
+    )
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        unhandled = []
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            await gateway.start()
+            with pytest.raises(FeishuReceiverError, match="DeviceFlow close timed out"):
+                await gateway.stop()
+            assert close_started.is_set()
+            assert close_finished.is_set()
+            assert not public_stop_called.is_set()
+            assert not gateway.is_running
             await asyncio.sleep(0)
             assert not any(
                 "Future exception was never retrieved"

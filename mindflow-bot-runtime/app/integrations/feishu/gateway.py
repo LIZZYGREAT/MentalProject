@@ -203,6 +203,8 @@ class FeishuGateway:
         receiver_target: Callable[..., None] | None = None,
         start_timeout_seconds: float = 30.0,
         stop_timeout_seconds: float = 8.0,
+        device_flow_close_timeout_seconds: float = 8.0,
+        channel_sdk_version: str | None = None,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -216,6 +218,8 @@ class FeishuGateway:
         self.receiver_target = receiver_target
         self.start_timeout_seconds = start_timeout_seconds
         self.stop_timeout_seconds = stop_timeout_seconds
+        self.device_flow_close_timeout_seconds = device_flow_close_timeout_seconds
+        self.channel_sdk_version = channel_sdk_version
         self._loop: asyncio.AbstractEventLoop | None = None
         self._process: Any | None = None
         self._process_started = False
@@ -306,6 +310,8 @@ class FeishuGateway:
                 self._output_queue,
                 self._stop_event,
                 self.channel_factory,
+                self.device_flow_close_timeout_seconds,
+                self.channel_sdk_version,
             ),
             daemon=True,
         )
