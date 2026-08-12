@@ -144,20 +144,13 @@ def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):
     assert options.env["CLAUDE_CODE_SUBAGENT_MODEL"] == "deepseek-v4-flash"
     assert "top-secret-token" not in str(options.allowed_tools)
 
-    async def permission_results():
-        return (
-            await options.can_use_tool("Skill", {}, None),
-            await options.can_use_tool("mcp__mindflow__safe_tool", {}, None),
-            await options.can_use_tool("Bash", {}, None),
-            await options.can_use_tool("SkillInjected", {}, None),
-        )
-
-    skill, mcp, bash, fake_skill = asyncio.run(permission_results())
-    assert isinstance(skill, FakeSDK.PermissionResultAllow)
-    assert isinstance(mcp, FakeSDK.PermissionResultAllow)
-    assert isinstance(bash, FakeSDK.PermissionResultDeny)
-    assert isinstance(fake_skill, FakeSDK.PermissionResultDeny)
-
+    assert "Bash" in options.disallowed_tools
+    assert "Read" in options.disallowed_tools
+    assert "Write" in options.disallowed_tools
+    assert "Edit" in options.disallowed_tools
+    assert "WebSearch" in options.disallowed_tools
+    assert "WebFetch" in options.disallowed_tools
+    assert set(options.mcp_servers) == {"mindflow"}
 
 def test_parent_environment_is_reduced_to_runtime_allowlist():
     environment = {

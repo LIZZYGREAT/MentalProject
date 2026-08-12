@@ -1,4 +1,15 @@
 services:
+  claude-state-init:
+    image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
+    user: root
+    command:
+      - sh
+      - -c
+      - chown -R 10001:10001 /home/mindflow/.claude
+    volumes:
+      - claude_state:/home/mindflow/.claude
+    restart: "no"
+
   bot:
     build:
       context: ..
@@ -8,6 +19,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      claude-state-init:
+        condition: service_completed_successfully
     command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
     environment:
       CLAUDE_WORKDIR: /srv/claude-workspace

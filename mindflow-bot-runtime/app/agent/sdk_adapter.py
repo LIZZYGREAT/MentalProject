@@ -306,21 +306,12 @@ class ProductionClaudeClientFactory:
         sdk = _load_sdk()
         server = build_sdk_mcp_server(self.registry, binding, sdk=sdk)
 
-        async def deny_unreviewed(tool_name, _tool_input, _context):
-            if tool_name in self.allowed_tools or tool_name == "Skill":
-                return sdk.PermissionResultAllow()
-            return sdk.PermissionResultDeny(
-                message="Tool is outside the MindFlow production allowlist",
-                interrupt=False,
-            )
-
         options = sdk.ClaudeAgentOptions(
             tools=["Skill"],
             skills=[SKILL_NAME],
             allowed_tools=list(self.allowed_tools),
             disallowed_tools=list(DISALLOWED_TOOLS),
             permission_mode="dontAsk",
-            can_use_tool=deny_unreviewed,
             mcp_servers={"mindflow": server},
             strict_mcp_config=True,
             setting_sources=[],

@@ -2,8 +2,7 @@
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": [
-      "Skill(mindflow-care:mental-health-care)",
-      "mcp__mindflow__*"
+      "Skill(mindflow-care:mental-health-care)"
     ],
     "deny": [
       "Bash",
