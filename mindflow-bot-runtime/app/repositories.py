@@ -540,6 +540,8 @@ class WarningScheduleRepository:
             "valid_until": row.valid_until.isoformat(), "warning_level": row.warning_level,
             "status": row.status, "payload": dict(row.payload_json),
             "attempt_count": row.attempt_count,
+            "claim_token": str(row.claim_token) if row.claim_token else None,
+            "claimed_at": row.claimed_at.isoformat() if row.claimed_at else None,
             "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
             "lease_until": row.lease_until.isoformat() if row.lease_until else None,
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
@@ -620,12 +622,28 @@ class WarningScheduleRepository:
                         row.risk_time = item["risk_time"]
                         row.valid_until = item["valid_until"]
                         row.next_attempt_at = now
+                        row.claim_token = None
+                        row.claimed_at = None
+                        row.lease_until = None
                         row.updated_at = now
                         counts["rescheduled"] += 1
                     else:
                         counts["kept"] += 1
                     continue
-                changed = row.target_time != item["target_time"] or row.warning_level != item["warning_level"]
+                changed = (
+                    row.forecast_version != forecast_version
+                    or dict(row.payload_json) != dict(item["payload"])
+                    or row.warning_level != item["warning_level"]
+                    or self._aware(row.target_time) != self._aware(item["target_time"])
+                    or self._aware(row.risk_time) != self._aware(item["risk_time"])
+                    or self._aware(row.valid_until) != self._aware(item["valid_until"])
+                )
+                if row.status == "claimed" and changed:
+                    row.status = "pending"
+                    row.claim_token = None
+                    row.claimed_at = None
+                    row.lease_until = None
+                    row.next_attempt_at = max(self._aware(item["target_time"]), now)
                 row.forecast_id = forecast_id
                 row.forecast_version = forecast_version
                 row.payload_json = dict(item["payload"])
@@ -645,6 +663,9 @@ class WarningScheduleRepository:
                     and self._aware(row.risk_time) > now
                 ):
                     row.status = "cancelled"
+                    row.claim_token = None
+                    row.claimed_at = None
+                    row.lease_until = None
                     row.updated_at = now
                     counts["cancelled"] += 1
         return counts
@@ -670,6 +691,9 @@ class WarningScheduleRepository:
             )).scalars().all()
             for row in expired:
                 row.status = "expired"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
                 row.updated_at = now
             rows = session.execute(
                 select(WarningSchedule).join(
@@ -726,36 +750,90 @@ class WarningScheduleRepository:
                 return None
             if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
                 row.status = "expired"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
                 row.updated_at = now
                 return None
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
                 row.status = "cancelled"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
                 row.updated_at = utc_now()
                 return None
             row.status = "claimed"
             row.claimed_at = now
             row.lease_until = now + timedelta(seconds=max(1, lease_seconds))
+            row.claim_token = uuid.uuid4()
             row.updated_at = now
             return self._view(row)
 
+    def validate_claim_current(
+        self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
+        expected_forecast_version: str, now: datetime,
+    ) -> bool:
+        now = self._aware(now)
+        token = uuid.UUID(str(claim_token))
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+                or row.claimed_at is None
+                or row.lease_until is None
+                or self._aware(row.lease_until) < now
+            ):
+                return False
+            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
+                row.status = "expired"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.updated_at = now
+                return False
+            forecast = session.get(ForecastSnapshot, row.forecast_id)
+            if (
+                forecast is None
+                or not forecast.valid
+                or forecast.forecast_version != expected_forecast_version
+            ):
+                row.status = "cancelled"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.updated_at = now
+                return False
+            return True
+
     def finish_claim(
-        self, warning_id: uuid.UUID, *, sent: bool, now: datetime,
+        self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
+        expected_forecast_version: str, sent: bool, now: datetime,
         retryable: bool = True, error_code: str | None = None,
         error_class: str | None = None, max_attempts: int = 5,
         retry_base_seconds: int = 60,
-    ) -> None:
+    ) -> bool:
         now = self._aware(now)
+        token = uuid.UUID(str(claim_token))
         with self.database.session() as session:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
-            if row is None or row.status != "claimed":
-                return
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
             row.attempt_count += 1
             row.last_attempt_at = now
             row.last_error_code = error_code
             row.last_error_class = error_class
             row.claimed_at = None
             row.lease_until = None
+            row.claim_token = None
             if sent:
                 row.status = "escalated" if bool(row.payload_json.get("escalation")) else "sent"
                 row.sent_at = now
@@ -776,14 +854,22 @@ class WarningScheduleRepository:
                     row.status = "pending"
                     row.next_attempt_at = next_attempt
             row.updated_at = now
+            return True
 
     def block_delivery(
-        self, warning_id: uuid.UUID, *, now: datetime, reason: str
-    ) -> None:
+        self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
+        expected_forecast_version: str, now: datetime, reason: str,
+    ) -> bool:
+        token = uuid.UUID(str(claim_token))
         with self.database.session() as session:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
-            if row is None or row.status != "claimed":
-                return
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
             now = self._aware(now)
             next_attempt = now + timedelta(minutes=5)
             if (
@@ -799,7 +885,9 @@ class WarningScheduleRepository:
             row.last_error_class = reason[:128]
             row.claimed_at = None
             row.lease_until = None
+            row.claim_token = None
             row.updated_at = now
+            return True
 
     def delivery_unavailable(
         self, now: datetime, *, limit: int = 100

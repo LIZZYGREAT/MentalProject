@@ -129,6 +129,8 @@ class ForecastScheduler:
         )
         if not claimed:
             return
+        claim_token = claimed["claim_token"]
+        expected_forecast_version = claimed["forecast_version"]
         binding = await asyncio.to_thread(
             self.bindings.get_for_participant,
             uuid.UUID(claimed["participant_id"]),
@@ -136,8 +138,17 @@ class ForecastScheduler:
         if not binding or not binding.get("chat_id"):
             await asyncio.to_thread(
                 self.warnings.block_delivery, warning_id, now=now,
+                claim_token=claim_token,
+                expected_forecast_version=expected_forecast_version,
                 reason="missing_chat_id",
             )
+            return
+        if not await asyncio.to_thread(
+            self.warnings.validate_claim_current, warning_id,
+            claim_token=claim_token,
+            expected_forecast_version=expected_forecast_version,
+            now=datetime.now(timezone.utc),
+        ):
             return
         payload = claimed["payload"]
         text = str(
@@ -153,6 +164,8 @@ class ForecastScheduler:
             )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
+                claim_token=claim_token,
+                expected_forecast_version=expected_forecast_version,
                 now=datetime.now(timezone.utc), retryable=exc.retryable,
                 error_code=str(exc.code) if exc.code is not None else None,
                 error_class=type(exc).__name__, max_attempts=self.warning_max_attempts,
@@ -166,6 +179,8 @@ class ForecastScheduler:
             )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
+                claim_token=claim_token,
+                expected_forecast_version=expected_forecast_version,
                 now=datetime.now(timezone.utc), retryable=True,
                 error_class=type(exc).__name__, max_attempts=self.warning_max_attempts,
                 retry_base_seconds=self.warning_retry_base_seconds,
@@ -173,6 +188,8 @@ class ForecastScheduler:
             return
         await asyncio.to_thread(
             self.warnings.finish_claim, warning_id, sent=True,
+            claim_token=claim_token,
+            expected_forecast_version=expected_forecast_version,
             now=datetime.now(timezone.utc), max_attempts=self.warning_max_attempts,
             retry_base_seconds=self.warning_retry_base_seconds,
         )

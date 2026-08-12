@@ -44,12 +44,27 @@ def _safe_error_message(exc: Exception) -> str:
 
 
 def _duration_minutes(event: Mapping[str, Any]) -> float:
+    if event.get("duration_minutes") is not None:
+        try:
+            return max(0.0, float(event["duration_minutes"]))
+        except (TypeError, ValueError):
+            pass
     try:
         start = datetime.fromisoformat(str(event.get("start_time") or "").replace("Z", "+00:00"))
         end = datetime.fromisoformat(str(event.get("end_time") or "").replace("Z", "+00:00"))
         return max(0.0, (end - start).total_seconds() / 60.0)
     except (TypeError, ValueError):
         return 60.0
+
+
+def _normalized_semantic_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": str(event.get("summary") or "")[:200],
+        "description": str(event.get("description") or "")[:800],
+        "event_type": str(event.get("event_type") or "task").lower(),
+        "task_type": str(event.get("task_type") or "general").lower(),
+        "duration_minutes": round(_duration_minutes(event), 2),
+    }
 
 
 class EventSemanticPreprocessor:
@@ -76,16 +91,37 @@ class EventSemanticPreprocessor:
 
     def _fingerprint(self, event: Mapping[str, Any]) -> str:
         payload = {
-            "summary": str(event.get("summary") or "")[:160],
-            "description": str(event.get("description") or "")[:800],
-            "event_type": str(event.get("event_type") or "task").lower(),
-            "task_type": str(event.get("task_type") or "general").lower(),
-            "duration_minutes": round(_duration_minutes(event), 2),
+            **_normalized_semantic_event(event),
             "schema_version": SEMANTIC_SCHEMA_VERSION,
             "prompt_version": PROMPT_VERSION,
             "model": self.model,
         }
         return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
+
+    def _validated_cached_external(
+        self, participant_id: Any, fingerprint: str,
+    ) -> dict[str, Any] | None:
+        cached = self.cache.get(
+            participant_id, fingerprint,
+            schema_version=SEMANTIC_SCHEMA_VERSION,
+            prompt_version=PROMPT_VERSION, model=self.model,
+        )
+        if not cached:
+            return None
+        external = dict(cached.get("external") or {})
+        try:
+            values, confidence, tags, reasoning = validate_external_semantics({
+                **external, "values": external.get("objective_semantics"),
+            })
+        except (TypeError, ValueError):
+            return None
+        return {
+            **external,
+            "objective_semantics": values,
+            "confidence": confidence,
+            "evidence_tags": tags,
+            "reasoning_summary": reasoning,
+        }
 
     def prepare(
         self, participant_id: Any, events: list[dict[str, Any]], *, consent: bool
@@ -96,12 +132,13 @@ class EventSemanticPreprocessor:
         eligible_count = 0
         for raw in events:
             event = deepcopy(raw)
-            event_type = str(event.get("event_type") or "task").lower()
-            task_type = str(event.get("task_type") or "general").lower()
-            duration = _duration_minutes(event)
+            normalized = _normalized_semantic_event(event)
+            event_type = normalized["event_type"]
+            task_type = normalized["task_type"]
+            duration = normalized["duration_minutes"]
             rule_values, matched, floors = infer_rule_semantics(
-                name=str(event.get("summary") or ""),
-                description=str(event.get("description") or ""),
+                name=normalized["summary"],
+                description=normalized["description"],
                 event_type=event_type,
                 task_type=task_type,
                 duration_minutes=duration,
@@ -109,33 +146,22 @@ class EventSemanticPreprocessor:
             fingerprint = self._fingerprint(event)
             eligible = event_type not in {"rest", "meal", "nap", "sleep", "gym"}
             eligible_count += int(eligible)
-            cached = self.cache.get(
-                participant_id, fingerprint, schema_version=SEMANTIC_SCHEMA_VERSION,
-                prompt_version=PROMPT_VERSION, model=self.model,
+            external = self._validated_cached_external(
+                participant_id, fingerprint
             ) if consent and eligible and self.client else None
             values = dict(rule_values)
-            external = None
             source = "rules"
             confidence = 0.82 if matched else 0.68
-            if cached:
-                external = dict(cached.get("external") or {})
-                raw_external_values = external.get("objective_semantics")
-                try:
-                    validated_values, validated_confidence, _, _ = validate_external_semantics({
-                        **external, "values": raw_external_values,
-                    })
-                except (TypeError, ValueError):
-                    cached = None
-                    external = None
-                else:
-                    values, _ = fuse_rule_and_external(
-                        rule_values, validated_values, validated_confidence, floors,
-                    )
-                    confidence = max(confidence, validated_confidence * 0.85)
-                    source = "hybrid"
-                    external_count += 1
+            if external:
+                values, _ = fuse_rule_and_external(
+                    rule_values, external["objective_semantics"],
+                    external["confidence"], floors,
+                )
+                confidence = max(confidence, external["confidence"] * 0.85)
+                source = "hybrid"
+                external_count += 1
             fused_appraisal = appraisal = score_description(
-                str(event.get("description") or ""), str(event.get("summary") or "")
+                normalized["description"], normalized["summary"]
             )
             if external and external.get("appraisal_score_1_10") is not None:
                 external_appraisal = float(external["appraisal_score_1_10"])
@@ -143,16 +169,10 @@ class EventSemanticPreprocessor:
                 fused_appraisal = max(
                     1.0, min(10.0, appraisal + max(-1.2, min(1.2, weight * (external_appraisal - appraisal))))
                 )
-            if not cached and consent and eligible and self.client:
+            if not external and consent and eligible and self.client:
                 misses.append({
                     "fingerprint": fingerprint,
-                    "event": {
-                        "summary": str(event.get("summary") or "")[:160],
-                        "description": str(event.get("description") or "")[:800],
-                        "event_type": event_type,
-                        "task_type": task_type,
-                        "duration_minutes": round(duration, 2),
-                    },
+                    "event": normalized,
                     "rule_values": rule_values,
                     "floors": floors,
                 })
@@ -305,6 +325,12 @@ class EventSemanticPreprocessor:
             if time.monotonic() < self._circuit_until:
                 return False
             try:
+                cached = await asyncio.to_thread(
+                    self._validated_cached_external,
+                    participant_id, miss["fingerprint"],
+                )
+                if cached is not None:
+                    return True
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
                 values, confidence, tags, reasoning = validate_external_semantics(raw)
                 appraisal = float(raw["appraisal_score_1_10"])

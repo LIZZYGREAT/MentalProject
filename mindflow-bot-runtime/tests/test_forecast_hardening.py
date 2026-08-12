@@ -30,6 +30,37 @@ TEST_LOCAL_DATE = date(2030, 1, 15)
 TEST_NOW = datetime(2030, 1, 15, 5, 45, tzinfo=timezone.utc)
 
 
+def supersede_claimed_warning(
+    database, participant, warnings, warning_id, *, now=TEST_NOW,
+):
+    forecasts = ForecastSnapshotRepository(database)
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        episode = row.episode_identity
+        target_time = row.target_time
+        risk_time = row.risk_time
+        valid_until = row.valid_until
+    saved = forecasts.save(
+        participant.id, TEST_LOCAL_DATE,
+        calendar_revision="new-calendar", semantic_revision="new-semantic",
+        algorithm_version="new-algorithm", forecast_version="new-forecast-version",
+        semantic_status="rules_only", semantic_input=[], curve=[], peaks=[],
+        warning_windows=[], output={},
+    )
+    warnings.sync(
+        participant.id, TEST_LOCAL_DATE, forecast_id=uuid.UUID(saved["id"]),
+        forecast_version=saved["forecast_version"], now=now,
+        warnings=[{
+            "warning_identity": episode, "episode_identity": episode,
+            "target_time": target_time, "risk_time": risk_time,
+            "valid_until": valid_until, "warning_level": "3",
+            "episode_drift_minutes": 15,
+            "payload": {"message": "NEW RED WARNING"},
+        }],
+    )
+    return saved
+
+
 def semantic(appraisal, difficulty=0.6):
     values = {
         "difficulty": difficulty, "cognitive_demand": 0.6, "stakes": 0.5,
@@ -311,9 +342,14 @@ def test_warning_retry_lease_expiry_and_missing_channel():
     claimed = warnings.claim_if_current(warning_id, now=now, lease_seconds=10)
     assert claimed is not None
     assert warnings.claim_if_current(warning_id, now=now + timedelta(seconds=5), lease_seconds=10) is None
-    assert warnings.claim_if_current(warning_id, now=now + timedelta(seconds=11), lease_seconds=10) is not None
+    reclaimed = warnings.claim_if_current(
+        warning_id, now=now + timedelta(seconds=11), lease_seconds=10
+    )
+    assert reclaimed is not None
     warnings.finish_claim(
-        warning_id, sent=False, now=now + timedelta(seconds=11), retryable=True,
+        warning_id, claim_token=reclaimed["claim_token"],
+        expected_forecast_version=reclaimed["forecast_version"], sent=False,
+        now=now + timedelta(seconds=11), retryable=True,
         max_attempts=5, retry_base_seconds=60, error_class="FeishuSendError",
     )
     with database.session() as session:
@@ -353,9 +389,12 @@ def test_warning_can_send_slightly_late_but_expires_at_risk_time():
         row.next_attempt_at = row.target_time
         warning_id = row.id
     assert [item["id"] for item in warnings.pending(TEST_NOW)] == [str(warning_id)]
-    assert warnings.claim_if_current(warning_id, now=TEST_NOW) is not None
+    claimed = warnings.claim_if_current(warning_id, now=TEST_NOW)
+    assert claimed is not None
     warnings.finish_claim(
-        warning_id, sent=False, now=TEST_NOW, retryable=True,
+        warning_id, claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"], sent=False,
+        now=TEST_NOW, retryable=True,
         retry_base_seconds=60,
     )
     with database.session() as session:
@@ -377,11 +416,16 @@ def test_warning_retry_crossing_risk_time_expires_instead_of_rescheduling():
     with database.session() as session:
         row = session.query(WarningSchedule).one()
         row.status = "claimed"
+        row.claim_token = uuid.uuid4()
         row.risk_time = TEST_NOW + timedelta(seconds=30)
         row.valid_until = TEST_NOW + timedelta(seconds=30)
         warning_id = row.id
+        claim_token = row.claim_token
+        forecast_version = row.forecast_version
     warnings.finish_claim(
-        warning_id, sent=False, now=TEST_NOW, retryable=True,
+        warning_id, claim_token=claim_token,
+        expected_forecast_version=forecast_version, sent=False,
+        now=TEST_NOW, retryable=True,
         retry_base_seconds=60,
     )
     with database.session() as session:
@@ -406,6 +450,116 @@ def test_mark_sent_rechecks_risk_time_after_delivery_race():
     assert warnings.mark_sent_if_current(warning_id, TEST_NOW) is False
     with database.session() as session:
         assert session.get(WarningSchedule, warning_id).status == "expired"
+
+
+def test_claimed_warning_superseded_before_send_is_not_sent(monkeypatch):
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return TEST_NOW.astimezone(tz) if tz else TEST_NOW.replace(tzinfo=None)
+
+    class Sender:
+        sent = []
+
+        def send_text(self, _chat_id, text):
+            self.sent.append(text)
+
+    class Bindings:
+        def get_for_participant(self, _participant_id):
+            supersede_claimed_warning(
+                database, participant, warnings, warning_id, now=TEST_NOW
+            )
+            return {"chat_id": "oc_test"}
+
+    monkeypatch.setattr("app.services.forecast_scheduler.datetime", FixedDateTime)
+
+    async def scenario():
+        await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
+        nonlocal_warning_id = None
+        with database.session() as session:
+            row = session.query(WarningSchedule).one()
+            row.target_time = TEST_NOW - timedelta(seconds=1)
+            row.next_attempt_at = TEST_NOW - timedelta(seconds=1)
+            row.valid_until = TEST_NOW + timedelta(minutes=10)
+            row.risk_time = TEST_NOW + timedelta(minutes=20)
+            nonlocal_warning_id = row.id
+        return nonlocal_warning_id
+
+    warning_id = asyncio.run(scenario())
+    sender = Sender()
+    scheduler = ForecastScheduler(
+        coordinator=coordinator, participants=None, warnings=warnings,
+        bindings=Bindings(), sender=sender, timezone_name="Asia/Shanghai",
+        daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
+        warning_poll_interval_seconds=999,
+    )
+    asyncio.run(scheduler._deliver_warning(warnings.pending(TEST_NOW)[0]))
+    assert sender.sent == []
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.status == "pending"
+        assert row.forecast_version == "new-forecast-version"
+        assert row.payload_json["message"] == "NEW RED WARNING"
+        assert row.claim_token is None
+
+
+def test_stale_claim_cannot_mark_new_warning_sent():
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+
+    async def prepare():
+        await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
+
+    asyncio.run(prepare())
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        row.target_time = TEST_NOW - timedelta(seconds=1)
+        row.next_attempt_at = TEST_NOW - timedelta(seconds=1)
+        row.valid_until = TEST_NOW + timedelta(minutes=10)
+        row.risk_time = TEST_NOW + timedelta(minutes=20)
+        warning_id = row.id
+    claimed = warnings.claim_if_current(warning_id, now=TEST_NOW)
+    supersede_claimed_warning(database, participant, warnings, warning_id)
+    assert warnings.finish_claim(
+        warning_id, claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"],
+        sent=True, now=TEST_NOW,
+    ) is False
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.status == "pending"
+        assert row.forecast_version == "new-forecast-version"
+        assert row.sent_at is None
+
+
+def test_stale_claim_failure_does_not_increment_new_warning_attempts():
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+
+    async def prepare():
+        await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
+
+    asyncio.run(prepare())
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        row.target_time = TEST_NOW - timedelta(seconds=1)
+        row.next_attempt_at = TEST_NOW - timedelta(seconds=1)
+        row.valid_until = TEST_NOW + timedelta(minutes=10)
+        row.risk_time = TEST_NOW + timedelta(minutes=20)
+        warning_id = row.id
+    claimed = warnings.claim_if_current(warning_id, now=TEST_NOW)
+    supersede_claimed_warning(database, participant, warnings, warning_id)
+    assert warnings.finish_claim(
+        warning_id, claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"],
+        sent=False, now=TEST_NOW, retryable=False, error_class="OldFailure",
+    ) is False
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.status == "pending"
+        assert row.forecast_version == "new-forecast-version"
+        assert row.attempt_count == 0
+        assert row.last_error_class is None
 
 
 def test_warning_episode_time_drift_dedupes_and_tier_escalates():

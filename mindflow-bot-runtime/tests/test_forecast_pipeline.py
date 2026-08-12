@@ -118,6 +118,30 @@ def test_semantic_fingerprint_reuses_time_only_update_but_changes_duration_or_te
     assert preprocessor._fingerprint(base) != preprocessor._fingerprint(changed)
 
 
+def test_semantic_fingerprint_uses_same_normalized_payload_as_api():
+    class Client:
+        provider = "deepseek"
+        model = "fake"
+
+        def infer(self, _payload):
+            raise AssertionError("not called")
+
+    summary = "a" * 160 + "first-tail" + "x" * 31
+    changed = "a" * 160 + "other-tail" + "x" * 31
+    _, participant, _, semantics, _, _, _ = build_pipeline(
+        [], consent=True, client=Client()
+    )
+    first = event(summary=summary, end="12:30")
+    second = event(summary=changed, end="12:30")
+    first_miss = semantics.prepare(participant.id, [first], consent=True)[3][0]
+    second_miss = semantics.prepare(participant.id, [second], consent=True)[3][0]
+    assert len(first_miss["event"]["summary"]) == 200
+    assert first_miss["event"]["duration_minutes"] == 150.0
+    assert first_miss["fingerprint"] == semantics._fingerprint(first_miss["event"])
+    assert second_miss["fingerprint"] == semantics._fingerprint(second_miss["event"])
+    assert first_miss["fingerprint"] != second_miss["fingerprint"]
+
+
 def test_no_consent_is_rules_only_and_never_queues_external_work():
     class Client:
         provider = "deepseek"
@@ -222,6 +246,114 @@ def test_invalid_external_response_opens_circuit_and_rules_remain_available():
         assert prepared[0]["metadata"]["semantic"]["values"]
 
     asyncio.run(scenario())
+
+
+def test_stale_semantic_miss_does_not_repeat_api_call():
+    class BlockingClient:
+        provider = "deepseek"
+        model = "fake"
+
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def infer(self, _payload):
+            self.calls += 1
+            self.started.set()
+            self.release.wait()
+            return {
+                "values": {key: 0.6 for key in (
+                    "difficulty", "cognitive_demand", "stakes", "time_pressure",
+                    "social_evaluation", "uncontrollability", "novelty",
+                    "expected_effort", "uncertainty", "unfinished",
+                )},
+                "appraisal_score_1_10": 5.0,
+                "confidence": 0.8,
+                "evidence_tags": [],
+                "reasoning_summary": "ok",
+            }
+
+    client = BlockingClient()
+    item = event(summary="stale miss")
+    _, participant, _, semantics, _, _, _ = build_pipeline(
+        [item], consent=True, client=client, semantic_max_concurrency=1
+    )
+
+    async def scenario():
+        first_miss = semantics.prepare(participant.id, [item], consent=True)[3]
+        first_completed = 0
+        second_completed = 0
+
+        async def first_done():
+            nonlocal first_completed
+            first_completed += 1
+
+        async def second_done():
+            nonlocal second_completed
+            second_completed += 1
+
+        await semantics.enqueue(participant.id, first_miss, first_done)
+        assert await asyncio.to_thread(client.started.wait, 2)
+        stale_miss = semantics.prepare(participant.id, [item], consent=True)[3]
+        assert len(stale_miss) == 1
+        client.release.set()
+        while semantics._inflight or semantics._completion_tasks:
+            await asyncio.sleep(0.01)
+        await semantics.enqueue(participant.id, stale_miss, second_done)
+        await semantics.close()
+        assert first_completed == 1
+        assert second_completed == 1
+        assert semantics.prepare(participant.id, [item], consent=True)[3] == []
+
+    asyncio.run(scenario())
+    assert client.calls == 1
+
+
+def test_corrupt_cache_does_not_block_real_api_repair():
+    class Client:
+        provider = "deepseek"
+        model = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        def infer(self, _payload):
+            self.calls += 1
+            return {
+                "values": {key: 0.7 for key in (
+                    "difficulty", "cognitive_demand", "stakes", "time_pressure",
+                    "social_evaluation", "uncontrollability", "novelty",
+                    "expected_effort", "uncertainty", "unfinished",
+                )},
+                "appraisal_score_1_10": 5.0,
+                "confidence": 0.8,
+                "evidence_tags": [],
+                "reasoning_summary": "repaired",
+            }
+
+    client = Client()
+    item = event(summary="corrupt cache")
+    _, participant, _, semantics, _, _, _ = build_pipeline(
+        [item], consent=True, client=client
+    )
+    fingerprint = semantics._fingerprint(item)
+    semantics.cache.put(
+        participant.id, fingerprint,
+        {"external": {"objective_semantics": {"difficulty": 0.5}}},
+        schema_version="event-semantics-v2", prompt_version="event-semantics-prompt-v2",
+        model="semantic-test-v1",
+    )
+
+    async def scenario():
+        misses = semantics.prepare(participant.id, [item], consent=True)[3]
+        assert len(misses) == 1
+        await semantics.enqueue(participant.id, misses, lambda: asyncio.sleep(0))
+        await semantics.close()
+        assert semantics.prepare(participant.id, [item], consent=True)[3] == []
+
+    asyncio.run(scenario())
+    assert client.calls == 1
 
 
 def test_circuit_recheck_after_semaphore_stops_queued_request_storm():
