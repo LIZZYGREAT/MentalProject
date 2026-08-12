@@ -390,13 +390,8 @@ PostgreSQL semantic cache hit
 
 ### 5.4 连续修改的当前限制
 
-配置中已有：
-
-```text
-FORECAST_CHANGE_DEBOUNCE_SECONDS=10
-```
-
-但当前版本尚未把该参数接入实际 coalesce timer。实际避免重复工作的机制是：
+当前 polling 模式没有独立 debounce timer，原先未生效的
+`FORECAST_CHANGE_DEBOUNCE_SECONDS` 已删除，避免配置项误导。实际避免重复工作的机制是：
 
 - Calendar 仅按轮询/按需刷新发现变化；
 - 同 participant/date Forecast 使用 single-flight；
@@ -404,7 +399,7 @@ FORECAST_CHANGE_DEBOUNCE_SECONDS=10
 - 相同 revision 走 no-op/fast path；
 - API 结果写入 durable cache。
 
-因此短时间内“改标题→改时间→改描述”如果都发生在同一个轮询周期内，通常只会看到最终状态；但如果每次修改恰好跨过多个轮询周期，仍可能发生多次 baseline Forecast。后续若接入 Calendar webhook，应同时正式接入该 debounce 参数。
+因此短时间内“改标题→改时间→改描述”如果都发生在同一个轮询周期内，通常只会看到最终状态；但如果每次修改恰好跨过多个轮询周期，仍可能发生多次 baseline Forecast。后续若接入 Calendar webhook，再设计真正的 per participant/date debounce。
 
 ### 5.5 API batch 的当前限制
 
@@ -415,7 +410,7 @@ FORECAST_CHANGE_DEBOUNCE_SECONDS=10
 - durable cache；
 - circuit breaker。
 
-但当前 DeepSeek client 仍是逐事件 HTTP 调用，不是把多个事件放进同一个 HTTP batch。`SEMANTIC_BATCH_SIZE` 已进入配置模型，但尚未形成真正的批量请求协议。日程数量较多时会并发受控地逐项 enrichment，而不会阻塞 baseline Forecast。若后续优化成本或吞吐，应增加带 item identity 的批量 prompt/response schema，并保留每个 fingerprint 独立缓存和校验。
+但当前 DeepSeek client 仍是逐事件 HTTP 调用，不是把多个事件放进同一个 HTTP batch。原先未生效的 `SEMANTIC_BATCH_SIZE` 已删除。日程数量较多时会受 `SEMANTIC_MAX_CONCURRENCY` 控制并发并逐项 enrichment，不会阻塞 baseline Forecast。若后续优化成本或吞吐，应增加带 item identity 的批量 prompt/response schema，并保留每个 fingerprint 独立缓存和校验。
 
 ---
 
@@ -423,7 +418,7 @@ FORECAST_CHANGE_DEBOUNCE_SECONDS=10
 
 DeepSeek 完成后不会无条件重算整条 Curve。
 
-系统对 enrichment 前后的语义值计算最大维度差异：
+系统通过统一的 `semantic_model_inputs()` projection 比较 enrichment 前后真正被模型消费的输入：10 个 objective dimensions 加上归一化为 `F_like [-1, 1]` 的 fused appraisal。审计字段、reasoning、provider、evidence tags 不参与版本或 materiality：
 
 ```text
 semantic delta < SEMANTIC_MATERIALITY_THRESHOLD
@@ -452,13 +447,15 @@ new → create
 changed → reschedule
 ```
 
-真正发送前会再次检查：
+每条预警保存 `risk_time`、`valid_until`、重试次数、下次重试时间和 claim lease。真正发送前会再次检查：
 
 - warning 是否仍为 pending；
 - 绑定的 Forecast 是否 valid；
-- Forecast version 是否匹配。
+- Forecast version 是否匹配；
+- 是否超过 `valid_until`；
+- 是否达到最大尝试次数。
 
-`warning_identity` 由实际日期和风险时间窗口组成，不包含 Forecast version，因此同一实际风险不会因为预测版本变化而重复发送。
+同一风险 episode 使用稳定的触发源/事件身份和当日 ordinal 标识，不包含精确风险分钟或 Forecast version。风险时间在漂移窗口内（默认 15 分钟）移动不会重复发送；已发送 episode 的 tier 升级允许一次 escalation；明显超出漂移窗口的后续风险则创建新 occurrence。该机制是 `best-effort dedupe + claim lease + episode dedupe`，不声称跨 HTTP/数据库提交边界的严格 exactly-once。
 
 ---
 
@@ -469,16 +466,21 @@ changed → reschedule
 ```text
 FORECAST_DAILY_PREPARE_LOCAL_TIME=07:30
 FORECAST_CALENDAR_SYNC_INTERVAL_SECONDS=300
-FORECAST_CHANGE_DEBOUNCE_SECONDS=10
+FORECAST_MAX_CONCURRENCY=1
 
 SEMANTIC_API_ENABLED=true
 SEMANTIC_API_MODEL=deepseek-v4-flash
 SEMANTIC_API_TIMEOUT_SECONDS=8
-SEMANTIC_BATCH_SIZE=8
 SEMANTIC_MAX_CONCURRENCY=2
 SEMANTIC_MATERIALITY_THRESHOLD=0.03
 
 WARNING_POLL_INTERVAL_SECONDS=15
+WARNING_LEAD_MINUTES=20
+WARNING_LATE_GRACE_MINUTES=10
+WARNING_MAX_ATTEMPTS=5
+WARNING_RETRY_BASE_SECONDS=60
+WARNING_CLAIM_LEASE_SECONDS=120
+WARNING_EPISODE_DRIFT_MINUTES=15
 ```
 
 如果更重视日程修改响应速度，可将 Calendar interval 调到 120–300 秒，但不建议秒级轮询。
@@ -492,7 +494,7 @@ WARNING_POLL_INTERVAL_SECONDS=15
 2. alembic upgrade head
 3. docker compose config
 4. 重启 bot/postgres 服务
-5. 检查 startup_resources 日志
+5. 检查 settings/database/business/gateway/scheduler 分阶段 RSS 日志
 6. 验证 daily_prepare、periodic_poll、user_curve_request
 7. 验证无 consent 时 0 次 semantic API 调用
 8. 验证重复周期课程命中 event_semantic_cache
@@ -505,9 +507,12 @@ WARNING_POLL_INTERVAL_SECONDS=15
 在 `MentalProject` Conda 环境运行：
 
 ```text
-pytest: 49 passed
+pytest: 64 passed
 compileall: passed
-docker compose config: passed
+git diff --check: passed
+docker compose config --quiet: passed
 ```
 
-覆盖了 Calendar revision、time-only update、description update、rules-only、consent、durable cache、single-flight、API invalid response/circuit breaker、Curve fast path、materiality、warning stale version、restart recovery 基础路径以及 spawn-safe import。
+覆盖了 Calendar revision、time-only update、description update、rules-only、consent、durable cache、single-flight、API invalid response/circuit breaker、appraisal/model projection、Curve fast path、materiality、Scheduler 启动顺序和并发上限、warning lease/backoff/expiry/episode/escalation、Today Context、日志凭据脱敏以及 spawn-safe import。
+
+说明：上述是本地 SQLite/Fake client 自动化验证和 Compose 静态配置校验。真实 PostgreSQL migration、ECS steady-state RSS、真实 DeepSeek cache miss/hit 和真实 Warning 发送仍必须按生产验收清单单独执行，不能用本地测试替代。
