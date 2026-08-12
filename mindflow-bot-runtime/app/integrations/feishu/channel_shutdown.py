@@ -72,9 +72,12 @@ def stop_feishu_channel_cleanly(
         or not bg_loop.is_running()
         or not callable(close)
     ):
-        raise DeviceFlowCloseError(
-            "lark-channel-sdk 1.2.0 shutdown internals are unavailable"
-        )
+        # Test doubles and future SDK objects without the 1.2.0 private
+        # DeviceFlow shape must still receive their public stop signal.  The
+        # compatibility pre-close is an optimization, not a reason to skip the
+        # only operation that can unblock channel.start().
+        channel.stop()
+        return
 
     completed = threading.Event()
 
