@@ -47,6 +47,8 @@ class Settings:
     progress_cooldown_seconds: int = 8
     progress_max_messages: int = 2
     feishu_send_max_retries: int = 1
+    feishu_gateway_start_timeout_seconds: int = 30
+    feishu_gateway_stop_timeout_seconds: int = 8
 
     @property
     def care_skill_path(self) -> Path:
@@ -138,6 +140,12 @@ class Settings:
             progress_max_messages=_int(values, "PROGRESS_MAX_MESSAGES", 2),
             feishu_send_max_retries=_int(
                 values, "FEISHU_SEND_MAX_RETRIES", 1, minimum=0
+            ),
+            feishu_gateway_start_timeout_seconds=_int(
+                values, "FEISHU_GATEWAY_START_TIMEOUT_SECONDS", 30
+            ),
+            feishu_gateway_stop_timeout_seconds=_int(
+                values, "FEISHU_GATEWAY_STOP_TIMEOUT_SECONDS", 8
             ),
         )
         if validate:

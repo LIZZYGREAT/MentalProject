@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 
 from sqlalchemy import text
 
@@ -28,6 +29,51 @@ from app.repositories import (
 )
 from app.services.safety_service import SafetyService
 from app.worker import BotWorker
+
+
+async def _run_gateway_until_shutdown(gateway: FeishuGateway) -> None:
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    installed_signals: list[signal.Signals] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            pass
+    gateway_start = asyncio.create_task(gateway.start(), name="feishu-gateway-start")
+    shutdown_requested = asyncio.create_task(
+        shutdown.wait(), name="process-shutdown-wait"
+    )
+    tasks: set[asyncio.Task] = {gateway_start, shutdown_requested}
+    try:
+        done, _ = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_requested in done:
+            gateway_start.cancel()
+            await asyncio.gather(gateway_start, return_exceptions=True)
+            return
+        await gateway_start
+
+        gateway_closed = asyncio.create_task(
+            gateway.wait_closed(), name="feishu-gateway-wait"
+        )
+        tasks.add(gateway_closed)
+        done, _ = await asyncio.wait(
+            {gateway_closed, shutdown_requested},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if gateway_closed in done:
+            await gateway_closed
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
 
 
 async def run() -> None:
@@ -101,6 +147,8 @@ async def run() -> None:
         identity,
         events,
         queue,
+        start_timeout_seconds=settings.feishu_gateway_start_timeout_seconds,
+        stop_timeout_seconds=settings.feishu_gateway_stop_timeout_seconds,
     )
     for saved in events.recoverable():
         await queue.put(
@@ -120,12 +168,17 @@ async def run() -> None:
 
     dispatcher = asyncio.create_task(worker.run_forever(), name="bot-dispatcher")
     try:
-        await gateway.start()
+        await _run_gateway_until_shutdown(gateway)
     finally:
-        dispatcher.cancel()
-        await asyncio.gather(dispatcher, return_exceptions=True)
-        await worker.close()
-        await runtime.close()
+        try:
+            await gateway.stop()
+        finally:
+            dispatcher.cancel()
+            await asyncio.gather(dispatcher, return_exceptions=True)
+            try:
+                await worker.close()
+            finally:
+                await runtime.close()
 
 
 def main() -> None:

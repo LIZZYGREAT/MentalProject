@@ -21,7 +21,7 @@ services:
         condition: service_healthy
       claude-state-init:
         condition: service_completed_successfully
-    command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
+    command: ["sh", "-c", "alembic upgrade head && exec python -m app.main"]
     environment:
       CLAUDE_WORKDIR: /srv/claude-workspace
       CLAUDE_SETTINGS_PATH: /srv/claude-workspace/.claude/settings.json

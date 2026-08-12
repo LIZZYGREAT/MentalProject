@@ -1,4 +1,4 @@
-"""Single-App, single-WebSocket ingress with fast durable deduplication."""
+"""Backend-owned durable ingress fed by an isolated Feishu receiver process."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import multiprocessing
+from queue import Empty
 from typing import Any, Callable
 
 from app.identity.service import IdentityService
@@ -20,6 +22,10 @@ class InvalidBotEvent(ValueError):
     pass
 
 
+class FeishuReceiverError(RuntimeError):
+    """The isolated WebSocket receiver failed or exited unexpectedly."""
+
+
 @dataclass(frozen=True)
 class BotEvent:
     event_id: str
@@ -30,6 +36,54 @@ class BotEvent:
     text: str
     create_time: datetime
     chat_type: str = "p2p"
+
+    def to_ipc_payload(self) -> dict[str, str]:
+        """Return a stable, SDK-free payload suitable for process IPC."""
+
+        return {
+            "event_id": self.event_id,
+            "message_id": self.message_id,
+            "app_id": self.app_id,
+            "open_id": self.open_id,
+            "chat_id": self.chat_id,
+            "chat_type": self.chat_type,
+            "message_type": "text",
+            "text": self.text,
+            "create_time": self.create_time.astimezone(timezone.utc).isoformat(),
+        }
+
+    @classmethod
+    def from_ipc_payload(cls, payload: dict[str, Any]) -> "BotEvent":
+        if payload.get("message_type") != "text":
+            raise InvalidBotEvent("unsupported IPC message type")
+        required = (
+            "event_id",
+            "message_id",
+            "app_id",
+            "open_id",
+            "chat_id",
+            "text",
+            "create_time",
+        )
+        values = {name: str(payload.get(name) or "").strip() for name in required}
+        if not all(values.values()):
+            raise InvalidBotEvent("IPC event is missing required fields")
+        try:
+            created = datetime.fromisoformat(values["create_time"])
+        except ValueError as exc:
+            raise InvalidBotEvent("IPC event has invalid create_time") from exc
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return cls(
+            event_id=values["event_id"],
+            message_id=values["message_id"],
+            app_id=values["app_id"],
+            open_id=values["open_id"],
+            chat_id=values["chat_id"],
+            text=values["text"][:4000],
+            create_time=created.astimezone(timezone.utc),
+            chat_type=str(payload.get("chat_type") or "p2p"),
+        )
 
 
 class FeishuEventParser:
@@ -82,7 +136,7 @@ class FeishuEventParser:
 
 
 class FeishuChannelMessageAdapter:
-    """Map lark_oapi.channel.InboundMessage without weakening event identity."""
+    """Map lark_channel inbound messages without weakening event identity."""
 
     def __init__(self, app_id: str):
         self.app_id = app_id
@@ -134,7 +188,7 @@ class FeishuChannelMessageAdapter:
 
 
 class FeishuGateway:
-    """Callback performs parsing, identity lookup, dedupe, persistence, enqueue only."""
+    """Own a spawned receiver and keep SDK lifecycle outside the backend loop."""
 
     def __init__(
         self,
@@ -144,6 +198,11 @@ class FeishuGateway:
         events: BotEventRepository,
         queue: asyncio.Queue[BotEvent],
         channel_factory: Callable[..., Any] | None = None,
+        *,
+        process_context: Any | None = None,
+        receiver_target: Callable[..., None] | None = None,
+        start_timeout_seconds: float = 30.0,
+        stop_timeout_seconds: float = 8.0,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -153,8 +212,20 @@ class FeishuGateway:
         self.parser = FeishuEventParser(app_id)
         self.channel_adapter = FeishuChannelMessageAdapter(app_id)
         self.channel_factory = channel_factory
+        self.process_context = process_context
+        self.receiver_target = receiver_target
+        self.start_timeout_seconds = start_timeout_seconds
+        self.stop_timeout_seconds = stop_timeout_seconds
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._channel: Any | None = None
+        self._process: Any | None = None
+        self._process_started = False
+        self._output_queue: Any | None = None
+        self._stop_event: Any | None = None
+        self._consumer_task: asyncio.Task[None] | None = None
+        self._ready: asyncio.Future[None] | None = None
+        self._closed: asyncio.Future[None] | None = None
+        self._stopping = False
+        self._shutdown_failure: BaseException | None = None
 
     def accept_payload(self, payload: dict[str, Any]) -> bool:
         """Safe to call from the SDK callback thread; never waits for an Agent."""
@@ -173,6 +244,8 @@ class FeishuGateway:
         return self.accept_event(event)
 
     def accept_event(self, event: BotEvent) -> bool:
+        if event.app_id != self.app_id:
+            return False
         participant = self.identity.resolve(event.app_id, event.open_id)
         participant_id = participant.id if participant else None
         if not self.events.accept(
@@ -204,30 +277,220 @@ class FeishuGateway:
             # Keep the durable event recoverable on the next process start.
             self.events.finish(event.event_id, status="received", error_code="queue_full")
 
+    @property
+    def is_running(self) -> bool:
+        return bool(self._process is not None and self._process.is_alive())
+
     async def start(self) -> None:
-        """Run one official Channel lifecycle without nested event loops."""
+        """Spawn the receiver and return only after its WebSocket is ready."""
 
-        if self.channel_factory is None:
-            from lark_channel import FeishuChannel
+        if self._process is not None:
+            raise RuntimeError("FeishuGateway is already started")
+        from app.integrations.feishu.receiver_process import receiver_process_main
 
-            factory = FeishuChannel
-        else:
-            factory = self.channel_factory
         self._loop = asyncio.get_running_loop()
-
-        async def on_message(message: Any) -> None:
-            try:
-                self.accept_channel_message(message)
-            except Exception:
-                logger.exception("feishu_event_callback_failed")
-
-        channel = factory(app_id=self.app_id, app_secret=self.app_secret)
-        self._channel = channel
-        channel.on("message", on_message)
+        context = self.process_context or multiprocessing.get_context("spawn")
+        target = self.receiver_target or receiver_process_main
+        self._output_queue = context.Queue()
+        self._stop_event = context.Event()
+        self._ready = self._loop.create_future()
+        self._closed = self._loop.create_future()
+        self._stopping = False
+        self._shutdown_failure = None
+        self._process = context.Process(
+            name="feishu-ws-receiver",
+            target=target,
+            args=(
+                self.app_id,
+                self.app_secret,
+                self._output_queue,
+                self._stop_event,
+                self.channel_factory,
+            ),
+            daemon=True,
+        )
         try:
-            await channel.connect()
-        finally:
-            disconnect = getattr(channel, "disconnect", None)
-            if disconnect is not None:
-                await disconnect()
-            self._channel = None
+            self._process.start()
+            self._process_started = True
+            self._consumer_task = asyncio.create_task(
+                self._consume_receiver_output(), name="feishu-receiver-ipc"
+            )
+            await asyncio.wait_for(
+                asyncio.shield(self._ready), timeout=self.start_timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            await self.stop()
+            raise FeishuReceiverError(
+                f"Feishu receiver did not become ready within "
+                f"{self.start_timeout_seconds:g} seconds"
+            ) from exc
+        except BaseException:
+            await self.stop()
+            raise
+        logger.info(
+            "feishu_receiver_ready",
+            extra={"receiver_pid": getattr(self._process, "pid", None)},
+        )
+
+    async def wait_closed(self) -> None:
+        """Wait for receiver termination and surface an abnormal exit."""
+
+        if self._closed is None:
+            raise RuntimeError("FeishuGateway has not been started")
+        await asyncio.shield(self._closed)
+
+    async def stop(self) -> None:
+        """Stop and reap the receiver, propagating any shutdown failure."""
+
+        process = self._process
+        if process is None:
+            return
+        closed = self._closed
+        forced_termination = False
+        terminal_state_timed_out = False
+        self._stopping = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._process_started:
+            await asyncio.to_thread(process.join, self.stop_timeout_seconds)
+            if process.is_alive():
+                logger.warning("feishu_receiver_graceful_stop_timed_out")
+                forced_termination = True
+                process.terminate()
+                await asyncio.to_thread(process.join, 2.0)
+        if self._consumer_task is not None and not self._consumer_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._consumer_task), timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                terminal_state_timed_out = True
+                self._consumer_task.cancel()
+                await asyncio.gather(self._consumer_task, return_exceptions=True)
+        if closed is not None and not closed.done():
+            if forced_termination:
+                self._shutdown_failure = FeishuReceiverError(
+                    "Feishu receiver required force termination during shutdown"
+                )
+                closed.set_exception(self._shutdown_failure)
+            elif terminal_state_timed_out:
+                self._shutdown_failure = FeishuReceiverError(
+                    "Feishu receiver exited without a terminal IPC state"
+                )
+                closed.set_exception(self._shutdown_failure)
+            elif process.exitcode not in (None, 0):
+                self._shutdown_failure = FeishuReceiverError(
+                    f"Feishu receiver stopped with code {process.exitcode}"
+                )
+                closed.set_exception(self._shutdown_failure)
+            else:
+                self._shutdown_failure = FeishuReceiverError(
+                    "Feishu receiver exited without confirming clean shutdown"
+                )
+                closed.set_exception(self._shutdown_failure)
+        if self._ready is not None:
+            if not self._ready.done():
+                self._ready.cancel()
+            try:
+                self._ready.result()
+            except BaseException:
+                # A shutdown error can also complete readiness after start()
+                # timed out. Retrieve that state before releasing the Future.
+                pass
+        if closed is not None:
+            try:
+                closed.result()
+            except asyncio.CancelledError as exc:
+                if self._shutdown_failure is None:
+                    self._shutdown_failure = FeishuReceiverError(
+                        "Feishu receiver shutdown state was cancelled"
+                    )
+                    self._shutdown_failure.__cause__ = exc
+            except BaseException:
+                # Explicitly retrieve the Future exception. Runtime failures are
+                # surfaced by wait_closed(); only failures during stop re-raise here.
+                pass
+        output_queue = self._output_queue
+        if output_queue is not None:
+            close = getattr(output_queue, "close", None)
+            if callable(close):
+                close()
+            join_thread = getattr(output_queue, "join_thread", None)
+            if callable(join_thread):
+                await asyncio.to_thread(join_thread)
+        self._process = None
+        self._process_started = False
+        self._output_queue = None
+        self._stop_event = None
+        self._consumer_task = None
+        self._loop = None
+        self._ready = None
+        self._closed = None
+        logger.info("feishu_receiver_stopped")
+        shutdown_failure = self._shutdown_failure
+        self._shutdown_failure = None
+        if shutdown_failure is not None:
+            raise shutdown_failure
+
+    async def _consume_receiver_output(self) -> None:
+        assert self._output_queue is not None
+        while True:
+            try:
+                envelope = await asyncio.to_thread(
+                    self._output_queue.get, True, 0.2
+                )
+            except Empty:
+                process = self._process
+                if process is not None and self._process_started and not process.is_alive():
+                    if not self._stopping:
+                        self._receiver_failed(
+                            f"Feishu receiver exited unexpectedly with code "
+                            f"{process.exitcode}"
+                        )
+                        return
+                    # A clean shutdown is confirmed only by an explicit terminal
+                    # envelope; Queue feeder delivery may lag process exit.
+                    continue
+                continue
+            except (EOFError, OSError) as exc:
+                if not self._stopping:
+                    self._receiver_failed(f"Feishu receiver IPC failed: {exc}")
+                return
+            if not isinstance(envelope, dict):
+                logger.warning("feishu_receiver_invalid_envelope")
+                continue
+            kind = envelope.get("kind")
+            if kind == "ready":
+                if self._ready is not None and not self._ready.done():
+                    self._ready.set_result(None)
+                continue
+            if kind == "event":
+                try:
+                    event = BotEvent.from_ipc_payload(envelope.get("payload") or {})
+                except InvalidBotEvent:
+                    logger.warning("feishu_receiver_invalid_event")
+                    continue
+                self.accept_event(event)
+                continue
+            if kind == "error":
+                error_type = str(envelope.get("error_type") or "ReceiverError")
+                message = str(envelope.get("message") or "unknown receiver failure")
+                self._receiver_failed(f"{error_type}: {message}")
+                return
+            if kind == "stopped":
+                if self._stopping:
+                    if self._closed is not None and not self._closed.done():
+                        self._closed.set_result(None)
+                else:
+                    self._receiver_failed("Feishu receiver stopped unexpectedly")
+                return
+
+    def _receiver_failed(self, message: str) -> None:
+        error = FeishuReceiverError(message)
+        logger.error("feishu_receiver_failed", extra={"receiver_error": message})
+        if self._stopping:
+            self._shutdown_failure = error
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_exception(error)
+        if self._closed is not None and not self._closed.done():
+            self._closed.set_exception(error)

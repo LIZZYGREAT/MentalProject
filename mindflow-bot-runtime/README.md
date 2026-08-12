@@ -3,7 +3,7 @@
 这是面向约 20 名实验参与者的独立生产后端。生产 Agent 路径固定为：
 
 ```text
-FeishuChannel
+FeishuChannel（独立 receiver process）
   -> durable BotEvent
   -> BotWorker（binding / consent / calendar / reliable delivery）
   -> ParticipantSessionManager（queue / interrupt / bounded warm pool）
@@ -13,6 +13,10 @@ FeishuChannel
   -> CareTools / AssessmentModel / Calendar / PostgreSQL
   -> Backend final delivery
 ```
+
+飞书 WebSocket 只在由 `spawn` 创建的 receiver 子进程中导入和运行。子进程拥有
+`lark-channel-sdk` 的模块级 event loop，并通过本地 IPC 发送普通事件 DTO；身份解析、
+数据库持久化与去重、业务队列、Claude 和飞书 HTTP 回发仍留在 Backend 进程。
 
 Claude Code 是 Agent Harness，DeepSeek 是模型提供方，MCP 是业务能力边界，
 PostgreSQL 保存 identity、状态、审计和 Claude session metadata。生产代码中没有
@@ -76,6 +80,12 @@ cd mindflow-bot-runtime
 docker compose up --build -d
 docker compose ps
 docker compose logs -f bot
+```
+
+可在 ECS 容器内单独验证 WebSocket receiver 的连接、存活和关闭（不会打印 Secret）：
+
+```powershell
+docker compose run --rm bot python -m app.smoke.feishu_gateway --seconds 30
 ```
 
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的

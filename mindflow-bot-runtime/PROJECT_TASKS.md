@@ -2,7 +2,7 @@
 document_status: ACTIVE
 project_status: NO_GO
 branch: production_runtime
-last_reviewed: 2026-08-11
+last_reviewed: 2026-08-12
 owner: project_operator
 superseded_by: null
 archive_rule: 所有必须项完成并形成证据后，将 document_status 改为 COMPLETED；若被新台账替代，改为 OBSOLETE 并填写 superseded_by。
@@ -28,7 +28,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 
 | 项目 | 当前值 |
 |---|---|
-| 代码与自动测试 | `READY`（29 项测试通过） |
+| 代码与自动测试 | `READY`（36 项测试通过） |
 | 真实环境配置 | `TODO` |
 | 两人真实飞书联调 | `TODO` |
 | 20 人实验启动 | `NO_GO` |
@@ -71,7 +71,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 | BASE-05 | DONE | OAuth Token AES-256-GCM 加密与参与者隔离 | 自动测试 |
 | BASE-06 | DONE | 完整预测输入快照、轨迹和告警留存 | 自动测试 |
 | BASE-07 | DONE | Agent SDK Docker、Claude state volume、0002 Alembic 和生产配置模板 | 静态验证 |
-| BASE-08 | DONE | FeishuChannel async lifecycle、字段映射、dedupe 与 queue-full 恢复 | 自动测试 |
+| BASE-08 | DOING | FeishuChannel 独立 receiver process、稳定 IPC DTO、字段映射、dedupe 与 queue-full 恢复 | 本地自动测试通过；待 ECS WebSocket smoke、restart_count=0 与旧 event-loop warning 消失后验收 |
 | BASE-09 | DONE | Backend progress policy、可靠 final delivery 与 `/stop` 控制路径 | 自动测试 |
 
 ## 文档生命周期
