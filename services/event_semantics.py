@@ -451,6 +451,7 @@ class OpenAICompatibleSemanticClient:
     def infer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         output_example = {
             **{key: 0.0 for key in DIMENSIONS},
+            "appraisal_score_1_10": 5.0,
             "confidence": 0.0,
             "evidence_tags": ["简短事实标签"],
             "reasoning_summary": "不超过80字的可审计依据",

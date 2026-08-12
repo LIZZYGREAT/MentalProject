@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 
 
-PROMPT_VERSION = "event_semantics_prompt.zh.v2"
+PROMPT_VERSION = "event_semantics_prompt.zh.v3"
 
 SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。你的唯一职责是把日程事件转换为可审计的客观任务语义，供后续心理压力动态模型作为弱先验使用。
 
@@ -33,6 +33,7 @@ SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。�
 - uncertainty：对要求、过程或结果不确定的程度。不得无依据地假设用户不会做。
 - unfinished：任务在输入所描述时点仍未完成、会继续占用注意的程度。明确已完成为 0；明确未完成或待提交可较高；没有完成信息时保持保守。
 - confidence：你对上述标注的整体把握。标题模糊、描述为空或上下文冲突时必须降低。
+- appraisal_score_1_10：仅根据文本中明确表达的用户主观感受给出弱先验；1 表示明确厌恶/痛苦，5 表示中性或没有主观证据，10 表示明确喜欢/期待。客观困难、课程名称或任务类别本身不得改变此分数。
 
 校准锚点：
 - 0.00–0.20：很低或基本没有；0.21–0.40：偏低；0.41–0.60：中等；0.61–0.80：偏高；0.81–1.00：很高。

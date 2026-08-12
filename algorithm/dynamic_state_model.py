@@ -25,7 +25,6 @@ import math
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from algorithm.time_utils import interval_minutes, parse_datetime_on_date
-from services.event_semantics import assess_event_semantics
 from utils.description_score import convert_score_to_Flike, score_description
 
 
@@ -178,27 +177,41 @@ def assess_event(event: Any) -> EventAssessment:
     task_type = str(getattr(event, "task_type", metadata.get("task_type", "general"))).lower()
     duration = interval_minutes(event.start_time, event.end_time, default=60.0)
     duration_load = _clamp(duration / 180.0)
-    supplied_semantic = metadata.get(
-        "semantic_inference",
-        metadata.get("external_semantic_inference"),
-    )
-    semantic = assess_event_semantics(
-        name=str(getattr(event, "name", "") or ""),
-        description=str(getattr(event, "description", "") or ""),
-        event_type=event_type,
-        task_type=task_type,
-        duration_minutes=duration,
-        context=(
-            metadata.get("semantic_context")
-            if isinstance(metadata.get("semantic_context"), Mapping)
-            else None
-        ),
-        supplied_external=(
-            supplied_semantic if isinstance(supplied_semantic, Mapping) else None
-        ),
-        allow_external=bool(metadata.get("allow_external_semantics", False)),
-    )
-    semantic_values = semantic["values"]
+    semantic = metadata.get("semantic")
+    if not isinstance(semantic, Mapping):
+        # Prediction is deliberately network/database free.  Callers are
+        # expected to inject semantics; this conservative neutral fallback
+        # keeps older direct algorithm integrations working.
+        semantic = {
+            "schema_version": "event_semantics.fallback.v1",
+            "source": "rules_fallback",
+            "values": {
+                "difficulty": 0.45,
+                "cognitive_demand": 0.50,
+                "stakes": 0.30,
+                "time_pressure": 0.28,
+                "social_evaluation": 0.18,
+                "uncontrollability": 0.25,
+                "novelty": 0.30,
+                "expected_effort": 0.52,
+                "uncertainty": 0.32,
+                "unfinished": 0.22,
+            },
+        }
+    raw_semantic_values = semantic.get("values")
+    if not isinstance(raw_semantic_values, Mapping):
+        fused = semantic.get("fused")
+        raw_semantic_values = (
+            fused.get("objective_semantics") if isinstance(fused, Mapping) else {}
+        )
+    semantic_values = {
+        key: _clamp(raw_semantic_values.get(key, 0.0))
+        for key in (
+            "difficulty", "cognitive_demand", "stakes", "time_pressure",
+            "social_evaluation", "uncontrollability", "novelty",
+            "expected_effort", "uncertainty", "unfinished",
+        )
+    }
 
     objective_defaults: Dict[str, Dict[str, float]] = {
         "course": {
