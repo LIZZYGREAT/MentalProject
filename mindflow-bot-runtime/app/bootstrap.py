@@ -45,6 +45,7 @@ class BusinessServices:
     prediction_service: PredictionService
     forecast_coordinator: ForecastCoordinator
     warning_schedules: WarningScheduleRepository
+    semantic_preprocessor: EventSemanticPreprocessor
     registry: ToolRegistry
     device_flows: DeviceFlowService
 
@@ -75,18 +76,21 @@ def build_business_services(
     semantic_preprocessor = EventSemanticPreprocessor(
         EventSemanticCacheRepository(database), client=semantic_client,
         model=settings.semantic_api_model,
-        batch_size=settings.semantic_batch_size,
         max_concurrency=settings.semantic_max_concurrency,
     )
     warning_schedules = WarningScheduleRepository(database)
+    forecast_snapshots = ForecastSnapshotRepository(database)
     forecast_coordinator = ForecastCoordinator(
         participants=ParticipantRepository(database), profiles=profiles,
         observations=observations, calendar=calendar,
         calendar_snapshots=CalendarSnapshotRepository(database),
         semantics=semantic_preprocessor, prediction=prediction_service,
-        forecasts=ForecastSnapshotRepository(database), warnings=warning_schedules,
+        forecasts=forecast_snapshots, warnings=warning_schedules,
         timezone_name=settings.timezone_name,
         materiality_threshold=settings.semantic_materiality_threshold,
+        warning_lead_minutes=settings.warning_lead_minutes,
+        warning_late_grace_minutes=settings.warning_late_grace_minutes,
+        warning_episode_drift_minutes=settings.warning_episode_drift_minutes,
     )
     registry = ToolRegistry(runs)
     CareTools(
@@ -98,6 +102,7 @@ def build_business_services(
         token_repository,
         settings.timezone_name,
         forecast_coordinator,
+        forecast_snapshots,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -109,6 +114,7 @@ def build_business_services(
         prediction_service=prediction_service,
         forecast_coordinator=forecast_coordinator,
         warning_schedules=warning_schedules,
+        semantic_preprocessor=semantic_preprocessor,
         registry=registry,
         device_flows=device_flows,
     )

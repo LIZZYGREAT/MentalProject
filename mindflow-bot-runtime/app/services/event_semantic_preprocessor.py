@@ -23,6 +23,7 @@ from services.event_semantics import (
     validate_external_semantics,
 )
 from utils.description_score import score_description
+from services.semantic_model_inputs import semantic_model_inputs
 
 
 def _canonical(value: Any) -> str:
@@ -45,17 +46,17 @@ class EventSemanticPreprocessor:
         *,
         client: OpenAICompatibleSemanticClient | None,
         model: str,
-        batch_size: int = 8,
         max_concurrency: int = 2,
         circuit_seconds: float = 60.0,
     ):
         self.cache = cache
         self.client = client
         self.model = model or "rules-only"
-        self.batch_size = max(1, batch_size)
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
+        self._completion_tasks: set[asyncio.Task] = set()
+        self._closing = False
         self._circuit_until = 0.0
         self._circuit_seconds = max(1.0, circuit_seconds)
 
@@ -161,12 +162,15 @@ class EventSemanticPreprocessor:
             metadata["semantic"] = semantic
             event["metadata"] = metadata
             prepared.append(event)
-        semantic_revision = hashlib.sha256(
-            _canonical([
-                {"id": item.get("id"), "semantic": (item.get("metadata") or {}).get("semantic")}
-                for item in prepared
-            ]).encode("utf-8")
-        ).hexdigest()
+        semantic_revision = hashlib.sha256(_canonical([
+            {
+                "id": item.get("id"),
+                "model_inputs": semantic_model_inputs(
+                    (item.get("metadata") or {}).get("semantic")
+                ),
+            }
+            for item in prepared
+        ]).encode("utf-8")).hexdigest()
         if not eligible_count or external_count == eligible_count:
             status = "hybrid_complete" if external_count else "rules_only"
         elif external_count:
@@ -179,7 +183,10 @@ class EventSemanticPreprocessor:
         self, participant_id: Any, misses: list[dict[str, Any]],
         on_complete: Callable[[], Awaitable[None]],
     ) -> None:
-        if not self.client or not misses or time.monotonic() < self._circuit_until:
+        if (
+            self._closing or not self.client or not misses
+            or time.monotonic() < self._circuit_until
+        ):
             return
         tasks = []
         async with self._inflight_lock:
@@ -188,7 +195,7 @@ class EventSemanticPreprocessor:
                 task = self._inflight.get(key)
                 if task is None or task.done():
                     task = asyncio.create_task(
-                        self._enrich_one(participant_id, miss),
+                        self._enrich_guarded(key, participant_id, miss),
                         name=f"semantic-{miss['fingerprint'][:10]}",
                     )
                     self._inflight[key] = task
@@ -198,7 +205,50 @@ class EventSemanticPreprocessor:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 if any(result is True for result in results):
                     await on_complete()
-            asyncio.create_task(finish(), name="semantic-enrichment-completion")
+            completion = asyncio.create_task(
+                finish(), name="semantic-enrichment-completion"
+            )
+            self._completion_tasks.add(completion)
+            completion.add_done_callback(self._completion_done)
+
+    def _completion_done(self, task: asyncio.Task) -> None:
+        self._completion_tasks.discard(task)
+        if task.cancelled():
+            return
+        # Retrieve callback failures so a completed background task never
+        # produces an unobserved "Task exception was never retrieved" warning.
+        task.exception()
+
+    async def _enrich_guarded(
+        self, key: tuple[str, str], participant_id: Any, miss: dict[str, Any]
+    ) -> bool:
+        try:
+            return await self._enrich_one(participant_id, miss)
+        finally:
+            current = asyncio.current_task()
+            async with self._inflight_lock:
+                if self._inflight.get(key) is current:
+                    self._inflight.pop(key, None)
+
+    async def close(self, timeout_seconds: float = 10.0) -> None:
+        """Stop accepting work and boundedly retrieve all background tasks."""
+
+        self._closing = True
+        async with self._inflight_lock:
+            tasks = list(self._inflight.values())
+        tasks.extend(self._completion_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=max(0.1, timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _enrich_one(self, participant_id: Any, miss: dict[str, Any]) -> bool:
         if time.monotonic() < self._circuit_until:

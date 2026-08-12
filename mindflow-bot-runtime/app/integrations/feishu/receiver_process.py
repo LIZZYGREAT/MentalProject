@@ -39,6 +39,9 @@ def receiver_process_main(
     # Establish the receiver-owned loop before the lazy SDK import.
     receiver_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(receiver_loop)
+    from app.logging_security import install_credential_redaction
+
+    install_credential_redaction()
 
     if channel_factory is None:
         from lark_channel import FeishuChannel

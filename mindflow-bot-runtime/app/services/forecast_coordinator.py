@@ -22,6 +22,7 @@ from app.repositories import (
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.prediction_service import PredictionService
 from services.event_lifecycle import prepare_event_instances
+from services.semantic_model_inputs import semantic_model_inputs
 
 
 def _canonical(value: Any) -> str:
@@ -57,6 +58,8 @@ class ForecastCoordinator:
         semantics: EventSemanticPreprocessor, prediction: PredictionService,
         forecasts: ForecastSnapshotRepository, warnings: WarningScheduleRepository,
         timezone_name: str, materiality_threshold: float = 0.03,
+        warning_lead_minutes: int = 20, warning_late_grace_minutes: int = 10,
+        warning_episode_drift_minutes: int = 15,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -69,13 +72,27 @@ class ForecastCoordinator:
         self.warnings = warnings
         self.timezone = ZoneInfo(timezone_name)
         self.materiality_threshold = materiality_threshold
+        self.warning_lead_minutes = warning_lead_minutes
+        self.warning_late_grace_minutes = warning_late_grace_minutes
+        self.warning_episode_drift_minutes = warning_episode_drift_minutes
         self._locks: dict[tuple[uuid.UUID, date], asyncio.Lock] = {}
         self._dirty: set[tuple[uuid.UUID, date]] = set()
+        self._lock_users: dict[tuple[uuid.UUID, date], int] = {}
         self._guard = asyncio.Lock()
 
     async def _lock_for(self, key: tuple[uuid.UUID, date]) -> asyncio.Lock:
         async with self._guard:
+            self._lock_users[key] = self._lock_users.get(key, 0) + 1
             return self._locks.setdefault(key, asyncio.Lock())
+
+    async def _release_lock(self, key: tuple[uuid.UUID, date]) -> None:
+        async with self._guard:
+            remaining = self._lock_users.get(key, 1) - 1
+            if remaining <= 0 and key not in self._dirty:
+                self._lock_users.pop(key, None)
+                self._locks.pop(key, None)
+            else:
+                self._lock_users[key] = remaining
 
     async def ensure_forecast(
         self, participant_id: uuid.UUID, local_date: date | str, reason: str,
@@ -86,18 +103,21 @@ class ForecastCoordinator:
         lock = await self._lock_for(key)
         if lock.locked():
             self._dirty.add(key)
-        async with lock:
-            latest_result: dict[str, Any] | None = None
-            while True:
-                self._dirty.discard(key)
-                latest_result = await self._ensure_once(
-                    participant_id, target, reason,
-                    refresh_calendar=refresh_calendar,
-                    enqueue_enrichment=enqueue_enrichment,
-                )
-                if key not in self._dirty:
-                    return latest_result
-                refresh_calendar = True
+        try:
+            async with lock:
+                latest_result: dict[str, Any] | None = None
+                while True:
+                    self._dirty.discard(key)
+                    latest_result = await self._ensure_once(
+                        participant_id, target, reason,
+                        refresh_calendar=refresh_calendar,
+                        enqueue_enrichment=enqueue_enrichment,
+                    )
+                    if key not in self._dirty:
+                        return latest_result
+                    refresh_calendar = True
+        finally:
+            await self._release_lock(key)
 
     async def _calendar_snapshot(
         self, participant_id: uuid.UUID, target: date, refresh: bool,
@@ -113,14 +133,18 @@ class ForecastCoordinator:
                 self.calendar_snapshots.upsert, participant_id, target,
                 revision=revision, events=normalized, degraded=False,
             )
-        except Exception:
+        except Exception as exc:
             if current is not None:
-                current["degraded"] = True
-                return current, False
+                return await asyncio.to_thread(
+                    self.calendar_snapshots.upsert, participant_id, target,
+                    revision=current["calendar_revision"], events=current["events"],
+                    degraded=True, refresh_error_class=type(exc).__name__,
+                )
             revision, normalized = normalized_calendar_revision([])
             return await asyncio.to_thread(
                 self.calendar_snapshots.upsert, participant_id, target,
                 revision=revision, events=normalized, degraded=True,
+                refresh_error_class=type(exc).__name__,
             )
 
     async def _ensure_once(
@@ -191,6 +215,13 @@ class ForecastCoordinator:
             )
             result = {**saved, "cache_hit": False, "calendar_changed": calendar_changed,
                       "warning_diff": warning_diff, "reason": reason}
+        result.update({
+            "calendar_fresh": not calendar_snapshot["degraded"],
+            "calendar_stale": bool(calendar_snapshot["degraded"]),
+            "calendar_degraded": bool(calendar_snapshot["degraded"]),
+            "calendar_last_refresh_success_at": calendar_snapshot.get("last_refresh_success_at"),
+            "calendar_last_refresh_error_class": calendar_snapshot.get("last_refresh_error_class"),
+        })
         if enqueue_enrichment and misses and consent:
             async def recompute() -> None:
                 before = semantic_revision
@@ -207,7 +238,8 @@ class ForecastCoordinator:
 
     def _warning_windows(self, alerts: Any, target: date) -> list[dict[str, Any]]:
         result = []
-        for alert in alerts:
+        trigger_counts: dict[str, int] = {}
+        for index, alert in enumerate(alerts):
             if not isinstance(alert, dict):
                 continue
             try:
@@ -215,24 +247,52 @@ class ForecastCoordinator:
                 risk_time = datetime.combine(target, time(hour, minute), self.timezone)
             except (TypeError, ValueError):
                 continue
-            target_time = risk_time - timedelta(minutes=20)
+            target_time = risk_time - timedelta(minutes=self.warning_lead_minutes)
+            valid_until = risk_time + timedelta(minutes=self.warning_late_grace_minutes)
             level = str(alert.get("tier") or alert.get("intensity_zone") or "1")
-            # Identity is the actual local risk episode, not a forecast version.
-            identity = _sha({"date": target.isoformat(), "risk_minute": risk_time.strftime("%H:%M")})
+            stressors = sorted(str(value) for value in (alert.get("dominant_stressors") or []))
+            current_events = sorted(str(value) for value in (alert.get("current_events") or []))
+            trigger = stressors or current_events or [
+                str(alert.get("trigger_source") or "trajectory_episode")
+            ]
+            trigger_key = _canonical(trigger)
+            ordinal = trigger_counts.get(trigger_key, 0)
+            trigger_counts[trigger_key] = ordinal + 1
+            episode_identity = _sha({
+                "date": target.isoformat(), "trigger": trigger, "ordinal": ordinal,
+            })
+            identity = episode_identity
             result.append({
                 "warning_identity": identity, "target_time": target_time.astimezone(timezone.utc),
+                "episode_identity": episode_identity,
+                "risk_time": risk_time.astimezone(timezone.utc),
+                "valid_until": valid_until.astimezone(timezone.utc),
+                "episode_drift_minutes": self.warning_episode_drift_minutes,
                 "warning_level": level, "payload": {**alert, "risk_time": risk_time.isoformat()},
             })
         return result
 
     @staticmethod
     def _serializable_warning(item: dict[str, Any]) -> dict[str, Any]:
-        return {**item, "target_time": item["target_time"].isoformat()}
+        return {
+            **item,
+            "target_time": item["target_time"].isoformat(),
+            "risk_time": item["risk_time"].isoformat(),
+            "valid_until": item["valid_until"].isoformat(),
+        }
 
     @staticmethod
     def _semantic_delta(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> float:
-        left = {str(item.get("id")): ((item.get("metadata") or {}).get("semantic") or {}).get("values", {}) for item in before}
-        right = {str(item.get("id")): ((item.get("metadata") or {}).get("semantic") or {}).get("values", {}) for item in after}
+        left = {
+            str(item.get("id")): semantic_model_inputs(
+                (item.get("metadata") or {}).get("semantic")
+            ) for item in before
+        }
+        right = {
+            str(item.get("id")): semantic_model_inputs(
+                (item.get("metadata") or {}).get("semantic")
+            ) for item in after
+        }
         delta = 0.0
         for event_id in set(left) | set(right):
             for dimension in set(left.get(event_id, {})) | set(right.get(event_id, {})):

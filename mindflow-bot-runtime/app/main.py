@@ -9,7 +9,18 @@ import signal
 from typing import Any
 
 
-async def _run_gateway_until_shutdown(gateway: Any) -> None:
+def _log_startup_phase(name: str) -> None:
+    try:
+        import resource
+        rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, AttributeError):
+        rss_kib = 0
+    logging.getLogger(__name__).info(
+        "startup_phase=%s pid=%s rss_kib=%s", name, os.getpid(), rss_kib
+    )
+
+
+async def _run_gateway_until_shutdown(gateway: Any, on_ready: Any = None) -> None:
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
     installed_signals: list[signal.Signals] = []
@@ -34,6 +45,8 @@ async def _run_gateway_until_shutdown(gateway: Any) -> None:
             await asyncio.gather(gateway_start, return_exceptions=True)
             return
         await gateway_start
+        if on_ready is not None:
+            await on_ready()
 
         gateway_closed = asyncio.create_task(
             gateway.wait_closed(), name="feishu-gateway-wait"
@@ -75,6 +88,7 @@ async def run() -> None:
     from app.services.forecast_scheduler import ForecastScheduler
     from app.services.safety_service import SafetyService
     from app.worker import BotWorker
+    from app.logging_security import install_credential_redaction
 
     settings = Settings.from_env()
     isolate_process_environment()
@@ -82,23 +96,19 @@ async def run() -> None:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    try:
-        import resource
-        rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    except (ImportError, AttributeError):
-        rss_kib = 0
-    logging.getLogger(__name__).info(
-        "startup_resources pid=%s rss_kib=%s", os.getpid(), rss_kib
-    )
+    install_credential_redaction()
+    _log_startup_phase("settings_ready")
     database = Database(build_engine(settings.database_url))
     with database.session() as session:
         session.execute(text("SELECT 1"))
+    _log_startup_phase("database_ready")
 
     bindings = BindingRepository(database)
     identity = IdentityService(database, bindings)
     events = BotEventRepository(database)
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
+    _log_startup_phase("business_ready")
 
     skill_loader = SkillLoader(settings.care_skill_path)
     skill_loader.load()
@@ -169,6 +179,10 @@ async def run() -> None:
         daily_prepare_local_time=settings.forecast_daily_prepare_local_time,
         calendar_sync_interval_seconds=settings.forecast_calendar_sync_interval_seconds,
         warning_poll_interval_seconds=settings.warning_poll_interval_seconds,
+        forecast_max_concurrency=settings.forecast_max_concurrency,
+        warning_max_attempts=settings.warning_max_attempts,
+        warning_retry_base_seconds=settings.warning_retry_base_seconds,
+        warning_claim_lease_seconds=settings.warning_claim_lease_seconds,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.
@@ -189,21 +203,45 @@ async def run() -> None:
     for participant_id in business.device_flows.pending_participants():
         worker.resume_device_flow(participant_id)
 
-    forecast_tasks = asyncio.create_task(scheduler.run_forever(), name="forecast-scheduler")
+    forecast_tasks: asyncio.Task | None = None
+
+    async def start_scheduler_after_gateway_ready() -> None:
+        nonlocal forecast_tasks
+        _log_startup_phase("gateway_ready")
+        forecast_tasks = asyncio.create_task(
+            scheduler.run_forever(), name="forecast-scheduler"
+        )
+        await scheduler.started.wait()
+        _log_startup_phase("forecast_scheduler_ready")
+
     try:
-        await _run_gateway_until_shutdown(gateway)
+        # Gateway readiness is a hard startup gate. Forecast work cannot
+        # compete with receiver spawn/connection on the small ECS host.
+        await _run_gateway_until_shutdown(
+            gateway, on_ready=start_scheduler_after_gateway_ready
+        )
     finally:
         try:
             await gateway.stop()
         finally:
             await scheduler.close()
-            forecast_tasks.cancel()
+            if forecast_tasks is not None:
+                forecast_tasks.cancel()
             dispatcher.cancel()
-            await asyncio.gather(dispatcher, forecast_tasks, return_exceptions=True)
+            await asyncio.gather(
+                dispatcher,
+                *(task for task in (forecast_tasks,) if task is not None),
+                return_exceptions=True,
+            )
             try:
                 await worker.close()
             finally:
-                await runtime.close()
+                try:
+                    await business.semantic_preprocessor.close(
+                        settings.semantic_api_timeout_seconds + 2
+                    )
+                finally:
+                    await runtime.close()
 
 
 def main() -> None:

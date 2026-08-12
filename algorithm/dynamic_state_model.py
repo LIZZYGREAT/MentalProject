@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 from algorithm.time_utils import interval_minutes, parse_datetime_on_date
 from utils.description_score import convert_score_to_Flike, score_description
+from services.semantic_model_inputs import fused_appraisal_score, semantic_model_inputs
 
 
 RECOVERY_TYPES = {"rest", "meal", "nap", "sleep"}
@@ -198,14 +199,9 @@ def assess_event(event: Any) -> EventAssessment:
                 "unfinished": 0.22,
             },
         }
-    raw_semantic_values = semantic.get("values")
-    if not isinstance(raw_semantic_values, Mapping):
-        fused = semantic.get("fused")
-        raw_semantic_values = (
-            fused.get("objective_semantics") if isinstance(fused, Mapping) else {}
-        )
+    model_semantics = semantic_model_inputs(semantic)
     semantic_values = {
-        key: _clamp(raw_semantic_values.get(key, 0.0))
+        key: model_semantics[key]
         for key in (
             "difficulty", "cognitive_demand", "stakes", "time_pressure",
             "social_evaluation", "uncontrollability", "novelty",
@@ -356,10 +352,12 @@ def assess_event(event: Any) -> EventAssessment:
             objective["unfinished"] = max(0.65, objective["unfinished"])
         metadata["lifecycle"] = lifecycle
 
-    description_score = score_description(
-        str(getattr(event, "description", "") or ""),
-        str(getattr(event, "name", "") or ""),
-    )
+    description_score = fused_appraisal_score(semantic)
+    if description_score is None:
+        description_score = score_description(
+            str(getattr(event, "description", "") or ""),
+            str(getattr(event, "name", "") or ""),
+        )
     valence = convert_score_to_Flike(description_score)
     default_threat = _clamp(
         0.08

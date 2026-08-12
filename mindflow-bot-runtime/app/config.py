@@ -71,15 +71,20 @@ class Settings:
     feishu_gateway_device_flow_close_timeout_seconds: int = 8
     forecast_daily_prepare_local_time: str = "07:30"
     forecast_calendar_sync_interval_seconds: int = 300
-    forecast_change_debounce_seconds: int = 10
     semantic_api_enabled: bool = False
     semantic_api_url: str = "https://api.deepseek.com/chat/completions"
     semantic_api_model: str = "deepseek-v4-flash"
     semantic_api_timeout_seconds: float = 8.0
-    semantic_batch_size: int = 8
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
+    warning_lead_minutes: int = 20
+    warning_late_grace_minutes: int = 10
+    warning_max_attempts: int = 5
+    warning_retry_base_seconds: int = 60
+    warning_claim_lease_seconds: int = 120
+    warning_episode_drift_minutes: int = 15
 
     @property
     def care_skill_path(self) -> Path:
@@ -189,9 +194,6 @@ class Settings:
             forecast_calendar_sync_interval_seconds=_int(
                 values, "FORECAST_CALENDAR_SYNC_INTERVAL_SECONDS", 300, minimum=60
             ),
-            forecast_change_debounce_seconds=_int(
-                values, "FORECAST_CHANGE_DEBOUNCE_SECONDS", 10, minimum=0
-            ),
             semantic_api_enabled=_bool(values, "SEMANTIC_API_ENABLED", False),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
@@ -202,14 +204,20 @@ class Settings:
             semantic_api_timeout_seconds=_float(
                 values, "SEMANTIC_API_TIMEOUT_SECONDS", 8.0, minimum=0.1
             ),
-            semantic_batch_size=_int(values, "SEMANTIC_BATCH_SIZE", 8),
             semantic_max_concurrency=_int(values, "SEMANTIC_MAX_CONCURRENCY", 2),
             semantic_materiality_threshold=_float(
                 values, "SEMANTIC_MATERIALITY_THRESHOLD", 0.03
             ),
+            forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
                 values, "WARNING_POLL_INTERVAL_SECONDS", 15
             ),
+            warning_lead_minutes=_int(values, "WARNING_LEAD_MINUTES", 20, minimum=0),
+            warning_late_grace_minutes=_int(values, "WARNING_LATE_GRACE_MINUTES", 10, minimum=0),
+            warning_max_attempts=_int(values, "WARNING_MAX_ATTEMPTS", 5),
+            warning_retry_base_seconds=_int(values, "WARNING_RETRY_BASE_SECONDS", 60),
+            warning_claim_lease_seconds=_int(values, "WARNING_CLAIM_LEASE_SECONDS", 120),
+            warning_episode_drift_minutes=_int(values, "WARNING_EPISODE_DRIFT_MINUTES", 15),
         )
         if validate:
             settings.validate()

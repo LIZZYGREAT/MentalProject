@@ -14,6 +14,7 @@ from app.repositories import (
     ObservationRepository,
     PredictionRepository,
     ProfileRepository,
+    ForecastSnapshotRepository,
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
@@ -54,6 +55,7 @@ class CareTools:
         tokens: TokenRepository,
         timezone_name: str,
         forecast_coordinator: ForecastCoordinator | None = None,
+        forecast_snapshots: ForecastSnapshotRepository | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -63,6 +65,7 @@ class CareTools:
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
         self.forecast_coordinator = forecast_coordinator
+        self.forecast_snapshots = forecast_snapshots
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -135,12 +138,18 @@ class CareTools:
         profile = self.profiles.current(ctx.participant_id)
         recent = self.observations.recent(ctx.participant_id, limit=1)
         prediction = self.predictions.latest(ctx.participant_id)
+        latest_forecast = (
+            self.forecast_snapshots.latest(
+                ctx.participant_id, datetime.now(self.timezone).date()
+            ) if self.forecast_snapshots is not None else None
+        )
         return {
             "ok": True,
             "profile": _safe_profile(profile["profile"]) if profile else None,
             "profile_version": profile["version"] if profile else None,
             "latest_checkin": recent[0] if recent else None,
             "latest_assessment": prediction,
+            "latest_forecast": latest_forecast,
         }
 
     def record_checkin(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
