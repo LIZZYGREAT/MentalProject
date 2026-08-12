@@ -551,7 +551,11 @@ class WarningScheduleRepository:
     ) -> dict[str, int]:
         counts = {"kept": 0, "created": 0, "rescheduled": 0, "cancelled": 0}
         now = self._aware(now)
-        desired = [item for item in warnings if self._aware(item["valid_until"]) > now]
+        desired = [
+            item for item in warnings
+            if self._aware(item["valid_until"]) >= now
+            and self._aware(item["risk_time"]) > now
+        ]
         with self.database.session() as session:
             rows = session.execute(
                 select(WarningSchedule).where(
@@ -635,7 +639,11 @@ class WarningScheduleRepository:
                 row.updated_at = utc_now()
                 counts["rescheduled" if changed else "kept"] += 1
             for row in unmatched.values():
-                if row.status in self.ACTIVE and self._aware(row.valid_until) > now:
+                if (
+                    row.status in self.ACTIVE
+                    and self._aware(row.valid_until) >= now
+                    and self._aware(row.risk_time) > now
+                ):
                     row.status = "cancelled"
                     row.updated_at = now
                     counts["cancelled"] += 1
@@ -655,7 +663,10 @@ class WarningScheduleRepository:
         with self.database.session() as session:
             expired = session.execute(select(WarningSchedule).where(
                 WarningSchedule.status.in_(("pending", "claimed")),
-                WarningSchedule.valid_until < now,
+                or_(
+                    WarningSchedule.valid_until < now,
+                    WarningSchedule.risk_time <= now,
+                ),
             )).scalars().all()
             for row in expired:
                 row.status = "expired"
@@ -675,6 +686,7 @@ class WarningScheduleRepository:
                     WarningSchedule.target_time <= now,
                     or_(WarningSchedule.next_attempt_at.is_(None), WarningSchedule.next_attempt_at <= now),
                     WarningSchedule.valid_until >= now,
+                    WarningSchedule.risk_time > now,
                     ForecastSnapshot.valid.is_(True),
                     ForecastSnapshot.forecast_version == WarningSchedule.forecast_version,
                 ).order_by(WarningSchedule.target_time).limit(limit)
@@ -682,9 +694,14 @@ class WarningScheduleRepository:
             return [self._view(row) for row in rows]
 
     def mark_sent_if_current(self, warning_id: uuid.UUID, now: datetime) -> bool:
+        now = self._aware(now)
         with self.database.session() as session:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if row is None or row.status != "pending":
+                return False
+            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
+                row.status = "expired"
+                row.updated_at = now
                 return False
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
@@ -707,7 +724,7 @@ class WarningScheduleRepository:
                 return None
             if row.status == "claimed" and row.lease_until and self._aware(row.lease_until) >= now:
                 return None
-            if self._aware(row.valid_until) < now:
+            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
                 row.status = "expired"
                 row.updated_at = now
                 return None
@@ -747,9 +764,17 @@ class WarningScheduleRepository:
                 row.status = "failed"
                 row.next_attempt_at = None
             else:
-                row.status = "pending"
                 delay = retry_base_seconds * (2 ** max(0, row.attempt_count - 1))
-                row.next_attempt_at = now + timedelta(seconds=delay)
+                next_attempt = now + timedelta(seconds=delay)
+                if (
+                    next_attempt >= self._aware(row.risk_time)
+                    or next_attempt > self._aware(row.valid_until)
+                ):
+                    row.status = "expired"
+                    row.next_attempt_at = None
+                else:
+                    row.status = "pending"
+                    row.next_attempt_at = next_attempt
             row.updated_at = now
 
     def block_delivery(
@@ -759,13 +784,22 @@ class WarningScheduleRepository:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if row is None or row.status != "claimed":
                 return
-            row.status = "delivery_unavailable"
-            row.next_attempt_at = self._aware(now) + timedelta(minutes=5)
-            row.last_attempt_at = self._aware(now)
+            now = self._aware(now)
+            next_attempt = now + timedelta(minutes=5)
+            if (
+                next_attempt >= self._aware(row.risk_time)
+                or next_attempt > self._aware(row.valid_until)
+            ):
+                row.status = "expired"
+                row.next_attempt_at = None
+            else:
+                row.status = "delivery_unavailable"
+                row.next_attempt_at = next_attempt
+            row.last_attempt_at = now
             row.last_error_class = reason[:128]
             row.claimed_at = None
             row.lease_until = None
-            row.updated_at = self._aware(now)
+            row.updated_at = now
 
     def delivery_unavailable(
         self, now: datetime, *, limit: int = 100
@@ -774,7 +808,10 @@ class WarningScheduleRepository:
         with self.database.session() as session:
             expired = session.execute(select(WarningSchedule).where(
                 WarningSchedule.status == "delivery_unavailable",
-                WarningSchedule.valid_until < now,
+                or_(
+                    WarningSchedule.valid_until < now,
+                    WarningSchedule.risk_time <= now,
+                ),
             )).scalars().all()
             for row in expired:
                 row.status = "expired"
@@ -782,6 +819,7 @@ class WarningScheduleRepository:
             rows = session.execute(select(WarningSchedule).where(
                 WarningSchedule.status == "delivery_unavailable",
                 WarningSchedule.valid_until >= now,
+                WarningSchedule.risk_time > now,
                 WarningSchedule.next_attempt_at <= now,
             ).limit(limit)).scalars().all()
             return [self._view(row) for row in rows]
@@ -794,13 +832,21 @@ class WarningScheduleRepository:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if row is None or row.status != "delivery_unavailable":
                 return
-            if self._aware(row.valid_until) < now:
+            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
                 row.status = "expired"
             elif available:
                 row.status = "pending"
                 row.next_attempt_at = now
             else:
-                row.next_attempt_at = now + timedelta(minutes=5)
+                next_attempt = now + timedelta(minutes=5)
+                if (
+                    next_attempt >= self._aware(row.risk_time)
+                    or next_attempt > self._aware(row.valid_until)
+                ):
+                    row.status = "expired"
+                    row.next_attempt_at = None
+                else:
+                    row.next_attempt_at = next_attempt
             row.updated_at = now
 
 

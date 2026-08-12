@@ -315,7 +315,6 @@ SEMANTIC_API_ENABLED=false
 SEMANTIC_API_ENABLED=true
 SEMANTIC_API_MODEL=deepseek-v4-flash
 SEMANTIC_API_TIMEOUT_SECONDS=8
-SEMANTIC_BATCH_SIZE=8
 SEMANTIC_MAX_CONCURRENCY=2
 SEMANTIC_MATERIALITY_THRESHOLD=0.03
 ```
@@ -410,7 +409,7 @@ PostgreSQL semantic cache hit
 - durable cache；
 - circuit breaker。
 
-但当前 DeepSeek client 仍是逐事件 HTTP 调用，不是把多个事件放进同一个 HTTP batch。原先未生效的 `SEMANTIC_BATCH_SIZE` 已删除。日程数量较多时会受 `SEMANTIC_MAX_CONCURRENCY` 控制并发并逐项 enrichment，不会阻塞 baseline Forecast。若后续优化成本或吞吐，应增加带 item identity 的批量 prompt/response schema，并保留每个 fingerprint 独立缓存和校验。
+但当前 DeepSeek client 仍是逐事件 HTTP 调用，不是把多个事件放进同一个 HTTP batch。日程数量较多时会受 `SEMANTIC_MAX_CONCURRENCY` 控制并发并逐项 enrichment，不会阻塞 baseline Forecast。若后续优化成本或吞吐，应增加带 item identity 的批量 prompt/response schema，并保留每个 fingerprint 独立缓存和校验。
 
 ---
 

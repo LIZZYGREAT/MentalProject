@@ -20,6 +20,9 @@ from app.services.forecast_coordinator import ForecastCoordinator, normalized_ca
 from helpers import memory_database
 
 
+TEST_LOCAL_DATE = date(2030, 1, 15)
+
+
 class MutableCalendar:
     def __init__(self, events):
         self.events = events
@@ -56,7 +59,7 @@ class FakePrediction:
 
 
 def event(summary="汇报", description="准备正式汇报", start="10:00", end="11:00"):
-    target = date.today().isoformat()
+    target = TEST_LOCAL_DATE.isoformat()
     return {
         "id": "event-1", "summary": summary, "description": description,
         "start_time": f"{target}T{start}:00+08:00",
@@ -144,6 +147,7 @@ def test_external_enrichment_is_single_flight_durable_and_identity_free():
                     "uncontrollability": 0.3, "novelty": 0.3,
                     "expected_effort": 0.7, "uncertainty": 0.3, "unfinished": 0.2,
                 },
+                "appraisal_score_1_10": 5.0,
                 "confidence": 0.8, "evidence_tags": ["汇报"],
                 "reasoning_summary": "正式汇报具有客观评价属性",
             }
@@ -175,7 +179,7 @@ def test_external_enrichment_is_single_flight_durable_and_identity_free():
         assert second_misses == []
         assert status == "hybrid_complete"
         assert prepared[0]["metadata"]["semantic"]["source"] == "hybrid"
-        assert completed >= 1
+        assert completed == 1
         forbidden = {"participant_id", "participant_code", "open_id", "chat_id", "access_token", "refresh_token"}
         assert not forbidden.intersection(client.payloads[0])
 
@@ -219,10 +223,10 @@ def test_on_demand_forecast_is_immediate_rules_baseline_and_fast_path():
 
     async def scenario():
         first = await coordinator.ensure_forecast(
-            participant.id, date.today(), "user_curve_request"
+            participant.id, TEST_LOCAL_DATE, "user_curve_request"
         )
         second = await coordinator.ensure_forecast(
-            participant.id, date.today(), "user_curve_request"
+            participant.id, TEST_LOCAL_DATE, "user_curve_request"
         )
         assert not first["cache_hit"]
         assert second["cache_hit"]
@@ -238,14 +242,14 @@ def test_create_delete_and_time_only_update_invalidate_forecast_not_semantic():
     _, participant, calendar, semantics, prediction, warnings, coordinator = build_pipeline([event()])
 
     async def scenario():
-        first = await coordinator.ensure_forecast(participant.id, date.today(), "daily_prepare")
+        first = await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
         first_fingerprint = first["semantic_input"][0]["semantic"]["fingerprint"]
         calendar.events = [event(start="11:00", end="12:00")]
-        moved = await coordinator.ensure_forecast(participant.id, date.today(), "periodic_poll")
+        moved = await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "periodic_poll")
         assert moved["forecast_version"] != first["forecast_version"]
         assert moved["semantic_input"][0]["semantic"]["fingerprint"] == first_fingerprint
         calendar.events = []
-        deleted = await coordinator.ensure_forecast(participant.id, date.today(), "periodic_poll")
+        deleted = await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "periodic_poll")
         assert deleted["forecast_version"] != moved["forecast_version"]
         assert prediction.calls == 3
         assert semantics._inflight == {}
@@ -258,13 +262,13 @@ def test_warning_is_durable_deduped_and_stale_forecast_cannot_send():
     database, participant, calendar, _, _, warnings, coordinator = build_pipeline([event()])
 
     async def scenario():
-        first = await coordinator.ensure_forecast(participant.id, date.today(), "daily_prepare")
+        first = await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
         with database.session() as session:
             from app.models import WarningSchedule
             row = session.query(WarningSchedule).one()
             warning_id = row.id
         calendar.events = [event(description="语义发生变化")]
-        await coordinator.ensure_forecast(participant.id, date.today(), "periodic_poll")
+        await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "periodic_poll")
         # Old forecast was invalidated; a stale row cannot be claimed/sent.
         old_row = None
         with database.session() as session:
@@ -304,7 +308,7 @@ def test_subthreshold_semantic_change_keeps_persisted_forecast_fast_path():
     _, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
 
     async def scenario():
-        first = await coordinator.ensure_forecast(participant.id, date.today(), "daily_prepare")
+        first = await coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
         semantic_events = []
         for item in first["semantic_input"]:
             semantic = dict(item["semantic"])

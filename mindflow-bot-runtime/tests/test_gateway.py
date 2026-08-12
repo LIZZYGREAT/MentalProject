@@ -229,7 +229,7 @@ def test_channel_adapter_keeps_stable_fields_and_filters_unsupported_messages():
             adapter.adapt(message)
 
 
-def test_gateway_start_forwards_events_and_stop_cleans_receiver():
+def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):
     database = memory_database()
     queue = asyncio.Queue(maxsize=2)
     identity = IdentityService(database, BindingRepository(database))
@@ -257,7 +257,14 @@ def test_gateway_start_forwards_events_and_stop_cleans_receiver():
         await gateway.stop()
         assert not gateway.is_running
 
-    asyncio.run(scenario())
+    with caplog.at_level("INFO"):
+        asyncio.run(scenario())
+    ready_records = [
+        record.getMessage() for record in caplog.records
+        if "feishu_receiver_ready" in record.getMessage()
+    ]
+    assert ready_records
+    assert all("receiver_pid=" in message for message in ready_records)
 
 
 def test_gateway_stop_waits_for_receiver_channel_cleanup():

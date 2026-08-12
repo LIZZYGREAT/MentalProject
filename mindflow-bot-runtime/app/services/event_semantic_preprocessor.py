@@ -7,8 +7,10 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
+import logging
+import re
 import time
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Hashable, Mapping
 
 from app.repositories import EventSemanticCacheRepository
 from services.event_semantic_prompt import PROMPT_VERSION
@@ -26,8 +28,19 @@ from utils.description_score import score_description
 from services.semantic_model_inputs import semantic_model_inputs
 
 
+logger = logging.getLogger(__name__)
+_SECRET = re.compile(
+    r"(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|secret|token)\s*[=:]\s*)[^\s,;]+"
+)
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _safe_error_message(exc: Exception) -> str:
+    message = " ".join(str(exc).split())[:160]
+    return _SECRET.sub(lambda match: f"{match.group(1) or match.group(2)}[redacted]", message)
 
 
 def _duration_minutes(event: Mapping[str, Any]) -> float:
@@ -56,6 +69,7 @@ class EventSemanticPreprocessor:
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
         self._completion_tasks: set[asyncio.Task] = set()
+        self._completion_by_key: dict[Hashable, asyncio.Task] = {}
         self._closing = False
         self._circuit_until = 0.0
         self._circuit_seconds = max(1.0, circuit_seconds)
@@ -106,26 +120,29 @@ class EventSemanticPreprocessor:
             if cached:
                 external = dict(cached.get("external") or {})
                 raw_external_values = external.get("objective_semantics")
-                if isinstance(raw_external_values, Mapping):
+                try:
+                    validated_values, validated_confidence, _, _ = validate_external_semantics({
+                        **external, "values": raw_external_values,
+                    })
+                except (TypeError, ValueError):
+                    cached = None
+                    external = None
+                else:
                     values, _ = fuse_rule_and_external(
-                        rule_values, raw_external_values,
-                        float(external.get("confidence") or 0.0), floors,
+                        rule_values, validated_values, validated_confidence, floors,
                     )
-                    confidence = max(confidence, float(external.get("confidence") or 0.0) * 0.85)
+                    confidence = max(confidence, validated_confidence * 0.85)
                     source = "hybrid"
                     external_count += 1
             fused_appraisal = appraisal = score_description(
                 str(event.get("description") or ""), str(event.get("summary") or "")
             )
             if external and external.get("appraisal_score_1_10") is not None:
-                try:
-                    external_appraisal = max(1.0, min(10.0, float(external["appraisal_score_1_10"])))
-                    weight = min(0.30, 0.30 * float(external.get("confidence") or 0.0))
-                    fused_appraisal = max(
-                        1.0, min(10.0, appraisal + max(-1.2, min(1.2, weight * (external_appraisal - appraisal))))
-                    )
-                except (TypeError, ValueError):
-                    fused_appraisal = appraisal
+                external_appraisal = float(external["appraisal_score_1_10"])
+                weight = min(0.30, 0.30 * float(external.get("confidence") or 0.0))
+                fused_appraisal = max(
+                    1.0, min(10.0, appraisal + max(-1.2, min(1.2, weight * (external_appraisal - appraisal))))
+                )
             if not cached and consent and eligible and self.client:
                 misses.append({
                     "fingerprint": fingerprint,
@@ -182,14 +199,22 @@ class EventSemanticPreprocessor:
     async def enqueue(
         self, participant_id: Any, misses: list[dict[str, Any]],
         on_complete: Callable[[], Awaitable[None]],
+        *, completion_key: Hashable | None = None,
     ) -> None:
         if (
             self._closing or not self.client or not misses
             or time.monotonic() < self._circuit_until
         ):
             return
+        callback_key = completion_key or (
+            str(participant_id),
+            tuple(sorted(miss["fingerprint"] for miss in misses)),
+        )
         tasks = []
         async with self._inflight_lock:
+            existing = self._completion_by_key.get(callback_key)
+            if existing is not None and not existing.done():
+                return
             for miss in misses:
                 key = (str(participant_id), miss["fingerprint"])
                 task = self._inflight.get(key)
@@ -200,14 +225,23 @@ class EventSemanticPreprocessor:
                     )
                     self._inflight[key] = task
                 tasks.append(task)
-        if tasks:
+            if not tasks:
+                return
+
             async def finish() -> None:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                if any(result is True for result in results):
-                    await on_complete()
+                try:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    if any(result is True for result in results):
+                        await on_complete()
+                finally:
+                    async with self._inflight_lock:
+                        if self._completion_by_key.get(callback_key) is asyncio.current_task():
+                            self._completion_by_key.pop(callback_key, None)
+
             completion = asyncio.create_task(
                 finish(), name="semantic-enrichment-completion"
             )
+            self._completion_by_key[callback_key] = completion
             self._completion_tasks.add(completion)
             completion.add_done_callback(self._completion_done)
 
@@ -257,11 +291,7 @@ class EventSemanticPreprocessor:
             try:
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
                 values, confidence, tags, reasoning = validate_external_semantics(raw)
-                appraisal = raw.get("appraisal_score_1_10", 5.0)
-                try:
-                    appraisal = max(1.0, min(10.0, float(appraisal)))
-                except (TypeError, ValueError):
-                    appraisal = 5.0
+                appraisal = float(raw["appraisal_score_1_10"])
                 assessment = {
                     "external": {
                         "available": True,
@@ -280,6 +310,15 @@ class EventSemanticPreprocessor:
                     prompt_version=PROMPT_VERSION, model=self.model,
                 )
                 return True
-            except Exception:
+            except Exception as exc:
                 self._circuit_until = time.monotonic() + self._circuit_seconds
+                provider = str(getattr(self.client, "provider", "unknown"))[:48]
+                model = str(getattr(self.client, "model", self.model))[:80]
+                message = _safe_error_message(exc)
+                logger.warning(
+                    "semantic_enrichment_failed fingerprint_prefix=%s provider=%s "
+                    "model=%s error_class=%s message=%s circuit_open_seconds=%s",
+                    str(miss.get("fingerprint") or "")[:12], provider, model,
+                    type(exc).__name__, message, self._circuit_seconds,
+                )
                 return False

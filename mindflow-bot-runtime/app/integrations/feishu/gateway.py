@@ -334,8 +334,8 @@ class FeishuGateway:
             await self.stop()
             raise
         logger.info(
-            "feishu_receiver_ready",
-            extra={"receiver_pid": getattr(self._process, "pid", None)},
+            "feishu_receiver_ready receiver_pid=%s",
+            getattr(self._process, "pid", None),
         )
 
     async def wait_closed(self) -> None:

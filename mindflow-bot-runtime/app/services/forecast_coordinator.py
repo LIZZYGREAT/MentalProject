@@ -75,24 +75,8 @@ class ForecastCoordinator:
         self.warning_lead_minutes = warning_lead_minutes
         self.warning_late_grace_minutes = warning_late_grace_minutes
         self.warning_episode_drift_minutes = warning_episode_drift_minutes
-        self._locks: dict[tuple[uuid.UUID, date], asyncio.Lock] = {}
-        self._dirty: set[tuple[uuid.UUID, date]] = set()
-        self._lock_users: dict[tuple[uuid.UUID, date], int] = {}
+        self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
-
-    async def _lock_for(self, key: tuple[uuid.UUID, date]) -> asyncio.Lock:
-        async with self._guard:
-            self._lock_users[key] = self._lock_users.get(key, 0) + 1
-            return self._locks.setdefault(key, asyncio.Lock())
-
-    async def _release_lock(self, key: tuple[uuid.UUID, date]) -> None:
-        async with self._guard:
-            remaining = self._lock_users.get(key, 1) - 1
-            if remaining <= 0 and key not in self._dirty:
-                self._lock_users.pop(key, None)
-                self._locks.pop(key, None)
-            else:
-                self._lock_users[key] = remaining
 
     async def ensure_forecast(
         self, participant_id: uuid.UUID, local_date: date | str, reason: str,
@@ -100,24 +84,67 @@ class ForecastCoordinator:
     ) -> dict[str, Any]:
         target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
         key = (participant_id, target)
-        lock = await self._lock_for(key)
-        if lock.locked():
-            self._dirty.add(key)
-        try:
-            async with lock:
-                latest_result: dict[str, Any] | None = None
-                while True:
-                    self._dirty.discard(key)
-                    latest_result = await self._ensure_once(
-                        participant_id, target, reason,
+        async with self._guard:
+            flight = self._inflight.get(key)
+            if flight is None:
+                flight = {
+                    "refresh_calendar": refresh_calendar,
+                    "followup_refresh": False,
+                    "followup_reason": reason,
+                    "followup_enrichment": enqueue_enrichment,
+                }
+                task = asyncio.create_task(
+                    self._run_flight(
+                        key, flight, participant_id, target, reason,
                         refresh_calendar=refresh_calendar,
                         enqueue_enrichment=enqueue_enrichment,
-                    )
-                    if key not in self._dirty:
-                        return latest_result
-                    refresh_calendar = True
+                    ),
+                    name=f"forecast-{participant_id}-{target.isoformat()}",
+                )
+                flight["task"] = task
+                self._inflight[key] = flight
+            elif refresh_calendar and not flight["refresh_calendar"]:
+                flight["followup_refresh"] = True
+                flight["followup_reason"] = reason
+                flight["followup_enrichment"] = (
+                    flight["followup_enrichment"] or enqueue_enrichment
+                )
+            task = flight["task"]
+        return await asyncio.shield(task)
+
+    async def _run_flight(
+        self, key: tuple[uuid.UUID, date], flight: dict[str, Any],
+        participant_id: uuid.UUID, target: date, reason: str, *,
+        refresh_calendar: bool, enqueue_enrichment: bool,
+    ) -> dict[str, Any]:
+        try:
+            result = await self._ensure_once(
+                participant_id, target, reason,
+                refresh_calendar=refresh_calendar,
+                enqueue_enrichment=enqueue_enrichment,
+            )
+            async with self._guard:
+                followup_refresh = bool(
+                    flight["followup_refresh"] and not flight["refresh_calendar"]
+                )
+                followup_reason = flight["followup_reason"]
+                followup_enrichment = flight["followup_enrichment"]
+                if followup_refresh:
+                    flight["refresh_calendar"] = True
+                    flight["followup_refresh"] = False
+                elif self._inflight.get(key) is flight:
+                    self._inflight.pop(key, None)
+            if followup_refresh:
+                result = await self._ensure_once(
+                    participant_id, target, followup_reason,
+                    refresh_calendar=True,
+                    enqueue_enrichment=followup_enrichment,
+                )
+            return result
         finally:
-            await self._release_lock(key)
+            async with self._guard:
+                if self._inflight.get(key) is flight:
+                    self._inflight.pop(key, None)
 
     async def _calendar_snapshot(
         self, participant_id: uuid.UUID, target: date, refresh: bool,
@@ -233,7 +260,10 @@ class ForecastCoordinator:
                         participant_id, target, "semantic_enrichment_completion",
                         refresh_calendar=False, enqueue_enrichment=False,
                     )
-            await self.semantics.enqueue(participant_id, misses, recompute)
+            await self.semantics.enqueue(
+                participant_id, misses, recompute,
+                completion_key=(participant_id, target),
+            )
         return result
 
     def _warning_windows(self, alerts: Any, target: date) -> list[dict[str, Any]]:
@@ -248,7 +278,10 @@ class ForecastCoordinator:
             except (TypeError, ValueError):
                 continue
             target_time = risk_time - timedelta(minutes=self.warning_lead_minutes)
-            valid_until = risk_time + timedelta(minutes=self.warning_late_grace_minutes)
+            valid_until = min(
+                target_time + timedelta(minutes=self.warning_late_grace_minutes),
+                risk_time,
+            )
             level = str(alert.get("tier") or alert.get("intensity_zone") or "1")
             stressors = sorted(str(value) for value in (alert.get("dominant_stressors") or []))
             current_events = sorted(str(value) for value in (alert.get("current_events") or []))

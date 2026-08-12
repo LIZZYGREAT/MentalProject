@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -361,6 +362,14 @@ def validate_external_semantics(
 ) -> tuple[Dict[str, float], float, list[str], str]:
     if not isinstance(raw, Mapping):
         raise ValueError("semantic API response must be an object")
+    try:
+        appraisal = float(raw["appraisal_score_1_10"])
+    except KeyError as exc:
+        raise ValueError("semantic API appraisal_score_1_10 is required") from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError("semantic API appraisal_score_1_10 must be numeric") from exc
+    if not math.isfinite(appraisal) or not 1.0 <= appraisal <= 10.0:
+        raise ValueError("semantic API appraisal_score_1_10 must be finite and within [1,10]")
     candidate = raw.get("values", raw)
     if not isinstance(candidate, Mapping):
         raise ValueError("semantic API values must be an object")
