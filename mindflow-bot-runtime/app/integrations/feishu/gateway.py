@@ -208,7 +208,7 @@ class FeishuGateway:
         """Run one official Channel lifecycle without nested event loops."""
 
         if self.channel_factory is None:
-            from lark_oapi.channel import FeishuChannel
+            from lark_channel import FeishuChannel
 
             factory = FeishuChannel
         else:
