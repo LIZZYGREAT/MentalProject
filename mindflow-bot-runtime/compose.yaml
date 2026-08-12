@@ -29,6 +29,10 @@ services:
     volumes:
       - claude_state:/home/mindflow/.claude
     restart: unless-stopped
+    cpus: ${BOT_CPU_LIMIT:-0.75}
+    mem_limit: ${BOT_MEMORY_LIMIT:-768m}
+    memswap_limit: ${BOT_MEMORY_SWAP_LIMIT:-1280m}
+    pids_limit: ${BOT_PID_LIMIT:-128}
 
   postgres:
     image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/postgres
@@ -44,6 +48,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    cpus: ${POSTGRES_CPU_LIMIT:-0.50}
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
+    memswap_limit: ${POSTGRES_MEMORY_SWAP_LIMIT:-768m}
+    pids_limit: ${POSTGRES_PID_LIMIT:-100}
 
 volumes:
   postgres_data:

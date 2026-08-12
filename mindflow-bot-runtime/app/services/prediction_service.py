@@ -14,6 +14,21 @@ class PredictionService:
         self.model = model
         self.predictions = predictions
 
+    def calculate(
+        self, *, profile: dict[str, Any], observations: list[dict[str, Any]],
+        calendar_events: list[dict[str, Any]], calendar_degraded: bool,
+        local_date: str,
+    ) -> dict[str, Any]:
+        """Calculate without adding message-level persistence side effects."""
+
+        return self.model.predict(
+            profile=profile,
+            observations=observations,
+            calendar_events=calendar_events,
+            local_date=local_date,
+            calendar_degraded=calendar_degraded,
+        ).to_dict()
+
     def run(
         self,
         *,
@@ -31,18 +46,15 @@ class PredictionService:
         )
         if existing is not None:
             return existing
-        result = self.model.predict(
-            profile=profile,
-            observations=observations,
-            calendar_events=calendar_events,
+        output = self.calculate(
+            profile=profile, observations=observations,
+            calendar_events=calendar_events, calendar_degraded=calendar_degraded,
             local_date=local_date,
-            calendar_degraded=calendar_degraded,
         )
-        output = result.to_dict()
         prediction_id = self.predictions.save(
             participant_id,
             profile_version=profile_version,
-            model_version=result.model_version,
+            model_version=str(output["model_version"]),
             input_snapshot={
                 "profile_version": profile_version,
                 "profile": profile,

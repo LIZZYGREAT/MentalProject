@@ -19,6 +19,25 @@ def _int(env: Mapping[str, str], name: str, default: int, minimum: int = 1) -> i
     return value
 
 
+def _float(
+    env: Mapping[str, str], name: str, default: float, minimum: float = 0.0
+) -> float:
+    try:
+        value = float(env.get(name, str(default)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    value = env.get(name, "true" if default else "false").strip().lower()
+    if value not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+        raise ValueError(f"{name} must be a boolean")
+    return value in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str
@@ -50,6 +69,17 @@ class Settings:
     feishu_gateway_start_timeout_seconds: int = 30
     feishu_gateway_stop_timeout_seconds: int = 8
     feishu_gateway_device_flow_close_timeout_seconds: int = 8
+    forecast_daily_prepare_local_time: str = "07:30"
+    forecast_calendar_sync_interval_seconds: int = 300
+    forecast_change_debounce_seconds: int = 10
+    semantic_api_enabled: bool = False
+    semantic_api_url: str = "https://api.deepseek.com/chat/completions"
+    semantic_api_model: str = "deepseek-v4-flash"
+    semantic_api_timeout_seconds: float = 8.0
+    semantic_batch_size: int = 8
+    semantic_max_concurrency: int = 2
+    semantic_materiality_threshold: float = 0.03
+    warning_poll_interval_seconds: int = 15
 
     @property
     def care_skill_path(self) -> Path:
@@ -153,6 +183,33 @@ class Settings:
                 "FEISHU_GATEWAY_DEVICE_FLOW_CLOSE_TIMEOUT_SECONDS",
                 8,
             ),
+            forecast_daily_prepare_local_time=values.get(
+                "FORECAST_DAILY_PREPARE_LOCAL_TIME", "07:30"
+            ).strip(),
+            forecast_calendar_sync_interval_seconds=_int(
+                values, "FORECAST_CALENDAR_SYNC_INTERVAL_SECONDS", 300, minimum=60
+            ),
+            forecast_change_debounce_seconds=_int(
+                values, "FORECAST_CHANGE_DEBOUNCE_SECONDS", 10, minimum=0
+            ),
+            semantic_api_enabled=_bool(values, "SEMANTIC_API_ENABLED", False),
+            semantic_api_url=values.get(
+                "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
+            ).strip(),
+            semantic_api_model=values.get(
+                "SEMANTIC_API_MODEL", "deepseek-v4-flash"
+            ).strip(),
+            semantic_api_timeout_seconds=_float(
+                values, "SEMANTIC_API_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            ),
+            semantic_batch_size=_int(values, "SEMANTIC_BATCH_SIZE", 8),
+            semantic_max_concurrency=_int(values, "SEMANTIC_MAX_CONCURRENCY", 2),
+            semantic_materiality_threshold=_float(
+                values, "SEMANTIC_MATERIALITY_THRESHOLD", 0.03
+            ),
+            warning_poll_interval_seconds=_int(
+                values, "WARNING_POLL_INTERVAL_SECONDS", 15
+            ),
         )
         if validate:
             settings.validate()
@@ -200,3 +257,11 @@ class Settings:
             ZoneInfo(self.timezone_name)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"APP_TIMEZONE is invalid: {self.timezone_name}") from exc
+        try:
+            hour, minute = (int(part) for part in self.forecast_daily_prepare_local_time.split(":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FORECAST_DAILY_PREPARE_LOCAL_TIME must be HH:MM") from exc
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("FORECAST_DAILY_PREPARE_LOCAL_TIME must be HH:MM")
+        if self.semantic_materiality_threshold > 1.0:
+            raise ValueError("SEMANTIC_MATERIALITY_THRESHOLD must be <= 1")

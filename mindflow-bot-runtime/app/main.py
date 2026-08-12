@@ -4,34 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
-
-from sqlalchemy import text
-
-from app.agent.claude_runtime import ClaudeAgentRuntime
-from app.agent.sdk_adapter import (
-    ProductionClaudeClientFactory,
-    isolate_process_environment,
-)
-from app.agent.session_manager import ParticipantSessionManager
-from app.agent.skill_loader import SkillLoader
-from app.bootstrap import build_business_services
-from app.config import Settings
-from app.db import Database, build_engine
-from app.identity.service import IdentityService
-from app.integrations.feishu.client import FeishuClient
-from app.integrations.feishu.gateway import BotEvent, FeishuGateway
-from app.repositories import (
-    AgentRunRepository,
-    BindingRepository,
-    BotEventRepository,
-    ClaudeSessionRepository,
-)
-from app.services.safety_service import SafetyService
-from app.worker import BotWorker
+from typing import Any
 
 
-async def _run_gateway_until_shutdown(gateway: FeishuGateway) -> None:
+async def _run_gateway_until_shutdown(gateway: Any) -> None:
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
     installed_signals: list[signal.Signals] = []
@@ -77,11 +55,40 @@ async def _run_gateway_until_shutdown(gateway: FeishuGateway) -> None:
 
 
 async def run() -> None:
+    # Heavy application/algorithm imports are intentionally inside run().
+    # Spawned Feishu receiver children importing app.main stay lightweight.
+    from sqlalchemy import text
+    from app.agent.claude_runtime import ClaudeAgentRuntime
+    from app.agent.sdk_adapter import ProductionClaudeClientFactory, isolate_process_environment
+    from app.agent.session_manager import ParticipantSessionManager
+    from app.agent.skill_loader import SkillLoader
+    from app.bootstrap import build_business_services
+    from app.config import Settings
+    from app.db import Database, build_engine
+    from app.identity.service import IdentityService
+    from app.integrations.feishu.client import FeishuClient
+    from app.integrations.feishu.gateway import BotEvent, FeishuGateway
+    from app.repositories import (
+        AgentRunRepository, BindingRepository, BotEventRepository,
+        ClaudeSessionRepository, ParticipantRepository,
+    )
+    from app.services.forecast_scheduler import ForecastScheduler
+    from app.services.safety_service import SafetyService
+    from app.worker import BotWorker
+
     settings = Settings.from_env()
     isolate_process_environment()
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    try:
+        import resource
+        rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, AttributeError):
+        rss_kib = 0
+    logging.getLogger(__name__).info(
+        "startup_resources pid=%s rss_kib=%s", os.getpid(), rss_kib
     )
     database = Database(build_engine(settings.database_url))
     with database.session() as session:
@@ -153,6 +160,19 @@ async def run() -> None:
             settings.feishu_gateway_device_flow_close_timeout_seconds
         ),
     )
+    scheduler = ForecastScheduler(
+        coordinator=business.forecast_coordinator,
+        participants=ParticipantRepository(database),
+        warnings=business.warning_schedules,
+        bindings=bindings, sender=sender,
+        timezone_name=settings.timezone_name,
+        daily_prepare_local_time=settings.forecast_daily_prepare_local_time,
+        calendar_sync_interval_seconds=settings.forecast_calendar_sync_interval_seconds,
+        warning_poll_interval_seconds=settings.warning_poll_interval_seconds,
+    )
+    # Start the consumer before recovery.  Queue capacity can be smaller than
+    # the durable backlog without causing startup deadlock.
+    dispatcher = asyncio.create_task(worker.run_forever(), name="bot-dispatcher")
     for saved in events.recoverable():
         await queue.put(
             BotEvent(
@@ -169,15 +189,17 @@ async def run() -> None:
     for participant_id in business.device_flows.pending_participants():
         worker.resume_device_flow(participant_id)
 
-    dispatcher = asyncio.create_task(worker.run_forever(), name="bot-dispatcher")
+    forecast_tasks = asyncio.create_task(scheduler.run_forever(), name="forecast-scheduler")
     try:
         await _run_gateway_until_shutdown(gateway)
     finally:
         try:
             await gateway.stop()
         finally:
+            await scheduler.close()
+            forecast_tasks.cancel()
             dispatcher.cancel()
-            await asyncio.gather(dispatcher, return_exceptions=True)
+            await asyncio.gather(dispatcher, forecast_tasks, return_exceptions=True)
             try:
                 await worker.close()
             finally:

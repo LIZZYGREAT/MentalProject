@@ -16,6 +16,7 @@ from app.repositories import (
     ProfileRepository,
 )
 from app.services.prediction_service import PredictionService
+from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.token_service import TokenRepository
 
 
@@ -52,6 +53,7 @@ class CareTools:
         calendar: CalendarService,
         tokens: TokenRepository,
         timezone_name: str,
+        forecast_coordinator: ForecastCoordinator | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -60,6 +62,7 @@ class CareTools:
         self.calendar = calendar
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
+        self.forecast_coordinator = forecast_coordinator
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -172,6 +175,12 @@ class CareTools:
     async def run_assessment(
         self, ctx: AgentContext, _args: dict[str, Any]
     ) -> dict[str, Any]:
+        if self.forecast_coordinator is not None:
+            result = await self.forecast_coordinator.ensure_forecast(
+                ctx.participant_id, datetime.now(self.timezone).date(),
+                "user_curve_request", refresh_calendar=True,
+            )
+            return {"ok": True, **result}
         profile_row = self.profiles.current(ctx.participant_id)
         profile = profile_row["profile"] if profile_row else {}
         observations = self.observations.recent(ctx.participant_id, limit=50)
