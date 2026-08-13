@@ -42,8 +42,10 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
 class Settings:
     app_env: str
     log_level: str
-    feishu_app_id: str
-    feishu_app_secret: str
+    feishu_bot_app_id: str
+    feishu_bot_app_secret: str
+    feishu_calendar_app_id: str
+    feishu_calendar_app_secret: str
     deepseek_api_key: str
     database_url: str
     token_encryption_key: str
@@ -130,11 +132,29 @@ class Settings:
         if not settings_path.is_absolute():
             settings_path = (root / settings_path).resolve()
 
+        legacy_app_id = values.get("FEISHU_APP_ID", "").strip()
+        legacy_app_secret = values.get("FEISHU_APP_SECRET", "").strip()
+        bot_app_id = values.get("FEISHU_BOT_APP_ID", "").strip() or legacy_app_id
+        bot_app_secret = (
+            values.get("FEISHU_BOT_APP_SECRET", "").strip() or legacy_app_secret
+        )
+        explicit_calendar_app_id = values.get("FEISHU_CALENDAR_APP_ID", "").strip()
+        explicit_calendar_app_secret = values.get(
+            "FEISHU_CALENDAR_APP_SECRET", ""
+        ).strip()
+        if bool(explicit_calendar_app_id) != bool(explicit_calendar_app_secret):
+            raise ValueError(
+                "FEISHU_CALENDAR_APP_ID and FEISHU_CALENDAR_APP_SECRET "
+                "must be configured together"
+            )
+
         settings = cls(
             app_env=values.get("APP_ENV", "production").strip().lower(),
             log_level=values.get("LOG_LEVEL", "INFO").strip().upper(),
-            feishu_app_id=values.get("FEISHU_APP_ID", "").strip(),
-            feishu_app_secret=values.get("FEISHU_APP_SECRET", "").strip(),
+            feishu_bot_app_id=bot_app_id,
+            feishu_bot_app_secret=bot_app_secret,
+            feishu_calendar_app_id=explicit_calendar_app_id or bot_app_id,
+            feishu_calendar_app_secret=explicit_calendar_app_secret or bot_app_secret,
             deepseek_api_key=values.get("DEEPSEEK_API_KEY", "").strip(),
             database_url=values.get("DATABASE_URL", "").strip(),
             token_encryption_key=values.get("TOKEN_ENCRYPTION_KEY", "").strip(),
@@ -225,8 +245,8 @@ class Settings:
 
     def validate(self) -> None:
         required = {
-            "FEISHU_APP_ID": self.feishu_app_id,
-            "FEISHU_APP_SECRET": self.feishu_app_secret,
+            "FEISHU_BOT_APP_ID": self.feishu_bot_app_id,
+            "FEISHU_BOT_APP_SECRET": self.feishu_bot_app_secret,
             "DEEPSEEK_API_KEY": self.deepseek_api_key,
             "DATABASE_URL": self.database_url,
             "TOKEN_ENCRYPTION_KEY": self.token_encryption_key,

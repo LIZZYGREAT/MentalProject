@@ -78,6 +78,7 @@ class FeishuOAuthToken(Base):
     participant_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
     )
+    oauth_app_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     access_token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     refresh_token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     access_token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -247,6 +248,7 @@ class FeishuDeviceFlow(Base):
     participant_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
     )
+    oauth_app_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     device_code_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     user_code: Mapped[str] = mapped_column(String(128), nullable=False)
     verification_url: Mapped[str] = mapped_column(Text, nullable=False)

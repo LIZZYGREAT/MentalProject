@@ -74,9 +74,16 @@ class TokenEncryptionService:
 
 
 class TokenRepository:
-    def __init__(self, database: Database, encryption: TokenEncryptionService):
+    def __init__(
+        self,
+        database: Database,
+        encryption: TokenEncryptionService,
+        *,
+        oauth_app_id: str,
+    ):
         self.database = database
         self.encryption = encryption
+        self.oauth_app_id = oauth_app_id
 
     def save(self, participant_id: uuid.UUID, tokens: OAuthTokenSet) -> None:
         with self.database.session() as session:
@@ -90,6 +97,7 @@ class TokenRepository:
             if row is None:
                 row = FeishuOAuthToken(
                     participant_id=participant_id,
+                    oauth_app_id=self.oauth_app_id,
                     access_token_ciphertext=access,
                     refresh_token_ciphertext=refresh,
                     access_token_expires_at=tokens.access_token_expires_at,
@@ -98,6 +106,7 @@ class TokenRepository:
                 )
                 session.add(row)
             else:
+                row.oauth_app_id = self.oauth_app_id
                 row.access_token_ciphertext = access
                 row.refresh_token_ciphertext = refresh
                 row.access_token_expires_at = tokens.access_token_expires_at
@@ -111,6 +120,8 @@ class TokenRepository:
             row = session.get(FeishuOAuthToken, participant_id)
             if row is None:
                 return {"connected": False, "status": "disconnected"}
+            if row.oauth_app_id != self.oauth_app_id:
+                return {"connected": False, "status": "reconnect_required"}
             now = datetime.now(timezone.utc)
             return {
                 "connected": True,
@@ -133,11 +144,13 @@ class TokenRefreshService:
         encryption: TokenEncryptionService,
         refresh: RefreshCallable,
         *,
+        expected_oauth_app_id: str,
         refresh_margin_seconds: int = 300,
     ):
         self.database = database
         self.encryption = encryption
         self.refresh = refresh
+        self.expected_oauth_app_id = expected_oauth_app_id
         self.refresh_margin = timedelta(seconds=max(0, refresh_margin_seconds))
         self._locks: dict[uuid.UUID, asyncio.Lock] = {}
 
@@ -152,6 +165,11 @@ class TokenRefreshService:
                 ).scalar_one_or_none()
                 if row is None:
                     raise PermissionError("calendar is not connected")
+                if row.oauth_app_id != self.expected_oauth_app_id:
+                    raise PermissionError(
+                        "calendar authorization belongs to another Feishu app; "
+                        "reconnect required"
+                    )
                 now = datetime.now(timezone.utc)
                 if _aware(row.access_token_expires_at) > now + self.refresh_margin:
                     return self.encryption.decrypt(

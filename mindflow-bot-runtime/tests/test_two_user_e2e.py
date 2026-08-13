@@ -99,7 +99,7 @@ def test_two_users_bind_route_and_run_without_identity_crossover():
     assert sender.sent[-2:] == [("oc_1", "P001:apple"), ("oc_2", "P002:banana")]
 
 
-def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent():
+def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent(caplog):
     database = memory_database()
     p1 = participant(database, "P001")
     bindings = BindingRepository(database)
@@ -124,7 +124,8 @@ def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent():
 
     async def scenario():
         assert gateway.accept_payload(payload("b1", "bm1", "ou_1", "oc_1", f"/bind {code}"))
-        await first_worker.process(await queue.get())
+        with caplog.at_level("WARNING"):
+            await first_worker.process(await queue.get())
         # The first send failed, but the successful binding reply is durable.
         saved = events.recoverable()
         assert saved[0].event_id == "b1"
@@ -158,6 +159,9 @@ def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent():
         assert runtime.seen == []
 
     asyncio.run(scenario())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("feishu_reply_send_failed" in message for message in messages)
+    assert "oc_1" not in " ".join(messages)
 
 
 def test_same_participant_messages_are_processed_serially():

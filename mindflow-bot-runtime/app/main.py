@@ -20,6 +20,41 @@ def _log_startup_phase(name: str) -> None:
     )
 
 
+def _build_bot_transport(
+    settings: Any,
+    identity: Any,
+    events: Any,
+    queue: Any,
+    *,
+    client_factory: Any = None,
+    gateway_factory: Any = None,
+) -> tuple[Any, Any]:
+    if client_factory is None:
+        from app.integrations.feishu.client import FeishuClient
+
+        client_factory = FeishuClient
+    if gateway_factory is None:
+        from app.integrations.feishu.gateway import FeishuGateway
+
+        gateway_factory = FeishuGateway
+    sender = client_factory(
+        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+    )
+    gateway = gateway_factory(
+        settings.feishu_bot_app_id,
+        settings.feishu_bot_app_secret,
+        identity,
+        events,
+        queue,
+        start_timeout_seconds=settings.feishu_gateway_start_timeout_seconds,
+        stop_timeout_seconds=settings.feishu_gateway_stop_timeout_seconds,
+        device_flow_close_timeout_seconds=(
+            settings.feishu_gateway_device_flow_close_timeout_seconds
+        ),
+    )
+    return sender, gateway
+
+
 async def _run_gateway_until_shutdown(gateway: Any, on_ready: Any = None) -> None:
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
@@ -79,8 +114,7 @@ async def run() -> None:
     from app.config import Settings
     from app.db import Database, build_engine
     from app.identity.service import IdentityService
-    from app.integrations.feishu.client import FeishuClient
-    from app.integrations.feishu.gateway import BotEvent, FeishuGateway
+    from app.integrations.feishu.gateway import BotEvent
     from app.repositories import (
         AgentRunRepository, BindingRepository, BotEventRepository,
         ClaudeSessionRepository, ParticipantRepository,
@@ -142,7 +176,7 @@ async def run() -> None:
     )
 
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(maxsize=settings.queue_max_size)
-    sender = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    sender, gateway = _build_bot_transport(settings, identity, events, queue)
     worker = BotWorker(
         queue,
         identity,
@@ -157,18 +191,6 @@ async def run() -> None:
         progress_delay_seconds=settings.progress_delay_seconds,
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
-    )
-    gateway = FeishuGateway(
-        settings.feishu_app_id,
-        settings.feishu_app_secret,
-        identity,
-        events,
-        queue,
-        start_timeout_seconds=settings.feishu_gateway_start_timeout_seconds,
-        stop_timeout_seconds=settings.feishu_gateway_stop_timeout_seconds,
-        device_flow_close_timeout_seconds=(
-            settings.feishu_gateway_device_flow_close_timeout_seconds
-        ),
     )
     scheduler = ForecastScheduler(
         coordinator=business.forecast_coordinator,

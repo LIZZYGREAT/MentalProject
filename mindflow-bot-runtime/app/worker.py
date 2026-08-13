@@ -341,8 +341,17 @@ class BotWorker:
         self.events.stage_reply(event.event_id, text)
         try:
             message_id = await self._send(event.chat_id, text)
-        except FeishuSendError:
+        except FeishuSendError as exc:
             self.events.note_reply_failure(event.event_id)
+            logger.warning(
+                "feishu_reply_send_failed event_id=%s message_id=%s "
+                "error_code=%s retryable=%s attempt=%s",
+                event.event_id,
+                event.message_id,
+                exc.code,
+                exc.retryable,
+                getattr(exc, "attempt", 1),
+            )
             return False
         self.events.finish(
             event.event_id,
@@ -357,6 +366,7 @@ class BotWorker:
                 return await asyncio.to_thread(self.sender.send_text, chat_id, text)
             except FeishuSendError as exc:
                 if not exc.retryable or attempt >= self.max_retries:
+                    exc.attempt = attempt + 1
                     raise
                 await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
         raise FeishuSendError(FALLBACK_TEMPORARY)

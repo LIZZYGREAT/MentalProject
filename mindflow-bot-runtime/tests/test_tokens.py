@@ -10,6 +10,7 @@ from app.services.token_service import (
     TokenRepository,
 )
 from app.integrations.feishu.calendar import CalendarService
+from app.models import FeishuOAuthToken
 from helpers import memory_database, participant
 
 
@@ -29,14 +30,19 @@ def test_tokens_are_encrypted_bound_and_isolated():
     p1 = participant(database, "P001")
     p2 = participant(database, "P002")
     encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
-    repo = TokenRepository(database, encryption)
+    repo = TokenRepository(database, encryption, oauth_app_id="calendar-app")
     repo.save(p1.id, token_set("access-one", "refresh-one"))
     repo.save(p2.id, token_set("access-two", "refresh-two"))
 
     async def should_not_refresh(_):
         raise AssertionError("valid token should not refresh")
 
-    service = TokenRefreshService(database, encryption, should_not_refresh)
+    service = TokenRefreshService(
+        database,
+        encryption,
+        should_not_refresh,
+        expected_oauth_app_id="calendar-app",
+    )
     assert asyncio.run(service.get_access_token(p1.id)) == "access-one"
     assert asyncio.run(service.get_access_token(p2.id)) == "access-two"
 
@@ -49,7 +55,7 @@ def test_concurrent_refresh_performs_one_rotation():
     database = memory_database()
     p1 = participant(database, "P001")
     encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
-    repo = TokenRepository(database, encryption)
+    repo = TokenRepository(database, encryption, oauth_app_id="calendar-app")
     repo.save(p1.id, token_set("expired", "refresh-old", expired=True))
     refresh_count = 0
 
@@ -60,7 +66,12 @@ def test_concurrent_refresh_performs_one_rotation():
         await asyncio.sleep(0.01)
         return token_set("access-new", "refresh-new")
 
-    service = TokenRefreshService(database, encryption, refresh)
+    service = TokenRefreshService(
+        database,
+        encryption,
+        refresh,
+        expected_oauth_app_id="calendar-app",
+    )
 
     async def run_both():
         return await asyncio.gather(
@@ -141,3 +152,66 @@ def test_calendar_resolves_the_requested_participant_token(monkeypatch):
         "Bearer token-two",
         "Bearer token-two",
     ]
+
+
+def test_token_save_records_oauth_app_id():
+    database = memory_database()
+    person = participant(database, "P001")
+    encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
+    TokenRepository(database, encryption, oauth_app_id="calendar-app").save(
+        person.id, token_set("access", "refresh")
+    )
+
+    with database.session() as session:
+        assert session.get(FeishuOAuthToken, person.id).oauth_app_id == "calendar-app"
+
+
+def test_valid_token_from_current_calendar_app_is_accepted():
+    database = memory_database()
+    person = participant(database, "P001")
+    encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
+    repo = TokenRepository(database, encryption, oauth_app_id="calendar-app")
+    repo.save(person.id, token_set("access", "refresh"))
+
+    async def should_not_refresh(_):
+        raise AssertionError("valid token should not refresh")
+
+    service = TokenRefreshService(
+        database,
+        encryption,
+        should_not_refresh,
+        expected_oauth_app_id="calendar-app",
+    )
+    assert asyncio.run(service.get_access_token(person.id)) == "access"
+    assert repo.status(person.id)["connected"] is True
+
+
+@pytest.mark.parametrize("stored_app_id", ["other-app", None])
+def test_token_from_wrong_or_legacy_app_requires_reconnect(stored_app_id):
+    database = memory_database()
+    person = participant(database, "P001")
+    encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
+    repo = TokenRepository(database, encryption, oauth_app_id="calendar-app")
+    repo.save(person.id, token_set("access", "refresh", expired=True))
+    with database.session() as session:
+        session.get(FeishuOAuthToken, person.id).oauth_app_id = stored_app_id
+    refresh_calls = 0
+
+    async def refresh(_):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return token_set("new-access", "new-refresh")
+
+    service = TokenRefreshService(
+        database,
+        encryption,
+        refresh,
+        expected_oauth_app_id="calendar-app",
+    )
+    with pytest.raises(PermissionError, match="reconnect required"):
+        asyncio.run(service.get_access_token(person.id))
+    assert refresh_calls == 0
+    assert repo.status(person.id) == {
+        "connected": False,
+        "status": "reconnect_required",
+    }

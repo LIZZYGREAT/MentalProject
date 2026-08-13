@@ -11,6 +11,15 @@ import time
 from app.integrations.feishu.receiver_process import receiver_process_main
 
 
+def _bot_credentials(environment: dict[str, str]) -> tuple[str, str]:
+    return (
+        environment.get("FEISHU_BOT_APP_ID", "").strip()
+        or environment.get("FEISHU_APP_ID", "").strip(),
+        environment.get("FEISHU_BOT_APP_SECRET", "").strip()
+        or environment.get("FEISHU_APP_SECRET", "").strip(),
+    )
+
+
 def _failure(stage: str, envelope: dict) -> SystemExit:
     error_type = str(envelope.get("error_type") or "ReceiverError")
     message = str(envelope.get("message") or "unknown receiver failure")
@@ -122,10 +131,11 @@ def main() -> None:
     if args.seconds < 0 or args.start_timeout <= 0 or args.stop_timeout <= 0:
         parser.error("durations must be positive")
 
-    app_id = os.environ.get("FEISHU_APP_ID", "").strip()
-    app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+    app_id, app_secret = _bot_credentials(os.environ)
     if not app_id or not app_secret:
-        raise SystemExit("FEISHU_APP_ID and FEISHU_APP_SECRET must be configured")
+        raise SystemExit(
+            "FEISHU_BOT_APP_ID and FEISHU_BOT_APP_SECRET must be configured"
+        )
     run_smoke(
         app_id,
         app_secret,

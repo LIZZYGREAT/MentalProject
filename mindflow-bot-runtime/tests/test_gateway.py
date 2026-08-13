@@ -477,7 +477,7 @@ def test_bot_event_ipc_round_trip_has_no_sdk_objects():
     assert type(event).from_ipc_payload(payload) == event
 
 
-def test_queue_full_keeps_durable_event_recoverable():
+def test_queue_full_keeps_durable_event_recoverable(caplog):
     database = memory_database()
     queue = asyncio.Queue(maxsize=1)
     identity = IdentityService(database, BindingRepository(database))
@@ -486,8 +486,42 @@ def test_queue_full_keeps_durable_event_recoverable():
     assert gateway.accept_payload(payload("evt-first")) is True
     second = payload("evt-second")
     second["event"]["message"]["message_id"] = "msg-2"
-    assert gateway.accept_payload(second) is True
+    with caplog.at_level("WARNING"):
+        assert gateway.accept_payload(second) is True
     assert [item.event_id for item in events.recoverable()] == [
         "evt-first",
         "evt-second",
     ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("feishu_event_queue_full" in message for message in messages)
+    assert all("user" not in message for message in messages)
+
+
+def test_normal_ingress_logs_safe_event_metadata(caplog):
+    database = memory_database()
+    queue = asyncio.Queue(maxsize=1)
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret-value",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        queue,
+    )
+    inbound = payload("evt-log")
+    inbound["event"]["message"]["content"] = '{"text":"private-message-text"}'
+
+    with caplog.at_level("INFO"):
+        assert gateway.accept_payload(inbound) is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "feishu_gateway_event_accepted" in message
+        and "event_id=evt-log" in message
+        and "chat_type=p2p" in message
+        for message in messages
+    )
+    combined = " ".join(messages)
+    assert "private-message-text" not in combined
+    assert "secret-value" not in combined
+    assert "ou_test" not in combined
+    assert "oc_test" not in combined

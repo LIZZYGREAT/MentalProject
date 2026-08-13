@@ -52,7 +52,8 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 `mindflow-bot-runtime/.env` 是唯一真实配置文件。把 `.env.example` 中的新变量合并进去：
 
-- `FEISHU_APP_ID`、`FEISHU_APP_SECRET`
+- `FEISHU_BOT_APP_ID`、`FEISHU_BOT_APP_SECRET`：Lizzy 的 WebSocket ingress、回复和 Warning sender。
+- `FEISHU_CALENDAR_APP_ID`、`FEISHU_CALENDAR_APP_SECRET`：Calendar OAuth、Token 和 Calendar API provider（测试环境为“喵学姐”）。若正式 Bot App 已有 Calendar 权限，可将两项都留空，自动复用 Bot credential。
 - `DEEPSEEK_API_KEY`
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 - `CLAUDE_MODEL`：主会话模型或 Claude Code alias。
@@ -64,6 +65,13 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 不要保留旧的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BOT_HISTORY_LIMIT`、
 `AGENT_MAX_TOOL_STEPS` 或 Direct API retry 配置。
+
+旧 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 仅作为已有单 App 部署的临时兼容
+回退，不再是推荐配置。Calendar credential 若显式配置，ID 与 Secret 必须同时提供。
+
+测试阶段的身份关系是：Lizzy 下的 `open_id` 只用于 Bot binding，“喵学姐”只负责
+Calendar OAuth。`open_id` 是 App-scoped identity，不能跨 App join；MindFlow 内部统一
+身份始终是 `participant_id`。
 
 生成 Token 加密 Key：
 
@@ -81,6 +89,15 @@ docker compose up --build -d
 docker compose ps
 docker compose logs -f bot
 ```
+
+生产验收期间用标准 smoke override 启动 Bot（`restart=no`、Rules-only、单 forecast
+并发）：
+
+```bash
+docker compose -f compose.yaml -f compose.smoke.yaml up -d --no-deps bot
+```
+
+验收结束并正式上线后，改回只使用主 `compose.yaml`，恢复生产 restart policy。
 
 可在 ECS 容器内单独验证 WebSocket receiver 的连接、存活和关闭（不会打印 Secret）：
 

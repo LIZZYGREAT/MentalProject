@@ -249,6 +249,11 @@ class FeishuGateway:
 
     def accept_event(self, event: BotEvent) -> bool:
         if event.app_id != self.app_id:
+            logger.debug(
+                "feishu_gateway_event_rejected event_id=%s message_id=%s reason=app_mismatch",
+                event.event_id,
+                event.message_id,
+            )
             return False
         participant = self.identity.resolve(event.app_id, event.open_id)
         participant_id = participant.id if participant else None
@@ -263,6 +268,11 @@ class FeishuGateway:
             text=event.text,
             create_time=event.create_time,
         ):
+            logger.debug(
+                "feishu_gateway_event_duplicate event_id=%s message_id=%s",
+                event.event_id,
+                event.message_id,
+            )
             return False
         try:
             if self._loop is not None:
@@ -271,7 +281,20 @@ class FeishuGateway:
                 self._enqueue(event)
         except RuntimeError:
             self.events.finish(event.event_id, status="failed", error_code="queue_unavailable")
+            logger.error(
+                "feishu_gateway_event_failed event_id=%s message_id=%s "
+                "error_code=queue_unavailable",
+                event.event_id,
+                event.message_id,
+            )
             return False
+        logger.info(
+            "feishu_gateway_event_accepted event_id=%s message_id=%s "
+            "chat_type=%s accepted=true",
+            event.event_id,
+            event.message_id,
+            event.chat_type,
+        )
         return True
 
     def _enqueue(self, event: BotEvent) -> None:
@@ -280,6 +303,11 @@ class FeishuGateway:
         except asyncio.QueueFull:
             # Keep the durable event recoverable on the next process start.
             self.events.finish(event.event_id, status="received", error_code="queue_full")
+            logger.warning(
+                "feishu_event_queue_full event_id=%s message_id=%s",
+                event.event_id,
+                event.message_id,
+            )
 
     @property
     def is_running(self) -> bool:
@@ -476,6 +504,13 @@ class FeishuGateway:
                 except InvalidBotEvent:
                     logger.warning("feishu_receiver_invalid_event")
                     continue
+                logger.info(
+                    "feishu_gateway_ipc_event_received event_id=%s message_id=%s "
+                    "chat_type=%s",
+                    event.event_id,
+                    event.message_id,
+                    event.chat_type,
+                )
                 self.accept_event(event)
                 continue
             if kind == "error":

@@ -58,12 +58,21 @@ def build_business_services(
     predictions = PredictionRepository(database)
     conversations = ConversationRepository(database)
     encryption = TokenEncryptionService(settings.token_encryption_key)
-    token_repository = TokenRepository(database, encryption)
-    oauth = FeishuOAuthClient(settings.feishu_app_id, settings.feishu_app_secret)
+    token_repository = TokenRepository(
+        database, encryption, oauth_app_id=settings.feishu_calendar_app_id
+    )
+    oauth = FeishuOAuthClient(
+        settings.feishu_calendar_app_id, settings.feishu_calendar_app_secret
+    )
     device_flows = DeviceFlowService(
         database, encryption, token_repository, oauth
     )
-    refresh = TokenRefreshService(database, encryption, oauth.refresh_token)
+    refresh = TokenRefreshService(
+        database,
+        encryption,
+        oauth.refresh_token,
+        expected_oauth_app_id=settings.feishu_calendar_app_id,
+    )
     calendar = CalendarService(refresh)
     prediction_service = PredictionService(AssessmentModel(), predictions)
     semantic_client = None

@@ -15,6 +15,25 @@ from app.repositories import BindingRepository, ParticipantRepository, ProfileRe
 from app.services.token_service import TokenEncryptionService, TokenRepository
 
 
+def _build_calendar_device_flow(
+    database: Database,
+    settings: Settings,
+    *,
+    oauth_factory=FeishuOAuthClient,
+) -> DeviceFlowService:
+    encryption = TokenEncryptionService(settings.token_encryption_key)
+    return DeviceFlowService(
+        database,
+        encryption,
+        TokenRepository(
+            database, encryption, oauth_app_id=settings.feishu_calendar_app_id
+        ),
+        oauth_factory(
+            settings.feishu_calendar_app_id, settings.feishu_calendar_app_secret
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -62,13 +81,7 @@ def main() -> None:
         print(f"participant_id={updated.id}")
         print(f"external_llm_consent={state}")
         return
-    encryption = TokenEncryptionService(settings.token_encryption_key)
-    flow = DeviceFlowService(
-        database,
-        encryption,
-        TokenRepository(database, encryption),
-        FeishuOAuthClient(settings.feishu_app_id, settings.feishu_app_secret),
-    )
+    flow = _build_calendar_device_flow(database, settings)
 
     async def authorize() -> None:
         details = await flow.start(participant.id)

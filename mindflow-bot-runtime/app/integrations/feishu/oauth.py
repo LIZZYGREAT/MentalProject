@@ -138,6 +138,7 @@ class DeviceFlowService:
                     select(FeishuDeviceFlow.participant_id).where(
                         FeishuDeviceFlow.status == "pending",
                         FeishuDeviceFlow.expires_at > datetime.now(timezone.utc),
+                        FeishuDeviceFlow.oauth_app_id == self.oauth.app_id,
                     )
                 ).scalars()
             )
@@ -152,6 +153,7 @@ class DeviceFlowService:
         with self.database.session() as session:
             row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
             values = {
+                "oauth_app_id": self.oauth.app_id,
                 "device_code_ciphertext": self.encryption.encrypt(
                     str(result["device_code"]),
                     participant_id=participant_id,
@@ -181,6 +183,9 @@ class DeviceFlowService:
                 row = session.get(FeishuDeviceFlow, participant_id)
                 if row is None or row.status != "pending":
                     return
+                if row.oauth_app_id != self.oauth.app_id:
+                    row.status = "failed"
+                    return
                 expires_at = row.expires_at
                 if expires_at.tzinfo is None:
                     expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -188,12 +193,19 @@ class DeviceFlowService:
                     row.status = "expired"
                     return
                 interval = row.interval_seconds
+            await asyncio.sleep(max(1, interval))
+            with self.database.session() as session:
+                row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
+                if row is None or row.status != "pending":
+                    return
+                if row.oauth_app_id != self.oauth.app_id:
+                    row.status = "failed"
+                    return
                 device_code = self.encryption.decrypt(
                     row.device_code_ciphertext,
                     participant_id=participant_id,
                     purpose="device_flow",
                 )
-            await asyncio.sleep(max(1, interval))
             try:
                 tokens = await self.oauth.poll_device_token(device_code)
             except FeishuOAuthError as exc:

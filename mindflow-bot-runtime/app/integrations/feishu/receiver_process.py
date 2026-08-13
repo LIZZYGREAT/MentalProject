@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import threading
 from typing import Any, Callable
 
@@ -42,6 +44,13 @@ def receiver_process_main(
     from app.logging_security import install_credential_redaction
 
     install_credential_redaction()
+    logging.basicConfig(
+        level=getattr(
+            logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO
+        ),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logger = logging.getLogger(__name__)
 
     if channel_factory is None:
         from lark_channel import FeishuChannel
@@ -97,8 +106,19 @@ def receiver_process_main(
         def on_message(message: Any) -> None:
             try:
                 event = adapter.adapt(message)
-            except InvalidBotEvent:
+            except InvalidBotEvent as exc:
+                logger.debug(
+                    "feishu_receiver_message_ignored reason=%s",
+                    str(exc) or type(exc).__name__,
+                )
                 return
+            logger.info(
+                "feishu_receiver_message_adapted event_id=%s message_id=%s "
+                "chat_type=%s",
+                event.event_id,
+                event.message_id,
+                event.chat_type,
+            )
             output_queue.put({"kind": "event", "payload": event.to_ipc_payload()})
 
         channel.on("message", on_message)

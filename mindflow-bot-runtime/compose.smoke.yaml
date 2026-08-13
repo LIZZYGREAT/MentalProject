@@ -1,0 +1,6 @@
+services:
+  bot:
+    restart: "no"
+    environment:
+      SEMANTIC_API_ENABLED: "false"
+      FORECAST_MAX_CONCURRENCY: "1"

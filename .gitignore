@@ -27,3 +27,6 @@ dist/
 build/
 tmp/
 docs/
+!docs/
+docs/*
+!docs/MINDFLOW_DEPLOYMENT_RUNBOOK.md
