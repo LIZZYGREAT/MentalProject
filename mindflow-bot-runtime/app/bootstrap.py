@@ -74,7 +74,9 @@ def build_business_services(
         expected_oauth_app_id=settings.feishu_calendar_app_id,
     )
     calendar = CalendarService(refresh)
-    prediction_service = PredictionService(AssessmentModel(), predictions)
+    prediction_service = PredictionService(
+        AssessmentModel(settings.timezone_name), predictions
+    )
     semantic_client = None
     if settings.semantic_api_enabled and settings.deepseek_api_key:
         semantic_client = OpenAICompatibleSemanticClient(

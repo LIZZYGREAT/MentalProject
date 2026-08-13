@@ -10,6 +10,21 @@ from settings.model_defaults import (
 )
 
 
+def _parse_full_datetime(value: Any) -> Optional[datetime]:
+    """Parse supported date-bearing values without assuming a timezone."""
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if len(text) < 10 or text[4:5] != "-" or text[7:8] != "-":
+        return None
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def extract_hhmm(value: Any, fallback: str = "00:00") -> str:
     """Extract an ``HH:MM`` string from a datetime-like value."""
     if isinstance(value, datetime):
@@ -20,6 +35,9 @@ def extract_hhmm(value: Any, fallback: str = "00:00") -> str:
     text = str(value).strip()
     if not text:
         return fallback
+    parsed = _parse_full_datetime(text)
+    if parsed is not None:
+        return parsed.strftime(DEFAULT_TIME_FORMAT)
     text = text.split(" ")[-1]
     parts = text.split(":")
     if len(parts) >= 2:
@@ -45,6 +63,11 @@ def parse_datetime_on_date(value: Any, date_str: str, fallback: str = "00:00") -
     if isinstance(value, datetime):
         base = datetime.strptime(date_str, DEFAULT_DATE_FORMAT)
         return value.replace(year=base.year, month=base.month, day=base.day)
+    parsed = _parse_full_datetime(value)
+    if parsed is not None:
+        # Business timezone conversion belongs to the assessment adapter. This
+        # defensive path only preserves the supplied wall-clock representation.
+        return parsed.replace(tzinfo=None)
     hhmm = extract_hhmm(value, fallback=fallback)
     return datetime.strptime(f"{date_str} {hhmm}", f"{DEFAULT_DATE_FORMAT} {DEFAULT_TIME_FORMAT}")
 
@@ -52,8 +75,10 @@ def parse_datetime_on_date(value: Any, date_str: str, fallback: str = "00:00") -
 def interval_minutes(start: Any, end: Any, default: float = 30.0) -> float:
     """Return duration in minutes, treating negative spans as crossing midnight."""
     try:
-        if isinstance(start, datetime) and isinstance(end, datetime):
-            minutes = (end - start).total_seconds() / 60.0
+        parsed_start = _parse_full_datetime(start)
+        parsed_end = _parse_full_datetime(end)
+        if parsed_start is not None and parsed_end is not None:
+            minutes = (parsed_end - parsed_start).total_seconds() / 60.0
         else:
             minutes = time_to_minutes(end) - time_to_minutes(start)
         if minutes < 0:

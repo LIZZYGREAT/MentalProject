@@ -87,6 +87,7 @@ def test_runtime_oauth_client_and_repository_use_calendar_credentials():
     assert services.device_flows.oauth.app_id == "calendar-app"
     assert services.device_flows.oauth.app_secret == "calendar-secret"
     assert services.token_repository.oauth_app_id == "calendar-app"
+    assert str(services.prediction_service.model.timezone) == "Asia/Shanghai"
 
 
 def test_gateway_smoke_uses_bot_credentials_with_legacy_fallback():

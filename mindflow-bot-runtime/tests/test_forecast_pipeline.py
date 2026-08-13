@@ -14,11 +14,14 @@ from app.repositories import (
     ObservationRepository,
     ParticipantRepository,
     ProfileRepository,
+    PredictionRepository,
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator, normalized_calendar_revision
+from app.services.prediction_service import PredictionService
 from helpers import memory_database
+from mindflow_core.assessment import AssessmentModel
 
 
 TEST_LOCAL_DATE = date(2030, 1, 15)
@@ -95,6 +98,51 @@ def build_pipeline(
         warnings=warnings, timezone_name="Asia/Shanghai", materiality_threshold=0.03,
     )
     return database, participant, calendar, semantics, prediction, warnings, coordinator
+
+
+def test_real_forecast_pipeline_accepts_timezone_aware_calendar_snapshot():
+    raw_event = {
+        "id": "real-event", "summary": "准备正式汇报",
+        "description": "完成项目汇报材料", "event_type": "task",
+        "start_time": "2030-01-15T07:00:00+00:00",
+        "end_time": "2030-01-15T08:00:00+00:00",
+    }
+    database = memory_database()
+    participants = ParticipantRepository(database)
+    participant = participants.create("REAL-FORECAST-TEST")
+    calendar = MutableCalendar([raw_event])
+    warnings = WarningScheduleRepository(database)
+    prediction = PredictionService(
+        AssessmentModel("Asia/Shanghai"), PredictionRepository(database)
+    )
+    coordinator = ForecastCoordinator(
+        participants=participants, profiles=ProfileRepository(database),
+        observations=ObservationRepository(database), calendar=calendar,
+        calendar_snapshots=CalendarSnapshotRepository(database),
+        semantics=EventSemanticPreprocessor(
+            EventSemanticCacheRepository(database), client=None, model="rules-only"
+        ),
+        prediction=prediction, forecasts=ForecastSnapshotRepository(database),
+        warnings=warnings, timezone_name="Asia/Shanghai",
+    )
+
+    forecast = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "real_assessment_regression"
+    ))
+
+    assert forecast["valid"] is True
+    assert forecast["curve"]
+    assert forecast["semantic_status"] == "rules_only"
+    assert forecast["output"]["calendar_event_count"] == 1
+    assert any(
+        "准备正式汇报" in point["current_events"]
+        for point in forecast["curve"]
+        if point["time"] == "15:00"
+    )
+    snapshot = CalendarSnapshotRepository(database).get(
+        participant.id, TEST_LOCAL_DATE
+    )
+    assert snapshot["events"][0]["start_time"] == raw_event["start_time"]
 
 
 def test_calendar_revision_is_canonical_and_detects_time_or_text_change():

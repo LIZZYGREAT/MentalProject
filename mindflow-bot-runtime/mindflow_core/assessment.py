@@ -8,10 +8,11 @@ that entry point and returns an ordinary immutable result.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # Local source runs keep the reviewed model one directory above this standalone
 # runtime. Container builds provide /srv/project through PYTHONPATH instead.
@@ -23,6 +24,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from entity.user import User
 from services.event_lifecycle import prepare_event_instances
+from settings.model_defaults import DEFAULT_EVENT_END, DEFAULT_EVENT_START
 from utils.event_factory import EventFactory
 
 
@@ -44,7 +46,10 @@ class PredictionResult:
 
 
 class AssessmentModel:
-    MODEL_VERSION = "mindflow-ctssm-runtime-v1"
+    MODEL_VERSION = "mindflow-ctssm-runtime-v2"
+
+    def __init__(self, timezone_name: str):
+        self.timezone = ZoneInfo(timezone_name)
 
     @staticmethod
     def _latest_state(observations: list[dict[str, Any]]) -> tuple[float, float]:
@@ -71,11 +76,33 @@ class AssessmentModel:
         local_date: str | None = None,
         calendar_degraded: bool = False,
     ) -> PredictionResult:
-        target_date = local_date or date.today().isoformat()
+        target_date = local_date or datetime.now(self.timezone).date().isoformat()
         parameters = profile.get("model_params") or profile.get("params") or {}
         user = User(user_id="runtime", params=dict(parameters), load_from_file=False)
         prepared = prepare_event_instances(calendar_events, target_date)
         for item in prepared:
+            start = normalize_event_datetime(
+                item.get("start_time") or DEFAULT_EVENT_START,
+                target_date,
+                self.timezone,
+            )
+            end = normalize_event_datetime(
+                item.get("end_time") or DEFAULT_EVENT_END,
+                target_date,
+                self.timezone,
+            )
+            # A legacy clock-only interval whose end is earlier than its start
+            # has always represented an event crossing midnight. ISO values
+            # already carry an unambiguous date, so this adjustment is only
+            # needed when both original values omit one.
+            if (
+                end < start
+                and not _has_explicit_date(item.get("start_time"))
+                and not _has_explicit_date(item.get("end_time"))
+            ):
+                end += timedelta(days=1)
+            item["start_time"] = start.strftime("%Y-%m-%d %H:%M:%S")
+            item["end_time"] = end.strftime("%Y-%m-%d %H:%M:%S")
             metadata = dict(item.get("metadata") or {})
             metadata["allow_external_semantics"] = False
             item["metadata"] = metadata
@@ -135,3 +162,43 @@ class AssessmentModel:
             trajectory=trajectory,
             alerts=safe_alerts,
         )
+
+
+def _has_explicit_date(value: Any) -> bool:
+    if isinstance(value, datetime):
+        return True
+    text = str(value or "").strip()
+    return len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-"
+
+
+def normalize_event_datetime(
+    value: Any,
+    local_date: str,
+    timezone: ZoneInfo,
+) -> datetime:
+    """Convert one calendar value to a naive model-local datetime.
+
+    Offset-bearing ISO values are converted to the configured application
+    timezone. Legacy clock and naive datetime values are already local wall
+    time, so they are preserved without consulting the host timezone.
+    """
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("calendar event time is empty")
+        if len(text) >= 5 and text[2:3] == ":" and not _has_explicit_date(text):
+            try:
+                parsed_time = datetime.strptime(text, "%H:%M").time()
+            except ValueError:
+                parsed_time = datetime.strptime(text, "%H:%M:%S").time()
+            parsed = datetime.combine(date.fromisoformat(local_date), parsed_time)
+        else:
+            iso_text = f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
+            parsed = datetime.fromisoformat(iso_text)
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone).replace(tzinfo=None)
+    return parsed
