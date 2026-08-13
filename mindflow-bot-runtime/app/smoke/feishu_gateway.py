@@ -12,12 +12,23 @@ from app.integrations.feishu.receiver_process import receiver_process_main
 
 
 def _bot_credentials(environment: dict[str, str]) -> tuple[str, str]:
-    return (
-        environment.get("FEISHU_BOT_APP_ID", "").strip()
-        or environment.get("FEISHU_APP_ID", "").strip(),
-        environment.get("FEISHU_BOT_APP_SECRET", "").strip()
-        or environment.get("FEISHU_APP_SECRET", "").strip(),
-    )
+    explicit_app_id = environment.get("FEISHU_BOT_APP_ID", "").strip()
+    explicit_app_secret = environment.get("FEISHU_BOT_APP_SECRET", "").strip()
+    if bool(explicit_app_id) != bool(explicit_app_secret):
+        raise ValueError(
+            "FEISHU_BOT_APP_ID and FEISHU_BOT_APP_SECRET "
+            "must be configured together"
+        )
+    if explicit_app_id:
+        return explicit_app_id, explicit_app_secret
+
+    legacy_app_id = environment.get("FEISHU_APP_ID", "").strip()
+    legacy_app_secret = environment.get("FEISHU_APP_SECRET", "").strip()
+    if bool(legacy_app_id) != bool(legacy_app_secret):
+        raise ValueError(
+            "FEISHU_APP_ID and FEISHU_APP_SECRET must be configured together"
+        )
+    return legacy_app_id, legacy_app_secret
 
 
 def _failure(stage: str, envelope: dict) -> SystemExit:

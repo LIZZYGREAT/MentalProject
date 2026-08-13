@@ -88,6 +88,47 @@ def test_legacy_feishu_app_config_still_works():
 @pytest.mark.parametrize(
     "name,value",
     [
+        ("FEISHU_BOT_APP_ID", "bot-app"),
+        ("FEISHU_BOT_APP_SECRET", "bot-secret"),
+    ],
+)
+def test_partial_bot_credentials_are_rejected_even_with_legacy_pair(name, value):
+    environment = valid_environment()
+    environment[name] = value
+
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID.*configured together"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
+def test_explicit_bot_pair_does_not_mix_with_legacy_pair():
+    environment = valid_environment()
+    environment.update(
+        {"FEISHU_BOT_APP_ID": "bot-app", "FEISHU_BOT_APP_SECRET": "bot-secret"}
+    )
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.feishu_bot_app_id == "bot-app"
+    assert settings.feishu_bot_app_secret == "bot-secret"
+
+
+def test_partial_legacy_feishu_pair_is_rejected():
+    environment = valid_environment()
+    environment.pop("FEISHU_APP_SECRET")
+
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_SECRET"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
         ("FEISHU_CALENDAR_APP_ID", "calendar-app"),
         ("FEISHU_CALENDAR_APP_SECRET", "calendar-secret"),
     ],

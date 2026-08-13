@@ -198,6 +198,7 @@ async def run() -> None:
         warnings=business.warning_schedules,
         bindings=bindings, sender=sender,
         timezone_name=settings.timezone_name,
+        calendar_oauth_app_id=settings.feishu_calendar_app_id,
         daily_prepare_local_time=settings.forecast_daily_prepare_local_time,
         calendar_sync_interval_seconds=settings.forecast_calendar_sync_interval_seconds,
         warning_poll_interval_seconds=settings.warning_poll_interval_seconds,

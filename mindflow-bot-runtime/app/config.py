@@ -134,10 +134,19 @@ class Settings:
 
         legacy_app_id = values.get("FEISHU_APP_ID", "").strip()
         legacy_app_secret = values.get("FEISHU_APP_SECRET", "").strip()
-        bot_app_id = values.get("FEISHU_BOT_APP_ID", "").strip() or legacy_app_id
-        bot_app_secret = (
-            values.get("FEISHU_BOT_APP_SECRET", "").strip() or legacy_app_secret
-        )
+        explicit_bot_app_id = values.get("FEISHU_BOT_APP_ID", "").strip()
+        explicit_bot_app_secret = values.get("FEISHU_BOT_APP_SECRET", "").strip()
+        if bool(explicit_bot_app_id) != bool(explicit_bot_app_secret):
+            raise ValueError(
+                "FEISHU_BOT_APP_ID and FEISHU_BOT_APP_SECRET "
+                "must be configured together"
+            )
+        if explicit_bot_app_id:
+            bot_app_id = explicit_bot_app_id
+            bot_app_secret = explicit_bot_app_secret
+        else:
+            bot_app_id = legacy_app_id
+            bot_app_secret = legacy_app_secret
         explicit_calendar_app_id = values.get("FEISHU_CALENDAR_APP_ID", "").strip()
         explicit_calendar_app_secret = values.get(
             "FEISHU_CALENDAR_APP_SECRET", ""

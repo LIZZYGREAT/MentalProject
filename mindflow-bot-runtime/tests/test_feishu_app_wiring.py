@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from app import admin
 from app.bootstrap import build_business_services
 from app.config import Settings
@@ -99,6 +101,43 @@ def test_gateway_smoke_uses_bot_credentials_with_legacy_fallback():
     assert _bot_credentials(
         {"FEISHU_APP_ID": "legacy-app", "FEISHU_APP_SECRET": "legacy-secret"}
     ) == ("legacy-app", "legacy-secret")
+
+
+def test_gateway_smoke_rejects_partial_explicit_bot_pair():
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID.*configured together"):
+        _bot_credentials(
+            {
+                "FEISHU_BOT_APP_ID": "bot-app",
+                "FEISHU_APP_ID": "legacy-app",
+                "FEISHU_APP_SECRET": "legacy-secret",
+            }
+        )
+
+
+def test_admin_connect_does_not_report_connected_when_flow_expires_or_fails(capsys):
+    class Tokens:
+        def status(self, _participant_id):
+            return {"connected": False, "status": "disconnected"}
+
+    class Flow:
+        tokens = Tokens()
+
+        async def start(self, _participant_id):
+            return {
+                "verification_url": "https://example.test/verify",
+                "user_code": "user-code",
+                "expires_at": "2026-08-13T00:00:00+00:00",
+            }
+
+        async def poll_until_complete(self, _participant_id):
+            return None
+
+    with pytest.raises(SystemExit, match="did not complete"):
+        asyncio.run(admin._authorize_calendar(Flow(), "participant"))
+
+    output = capsys.readouterr().out
+    assert "calendar_status=disconnected" in output
+    assert "calendar_status=connected" not in output
 
 
 class OAuth:

@@ -279,15 +279,53 @@ def test_active_calendar_ids_excludes_participant_without_oauth():
     now = datetime.now(timezone.utc)
     with database.session() as session:
         session.add(FeishuOAuthToken(
-            participant_id=connected.id, access_token_ciphertext="x",
+            participant_id=connected.id, oauth_app_id="calendar-app",
+            access_token_ciphertext="x",
             refresh_token_ciphertext="y", access_token_expires_at=now + timedelta(hours=1),
         ))
-    assert participants.active_calendar_ids() == [connected.id]
+    assert participants.active_calendar_ids("calendar-app") == [connected.id]
 
 
-def test_scheduler_bounds_concurrency_and_logs_job_failure(caplog):
+def _calendar_ids_for_provider_rows(rows):
+    database = memory_database()
+    participants = ParticipantRepository(database)
+    now = datetime.now(timezone.utc)
+    created = [participants.create(code) for code, _ in rows]
+    with database.session() as session:
+        for person, (_, oauth_app_id) in zip(created, rows):
+            session.add(FeishuOAuthToken(
+                participant_id=person.id,
+                oauth_app_id=oauth_app_id,
+                access_token_ciphertext="x",
+                refresh_token_ciphertext="y",
+                access_token_expires_at=now + timedelta(hours=1),
+            ))
+    return created, participants.active_calendar_ids("calendar-app")
+
+
+def test_active_calendar_ids_excludes_legacy_null_oauth_app():
+    people, active_ids = _calendar_ids_for_provider_rows(
+        [("CURRENT", "calendar-app"), ("LEGACY", None)]
+    )
+    assert active_ids == [people[0].id]
+
+
+def test_active_calendar_ids_excludes_different_oauth_app():
+    people, active_ids = _calendar_ids_for_provider_rows(
+        [("CURRENT", "calendar-app"), ("DIFFERENT", "old-calendar-app")]
+    )
+    assert active_ids == [people[0].id]
+
+
+def test_scheduler_queries_participants_for_current_calendar_app_and_bounds_concurrency(
+    caplog,
+):
     class Participants:
-        def active_calendar_ids(self):
+        def __init__(self):
+            self.oauth_app_ids = []
+
+        def active_calendar_ids(self, oauth_app_id):
+            self.oauth_app_ids.append(oauth_app_id)
             return [uuid.uuid4() for _ in range(4)]
 
     class Coordinator:
@@ -308,9 +346,11 @@ def test_scheduler_bounds_concurrency_and_logs_job_failure(caplog):
                 self.running -= 1
 
     coordinator = Coordinator()
+    participants = Participants()
     scheduler = ForecastScheduler(
-        coordinator=coordinator, participants=Participants(), warnings=None,
+        coordinator=coordinator, participants=participants, warnings=None,
         bindings=None, sender=None, timezone_name="Asia/Shanghai",
+        calendar_oauth_app_id="calendar-app",
         daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
         warning_poll_interval_seconds=999, forecast_max_concurrency=2,
     )
@@ -325,6 +365,8 @@ def test_scheduler_bounds_concurrency_and_logs_job_failure(caplog):
     with caplog.at_level(logging.ERROR):
         asyncio.run(scenario())
     assert coordinator.maximum <= 2
+    assert participants.oauth_app_ids
+    assert set(participants.oauth_app_ids) == {"calendar-app"}
     assert "forecast_job_failed" in caplog.text
 
 
@@ -492,6 +534,7 @@ def test_claimed_warning_superseded_before_send_is_not_sent(monkeypatch):
     scheduler = ForecastScheduler(
         coordinator=coordinator, participants=None, warnings=warnings,
         bindings=Bindings(), sender=sender, timezone_name="Asia/Shanghai",
+        calendar_oauth_app_id="calendar-app",
         daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
         warning_poll_interval_seconds=999,
     )
@@ -712,6 +755,7 @@ def test_nonretryable_feishu_failure_is_not_hot_retried():
         scheduler = ForecastScheduler(
             coordinator=coordinator, participants=None, warnings=warnings,
             bindings=Bindings(), sender=Sender(), timezone_name="Asia/Shanghai",
+            calendar_oauth_app_id="calendar-app",
             daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
             warning_poll_interval_seconds=999,
         )
@@ -755,6 +799,7 @@ def test_missing_chat_binding_is_rechecked_without_consuming_send_attempt(monkey
         scheduler = ForecastScheduler(
             coordinator=coordinator, participants=None, warnings=warnings,
             bindings=bindings, sender=None, timezone_name="Asia/Shanghai",
+            calendar_oauth_app_id="calendar-app",
             daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
             warning_poll_interval_seconds=999,
         )

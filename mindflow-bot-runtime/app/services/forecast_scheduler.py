@@ -22,6 +22,7 @@ class ForecastScheduler:
         warnings: WarningScheduleRepository, bindings: BindingRepository,
         sender: FeishuClient, timezone_name: str, daily_prepare_local_time: str,
         calendar_sync_interval_seconds: int, warning_poll_interval_seconds: int,
+        calendar_oauth_app_id: str,
         forecast_max_concurrency: int = 1, warning_max_attempts: int = 5,
         warning_retry_base_seconds: int = 60, warning_claim_lease_seconds: int = 120,
     ):
@@ -30,6 +31,7 @@ class ForecastScheduler:
         self.warnings = warnings
         self.bindings = bindings
         self.sender = sender
+        self.calendar_oauth_app_id = calendar_oauth_app_id
         self.timezone = ZoneInfo(timezone_name)
         hour, minute = (int(part) for part in daily_prepare_local_time.split(":"))
         self.daily_time = time(hour, minute)
@@ -65,7 +67,8 @@ class ForecastScheduler:
                     reason = "daily_prepare"
                     last_daily = now.date()
                 participant_ids = await asyncio.to_thread(
-                    self.participants.active_calendar_ids
+                    self.participants.active_calendar_ids,
+                    self.calendar_oauth_app_id,
                 )
                 jobs = [
                     (participant_id, now.date() + timedelta(days=offset),

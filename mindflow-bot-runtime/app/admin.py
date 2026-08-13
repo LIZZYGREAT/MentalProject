@@ -34,6 +34,18 @@ def _build_calendar_device_flow(
     )
 
 
+async def _authorize_calendar(flow: DeviceFlowService, participant_id) -> None:
+    details = await flow.start(participant_id)
+    print(f"verification_url={details['verification_url']}")
+    print(f"user_code={details['user_code']}")
+    print(f"expires_at={details['expires_at']}")
+    await flow.poll_until_complete(participant_id)
+    status = flow.tokens.status(participant_id)
+    print(f"calendar_status={status['status']}")
+    if not status.get("connected"):
+        raise SystemExit("calendar authorization did not complete")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -83,15 +95,7 @@ def main() -> None:
         return
     flow = _build_calendar_device_flow(database, settings)
 
-    async def authorize() -> None:
-        details = await flow.start(participant.id)
-        print(f"verification_url={details['verification_url']}")
-        print(f"user_code={details['user_code']}")
-        print(f"expires_at={details['expires_at']}")
-        await flow.poll_until_complete(participant.id)
-        print("calendar_status=connected")
-
-    asyncio.run(authorize())
+    asyncio.run(_authorize_calendar(flow, participant.id))
 
 
 if __name__ == "__main__":

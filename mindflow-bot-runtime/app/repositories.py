@@ -118,8 +118,8 @@ class ParticipantRepository:
                 select(Participant.id).where(Participant.status == "active")
             ).scalars().all())
 
-    def active_calendar_ids(self) -> list[uuid.UUID]:
-        """Return active participants with a persisted Calendar OAuth token."""
+    def active_calendar_ids(self, oauth_app_id: str) -> list[uuid.UUID]:
+        """Return active participants authorized by the current Calendar app."""
 
         with self.database.session() as session:
             return list(session.execute(
@@ -128,7 +128,10 @@ class ParticipantRepository:
                     FeishuOAuthToken,
                     FeishuOAuthToken.participant_id == Participant.id,
                 )
-                .where(Participant.status == "active")
+                .where(
+                    Participant.status == "active",
+                    FeishuOAuthToken.oauth_app_id == oauth_app_id,
+                )
             ).scalars().all())
 
 
