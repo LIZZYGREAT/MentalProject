@@ -12,7 +12,7 @@ from app.agent.context import AgentContext
 from app.integrations.feishu.client import FeishuSendError
 from app.integrations.feishu.gateway import FeishuGateway
 from app.logging_security import install_credential_redaction
-from app.models import FeishuOAuthToken, WarningSchedule
+from app.models import FeishuOAuthToken, ForecastSnapshot, WarningSchedule
 from app.repositories import (
     BindingRepository, ForecastSnapshotRepository, ParticipantRepository,
 )
@@ -30,27 +30,38 @@ TEST_LOCAL_DATE = date(2030, 1, 15)
 TEST_NOW = datetime(2030, 1, 15, 5, 45, tzinfo=timezone.utc)
 
 
+def save_forecast_and_warnings(
+    database, participant, warnings, *, version, items, now=TEST_NOW,
+):
+    forecasts = ForecastSnapshotRepository(database)
+    serialized = [{
+        **item,
+        "target_time": item["target_time"].isoformat(),
+        "risk_time": item["risk_time"].isoformat(),
+        "valid_until": item["valid_until"].isoformat(),
+    } for item in items]
+    return forecasts.save_and_sync_warnings(
+        warnings, participant.id, TEST_LOCAL_DATE,
+        calendar_revision=f"calendar-{version}",
+        semantic_revision=f"semantic-{version}",
+        algorithm_version="algorithm", forecast_version=version,
+        semantic_status="rules_only", semantic_input=[], curve=[], peaks=[],
+        warning_windows=serialized, output={}, warnings=items, now=now,
+    )
+
+
 def supersede_claimed_warning(
     database, participant, warnings, warning_id, *, now=TEST_NOW,
 ):
-    forecasts = ForecastSnapshotRepository(database)
     with database.session() as session:
         row = session.get(WarningSchedule, warning_id)
         episode = row.episode_identity
         target_time = row.target_time
         risk_time = row.risk_time
         valid_until = row.valid_until
-    saved = forecasts.save(
-        participant.id, TEST_LOCAL_DATE,
-        calendar_revision="new-calendar", semantic_revision="new-semantic",
-        algorithm_version="new-algorithm", forecast_version="new-forecast-version",
-        semantic_status="rules_only", semantic_input=[], curve=[], peaks=[],
-        warning_windows=[], output={},
-    )
-    warnings.sync(
-        participant.id, TEST_LOCAL_DATE, forecast_id=uuid.UUID(saved["id"]),
-        forecast_version=saved["forecast_version"], now=now,
-        warnings=[{
+    saved, _ = save_forecast_and_warnings(
+        database, participant, warnings, version="new-forecast-version", now=now,
+        items=[{
             "warning_identity": episode, "episode_identity": episode,
             "target_time": target_time, "risk_time": risk_time,
             "valid_until": valid_until, "warning_level": "3",
@@ -403,6 +414,148 @@ def test_warning_retry_lease_expiry_and_missing_channel():
     assert warnings.pending(now + timedelta(seconds=21)) == []
     with database.session() as session:
         assert session.get(WarningSchedule, warning_id).status == "expired"
+
+
+def test_unattempted_pending_warning_uses_earlier_rescheduled_window():
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare"))
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        warning_id = row.id
+        episode = row.episode_identity
+        row.target_time = TEST_NOW + timedelta(minutes=30)
+        row.valid_until = TEST_NOW + timedelta(minutes=40)
+        row.risk_time = TEST_NOW + timedelta(minutes=50)
+        row.next_attempt_at = row.target_time
+
+    new_target = TEST_NOW + timedelta(minutes=10)
+    saved, diff = save_forecast_and_warnings(
+        database, participant, warnings, version="earlier-window", items=[{
+            "warning_identity": episode, "episode_identity": episode,
+            "target_time": new_target,
+            "valid_until": TEST_NOW + timedelta(minutes=20),
+            "risk_time": TEST_NOW + timedelta(minutes=30),
+            "warning_level": "2", "episode_drift_minutes": 15,
+            "payload": {"message": "moved earlier"},
+        }],
+    )
+
+    assert diff["rescheduled"] == 1
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.id == warning_id
+        assert row.forecast_id == uuid.UUID(saved["id"])
+        assert row.forecast_version == "earlier-window"
+        assert warnings._aware(row.next_attempt_at) == new_target
+        forecast = session.get(ForecastSnapshot, row.forecast_id)
+        assert forecast.valid is True
+        assert forecast.forecast_version == row.forecast_version
+    assert [item["id"] for item in warnings.pending(new_target)] == [str(warning_id)]
+
+
+def test_unattempted_warning_rescheduled_into_open_window_is_due_immediately():
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare"))
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        warning_id = row.id
+        episode = row.episode_identity
+        row.target_time = TEST_NOW + timedelta(minutes=20)
+        row.valid_until = TEST_NOW + timedelta(minutes=30)
+        row.risk_time = TEST_NOW + timedelta(minutes=40)
+        row.next_attempt_at = row.target_time
+
+    save_forecast_and_warnings(
+        database, participant, warnings, version="open-window", items=[{
+            "warning_identity": episode, "episode_identity": episode,
+            "target_time": TEST_NOW - timedelta(minutes=5),
+            "valid_until": TEST_NOW + timedelta(minutes=5),
+            "risk_time": TEST_NOW + timedelta(minutes=15),
+            "warning_level": "2", "episode_drift_minutes": 15,
+            "payload": {"message": "already open"},
+        }],
+    )
+
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert warnings._aware(row.next_attempt_at) == TEST_NOW
+        assert row.attempt_count == 0
+    assert [item["id"] for item in warnings.pending(TEST_NOW)] == [str(warning_id)]
+
+
+def test_forecast_metadata_update_preserves_existing_retry_backoff():
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare"))
+    target = TEST_NOW - timedelta(minutes=1)
+    valid_until = TEST_NOW + timedelta(minutes=20)
+    risk_time = TEST_NOW + timedelta(minutes=30)
+    backoff_deadline = TEST_NOW + timedelta(minutes=8)
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        warning_id = row.id
+        episode = row.episode_identity
+        row.target_time = target
+        row.valid_until = valid_until
+        row.risk_time = risk_time
+        row.attempt_count = 1
+        row.next_attempt_at = backoff_deadline
+
+    save_forecast_and_warnings(
+        database, participant, warnings, version="metadata-only", items=[{
+            "warning_identity": episode, "episode_identity": episode,
+            "target_time": target, "valid_until": valid_until, "risk_time": risk_time,
+            "warning_level": "2", "episode_drift_minutes": 15,
+            "payload": {"message": "updated payload"},
+        }],
+    )
+
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert warnings._aware(row.next_attempt_at) == backoff_deadline
+        assert row.attempt_count == 1
+    assert warnings.pending(backoff_deadline - timedelta(seconds=1)) == []
+    assert [item["id"] for item in warnings.pending(backoff_deadline)] == [str(warning_id)]
+
+
+def test_forecast_activation_and_warning_rebind_roll_back_together(monkeypatch):
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare"))
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        warning_id = row.id
+        old_forecast_id = row.forecast_id
+        old_forecast_version = row.forecast_version
+        item = {
+            "warning_identity": row.warning_identity,
+            "episode_identity": row.episode_identity,
+            "target_time": row.target_time,
+            "valid_until": row.valid_until,
+            "risk_time": row.risk_time,
+            "warning_level": row.warning_level,
+            "episode_drift_minutes": 15,
+            "payload": dict(row.payload_json),
+        }
+
+    original_sync = warnings._sync_in_session
+
+    def fail_after_sync(*args, **kwargs):
+        original_sync(*args, **kwargs)
+        raise RuntimeError("simulated warning sync failure")
+
+    monkeypatch.setattr(warnings, "_sync_in_session", fail_after_sync)
+    with pytest.raises(RuntimeError, match="simulated warning sync failure"):
+        save_forecast_and_warnings(
+            database, participant, warnings, version="must-roll-back", items=[item],
+        )
+
+    with database.session() as session:
+        forecasts = session.query(ForecastSnapshot).all()
+        assert len(forecasts) == 1
+        assert forecasts[0].id == old_forecast_id
+        assert forecasts[0].valid is True
+        row = session.get(WarningSchedule, warning_id)
+        assert row.forecast_id == old_forecast_id
+        assert row.forecast_version == old_forecast_version
 
 
 def test_warning_window_late_grace_stays_before_risk_time():

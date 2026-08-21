@@ -226,19 +226,14 @@ class ForecastCoordinator:
                 {"event_id": item.get("id"), "semantic": (item.get("metadata") or {}).get("semantic")}
                 for item in semantic_events
             ]
-            saved = await asyncio.to_thread(
-                self.forecasts.save, participant_id, target,
+            saved, warning_diff = await asyncio.to_thread(
+                self.forecasts.save_and_sync_warnings, self.warnings, participant_id, target,
                 calendar_revision=calendar_snapshot["calendar_revision"],
                 semantic_revision=semantic_revision, algorithm_version=algorithm_version,
                 forecast_version=expected_version, semantic_status=semantic_status,
                 semantic_input=semantic_input, curve=curve, peaks=peaks,
                 warning_windows=[self._serializable_warning(item) for item in warning_windows],
-                output=output,
-            )
-            warning_diff = await asyncio.to_thread(
-                self.warnings.sync, participant_id, target,
-                forecast_id=uuid.UUID(saved["id"]), forecast_version=expected_version,
-                warnings=warning_windows, now=datetime.now(timezone.utc),
+                output=output, warnings=warning_windows, now=datetime.now(timezone.utc),
             )
             result = {**saved, "cache_hit": False, "calendar_changed": calendar_changed,
                       "warning_diff": warning_diff, "reason": reason}

@@ -491,35 +491,79 @@ class ForecastSnapshotRepository:
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
     ) -> dict[str, Any]:
         with self.database.session() as session:
-            existing = session.execute(
-                select(ForecastSnapshot).where(
-                    ForecastSnapshot.participant_id == participant_id,
-                    ForecastSnapshot.local_date == local_date,
-                    ForecastSnapshot.forecast_version == forecast_version,
-                )
-            ).scalar_one_or_none()
-            if existing:
-                return self._view(existing)
-            stale = session.execute(
-                select(ForecastSnapshot).where(
-                    ForecastSnapshot.participant_id == participant_id,
-                    ForecastSnapshot.local_date == local_date,
-                    ForecastSnapshot.valid.is_(True),
-                )
-            ).scalars().all()
-            for row in stale:
-                row.valid = False
-            row = ForecastSnapshot(
-                participant_id=participant_id, local_date=local_date,
+            return self._save_in_session(
+                session, participant_id, local_date,
                 calendar_revision=calendar_revision, semantic_revision=semantic_revision,
                 algorithm_version=algorithm_version, forecast_version=forecast_version,
-                semantic_status=semantic_status, semantic_input_json=list(semantic_input),
-                curve_json=list(curve), peaks_json=list(peaks),
-                warning_windows_json=list(warning_windows), output_json=dict(output), valid=True,
+                semantic_status=semantic_status, semantic_input=semantic_input,
+                curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
             )
-            session.add(row)
+
+    def save_and_sync_warnings(
+        self, warning_repository: "WarningScheduleRepository",
+        participant_id: uuid.UUID, local_date: date, *,
+        calendar_revision: str, semantic_revision: str, algorithm_version: str,
+        forecast_version: str, semantic_status: str, semantic_input: list[dict[str, Any]],
+        curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
+        warning_windows: list[dict[str, Any]], output: dict[str, Any],
+        warnings: list[dict[str, Any]], now: datetime,
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        if warning_repository.database is not self.database:
+            raise ValueError("forecast and warning repositories must share a database")
+        with self.database.session() as session:
+            saved = self._save_in_session(
+                session, participant_id, local_date,
+                calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+                algorithm_version=algorithm_version, forecast_version=forecast_version,
+                semantic_status=semantic_status, semantic_input=semantic_input,
+                curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
+            )
+            warning_diff = warning_repository._sync_in_session(
+                session, participant_id, local_date,
+                forecast_id=uuid.UUID(saved["id"]), forecast_version=forecast_version,
+                warnings=warnings, now=now,
+            )
+            return saved, warning_diff
+
+    def _save_in_session(
+        self, session: Any, participant_id: uuid.UUID, local_date: date, *,
+        calendar_revision: str, semantic_revision: str, algorithm_version: str,
+        forecast_version: str, semantic_status: str, semantic_input: list[dict[str, Any]],
+        curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
+        warning_windows: list[dict[str, Any]], output: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing = session.execute(
+            select(ForecastSnapshot).where(
+                ForecastSnapshot.participant_id == participant_id,
+                ForecastSnapshot.local_date == local_date,
+                ForecastSnapshot.forecast_version == forecast_version,
+            ).with_for_update()
+        ).scalar_one_or_none()
+        stale = session.execute(
+            select(ForecastSnapshot).where(
+                ForecastSnapshot.participant_id == participant_id,
+                ForecastSnapshot.local_date == local_date,
+                ForecastSnapshot.valid.is_(True),
+            ).with_for_update()
+        ).scalars().all()
+        for row in stale:
+            if existing is None or row.id != existing.id:
+                row.valid = False
+        if existing is not None:
+            existing.valid = True
             session.flush()
-            return self._view(row)
+            return self._view(existing)
+        row = ForecastSnapshot(
+            participant_id=participant_id, local_date=local_date,
+            calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+            algorithm_version=algorithm_version, forecast_version=forecast_version,
+            semantic_status=semantic_status, semantic_input_json=list(semantic_input),
+            curve_json=list(curve), peaks_json=list(peaks),
+            warning_windows_json=list(warning_windows), output_json=dict(output), valid=True,
+        )
+        session.add(row)
+        session.flush()
+        return self._view(row)
 
 
 class WarningScheduleRepository:
@@ -554,6 +598,18 @@ class WarningScheduleRepository:
         self, participant_id: uuid.UUID, local_date: date, *, forecast_id: uuid.UUID,
         forecast_version: str, warnings: list[dict[str, Any]], now: datetime,
     ) -> dict[str, int]:
+        now = self._aware(now)
+        with self.database.session() as session:
+            return self._sync_in_session(
+                session, participant_id, local_date, forecast_id=forecast_id,
+                forecast_version=forecast_version, warnings=warnings, now=now,
+            )
+
+    def _sync_in_session(
+        self, session: Any, participant_id: uuid.UUID, local_date: date, *,
+        forecast_id: uuid.UUID, forecast_version: str,
+        warnings: list[dict[str, Any]], now: datetime,
+    ) -> dict[str, int]:
         counts = {"kept": 0, "created": 0, "rescheduled": 0, "cancelled": 0}
         now = self._aware(now)
         desired = [
@@ -561,116 +617,127 @@ class WarningScheduleRepository:
             if self._aware(item["valid_until"]) >= now
             and self._aware(item["risk_time"]) > now
         ]
-        with self.database.session() as session:
-            rows = session.execute(
-                select(WarningSchedule).where(
-                    WarningSchedule.participant_id == participant_id,
-                    WarningSchedule.local_date == local_date,
-                ).with_for_update()
-            ).scalars().all()
-            unmatched = {row.id: row for row in rows}
-            used_identities = {row.warning_identity for row in rows}
-            for item in desired:
-                episode_identity = item["episode_identity"]
-                candidates = [
-                    row for row in unmatched.values()
-                    if row.episode_identity == episode_identity
-                ]
-                candidates.sort(key=lambda row: abs(
+        rows = session.execute(
+            select(WarningSchedule).where(
+                WarningSchedule.participant_id == participant_id,
+                WarningSchedule.local_date == local_date,
+            ).with_for_update()
+        ).scalars().all()
+        unmatched = {row.id: row for row in rows}
+        used_identities = {row.warning_identity for row in rows}
+        for item in desired:
+            episode_identity = item["episode_identity"]
+            candidates = [
+                row for row in unmatched.values()
+                if row.episode_identity == episode_identity
+            ]
+            candidates.sort(key=lambda row: abs(
+                (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
+            ))
+            row = candidates[0] if candidates else None
+            if row is not None:
+                drift = abs(
                     (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
-                ))
-                row = candidates[0] if candidates else None
-                if row is not None:
-                    drift = abs(
-                        (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
-                    ) / 60
-                    # Before delivery, a moving prediction reschedules the same
-                    # item even when it moves substantially.  After delivery,
-                    # only a small drift is the same episode; a far-away risk is
-                    # allowed to become a new occurrence later that day.
-                    if row.status not in self.ACTIVE and drift > float(
-                        item.get("episode_drift_minutes", 15)
-                    ):
-                        row = None
-                if row is None:
-                    identity = episode_identity
-                    if identity in used_identities:
-                        identity = hashlib.sha256(
-                            f"{episode_identity}\0{self._aware(item['risk_time']).isoformat()}".encode("utf-8")
-                        ).hexdigest()
-                    used_identities.add(identity)
-                    session.add(WarningSchedule(
-                        participant_id=participant_id, local_date=local_date,
-                        forecast_id=forecast_id, forecast_version=forecast_version,
-                        warning_identity=identity, target_time=item["target_time"],
-                        episode_identity=episode_identity,
-                        risk_time=item["risk_time"], valid_until=item["valid_until"],
-                        warning_level=item["warning_level"], status="pending",
-                        payload_json=dict(item["payload"]),
-                        next_attempt_at=max(self._aware(item["target_time"]), now),
-                    ))
-                    counts["created"] += 1
-                    continue
-                unmatched.pop(row.id, None)
-                if row.status in {"sent", "escalated"}:
-                    old_tier = self._level_rank(row.warning_level)
-                    new_tier = self._level_rank(item["warning_level"])
-                    if row.status == "sent" and new_tier > old_tier:
-                        row.status = "pending"
-                        row.payload_json = {**dict(item["payload"]), "escalation": True}
-                        row.warning_level = item["warning_level"]
-                        row.forecast_id = forecast_id
-                        row.forecast_version = forecast_version
-                        row.target_time = now
-                        row.risk_time = item["risk_time"]
-                        row.valid_until = item["valid_until"]
-                        row.next_attempt_at = now
-                        row.claim_token = None
-                        row.claimed_at = None
-                        row.lease_until = None
-                        row.updated_at = now
-                        counts["rescheduled"] += 1
-                    else:
-                        counts["kept"] += 1
-                    continue
-                changed = (
-                    row.forecast_version != forecast_version
-                    or dict(row.payload_json) != dict(item["payload"])
-                    or row.warning_level != item["warning_level"]
-                    or self._aware(row.target_time) != self._aware(item["target_time"])
-                    or self._aware(row.risk_time) != self._aware(item["risk_time"])
-                    or self._aware(row.valid_until) != self._aware(item["valid_until"])
-                )
-                if row.status == "claimed" and changed:
-                    row.status = "pending"
-                    row.claim_token = None
-                    row.claimed_at = None
-                    row.lease_until = None
-                    row.next_attempt_at = max(self._aware(item["target_time"]), now)
-                row.forecast_id = forecast_id
-                row.forecast_version = forecast_version
-                row.payload_json = dict(item["payload"])
-                row.target_time = item["target_time"]
-                row.risk_time = item["risk_time"]
-                row.valid_until = item["valid_until"]
-                row.warning_level = item["warning_level"]
-                row.episode_identity = item["episode_identity"]
-                if row.status not in {"claimed", "delivery_unavailable"}:
-                    row.status = "pending"
-                row.updated_at = utc_now()
-                counts["rescheduled" if changed else "kept"] += 1
-            for row in unmatched.values():
-                if (
-                    row.status in self.ACTIVE
-                    and self._aware(row.valid_until) >= now
-                    and self._aware(row.risk_time) > now
+                ) / 60
+                # Before delivery, a moving prediction reschedules the same
+                # item even when it moves substantially.  After delivery,
+                # only a small drift is the same episode; a far-away risk is
+                # allowed to become a new occurrence later that day.
+                if row.status not in self.ACTIVE and drift > float(
+                    item.get("episode_drift_minutes", 15)
                 ):
-                    row.status = "cancelled"
+                    row = None
+            if row is None:
+                identity = episode_identity
+                if identity in used_identities:
+                    identity = hashlib.sha256(
+                        f"{episode_identity}\0{self._aware(item['risk_time']).isoformat()}".encode("utf-8")
+                    ).hexdigest()
+                used_identities.add(identity)
+                session.add(WarningSchedule(
+                    participant_id=participant_id, local_date=local_date,
+                    forecast_id=forecast_id, forecast_version=forecast_version,
+                    warning_identity=identity, target_time=item["target_time"],
+                    episode_identity=episode_identity,
+                    risk_time=item["risk_time"], valid_until=item["valid_until"],
+                    warning_level=item["warning_level"], status="pending",
+                    payload_json=dict(item["payload"]),
+                    next_attempt_at=max(self._aware(item["target_time"]), now),
+                ))
+                counts["created"] += 1
+                continue
+            unmatched.pop(row.id, None)
+            if row.status in {"sent", "escalated"}:
+                old_tier = self._level_rank(row.warning_level)
+                new_tier = self._level_rank(item["warning_level"])
+                if row.status == "sent" and new_tier > old_tier:
+                    row.status = "pending"
+                    row.payload_json = {**dict(item["payload"]), "escalation": True}
+                    row.warning_level = item["warning_level"]
+                    row.forecast_id = forecast_id
+                    row.forecast_version = forecast_version
+                    row.target_time = now
+                    row.risk_time = item["risk_time"]
+                    row.valid_until = item["valid_until"]
+                    row.next_attempt_at = now
                     row.claim_token = None
                     row.claimed_at = None
                     row.lease_until = None
                     row.updated_at = now
-                    counts["cancelled"] += 1
+                    counts["rescheduled"] += 1
+                else:
+                    counts["kept"] += 1
+                continue
+            schedule_changed = (
+                self._aware(row.target_time) != self._aware(item["target_time"])
+                or self._aware(row.risk_time) != self._aware(item["risk_time"])
+                or self._aware(row.valid_until) != self._aware(item["valid_until"])
+            )
+            changed = (
+                row.forecast_version != forecast_version
+                or dict(row.payload_json) != dict(item["payload"])
+                or row.warning_level != item["warning_level"]
+                or schedule_changed
+            )
+            if row.status == "claimed" and changed:
+                row.status = "pending"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.next_attempt_at = max(self._aware(item["target_time"]), now)
+            elif (
+                schedule_changed
+                and row.attempt_count == 0
+                and row.status in {"pending", "cancelled"}
+            ):
+                # This is still the first delivery schedule, so a moved
+                # forecast window replaces the old due time.  Retried rows
+                # keep their delivery backoff even if the forecast changes.
+                row.next_attempt_at = max(self._aware(item["target_time"]), now)
+            row.forecast_id = forecast_id
+            row.forecast_version = forecast_version
+            row.payload_json = dict(item["payload"])
+            row.target_time = item["target_time"]
+            row.risk_time = item["risk_time"]
+            row.valid_until = item["valid_until"]
+            row.warning_level = item["warning_level"]
+            row.episode_identity = item["episode_identity"]
+            if row.status not in {"claimed", "delivery_unavailable"}:
+                row.status = "pending"
+            row.updated_at = utc_now()
+            counts["rescheduled" if changed else "kept"] += 1
+        for row in unmatched.values():
+            if (
+                row.status in self.ACTIVE
+                and self._aware(row.valid_until) >= now
+                and self._aware(row.risk_time) > now
+            ):
+                row.status = "cancelled"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.updated_at = now
+                counts["cancelled"] += 1
         return counts
 
     @staticmethod
