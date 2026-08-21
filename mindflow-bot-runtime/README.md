@@ -30,19 +30,23 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
-- SDK MCP 只暴露六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
+- SDK MCP 只暴露十个业务 Tool，participant identity 只来自 frozen `AgentContext`。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
-## 六个业务 Tool
+## 十个业务 Tool
 
 1. `care_get_today_context`
 2. `care_record_checkin`
 3. `care_get_recent_state`
 4. `care_run_today_assessment`
 5. `care_get_support`
-6. `calendar_connection_status`
+6. `care_get_pressure_curve`
+7. `calendar_connection_status`
+8. `calendar_list_calendars`
+9. `calendar_list_events`
+10. `calendar_create_event`
 
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
 身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
@@ -54,6 +58,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 - `FEISHU_BOT_APP_ID`、`FEISHU_BOT_APP_SECRET`：Lizzy 的 WebSocket ingress、回复和 Warning sender。
 - `FEISHU_CALENDAR_APP_ID`、`FEISHU_CALENDAR_APP_SECRET`：Calendar OAuth、Token 和 Calendar API provider（测试环境为“喵学姐”）。若正式 Bot App 已有 Calendar 权限，可将两项都留空，自动复用 Bot credential。
+- “喵学姐”需在开放平台开通 `calendar:calendar:readonly` 和 `calendar:calendar.event:create` 用户权限并发布应用版本。新增创建权限后，已有参与者需要重新发送 `/calendar` 完成授权。
 - `DEEPSEEK_API_KEY`
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 - `CLAUDE_MODEL`：主会话模型或 Claude Code alias。

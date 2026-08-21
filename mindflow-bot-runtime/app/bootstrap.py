@@ -24,6 +24,7 @@ from app.repositories import (
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
+from app.services.presentation_service import PresentationOutbox
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
@@ -48,6 +49,7 @@ class BusinessServices:
     semantic_preprocessor: EventSemanticPreprocessor
     registry: ToolRegistry
     device_flows: DeviceFlowService
+    presentations: PresentationOutbox
 
 
 def build_business_services(
@@ -73,7 +75,8 @@ def build_business_services(
         oauth.refresh_token,
         expected_oauth_app_id=settings.feishu_calendar_app_id,
     )
-    calendar = CalendarService(refresh)
+    calendar = CalendarService(refresh, timezone_name=settings.timezone_name)
+    presentations = PresentationOutbox()
     prediction_service = PredictionService(
         AssessmentModel(settings.timezone_name), predictions
     )
@@ -114,6 +117,7 @@ def build_business_services(
         settings.timezone_name,
         forecast_coordinator,
         forecast_snapshots,
+        presentations,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -128,4 +132,5 @@ def build_business_services(
         semantic_preprocessor=semantic_preprocessor,
         registry=registry,
         device_flows=device_flows,
+        presentations=presentations,
     )

@@ -186,6 +186,7 @@ async def run() -> None:
         runtime,
         sender,
         business.device_flows,
+        business.presentations,
         model=f"claude-code/{settings.claude_model}",
         max_retries=settings.feishu_send_max_retries,
         progress_delay_seconds=settings.progress_delay_seconds,

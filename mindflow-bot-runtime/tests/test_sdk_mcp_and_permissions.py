@@ -79,7 +79,7 @@ def test_sdk_mcp_uses_registry_schema_and_backend_context_only():
     assert not any(field in schema_text for field in FORBIDDEN_FIELDS)
 
 
-def test_all_six_production_tool_schemas_are_closed_and_identity_free():
+def test_all_production_tool_schemas_are_closed_and_identity_free():
     registry = ToolRegistry()
     CareTools(None, None, None, None, None, None, "Asia/Shanghai").register(registry)
 
@@ -88,8 +88,12 @@ def test_all_six_production_tool_schemas_are_closed_and_identity_free():
         "care_record_checkin",
         "care_get_recent_state",
         "care_run_today_assessment",
+        "care_get_pressure_curve",
         "care_get_support",
         "calendar_connection_status",
+        "calendar_list_calendars",
+        "calendar_list_events",
+        "calendar_create_event",
     }
     for spec in registry.specs:
         assert spec.parameters["type"] == "object"

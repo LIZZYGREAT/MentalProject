@@ -31,13 +31,25 @@ class FeishuClient:
         )
 
     def send_text(self, chat_id: str, text: str) -> str:
+        return self._send_message(
+            chat_id, "text", {"text": str(text)}
+        )
+
+    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+        if not isinstance(card, dict) or not card:
+            raise ValueError("Feishu card must be a non-empty object")
+        return self._send_message(chat_id, "interactive", card)
+
+    def _send_message(
+        self, chat_id: str, msg_type: str, content: dict[str, Any]
+    ) -> str:
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
         body = (
             CreateMessageRequestBody.builder()
             .receive_id(str(chat_id))
-            .msg_type("text")
-            .content(json.dumps({"text": str(text)}, ensure_ascii=False))
+            .msg_type(msg_type)
+            .content(json.dumps(content, ensure_ascii=False))
             .build()
         )
         request = (

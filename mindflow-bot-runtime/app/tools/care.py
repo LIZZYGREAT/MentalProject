@@ -1,4 +1,4 @@
-"""First production allowlist: five participant-bound care tools."""
+"""Production allowlist of participant-bound care and calendar tools."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
+from app.integrations.feishu.cards import pressure_curve_card
 from app.integrations.feishu.calendar import CalendarService
 from app.repositories import (
     ObservationRepository,
@@ -18,6 +19,7 @@ from app.repositories import (
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.presentation_service import PresentationOutbox
 from app.services.token_service import TokenRepository
 
 
@@ -44,6 +46,19 @@ def _safe_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return clean(profile)
 
 
+def _parse_datetime(value: Any, timezone_value: ZoneInfo) -> datetime:
+    text = str(value or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("calendar time must be ISO 8601") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone_value)
+    return parsed.astimezone(timezone_value)
+
+
 class CareTools:
     def __init__(
         self,
@@ -56,6 +71,7 @@ class CareTools:
         timezone_name: str,
         forecast_coordinator: ForecastCoordinator | None = None,
         forecast_snapshots: ForecastSnapshotRepository | None = None,
+        presentations: PresentationOutbox | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -66,6 +82,7 @@ class CareTools:
         self.timezone = ZoneInfo(timezone_name)
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
+        self.presentations = presentations
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -128,10 +145,73 @@ class CareTools:
             self.get_support,
         )
         registry.register(
+            "care_get_pressure_curve",
+            "Generate today's participant-bound forecast and queue a Feishu pressure/vitality curve card.",
+            _empty_schema(),
+            self.get_pressure_curve,
+        )
+        registry.register(
             "calendar_connection_status",
             "Return whether this participant has a usable Feishu calendar authorization.",
             _empty_schema(),
             self.calendar_connection_status,
+        )
+        registry.register(
+            "calendar_list_calendars",
+            "List calendars visible to this participant without exposing calendar identifiers.",
+            _empty_schema(),
+            self.list_calendars,
+        )
+        registry.register(
+            "calendar_list_events",
+            "List this participant's primary-calendar events in an explicit ISO 8601 time range.",
+            {
+                "type": "object",
+                "properties": {
+                    "start_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "ISO 8601 start; timezone optional and defaults to the configured local timezone.",
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "ISO 8601 end; timezone optional and defaults to the configured local timezone.",
+                    },
+                },
+                "required": ["start_time", "end_time"],
+                "additionalProperties": False,
+            },
+            self.list_calendar_events,
+        )
+        registry.register(
+            "calendar_create_event",
+            "Create one event in this participant's primary Feishu calendar after an explicit user request.",
+            {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "start_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "ISO 8601 start; timezone optional and defaults to the configured local timezone.",
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "ISO 8601 end; timezone optional and defaults to the configured local timezone.",
+                    },
+                    "description": {"type": "string", "maxLength": 1000},
+                    "reminder_minutes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1440,
+                    },
+                },
+                "required": ["summary", "start_time", "end_time"],
+                "additionalProperties": False,
+            },
+            self.create_calendar_event,
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -234,7 +314,97 @@ class CareTools:
             "context_acknowledged": bool(args.get("context")),
         }
 
+    async def get_pressure_curve(
+        self, ctx: AgentContext, _args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.forecast_coordinator is None:
+            raise RuntimeError("forecast coordinator is unavailable")
+        result = await self.forecast_coordinator.ensure_forecast(
+            ctx.participant_id,
+            datetime.now(self.timezone).date(),
+            "user_curve_card_request",
+            refresh_calendar=True,
+        )
+        curve = list(result.get("curve") or [])
+        card = pressure_curve_card(
+            curve, local_date=str(result.get("local_date") or datetime.now(self.timezone).date())
+        )
+        if self.presentations is None:
+            raise RuntimeError("rich reply delivery is unavailable")
+        self.presentations.stage_card(ctx.agent_run_id, card)
+        stress_points = []
+        for point in curve:
+            try:
+                stress_points.append(
+                    (str(point.get("time") or ""), float(point.get("stress_0_10")))
+                )
+            except (TypeError, ValueError):
+                continue
+        peak_time, peak_value = max(stress_points, key=lambda item: item[1])
+        return {
+            "ok": True,
+            "card_queued": True,
+            "local_date": str(result.get("local_date") or ""),
+            "point_count": len(stress_points),
+            "predicted_peak": {"time": peak_time, "stress_0_10": round(peak_value, 2)},
+            "calendar_degraded": bool(result.get("calendar_degraded")),
+        }
+
     def calendar_connection_status(
         self, ctx: AgentContext, _args: dict[str, Any]
     ) -> dict[str, Any]:
-        return {"ok": True, **self.tokens.status(ctx.participant_id)}
+        status = self.tokens.status(ctx.participant_id)
+        scopes = set(status.get("scopes") or [])
+        return {
+            "ok": True,
+            **status,
+            "calendar_write_enabled": bool(
+                "calendar:calendar.event:create" in scopes
+                or "calendar:calendar" in scopes
+            ),
+        }
+
+    async def list_calendars(
+        self, ctx: AgentContext, _args: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            calendars = await self.calendar.list_calendars(ctx.participant_id)
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        return {"ok": True, "calendars": calendars}
+
+    async def list_calendar_events(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        start_time = _parse_datetime(args["start_time"], self.timezone)
+        end_time = _parse_datetime(args["end_time"], self.timezone)
+        try:
+            events = await self.calendar.get_events(
+                ctx.participant_id, start_time, end_time
+            )
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        return {
+            "ok": True,
+            "range": {"start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
+            "events": events,
+        }
+
+    async def create_calendar_event(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        start_time = _parse_datetime(args["start_time"], self.timezone)
+        end_time = _parse_datetime(args["end_time"], self.timezone)
+        try:
+            event = await self.calendar.create_event(
+                ctx.participant_id,
+                summary=str(args["summary"]),
+                description=str(args.get("description") or ""),
+                start_time=start_time,
+                end_time=end_time,
+                reminder_minutes=args.get("reminder_minutes"),
+                source_message_id=ctx.message_id,
+            )
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        return {"ok": True, "created": event}

@@ -145,8 +145,10 @@ class OAuth:
     def __init__(self, app_id):
         self.app_id = app_id
         self.poll_calls = 0
+        self.started_scope = None
 
-    async def start_device_flow(self, _scope):
+    async def start_device_flow(self, scope):
+        self.started_scope = scope
         return {
             "device_code": "device-code",
             "user_code": "user-code",
@@ -173,6 +175,7 @@ def test_device_flow_records_oauth_app_id_and_filters_pending():
     )
 
     asyncio.run(service.start(person.id))
+    assert "calendar:calendar.event:create" in oauth.started_scope.split()
     with database.session() as session:
         row = session.get(FeishuDeviceFlow, person.id)
         assert row.oauth_app_id == "calendar-app"

@@ -22,6 +22,7 @@ from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
 from app.integrations.feishu.oauth import DeviceFlowService
 from app.repositories import AgentRunRepository, BotEventRepository
+from app.services.presentation_service import PresentationOutbox
 
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,11 @@ TOOL_PROGRESS_TEXT = {
     "care_get_today_context": "正在读取已记录的状态……",
     "care_get_recent_state": "正在读取最近的状态记录……",
     "care_run_today_assessment": "正在读取今天的数据并进行评估……",
+    "care_get_pressure_curve": "正在生成今天的压力曲线卡片……",
     "calendar_connection_status": "正在检查日历连接状态……",
+    "calendar_list_calendars": "正在读取可用日历……",
+    "calendar_list_events": "正在读取日程……",
+    "calendar_create_event": "正在创建日程……",
 }
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -85,6 +90,7 @@ class BotWorker:
         runtime: AgentRuntimeProtocol,
         sender: FeishuClient,
         device_flows: DeviceFlowService | None = None,
+        presentations: PresentationOutbox | None = None,
         *,
         model: str,
         max_retries: int = 1,
@@ -100,6 +106,7 @@ class BotWorker:
         self.runtime = runtime
         self.sender = sender
         self.device_flows = device_flows
+        self.presentations = presentations
         self.model = model
         self.max_retries = max_retries
         self.progress_delay_seconds = progress_delay_seconds
@@ -303,14 +310,39 @@ class BotWorker:
                 chat_type=event.chat_type,
                 on_tool_use=on_tool_use,
             )
+            cards = (
+                self.presentations.take_cards(run_id)
+                if self.presentations is not None
+                else []
+            )
+            card_delivery_failed = False
+            for card in cards:
+                try:
+                    await self._send_card(event.chat_id, card)
+                except FeishuSendError as exc:
+                    card_delivery_failed = True
+                    logger.warning(
+                        "feishu_card_send_failed event_id=%s message_id=%s "
+                        "error_code=%s retryable=%s",
+                        event.event_id,
+                        event.message_id,
+                        exc.code,
+                        exc.retryable,
+                    )
+            if card_delivery_failed:
+                answer = answer + "\n\n卡片暂时未能发送，请稍后再试。"
             self.runs.finish(run_id, "succeeded")
             delivered = await self._deliver(event, answer)
             status = "completed" if delivered else "reply_pending"
         except ClaudeRuntimeInterrupted:
+            if self.presentations is not None:
+                self.presentations.discard(run_id)
             self.runs.finish(run_id, "interrupted")
             delivered = await self._deliver(event, FALLBACK_INTERRUPTED)
             status = "interrupted" if delivered else "reply_pending"
         except Exception:
+            if self.presentations is not None:
+                self.presentations.discard(run_id)
             logger.exception(
                 "bot_event_failed",
                 extra={
@@ -364,6 +396,20 @@ class BotWorker:
         for attempt in range(self.max_retries + 1):
             try:
                 return await asyncio.to_thread(self.sender.send_text, chat_id, text)
+            except FeishuSendError as exc:
+                if not exc.retryable or attempt >= self.max_retries:
+                    exc.attempt = attempt + 1
+                    raise
+                await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+        raise FeishuSendError(FALLBACK_TEMPORARY)
+
+    async def _send_card(self, chat_id: str, card: dict) -> str:
+        send_card = getattr(self.sender, "send_card", None)
+        if not callable(send_card):
+            raise FeishuSendError("Feishu card sending is unavailable", retryable=False)
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await asyncio.to_thread(send_card, chat_id, card)
             except FeishuSendError as exc:
                 if not exc.retryable or attempt >= self.max_retries:
                     exc.attempt = attempt + 1
