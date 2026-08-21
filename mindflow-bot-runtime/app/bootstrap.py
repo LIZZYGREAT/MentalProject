@@ -25,6 +25,7 @@ from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.presentation_service import PresentationOutbox
+from app.services.card_action_service import CardActionService
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
@@ -50,6 +51,7 @@ class BusinessServices:
     registry: ToolRegistry
     device_flows: DeviceFlowService
     presentations: PresentationOutbox
+    card_actions: CardActionService
 
 
 def build_business_services(
@@ -77,6 +79,7 @@ def build_business_services(
     )
     calendar = CalendarService(refresh, timezone_name=settings.timezone_name)
     presentations = PresentationOutbox()
+    card_actions = CardActionService(observations)
     prediction_service = PredictionService(
         AssessmentModel(settings.timezone_name), predictions
     )
@@ -133,4 +136,5 @@ def build_business_services(
         registry=registry,
         device_flows=device_flows,
         presentations=presentations,
+        card_actions=card_actions,
     )

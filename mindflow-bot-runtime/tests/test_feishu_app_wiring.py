@@ -176,6 +176,8 @@ def test_device_flow_records_oauth_app_id_and_filters_pending():
 
     asyncio.run(service.start(person.id))
     assert "calendar:calendar.event:create" in oauth.started_scope.split()
+    assert "calendar:calendar.event:update" in oauth.started_scope.split()
+    assert "calendar:calendar.event:delete" in oauth.started_scope.split()
     with database.session() as session:
         row = session.get(FeishuDeviceFlow, person.id)
         assert row.oauth_app_id == "calendar-app"

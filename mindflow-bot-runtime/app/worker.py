@@ -37,10 +37,13 @@ TOOL_PROGRESS_TEXT = {
     "care_get_recent_state": "正在读取最近的状态记录……",
     "care_run_today_assessment": "正在读取今天的数据并进行评估……",
     "care_get_pressure_curve": "正在生成今天的压力曲线卡片……",
+    "care_get_checkin_card": "正在准备状态记录卡片……",
     "calendar_connection_status": "正在检查日历连接状态……",
     "calendar_list_calendars": "正在读取可用日历……",
     "calendar_list_events": "正在读取日程……",
     "calendar_create_event": "正在创建日程……",
+    "calendar_update_event": "正在更新日程……",
+    "calendar_delete_event": "正在删除日程……",
 }
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -146,7 +149,7 @@ class BotWorker:
         while True:
             event = await self.queue.get()
             task = asyncio.create_task(
-                self._process_queued(event), name=f"bot-event-{event.event_id}"
+                self._process_queued(event), name=f"feishu-event-{event.event_id}"
             )
             self._track(task)
 

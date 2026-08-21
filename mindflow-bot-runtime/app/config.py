@@ -57,6 +57,12 @@ class Settings:
     claude_default_sonnet_model: str
     claude_default_haiku_model: str
     claude_code_subagent_model: str
+    feishu_card_callback_enabled: bool = False
+    feishu_card_callback_host: str = "0.0.0.0"
+    feishu_card_callback_port: int = 8000
+    feishu_card_callback_path: str = "/feishu/card/callback"
+    feishu_card_verification_token: str = ""
+    feishu_card_encrypt_key: str = ""
     timezone_name: str = "Asia/Shanghai"
     queue_max_size: int = 100
     participant_input_queue_size: int = 20
@@ -185,6 +191,24 @@ class Settings:
             claude_code_subagent_model=values.get(
                 "CLAUDE_CODE_SUBAGENT_MODEL", ""
             ).strip(),
+            feishu_card_callback_enabled=_bool(
+                values, "FEISHU_CARD_CALLBACK_ENABLED", False
+            ),
+            feishu_card_callback_host=values.get(
+                "FEISHU_CARD_CALLBACK_HOST", "0.0.0.0"
+            ).strip(),
+            feishu_card_callback_port=_int(
+                values, "FEISHU_CARD_CALLBACK_PORT", 8000
+            ),
+            feishu_card_callback_path=values.get(
+                "FEISHU_CARD_CALLBACK_PATH", "/feishu/card/callback"
+            ).strip(),
+            feishu_card_verification_token=values.get(
+                "FEISHU_CARD_VERIFICATION_TOKEN", ""
+            ).strip(),
+            feishu_card_encrypt_key=values.get(
+                "FEISHU_CARD_ENCRYPT_KEY", ""
+            ).strip(),
             timezone_name=values.get("APP_TIMEZONE", "Asia/Shanghai").strip(),
             queue_max_size=_int(values, "BOT_QUEUE_MAX_SIZE", 100),
             participant_input_queue_size=_int(
@@ -272,6 +296,24 @@ class Settings:
             raise ValueError(
                 "CLAUDE_CODE_SUBAGENT_MODEL must match CLAUDE_DEFAULT_HAIKU_MODEL"
             )
+        if self.feishu_card_callback_enabled:
+            missing_callback = [
+                name
+                for name, value in {
+                    "FEISHU_CARD_VERIFICATION_TOKEN": self.feishu_card_verification_token,
+                    "FEISHU_CARD_ENCRYPT_KEY": self.feishu_card_encrypt_key,
+                }.items()
+                if not value
+            ]
+            if missing_callback:
+                raise ValueError(
+                    "Missing required card callback values: "
+                    + ", ".join(missing_callback)
+                )
+            if not self.feishu_card_callback_path.startswith("/"):
+                raise ValueError("FEISHU_CARD_CALLBACK_PATH must start with /")
+            if self.feishu_card_callback_port > 65535:
+                raise ValueError("FEISHU_CARD_CALLBACK_PORT must be <= 65535")
         if self.app_env == "production" and not self.database_url.startswith(
             ("postgresql://", "postgresql+psycopg://")
         ):

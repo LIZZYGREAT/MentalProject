@@ -89,17 +89,29 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "care_get_recent_state",
         "care_run_today_assessment",
         "care_get_pressure_curve",
+        "care_get_checkin_card",
         "care_get_support",
         "calendar_connection_status",
         "calendar_list_calendars",
         "calendar_list_events",
         "calendar_create_event",
+        "calendar_update_event",
+        "calendar_delete_event",
     }
     for spec in registry.specs:
         assert spec.parameters["type"] == "object"
         assert spec.parameters["additionalProperties"] is False
         properties = set(spec.parameters.get("properties", {}))
         assert properties.isdisjoint(FORBIDDEN_FIELDS)
+
+    delete_spec = next(
+        spec for spec in registry.specs if spec.name == "calendar_delete_event"
+    )
+    assert delete_spec.parameters["required"] == ["event_id", "confirmed"]
+    assert delete_spec.parameters["properties"]["confirmed"] == {
+        "type": "boolean",
+        "const": True,
+    }
 
 
 def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):

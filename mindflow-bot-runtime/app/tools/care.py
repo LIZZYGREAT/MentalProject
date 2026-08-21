@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
-from app.integrations.feishu.cards import pressure_curve_card
-from app.integrations.feishu.calendar import CalendarService
+from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
+from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.repositories import (
     ObservationRepository,
     PredictionRepository,
@@ -57,6 +57,42 @@ def _parse_datetime(value: Any, timezone_value: ZoneInfo) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone_value)
     return parsed.astimezone(timezone_value)
+
+
+def _recurrence_schema_properties() -> dict[str, Any]:
+    return {
+        "recurrence_frequency": {
+            "type": "string",
+            "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"],
+        },
+        "recurrence_interval": {"type": "integer", "minimum": 1, "maximum": 99},
+        "recurrence_weekdays": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]},
+            "uniqueItems": True,
+            "maxItems": 7,
+        },
+        "recurrence_count": {"type": "integer", "minimum": 1, "maximum": 999},
+        "recurrence_until": {"type": "string", "format": "date-time"},
+    }
+
+
+def _recurrence_from_args(args: dict[str, Any], timezone_value: ZoneInfo) -> str | None:
+    frequency = args.get("recurrence_frequency")
+    if frequency is None:
+        return None
+    until = (
+        _parse_datetime(args["recurrence_until"], timezone_value)
+        if args.get("recurrence_until")
+        else None
+    )
+    return build_recurrence_rule(
+        str(frequency),
+        interval=int(args.get("recurrence_interval", 1)),
+        weekdays=list(args.get("recurrence_weekdays") or []),
+        count=args.get("recurrence_count"),
+        until=until,
+    )
 
 
 class CareTools:
@@ -151,6 +187,12 @@ class CareTools:
             self.get_pressure_curve,
         )
         registry.register(
+            "care_get_checkin_card",
+            "Queue the reviewed Feishu daily-state questionnaire card for this participant.",
+            _empty_schema(),
+            self.get_checkin_card,
+        )
+        registry.register(
             "calendar_connection_status",
             "Return whether this participant has a usable Feishu calendar authorization.",
             _empty_schema(),
@@ -207,11 +249,46 @@ class CareTools:
                         "minimum": 0,
                         "maximum": 1440,
                     },
+                    **_recurrence_schema_properties(),
                 },
                 "required": ["summary", "start_time", "end_time"],
                 "additionalProperties": False,
             },
             self.create_calendar_event,
+        )
+        registry.register(
+            "calendar_update_event",
+            "Update one exact event in this participant's primary calendar after confirmation.",
+            {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "start_time": {"type": "string", "format": "date-time"},
+                    "end_time": {"type": "string", "format": "date-time"},
+                    "description": {"type": "string", "maxLength": 1000},
+                    "reminder_minutes": {"type": "integer", "minimum": 0, "maximum": 1440},
+                    "clear_recurrence": {"type": "boolean"},
+                    **_recurrence_schema_properties(),
+                },
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+            self.update_calendar_event,
+        )
+        registry.register(
+            "calendar_delete_event",
+            "Delete one exact event from this participant's primary calendar after explicit confirmation.",
+            {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "confirmed": {"type": "boolean", "const": True},
+                },
+                "required": ["event_id", "confirmed"],
+                "additionalProperties": False,
+            },
+            self.delete_calendar_event,
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -350,17 +427,36 @@ class CareTools:
             "calendar_degraded": bool(result.get("calendar_degraded")),
         }
 
+    def get_checkin_card(
+        self, ctx: AgentContext, _args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            raise RuntimeError("rich reply delivery is unavailable")
+        self.presentations.stage_card(ctx.agent_run_id, daily_checkin_card())
+        return {
+            "ok": True,
+            "card_queued": True,
+            "questionnaire": "daily_non_clinical_checkin_v1",
+        }
+
     def calendar_connection_status(
         self, ctx: AgentContext, _args: dict[str, Any]
     ) -> dict[str, Any]:
         status = self.tokens.status(ctx.participant_id)
         scopes = set(status.get("scopes") or [])
+        create_enabled = bool(
+            "calendar:calendar.event:create" in scopes or "calendar:calendar" in scopes
+        )
         return {
             "ok": True,
             **status,
-            "calendar_write_enabled": bool(
-                "calendar:calendar.event:create" in scopes
-                or "calendar:calendar" in scopes
+            "calendar_write_enabled": create_enabled,
+            "calendar_create_enabled": create_enabled,
+            "calendar_update_enabled": bool(
+                "calendar:calendar.event:update" in scopes or "calendar:calendar" in scopes
+            ),
+            "calendar_delete_enabled": bool(
+                "calendar:calendar.event:delete" in scopes or "calendar:calendar" in scopes
             ),
         }
 
@@ -395,6 +491,7 @@ class CareTools:
     ) -> dict[str, Any]:
         start_time = _parse_datetime(args["start_time"], self.timezone)
         end_time = _parse_datetime(args["end_time"], self.timezone)
+        recurrence = _recurrence_from_args(args, self.timezone)
         try:
             event = await self.calendar.create_event(
                 ctx.participant_id,
@@ -403,8 +500,52 @@ class CareTools:
                 start_time=start_time,
                 end_time=end_time,
                 reminder_minutes=args.get("reminder_minutes"),
+                recurrence=recurrence,
                 source_message_id=ctx.message_id,
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
         return {"ok": True, "created": event}
+
+    async def update_calendar_event(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        start_time = (
+            _parse_datetime(args["start_time"], self.timezone)
+            if args.get("start_time") is not None
+            else None
+        )
+        end_time = (
+            _parse_datetime(args["end_time"], self.timezone)
+            if args.get("end_time") is not None
+            else None
+        )
+        recurrence = _recurrence_from_args(args, self.timezone)
+        try:
+            event = await self.calendar.update_event(
+                ctx.participant_id,
+                str(args["event_id"]),
+                summary=args.get("summary"),
+                description=args.get("description"),
+                start_time=start_time,
+                end_time=end_time,
+                reminder_minutes=args.get("reminder_minutes"),
+                recurrence=recurrence,
+                clear_recurrence=bool(args.get("clear_recurrence", False)),
+            )
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        return {"ok": True, "updated": event}
+
+    async def delete_calendar_event(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if args.get("confirmed") is not True:
+            return {"ok": False, "error": "explicit_confirmation_required"}
+        try:
+            deleted = await self.calendar.delete_event(
+                ctx.participant_id, str(args["event_id"])
+            )
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        return {"ok": True, "deleted": deleted}

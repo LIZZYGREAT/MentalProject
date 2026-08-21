@@ -28,6 +28,8 @@ services:
       HOME: /home/mindflow
     volumes:
       - claude_state:/home/mindflow/.claude
+    ports:
+      - "${FEISHU_CARD_CALLBACK_PORT:-8000}:${FEISHU_CARD_CALLBACK_PORT:-8000}"
     restart: unless-stopped
     cpus: ${BOT_CPU_LIMIT:-0.75}
     mem_limit: ${BOT_MEMORY_LIMIT:-768m}

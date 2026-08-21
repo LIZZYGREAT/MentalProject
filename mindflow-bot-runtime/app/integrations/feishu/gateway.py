@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -83,6 +84,79 @@ class BotEvent:
             text=values["text"][:4000],
             create_time=created.astimezone(timezone.utc),
             chat_type=str(payload.get("chat_type") or "p2p"),
+        )
+
+
+@dataclass(frozen=True)
+class CardActionEvent:
+    event_id: str
+    message_id: str
+    app_id: str
+    open_id: str
+    chat_id: str
+    action_tag: str
+    action_value: dict[str, Any]
+    form_value: dict[str, Any]
+
+
+class FeishuCardActionAdapter:
+    def __init__(self, app_id: str):
+        self.app_id = app_id
+
+    def adapt(self, event: Any) -> CardActionEvent:
+        return self._build(
+            message_id=getattr(event, "message_id", ""),
+            chat_id=getattr(event, "chat_id", ""),
+            open_id=getattr(getattr(event, "operator", None), "open_id", ""),
+            action=getattr(event, "action", None),
+        )
+
+    def adapt_p2(self, callback: Any) -> CardActionEvent:
+        event = getattr(callback, "event", None)
+        context = getattr(event, "context", None)
+        return self._build(
+            message_id=getattr(context, "open_message_id", ""),
+            chat_id=getattr(context, "open_chat_id", ""),
+            open_id=getattr(getattr(event, "operator", None), "open_id", ""),
+            action=getattr(event, "action", None),
+        )
+
+    def _build(
+        self, *, message_id: Any, chat_id: Any, open_id: Any, action: Any
+    ) -> CardActionEvent:
+        message_id = str(message_id or "").strip()
+        chat_id = str(chat_id or "").strip()
+        open_id = str(open_id or "").strip()
+        tag = str(getattr(action, "tag", "") or "")[:64]
+        value = getattr(action, "value", None) or {}
+        form_value = getattr(action, "form_value", None) or {}
+        if not all((message_id, chat_id, open_id)):
+            raise InvalidBotEvent("card action is missing routing fields")
+        if not isinstance(value, dict) or not isinstance(form_value, dict):
+            raise InvalidBotEvent("card action values must be objects")
+        identity_payload = json.dumps(
+            {
+                "message_id": message_id,
+                "open_id": open_id,
+                "tag": tag,
+                "value": value,
+                "form_value": form_value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        event_id = "card:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+        return CardActionEvent(
+            event_id=event_id,
+            message_id=message_id,
+            app_id=self.app_id,
+            open_id=open_id,
+            chat_id=chat_id,
+            action_tag=tag,
+            action_value=dict(value),
+            form_value=dict(form_value),
         )
 
 

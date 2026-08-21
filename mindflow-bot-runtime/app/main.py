@@ -115,6 +115,7 @@ async def run() -> None:
     from app.db import Database, build_engine
     from app.identity.service import IdentityService
     from app.integrations.feishu.gateway import BotEvent
+    from app.integrations.feishu.card_callback import FeishuCardCallbackServer
     from app.repositories import (
         AgentRunRepository, BindingRepository, BotEventRepository,
         ClaudeSessionRepository, ParticipantRepository,
@@ -175,7 +176,9 @@ async def run() -> None:
         SafetyService(),
     )
 
-    queue: asyncio.Queue[BotEvent] = asyncio.Queue(maxsize=settings.queue_max_size)
+    queue: asyncio.Queue[BotEvent] = asyncio.Queue(
+        maxsize=settings.queue_max_size
+    )
     sender, gateway = _build_bot_transport(settings, identity, events, queue)
     worker = BotWorker(
         queue,
@@ -192,6 +195,30 @@ async def run() -> None:
         progress_delay_seconds=settings.progress_delay_seconds,
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
+    )
+    def handle_card_action(event: Any) -> dict[str, Any]:
+        participant = identity.resolve(event.app_id, event.open_id)
+        if participant is None:
+            raise ValueError("card operator is not bound to a participant")
+        return business.card_actions.handle(
+            participant.id,
+            message_id=event.message_id,
+            action_value=event.action_value,
+            form_value=event.form_value,
+        )
+
+    card_callback = (
+        FeishuCardCallbackServer(
+            app_id=settings.feishu_bot_app_id,
+            verification_token=settings.feishu_card_verification_token,
+            encrypt_key=settings.feishu_card_encrypt_key,
+            action_handler=handle_card_action,
+            host=settings.feishu_card_callback_host,
+            port=settings.feishu_card_callback_port,
+            path=settings.feishu_card_callback_path,
+        )
+        if settings.feishu_card_callback_enabled
+        else None
     )
     scheduler = ForecastScheduler(
         coordinator=business.forecast_coordinator,
@@ -239,6 +266,9 @@ async def run() -> None:
         _log_startup_phase("forecast_scheduler_ready")
 
     try:
+        if card_callback is not None:
+            await card_callback.start()
+            _log_startup_phase("card_callback_ready")
         # Gateway readiness is a hard startup gate. Forecast work cannot
         # compete with receiver spawn/connection on the small ECS host.
         await _run_gateway_until_shutdown(
@@ -248,6 +278,8 @@ async def run() -> None:
         try:
             await gateway.stop()
         finally:
+            if card_callback is not None:
+                await card_callback.stop()
             await scheduler.close()
             if forecast_tasks is not None:
                 forecast_tasks.cancel()

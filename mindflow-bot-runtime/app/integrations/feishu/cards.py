@@ -5,6 +5,106 @@ from __future__ import annotations
 from typing import Any
 
 
+def daily_checkin_card() -> dict[str, Any]:
+    """Build the fixed non-clinical check-in form accepted by the callback service."""
+
+    scale_options = [
+        {"text": {"tag": "plain_text", "content": str(value)}, "value": str(value)}
+        for value in range(11)
+    ]
+    boolean_options = [
+        {"text": {"tag": "plain_text", "content": "是"}, "value": "true"},
+        {"text": {"tag": "plain_text", "content": "否"}, "value": "false"},
+    ]
+    return {
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": False,
+            "enable_forward": False,
+        },
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "每日状态记录"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "请按此刻感受填写。0 表示最低，10 表示最高。",
+                },
+            },
+            {
+                "tag": "form",
+                "name": "mindflow_daily_checkin",
+                "elements": [
+                    {
+                        "tag": "select_static",
+                        "name": "stress",
+                        "required": True,
+                        "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
+                        "label": {"tag": "plain_text", "content": "当前压力"},
+                        "options": scale_options,
+                    },
+                    {
+                        "tag": "select_static",
+                        "name": "energy",
+                        "required": True,
+                        "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
+                        "label": {"tag": "plain_text", "content": "当前精力"},
+                        "options": scale_options,
+                    },
+                    {
+                        "tag": "input",
+                        "name": "activity",
+                        "required": True,
+                        "max_length": 120,
+                        "placeholder": {"tag": "plain_text", "content": "例如：在图书馆写作业"},
+                        "label": {"tag": "plain_text", "content": "正在做什么"},
+                    },
+                    {
+                        "tag": "select_static",
+                        "name": "stress_event_since_last",
+                        "required": True,
+                        "placeholder": {"tag": "plain_text", "content": "请选择"},
+                        "label": {"tag": "plain_text", "content": "上次记录后有压力事件吗"},
+                        "options": boolean_options,
+                    },
+                    {
+                        "tag": "select_static",
+                        "name": "event_ongoing",
+                        "required": True,
+                        "placeholder": {"tag": "plain_text", "content": "请选择"},
+                        "label": {"tag": "plain_text", "content": "该事件仍在持续吗"},
+                        "options": boolean_options,
+                    },
+                    {
+                        "tag": "button",
+                        "name": "submit_checkin",
+                        "action_type": "form_submit",
+                        "type": "primary",
+                        "text": {"tag": "plain_text", "content": "提交记录"},
+                        "value": {"mindflow_action": "submit_checkin", "version": "1"},
+                        "confirm": {
+                            "title": {"tag": "plain_text", "content": "提交状态记录"},
+                            "text": {"tag": "plain_text", "content": "确认提交本次记录吗？"},
+                        },
+                    },
+                ],
+            },
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": "用于日常状态建模，不是医学问卷或诊断量表。",
+                    }
+                ],
+            },
+        ],
+    }
+
+
 def pressure_curve_card(
     curve: list[dict[str, Any]], *, local_date: str
 ) -> dict[str, Any]:

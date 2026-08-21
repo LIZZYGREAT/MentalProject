@@ -141,3 +141,27 @@ def test_partial_calendar_credentials_are_rejected(name, value):
         Settings.from_env(
             environment, base_dir=Path(__file__).resolve().parents[1]
         )
+
+
+def test_card_callback_requires_verified_encrypted_configuration_when_enabled():
+    environment = valid_environment()
+    environment["FEISHU_CARD_CALLBACK_ENABLED"] = "true"
+
+    with pytest.raises(ValueError, match="FEISHU_CARD_VERIFICATION_TOKEN"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+    environment.update(
+        {
+            "FEISHU_CARD_VERIFICATION_TOKEN": "verification-token",
+            "FEISHU_CARD_ENCRYPT_KEY": "encrypt-key",
+            "FEISHU_CARD_CALLBACK_PORT": "8123",
+        }
+    )
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.feishu_card_callback_enabled is True
+    assert settings.feishu_card_callback_port == 8123
+    assert settings.feishu_card_callback_path == "/feishu/card/callback"

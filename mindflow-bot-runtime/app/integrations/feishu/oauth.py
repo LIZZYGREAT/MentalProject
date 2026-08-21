@@ -119,7 +119,8 @@ class FeishuOAuthClient:
 class DeviceFlowService:
     DEFAULT_SCOPE = (
         "offline_access calendar:calendar:readonly "
-        "calendar:calendar.event:create"
+        "calendar:calendar.event:create calendar:calendar.event:update "
+        "calendar:calendar.event:delete"
     )
 
     def __init__(

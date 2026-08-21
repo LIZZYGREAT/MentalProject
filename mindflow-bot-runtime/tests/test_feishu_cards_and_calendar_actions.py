@@ -1,16 +1,33 @@
 import asyncio
 from datetime import datetime, timedelta
+import hashlib
+import json
+from types import SimpleNamespace
 import uuid
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
-from app.integrations.feishu.calendar import CalendarService
-from app.integrations.feishu.cards import pressure_curve_card
+from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
+from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
 from app.integrations.feishu.client import FeishuClient
-from app.integrations.feishu.gateway import BotEvent, FeishuGateway
+from app.integrations.feishu.card_callback import FeishuCardCallbackServer
+from app.integrations.feishu.gateway import (
+    BotEvent,
+    CardActionEvent,
+    FeishuCardActionAdapter,
+    FeishuGateway,
+)
 from app.identity.service import IdentityService
-from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
+from app.repositories import (
+    AgentRunRepository,
+    BindingRepository,
+    BotEventRepository,
+    ObservationRepository,
+)
+from app.services.card_action_service import CardActionService
 from app.services.presentation_service import PresentationOutbox
 from app.tools.care import CareTools
 from app.worker import BotWorker
@@ -38,6 +55,127 @@ def test_pressure_curve_card_contains_native_feishu_line_chart():
         "压力",
         "活力",
     }
+
+
+def test_daily_checkin_card_is_a_fixed_form_submit_workflow():
+    card = daily_checkin_card()
+    form = next(item for item in card["elements"] if item["tag"] == "form")
+    fields = {item.get("name"): item for item in form["elements"]}
+
+    assert set(fields) == {
+        "stress",
+        "energy",
+        "activity",
+        "stress_event_since_last",
+        "event_ongoing",
+        "submit_checkin",
+    }
+    assert fields["submit_checkin"]["action_type"] == "form_submit"
+    assert fields["submit_checkin"]["value"] == {
+        "mindflow_action": "submit_checkin",
+        "version": "1",
+    }
+
+
+def test_card_callback_server_exposes_only_configured_callback_and_health_routes():
+    handled = []
+    server = FeishuCardCallbackServer(
+        app_id="app",
+        verification_token="verification-token",
+        encrypt_key="encrypt-key",
+        action_handler=lambda event: (
+            handled.append(event)
+            or {"ok": True, "reply_text": "记录成功"}
+        ),
+        host="127.0.0.1",
+        port=8123,
+        path="/feishu/card/callback",
+    )
+
+    assert {route.path for route in server.app.routes} == {
+        "/feishu/card/callback",
+        "/healthz",
+    }
+
+    async def verify_url_challenge():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="https://callback.test"
+        ) as client:
+            response = await client.post(
+                "/feishu/card/callback",
+                json={
+                    "type": "url_verification",
+                    "token": "verification-token",
+                    "challenge": "challenge-value",
+                },
+            )
+        assert response.status_code == 200
+        assert response.json() == {"challenge": "challenge-value"}
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="https://callback.test"
+        ) as client:
+            callback_body = json.dumps(
+                {
+                    "schema": "2.0",
+                    "header": {
+                        "event_id": "event-card-1",
+                        "event_type": "card.action.trigger",
+                        "token": "verification-token",
+                        "app_id": "app",
+                        "tenant_key": "tenant",
+                    },
+                    "event": {
+                        "operator": {"open_id": "ou-user"},
+                        "token": "update-token",
+                        "action": {
+                            "tag": "button",
+                            "value": {
+                                "mindflow_action": "submit_checkin",
+                                "version": "1",
+                            },
+                            "form_value": {"stress": "7"},
+                        },
+                        "context": {
+                            "open_message_id": "om-card",
+                            "open_chat_id": "oc-chat",
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            ).encode()
+            timestamp = "1786200000"
+            nonce = "nonce"
+            signature = hashlib.sha256(
+                (timestamp + nonce + "encrypt-key").encode() + callback_body
+            ).hexdigest()
+            response = await client.post(
+                "/feishu/card/callback",
+                content=callback_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Lark-Request-Timestamp": timestamp,
+                    "X-Lark-Request-Nonce": nonce,
+                    "X-Lark-Signature": signature,
+                },
+            )
+        assert response.status_code == 200
+        event = handled[0]
+        assert event.message_id == "om-card"
+        assert event.action_value["mindflow_action"] == "submit_checkin"
+
+    asyncio.run(verify_url_challenge())
+
+
+def test_recurrence_builder_exposes_only_reviewed_rfc5545_subset():
+    until = datetime(2030, 3, 1, 18, 0, tzinfo=TZ)
+    assert build_recurrence_rule(
+        "weekly", interval=2, weekdays=["MO", "FR"], until=until
+    ) == "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,FR;UNTIL=20300301T100000Z"
+
+    with __import__("pytest").raises(ValueError, match="count and until"):
+        build_recurrence_rule("DAILY", count=3, until=until)
 
 
 def test_feishu_client_sends_card_as_interactive_message():
@@ -210,3 +348,123 @@ def test_calendar_create_event_uses_user_token_primary_calendar_and_idempotency(
     assert len(create_call[2]["idempotency_key"]) == 64
     assert create_call[3]["reminders"] == [{"minutes": 15}]
     assert create_call[3]["start_time"]["timezone"] == "Asia/Shanghai"
+
+
+def test_calendar_update_and_delete_use_exact_primary_calendar_event(monkeypatch):
+    person_id = uuid.uuid4()
+
+    class Tokens:
+        async def get_access_token(self, participant_id):
+            assert participant_id == person_id
+            return "user-token"
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        calls = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            self.calls.append(("POST", url, kwargs))
+            return Response({"code": 0, "data": {"calendar": {"calendar_id": "primary/calendar"}}})
+
+        async def patch(self, url, **kwargs):
+            self.calls.append(("PATCH", url, kwargs))
+            return Response({
+                "code": 0,
+                "data": {"event": {"event_id": "event/1", **kwargs["json"]}},
+            })
+
+        async def delete(self, url, **kwargs):
+            self.calls.append(("DELETE", url, kwargs))
+            return Response({"code": 0, "data": {}})
+
+    monkeypatch.setattr("app.integrations.feishu.calendar.httpx.AsyncClient", Client)
+    calendar = CalendarService(Tokens())
+    updated = asyncio.run(calendar.update_event(
+        person_id,
+        "event/1",
+        summary="新标题",
+        recurrence="FREQ=WEEKLY;INTERVAL=1;BYDAY=MO",
+    ))
+    deleted = asyncio.run(calendar.delete_event(person_id, "event/1"))
+
+    patch_call = next(call for call in Client.calls if call[0] == "PATCH")
+    delete_call = next(call for call in Client.calls if call[0] == "DELETE")
+    assert patch_call[1].endswith("/events/event%2F1")
+    assert patch_call[2]["json"]["recurrence"].startswith("FREQ=WEEKLY")
+    assert updated["summary"] == "新标题"
+    assert delete_call[1].endswith("/events/event%2F1")
+    assert deleted == {"id": "event/1", "deleted": True}
+
+
+def test_card_action_adapter_and_service_record_one_idempotent_checkin():
+    database = memory_database()
+    person = participant(database, "P001")
+    observations = ObservationRepository(database)
+    service = CardActionService(observations)
+    raw = SimpleNamespace(
+        message_id="om-card",
+        chat_id="oc-chat",
+        operator=SimpleNamespace(open_id="ou-user"),
+        action=SimpleNamespace(
+            tag="button",
+            value={"mindflow_action": "submit_checkin", "version": "1"},
+            form_value={
+                "stress": "7",
+                "energy": "4",
+                "activity": "写课程作业",
+                "stress_event_since_last": "true",
+                "event_ongoing": "false",
+            },
+        ),
+    )
+    event = FeishuCardActionAdapter("app").adapt(raw)
+
+    p2_event = FeishuCardActionAdapter("app").adapt_p2(
+        SimpleNamespace(
+            event=SimpleNamespace(
+                context=SimpleNamespace(
+                    open_message_id="om-card", open_chat_id="oc-chat"
+                ),
+                operator=SimpleNamespace(open_id="ou-user"),
+                action=raw.action,
+            )
+        )
+    )
+
+    first = service.handle(
+        person.id,
+        message_id=event.message_id,
+        action_value=event.action_value,
+        form_value=event.form_value,
+    )
+    second = service.handle(
+        person.id,
+        message_id=event.message_id,
+        action_value=event.action_value,
+        form_value=event.form_value,
+    )
+
+    assert event.event_id.startswith("card:")
+    assert p2_event == event
+    assert first["observation_id"] == second["observation_id"]
+    recorded = observations.recent(person.id, limit=5)
+    assert len(recorded) == 1
+    assert recorded[0]["payload"]["input_method"] == "feishu_card"
+    assert recorded[0]["payload"]["stress_0_10"] == 7.0
