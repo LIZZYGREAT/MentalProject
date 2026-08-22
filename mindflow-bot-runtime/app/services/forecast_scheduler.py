@@ -98,10 +98,17 @@ class ForecastScheduler:
                             and target == now.date()
                             and why in {"daily_prepare", "periodic_poll"}
                         ):
-                            await asyncio.to_thread(
-                                self.profile_calibration.maybe_calibrate,
-                                pid, through=target,
-                            )
+                            try:
+                                await asyncio.to_thread(
+                                    self.profile_calibration.maybe_calibrate,
+                                    pid, through=target,
+                                )
+                            except Exception as exc:
+                                logger.exception(
+                                    "profile_calibration_failed participant_id=%s "
+                                    "local_date=%s error_class=%s message=%s",
+                                    pid, target, type(exc).__name__, str(exc)[:160],
+                                )
             except Exception as exc:
                 logger.exception(
                     "forecast_scheduler_iteration_failed error_class=%s message=%s",
@@ -176,7 +183,10 @@ class ForecastScheduler:
             or "预测到临近的高压时段，可以提前安排短暂休息。"
         )
         try:
-            await asyncio.to_thread(self.sender.send_text, binding["chat_id"], text)
+            await asyncio.to_thread(
+                self.sender.send_text, binding["chat_id"], text,
+                message_uuid=str(warning_id),
+            )
         except FeishuSendError as exc:
             logger.warning(
                 "forecast_warning_send_failed warning_id=%s retryable=%s code=%s",

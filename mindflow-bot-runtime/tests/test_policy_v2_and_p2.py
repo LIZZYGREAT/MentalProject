@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+import logging
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from app.repositories import (
 )
 from app.services.curve_analysis import analyze_curve
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.forecast_scheduler import ForecastScheduler
 from app.services.profile_calibration import ProfileCalibrationService, layered_profile
 from app.services.warning_policy import WarningPolicy
 from app.tools.care import CareTools
@@ -65,12 +67,158 @@ def _versioned_forecast(database, participant_id, version, *, local_date=DAY, cu
     )
 
 
-def _window(episode, target, valid, risk):
+def _window(episode, target, valid, risk, *, trigger=None):
     return {
         "episode_identity": episode, "target_time": target,
         "valid_until": valid, "risk_time": risk, "warning_level": "2",
-        "payload": {}, "episode_drift_minutes": 15,
+        "payload": ({"trigger_source": trigger} if trigger else {}),
+        "episode_drift_minutes": 15,
     }
+
+
+def _boundary_windows(
+    trigger="workload", *, second_trigger=None,
+    first_stressors=None, second_stressors=None, event_id=None,
+):
+    coordinator = object.__new__(ForecastCoordinator)
+    coordinator.timezone = ZoneInfo("Asia/Shanghai")
+    coordinator.warning_lead_minutes = 20
+    coordinator.warning_late_grace_minutes = 10
+    coordinator.warning_episode_drift_minutes = 15
+    shared = {"calendar_event_id": event_id} if event_id else {}
+    first_alert = {
+        **_alert("10:55", 2, 0.8, 1), **shared, "trigger_source": trigger,
+    }
+    second_alert = {
+        **_alert("11:00", 2, 0.8, 1), **shared,
+        "trigger_source": second_trigger or trigger,
+    }
+    if first_stressors is not None:
+        first_alert["dominant_stressors"] = first_stressors
+    if second_stressors is not None:
+        second_alert["dominant_stressors"] = second_stressors
+    first = coordinator._warning_windows([first_alert], DAY)[0]
+    second = coordinator._warning_windows([second_alert], DAY)[0]
+    assert first["episode_identity"] != second["episode_identity"]
+    return first, second
+
+
+def _exact_identity_collision_windows(
+    first_time="09:10", second_time="10:40", *,
+    first_trigger="sustained_intensity", second_trigger=None, stressors=None,
+):
+    coordinator = object.__new__(ForecastCoordinator)
+    coordinator.timezone = ZoneInfo("Asia/Shanghai")
+    coordinator.warning_lead_minutes = 20
+    coordinator.warning_late_grace_minutes = 10
+    coordinator.warning_episode_drift_minutes = 15
+    first = coordinator._warning_windows([{
+        **_alert(first_time, 2, 0.8, 1),
+        "trigger_source": first_trigger,
+        **({"dominant_stressors": stressors} if stressors else {}),
+    }], DAY)[0]
+    second = coordinator._warning_windows([{
+        **_alert(second_time, 2, 0.8, 2),
+        "trigger_source": second_trigger or first_trigger,
+        **({"dominant_stressors": stressors} if stressors else {}),
+    }], DAY)[0]
+    assert first["episode_identity"] == second["episode_identity"]
+    return first, second
+
+
+def _sync_exact_identity_collision_terminal(status, *, first_time="09:10", second_time="10:40"):
+    database = memory_database()
+    participant = ParticipantRepository(database).create(f"EXACT-COLLISION-{status}")
+    repository = WarningScheduleRepository(database)
+    first, second = _exact_identity_collision_windows(first_time, second_time)
+    drift = abs((second["risk_time"] - first["risk_time"]).total_seconds()) / 60
+
+    initial = _versioned_forecast(database, participant.id, f"exact-{status}-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version=f"exact-{status}-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        original_id = row.id
+        row.status = status
+        if status in WarningScheduleRepository.SUCCESSFUL:
+            row.sent_at = first["risk_time"]
+        elif status == "failed":
+            row.attempt_count = 5
+
+    latest = _versioned_forecast(database, participant.id, f"exact-{status}-b")
+    diff = repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version=f"exact-{status}-b", warnings=[second], now=NOW,
+    )
+    return database, participant, repository, original_id, second, drift, diff
+
+
+def _sync_exact_identity_different_trigger(status):
+    database = memory_database()
+    participant = ParticipantRepository(database).create(f"EXACT-TRIGGER-{status}")
+    repository = WarningScheduleRepository(database)
+    first, second = _exact_identity_collision_windows(
+        first_time="09:10", second_time="09:15",
+        first_trigger="sustained_intensity", second_trigger="extreme_spike",
+        stressors=["Course A"],
+    )
+    assert (
+        first["payload"]["episode_trigger_fingerprint"]
+        != second["payload"]["episode_trigger_fingerprint"]
+    )
+
+    initial = _versioned_forecast(database, participant.id, f"trigger-{status}-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version=f"trigger-{status}-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        original_id = row.id
+        row.status = status
+        if status in WarningScheduleRepository.SUCCESSFUL:
+            row.sent_at = first["target_time"]
+        elif status == "failed":
+            row.attempt_count = 5
+
+    latest = _versioned_forecast(database, participant.id, f"trigger-{status}-b")
+    diff = repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version=f"trigger-{status}-b", warnings=[second], now=NOW,
+    )
+    return database, repository, original_id, first, second, diff
+
+
+def _sync_boundary_terminal(status, *, first_stressors=None, second_stressors=None):
+    database = memory_database()
+    participant = ParticipantRepository(database).create(f"BOUNDARY-{status}")
+    repository = WarningScheduleRepository(database)
+    first, second = _boundary_windows(
+        first_stressors=first_stressors, second_stressors=second_stressors,
+    )
+    initial = _versioned_forecast(database, participant.id, f"boundary-{status}-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version=f"boundary-{status}-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        original_id = row.id
+        row.status = status
+        if status == "sent":
+            row.sent_at = NOW
+        elif status == "failed":
+            row.attempt_count = 5
+    latest = _versioned_forecast(database, participant.id, f"boundary-{status}-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version=f"boundary-{status}-b", warnings=[second], now=NOW,
+    )
+    with database.session() as session:
+        rows = session.query(WarningSchedule).all()
+        return original_id, [(row.id, row.status, row.attempt_count) for row in rows]
 
 
 def _warning_row(participant_id, forecast_id, identity, *, target, risk, valid, status="pending", sent_at=None):
@@ -270,6 +418,560 @@ def test_minimum_interval_recovery_still_respects_valid_until():
         rows = session.query(WarningSchedule).filter_by(episode_identity="minimum-episode").all()
         assert len(rows) == 1
         assert session.get(WarningSchedule, old_id).status == "suppressed"
+
+
+def _terminal_sibling_case(status):
+    database = memory_database()
+    participant = ParticipantRepository(database).create(f"SIBLING-{status}")
+    saved = _versioned_forecast(database, participant.id, "sibling-v")
+    forecast_id = uuid.UUID(saved["id"])
+    target = NOW + timedelta(minutes=10)
+    valid = target + timedelta(minutes=10)
+    risk = target + timedelta(minutes=20)
+    with database.session() as session:
+        cancelled = _warning_row(
+            participant.id, forecast_id, f"cancelled-{status}", target=target,
+            valid=valid, risk=risk, status="cancelled",
+        )
+        terminal = _warning_row(
+            participant.id, forecast_id, f"terminal-{status}", target=target,
+            valid=valid, risk=risk, status=status,
+            sent_at=target if status in {"sent", "escalated"} else None,
+        )
+        cancelled.episode_identity = "shared-episode"
+        terminal.episode_identity = "shared-episode"
+        if status == "failed":
+            terminal.attempt_count = 5
+        session.add_all([cancelled, terminal])
+    repository = WarningScheduleRepository(database)
+    repository.sync(
+        participant.id, DAY, forecast_id=forecast_id,
+        forecast_version="sibling-v", now=NOW,
+        warnings=[_window("shared-episode", target, valid, risk)],
+    )
+    with database.session() as session:
+        rows = session.query(WarningSchedule).filter_by(episode_identity="shared-episode").all()
+        return [(row.status, row.attempt_count) for row in rows]
+
+
+def test_cancelled_sibling_does_not_reactivate_when_same_episode_already_sent():
+    states = _terminal_sibling_case("sent")
+    assert ("sent", 0) in states
+    assert not any(status in WarningScheduleRepository.ACTIVE for status, _ in states)
+
+
+def test_cancelled_sibling_does_not_reactivate_when_same_episode_already_escalated():
+    states = _terminal_sibling_case("escalated")
+    assert ("escalated", 0) in states
+    assert not any(status in WarningScheduleRepository.ACTIVE for status, _ in states)
+
+
+def test_cancelled_sibling_does_not_bypass_failed_terminal_same_episode():
+    states = _terminal_sibling_case("failed")
+    assert ("failed", 5) in states
+    assert not any(status in WarningScheduleRepository.ACTIVE for status, _ in states)
+
+
+def test_expired_sibling_does_not_block_new_future_delivery_window():
+    # Existing regression explicitly proves that expired is not part of the
+    # blocking terminal sibling set.
+    test_expired_audit_row_is_preserved_and_future_window_creates_new_row()
+
+
+def test_minimum_interval_suppressed_sibling_can_use_later_legal_window():
+    test_minimum_interval_suppressed_warning_can_use_later_valid_window()
+
+
+def test_episode_reconciliation_survives_time_bucket_boundary_drift():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("BOUNDARY-ACTIVE")
+    repository = WarningScheduleRepository(database)
+    first, second = _boundary_windows()
+    initial = _versioned_forecast(database, participant.id, "boundary-active-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="boundary-active-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        original_id = session.query(WarningSchedule).one().id
+
+    latest = _versioned_forecast(database, participant.id, "boundary-active-b")
+    diff = repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="boundary-active-b", warnings=[second], now=NOW,
+    )
+
+    assert diff["rescheduled"] == 1
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        assert row.id == original_id
+        assert row.status == "pending"
+        assert row.episode_identity == second["episode_identity"]
+
+
+def test_failed_terminal_cannot_be_bypassed_by_small_identity_boundary_drift():
+    original_id, states = _sync_boundary_terminal("failed")
+    assert states == [(original_id, "failed", 5)]
+    assert not any(status in WarningScheduleRepository.ACTIVE for _, status, _ in states)
+
+
+def test_sent_terminal_cannot_be_bypassed_by_small_identity_boundary_drift():
+    original_id, states = _sync_boundary_terminal("sent")
+    assert states == [(original_id, "sent", 0)]
+    assert not any(status in WarningScheduleRepository.ACTIVE for _, status, _ in states)
+
+
+def test_cancelled_warning_can_reconcile_across_small_identity_boundary_drift():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("BOUNDARY-CANCELLED")
+    repository = WarningScheduleRepository(database)
+    first, second = _boundary_windows()
+    initial = _versioned_forecast(database, participant.id, "boundary-cancelled-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="boundary-cancelled-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        original_id = session.query(WarningSchedule).one().id
+    absent = _versioned_forecast(database, participant.id, "boundary-cancelled-absent")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(absent["id"]),
+        forecast_version="boundary-cancelled-absent", warnings=[], now=NOW,
+    )
+    with database.session() as session:
+        assert session.get(WarningSchedule, original_id).status == "cancelled"
+
+    latest = _versioned_forecast(database, participant.id, "boundary-cancelled-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="boundary-cancelled-b", warnings=[second], now=NOW,
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        assert row.id == original_id
+        assert row.status == "pending"
+        assert row.attempt_count == 0
+        assert row.episode_identity == second["episode_identity"]
+
+
+def test_distinct_episodes_are_not_merged_by_fuzzy_reconciliation():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("FUZZY-DISTINCT")
+    repository = WarningScheduleRepository(database)
+    risk_a = datetime(2030, 1, 15, 10, 55, tzinfo=timezone.utc)
+    risk_b = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    initial = _versioned_forecast(database, participant.id, "distinct-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="distinct-a", now=NOW,
+        warnings=[_window(
+            "distinct-a", risk_a - timedelta(minutes=20),
+            risk_a - timedelta(minutes=10), risk_a, trigger="workload",
+        )],
+    )
+    with database.session() as session:
+        first = session.query(WarningSchedule).one()
+        first.status = "sent"
+        first.sent_at = NOW
+
+    latest = _versioned_forecast(database, participant.id, "distinct-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="distinct-b", now=NOW,
+        warnings=[_window(
+            "distinct-b", risk_b - timedelta(minutes=20),
+            risk_b - timedelta(minutes=10), risk_b, trigger="workload",
+        )],
+    )
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert [(row.episode_identity, row.status) for row in rows] == [
+            ("distinct-a", "sent"), ("distinct-b", "pending"),
+        ]
+
+
+def test_sent_exact_identity_does_not_block_distinct_occurrence_beyond_drift():
+    database, _, _, original_id, second, drift, diff = (
+        _sync_exact_identity_collision_terminal("sent")
+    )
+    assert drift == 90
+    assert drift > second["episode_drift_minutes"]
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [row.status for row in rows] == ["sent", "pending"]
+        assert rows[0].episode_identity == rows[1].episode_identity
+
+
+def test_escalated_exact_identity_does_not_block_distinct_occurrence_beyond_drift():
+    database, _, _, original_id, second, drift, diff = (
+        _sync_exact_identity_collision_terminal("escalated")
+    )
+    assert drift == 90
+    assert drift > second["episode_drift_minutes"]
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [row.status for row in rows] == ["escalated", "pending"]
+        assert rows[0].episode_identity == rows[1].episode_identity
+
+
+def test_sent_exact_identity_still_blocks_small_drift_same_occurrence():
+    database, _, _, original_id, second, drift, diff = (
+        _sync_exact_identity_collision_terminal(
+            "sent", first_time="09:10", second_time="09:15",
+        )
+    )
+    assert drift == 5
+    assert drift <= second["episode_drift_minutes"]
+    assert diff["created"] == 0
+    with database.session() as session:
+        rows = session.query(WarningSchedule).all()
+        assert [(row.id, row.status) for row in rows] == [(original_id, "sent")]
+
+
+def test_failed_exact_identity_beyond_drift_remains_new_occurrence_behavior():
+    database, _, _, original_id, second, drift, diff = (
+        _sync_exact_identity_collision_terminal("failed")
+    )
+    assert drift == 90
+    assert drift > second["episode_drift_minutes"]
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [(row.status, row.attempt_count) for row in rows] == [
+            ("failed", 5), ("pending", 0),
+        ]
+        assert rows[0].episode_identity == rows[1].episode_identity
+
+
+def test_distinct_exact_identity_occurrence_still_respects_four_hour_delivery_guard():
+    database, _, repository, _, second, drift, diff = (
+        _sync_exact_identity_collision_terminal("sent")
+    )
+    assert drift == 90
+    assert diff["created"] == 1
+    with database.session() as session:
+        candidate = session.query(WarningSchedule).filter_by(status="pending").one()
+        candidate_id = candidate.id
+
+    assert repository.claim_if_current(
+        candidate_id, now=second["target_time"],
+    ) is None
+    with database.session() as session:
+        candidate = session.get(WarningSchedule, candidate_id)
+        assert candidate.status == "suppressed"
+        assert candidate.payload_json["suppression_reason"] == "minimum_interval"
+
+
+def test_exact_identity_different_trigger_source_is_distinct_occurrence():
+    database, _, original_id, first, second, diff = (
+        _sync_exact_identity_different_trigger("pending")
+    )
+    assert first["episode_identity"] == second["episode_identity"]
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [row.status for row in rows] == ["cancelled", "pending"]
+
+
+def test_sent_exact_identity_different_trigger_does_not_block_new_occurrence():
+    database, _, original_id, _, _, diff = _sync_exact_identity_different_trigger("sent")
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [row.status for row in rows] == ["sent", "pending"]
+
+
+def test_failed_exact_identity_different_trigger_does_not_block_new_occurrence():
+    database, _, original_id, _, _, diff = _sync_exact_identity_different_trigger("failed")
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [(row.status, row.attempt_count) for row in rows] == [
+            ("failed", 5), ("pending", 0),
+        ]
+
+
+def test_cancelled_exact_identity_different_trigger_is_not_reused():
+    database, _, original_id, first, second, diff = (
+        _sync_exact_identity_different_trigger("cancelled")
+    )
+    assert diff["created"] == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert len(rows) == 2
+        assert rows[0].id == original_id
+        assert [row.status for row in rows] == ["cancelled", "pending"]
+        assert rows[0].payload_json["trigger_source"] == first["payload"]["trigger_source"]
+        assert rows[1].payload_json["trigger_source"] == second["payload"]["trigger_source"]
+
+
+def test_same_trigger_small_drift_still_reconciles_after_exact_trigger_fix():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("EXACT-TRIGGER-SAME")
+    repository = WarningScheduleRepository(database)
+    first, second = _exact_identity_collision_windows(
+        first_time="09:10", second_time="09:15", stressors=["Course A"],
+    )
+    initial = _versioned_forecast(database, participant.id, "trigger-same-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="trigger-same-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        original_id = session.query(WarningSchedule).one().id
+    latest = _versioned_forecast(database, participant.id, "trigger-same-b")
+    diff = repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="trigger-same-b", warnings=[second], now=NOW,
+    )
+    assert diff["created"] == 0
+    assert diff["rescheduled"] == 1
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        assert row.id == original_id
+        assert row.status == "pending"
+        assert row.risk_time == second["risk_time"].replace(tzinfo=None)
+
+
+def test_distinct_trigger_exact_identity_still_respects_four_hour_delivery_guard():
+    database, repository, _, _, second, diff = _sync_exact_identity_different_trigger("sent")
+    assert diff["created"] == 1
+    with database.session() as session:
+        candidate = session.query(WarningSchedule).filter_by(status="pending").one()
+        candidate_id = candidate.id
+    assert repository.claim_if_current(candidate_id, now=NOW) is None
+    with database.session() as session:
+        candidate = session.get(WarningSchedule, candidate_id)
+        assert candidate.status == "suppressed"
+        assert candidate.payload_json["suppression_reason"] == "minimum_interval"
+
+
+def test_different_triggers_are_not_fuzzy_matched():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("FUZZY-TRIGGERS")
+    repository = WarningScheduleRepository(database)
+    risk_a = datetime(2030, 1, 15, 10, 55, tzinfo=timezone.utc)
+    risk_b = risk_a + timedelta(minutes=5)
+    initial = _versioned_forecast(database, participant.id, "triggers-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="triggers-a", now=NOW,
+        warnings=[_window(
+            "trigger-a", risk_a - timedelta(minutes=20),
+            risk_a - timedelta(minutes=10), risk_a, trigger="fatigue",
+        )],
+    )
+    latest = _versioned_forecast(database, participant.id, "triggers-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="triggers-b", now=NOW,
+        warnings=[_window(
+            "trigger-b", risk_b - timedelta(minutes=20),
+            risk_b - timedelta(minutes=10), risk_b, trigger="overload",
+        )],
+    )
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert [(row.episode_identity, row.status) for row in rows] == [
+            ("trigger-a", "cancelled"), ("trigger-b", "pending"),
+        ]
+
+
+def test_failed_terminal_survives_dominant_stressor_drift():
+    original_id, states = _sync_boundary_terminal(
+        "failed",
+        first_stressors=["Course A"],
+        second_stressors=["Course A", "Deadline B"],
+    )
+    assert states == [(original_id, "failed", 5)]
+    assert not any(status in WarningScheduleRepository.ACTIVE for _, status, _ in states)
+
+
+def test_sent_terminal_survives_dominant_stressor_drift():
+    original_id, states = _sync_boundary_terminal(
+        "sent",
+        first_stressors=["Course A"],
+        second_stressors=["Course A", "Deadline B"],
+    )
+    assert states == [(original_id, "sent", 0)]
+    assert not any(status in WarningScheduleRepository.ACTIVE for _, status, _ in states)
+
+
+def test_cancelled_reconciles_when_dominant_stressors_change():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("STRESSOR-CANCELLED")
+    repository = WarningScheduleRepository(database)
+    first, second = _boundary_windows(
+        trigger="sustained_intensity",
+        first_stressors=["Course A"],
+        second_stressors=["Course A", "Deadline B"],
+    )
+    initial = _versioned_forecast(database, participant.id, "stressor-cancelled-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="stressor-cancelled-a", warnings=[first], now=NOW,
+    )
+    with database.session() as session:
+        original_id = session.query(WarningSchedule).one().id
+    absent = _versioned_forecast(database, participant.id, "stressor-cancelled-absent")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(absent["id"]),
+        forecast_version="stressor-cancelled-absent", warnings=[], now=NOW,
+    )
+    latest = _versioned_forecast(database, participant.id, "stressor-cancelled-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="stressor-cancelled-b", warnings=[second], now=NOW,
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        assert row.id == original_id
+        assert row.status == "pending"
+        assert row.episode_identity == second["episode_identity"]
+
+
+def test_different_trigger_sources_remain_distinct_despite_same_stressors():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("STRESSOR-SOURCES")
+    repository = WarningScheduleRepository(database)
+    first, second = _boundary_windows(
+        trigger="sustained_intensity", second_trigger="extreme_spike",
+        first_stressors=["Course A"], second_stressors=["Course A"],
+    )
+    assert (
+        first["payload"]["episode_trigger_fingerprint"]
+        != second["payload"]["episode_trigger_fingerprint"]
+    )
+    initial = _versioned_forecast(database, participant.id, "stressor-sources-a")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(initial["id"]),
+        forecast_version="stressor-sources-a", warnings=[first], now=NOW,
+    )
+    latest = _versioned_forecast(database, participant.id, "stressor-sources-b")
+    repository.sync(
+        participant.id, DAY, forecast_id=uuid.UUID(latest["id"]),
+        forecast_version="stressor-sources-b", warnings=[second], now=NOW,
+    )
+    with database.session() as session:
+        rows = session.query(WarningSchedule).order_by(WarningSchedule.risk_time).all()
+        assert [row.status for row in rows] == ["cancelled", "pending"]
+
+
+def test_stable_event_id_takes_priority_over_dominant_stressors():
+    fingerprint = WarningScheduleRepository.episode_trigger_fingerprint
+    first = fingerprint({
+        "calendar_event_id": "event-42",
+        "trigger_source": "sustained_intensity",
+        "dominant_stressors": ["Course A"],
+    })
+    second = fingerprint({
+        "calendar_event_id": "event-42",
+        "trigger_source": "sustained_intensity",
+        "dominant_stressors": ["Course A", "Deadline B"],
+    })
+    assert first == second
+    assert first != fingerprint({
+        "calendar_event_id": "event-42",
+        "trigger_source": "extreme_spike",
+        "dominant_stressors": ["Course A"],
+    })
+
+
+def test_legacy_stressor_fingerprint_is_recomputed_from_stable_source():
+    fingerprint = WarningScheduleRepository.episode_trigger_fingerprint
+    legacy = fingerprint({
+        "episode_trigger_fingerprint": "legacy-stressor-based-value",
+        "trigger_source": "sustained_intensity",
+        "dominant_stressors": ["Course A"],
+    })
+    current = fingerprint({
+        "trigger_source": "sustained_intensity",
+        "dominant_stressors": ["Course A", "Deadline B"],
+    })
+    assert legacy == current
+    assert legacy != "legacy-stressor-based-value"
+
+
+def test_later_episode_identity_remains_stable_when_earlier_episode_disappears():
+    coordinator = object.__new__(ForecastCoordinator)
+    coordinator.timezone = ZoneInfo("Asia/Shanghai")
+    coordinator.warning_lead_minutes = 20
+    coordinator.warning_late_grace_minutes = 10
+    coordinator.warning_episode_drift_minutes = 15
+    earlier = {**_alert("09:00", 1, 0.5, 1), "trigger_source": "episode-a"}
+    later_a = {**_alert("15:00", 2, 0.8, 2), "trigger_source": "episode-b"}
+    later_b = {**later_a, "episode_index": 1}
+    first = coordinator._warning_windows([earlier, later_a], DAY)
+    second = coordinator._warning_windows([later_b], DAY)
+    assert first[1]["episode_identity"] == second[0]["episode_identity"]
+    assert first[0]["episode_identity"] != first[1]["episode_identity"]
+
+
+def test_profile_calibration_failure_does_not_fail_forecast_scheduler_iteration(caplog):
+    participant_a = uuid.uuid4()
+    participant_b = uuid.uuid4()
+
+    class Participants:
+        def active_calendar_ids(self, _oauth_app_id):
+            return [participant_a, participant_b]
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def ensure_forecast(self, participant_id, target, reason):
+            self.calls.append((participant_id, target, reason))
+            return {"ok": True}
+
+    class Calibration:
+        def __init__(self):
+            self.calls = []
+
+        def maybe_calibrate(self, participant_id, *, through):
+            self.calls.append((participant_id, through))
+            if participant_id == participant_a:
+                raise RuntimeError("calibration exploded")
+            return {"status": "unchanged"}
+
+    coordinator = Coordinator()
+    calibration = Calibration()
+    scheduler = ForecastScheduler(
+        coordinator=coordinator, participants=Participants(), warnings=None,
+        bindings=None, sender=None, timezone_name="Asia/Shanghai",
+        calendar_oauth_app_id="calendar-app", daily_prepare_local_time="00:00",
+        calendar_sync_interval_seconds=999, warning_poll_interval_seconds=999,
+        forecast_max_concurrency=2, profile_calibration=calibration,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(scheduler._forecast_loop())
+        while len(calibration.calls) < 2:
+            await asyncio.sleep(0.01)
+        await scheduler.close()
+        await task
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    assert {participant_id for participant_id, _ in calibration.calls} == {
+        participant_a, participant_b
+    }
+    assert len(coordinator.calls) == 4
+    assert "profile_calibration_failed" in caplog.text
+    assert "forecast_scheduler_iteration_failed" not in caplog.text
 
 
 def test_expired_audit_row_is_preserved_and_future_window_creates_new_row():

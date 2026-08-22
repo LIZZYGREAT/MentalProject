@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import json
 import uuid
 from typing import Any, Optional
 
@@ -692,6 +693,54 @@ class WarningScheduleRepository:
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
     @staticmethod
+    def episode_trigger_fingerprint(
+        payload: dict[str, Any] | None, *, default_source: str | None = None,
+    ) -> str | None:
+        """Return a stable risk-source key without relying on description text."""
+        data = payload or {}
+        explicit = str(data.get("episode_trigger_fingerprint") or "").strip()
+        if explicit and data.get("episode_trigger_fingerprint_version") == 2:
+            return explicit
+
+        event_values = []
+        for key in (
+            "event_identity", "event_id", "source_event_id", "calendar_event_id",
+            "dominant_event_id", "current_event_ids",
+        ):
+            value = data.get(key)
+            if isinstance(value, (list, tuple, set)):
+                event_values.extend(str(item).strip() for item in value if str(item).strip())
+            elif value is not None and str(value).strip():
+                event_values.append(str(value).strip())
+        source = str(data.get("trigger_source") or default_source or "").strip().casefold()
+        if event_values:
+            basis = {"kind": "event", "values": sorted(set(event_values))}
+            if source:
+                basis["trigger_source"] = source
+        else:
+            stressors = sorted({
+                str(value).strip().casefold()
+                for value in (data.get("dominant_stressors") or [])
+                if str(value).strip()
+            })
+            if source:
+                basis = {"kind": "source", "values": [source]}
+            elif stressors:
+                # Explanatory model output is intentionally the last fallback:
+                # its membership may drift while the real episode stays the same.
+                basis = {"kind": "stressor", "values": stressors}
+            elif "time" in data:
+                # Forecast alerts historically did not always persist a source.
+                # Their model-level source is the generic trajectory episode.
+                basis = {"kind": "source", "values": ["trajectory_episode"]}
+            else:
+                return explicit or None
+        canonical = json.dumps(
+            basis, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _view(row: WarningSchedule) -> dict[str, Any]:
         return {
             "id": str(row.id), "participant_id": str(row.participant_id),
@@ -749,23 +798,94 @@ class WarningScheduleRepository:
         for item in desired:
             new_next_attempt_at: datetime | None = None
             episode_identity = item["episode_identity"]
-            candidates = [
+            desired_trigger = self.episode_trigger_fingerprint(item.get("payload"))
+
+            def trigger_compatible(candidate: WarningSchedule) -> bool:
+                candidate_trigger = self.episode_trigger_fingerprint(candidate.payload_json)
+                # Missing fingerprints are legacy/unknown data.  Preserve
+                # exact-key compatibility for them, but never merge two
+                # explicitly identifiable and different trigger sources.
+                return (
+                    desired_trigger is None
+                    or candidate_trigger is None
+                    or candidate_trigger == desired_trigger
+                )
+
+            exact_episode_rows = [
                 row for row in unmatched.values()
                 if row.episode_identity == episode_identity
+                and trigger_compatible(row)
             ]
+            drift_limit = float(item.get("episode_drift_minutes", 15))
+
+            def drift_minutes(candidate: WarningSchedule) -> float:
+                return abs(
+                    (self._aware(candidate.risk_time) - self._aware(item["risk_time"])).total_seconds()
+                ) / 60
+
+            fuzzy_episode_rows = []
+            if desired_trigger is not None:
+                fuzzy_episode_rows = [
+                    row for row in unmatched.values()
+                    if row.episode_identity != episode_identity
+                    and drift_minutes(row) <= drift_limit
+                    and self.episode_trigger_fingerprint(row.payload_json) == desired_trigger
+                ]
+            # Exact identity remains the primary audit key.  Nearby rows with
+            # the same stable trigger augment the occurrence group so a bucket
+            # boundary cannot hide a sent/failed sibling.
+            same_episode_rows = exact_episode_rows + sorted(
+                fuzzy_episode_rows,
+                key=lambda candidate: (drift_minutes(candidate), str(candidate.id)),
+            )
+
+            success_terminal = next(
+                (
+                    row for row in same_episode_rows
+                    if row.status in self.SUCCESSFUL
+                    and drift_minutes(row) <= drift_limit
+                ),
+                None,
+            )
+            suppressed_terminal = next((
+                row for row in same_episode_rows
+                if row.status == "suppressed"
+                and str((row.payload_json or {}).get("suppression_reason") or "") != "minimum_interval"
+            ), None)
+            failed_terminal = next((
+                row for row in same_episode_rows
+                if row.status == "failed" and drift_minutes(row) <= drift_limit
+            ), None)
+            active_rows = [row for row in same_episode_rows if row.status in self.ACTIVE]
+            minimum_interval_rows = [
+                row for row in same_episode_rows
+                if row.status == "suppressed"
+                and str((row.payload_json or {}).get("suppression_reason") or "") == "minimum_interval"
+            ]
+            candidates = active_rows or minimum_interval_rows or same_episode_rows
             candidates.sort(key=lambda row: (
                 0 if row.status in self.ACTIVE or row.status == "cancelled" else 1,
-                abs((self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()),
+                drift_minutes(row),
             ))
-            row = candidates[0] if candidates else None
+            blocking_terminal_sibling = bool(
+                success_terminal or suppressed_terminal or failed_terminal
+            )
+            row = (
+                success_terminal
+                or suppressed_terminal
+                or failed_terminal
+                or (candidates[0] if candidates else None)
+            )
             if row is not None:
-                drift = abs(
-                    (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
-                ) / 60
+                drift = drift_minutes(row)
                 suppression_reason = str(
                     (row.payload_json or {}).get("suppression_reason") or ""
                 )
-                if row.status == "suppressed" and suppression_reason == "daily_cap":
+                if blocking_terminal_sibling:
+                    # An occurrence-scoped successful/failed delivery or a
+                    # durable suppression blocks every cancelled sibling.
+                    pass
+                elif row.status == "suppressed" and suppression_reason == "daily_cap":
                     # The successful-send count is authoritative for the whole
                     # local day. Schedule drift can never reopen this row.
                     pass
@@ -795,7 +915,7 @@ class WarningScheduleRepository:
                 # only a small drift is the same episode; a far-away risk is
                 # allowed to become a new occurrence later that day.
                 elif row.status not in self.ACTIVE and drift > float(
-                    item.get("episode_drift_minutes", 15)
+                    drift_limit
                 ):
                     row = None
                 elif row.status == "expired":

@@ -36,9 +36,13 @@ class FeishuClient:
             .build()
         )
 
-    def send_text(self, chat_id: str, text: str) -> str:
+    def send_text(
+        self, chat_id: str, text: str, *, message_uuid: str | None = None,
+    ) -> str:
+        if message_uuid is None:
+            return self._send_message(chat_id, "text", {"text": str(text)})
         return self._send_message(
-            chat_id, "text", {"text": str(text)}
+            chat_id, "text", {"text": str(text)}, message_uuid=message_uuid,
         )
 
     def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
@@ -90,17 +94,21 @@ class FeishuClient:
         return self._send_message(chat_id, "image", {"image_key": normalized})
 
     def _send_message(
-        self, chat_id: str, msg_type: str, content: dict[str, Any]
+        self, chat_id: str, msg_type: str, content: dict[str, Any], *,
+        message_uuid: str | None = None,
     ) -> str:
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-        body = (
+        body_builder = (
             CreateMessageRequestBody.builder()
             .receive_id(str(chat_id))
             .msg_type(msg_type)
             .content(json.dumps(content, ensure_ascii=False))
-            .build()
         )
+        normalized_uuid = str(message_uuid or "").strip()
+        if normalized_uuid:
+            body_builder = body_builder.uuid(normalized_uuid)
+        body = body_builder.build()
         request = (
             CreateMessageRequest.builder()
             .receive_id_type("chat_id")

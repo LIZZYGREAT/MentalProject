@@ -464,6 +464,28 @@ def test_send_image_uses_image_message_type():
     assert seen == [("oc", "image", {"image_key": "img-key"})]
 
 
+def test_send_text_sets_sdk_message_uuid():
+    requests = []
+
+    class Messages:
+        def create(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om-warning"),
+            )
+
+    sdk_client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+    )
+    client = FeishuClient("app", "secret", sdk_client=sdk_client)
+
+    assert client.send_text(
+        "oc-chat", "warning", message_uuid="stable-warning-id",
+    ) == "om-warning"
+    assert requests[0].request_body.uuid == "stable-warning-id"
+
+
 def test_worker_uploads_then_sends_materialized_image_card():
     worker = BotWorker.__new__(BotWorker)
     worker.max_retries = 0

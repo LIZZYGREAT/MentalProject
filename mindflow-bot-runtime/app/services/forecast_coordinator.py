@@ -312,9 +312,17 @@ class ForecastCoordinator:
             trigger = stressors or current_events or [
                 str(alert.get("trigger_source") or "trajectory_episode")
             ]
-            ordinal = alert.get("episode_index", index)
+            trigger_fingerprint = WarningScheduleRepository.episode_trigger_fingerprint(
+                alert, default_source="trajectory_episode",
+            )
+            # A model-side ordinal is unstable when an earlier episode
+            # disappears on recomputation.  Trigger + a coarse risk anchor is
+            # stable across ordinary drift while keeping opportunities four
+            # hours apart distinct under the delivery policy.
+            anchor_bucket = int((hour * 60 + minute + 60) // 120)
             episode_identity = _sha({
-                "date": target.isoformat(), "trigger": trigger, "ordinal": ordinal,
+                "date": target.isoformat(), "trigger": trigger,
+                "risk_anchor_2h": anchor_bucket,
             })
             identity = episode_identity
             result.append({
@@ -323,7 +331,12 @@ class ForecastCoordinator:
                 "risk_time": risk_time.astimezone(timezone.utc),
                 "valid_until": valid_until.astimezone(timezone.utc),
                 "episode_drift_minutes": self.warning_episode_drift_minutes,
-                "warning_level": level, "payload": {**alert, "risk_time": risk_time.isoformat()},
+                "warning_level": level, "payload": {
+                    **alert,
+                    "risk_time": risk_time.isoformat(),
+                    "episode_trigger_fingerprint": trigger_fingerprint,
+                    "episode_trigger_fingerprint_version": 2,
+                },
             })
         return result
 

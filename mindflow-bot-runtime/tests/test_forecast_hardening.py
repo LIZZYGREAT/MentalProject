@@ -647,6 +647,172 @@ def test_mark_sent_rechecks_risk_time_after_delivery_race():
         assert session.get(WarningSchedule, warning_id).status == "expired"
 
 
+class _WarningDeliveryDateTime(datetime):
+    current = TEST_NOW
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+
+def _warning_delivery_fixture(monkeypatch, sender, *, lease_seconds=1, retry_seconds=1):
+    database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
+    asyncio.run(
+        coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "daily_prepare")
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        row.target_time = TEST_NOW - timedelta(seconds=1)
+        row.next_attempt_at = TEST_NOW - timedelta(seconds=1)
+        row.valid_until = TEST_NOW + timedelta(minutes=10)
+        row.risk_time = TEST_NOW + timedelta(minutes=20)
+        row.payload_json = {**dict(row.payload_json), "message": "stable warning"}
+        warning_id = row.id
+
+    class Bindings:
+        def get_for_participant(self, _participant_id):
+            return {"chat_id": "oc_test"}
+
+    _WarningDeliveryDateTime.current = TEST_NOW
+    monkeypatch.setattr(
+        "app.services.forecast_scheduler.datetime", _WarningDeliveryDateTime,
+    )
+    scheduler = ForecastScheduler(
+        coordinator=coordinator, participants=None, warnings=warnings,
+        bindings=Bindings(), sender=sender, timezone_name="Asia/Shanghai",
+        calendar_oauth_app_id="calendar-app",
+        daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
+        warning_poll_interval_seconds=999,
+        warning_claim_lease_seconds=lease_seconds,
+        warning_retry_base_seconds=retry_seconds,
+    )
+    return database, warnings, scheduler, warning_id
+
+
+def test_warning_send_uses_warning_id_as_feishu_message_uuid(monkeypatch):
+    class Sender:
+        def __init__(self):
+            self.calls = []
+
+        def send_text(self, chat_id, text, *, message_uuid=None):
+            self.calls.append((chat_id, text, message_uuid))
+            return "om-warning"
+
+    sender = Sender()
+    database, warnings, scheduler, warning_id = _warning_delivery_fixture(
+        monkeypatch, sender,
+    )
+    asyncio.run(scheduler._deliver_warning(warnings.pending(TEST_NOW)[0]))
+
+    assert sender.calls == [("oc_test", "stable warning", str(warning_id))]
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "sent"
+
+
+def test_reclaimed_warning_reuses_same_feishu_message_uuid(monkeypatch):
+    class CrashAfterProviderSuccess(BaseException):
+        pass
+
+    class Sender:
+        def __init__(self):
+            self.calls = []
+            self.crash = True
+
+        def send_text(self, _chat_id, _text, *, message_uuid=None):
+            self.calls.append(message_uuid)
+            if self.crash:
+                self.crash = False
+                raise CrashAfterProviderSuccess()
+            return "om-warning"
+
+    sender = Sender()
+    database, warnings, scheduler, warning_id = _warning_delivery_fixture(
+        monkeypatch, sender,
+    )
+    with pytest.raises(CrashAfterProviderSuccess):
+        asyncio.run(scheduler._deliver_warning(warnings.pending(TEST_NOW)[0]))
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "claimed"
+
+    _WarningDeliveryDateTime.current = TEST_NOW + timedelta(seconds=2)
+    recovered = warnings.pending(_WarningDeliveryDateTime.current)
+    asyncio.run(scheduler._deliver_warning(recovered[0]))
+
+    assert sender.calls == [str(warning_id), str(warning_id)]
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "sent"
+
+
+def test_retry_after_ambiguous_send_failure_reuses_same_message_uuid(monkeypatch):
+    class Sender:
+        def __init__(self):
+            self.calls = []
+
+        def send_text(self, _chat_id, _text, *, message_uuid=None):
+            self.calls.append(message_uuid)
+            if len(self.calls) == 1:
+                raise FeishuSendError("ambiguous timeout", retryable=True)
+            return "om-warning"
+
+    sender = Sender()
+    database, warnings, scheduler, warning_id = _warning_delivery_fixture(
+        monkeypatch, sender,
+    )
+    asyncio.run(scheduler._deliver_warning(warnings.pending(TEST_NOW)[0]))
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.status == "pending"
+        assert row.attempt_count == 1
+
+    _WarningDeliveryDateTime.current = TEST_NOW + timedelta(seconds=1)
+    retry = warnings.pending(_WarningDeliveryDateTime.current)
+    asyncio.run(scheduler._deliver_warning(retry[0]))
+
+    assert sender.calls == [str(warning_id), str(warning_id)]
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        assert row.status == "sent"
+        assert row.attempt_count == 2
+
+
+def test_warning_delivery_is_idempotent_across_crash_after_provider_success(monkeypatch):
+    class CrashAfterProviderSuccess(BaseException):
+        pass
+
+    class FakeProvider:
+        def __init__(self):
+            self.sent_by_uuid = {}
+            self.attempts = []
+            self.crash = True
+
+        def send_text(self, _chat_id, _text, *, message_uuid=None):
+            self.attempts.append(message_uuid)
+            message_id = self.sent_by_uuid.setdefault(
+                message_uuid, f"om-{len(self.sent_by_uuid) + 1}",
+            )
+            if self.crash:
+                self.crash = False
+                raise CrashAfterProviderSuccess()
+            return message_id
+
+    provider = FakeProvider()
+    database, warnings, scheduler, warning_id = _warning_delivery_fixture(
+        monkeypatch, provider,
+    )
+    with pytest.raises(CrashAfterProviderSuccess):
+        asyncio.run(scheduler._deliver_warning(warnings.pending(TEST_NOW)[0]))
+
+    _WarningDeliveryDateTime.current = TEST_NOW + timedelta(seconds=2)
+    asyncio.run(scheduler._deliver_warning(
+        warnings.pending(_WarningDeliveryDateTime.current)[0]
+    ))
+
+    assert provider.attempts == [str(warning_id), str(warning_id)]
+    assert provider.sent_by_uuid == {str(warning_id): "om-1"}
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "sent"
+
+
 def test_claimed_warning_superseded_before_send_is_not_sent(monkeypatch):
     database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
 
@@ -658,7 +824,8 @@ def test_claimed_warning_superseded_before_send_is_not_sent(monkeypatch):
     class Sender:
         sent = []
 
-        def send_text(self, _chat_id, text):
+        def send_text(self, _chat_id, text, *, message_uuid=None):
+            assert message_uuid is not None
             self.sent.append(text)
 
     class Bindings:
@@ -805,7 +972,7 @@ def test_warning_episode_time_drift_dedupes_and_tier_escalates():
         assert "escalation" not in row.payload_json
 
 
-def test_same_trigger_far_outside_drift_window_creates_a_new_episode():
+def test_sent_episode_allows_far_later_occurrence_with_same_exact_identity():
     database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
 
     async def prepare():
@@ -835,6 +1002,7 @@ def test_same_trigger_far_outside_drift_window_creates_a_new_episode():
         rows = session.query(WarningSchedule).all()
         assert len(rows) == 2
         assert {row.status for row in rows} == {"sent", "pending"}
+        assert {row.episode_identity for row in rows} == {episode}
 
 
 def test_claimed_row_without_lease_is_recovered_after_migration_compatibility():
@@ -891,7 +1059,7 @@ def test_nonretryable_feishu_failure_is_not_hot_retried():
     database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
 
     class Sender:
-        def send_text(self, *_args):
+        def send_text(self, *_args, **_kwargs):
             raise FeishuSendError("no", code=230001, retryable=False)
 
     class Bindings:
