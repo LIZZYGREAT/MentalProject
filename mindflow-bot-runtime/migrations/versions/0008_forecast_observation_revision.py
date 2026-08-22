@@ -15,6 +15,10 @@ depends_on = None
 
 def upgrade() -> None:
     op.execute(
+        "ALTER TABLE alembic_version "
+        "ALTER COLUMN version_num TYPE VARCHAR(64)"
+    )
+    op.execute(
         "ALTER TABLE forecast_snapshots "
         "ADD COLUMN observation_revision VARCHAR(64) NOT NULL DEFAULT ''"
     )
