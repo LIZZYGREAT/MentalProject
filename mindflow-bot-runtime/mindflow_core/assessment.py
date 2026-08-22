@@ -24,6 +24,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from entity.user import User
 from services.event_lifecycle import prepare_event_instances
+from algorithm.dynamic_state_model import model_variant_metadata
 from settings.model_defaults import DEFAULT_EVENT_END, DEFAULT_EVENT_START
 from utils.event_factory import EventFactory
 
@@ -31,7 +32,14 @@ from utils.event_factory import EventFactory
 @dataclass(frozen=True)
 class PredictionResult:
     model_version: str
+    model_family: str
+    model_variant: str
+    active_states: tuple[str, ...]
     local_date: str
+    stress_baseline_0_10: float
+    stress_threshold_0_10: float
+    vitality_baseline_0_10: float
+    energy_critical_0_10: float
     stress_0_10: float
     vitality_0_10: float
     alert_count: int
@@ -40,13 +48,14 @@ class PredictionResult:
     calendar_degraded: bool
     trajectory: tuple[dict[str, Any], ...]
     alerts: tuple[dict[str, Any], ...]
+    confidence_series: tuple[float, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class AssessmentModel:
-    MODEL_VERSION = "mindflow-ctssm-runtime-v2"
+    MODEL_VERSION = "mindflow-ctssm-runtime-v4"
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
@@ -79,6 +88,12 @@ class AssessmentModel:
         target_date = local_date or datetime.now(self.timezone).date().isoformat()
         parameters = profile.get("model_params") or profile.get("params") or {}
         user = User(user_id="runtime", params=dict(parameters), load_from_file=False)
+        model_family = str(user.get_param("model_family", "stress-ctssm.m0"))
+        model_info = model_variant_metadata(model_family)
+        active_states = tuple(str(value) for value in model_info["active_states"])
+        ctssm_params = user.get_param("ctssm_params", {})
+        if not isinstance(ctssm_params, dict):
+            ctssm_params = {}
         prepared = prepare_event_instances(calendar_events, target_date)
         for item in prepared:
             start = normalize_event_datetime(
@@ -124,7 +139,7 @@ class AssessmentModel:
             target_date,
             observations=model_observations,
         )
-        points, end_stress, end_vitality, _, _, alerts, *_ = result
+        points, end_stress, end_vitality, _, _, alerts, confidence_series, *_ = result
         trajectory = tuple(
             {
                 "time": str(point.get("time") or ""),
@@ -134,11 +149,45 @@ class AssessmentModel:
                     3,
                 ),
                 "state": str(point.get("state") or ""),
+                "stress_equilibrium_0_10": round(
+                    float(point.get("stress_equilibrium") or 0.0) / 10.0, 3
+                ),
+                "stress_interval_90_0_10": {
+                    "lower": round(
+                        float((point.get("stress_interval_90") or {}).get("lower") or 0.0)
+                        / 10.0,
+                        3,
+                    ),
+                    "upper": round(
+                        float((point.get("stress_interval_90") or {}).get("upper") or 0.0)
+                        / 10.0,
+                        3,
+                    ),
+                },
+                "event_stress_input": round(
+                    max(0.0, min(1.0, float(point.get("event_stress_input") or 0.0))),
+                    4,
+                ),
+                "anticipatory_input": round(
+                    max(0.0, min(1.0, float(point.get("anticipatory_input") or 0.0))),
+                    4,
+                ),
+                "post_event_input": round(
+                    max(0.0, min(1.0, float(point.get("post_event_input") or 0.0))),
+                    4,
+                ),
+                "observation_assimilated": bool(point.get("observation_assimilated")),
+                "confidence_0_1": round(
+                    max(0.0, min(1.0, float(confidence_series[index]))), 4
+                ) if index < len(confidence_series or []) else 0.0,
+                "continuous_load_penalty": round(
+                    max(0.0, float(point.get("f_pen") or 0.0)), 4
+                ),
                 "current_events": [
                     str(value)[:160] for value in (point.get("current_events") or [])[:10]
                 ],
             }
-            for point in (points or [])
+            for index, point in enumerate(points or [])
         )
         safe_alerts = tuple(
             {
@@ -152,7 +201,18 @@ class AssessmentModel:
         )
         return PredictionResult(
             model_version=self.MODEL_VERSION,
+            model_family=model_family,
+            model_variant=str(model_info["key"]),
+            active_states=active_states,
             local_date=target_date,
+            stress_baseline_0_10=round(user.get_current_S_star() / 10.0, 3),
+            stress_threshold_0_10=round(user.get_current_threshold() / 10.0, 3),
+            vitality_baseline_0_10=round(
+                float(ctssm_params.get("vitality_baseline", 72.0)) / 10.0, 3
+            ),
+            energy_critical_0_10=round(
+                float(user.get_param("E_critical", 25.0)) / 10.0, 3
+            ),
             stress_0_10=round(float(end_stress) / 10.0, 2),
             vitality_0_10=round(float(end_vitality) / 10.0, 2),
             alert_count=len(alerts or []),
@@ -161,6 +221,10 @@ class AssessmentModel:
             calendar_degraded=bool(calendar_degraded),
             trajectory=trajectory,
             alerts=safe_alerts,
+            confidence_series=tuple(
+                round(max(0.0, min(1.0, float(value))), 4)
+                for value in (confidence_series or [])
+            ),
         )
 
 

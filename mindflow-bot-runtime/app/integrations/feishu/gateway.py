@@ -105,6 +105,7 @@ class FeishuCardActionAdapter:
 
     def adapt(self, event: Any) -> CardActionEvent:
         return self._build(
+            callback_event_id=getattr(event, "event_id", ""),
             message_id=getattr(event, "message_id", ""),
             chat_id=getattr(event, "chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
@@ -115,6 +116,7 @@ class FeishuCardActionAdapter:
         event = getattr(callback, "event", None)
         context = getattr(event, "context", None)
         return self._build(
+            callback_event_id=getattr(getattr(callback, "header", None), "event_id", ""),
             message_id=getattr(context, "open_message_id", ""),
             chat_id=getattr(context, "open_chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
@@ -122,7 +124,8 @@ class FeishuCardActionAdapter:
         )
 
     def _build(
-        self, *, message_id: Any, chat_id: Any, open_id: Any, action: Any
+        self, *, callback_event_id: Any, message_id: Any, chat_id: Any,
+        open_id: Any, action: Any
     ) -> CardActionEvent:
         message_id = str(message_id or "").strip()
         chat_id = str(chat_id or "").strip()
@@ -147,7 +150,12 @@ class FeishuCardActionAdapter:
             separators=(",", ":"),
             default=str,
         )
-        event_id = "card:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+        provider_event_id = str(callback_event_id or "").strip()
+        event_id = (
+            "card-event:" + hashlib.sha256(provider_event_id.encode("utf-8")).hexdigest()
+            if provider_event_id
+            else "card:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+        )
         return CardActionEvent(
             event_id=event_id,
             message_id=message_id,

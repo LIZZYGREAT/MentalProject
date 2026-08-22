@@ -10,6 +10,7 @@ lark-channel-sdk==1.2.0
 starlette==1.6.0
 uvicorn==0.52.1
 numpy==2.0.2
+matplotlib==3.9.2
 requests==2.32.5
 python-dotenv==1.0.1
 tzdata==2025.2

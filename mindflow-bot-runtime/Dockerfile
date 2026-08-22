@@ -2,11 +2,15 @@ FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/srv/runtime:/srv/project \
+    MPLCONFIGDIR=/tmp/matplotlib \
     HOME=/home/mindflow \
     CLAUDE_WORKDIR=/srv/claude-workspace
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-noto-cjk \
+ && rm -rf /var/lib/apt/lists/*
 RUN pip install \
     --no-cache-dir \
     --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -28,7 +32,8 @@ COPY services/ /srv/project/services/
 COPY claude-runtime/ /srv/claude-workspace/
 
 RUN useradd --create-home --uid 10001 mindflow \
- && chown -R mindflow:mindflow /srv/runtime /srv/project /srv/claude-workspace /home/mindflow
+ && mkdir -p /tmp/matplotlib \
+ && chown -R mindflow:mindflow /srv/runtime /srv/project /srv/claude-workspace /home/mindflow /tmp/matplotlib
 USER mindflow
 
 CMD ["python", "-m", "app.main"]

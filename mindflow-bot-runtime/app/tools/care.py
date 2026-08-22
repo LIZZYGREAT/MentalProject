@@ -19,7 +19,12 @@ from app.repositories import (
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
-from app.services.presentation_service import PresentationOutbox
+from app.services.curve_analysis import analyze_curve
+from app.services.pressure_curve_renderer import PressureCurveRenderer
+from app.services.presentation_service import (
+    IMAGE_KEY_PLACEHOLDER,
+    PresentationOutbox,
+)
 from app.services.token_service import TokenRepository
 
 
@@ -119,6 +124,7 @@ class CareTools:
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
         self.presentations = presentations
+        self.curve_renderer = PressureCurveRenderer()
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -164,7 +170,7 @@ class CareTools:
         )
         registry.register(
             "care_run_today_assessment",
-            "Run the reviewed MindFlow stress/vitality model for today.",
+            "Run today's reviewed MindFlow model using its active versioned state definition.",
             _empty_schema(),
             self.run_assessment,
         )
@@ -182,7 +188,7 @@ class CareTools:
         )
         registry.register(
             "care_get_pressure_curve",
-            "Generate today's participant-bound forecast and queue a Feishu pressure/vitality curve card.",
+            "Generate today's participant-bound forecast and queue its model-aware pressure curve card.",
             _empty_schema(),
             self.get_pressure_curve,
         )
@@ -403,29 +409,77 @@ class CareTools:
             refresh_calendar=True,
         )
         curve = list(result.get("curve") or [])
+        analysis = analyze_curve(
+            curve,
+            warning_windows=list(result.get("warning_windows") or []),
+            calendar_events=list(result.get("calendar_events") or []),
+            now=datetime.now(self.timezone),
+            timezone_value=self.timezone,
+        )
+        png_bytes = await asyncio.to_thread(
+            self.curve_renderer.render,
+            curve,
+            analysis,
+            dict(result.get("output") or {}),
+        )
         card = pressure_curve_card(
-            curve, local_date=str(result.get("local_date") or datetime.now(self.timezone).date())
+            analysis,
+            image_key=IMAGE_KEY_PLACEHOLDER,
+            local_date=str(result.get("local_date") or datetime.now(self.timezone).date()),
+            model_output=dict(result.get("output") or {}),
         )
         if self.presentations is None:
             raise RuntimeError("rich reply delivery is unavailable")
-        self.presentations.stage_card(ctx.agent_run_id, card)
-        stress_points = []
-        for point in curve:
-            try:
-                stress_points.append(
-                    (str(point.get("time") or ""), float(point.get("stress_0_10")))
-                )
-            except (TypeError, ValueError):
-                continue
-        peak_time, peak_value = max(stress_points, key=lambda item: item[1])
+        self.presentations.stage_image_card(ctx.agent_run_id, png_bytes, card)
         return {
             "ok": True,
             "card_queued": True,
             "local_date": str(result.get("local_date") or ""),
-            "point_count": len(stress_points),
-            "predicted_peak": {"time": peak_time, "stress_0_10": round(peak_value, 2)},
+            "point_count": analysis.point_count,
+            "predicted_peak": {
+                "time": analysis.peak_stress_time,
+                "stress_0_10": analysis.peak_stress,
+            },
+            "curve_analysis": analysis.to_dict(),
             "calendar_degraded": bool(result.get("calendar_degraded")),
         }
+
+    async def _refresh_calendar_mutation_forecasts(
+        self,
+        participant_id: Any,
+        dates: set[Any],
+        reason: str,
+    ) -> list[str]:
+        if self.forecast_coordinator is None:
+            return []
+        normalized = sorted(
+            value for value in dates if value is not None
+        )
+        if not normalized:
+            normalized = [datetime.now(self.timezone).date()]
+        await asyncio.gather(*(
+            self.forecast_coordinator.ensure_forecast(
+                participant_id,
+                target,
+                reason,
+                refresh_calendar=True,
+            )
+            for target in normalized
+        ))
+        return [value.isoformat() for value in normalized]
+
+    def _event_dates(self, event: dict[str, Any] | None) -> set[Any]:
+        if not event:
+            return set()
+        result = set()
+        for key in ("start_time", "end_time"):
+            value = event.get(key)
+            if value:
+                try:
+                    result.add(_parse_datetime(value, self.timezone).date())
+                except ValueError:
+                    continue
+        return result
 
     def get_checkin_card(
         self, ctx: AgentContext, _args: dict[str, Any]
@@ -505,7 +559,12 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        return {"ok": True, "created": event}
+        refreshed = await self._refresh_calendar_mutation_forecasts(
+            ctx.participant_id,
+            self._event_dates(event) or {start_time.date(), end_time.date()},
+            "calendar_create_event",
+        )
+        return {"ok": True, "created": event, "forecast_refreshed_dates": refreshed}
 
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -522,6 +581,9 @@ class CareTools:
         )
         recurrence = _recurrence_from_args(args, self.timezone)
         try:
+            previous = await self.calendar.get_event(
+                ctx.participant_id, str(args["event_id"])
+            )
             event = await self.calendar.update_event(
                 ctx.participant_id,
                 str(args["event_id"]),
@@ -535,7 +597,13 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        return {"ok": True, "updated": event}
+        dates = self._event_dates(previous) | self._event_dates(event)
+        if start_time is not None:
+            dates.update({start_time.date(), end_time.date()})
+        refreshed = await self._refresh_calendar_mutation_forecasts(
+            ctx.participant_id, dates, "calendar_update_event"
+        )
+        return {"ok": True, "updated": event, "forecast_refreshed_dates": refreshed}
 
     async def delete_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -543,9 +611,17 @@ class CareTools:
         if args.get("confirmed") is not True:
             return {"ok": False, "error": "explicit_confirmation_required"}
         try:
+            previous = await self.calendar.get_event(
+                ctx.participant_id, str(args["event_id"])
+            )
             deleted = await self.calendar.delete_event(
                 ctx.participant_id, str(args["event_id"])
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        return {"ok": True, "deleted": deleted}
+        refreshed = await self._refresh_calendar_mutation_forecasts(
+            ctx.participant_id,
+            self._event_dates(previous),
+            "calendar_delete_event",
+        )
+        return {"ok": True, "deleted": deleted, "forecast_refreshed_dates": refreshed}

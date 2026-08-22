@@ -187,11 +187,16 @@ class ForecastCoordinator:
         semantic_events, semantic_revision, semantic_status, misses = await asyncio.to_thread(
             self.semantics.prepare, participant_id, events, consent=consent
         )
+        observations = await asyncio.to_thread(
+            self.observations.recent, participant_id, 50
+        )
+        observation_revision = _sha(observations)
         latest = await asyncio.to_thread(self.forecasts.latest, participant_id, target)
         algorithm_version = str(self.prediction.model.MODEL_VERSION)
         expected_version = _sha({
             "calendar_revision": calendar_snapshot["calendar_revision"],
             "semantic_revision": semantic_revision,
+            "observation_revision": observation_revision,
             "algorithm_version": algorithm_version,
         })
         if latest and latest["forecast_version"] == expected_version:
@@ -199,6 +204,7 @@ class ForecastCoordinator:
         elif (
             latest
             and latest["calendar_revision"] == calendar_snapshot["calendar_revision"]
+            and latest.get("observation_revision", "") == observation_revision
             and latest["algorithm_version"] == algorithm_version
             and self._semantic_input_delta(latest["semantic_input"], semantic_events)
             < self.materiality_threshold
@@ -212,7 +218,6 @@ class ForecastCoordinator:
             }
         else:
             profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
-            observations = await asyncio.to_thread(self.observations.recent, participant_id, 50)
             output = await asyncio.to_thread(
                 self.prediction.calculate,
                 profile=profile_row["profile"] if profile_row else {},
@@ -230,6 +235,7 @@ class ForecastCoordinator:
                 self.forecasts.save_and_sync_warnings, self.warnings, participant_id, target,
                 calendar_revision=calendar_snapshot["calendar_revision"],
                 semantic_revision=semantic_revision, algorithm_version=algorithm_version,
+                observation_revision=observation_revision,
                 forecast_version=expected_version, semantic_status=semantic_status,
                 semantic_input=semantic_input, curve=curve, peaks=peaks,
                 warning_windows=[self._serializable_warning(item) for item in warning_windows],
@@ -243,6 +249,7 @@ class ForecastCoordinator:
             "calendar_degraded": bool(calendar_snapshot["degraded"]),
             "calendar_last_refresh_success_at": calendar_snapshot.get("last_refresh_success_at"),
             "calendar_last_refresh_error_class": calendar_snapshot.get("last_refresh_error_class"),
+            "calendar_events": list(calendar_snapshot.get("events") or []),
         })
         if enqueue_enrichment and misses and consent:
             async def recompute() -> None:

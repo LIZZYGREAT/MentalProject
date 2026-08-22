@@ -23,6 +23,7 @@ from app.integrations.feishu.gateway import BotEvent
 from app.integrations.feishu.oauth import DeviceFlowService
 from app.repositories import AgentRunRepository, BotEventRepository
 from app.services.presentation_service import PresentationOutbox
+from app.services.presentation_service import PendingImageCard
 
 
 logger = logging.getLogger(__name__)
@@ -321,7 +322,10 @@ class BotWorker:
             card_delivery_failed = False
             for card in cards:
                 try:
-                    await self._send_card(event.chat_id, card)
+                    if isinstance(card, PendingImageCard):
+                        await self._send_image_card(event.chat_id, card)
+                    else:
+                        await self._send_card(event.chat_id, card)
                 except FeishuSendError as exc:
                     card_delivery_failed = True
                     logger.warning(
@@ -419,6 +423,30 @@ class BotWorker:
                     raise
                 await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
         raise FeishuSendError(FALLBACK_TEMPORARY)
+
+    async def _send_image_card(
+        self, chat_id: str, presentation: PendingImageCard
+    ) -> str:
+        upload_image = getattr(self.sender, "upload_image", None)
+        if not callable(upload_image):
+            raise FeishuSendError("Feishu image upload is unavailable", retryable=False)
+        image_key = ""
+        for attempt in range(self.max_retries + 1):
+            try:
+                image_key = await asyncio.to_thread(
+                    upload_image, presentation.png_bytes
+                )
+                break
+            except FeishuSendError as exc:
+                if not exc.retryable or attempt >= self.max_retries:
+                    exc.attempt = attempt + 1
+                    raise
+                await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+        if not image_key:
+            raise FeishuSendError("Feishu image upload returned no image_key")
+        return await self._send_card(
+            chat_id, presentation.materialize(str(image_key))
+        )
 
     async def close(self) -> None:
         tasks = list(self._background_tasks)

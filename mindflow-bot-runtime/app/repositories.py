@@ -223,34 +223,52 @@ class ObservationRepository:
         observed_at: Optional[datetime] = None,
         source_message_id: Optional[str] = None,
     ) -> uuid.UUID:
-        with self.database.session() as session:
-            if source_message_id:
-                existing = session.execute(
-                    select(StateObservation).where(
-                        StateObservation.participant_id == participant_id,
-                        StateObservation.source_message_id == source_message_id,
-                        StateObservation.observation_type == observation_type,
-                    )
-                ).scalar_one_or_none()
+        def find_existing(session: Any) -> StateObservation | None:
+            if not source_message_id:
+                return None
+            return session.execute(
+                select(StateObservation).where(
+                    StateObservation.participant_id == participant_id,
+                    StateObservation.source_message_id == source_message_id,
+                    StateObservation.observation_type == observation_type,
+                )
+            ).scalar_one_or_none()
+
+        try:
+            with self.database.session() as session:
+                existing = find_existing(session)
                 if existing is not None:
                     return existing.id
-            row = StateObservation(
-                participant_id=participant_id,
-                observation_type=observation_type,
-                source_message_id=source_message_id,
-                payload_json=dict(payload),
-                observed_at=observed_at or utc_now(),
-            )
-            session.add(row)
-            session.flush()
-            return row.id
+                row = StateObservation(
+                    participant_id=participant_id,
+                    observation_type=observation_type,
+                    source_message_id=source_message_id,
+                    payload_json=dict(payload),
+                    observed_at=observed_at or utc_now(),
+                )
+                session.add(row)
+                session.flush()
+                return row.id
+        except IntegrityError:
+            # A competing request can commit after the SELECT but before this
+            # INSERT. The database constraint is authoritative; return the row
+            # that won the race instead of turning an idempotent retry into 500.
+            with self.database.session() as session:
+                existing = find_existing(session)
+                if existing is not None:
+                    return existing.id
+            raise
 
     def recent(self, participant_id: uuid.UUID, limit: int = 20) -> list[dict[str, Any]]:
         with self.database.session() as session:
             rows = session.execute(
                 select(StateObservation)
                 .where(StateObservation.participant_id == participant_id)
-                .order_by(desc(StateObservation.observed_at))
+                .order_by(
+                    desc(StateObservation.observed_at),
+                    desc(StateObservation.created_at),
+                    desc(StateObservation.id),
+                )
                 .limit(max(1, min(int(limit), 100)))
             ).scalars()
             return [
@@ -462,6 +480,7 @@ class ForecastSnapshotRepository:
             "local_date": row.local_date.isoformat(),
             "calendar_revision": row.calendar_revision,
             "semantic_revision": row.semantic_revision,
+            "observation_revision": row.observation_revision,
             "algorithm_version": row.algorithm_version,
             "forecast_version": row.forecast_version,
             "semantic_status": row.semantic_status,
@@ -489,11 +508,13 @@ class ForecastSnapshotRepository:
         forecast_version: str, semantic_status: str, semantic_input: list[dict[str, Any]],
         curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
+        observation_revision: str = "",
     ) -> dict[str, Any]:
         with self.database.session() as session:
             return self._save_in_session(
                 session, participant_id, local_date,
                 calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+                observation_revision=observation_revision,
                 algorithm_version=algorithm_version, forecast_version=forecast_version,
                 semantic_status=semantic_status, semantic_input=semantic_input,
                 curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
@@ -507,6 +528,7 @@ class ForecastSnapshotRepository:
         curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
         warnings: list[dict[str, Any]], now: datetime,
+        observation_revision: str = "",
     ) -> tuple[dict[str, Any], dict[str, int]]:
         if warning_repository.database is not self.database:
             raise ValueError("forecast and warning repositories must share a database")
@@ -514,6 +536,7 @@ class ForecastSnapshotRepository:
             saved = self._save_in_session(
                 session, participant_id, local_date,
                 calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+                observation_revision=observation_revision,
                 algorithm_version=algorithm_version, forecast_version=forecast_version,
                 semantic_status=semantic_status, semantic_input=semantic_input,
                 curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
@@ -531,6 +554,7 @@ class ForecastSnapshotRepository:
         forecast_version: str, semantic_status: str, semantic_input: list[dict[str, Any]],
         curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
+        observation_revision: str = "",
     ) -> dict[str, Any]:
         existing = session.execute(
             select(ForecastSnapshot).where(
@@ -556,6 +580,7 @@ class ForecastSnapshotRepository:
         row = ForecastSnapshot(
             participant_id=participant_id, local_date=local_date,
             calendar_revision=calendar_revision, semantic_revision=semantic_revision,
+            observation_revision=observation_revision,
             algorithm_version=algorithm_version, forecast_version=forecast_version,
             semantic_status=semantic_status, semantic_input_json=list(semantic_input),
             curve_json=list(curve), peaks_json=list(peaks),
@@ -699,6 +724,20 @@ class WarningScheduleRepository:
                 or row.warning_level != item["warning_level"]
                 or schedule_changed
             )
+            if row.status in {"failed", "expired"}:
+                # These are terminal for this episode. Metadata refresh and
+                # small prediction drift may rebind audit metadata, but must
+                # never defeat max-attempt or non-retryable failure semantics.
+                row.forecast_id = forecast_id
+                row.forecast_version = forecast_version
+                row.payload_json = dict(item["payload"])
+                row.target_time = item["target_time"]
+                row.risk_time = item["risk_time"]
+                row.valid_until = item["valid_until"]
+                row.warning_level = item["warning_level"]
+                row.updated_at = now
+                counts["kept"] += 1
+                continue
             if row.status == "claimed" and changed:
                 row.status = "pending"
                 row.claim_token = None
@@ -714,6 +753,8 @@ class WarningScheduleRepository:
                 # forecast window replaces the old due time.  Retried rows
                 # keep their delivery backoff even if the forecast changes.
                 row.next_attempt_at = max(self._aware(item["target_time"]), now)
+                if row.status == "cancelled":
+                    row.status = "pending"
             row.forecast_id = forecast_id
             row.forecast_version = forecast_version
             row.payload_json = dict(item["payload"])
@@ -722,8 +763,9 @@ class WarningScheduleRepository:
             row.valid_until = item["valid_until"]
             row.warning_level = item["warning_level"]
             row.episode_identity = item["episode_identity"]
-            if row.status not in {"claimed", "delivery_unavailable"}:
-                row.status = "pending"
+            # Metadata-only refresh preserves a cancelled row. A genuine
+            # schedule change above explicitly reactivates it only when it has
+            # never been attempted. Other active states retain their semantics.
             row.updated_at = utc_now()
             counts["rescheduled" if changed else "kept"] += 1
         for row in unmatched.values():

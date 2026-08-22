@@ -208,6 +208,31 @@ class CalendarService:
         event = data.get("event") or data
         return self._sanitize_event(event)
 
+    async def get_event(
+        self, participant_id: uuid.UUID, event_id: str
+    ) -> dict[str, Any]:
+        normalized_event_id = str(event_id).strip()
+        if not normalized_event_id or len(normalized_event_id) > 256:
+            raise ValueError("calendar event id is invalid")
+        token = await self.tokens.get_access_token(participant_id)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            primary_response = await client.post(
+                "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
+                headers=headers,
+                params={"user_id_type": "open_id"},
+            )
+            calendar_id = self._calendar_id(self._checked(primary_response))
+            response = await client.get(
+                "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
+                + quote(calendar_id, safe="")
+                + "/events/"
+                + quote(normalized_event_id, safe=""),
+                headers=headers,
+            )
+        data = self._checked(response).get("data") or {}
+        return self._sanitize_event(data.get("event") or data)
+
     async def update_event(
         self,
         participant_id: uuid.UUID,

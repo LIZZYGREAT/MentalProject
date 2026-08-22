@@ -55,9 +55,12 @@ class FeishuCardCallbackServer:
                 return P2CardActionTriggerResponse(
                     {"toast": {"type": "error", "content": "提交失败，请稍后重试"}}
                 )
-            return P2CardActionTriggerResponse(
-                {"toast": {"type": "success", "content": content}}
-            )
+            payload: dict[str, Any] = {
+                "toast": {"type": "success", "content": content}
+            }
+            if isinstance(result.get("card"), dict):
+                payload["card"] = {"type": "raw", "data": result["card"]}
+            return P2CardActionTriggerResponse(payload)
 
         self.dispatcher = (
             lark.EventDispatcherHandler.builder(

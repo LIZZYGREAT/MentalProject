@@ -317,6 +317,7 @@ class ForecastSnapshot(Base):
     local_date: Mapped[date] = mapped_column(Date, nullable=False)
     calendar_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     semantic_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    observation_revision: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
     forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
     semantic_status: Mapped[str] = mapped_column(String(32), nullable=False)

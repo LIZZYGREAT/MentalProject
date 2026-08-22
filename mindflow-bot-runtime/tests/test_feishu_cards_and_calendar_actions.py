@@ -28,7 +28,8 @@ from app.repositories import (
     ObservationRepository,
 )
 from app.services.card_action_service import CardActionService
-from app.services.presentation_service import PresentationOutbox
+from app.services.curve_analysis import analyze_curve
+from app.services.presentation_service import PendingImageCard, PresentationOutbox
 from app.tools.care import CareTools
 from app.worker import BotWorker
 from helpers import memory_database, participant, skill_path
@@ -37,24 +38,38 @@ from helpers import memory_database, participant, skill_path
 TZ = ZoneInfo("Asia/Shanghai")
 
 
-def test_pressure_curve_card_contains_native_feishu_line_chart():
-    card = pressure_curve_card(
+def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
+    analysis = analyze_curve(
         [
             {"time": "09:00", "stress_0_10": 4.5, "vitality_0_10": 7.0},
             {"time": "10:00", "stress_0_10": 8.0, "vitality_0_10": 5.0},
-        ],
+        ]
+    )
+    card = pressure_curve_card(
+        analysis,
+        image_key="img-key",
         local_date="2030-01-15",
     )
 
     assert card["schema"] == "2.0"
-    chart = card["body"]["elements"][0]
-    assert chart["tag"] == "chart"
-    assert chart["chart_spec"]["type"] == "line"
-    assert chart["chart_spec"]["yField"] == "value"
-    assert {item["metric"] for item in chart["chart_spec"]["data"][0]["values"]} == {
-        "压力",
-        "活力",
+    image = card["body"]["elements"][0]
+    assert image == {
+        "tag": "img",
+        "img_key": "img-key",
+        "alt": {"tag": "plain_text", "content": "今日 M0 压力预测曲线"},
+        "mode": "fit_horizontal",
+        "preview": True,
     }
+    assert not any(item["tag"] == "chart" for item in card["body"]["elements"])
+    summary = card["body"]["elements"][1]["content"]
+    assert "stress-ctssm.m0（仅压力状态 S）" in summary
+    assert "当前精力" not in summary
+    actions = {
+        item.get("value", {}).get("mindflow_action")
+        for item in card["body"]["elements"]
+        if item.get("tag") == "button"
+    }
+    assert actions == {"request_checkin", "view_today_calendar"}
 
 
 def test_daily_checkin_card_is_a_fixed_form_submit_workflow():
@@ -218,7 +233,11 @@ def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
     assert result["predicted_peak"] == {"time": "10:00", "stress_0_10": 7.5}
     cards = outbox.take_cards(context.agent_run_id)
     assert len(cards) == 1
-    assert cards[0]["body"]["elements"][0]["tag"] == "chart"
+    assert isinstance(cards[0], PendingImageCard)
+    assert cards[0].png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    materialized = cards[0].materialize("img-key")
+    assert materialized["body"]["elements"][0]["tag"] == "img"
+    assert materialized["body"]["elements"][0]["img_key"] == "img-key"
 
 
 def test_worker_delivers_staged_card_before_final_text():

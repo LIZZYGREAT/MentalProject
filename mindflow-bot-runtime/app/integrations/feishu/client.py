@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from typing import Any
 
 
 class FeishuSendError(RuntimeError):
-    def __init__(self, message: str, *, code: int | None = None, retryable: bool = True):
+    def __init__(
+        self, message: str, *, code: int | None = None,
+        retryable: bool = True, operation: str = "send_message",
+    ):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.operation = operation
+        self.error_class = type(self).__name__
 
 
 class FeishuClient:
@@ -39,6 +45,49 @@ class FeishuClient:
         if not isinstance(card, dict) or not card:
             raise ValueError("Feishu card must be a non-empty object")
         return self._send_message(chat_id, "interactive", card)
+
+    def upload_image(self, png_bytes: bytes) -> str:
+        if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:
+            raise ValueError("Feishu image upload requires non-empty bytes")
+        if not bytes(png_bytes).startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Feishu pressure image must be PNG")
+        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+
+        body = (
+            CreateImageRequestBody.builder()
+            .image_type("message")
+            .image(BytesIO(bytes(png_bytes)))
+            .build()
+        )
+        request = CreateImageRequest.builder().request_body(body).build()
+        try:
+            response = self._client.im.v1.image.create(request)
+        except Exception as exc:
+            raise FeishuSendError(
+                "Feishu image upload request failed", operation="upload_image"
+            ) from exc
+        if not response or not response.success():
+            code = getattr(response, "code", None)
+            retryable = code not in {230001, 230003, 230006, 99991672}
+            raise FeishuSendError(
+                str(getattr(response, "msg", "Feishu image upload failed")),
+                code=code,
+                retryable=retryable,
+                operation="upload_image",
+            )
+        image_key = str(getattr(getattr(response, "data", None), "image_key", ""))
+        if not image_key:
+            raise FeishuSendError(
+                "Feishu image upload response has no image_key",
+                operation="upload_image",
+            )
+        return image_key
+
+    def send_image(self, chat_id: str, image_key: str) -> str:
+        normalized = str(image_key or "").strip()
+        if not normalized:
+            raise ValueError("Feishu image_key is required")
+        return self._send_message(chat_id, "image", {"image_key": normalized})
 
     def _send_message(
         self, chat_id: str, msg_type: str, content: dict[str, Any]

@@ -79,7 +79,9 @@ def build_business_services(
     )
     calendar = CalendarService(refresh, timezone_name=settings.timezone_name)
     presentations = PresentationOutbox()
-    card_actions = CardActionService(observations)
+    card_actions = CardActionService(
+        observations, calendar, timezone_name=settings.timezone_name
+    )
     prediction_service = PredictionService(
         AssessmentModel(settings.timezone_name), predictions
     )
