@@ -292,11 +292,9 @@ GLOBAL_DEFAULT_CONFIG = {
         "orange_confirm_minutes": 20.0,
         "red_confirm_minutes": 10.0,
         "rearm_minutes": 45.0,
-        "cooldown_minutes": 180.0,
-        "escalation_cooldown_minutes": 90.0,
-        "critical_cooldown_minutes": 90.0,
-        "max_daily_care": 2,
-        "max_daily_critical_override": 1,
+        # Delivery frequency is deliberately absent here.  Runtime
+        # WarningPolicy + the durable repository own the 2/day and 240-minute
+        # invariants; model candidates cannot define an override.
         "elevated_auc_yellow": 2.2,
         "elevated_auc_orange": 3.6,
         "elevated_auc_red": 5.5,

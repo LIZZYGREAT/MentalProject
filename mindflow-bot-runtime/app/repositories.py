@@ -24,6 +24,7 @@ from app.models import (
     FeishuOAuthToken,
     Participant,
     ParticipantProfile,
+    LearnedModelProfile,
     ForecastSnapshot,
     PredictionRun,
     StateObservation,
@@ -210,6 +211,53 @@ class ProfileRepository:
             return version
 
 
+class LearnedProfileRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: LearnedModelProfile) -> dict[str, Any]:
+        return {
+            "version": row.version,
+            "parameters": dict(row.parameters_json),
+            "source": row.source,
+            "sample_count": row.sample_count,
+            "day_count": row.day_count,
+            "confidence": row.confidence,
+            "window_start": row.window_start.isoformat(),
+            "window_end": row.window_end.isoformat(),
+            "created_at": row.created_at.isoformat(),
+        }
+
+    def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
+        with self.database.session() as session:
+            row = session.execute(select(LearnedModelProfile).where(
+                LearnedModelProfile.participant_id == participant_id
+            ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
+    def save(
+        self, participant_id: uuid.UUID, *, parameters: dict[str, Any],
+        sample_count: int, day_count: int, confidence: float,
+        window_start: date, window_end: date, source: str = "calibration.v1",
+    ) -> dict[str, Any]:
+        with self.database.session() as session:
+            session.get(Participant, participant_id, with_for_update=True)
+            latest = session.execute(select(LearnedModelProfile.version).where(
+                LearnedModelProfile.participant_id == participant_id
+            ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
+            row = LearnedModelProfile(
+                participant_id=participant_id, version=int(latest or 0) + 1,
+                parameters_json=dict(parameters), source=source,
+                sample_count=sample_count, day_count=day_count,
+                confidence=max(0.0, min(1.0, float(confidence))),
+                window_start=window_start, window_end=window_end,
+            )
+            session.add(row)
+            session.flush()
+            return self._view(row)
+
+
 class ObservationRepository:
     def __init__(self, database: Database):
         self.database = database
@@ -277,6 +325,7 @@ class ObservationRepository:
                     "type": row.observation_type,
                     "payload": dict(row.payload_json),
                     "observed_at": row.observed_at.isoformat(),
+                    "created_at": row.created_at.isoformat(),
                 }
                 for row in rows
             ]
@@ -502,6 +551,44 @@ class ForecastSnapshotRepository:
             ).scalar_one_or_none()
             return self._view(row) if row else None
 
+    def history(
+        self, participant_id: uuid.UUID, *, through: date, days: int = 14
+    ) -> list[dict[str, Any]]:
+        start = through - timedelta(days=max(1, days) - 1)
+        with self.database.session() as session:
+            rows = session.execute(select(ForecastSnapshot).where(
+                ForecastSnapshot.participant_id == participant_id,
+                ForecastSnapshot.local_date >= start,
+                ForecastSnapshot.local_date <= through,
+                ForecastSnapshot.valid.is_(True),
+            ).order_by(ForecastSnapshot.local_date, desc(ForecastSnapshot.generated_at))).scalars().all()
+            # Only the latest valid snapshot for each date participates.
+            result: list[dict[str, Any]] = []
+            seen: set[date] = set()
+            for row in rows:
+                if row.local_date in seen:
+                    continue
+                seen.add(row.local_date)
+                result.append(self._view(row))
+            return result
+
+    def latest_before(
+        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
+    ) -> Optional[dict[str, Any]]:
+        """Return the newest snapshot generated before a causal cutoff.
+
+        Invalidated snapshots are intentionally included: a later forecast may
+        invalidate the exact pre-observation version that calibration needs.
+        """
+
+        with self.database.session() as session:
+            row = session.execute(select(ForecastSnapshot).where(
+                ForecastSnapshot.participant_id == participant_id,
+                ForecastSnapshot.local_date == local_date,
+                ForecastSnapshot.generated_at < timestamp,
+            ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
     def save(
         self, participant_id: uuid.UUID, local_date: date, *,
         calendar_revision: str, semantic_revision: str, algorithm_version: str,
@@ -593,6 +680,9 @@ class ForecastSnapshotRepository:
 
 class WarningScheduleRepository:
     ACTIVE = {"pending", "claimed", "delivery_unavailable"}
+    SUCCESSFUL = {"sent", "escalated"}
+    MAX_DAILY_SENDS = 2
+    MIN_INTERVAL_MINUTES = 240
 
     def __init__(self, database: Database):
         self.database = database
@@ -650,68 +740,107 @@ class WarningScheduleRepository:
         ).scalars().all()
         unmatched = {row.id: row for row in rows}
         used_identities = {row.warning_identity for row in rows}
+        successful = sorted(
+            (row for row in rows if row.status in self.SUCCESSFUL and row.sent_at is not None),
+            key=lambda row: self._aware(row.sent_at),
+            reverse=True,
+        )
+        latest_successful_at = self._aware(successful[0].sent_at) if successful else None
         for item in desired:
+            new_next_attempt_at: datetime | None = None
             episode_identity = item["episode_identity"]
             candidates = [
                 row for row in unmatched.values()
                 if row.episode_identity == episode_identity
             ]
-            candidates.sort(key=lambda row: abs(
-                (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
+            candidates.sort(key=lambda row: (
+                0 if row.status in self.ACTIVE or row.status == "cancelled" else 1,
+                abs((self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()),
             ))
             row = candidates[0] if candidates else None
             if row is not None:
                 drift = abs(
                     (self._aware(row.risk_time) - self._aware(item["risk_time"])).total_seconds()
                 ) / 60
+                suppression_reason = str(
+                    (row.payload_json or {}).get("suppression_reason") or ""
+                )
+                if row.status == "suppressed" and suppression_reason == "daily_cap":
+                    # The successful-send count is authoritative for the whole
+                    # local day. Schedule drift can never reopen this row.
+                    pass
+                elif row.status == "suppressed" and suppression_reason == "minimum_interval":
+                    schedule_changed = (
+                        self._aware(row.target_time) != self._aware(item["target_time"])
+                        or self._aware(row.risk_time) != self._aware(item["risk_time"])
+                        or self._aware(row.valid_until) != self._aware(item["valid_until"])
+                    )
+                    next_allowed = (
+                        latest_successful_at + timedelta(minutes=self.MIN_INTERVAL_MINUTES)
+                        if latest_successful_at is not None else now
+                    )
+                    due = max(self._aware(item["target_time"]), next_allowed, now)
+                    legal_new_window = (
+                        schedule_changed
+                        and due <= self._aware(item["valid_until"])
+                        and due < self._aware(item["risk_time"])
+                    )
+                    if legal_new_window and len(successful) < self.MAX_DAILY_SENDS:
+                        # Preserve the old suppressed audit row and create a
+                        # distinct delivery opportunity below.
+                        row = None
+                        new_next_attempt_at = due
                 # Before delivery, a moving prediction reschedules the same
                 # item even when it moves substantially.  After delivery,
                 # only a small drift is the same episode; a far-away risk is
                 # allowed to become a new occurrence later that day.
-                if row.status not in self.ACTIVE and drift > float(
+                elif row.status not in self.ACTIVE and drift > float(
                     item.get("episode_drift_minutes", 15)
                 ):
+                    row = None
+                elif row.status == "expired":
+                    # A forecast with a genuinely future valid window is a
+                    # new delivery opportunity.  Never revive the expired
+                    # audit row, even when its episode identity is unchanged.
                     row = None
             if row is None:
                 identity = episode_identity
                 if identity in used_identities:
                     identity = hashlib.sha256(
-                        f"{episode_identity}\0{self._aware(item['risk_time']).isoformat()}".encode("utf-8")
+                        "\0".join((
+                            episode_identity,
+                            self._aware(item["target_time"]).isoformat(),
+                            self._aware(item["risk_time"]).isoformat(),
+                            self._aware(item["valid_until"]).isoformat(),
+                        )).encode("utf-8")
                     ).hexdigest()
                 used_identities.add(identity)
+                payload = dict(item["payload"])
+                status = "pending"
+                next_attempt_at = new_next_attempt_at or max(
+                    self._aware(item["target_time"]), now
+                )
+                if len(successful) >= self.MAX_DAILY_SENDS:
+                    status = "suppressed"
+                    payload["suppression_reason"] = "daily_cap"
+                    next_attempt_at = None
                 session.add(WarningSchedule(
                     participant_id=participant_id, local_date=local_date,
                     forecast_id=forecast_id, forecast_version=forecast_version,
                     warning_identity=identity, target_time=item["target_time"],
                     episode_identity=episode_identity,
                     risk_time=item["risk_time"], valid_until=item["valid_until"],
-                    warning_level=item["warning_level"], status="pending",
-                    payload_json=dict(item["payload"]),
-                    next_attempt_at=max(self._aware(item["target_time"]), now),
+                    warning_level=item["warning_level"], status=status,
+                    payload_json=payload, next_attempt_at=next_attempt_at,
                 ))
                 counts["created"] += 1
                 continue
             unmatched.pop(row.id, None)
-            if row.status in {"sent", "escalated"}:
-                old_tier = self._level_rank(row.warning_level)
-                new_tier = self._level_rank(item["warning_level"])
-                if row.status == "sent" and new_tier > old_tier:
-                    row.status = "pending"
-                    row.payload_json = {**dict(item["payload"]), "escalation": True}
-                    row.warning_level = item["warning_level"]
-                    row.forecast_id = forecast_id
-                    row.forecast_version = forecast_version
-                    row.target_time = now
-                    row.risk_time = item["risk_time"]
-                    row.valid_until = item["valid_until"]
-                    row.next_attempt_at = now
-                    row.claim_token = None
-                    row.claimed_at = None
-                    row.lease_until = None
-                    row.updated_at = now
-                    counts["rescheduled"] += 1
-                else:
-                    counts["kept"] += 1
+            if row.status in {"sent", "escalated", "failed", "expired", "suppressed"}:
+                # Terminal rows are immutable audit records.  A later valid
+                # opportunity is represented by a new row; an ordinary drift
+                # or tier change never revives or rewrites the old record.
+                counts["kept"] += 1
                 continue
             schedule_changed = (
                 self._aware(row.target_time) != self._aware(item["target_time"])
@@ -724,20 +853,6 @@ class WarningScheduleRepository:
                 or row.warning_level != item["warning_level"]
                 or schedule_changed
             )
-            if row.status in {"failed", "expired"}:
-                # These are terminal for this episode. Metadata refresh and
-                # small prediction drift may rebind audit metadata, but must
-                # never defeat max-attempt or non-retryable failure semantics.
-                row.forecast_id = forecast_id
-                row.forecast_version = forecast_version
-                row.payload_json = dict(item["payload"])
-                row.target_time = item["target_time"]
-                row.risk_time = item["risk_time"]
-                row.valid_until = item["valid_until"]
-                row.warning_level = item["warning_level"]
-                row.updated_at = now
-                counts["kept"] += 1
-                continue
             if row.status == "claimed" and changed:
                 row.status = "pending"
                 row.claim_token = None
@@ -745,16 +860,36 @@ class WarningScheduleRepository:
                 row.lease_until = None
                 row.next_attempt_at = max(self._aware(item["target_time"]), now)
             elif (
+                row.status == "cancelled"
+                and row.attempt_count == 0
+                and row.sent_at is None
+                and len(successful) < self.MAX_DAILY_SENDS
+            ):
+                # Re-entering the latest desired set is enough to reactivate
+                # an untouched cancelled row; the schedule may be identical.
+                due = max(self._aware(item["target_time"]), now)
+                if due <= self._aware(item["valid_until"]) and due < self._aware(item["risk_time"]):
+                    row.status = "pending"
+                    row.next_attempt_at = due
+            elif (
                 schedule_changed
                 and row.attempt_count == 0
-                and row.status in {"pending", "cancelled"}
+                and row.status == "pending"
             ):
                 # This is still the first delivery schedule, so a moved
                 # forecast window replaces the old due time.  Retried rows
                 # keep their delivery backoff even if the forecast changes.
                 row.next_attempt_at = max(self._aware(item["target_time"]), now)
-                if row.status == "cancelled":
-                    row.status = "pending"
+            elif schedule_changed and row.status == "delivery_unavailable":
+                # Recompute the channel recheck inside the new valid window.
+                # This was previously omitted, leaving a permanently active
+                # row whose next attempt was outside its moved window.
+                due = max(self._aware(item["target_time"]), now)
+                if due >= self._aware(item["risk_time"]) or due > self._aware(item["valid_until"]):
+                    row.status = "expired"
+                    row.next_attempt_at = None
+                else:
+                    row.next_attempt_at = due
             row.forecast_id = forecast_id
             row.forecast_version = forecast_version
             row.payload_json = dict(item["payload"])
@@ -763,9 +898,8 @@ class WarningScheduleRepository:
             row.valid_until = item["valid_until"]
             row.warning_level = item["warning_level"]
             row.episode_identity = item["episode_identity"]
-            # Metadata-only refresh preserves a cancelled row. A genuine
-            # schedule change above explicitly reactivates it only when it has
-            # never been attempted. Other active states retain their semantics.
+            # A desired, untouched cancelled row is reactivated even when the
+            # timestamps are identical. Other active states retain semantics.
             row.updated_at = utc_now()
             counts["rescheduled" if changed else "kept"] += 1
         for row in unmatched.values():
@@ -790,6 +924,28 @@ class WarningScheduleRepository:
         if normalized in {"2", "orange", "high"}:
             return 2
         return 1
+
+    def count_successful_deliveries(
+        self, participant_id: uuid.UUID, local_date: date
+    ) -> int:
+        with self.database.session() as session:
+            return len(session.execute(select(WarningSchedule.id).where(
+                WarningSchedule.participant_id == participant_id,
+                WarningSchedule.local_date == local_date,
+                WarningSchedule.status.in_(("sent", "escalated")),
+            )).all())
+
+    def latest_successful_delivery(
+        self, participant_id: uuid.UUID, local_date: date
+    ) -> datetime | None:
+        with self.database.session() as session:
+            row = session.execute(select(WarningSchedule).where(
+                WarningSchedule.participant_id == participant_id,
+                WarningSchedule.local_date == local_date,
+                WarningSchedule.status.in_(("sent", "escalated")),
+                WarningSchedule.sent_at.is_not(None),
+            ).order_by(desc(WarningSchedule.sent_at)).limit(1)).scalar_one_or_none()
+            return self._aware(row.sent_at) if row is not None else None
 
     def pending(self, now: datetime, *, limit: int = 100) -> list[dict[str, Any]]:
         now = self._aware(now)
@@ -851,7 +1007,8 @@ class WarningScheduleRepository:
 
     def claim_if_current(
         self, warning_id: uuid.UUID, *, now: datetime | None = None,
-        lease_seconds: int = 120,
+        lease_seconds: int = 120, max_daily_sends: int = 2,
+        min_interval_minutes: int = 240,
     ) -> Optional[dict[str, Any]]:
         now = self._aware(now or utc_now())
         with self.database.session() as session:
@@ -875,6 +1032,60 @@ class WarningScheduleRepository:
                 row.lease_until = None
                 row.updated_at = utc_now()
                 return None
+            # Serialize claims for this participant.  Counting only sent rows
+            # is semantically correct, while a live claim acts as a temporary
+            # reservation so two workers cannot send concurrently before the
+            # first one records success.
+            session.get(Participant, row.participant_id, with_for_update=True)
+            live_claim = session.execute(select(WarningSchedule).where(
+                WarningSchedule.participant_id == row.participant_id,
+                WarningSchedule.local_date == row.local_date,
+                WarningSchedule.id != row.id,
+                WarningSchedule.status == "claimed",
+                WarningSchedule.lease_until >= now,
+            ).limit(1)).scalar_one_or_none()
+            if live_claim is not None:
+                row.status = "pending"
+                row.next_attempt_at = max(
+                    now + timedelta(seconds=1),
+                    self._aware(live_claim.lease_until),
+                )
+                row.updated_at = now
+                return None
+
+            successful = session.execute(select(WarningSchedule).where(
+                WarningSchedule.participant_id == row.participant_id,
+                WarningSchedule.local_date == row.local_date,
+                WarningSchedule.status.in_(("sent", "escalated")),
+            ).order_by(desc(WarningSchedule.sent_at))).scalars().all()
+            if len(successful) >= max(0, max_daily_sends):
+                row.status = "suppressed"
+                row.payload_json = {**dict(row.payload_json), "suppression_reason": "daily_cap"}
+                row.next_attempt_at = None
+                row.updated_at = now
+                return None
+            if successful and min_interval_minutes > 0:
+                latest = next((item for item in successful if item.sent_at is not None), None)
+                if latest is not None:
+                    next_allowed = self._aware(latest.sent_at) + timedelta(
+                        minutes=min_interval_minutes
+                    )
+                    if next_allowed > now:
+                        if (
+                            next_allowed < self._aware(row.risk_time)
+                            and next_allowed <= self._aware(row.valid_until)
+                        ):
+                            row.status = "pending"
+                            row.next_attempt_at = max(self._aware(row.target_time), next_allowed)
+                        else:
+                            row.status = "suppressed"
+                            row.payload_json = {
+                                **dict(row.payload_json),
+                                "suppression_reason": "minimum_interval",
+                            }
+                            row.next_attempt_at = None
+                        row.updated_at = now
+                        return None
             row.status = "claimed"
             row.claimed_at = now
             row.lease_until = now + timedelta(seconds=max(1, lease_seconds))

@@ -7,6 +7,24 @@ from typing import Any
 from app.services.curve_analysis import CurveAnalysis, forecast_model_context
 
 
+def select_card_key_nodes(analysis: CurveAnalysis, limit: int = 8) -> list[Any]:
+    """Keep safety-relevant nodes visible before filling with calendar items."""
+
+    priority = {
+        "high_risk_entry": 0,
+        "peak": 1,
+        "warning_window": 2,
+        "recovery": 3,
+        "risk_entry": 4,
+        "calendar_event": 5,
+    }
+    ranked = sorted(
+        analysis.key_nodes,
+        key=lambda node: (priority.get(node.type, 4), node.time),
+    )[:max(0, limit)]
+    return sorted(ranked, key=lambda node: node.time)
+
+
 def daily_checkin_card() -> dict[str, Any]:
     """Build the fixed non-clinical check-in form accepted by the callback service."""
 
@@ -119,7 +137,7 @@ def pressure_curve_card(
     normalized_key = str(image_key or "").strip()
     if not normalized_key:
         raise ValueError("pressure curve image_key is required")
-    nodes = list(analysis.key_nodes)[:8]
+    nodes = select_card_key_nodes(analysis, 8)
     node_text = "\n".join(
         f"• **{node.time}** {node.text}" for node in nodes
     ) or "• 暂无显著风险节点"

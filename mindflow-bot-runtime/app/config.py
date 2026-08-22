@@ -93,6 +93,9 @@ class Settings:
     warning_retry_base_seconds: int = 60
     warning_claim_lease_seconds: int = 120
     warning_episode_drift_minutes: int = 15
+    warning_max_daily_sends: int = 2
+    warning_min_interval_minutes: int = 240
+    profile_calibration_enabled: bool = False
 
     @property
     def care_skill_path(self) -> Path:
@@ -271,6 +274,9 @@ class Settings:
             warning_retry_base_seconds=_int(values, "WARNING_RETRY_BASE_SECONDS", 60),
             warning_claim_lease_seconds=_int(values, "WARNING_CLAIM_LEASE_SECONDS", 120),
             warning_episode_drift_minutes=_int(values, "WARNING_EPISODE_DRIFT_MINUTES", 15),
+            warning_max_daily_sends=_int(values, "WARNING_MAX_DAILY_SENDS", 2, minimum=0),
+            warning_min_interval_minutes=_int(values, "WARNING_MIN_INTERVAL_MINUTES", 240, minimum=0),
+            profile_calibration_enabled=_bool(values, "PROFILE_CALIBRATION_ENABLED", False),
         )
         if validate:
             settings.validate()

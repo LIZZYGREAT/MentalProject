@@ -33,6 +33,15 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
+    base = valid_environment()
+    settings = Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])
+    assert settings.profile_calibration_enabled is False
+    base["PROFILE_CALIBRATION_ENABLED"] = "true"
+    enabled = Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])
+    assert enabled.profile_calibration_enabled is True
+
+
 def test_haiku_and_subagent_must_use_the_same_model():
     environment = valid_environment()
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = "wrong-model"

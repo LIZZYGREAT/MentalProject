@@ -17,10 +17,13 @@ from app.repositories import (
     ObservationRepository,
     ParticipantRepository,
     ProfileRepository,
+    LearnedProfileRepository,
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.prediction_service import PredictionService
+from app.services.warning_policy import WarningPolicy
+from app.services.profile_calibration import layered_profile
 from services.event_lifecycle import prepare_event_instances
 from services.semantic_model_inputs import semantic_model_inputs
 
@@ -60,6 +63,9 @@ class ForecastCoordinator:
         timezone_name: str, materiality_threshold: float = 0.03,
         warning_lead_minutes: int = 20, warning_late_grace_minutes: int = 10,
         warning_episode_drift_minutes: int = 15,
+        warning_max_daily_sends: int = 2,
+        warning_min_interval_minutes: int = 240,
+        learned_profiles: LearnedProfileRepository | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -75,6 +81,11 @@ class ForecastCoordinator:
         self.warning_lead_minutes = warning_lead_minutes
         self.warning_late_grace_minutes = warning_late_grace_minutes
         self.warning_episode_drift_minutes = warning_episode_drift_minutes
+        self.warning_policy = WarningPolicy(
+            max_daily_sends=warning_max_daily_sends,
+            min_interval_minutes=warning_min_interval_minutes,
+        )
+        self.learned_profiles = learned_profiles
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
 
@@ -191,12 +202,23 @@ class ForecastCoordinator:
             self.observations.recent, participant_id, 50
         )
         observation_revision = _sha(observations)
+        profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
+        learned_row = (
+            await asyncio.to_thread(self.learned_profiles.current, participant_id)
+            if self.learned_profiles is not None else None
+        )
+        effective_profile, profile_layers = layered_profile(profile_row, learned_row)
+        profile_revision = _sha({
+            "explicit": profile_row,
+            "learned": learned_row,
+        })
         latest = await asyncio.to_thread(self.forecasts.latest, participant_id, target)
         algorithm_version = str(self.prediction.model.MODEL_VERSION)
         expected_version = _sha({
             "calendar_revision": calendar_snapshot["calendar_revision"],
             "semantic_revision": semantic_revision,
             "observation_revision": observation_revision,
+            "profile_revision": profile_revision,
             "algorithm_version": algorithm_version,
         })
         if latest and latest["forecast_version"] == expected_version:
@@ -206,6 +228,7 @@ class ForecastCoordinator:
             and latest["calendar_revision"] == calendar_snapshot["calendar_revision"]
             and latest.get("observation_revision", "") == observation_revision
             and latest["algorithm_version"] == algorithm_version
+            and (latest.get("output") or {}).get("profile_revision") == profile_revision
             and self._semantic_input_delta(latest["semantic_input"], semantic_events)
             < self.materiality_threshold
         ):
@@ -217,16 +240,21 @@ class ForecastCoordinator:
                 "material_change": False, "reason": reason,
             }
         else:
-            profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
             output = await asyncio.to_thread(
                 self.prediction.calculate,
-                profile=profile_row["profile"] if profile_row else {},
+                profile=effective_profile,
                 observations=observations, calendar_events=semantic_events,
                 calendar_degraded=calendar_snapshot["degraded"], local_date=target.isoformat(),
             )
+            output["profile_layers"] = profile_layers
+            output["profile_revision"] = profile_revision
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
-            warning_windows = self._warning_windows(output.get("alerts") or [], target)
+            selected_alerts = self.warning_policy.select_daily_candidates(
+                output.get("alerts") or []
+            )
+            output["selected_warning_candidates"] = selected_alerts
+            warning_windows = self._warning_windows(selected_alerts, target)
             semantic_input = [
                 {"event_id": item.get("id"), "semantic": (item.get("metadata") or {}).get("semantic")}
                 for item in semantic_events
@@ -265,7 +293,6 @@ class ForecastCoordinator:
 
     def _warning_windows(self, alerts: Any, target: date) -> list[dict[str, Any]]:
         result = []
-        trigger_counts: dict[str, int] = {}
         for index, alert in enumerate(alerts):
             if not isinstance(alert, dict):
                 continue
@@ -285,9 +312,7 @@ class ForecastCoordinator:
             trigger = stressors or current_events or [
                 str(alert.get("trigger_source") or "trajectory_episode")
             ]
-            trigger_key = _canonical(trigger)
-            ordinal = trigger_counts.get(trigger_key, 0)
-            trigger_counts[trigger_key] = ordinal + 1
+            ordinal = alert.get("episode_index", index)
             episode_identity = _sha({
                 "date": target.isoformat(), "trigger": trigger, "ordinal": ordinal,
             })

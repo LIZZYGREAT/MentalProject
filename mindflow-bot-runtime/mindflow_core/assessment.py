@@ -86,7 +86,16 @@ class AssessmentModel:
         calendar_degraded: bool = False,
     ) -> PredictionResult:
         target_date = local_date or datetime.now(self.timezone).date().isoformat()
-        parameters = profile.get("model_params") or profile.get("params") or {}
+        parameters = dict(profile.get("model_params") or profile.get("params") or {})
+        if isinstance(parameters.get("ctssm_params"), dict):
+            # User stores are commonly sparse.  Preserve the complete M0
+            # default block when a learned/explicit layer overrides one
+            # identifiable nested coefficient.
+            from entry.config import GLOBAL_DEFAULT_CONFIG
+            parameters["ctssm_params"] = {
+                **dict(GLOBAL_DEFAULT_CONFIG.get("ctssm_params") or {}),
+                **dict(parameters["ctssm_params"]),
+            }
         user = User(user_id="runtime", params=dict(parameters), load_from_file=False)
         model_family = str(user.get_param("model_family", "stress-ctssm.m0"))
         model_info = model_variant_metadata(model_family)

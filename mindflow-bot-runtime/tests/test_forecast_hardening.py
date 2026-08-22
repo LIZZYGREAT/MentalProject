@@ -799,8 +799,10 @@ def test_warning_episode_time_drift_dedupes_and_tier_escalates():
     )
     with database.session() as session:
         row = session.get(WarningSchedule, original_id)
-        assert row.status == "pending"
-        assert row.payload_json["escalation"] is True
+        # Warning Policy v2: a delivered episode is immutable.  A tier drift
+        # never revives the same audit row or bypasses durable interval/cap.
+        assert row.status == "sent"
+        assert "escalation" not in row.payload_json
 
 
 def test_same_trigger_far_outside_drift_window_creates_a_new_episode():

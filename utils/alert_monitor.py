@@ -1,11 +1,9 @@
 """Burden-aware care policy for predicted subjective stress.
 
-The monitor separates *state estimation* from *intervention delivery*.  A
-high predicted point does not automatically create a user-facing message:
-ordinary elevations require persistence, messages have a cooldown, and the
-day has a small care budget.  A very high sustained state may override the
-regular budget once so a conservative policy does not become silent exactly
-when support is most relevant.
+The monitor separates *state estimation* from *intervention delivery*.  It
+detects persistent candidate episodes only.  Cross-episode ranking, the daily
+budget and delivery interval belong to the runtime WarningPolicy and durable
+repository guard, so a model-side exception can never bypass user limits.
 """
 
 from __future__ import annotations
@@ -53,17 +51,6 @@ class AlertMonitor:
             3: float(cfg.get("red_confirm_minutes", 10.0)),
         }
         self.rearm_minutes = float(cfg.get("rearm_minutes", 45.0))
-        self.cooldown_minutes = float(cfg.get("cooldown_minutes", 180.0))
-        self.escalation_cooldown_minutes = float(
-            cfg.get("escalation_cooldown_minutes", 90.0)
-        )
-        self.critical_cooldown_minutes = float(
-            cfg.get("critical_cooldown_minutes", 90.0)
-        )
-        self.max_daily_care = max(0, int(cfg.get("max_daily_care", 2)))
-        self.max_daily_critical_override = max(
-            0, int(cfg.get("max_daily_critical_override", 1))
-        )
         self.auc_thresholds = {
             1: float(cfg.get("elevated_auc_yellow", 2.2)),
             2: float(cfg.get("elevated_auc_orange", 3.6)),
@@ -85,9 +72,7 @@ class AlertMonitor:
         candidate_minutes = 0.0
         episode_tier = 0
         recovery_minutes = 0.0
-        last_alert_minute: Optional[float] = None
-        regular_count = 0
-        critical_override_count = 0
+        episode_index = 0
         previous_minute: Optional[int] = None
 
         for row in results:
@@ -221,44 +206,14 @@ class AlertMonitor:
                 if not escalation_supported:
                     continue
 
-            elapsed_since_alert = (
-                None
-                if last_alert_minute is None
-                else float((minute - int(last_alert_minute)) % 1440)
-            )
-            is_escalation = episode_tier > 0 and target_tier > episode_tier
-            required_cooldown = (
-                self.critical_cooldown_minutes
-                if target_tier == 3
-                else (
-                    self.escalation_cooldown_minutes
-                    if is_escalation
-                    else self.cooldown_minutes
-                )
-            )
-            if (
-                elapsed_since_alert is not None
-                and elapsed_since_alert < required_cooldown
-            ):
-                continue
-
-            use_critical_override = False
-            if regular_count >= self.max_daily_care:
-                use_critical_override = (
-                    target_tier == 3
-                    and intensity_tier == 3
-                    and critical_override_count
-                    < self.max_daily_critical_override
-                )
-                if not use_critical_override:
-                    continue
-
             trigger_source = self._trigger_source(
                 extreme_override,
                 intensity_tier,
                 burden_tier,
                 vulnerability_tier,
             )
+            if episode_tier == 0:
+                episode_index += 1
             alert = self._build_alert(
                 row=row,
                 tier=target_tier,
@@ -267,13 +222,9 @@ class AlertMonitor:
                 elevated_auc=elevated_auc,
                 fatigue=fatigue,
                 vitality=vitality,
+                episode_index=episode_index,
             )
             alerts.append(alert)
-            if use_critical_override:
-                critical_override_count += 1
-            else:
-                regular_count += 1
-            last_alert_minute = float(minute)
             episode_tier = target_tier
 
         return alerts, confidence_series
@@ -349,6 +300,7 @@ class AlertMonitor:
         elevated_auc: float,
         fatigue: float,
         vitality: float,
+        episode_index: int,
     ) -> Dict[str, Any]:
         if tier == 3:
             title = "[红] 很高压力趋势"
@@ -386,10 +338,12 @@ class AlertMonitor:
             "dominant_stressors": dominant_stressors,
             "C": round(risk, 3),
             "tier": tier,
+            "episode_index": episode_index,
             "policy": {
                 "persistence_confirmed": True,
-                "daily_budgeted": True,
+                "daily_budgeted": False,
                 "episode_deduplicated": True,
+                "candidate_only": True,
                 "clinical_alert": False,
             },
         }

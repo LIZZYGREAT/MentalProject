@@ -16,6 +16,7 @@ from app.repositories import (
     PredictionRepository,
     ProfileRepository,
     ForecastSnapshotRepository,
+    LearnedProfileRepository,
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
@@ -113,6 +114,7 @@ class CareTools:
         forecast_coordinator: ForecastCoordinator | None = None,
         forecast_snapshots: ForecastSnapshotRepository | None = None,
         presentations: PresentationOutbox | None = None,
+        learned_profiles: LearnedProfileRepository | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -124,6 +126,7 @@ class CareTools:
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
         self.presentations = presentations
+        self.learned_profiles = learned_profiles
         self.curve_renderer = PressureCurveRenderer()
 
     def register(self, registry: ToolRegistry) -> None:
@@ -299,6 +302,10 @@ class CareTools:
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
         profile = self.profiles.current(ctx.participant_id)
+        learned_profile = (
+            self.learned_profiles.current(ctx.participant_id)
+            if self.learned_profiles is not None else None
+        )
         recent = self.observations.recent(ctx.participant_id, limit=1)
         prediction = self.predictions.latest(ctx.participant_id)
         latest_forecast = (
@@ -310,6 +317,11 @@ class CareTools:
             "ok": True,
             "profile": _safe_profile(profile["profile"]) if profile else None,
             "profile_version": profile["version"] if profile else None,
+            "profile_layers": {
+                "precedence": ["system_defaults", "learned", "explicit"],
+                "explicit": profile,
+                "learned": learned_profile,
+            },
             "latest_checkin": recent[0] if recent else None,
             "latest_assessment": prediction,
             "latest_forecast": latest_forecast,
@@ -449,15 +461,20 @@ class CareTools:
         participant_id: Any,
         dates: set[Any],
         reason: str,
-    ) -> list[str]:
+    ) -> dict[str, Any]:
         if self.forecast_coordinator is None:
-            return []
+            return {
+                "forecast_refresh": "not_configured",
+                "forecast_refresh_degraded": False,
+                "forecast_refreshed_dates": [],
+                "forecast_refresh_errors": [],
+            }
         normalized = sorted(
             value for value in dates if value is not None
         )
         if not normalized:
             normalized = [datetime.now(self.timezone).date()]
-        await asyncio.gather(*(
+        results = await asyncio.gather(*(
             self.forecast_coordinator.ensure_forecast(
                 participant_id,
                 target,
@@ -465,8 +482,24 @@ class CareTools:
                 refresh_calendar=True,
             )
             for target in normalized
-        ))
-        return [value.isoformat() for value in normalized]
+        ), return_exceptions=True)
+        refreshed = [
+            target.isoformat() for target, result in zip(normalized, results)
+            if not isinstance(result, BaseException)
+        ]
+        errors = [
+            {"local_date": target.isoformat(), "error_class": type(result).__name__}
+            for target, result in zip(normalized, results)
+            if isinstance(result, BaseException)
+        ]
+        return {
+            "forecast_refresh": (
+                "succeeded" if not errors else "failed" if not refreshed else "partial"
+            ),
+            "forecast_refresh_degraded": bool(errors),
+            "forecast_refreshed_dates": refreshed,
+            "forecast_refresh_errors": errors,
+        }
 
     def _event_dates(self, event: dict[str, Any] | None) -> set[Any]:
         if not event:
@@ -559,12 +592,12 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        refreshed = await self._refresh_calendar_mutation_forecasts(
+        refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
             self._event_dates(event) or {start_time.date(), end_time.date()},
             "calendar_create_event",
         )
-        return {"ok": True, "created": event, "forecast_refreshed_dates": refreshed}
+        return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
 
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -600,10 +633,10 @@ class CareTools:
         dates = self._event_dates(previous) | self._event_dates(event)
         if start_time is not None:
             dates.update({start_time.date(), end_time.date()})
-        refreshed = await self._refresh_calendar_mutation_forecasts(
+        refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id, dates, "calendar_update_event"
         )
-        return {"ok": True, "updated": event, "forecast_refreshed_dates": refreshed}
+        return {"ok": True, "calendar_mutation": "succeeded", "updated": event, **refresh}
 
     async def delete_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -619,9 +652,9 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        refreshed = await self._refresh_calendar_mutation_forecasts(
+        refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
             self._event_dates(previous),
             "calendar_delete_event",
         )
-        return {"ok": True, "deleted": deleted, "forecast_refreshed_dates": refreshed}
+        return {"ok": True, "calendar_mutation": "succeeded", "deleted": deleted, **refresh}

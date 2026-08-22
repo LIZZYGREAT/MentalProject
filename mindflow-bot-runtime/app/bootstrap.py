@@ -19,6 +19,7 @@ from app.repositories import (
     ParticipantRepository,
     PredictionRepository,
     ProfileRepository,
+    LearnedProfileRepository,
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
@@ -26,6 +27,7 @@ from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
+from app.services.profile_calibration import ProfileCalibrationService
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
@@ -52,6 +54,7 @@ class BusinessServices:
     device_flows: DeviceFlowService
     presentations: PresentationOutbox
     card_actions: CardActionService
+    profile_calibration: ProfileCalibrationService
 
 
 def build_business_services(
@@ -99,6 +102,10 @@ def build_business_services(
     )
     warning_schedules = WarningScheduleRepository(database)
     forecast_snapshots = ForecastSnapshotRepository(database)
+    learned_profiles = LearnedProfileRepository(database)
+    profile_calibration = ProfileCalibrationService(
+        observations, forecast_snapshots, learned_profiles, settings.timezone_name
+    )
     forecast_coordinator = ForecastCoordinator(
         participants=ParticipantRepository(database), profiles=profiles,
         observations=observations, calendar=calendar,
@@ -110,6 +117,9 @@ def build_business_services(
         warning_lead_minutes=settings.warning_lead_minutes,
         warning_late_grace_minutes=settings.warning_late_grace_minutes,
         warning_episode_drift_minutes=settings.warning_episode_drift_minutes,
+        warning_max_daily_sends=settings.warning_max_daily_sends,
+        warning_min_interval_minutes=settings.warning_min_interval_minutes,
+        learned_profiles=learned_profiles,
     )
     registry = ToolRegistry(runs)
     CareTools(
@@ -123,6 +133,7 @@ def build_business_services(
         forecast_coordinator,
         forecast_snapshots,
         presentations,
+        learned_profiles=learned_profiles,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -139,4 +150,5 @@ def build_business_services(
         device_flows=device_flows,
         presentations=presentations,
         card_actions=card_actions,
+        profile_calibration=profile_calibration,
     )

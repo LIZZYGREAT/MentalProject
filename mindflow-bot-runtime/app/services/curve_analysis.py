@@ -275,14 +275,6 @@ def analyze_curve(
         important_events.append(sanitized)
         nodes.append(KeyNode(parsed[1], "calendar_event", f"日程：{title}"))
 
-    deduped: list[KeyNode] = []
-    seen: set[tuple[str, str, str]] = set()
-    for node in sorted(nodes, key=lambda item: (_minute_and_label(item.time) or (9999, ""))[0]):
-        key = (node.time, node.type, node.text)
-        if key not in seen:
-            deduped.append(node)
-            seen.add(key)
-
     normalized_windows = []
     for window in warning_windows or []:
         normalized = dict(window)
@@ -291,6 +283,17 @@ def analyze_curve(
             if parsed is not None:
                 normalized[f"{key}_local"] = parsed[1]
         normalized_windows.append(normalized)
+        label = normalized.get("risk_time_local") or normalized.get("target_time_local")
+        if label:
+            nodes.append(KeyNode(str(label), "warning_window", "主动关怀提醒窗口"))
+
+    deduped: list[KeyNode] = []
+    seen: set[tuple[str, str, str]] = set()
+    for node in sorted(nodes, key=lambda item: (_minute_and_label(item.time) or (9999, ""))[0]):
+        key = (node.time, node.type, node.text)
+        if key not in seen:
+            deduped.append(node)
+            seen.add(key)
 
     return CurveAnalysis(
         point_count=len(points),

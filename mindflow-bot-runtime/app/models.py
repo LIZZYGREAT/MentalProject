@@ -10,6 +10,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Float,
     Index,
     Integer,
     JSON,
@@ -166,6 +167,30 @@ class ConversationMessage(Base):
     feishu_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class LearnedModelProfile(Base):
+    """Versioned, conservative parameters learned from longitudinal evidence."""
+
+    __tablename__ = "learned_model_profiles"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "version", name="uq_learned_profile_version"),
+        Index("ix_learned_profile_participant_version", "participant_id", "version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    parameters_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="calibration.v1")
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    day_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    window_end: Mapped[date] = mapped_column(Date, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
