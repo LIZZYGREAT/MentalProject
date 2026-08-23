@@ -42,6 +42,24 @@ _PREFERRED_CJK_FONT_NAMES = (
     "SimHei",
 )
 
+_EVENT_TYPE_ALIASES = {
+    "class": "course",
+    "meeting": "task",
+    "work": "task",
+    "exercise": "gym",
+    "workout": "gym",
+    "study": "library",
+    "self_study": "library",
+    "课程": "course",
+    "任务": "task",
+    "睡眠": "sleep",
+    "午休": "nap",
+    "就餐": "meal",
+    "休息": "rest",
+    "运动": "gym",
+    "自习": "library",
+}
+
 
 class PressureCurveRenderer:
     """Render only states and inputs that the active forecast model computes."""
@@ -103,6 +121,8 @@ class PressureCurveRenderer:
         curve: list[dict[str, Any]],
         analysis: CurveAnalysis,
         model_output: dict[str, Any] | None = None,
+        *,
+        stress_only: bool = False,
     ):
         """Build a plot whose panels follow the active M0--M3 state definition."""
 
@@ -117,16 +137,22 @@ class PressureCurveRenderer:
         ]
 
         with plt.rc_context(self._font_rc(font_name)):
-            figure, (stress_axis, secondary_axis) = plt.subplots(
-                2,
-                1,
-                figsize=FIGSIZE,
-                dpi=PLOT_DPI,
-                sharex=True,
-                gridspec_kw={
-                    "height_ratios": [S_PANEL_HEIGHT_RATIO, E_PANEL_HEIGHT_RATIO]
-                },
-            )
+            if stress_only:
+                figure, stress_axis = plt.subplots(
+                    1, 1, figsize=(FIGSIZE[0], 6), dpi=PLOT_DPI
+                )
+                secondary_axis = None
+            else:
+                figure, (stress_axis, secondary_axis) = plt.subplots(
+                    2,
+                    1,
+                    figsize=FIGSIZE,
+                    dpi=PLOT_DPI,
+                    sharex=True,
+                    gridspec_kw={
+                        "height_ratios": [S_PANEL_HEIGHT_RATIO, E_PANEL_HEIGHT_RATIO]
+                    },
+                )
 
             stress_axis.plot(
                 times,
@@ -212,7 +238,8 @@ class PressureCurveRenderer:
                 end = int(event.get("end_minute", start))
                 if end < start:
                     end = 1440
-                event_type = str(event.get("event_type") or "other")
+                event_type = str(event.get("event_type") or "other").strip().lower()
+                event_type = _EVENT_TYPE_ALIASES.get(event_type, event_type)
                 color, type_name = EVENT_COLOR_MAP.get(
                     event_type, ("#7f7f7f", "其他")
                 )
@@ -220,7 +247,10 @@ class PressureCurveRenderer:
                 start_hour = start / 60.0
                 end_hour = end / 60.0
                 stress_axis.axvspan(start_hour, end_hour, color=color, alpha=alpha)
-                secondary_axis.axvspan(start_hour, end_hour, color=color, alpha=alpha)
+                if secondary_axis is not None:
+                    secondary_axis.axvspan(
+                        start_hour, end_hour, color=color, alpha=alpha
+                    )
                 midpoint = start_hour + (end_hour - start_hour) / 2.0
                 y_position = EVENT_LABEL_Y_OFFSETS[index % len(EVENT_LABEL_Y_OFFSETS)]
                 label = (
@@ -315,19 +345,28 @@ class PressureCurveRenderer:
                     alpha=0.75,
                     label="当前时刻",
                 )
-                secondary_axis.axvline(
-                    current_hour,
-                    color="#475569",
-                    linestyle=":",
-                    linewidth=1.2,
-                    alpha=0.75,
-                )
+                if secondary_axis is not None:
+                    secondary_axis.axvline(
+                        current_hour,
+                        color="#475569",
+                        linestyle=":",
+                        linewidth=1.2,
+                        alpha=0.75,
+                    )
 
             stress_axis.legend(
                 loc="center left", bbox_to_anchor=(0.01, 0.75), fontsize=10
             )
 
-            if context.has_dynamic_vitality:
+            if stress_only:
+                title = "压力趋势"
+                stress_axis.set_xlabel("时间 (24h)", fontsize=12)
+                stress_axis.set_xlim(min(times), max(times))
+                stress_axis.set_xticks(range(0, 25, 2))
+                stress_axis.set_xticklabels(
+                    [f"{hour:02d}:00" for hour in range(0, 25, 2)], rotation=45
+                )
+            elif context.has_dynamic_vitality:
                 vitality_values = [
                     point.vitality * 10.0
                     if point.vitality is not None
@@ -400,13 +439,14 @@ class PressureCurveRenderer:
                 secondary_axis.legend(loc="upper left", fontsize=10, ncol=3)
                 title = "今日压力趋势与影响因素"
 
-            secondary_axis.grid(True, linestyle="--", alpha=0.3)
-            secondary_axis.set_xlabel("时间 (24h)", fontsize=12)
-            secondary_axis.set_xlim(min(times), max(times))
-            secondary_axis.set_xticks(range(0, 25, 2))
-            secondary_axis.set_xticklabels(
-                [f"{hour:02d}:00" for hour in range(0, 25, 2)], rotation=45
-            )
+            if secondary_axis is not None:
+                secondary_axis.grid(True, linestyle="--", alpha=0.3)
+                secondary_axis.set_xlabel("时间 (24h)", fontsize=12)
+                secondary_axis.set_xlim(min(times), max(times))
+                secondary_axis.set_xticks(range(0, 25, 2))
+                secondary_axis.set_xticklabels(
+                    [f"{hour:02d}:00" for hour in range(0, 25, 2)], rotation=45
+                )
 
             if any(math.isfinite(value) for value in confidence_values):
                 confidence_axis = stress_axis.twinx()
@@ -440,13 +480,17 @@ class PressureCurveRenderer:
         curve: list[dict[str, Any]],
         analysis: CurveAnalysis,
         model_output: dict[str, Any] | None = None,
+        *,
+        stress_only: bool = False,
     ) -> bytes:
         plt, font_name = self._pyplot()
         # Matplotlib resolves generic sans-serif families at draw/save time.
         # Keep savefig inside the same context used to create the artists or it
         # can silently fall back to DejaVu even after selecting a CJK font.
         with plt.rc_context(self._font_rc(font_name)):
-            figure = self._draw_core_plot(curve, analysis, model_output)
+            figure = self._draw_core_plot(
+                curve, analysis, model_output, stress_only=stress_only
+            )
             try:
                 output = BytesIO()
                 figure.savefig(

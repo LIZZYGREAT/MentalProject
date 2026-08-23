@@ -84,6 +84,7 @@ class AssessmentModel:
         calendar_events: list[dict[str, Any]],
         local_date: str | None = None,
         calendar_degraded: bool = False,
+        initial_state: dict[str, Any] | None = None,
     ) -> PredictionResult:
         target_date = local_date or datetime.now(self.timezone).date().isoformat()
         parameters = dict(profile.get("model_params") or profile.get("params") or {})
@@ -131,7 +132,18 @@ class AssessmentModel:
             metadata["allow_external_semantics"] = False
             item["metadata"] = metadata
         events = EventFactory.create_from_json(prepared)
-        initial_stress, initial_vitality = self._latest_state(observations)
+        if initial_state is None:
+            initial_stress, initial_vitality = self._latest_state(observations)
+        else:
+            try:
+                initial_stress = float(initial_state["stress_0_10"]) * 10.0
+                initial_vitality = float(initial_state["vitality_0_10"]) * 10.0
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "initial_state must contain numeric stress_0_10 and vitality_0_10"
+                ) from exc
+            initial_stress = max(0.0, min(initial_stress, 100.0))
+            initial_vitality = max(0.0, min(initial_vitality, 100.0))
         model_observations = [
             {
                 "target_time": item.get("observed_at"),

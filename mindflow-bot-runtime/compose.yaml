@@ -36,6 +36,24 @@ services:
     memswap_limit: ${BOT_MEMORY_SWAP_LIMIT:-1280m}
     pids_limit: ${BOT_PID_LIMIT:-128}
 
+  admin:
+    build:
+      context: ..
+      dockerfile: mindflow-bot-runtime/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.admin_web.main"]
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-8081}:8081"
+    restart: unless-stopped
+    cpus: ${ADMIN_CPU_LIMIT:-0.35}
+    mem_limit: ${ADMIN_MEMORY_LIMIT:-384m}
+    memswap_limit: ${ADMIN_MEMORY_SWAP_LIMIT:-512m}
+    pids_limit: ${ADMIN_PID_LIMIT:-64}
+
   postgres:
     image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/postgres
     environment:

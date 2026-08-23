@@ -18,6 +18,7 @@ class PredictionService:
         self, *, profile: dict[str, Any], observations: list[dict[str, Any]],
         calendar_events: list[dict[str, Any]], calendar_degraded: bool,
         local_date: str,
+        initial_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Calculate without adding message-level persistence side effects."""
 
@@ -27,6 +28,7 @@ class PredictionService:
             calendar_events=calendar_events,
             local_date=local_date,
             calendar_degraded=calendar_degraded,
+            initial_state=initial_state,
         ).to_dict()
 
     def run(
@@ -40,6 +42,7 @@ class PredictionService:
         calendar_degraded: bool,
         local_date: str,
         source_message_id: str,
+        initial_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         existing = self.predictions.by_source_message(
             participant_id, source_message_id
@@ -50,6 +53,7 @@ class PredictionService:
             profile=profile, observations=observations,
             calendar_events=calendar_events, calendar_degraded=calendar_degraded,
             local_date=local_date,
+            initial_state=initial_state,
         )
         prediction_id = self.predictions.save(
             participant_id,
@@ -62,6 +66,7 @@ class PredictionService:
                 "calendar_events": calendar_events,
                 "calendar_degraded": calendar_degraded,
                 "local_date": local_date,
+                "initial_state": initial_state,
             },
             output=output,
             source_message_id=source_message_id,

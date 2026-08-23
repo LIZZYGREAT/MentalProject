@@ -25,6 +25,7 @@ from app.repositories import (
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
+from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
 from app.services.profile_calibration import ProfileCalibrationService
@@ -55,6 +56,7 @@ class BusinessServices:
     presentations: PresentationOutbox
     card_actions: CardActionService
     profile_calibration: ProfileCalibrationService
+    pressure_curves: PressureCurveService
 
 
 def build_business_services(
@@ -121,6 +123,10 @@ def build_business_services(
         warning_min_interval_minutes=settings.warning_min_interval_minutes,
         learned_profiles=learned_profiles,
     )
+    pressure_curves = PressureCurveService(
+        forecast_coordinator,
+        timezone_name=settings.timezone_name,
+    )
     registry = ToolRegistry(runs)
     CareTools(
         profiles,
@@ -134,6 +140,7 @@ def build_business_services(
         forecast_snapshots,
         presentations,
         learned_profiles=learned_profiles,
+        pressure_curves=pressure_curves,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -151,4 +158,5 @@ def build_business_services(
         presentations=presentations,
         card_actions=card_actions,
         profile_calibration=profile_calibration,
+        pressure_curves=pressure_curves,
     )

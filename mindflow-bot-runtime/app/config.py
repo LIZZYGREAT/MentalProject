@@ -107,6 +107,14 @@ class Settings:
     warning_max_daily_sends: int = 2
     warning_min_interval_minutes: int = 240
     profile_calibration_enabled: bool = False
+    admin_enabled: bool = True
+    admin_host: str = "0.0.0.0"
+    admin_port: int = 8081
+    admin_username: str = ""
+    admin_password_hash: str = ""
+    admin_session_secret: str = ""
+    admin_session_ttl_seconds: int = 28800
+    admin_secure_cookie: bool = False
 
     @property
     def care_skill_path(self) -> Path:
@@ -322,6 +330,16 @@ class Settings:
             warning_max_daily_sends=_int(values, "WARNING_MAX_DAILY_SENDS", 2, minimum=0),
             warning_min_interval_minutes=_int(values, "WARNING_MIN_INTERVAL_MINUTES", 240, minimum=0),
             profile_calibration_enabled=_bool(values, "PROFILE_CALIBRATION_ENABLED", False),
+            admin_enabled=_bool(values, "ADMIN_ENABLED", True),
+            admin_host=values.get("ADMIN_HOST", "0.0.0.0").strip(),
+            admin_port=_int(values, "ADMIN_PORT", 8081),
+            admin_username=values.get("ADMIN_USERNAME", "").strip(),
+            admin_password_hash=values.get("ADMIN_PASSWORD_HASH", "").strip(),
+            admin_session_secret=values.get("ADMIN_SESSION_SECRET", "").strip(),
+            admin_session_ttl_seconds=_int(
+                values, "ADMIN_SESSION_TTL_SECONDS", 28800, minimum=300
+            ),
+            admin_secure_cookie=_bool(values, "ADMIN_SECURE_COOKIE", False),
         )
         if validate:
             settings.validate()
@@ -403,3 +421,20 @@ class Settings:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:
             raise ValueError("PRESENTATION_AGENT_MAX_SEGMENTS must be <= 3")
+        if self.admin_port > 65535:
+            raise ValueError("ADMIN_PORT must be <= 65535")
+        if self.admin_enabled and self.app_env == "production":
+            missing_admin = [
+                name
+                for name, value in {
+                    "ADMIN_USERNAME": self.admin_username,
+                    "ADMIN_PASSWORD_HASH": self.admin_password_hash,
+                    "ADMIN_SESSION_SECRET": self.admin_session_secret,
+                }.items()
+                if not value
+            ]
+            if missing_admin:
+                raise ValueError(
+                    "Missing required admin environment values: "
+                    + ", ".join(missing_admin)
+                )

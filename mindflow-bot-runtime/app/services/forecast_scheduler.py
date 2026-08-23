@@ -9,7 +9,12 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
-from app.repositories import BindingRepository, ParticipantRepository, WarningScheduleRepository
+from app.repositories import (
+    BindingRepository,
+    ParticipantRepository,
+    RuntimeIncidentRepository,
+    WarningScheduleRepository,
+)
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.profile_calibration import ProfileCalibrationService
 
@@ -28,6 +33,7 @@ class ForecastScheduler:
         warning_retry_base_seconds: int = 60, warning_claim_lease_seconds: int = 120,
         warning_max_daily_sends: int = 2, warning_min_interval_minutes: int = 240,
         profile_calibration: ProfileCalibrationService | None = None,
+        incidents: RuntimeIncidentRepository | None = None,
     ):
         self.coordinator = coordinator
         self.participants = participants
@@ -47,8 +53,17 @@ class ForecastScheduler:
         self.warning_max_daily_sends = warning_max_daily_sends
         self.warning_min_interval_minutes = warning_min_interval_minutes
         self.profile_calibration = profile_calibration
+        self.incidents = incidents
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
+
+    def _record_incident(self, **values) -> None:
+        if self.incidents is None:
+            return
+        try:
+            self.incidents.record(**values)
+        except Exception:
+            logger.warning("runtime_incident_persist_failed", exc_info=True)
 
     async def run_forever(self) -> None:
         self.started.set()
@@ -76,45 +91,76 @@ class ForecastScheduler:
                     self.participants.active_calendar_ids,
                     self.calendar_oauth_app_id,
                 )
-                jobs = [
-                    (participant_id, now.date() + timedelta(days=offset),
-                     reason if offset == 0 else "future_periodic_poll")
-                    for participant_id in participant_ids for offset in (0, 1)
-                ]
-                for start in range(0, len(jobs), self.max_concurrency):
-                    batch = jobs[start : start + self.max_concurrency]
-                    results = await asyncio.gather(*(
-                        self.coordinator.ensure_forecast(pid, target, why)
-                        for pid, target, why in batch
-                    ), return_exceptions=True)
-                    for (pid, target, why), result in zip(batch, results):
-                        if isinstance(result, BaseException):
-                            logger.error(
-                                "forecast_job_failed participant_id=%s local_date=%s reason=%s error_class=%s message=%s",
-                                pid, target, why, type(result).__name__, str(result)[:160],
-                            )
-                        elif (
-                            self.profile_calibration is not None
-                            and target == now.date()
-                            and why in {"daily_prepare", "periodic_poll"}
-                        ):
-                            try:
-                                await asyncio.to_thread(
-                                    self.profile_calibration.maybe_calibrate,
-                                    pid, through=target,
-                                )
-                            except Exception as exc:
-                                logger.exception(
-                                    "profile_calibration_failed participant_id=%s "
-                                    "local_date=%s error_class=%s message=%s",
-                                    pid, target, type(exc).__name__, str(exc)[:160],
-                                )
+                # Tomorrow depends on today's terminal state.  Finish the
+                # entire bounded today phase before any tomorrow job starts.
+                await self._run_forecast_phase(
+                    participant_ids, now.date(), reason, calibrate=True
+                )
+                await self._run_forecast_phase(
+                    participant_ids,
+                    now.date() + timedelta(days=1),
+                    "future_periodic_poll",
+                    calibrate=False,
+                )
             except Exception as exc:
                 logger.exception(
                     "forecast_scheduler_iteration_failed error_class=%s message=%s",
                     type(exc).__name__, str(exc)[:160],
                 )
+                self._record_incident(
+                    severity="error",
+                    subsystem="forecast_scheduler",
+                    event_name="forecast_scheduler_iteration_failed",
+                    error_class=type(exc).__name__,
+                    summary=str(exc)[:1000],
+                )
             await self._wait(self.sync_interval)
+
+    async def _run_forecast_phase(
+        self,
+        participant_ids: list[uuid.UUID],
+        target,
+        reason: str,
+        *,
+        calibrate: bool,
+    ) -> None:
+        jobs = [(participant_id, target, reason) for participant_id in participant_ids]
+        for start in range(0, len(jobs), self.max_concurrency):
+            batch = jobs[start : start + self.max_concurrency]
+            results = await asyncio.gather(
+                *(
+                    self.coordinator.ensure_forecast(pid, local_date, why)
+                    for pid, local_date, why in batch
+                ),
+                return_exceptions=True,
+            )
+            for (pid, local_date, why), result in zip(batch, results):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "forecast_job_failed participant_id=%s local_date=%s "
+                        "reason=%s error_class=%s message=%s",
+                        pid,
+                        local_date,
+                        why,
+                        type(result).__name__,
+                        str(result)[:160],
+                    )
+                elif calibrate and self.profile_calibration is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.profile_calibration.maybe_calibrate,
+                            pid,
+                            through=local_date,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "profile_calibration_failed participant_id=%s "
+                            "local_date=%s error_class=%s message=%s",
+                            pid,
+                            local_date,
+                            type(exc).__name__,
+                            str(exc)[:160],
+                        )
 
     async def _warning_loop(self) -> None:
         while not self._stop.is_set():
@@ -129,6 +175,13 @@ class ForecastScheduler:
                 logger.exception(
                     "warning_scheduler_iteration_failed error_class=%s message=%s",
                     type(exc).__name__, str(exc)[:160],
+                )
+                self._record_incident(
+                    severity="error",
+                    subsystem="warning_scheduler",
+                    event_name="warning_scheduler_iteration_failed",
+                    error_class=type(exc).__name__,
+                    summary=str(exc)[:1000],
                 )
             await self._wait(self.warning_interval)
 
@@ -192,6 +245,16 @@ class ForecastScheduler:
                 "forecast_warning_send_failed warning_id=%s retryable=%s code=%s",
                 warning_id, exc.retryable, exc.code,
             )
+            self._record_incident(
+                severity="error",
+                subsystem="warning_scheduler",
+                event_name="forecast_warning_send_failed",
+                participant_id=uuid.UUID(claimed["participant_id"]),
+                error_code=str(exc.code) if exc.code is not None else None,
+                error_class=type(exc).__name__,
+                summary="A forecast warning could not be delivered.",
+                details={"warning_id": str(warning_id)},
+            )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
                 claim_token=claim_token,
@@ -206,6 +269,15 @@ class ForecastScheduler:
             logger.warning(
                 "forecast_warning_send_failed warning_id=%s error_class=%s",
                 warning_id, type(exc).__name__,
+            )
+            self._record_incident(
+                severity="error",
+                subsystem="warning_scheduler",
+                event_name="forecast_warning_send_failed",
+                participant_id=uuid.UUID(claimed["participant_id"]),
+                error_class=type(exc).__name__,
+                summary="A forecast warning could not be delivered.",
+                details={"warning_id": str(warning_id)},
             )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,

@@ -6,7 +6,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 from app.agent.context import AgentContext
 from app.repositories import AgentRunRepository
@@ -131,7 +131,9 @@ class ToolRegistry:
             self._log(ctx, name, None, result, "invalid_arguments")
             return ToolExecution(result, "invalid_arguments")
         errors = sorted(
-            Draft202012Validator(spec.parameters).iter_errors(arguments),
+            Draft202012Validator(
+                spec.parameters, format_checker=FormatChecker()
+            ).iter_errors(arguments),
             key=lambda error: list(error.path),
         )
         if errors:

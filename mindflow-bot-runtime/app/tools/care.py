@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,8 +20,7 @@ from app.repositories import (
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
-from app.services.curve_analysis import analyze_curve
-from app.services.pressure_curve_renderer import PressureCurveRenderer
+from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PresentationOutbox,
@@ -115,6 +114,7 @@ class CareTools:
         forecast_snapshots: ForecastSnapshotRepository | None = None,
         presentations: PresentationOutbox | None = None,
         learned_profiles: LearnedProfileRepository | None = None,
+        pressure_curves: PressureCurveService | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -127,7 +127,14 @@ class CareTools:
         self.forecast_snapshots = forecast_snapshots
         self.presentations = presentations
         self.learned_profiles = learned_profiles
-        self.curve_renderer = PressureCurveRenderer()
+        self.pressure_curves = pressure_curves or (
+            PressureCurveService(
+                forecast_coordinator,
+                timezone_name=timezone_name,
+            )
+            if forecast_coordinator is not None
+            else None
+        )
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -191,8 +198,18 @@ class CareTools:
         )
         registry.register(
             "care_get_pressure_curve",
-            "Generate today's participant-bound forecast and queue its model-aware pressure curve card.",
-            _empty_schema(),
+            "Generate a participant-bound pressure forecast for a requested local date and queue its pressure-only curve card.",
+            {
+                "type": "object",
+                "properties": {
+                    "local_date": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Requested local calendar date in YYYY-MM-DD. Omit for today.",
+                    }
+                },
+                "additionalProperties": False,
+            },
             self.get_pressure_curve,
         )
         registry.register(
@@ -410,39 +427,37 @@ class CareTools:
         }
 
     async def get_pressure_curve(
-        self, ctx: AgentContext, _args: dict[str, Any]
+        self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        if self.forecast_coordinator is None:
-            raise RuntimeError("forecast coordinator is unavailable")
-        result = await self.forecast_coordinator.ensure_forecast(
+        if self.pressure_curves is None:
+            raise RuntimeError("pressure curve service is unavailable")
+        try:
+            target = (
+                date.fromisoformat(str(args["local_date"]))
+                if args.get("local_date")
+                else datetime.now(self.timezone).date()
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("local_date must be YYYY-MM-DD") from exc
+        view = await self.pressure_curves.build(
             ctx.participant_id,
-            datetime.now(self.timezone).date(),
-            "user_curve_card_request",
+            target,
+            reason="user_curve_card_request",
             refresh_calendar=True,
+            stress_only=True,
         )
-        curve = list(result.get("curve") or [])
-        analysis = analyze_curve(
-            curve,
-            warning_windows=list(result.get("warning_windows") or []),
-            calendar_events=list(result.get("calendar_events") or []),
-            now=datetime.now(self.timezone),
-            timezone_value=self.timezone,
-        )
-        png_bytes = await asyncio.to_thread(
-            self.curve_renderer.render,
-            curve,
-            analysis,
-            dict(result.get("output") or {}),
-        )
+        result = view.forecast
+        analysis = view.analysis
         card = pressure_curve_card(
             analysis,
             image_key=IMAGE_KEY_PLACEHOLDER,
             local_date=str(result.get("local_date") or datetime.now(self.timezone).date()),
             model_output=dict(result.get("output") or {}),
+            requested_date_is_today=(target == datetime.now(self.timezone).date()),
         )
         if self.presentations is None:
             raise RuntimeError("rich reply delivery is unavailable")
-        self.presentations.stage_image_card(ctx.agent_run_id, png_bytes, card)
+        self.presentations.stage_image_card(ctx.agent_run_id, view.png_bytes, card)
         return {
             "ok": True,
             "card_queued": True,
@@ -469,20 +484,32 @@ class CareTools:
                 "forecast_refreshed_dates": [],
                 "forecast_refresh_errors": [],
             }
-        normalized = sorted(
-            value for value in dates if value is not None
-        )
+        normalized = sorted(value for value in dates if value is not None)
         if not normalized:
             normalized = [datetime.now(self.timezone).date()]
-        results = await asyncio.gather(*(
-            self.forecast_coordinator.ensure_forecast(
-                participant_id,
-                target,
-                reason,
-                refresh_calendar=True,
-            )
-            for target in normalized
-        ), return_exceptions=True)
+        today = datetime.now(self.timezone).date()
+        dependency = {}
+        if today in normalized:
+            tomorrow = today + timedelta(days=1)
+            if tomorrow not in normalized:
+                normalized.append(tomorrow)
+                normalized.sort()
+            dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
+
+        # Preserve dependency order for today -> tomorrow. Other independent
+        # dates remain deterministic and are inexpensive at mutation time.
+        results = []
+        for target in normalized:
+            try:
+                result = await self.forecast_coordinator.ensure_forecast(
+                    participant_id,
+                    target,
+                    reason,
+                    refresh_calendar=True,
+                )
+            except BaseException as exc:
+                result = exc
+            results.append(result)
         refreshed = [
             target.isoformat() for target, result in zip(normalized, results)
             if not isinstance(result, BaseException)
@@ -499,6 +526,7 @@ class CareTools:
             "forecast_refresh_degraded": bool(errors),
             "forecast_refreshed_dates": refreshed,
             "forecast_refresh_errors": errors,
+            "forecast_dependency_refresh": dependency,
         }
 
     def _event_dates(self, event: dict[str, Any] | None) -> set[Any]:

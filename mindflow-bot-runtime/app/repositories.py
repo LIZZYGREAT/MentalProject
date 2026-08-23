@@ -28,6 +28,7 @@ from app.models import (
     LearnedModelProfile,
     ForecastSnapshot,
     PredictionRun,
+    RuntimeIncident,
     StateObservation,
     WarningSchedule,
 )
@@ -1818,6 +1819,63 @@ class BotEventRepository:
             if reply_message_id:
                 row.reply_message_id = str(reply_message_id)[:128]
             row.processed_at = utc_now()
+
+    def save_telemetry(self, event_id: str, metrics: dict[str, Any]) -> None:
+        """Persist non-secret delivery timings in an independent transaction."""
+
+        allowed = {
+            "latency_ms",
+            "received_to_agent_start_ms",
+            "agent_start_to_first_activity_ms",
+            "first_tool_start_ms",
+            "tool_duration_ms",
+            "agent_result_ms",
+            "presentation_ms",
+            "card_upload_ms",
+            "first_final_send_ms",
+            "total_delivery_ms",
+            "segment_count",
+            "presentation_agent_used",
+        }
+        payload = {key: metrics[key] for key in allowed if key in metrics}
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is not None:
+                row.telemetry_json = payload
+
+
+class RuntimeIncidentRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    def record(
+        self,
+        *,
+        severity: str,
+        subsystem: str,
+        event_name: str,
+        summary: str,
+        participant_id: uuid.UUID | None = None,
+        bot_event_id: str | None = None,
+        error_code: str | None = None,
+        error_class: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> uuid.UUID:
+        row = RuntimeIncident(
+            severity=str(severity)[:16],
+            subsystem=str(subsystem)[:64],
+            event_name=str(event_name)[:128],
+            participant_id=participant_id,
+            bot_event_id=str(bot_event_id)[:128] if bot_event_id else None,
+            error_code=str(error_code)[:128] if error_code else None,
+            error_class=str(error_class)[:128] if error_class else None,
+            summary=str(summary)[:1000],
+            details_json=dict(details or {}),
+        )
+        with self.database.session() as session:
+            session.add(row)
+            session.flush()
+            return row.id
 
 
 class AgentRunRepository:

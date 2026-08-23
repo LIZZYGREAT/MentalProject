@@ -118,7 +118,7 @@ async def run() -> None:
     from app.integrations.feishu.card_callback import FeishuCardCallbackServer
     from app.repositories import (
         AgentRunRepository, BindingRepository, BotEventRepository,
-        ClaudeSessionRepository, ParticipantRepository,
+        ClaudeSessionRepository, ParticipantRepository, RuntimeIncidentRepository,
     )
     from app.services.forecast_scheduler import ForecastScheduler
     from app.services.safety_service import SafetyService
@@ -145,6 +145,7 @@ async def run() -> None:
     bindings = BindingRepository(database)
     identity = IdentityService(database, bindings)
     events = BotEventRepository(database)
+    incidents = RuntimeIncidentRepository(database)
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
     _log_startup_phase("business_ready")
@@ -233,6 +234,7 @@ async def run() -> None:
         progress_delay_seconds=settings.progress_delay_seconds,
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
+        incidents=incidents,
     )
     def handle_card_action(event: Any) -> dict[str, Any]:
         participant = identity.resolve(event.app_id, event.open_id)
@@ -279,6 +281,7 @@ async def run() -> None:
             business.profile_calibration
             if settings.profile_calibration_enabled else None
         ),
+        incidents=incidents,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.

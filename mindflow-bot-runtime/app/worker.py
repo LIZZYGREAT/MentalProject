@@ -23,7 +23,11 @@ from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
 from app.integrations.feishu.oauth import DeviceFlowService
-from app.repositories import AgentRunRepository, BotEventRepository
+from app.repositories import (
+    AgentRunRepository,
+    BotEventRepository,
+    RuntimeIncidentRepository,
+)
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
@@ -124,6 +128,7 @@ class BotWorker:
         progress_delay_seconds: int = 3,
         progress_cooldown_seconds: int = 3,
         progress_max_messages: int = 2,
+        incidents: RuntimeIncidentRepository | None = None,
     ):
         self.queue = queue
         self.identity = identity
@@ -141,10 +146,19 @@ class BotWorker:
         self.progress_delay_seconds = progress_delay_seconds
         self.progress_cooldown_seconds = progress_cooldown_seconds
         self.progress_max_messages = progress_max_messages
+        self.incidents = incidents
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
         self._cancelled_participants: set[object] = set()
+
+    def _record_incident(self, **values) -> None:
+        if self.incidents is None:
+            return
+        try:
+            self.incidents.record(**values)
+        except Exception:
+            logger.warning("runtime_incident_persist_failed", exc_info=True)
 
     def resume_device_flow(self, participant_id) -> None:
         if self.device_flows is None:
@@ -195,6 +209,14 @@ class BotWorker:
                 event.event_id,
                 status="failed",
                 error_code="unhandled_worker_failure",
+            )
+            self._record_incident(
+                severity="error",
+                subsystem="worker",
+                event_name="worker_event_unhandled",
+                bot_event_id=event.event_id,
+                error_code="unhandled_worker_failure",
+                summary="Bot worker could not handle a queued event.",
             )
         finally:
             self.queue.task_done()
@@ -433,6 +455,16 @@ class BotWorker:
                         exc.code,
                         exc.retryable,
                     )
+                    self._record_incident(
+                        severity="error",
+                        subsystem="feishu",
+                        event_name="feishu_card_send_failed",
+                        participant_id=ctx.participant_id,
+                        bot_event_id=event.event_id,
+                        error_code=str(exc.code) if exc.code is not None else None,
+                        error_class=type(exc).__name__,
+                        summary="A reviewed Feishu card could not be delivered.",
+                    )
             metrics["card_upload_ms"] = round(
                 (time.monotonic() - card_started) * 1000, 1
             )
@@ -503,13 +535,23 @@ class BotWorker:
             )
         if progress.tool_durations_ms:
             metrics["tool_duration_ms"] = progress.tool_durations_ms
+        metrics["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        save_telemetry = getattr(self.events, "save_telemetry", None)
+        if callable(save_telemetry):
+            try:
+                await asyncio.to_thread(save_telemetry, event.event_id, metrics)
+            except Exception:
+                logger.warning(
+                    "bot_event_telemetry_persist_failed event_id=%s",
+                    event.event_id,
+                    exc_info=True,
+                )
         _log(
             status,
             participant_id=str(ctx.participant_id),
             message_id=event.message_id,
             event_id=event.event_id,
             agent_run_id=str(run_id),
-            latency_ms=round((time.monotonic() - started) * 1000, 1),
             **metrics,
         )
 
@@ -587,6 +629,17 @@ class BotWorker:
                     exc.code,
                     exc.retryable,
                     getattr(exc, "attempt", 1),
+                )
+                self._record_incident(
+                    severity="error",
+                    subsystem="feishu",
+                    event_name="feishu_reply_send_failed",
+                    participant_id=participant_id,
+                    bot_event_id=event.event_id,
+                    error_code=str(exc.code) if exc.code is not None else None,
+                    error_class=type(exc).__name__,
+                    summary="A durable reply segment could not be delivered.",
+                    details={"segment_index": index},
                 )
                 return False
             if metrics is not None and not first_final_recorded:

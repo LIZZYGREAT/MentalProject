@@ -22,6 +22,10 @@ from app.repositories import (
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+from app.services.forecast_initial_state import (
+    ForecastInitialState,
+    ForecastInitialStateResolver,
+)
 from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
@@ -90,6 +94,7 @@ class ForecastCoordinator:
             min_interval_minutes=warning_min_interval_minutes,
         )
         self.learned_profiles = learned_profiles
+        self.initial_states = ForecastInitialStateResolver()
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
 
@@ -299,6 +304,11 @@ class ForecastCoordinator:
         self, participant_id: uuid.UUID, target: date, reason: str, *,
         refresh_calendar: bool, enqueue_enrichment: bool,
     ) -> dict[str, Any]:
+        initial_state = await self._resolve_initial_state(
+            participant_id,
+            target,
+            refresh_calendar=refresh_calendar,
+        )
         calendar_snapshot, calendar_changed = await self._calendar_snapshot(
             participant_id, target, refresh_calendar
         )
@@ -332,6 +342,7 @@ class ForecastCoordinator:
             "profile_revision": profile_revision,
             "algorithm_version": algorithm_version,
             "warning_revision": warning_revision,
+            "initial_state_revision": initial_state.revision,
         })
         if latest and latest["forecast_version"] == expected_version:
             cached = await self._reconcile_cached_warning_state(
@@ -353,6 +364,8 @@ class ForecastCoordinator:
             and latest["algorithm_version"] == algorithm_version
             and (latest.get("output") or {}).get("profile_revision") == profile_revision
             and (latest.get("output") or {}).get("warning_revision") == warning_revision
+            and (latest.get("output") or {}).get("initial_state_revision")
+            == initial_state.revision
             and self._semantic_input_delta(latest["semantic_input"], semantic_events)
             < self.materiality_threshold
         ):
@@ -375,11 +388,14 @@ class ForecastCoordinator:
                 profile=effective_profile,
                 observations=observations, calendar_events=semantic_events,
                 calendar_degraded=calendar_snapshot["degraded"], local_date=target.isoformat(),
+                initial_state=initial_state.model_override,
             )
             output["profile_layers"] = profile_layers
             output["profile_revision"] = profile_revision
             output["warning_revision"] = warning_revision
             output["warning_policy_config"] = warning_policy_config
+            output["initial_state"] = initial_state.to_dict()
+            output["initial_state_revision"] = initial_state.revision
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
             selected_alerts, warning_windows, serialized_windows = (
@@ -422,6 +438,29 @@ class ForecastCoordinator:
                 completion_key=(participant_id, target),
             )
         return result
+
+    async def _resolve_initial_state(
+        self,
+        participant_id: uuid.UUID,
+        target: date,
+        *,
+        refresh_calendar: bool,
+    ) -> ForecastInitialState:
+        local_today = datetime.now(self.timezone).date()
+        previous = None
+        if target == local_today + timedelta(days=1):
+            previous = await self.ensure_forecast(
+                participant_id,
+                local_today,
+                "next_day_initial_state",
+                refresh_calendar=refresh_calendar,
+                enqueue_enrichment=False,
+            )
+        return self.initial_states.resolve(
+            target,
+            local_today,
+            previous_day_forecast=previous,
+        )
 
     def _warning_windows(self, alerts: Any, target: date) -> list[dict[str, Any]]:
         result = []

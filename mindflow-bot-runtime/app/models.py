@@ -215,6 +215,10 @@ class ClaudeSession(Base):
 
 class BotEvent(Base):
     __tablename__ = "bot_events"
+    __table_args__ = (
+        Index("ix_bot_event_participant_received", "participant_id", "received_at"),
+        Index("ix_bot_event_status_received", "status", "received_at"),
+    )
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -238,12 +242,16 @@ class BotEvent(Base):
     reply_message_ids_json: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     reply_plan_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     reply_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    telemetry_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AgentRun(Base):
     __tablename__ = "agent_runs"
+    __table_args__ = (
+        Index("ix_agent_run_participant_started", "participant_id", "started_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     participant_id: Mapped[uuid.UUID] = mapped_column(
@@ -393,3 +401,33 @@ class WarningSchedule(Base):
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class RuntimeIncident(Base):
+    __tablename__ = "runtime_incidents"
+    __table_args__ = (
+        Index("ix_runtime_incident_created", "created_at"),
+        Index("ix_runtime_incident_severity_created", "severity", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    subsystem: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    participant_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    bot_event_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("bot_events.event_id", ondelete="SET NULL"), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )

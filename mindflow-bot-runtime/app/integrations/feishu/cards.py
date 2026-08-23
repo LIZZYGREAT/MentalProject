@@ -131,6 +131,7 @@ def pressure_curve_card(
     image_key: str,
     local_date: str,
     model_output: dict[str, Any] | None = None,
+    requested_date_is_today: bool = True,
 ) -> dict[str, Any]:
     """Build the image/key-node card from the same authoritative analysis."""
 
@@ -151,15 +152,25 @@ def pressure_curve_card(
         summary = (
             f"**当前压力：** {analysis.current_stress:g}/10　"
             f"**当前活力：** {vitality}\n"
-            f"**今日峰值：** {analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
+            f"**{'今日' if requested_date_is_today else '当日'}峰值：** "
+            f"{analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
         )
-        title = "今日压力与活力趋势"
+        title = (
+            "今日压力与活力趋势"
+            if requested_date_is_today
+            else f"{str(local_date)[:10]} 压力与活力趋势"
+        )
     else:
         summary = (
             f"**当前压力：** {analysis.current_stress:g}/10\n"
-            f"**今日峰值：** {analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
+            f"**{'今日' if requested_date_is_today else '当日'}峰值：** "
+            f"{analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
         )
-        title = "今日压力趋势"
+        title = (
+            "今日压力趋势"
+            if requested_date_is_today
+            else f"{str(local_date)[:10]} 压力趋势"
+        )
 
     return {
         "schema": "2.0",
