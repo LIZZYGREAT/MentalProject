@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from io import BytesIO
+import logging
 import math
+from pathlib import Path
 from typing import Any
 
 from app.services.curve_analysis import (
@@ -23,10 +26,49 @@ from settings.visual_defaults import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+_CJK_FONT_PATHS = (
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+)
+
+_PREFERRED_CJK_FONT_NAMES = (
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK TC",
+    "Source Han Sans SC",
+    "Microsoft YaHei",
+    "SimHei",
+)
+
+
 class PressureCurveRenderer:
     """Render only states and inputs that the active forecast model computes."""
 
     @staticmethod
+    def _resolve_font_name(font_manager) -> str:
+        available = {
+            font.name for font in font_manager.fontManager.ttflist
+        }
+        for name in _PREFERRED_CJK_FONT_NAMES:
+            if name in available:
+                return name
+
+        for path in _CJK_FONT_PATHS:
+            if not path.exists():
+                continue
+            try:
+                font_manager.fontManager.addfont(str(path))
+                name = font_manager.FontProperties(fname=str(path)).get_name()
+                if name:
+                    return str(name)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return "DejaVu Sans"
+
+    @staticmethod
+    @lru_cache(maxsize=1)
     def _pyplot():
         import matplotlib
 
@@ -34,18 +76,27 @@ class PressureCurveRenderer:
         from matplotlib import font_manager
         from matplotlib import pyplot as plt
 
-        available = {font.name for font in font_manager.fontManager.ttflist}
-        preferred = (
-            "Noto Sans CJK SC",
-            "Source Han Sans SC",
-            "Microsoft YaHei",
-            "SimHei",
-            "DejaVu Sans",
-        )
-        font_name = next(
-            (name for name in preferred if name in available), "DejaVu Sans"
-        )
+        font_name = PressureCurveRenderer._resolve_font_name(font_manager)
+        if font_name == "DejaVu Sans":
+            logger.warning(
+                "pressure_curve_cjk_font_unavailable",
+                extra={"fallback_font": font_name},
+            )
+        else:
+            logger.info(
+                "pressure_curve_font_selected",
+                extra={"font_name": font_name},
+            )
         return plt, font_name
+
+    @staticmethod
+    def _font_rc(font_name: str) -> dict[str, Any]:
+        return {
+            "font.family": "sans-serif",
+            "font.sans-serif": [font_name, "DejaVu Sans"],
+            "axes.unicode_minus": False,
+            "figure.facecolor": "white",
+        }
 
     def _draw_core_plot(
         self,
@@ -65,14 +116,7 @@ class PressureCurveRenderer:
             for point in points
         ]
 
-        with plt.rc_context(
-            {
-                "font.family": font_name,
-                "font.sans-serif": [font_name],
-                "axes.unicode_minus": False,
-                "figure.facecolor": "white",
-            }
-        ):
+        with plt.rc_context(self._font_rc(font_name)):
             figure, (stress_axis, secondary_axis) = plt.subplots(
                 2,
                 1,
@@ -394,16 +438,20 @@ class PressureCurveRenderer:
         analysis: CurveAnalysis,
         model_output: dict[str, Any] | None = None,
     ) -> bytes:
-        plt, _font_name = self._pyplot()
-        figure = self._draw_core_plot(curve, analysis, model_output)
-        try:
-            output = BytesIO()
-            figure.savefig(
-                output,
-                format="png",
-                bbox_inches="tight",
-                dpi=PLOT_DPI,
-            )
-            return output.getvalue()
-        finally:
-            plt.close(figure)
+        plt, font_name = self._pyplot()
+        # Matplotlib resolves generic sans-serif families at draw/save time.
+        # Keep savefig inside the same context used to create the artists or it
+        # can silently fall back to DejaVu even after selecting a CJK font.
+        with plt.rc_context(self._font_rc(font_name)):
+            figure = self._draw_core_plot(curve, analysis, model_output)
+            try:
+                output = BytesIO()
+                figure.savefig(
+                    output,
+                    format="png",
+                    bbox_inches="tight",
+                    dpi=PLOT_DPI,
+                )
+                return output.getvalue()
+            finally:
+                plt.close(figure)

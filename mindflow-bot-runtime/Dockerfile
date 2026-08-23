@@ -8,8 +8,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt
-RUN apt-get update \
- && apt-get install -y --no-install-recommends fonts-noto-cjk \
+RUN for source_file in \
+      /etc/apt/sources.list.d/debian.sources \
+      /etc/apt/sources.list; do \
+      if [ -f "$source_file" ] && grep -q 'deb.debian.org' "$source_file"; then \
+        sed -i \
+          -e 's|https://deb.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+          -e 's|http://deb.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+          -e 's|https://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+          -e 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+          "$source_file"; \
+      fi; \
+    done \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      fontconfig \
+      fonts-noto-cjk \
+ && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
 RUN pip install \
     --no-cache-dir \

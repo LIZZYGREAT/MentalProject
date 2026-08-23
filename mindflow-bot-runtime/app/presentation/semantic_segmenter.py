@@ -32,6 +32,11 @@ class SemanticSegmenter:
             return ()
         if not self.enabled or len(value) < self.min_total_chars:
             return (value,)
+        # The delivery envelope is a UX target, not permission to discard an
+        # authoritative business result. PresentationAgent may safely compress
+        # validated content, but deterministic fallback must remain lossless.
+        if len(value) > self.max_segments * self.max_chars:
+            return (value,)
 
         units: list[str] = []
         for unit in _STRONG_BOUNDARY.split(value):
@@ -132,9 +137,5 @@ class SemanticSegmenter:
             result.append(remaining[:cut].strip())
             remaining = remaining[cut:].strip()
         if remaining:
-            # The configured delivery envelope is finite. Keep the invariant
-            # explicit rather than producing an unbounded final message.
-            suffix = "…"
-            result[-1] = result[-1][: self.max_chars - len(suffix)].rstrip() + suffix
+            return (value,)
         return tuple(item for item in result if item)
-

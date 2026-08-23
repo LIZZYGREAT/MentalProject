@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,20 @@ from app.presentation.semantic_segmenter import SemanticSegmenter
 from app.repositories import BotEventRepository
 from app.worker import BotWorker, ProgressState
 from helpers import memory_database
+
+
+def test_dockerfile_pins_debian_apt_to_aliyun_without_overwriting_custom_sources():
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    mirror_position = dockerfile.index("mirrors.aliyun.com/debian")
+    update_position = dockerfile.index("apt-get update")
+    assert mirror_position < update_position
+    assert "/etc/apt/sources.list.d/debian.sources" in dockerfile
+    assert "/etc/apt/sources.list" in dockerfile
+    assert "grep -q 'deb.debian.org'" in dockerfile
+    assert "mirrors.aliyun.com/debian-security" in dockerfile
 
 
 def test_markdown_sanitizer_removes_presentation_tokens_conservatively():
@@ -58,6 +73,25 @@ def test_semantic_segmenter_keeps_short_answers_single_and_long_answers_bounded(
     assert "https://example.com/report/2026-08-23" in "".join(segments)
 
 
+def test_semantic_segmenter_never_drops_authoritative_tail():
+    segmenter = SemanticSegmenter(
+        min_total_chars=320,
+        target_chars=260,
+        max_chars=650,
+        max_segments=3,
+    )
+    source = "前段分析内容。" * 430 + "最终风险时间 15:45，压力值 74.06。"
+
+    segments = segmenter.segment(source)
+    combined = "".join(segments)
+
+    assert len(source) > 3 * 650
+    assert segments == (source,)
+    assert combined == source
+    assert "15:45" in combined
+    assert "74.06" in combined
+
+
 def test_progress_presenter_uses_task_stage_and_avoids_generic_after_activity():
     presenter = ProgressPresenter()
     state = ProgressState()
@@ -94,6 +128,14 @@ class TimeoutPresentationAgent:
     async def compose(self, *_args, **_kwargs):
         await asyncio.sleep(0.05)
         return ("不会采用",)
+
+
+class MarkdownPresentationAgent:
+    async def compose(self, *_args, **_kwargs):
+        return (
+            "- 第一项：15:45 压力值 74.06",
+            "`inline` [帮助](https://example.com)",
+        )
 
 
 def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent():
@@ -151,6 +193,58 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
     slow_plan = asyncio.run(slow.build_plan(source, cards=[], used_tools=set()))
     assert slow_plan.presentation_agent_used is False
     assert "15:45" in slow_plan.full_text
+
+
+def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
+    orchestrator = ResponseOrchestrator(
+        presentation_agent=MarkdownPresentationAgent(),
+        presentation_agent_min_chars=1,
+        segmenter=SemanticSegmenter(min_total_chars=1),
+    )
+    plan = asyncio.run(
+        orchestrator.build_plan(
+            RuntimeResponse(
+                "第一项：15:45 压力值 74.06。inline 帮助内容。",
+                response_kind="analysis",
+            ),
+            cards=[],
+            used_tools=set(),
+        )
+    )
+
+    assert plan.presentation_agent_used is True
+    assert tuple(segment.text for segment in plan.segments) == (
+        "• 第一项：15:45 压力值 74.06",
+        "inline 帮助：https://example.com",
+    )
+    assert "`" not in plan.full_text
+    assert "[帮助](" not in plan.full_text
+    assert "- 第一项" not in plan.full_text
+
+
+def test_invalid_presentation_fallback_keeps_complete_authoritative_answer():
+    source = (
+        "**前段分析**。" * 500
+        + "最终风险时间 15:45，压力值 74.06。"
+    )
+    orchestrator = ResponseOrchestrator(
+        presentation_agent=BadNumericPresentationAgent(),
+        presentation_agent_min_chars=1,
+    )
+    plan = asyncio.run(
+        orchestrator.build_plan(
+            RuntimeResponse(source, response_kind="analysis"),
+            cards=[],
+            used_tools=set(),
+        )
+    )
+
+    expected = MarkdownSanitizer().sanitize(source)
+    assert plan.presentation_agent_used is False
+    assert len(plan.segments) == 1
+    assert plan.segments[0].text == expected
+    assert "15:45" in plan.full_text
+    assert "74.06" in plan.full_text
 
 
 def test_safety_locked_response_is_byte_for_byte_and_never_rewritten():

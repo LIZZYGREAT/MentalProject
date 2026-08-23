@@ -100,8 +100,13 @@ class ResponseOrchestrator:
                     ),
                     timeout=self.presentation_agent_timeout_seconds,
                 )
-                agent_segments = self._validate_agent_output(
-                    authoritative.text, raw
+                raw_segments = self._parse_agent_output(raw)
+                sanitized_segments = tuple(
+                    self.sanitizer.sanitize(segment)
+                    for segment in raw_segments
+                )
+                agent_segments = self._validate_sanitized_agent_output(
+                    authoritative.text, sanitized_segments
                 )
             except Exception:
                 agent_segments = None
@@ -149,9 +154,8 @@ class ResponseOrchestrator:
             and self.presentation_agent is not None
         )
 
-    def _validate_agent_output(
-        self, source_text: str, raw: Any
-    ) -> tuple[str, ...]:
+    @staticmethod
+    def _parse_agent_output(raw: Any) -> tuple[str, ...]:
         if isinstance(raw, str):
             payload = json.loads(raw)
             raw = payload.get("segments") if isinstance(payload, dict) else None
@@ -159,7 +163,12 @@ class ResponseOrchestrator:
             raw = raw.get("segments")
         if not isinstance(raw, (list, tuple)):
             raise ValueError("segments must be a list")
-        segments = tuple(str(item).strip() for item in raw)
+        return tuple(str(item) for item in raw)
+
+    def _validate_sanitized_agent_output(
+        self, source_text: str, segments: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        segments = tuple(str(item).strip() for item in segments)
         if not 1 <= len(segments) <= self.presentation_agent_max_segments:
             raise ValueError("invalid segment count")
         if any(not item for item in segments):
