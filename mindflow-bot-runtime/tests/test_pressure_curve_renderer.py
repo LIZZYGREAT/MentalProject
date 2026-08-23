@@ -6,6 +6,7 @@ import pytest
 
 from app.services.curve_analysis import analyze_curve
 from app.services.pressure_curve_renderer import PressureCurveRenderer
+from settings.visual_defaults import EVENT_COLOR_MAP
 
 
 def _font_manager(*names, resolved_path_name="Noto Sans CJK JP"):
@@ -104,6 +105,136 @@ def test_chinese_pressure_curve_png_has_no_missing_glyph_warning():
 
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert not any("Glyph" in str(item.message) for item in caught)
+
+
+def test_chart_matches_sqlite_auth_deployment_colors_and_uses_formal_copy():
+    curve = [
+        {
+            "time": "08:00",
+            "stress_0_10": 4.0,
+            "vitality_0_10": 8.0,
+            "confidence_0_1": 0.3,
+            "event_stress_input": 0.2,
+            "anticipatory_input": 0.1,
+            "post_event_input": 0.0,
+        },
+        {
+            "time": "12:00",
+            "stress_0_10": 7.5,
+            "vitality_0_10": 5.0,
+            "confidence_0_1": 0.8,
+            "event_stress_input": 0.7,
+            "anticipatory_input": 0.4,
+            "post_event_input": 0.3,
+        },
+        {
+            "time": "18:00",
+            "stress_0_10": 5.0,
+            "vitality_0_10": 6.0,
+            "confidence_0_1": 0.4,
+            "event_stress_input": 0.1,
+            "anticipatory_input": 0.0,
+            "post_event_input": 0.2,
+        },
+    ]
+    analysis = analyze_curve(curve)
+    renderer = PressureCurveRenderer()
+    plt, _font_name = renderer._pyplot()
+
+    figure = renderer._draw_core_plot(curve, analysis)
+    try:
+        stress_axis = next(
+            axis for axis in figure.axes if axis.get_ylabel() == "心理压力（0–100）"
+        )
+        input_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_ylabel() == "压力影响强度（0–1）"
+        )
+        confidence_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_ylabel() == "预测置信度（0–1）"
+        )
+        stress_lines = {line.get_label(): line for line in stress_axis.lines}
+        input_lines = {line.get_label(): line for line in input_axis.lines}
+        confidence_lines = {
+            line.get_label(): line for line in confidence_axis.lines
+        }
+
+        assert figure._suptitle.get_text() == "今日压力趋势与影响因素"
+        assert stress_lines["压力值 S(t)"].get_color() == "royalblue"
+        assert stress_lines["压力值 S(t)"].get_linewidth() == 2.5
+        assert stress_lines["压力基准值=50"].get_color() == "gray"
+        assert stress_lines["压力基准值=50"].get_linestyle() == ":"
+        assert stress_lines["压力关注线=70"].get_color() == "red"
+        assert stress_lines["压力关注线=70"].get_linestyle() == "--"
+        assert input_lines["事件影响"].get_color() == "#dc2626"
+        assert input_lines["事前影响"].get_color() == "#d97706"
+        assert input_lines["事后影响"].get_color() == "#7c3aed"
+        assert confidence_lines["预测置信度"].get_color() == "orange"
+        assert confidence_lines["预测置信度"].get_alpha() == 0.60
+
+        visible_text = "\n".join(
+            [figure._suptitle.get_text()]
+            + [axis.get_ylabel() for axis in figure.axes]
+            + [line.get_label() for axis in figure.axes for line in axis.lines]
+        )
+        assert not any(
+            token in visible_text
+            for token in ("M0", "M3", "真实预测", "公式输入", "S_eq")
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_dynamic_vitality_chart_keeps_legacy_primary_palette():
+    curve = [
+        {
+            "time": "08:00",
+            "stress_0_10": 4.0,
+            "vitality_0_10": 8.0,
+            "confidence_0_1": 0.3,
+        },
+        {
+            "time": "12:00",
+            "stress_0_10": 7.5,
+            "vitality_0_10": 5.0,
+            "confidence_0_1": 0.8,
+        },
+    ]
+    analysis = analyze_curve(curve)
+    renderer = PressureCurveRenderer()
+    plt, _font_name = renderer._pyplot()
+    model_output = {"model_variant": "m3", "active_states": ["S", "V", "F"]}
+
+    figure = renderer._draw_core_plot(curve, analysis, model_output)
+    try:
+        vitality_axis = next(
+            axis for axis in figure.axes if axis.get_ylabel() == "活力值（0–100）"
+        )
+        vitality_lines = {line.get_label(): line for line in vitality_axis.lines}
+
+        assert figure._suptitle.get_text() == "今日压力与活力趋势"
+        assert vitality_lines["活力值 V(t)"].get_color() == "mediumseagreen"
+        assert vitality_lines["活力值 V(t)"].get_linewidth() == 2.5
+        assert vitality_lines["低活力关注线=25"].get_color() == "crimson"
+        assert vitality_lines["低活力关注线=25"].get_linestyle() == "-."
+    finally:
+        plt.close(figure)
+
+
+def test_event_palette_matches_sqlite_auth_deployment_branch():
+    assert EVENT_COLOR_MAP == {
+        "course": ("#4169E1", "课程"),
+        "task": ("#DC143C", "任务"),
+        "sleep": ("#191970", "睡眠"),
+        "nap": ("#20B2AA", "午休"),
+        "meal": ("#3CB371", "就餐"),
+        "rest": ("#BDB76B", "休息"),
+        "gym": ("#FF8C00", "运动"),
+        "library": ("#8A2BE2", "自习"),
+    }
 
 
 def test_dockerfile_installs_fontconfig_and_refreshes_cache():

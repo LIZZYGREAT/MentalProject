@@ -56,13 +56,15 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
     assert image == {
         "tag": "img",
         "img_key": "img-key",
-        "alt": {"tag": "plain_text", "content": "今日 M0 压力预测曲线"},
+        "alt": {"tag": "plain_text", "content": "今日压力趋势"},
         "mode": "fit_horizontal",
         "preview": True,
     }
     assert not any(item["tag"] == "chart" for item in card["body"]["elements"])
     summary = card["body"]["elements"][1]["content"]
-    assert "stress-ctssm.m0（仅压力状态 S）" in summary
+    assert "今日峰值" in summary
+    assert "stress-ctssm" not in summary
+    assert "M0" not in summary
     assert "当前精力" not in summary
     actions = {
         item.get("value", {}).get("mindflow_action")
@@ -238,6 +240,12 @@ def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
     materialized = cards[0].materialize("img-key")
     assert materialized["body"]["elements"][0]["tag"] == "img"
     assert materialized["body"]["elements"][0]["img_key"] == "img-key"
+    assert materialized["header"]["title"]["content"] == "今日压力趋势"
+    visible_card_text = str(materialized)
+    assert "M0" not in visible_card_text
+    assert "stress-ctssm" not in visible_card_text
+    assert "关键时段" in visible_card_text
+    assert "仅供日常状态参考" in visible_card_text
 
 
 def test_worker_delivers_staged_card_before_final_text():

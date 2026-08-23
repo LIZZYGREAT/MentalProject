@@ -153,14 +153,13 @@ def pressure_curve_card(
             f"**当前活力：** {vitality}\n"
             f"**今日峰值：** {analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
         )
-        title = f"今日 {model.variant.upper()} 压力与活力曲线"
+        title = "今日压力与活力趋势"
     else:
         summary = (
             f"**当前压力：** {analysis.current_stress:g}/10\n"
-            f"**今日峰值：** {analysis.peak_stress:g}/10（{analysis.peak_stress_time}）\n"
-            f"**模型：** {model.family}（仅压力状态 S）"
+            f"**今日峰值：** {analysis.peak_stress:g}/10（{analysis.peak_stress_time}）"
         )
-        title = "今日 M0 压力预测曲线"
+        title = "今日压力趋势"
 
     return {
         "schema": "2.0",
@@ -185,7 +184,7 @@ def pressure_curve_card(
                     "preview": True,
                 },
                 {"tag": "markdown", "content": summary},
-                {"tag": "markdown", "content": "**关键节点**\n" + node_text},
+                {"tag": "markdown", "content": "**关键时段**\n" + node_text},
                 {
                     "tag": "button",
                     "type": "primary",
@@ -201,7 +200,7 @@ def pressure_curve_card(
                 {
                     "tag": "markdown",
                     "text_size": "notation",
-                    "content": "这是模型预测，不是已观察事实或医疗判断。",
+                    "content": "图中内容为模型预测，仅供日常状态参考，不代表已观察事实或医疗判断。",
                 },
             ],
         },

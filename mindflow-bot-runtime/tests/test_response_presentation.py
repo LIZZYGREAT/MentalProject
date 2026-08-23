@@ -168,6 +168,25 @@ def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent()
     assert agent.calls == 1
 
 
+def test_pressure_curve_card_companion_is_formal_and_contains_no_extra_analysis():
+    plan = asyncio.run(
+        ResponseOrchestrator().build_plan(
+            RuntimeResponse(
+                "内部工具返回了很多绘图参数、模型版本和诊断信息。",
+                response_kind="analysis",
+            ),
+            cards=[{"schema": "2.0"}],
+            used_tools={"care_get_pressure_curve"},
+        )
+    )
+
+    assert plan.kind == "rich"
+    assert plan.full_text == "今日压力曲线已生成，请查看卡片。"
+    assert len(plan.segments) == 1
+    assert "绘图参数" not in plan.full_text
+    assert "模型版本" not in plan.full_text
+    assert "诊断信息" not in plan.full_text
+
 def test_presentation_agent_validation_and_timeout_fall_back_deterministically():
     source = RuntimeResponse(
         "**分析**：峰值在 15:45，数值为 74.06。后续建议保持缓冲。",

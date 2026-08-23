@@ -133,7 +133,7 @@ class PressureCurveRenderer:
                 stress_values,
                 color="royalblue",
                 linewidth=2.5,
-                label="真实 M0 压力 S(t)" if context.variant == "m0" else "压力值 S(t)",
+                label="压力值 S(t)",
             )
 
             equilibrium_values = [
@@ -150,7 +150,7 @@ class PressureCurveRenderer:
                     linewidth=1.35,
                     linestyle="--",
                     alpha=0.85,
-                    label="瞬时平衡 S_eq(t)",
+                    label="动态压力基准",
                 )
 
             interval_lower = [
@@ -175,7 +175,7 @@ class PressureCurveRenderer:
                     interval_upper,
                     color="royalblue",
                     alpha=0.10,
-                    label="压力 90% 预测区间",
+                    label="压力预测区间（90%）",
                 )
 
             equilibrium = context.stress_baseline * 10.0
@@ -185,14 +185,14 @@ class PressureCurveRenderer:
                 color="gray",
                 linestyle=":",
                 linewidth=1.5,
-                label=f"用户平衡值 S*={equilibrium:g}",
+                label=f"压力基准值={equilibrium:g}",
             )
             stress_axis.axhline(
                 threshold,
                 color="red",
                 linestyle="--",
                 linewidth=1.5,
-                label=f"关怀观察线={threshold:g}",
+                label=f"压力关注线={threshold:g}",
             )
 
             lower_limit = max(0.0, min(stress_values) - 10.0)
@@ -201,7 +201,7 @@ class PressureCurveRenderer:
             y_range = upper_limit - lower_limit
             stress_axis.set_ylim(lower_limit, upper_limit)
             stress_axis.set_ylabel(
-                "心理压力 (S, 0-100)", color="royalblue", fontsize=13, weight="bold"
+                "心理压力（0–100）", color="royalblue", fontsize=13, weight="bold"
             )
             stress_axis.tick_params(axis="y", labelcolor="royalblue")
             stress_axis.grid(True, linestyle="--", alpha=0.3)
@@ -259,7 +259,7 @@ class PressureCurveRenderer:
                     scaled_penalty,
                     color="crimson",
                     alpha=0.25,
-                    label="M3 恢复债状态 F(t)",
+                    label="持续负荷影响",
                     step="post",
                 )
 
@@ -324,7 +324,7 @@ class PressureCurveRenderer:
                 )
 
             stress_axis.legend(
-                loc="center left", bbox_to_anchor=(0.01, 0.73), fontsize=9
+                loc="center left", bbox_to_anchor=(0.01, 0.75), fontsize=10
             )
 
             if context.has_dynamic_vitality:
@@ -339,7 +339,7 @@ class PressureCurveRenderer:
                     vitality_values,
                     color="mediumseagreen",
                     linewidth=2.5,
-                    label="主观活力 V(t)",
+                    label="活力值 V(t)",
                 )
                 critical = context.energy_critical * 10.0
                 secondary_axis.axhline(
@@ -347,17 +347,20 @@ class PressureCurveRenderer:
                     color="crimson",
                     linestyle="-.",
                     linewidth=1.5,
-                    label=f"活力参考线={critical:g}",
+                    label=f"低活力关注线={critical:g}",
                 )
                 secondary_axis.fill_between(
                     times, 0, critical, color="red", alpha=0.10
                 )
                 secondary_axis.set_ylabel(
-                    "主观活力 (V)", color="mediumseagreen", fontsize=13, weight="bold"
+                    "活力值（0–100）",
+                    color="mediumseagreen",
+                    fontsize=13,
+                    weight="bold",
                 )
                 secondary_axis.set_ylim(0, 105)
                 secondary_axis.legend(loc="lower left", fontsize=10)
-                title = f"{context.variant.upper()} 压力与活力演化模型（真实预测）"
+                title = "今日压力与活力趋势"
             else:
                 event_input = [point.event_stress_input for point in points]
                 anticipation = [point.anticipatory_input for point in points]
@@ -374,28 +377,28 @@ class PressureCurveRenderer:
                     event_input,
                     color="#dc2626",
                     linewidth=1.8,
-                    label="事件压力 U(t)",
+                    label="事件影响",
                 )
                 secondary_axis.plot(
                     times,
                     anticipation,
                     color="#d97706",
                     linewidth=1.5,
-                    label="事前预期 A(t)",
+                    label="事前影响",
                 )
                 secondary_axis.plot(
                     times,
                     aftermath,
                     color="#7c3aed",
                     linewidth=1.5,
-                    label="事后残留 H(t)",
+                    label="事后影响",
                 )
                 secondary_axis.set_ylabel(
-                    "M0 公式输入 (0-1)", fontsize=12, weight="bold"
+                    "压力影响强度（0–1）", fontsize=12, weight="bold"
                 )
                 secondary_axis.set_ylim(0, 1.05)
-                secondary_axis.legend(loc="upper left", fontsize=9, ncol=3)
-                title = "M0 压力时变平衡模型（真实预测）"
+                secondary_axis.legend(loc="upper left", fontsize=10, ncol=3)
+                title = "今日压力趋势与影响因素"
 
             secondary_axis.grid(True, linestyle="--", alpha=0.3)
             secondary_axis.set_xlabel("时间 (24h)", fontsize=12)
@@ -416,16 +419,16 @@ class PressureCurveRenderer:
                     color="orange",
                     linestyle="--",
                     linewidth=1.5,
-                    alpha=0.65,
-                    label="预警风险置信度",
+                    alpha=0.60,
+                    label="预测置信度",
                 )
                 confidence_axis.set_ylim(0, 1.05)
                 confidence_axis.set_ylabel(
-                    "预警置信度 (0-1)", color="orange", fontsize=11
+                    "预测置信度（0–1）", color="orange", fontsize=11
                 )
                 confidence_axis.tick_params(axis="y", labelcolor="orange")
                 confidence_axis.legend(
-                    loc="center left", bbox_to_anchor=(0.01, 0.59), fontsize=9
+                    loc="center left", bbox_to_anchor=(0.01, 0.65), fontsize=10
                 )
 
             figure.suptitle(title, fontsize=16, weight="bold")

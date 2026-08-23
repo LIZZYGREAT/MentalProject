@@ -348,18 +348,18 @@ def test_renderer_matches_m0_state_definition_and_reference_visual_style():
         assert tuple(figure.get_size_inches()) == (14.0, 9.0)
         assert len(figure.axes) == 3  # pressure, M0 inputs, alert confidence
         pressure_axis, input_axis, confidence_axis = figure.axes
-        assert pressure_axis.get_ylabel() == "心理压力 (S, 0-100)"
-        assert input_axis.get_ylabel() == "M0 公式输入 (0-1)"
-        assert confidence_axis.get_ylabel() == "预警置信度 (0-1)"
-        assert figure._suptitle.get_text() == "M0 压力时变平衡模型（真实预测）"
+        assert pressure_axis.get_ylabel() == "心理压力（0–100）"
+        assert input_axis.get_ylabel() == "压力影响强度（0–1）"
+        assert confidence_axis.get_ylabel() == "预测置信度（0–1）"
+        assert figure._suptitle.get_text() == "今日压力趋势与影响因素"
         pressure_labels = pressure_axis.get_legend_handles_labels()[1]
-        assert "真实 M0 压力 S(t)" in pressure_labels
-        assert "瞬时平衡 S_eq(t)" in pressure_labels
-        assert "用户平衡值 S*=55" in pressure_labels
-        assert "关怀观察线=74" in pressure_labels
+        assert "压力值 S(t)" in pressure_labels
+        assert "动态压力基准" in pressure_labels
+        assert "压力基准值=55" in pressure_labels
+        assert "压力关注线=74" in pressure_labels
         assert "连轴转惩罚生效区" not in pressure_labels
         input_labels = input_axis.get_legend_handles_labels()[1]
-        assert input_labels == ["事件压力 U(t)", "事前预期 A(t)", "事后残留 H(t)"]
+        assert input_labels == ["事件影响", "事前影响", "事后影响"]
         assert "认知精力 E(t)" not in input_labels
     finally:
         renderer._pyplot()[0].close(figure)
