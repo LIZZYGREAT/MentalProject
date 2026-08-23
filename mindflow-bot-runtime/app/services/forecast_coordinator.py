@@ -6,6 +6,7 @@ import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -26,6 +27,9 @@ from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
 from services.event_lifecycle import prepare_event_instances
 from services.semantic_model_inputs import semantic_model_inputs
+
+
+logger = logging.getLogger(__name__)
 
 
 def _canonical(value: Any) -> str:
@@ -97,6 +101,103 @@ class ForecastCoordinator:
             "episode_drift_minutes": self.warning_episode_drift_minutes,
         }
         return _sha(payload), payload
+
+    def _derive_warning_state(
+        self, output: dict[str, Any], target: date
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        selected = self.warning_policy.select_daily_candidates(
+            output.get("alerts") or []
+        )
+        windows = self._warning_windows(selected, target)
+        serialized_windows = [
+            self._serializable_warning(item) for item in windows
+        ]
+        return selected, windows, serialized_windows
+
+    @staticmethod
+    def _warning_derivatives_match(
+        snapshot: dict[str, Any],
+        *,
+        selected: list[dict[str, Any]],
+        windows: list[dict[str, Any]],
+        warning_revision: str,
+        warning_policy_config: dict[str, object],
+    ) -> bool:
+        output = dict(snapshot.get("output") or {})
+        return (
+            _canonical(output.get("selected_warning_candidates"))
+            == _canonical(selected)
+            and _canonical(snapshot.get("warning_windows"))
+            == _canonical(windows)
+            and output.get("warning_revision") == warning_revision
+            and _canonical(output.get("warning_policy_config"))
+            == _canonical(warning_policy_config)
+        )
+
+    async def _reconcile_cached_warning_state(
+        self,
+        snapshot: dict[str, Any],
+        target: date,
+        *,
+        warning_revision: str,
+        warning_policy_config: dict[str, object],
+    ) -> dict[str, Any]:
+        output = dict(snapshot.get("output") or {})
+        selected, windows, serialized_windows = self._derive_warning_state(
+            output, target
+        )
+        if self._warning_derivatives_match(
+            snapshot,
+            selected=selected,
+            windows=serialized_windows,
+            warning_revision=warning_revision,
+            warning_policy_config=warning_policy_config,
+        ):
+            return {**snapshot, "warning_reconciled": False}
+
+        persisted_selected = output.get("selected_warning_candidates")
+        persisted_windows = snapshot.get("warning_windows")
+        repaired, warning_diff, reconciled = await asyncio.to_thread(
+            self.forecasts.reconcile_warning_derivatives,
+            self.warnings,
+            uuid.UUID(str(snapshot["participant_id"])),
+            target,
+            forecast_id=uuid.UUID(str(snapshot["id"])),
+            forecast_version=str(snapshot["forecast_version"]),
+            selected_candidates=selected,
+            warning_windows=serialized_windows,
+            warning_revision=warning_revision,
+            warning_policy_config=warning_policy_config,
+            warnings=windows,
+            now=datetime.now(timezone.utc),
+        )
+        if reconciled:
+            logger.info(
+                "forecast_warning_reconciled",
+                extra={
+                    "participant_id": str(snapshot["participant_id"]),
+                    "local_date": target.isoformat(),
+                    "forecast_id": str(snapshot["id"]),
+                    "forecast_version_prefix": str(
+                        snapshot["forecast_version"]
+                    )[:12],
+                    "raw_alerts": len(output.get("alerts") or []),
+                    "persisted_selected": len(persisted_selected or []),
+                    "expected_selected": len(selected),
+                    "persisted_windows": len(persisted_windows or []),
+                    "expected_windows": len(serialized_windows),
+                    "warning_diff": warning_diff,
+                },
+            )
+        return {
+            **repaired,
+            "warning_reconciled": reconciled,
+            "warning_diff": warning_diff,
+        }
 
     async def ensure_forecast(
         self, participant_id: uuid.UUID, local_date: date | str, reason: str,
@@ -233,7 +334,18 @@ class ForecastCoordinator:
             "warning_revision": warning_revision,
         })
         if latest and latest["forecast_version"] == expected_version:
-            result = {**latest, "cache_hit": True, "calendar_changed": calendar_changed, "reason": reason}
+            cached = await self._reconcile_cached_warning_state(
+                latest,
+                target,
+                warning_revision=warning_revision,
+                warning_policy_config=warning_policy_config,
+            )
+            result = {
+                **cached,
+                "cache_hit": True,
+                "calendar_changed": calendar_changed,
+                "reason": reason,
+            }
         elif (
             latest
             and latest["calendar_revision"] == calendar_snapshot["calendar_revision"]
@@ -247,8 +359,14 @@ class ForecastCoordinator:
             # Persisted forecast remains the effective semantic version until
             # enrichment changes enough to affect the model.  This keeps later
             # curve requests from undoing the materiality decision.
+            cached = await self._reconcile_cached_warning_state(
+                latest,
+                target,
+                warning_revision=warning_revision,
+                warning_policy_config=warning_policy_config,
+            )
             result = {
-                **latest, "cache_hit": True, "calendar_changed": calendar_changed,
+                **cached, "cache_hit": True, "calendar_changed": calendar_changed,
                 "material_change": False, "reason": reason,
             }
         else:
@@ -264,11 +382,10 @@ class ForecastCoordinator:
             output["warning_policy_config"] = warning_policy_config
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
-            selected_alerts = self.warning_policy.select_daily_candidates(
-                output.get("alerts") or []
+            selected_alerts, warning_windows, serialized_windows = (
+                self._derive_warning_state(output, target)
             )
             output["selected_warning_candidates"] = selected_alerts
-            warning_windows = self._warning_windows(selected_alerts, target)
             semantic_input = [
                 {"event_id": item.get("id"), "semantic": (item.get("metadata") or {}).get("semantic")}
                 for item in semantic_events
@@ -280,11 +397,12 @@ class ForecastCoordinator:
                 observation_revision=observation_revision,
                 forecast_version=expected_version, semantic_status=semantic_status,
                 semantic_input=semantic_input, curve=curve, peaks=peaks,
-                warning_windows=[self._serializable_warning(item) for item in warning_windows],
+                warning_windows=serialized_windows,
                 output=output, warnings=warning_windows, now=datetime.now(timezone.utc),
             )
             result = {**saved, "cache_hit": False, "calendar_changed": calendar_changed,
-                      "warning_diff": warning_diff, "reason": reason}
+                      "warning_reconciled": False, "warning_diff": warning_diff,
+                      "reason": reason}
         result.update({
             "calendar_fresh": not calendar_snapshot["degraded"],
             "calendar_stale": bool(calendar_snapshot["degraded"]),

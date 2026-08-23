@@ -1162,6 +1162,284 @@ def test_calendar_refresh_failure_is_persisted_and_returned_as_stale():
     asyncio.run(scenario())
 
 
+_KEEP_WARNING_DERIVATIVE = object()
+
+
+def _damage_warning_derivatives(
+    database,
+    forecast_id,
+    *,
+    selected=_KEEP_WARNING_DERIVATIVE,
+    windows=_KEEP_WARNING_DERIVATIVE,
+    delete_unsent_schedules=False,
+):
+    with database.session() as session:
+        row = session.get(ForecastSnapshot, uuid.UUID(forecast_id))
+        if selected is not _KEEP_WARNING_DERIVATIVE:
+            output = dict(row.output_json)
+            output["selected_warning_candidates"] = list(selected)
+            row.output_json = output
+        if windows is not _KEEP_WARNING_DERIVATIVE:
+            row.warning_windows_json = list(windows)
+        if delete_unsent_schedules:
+            session.query(WarningSchedule).filter(
+                WarningSchedule.forecast_id == row.id,
+                WarningSchedule.sent_at.is_(None),
+            ).delete(synchronize_session=False)
+
+
+def _warning_core(snapshot):
+    output = dict(snapshot["output"])
+    generated_at = datetime.fromisoformat(snapshot["generated_at"])
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+    return {
+        "id": snapshot["id"],
+        "forecast_version": snapshot["forecast_version"],
+        "curve": snapshot["curve"],
+        "peaks": snapshot["peaks"],
+        "alerts": output.get("alerts"),
+        "profile_revision": output.get("profile_revision"),
+        "calendar_revision": snapshot["calendar_revision"],
+        "semantic_revision": snapshot["semantic_revision"],
+        "observation_revision": snapshot["observation_revision"],
+        "algorithm_version": snapshot["algorithm_version"],
+        "generated_at": generated_at.astimezone(timezone.utc),
+    }
+
+
+def test_exact_cache_hit_reconciles_corrupt_warning_snapshot_and_schedule(caplog):
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-reconcile-setup"
+        )
+    )
+    assert len(first["output"]["alerts"]) == 1
+    assert len(first["output"]["selected_warning_candidates"]) == 1
+    assert len(first["warning_windows"]) == 1
+    _damage_warning_derivatives(
+        database,
+        first["id"],
+        selected=[],
+        windows=[],
+        delete_unsent_schedules=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.forecast_coordinator"):
+        repaired = asyncio.run(
+            coordinator.ensure_forecast(
+                participant.id, TEST_LOCAL_DATE, "warning-reconcile-exact"
+            )
+        )
+
+    assert repaired["cache_hit"] is True
+    assert repaired["warning_reconciled"] is True
+    assert len(repaired["output"]["alerts"]) == 1
+    assert len(repaired["output"]["selected_warning_candidates"]) == 1
+    assert len(repaired["warning_windows"]) == 1
+    assert repaired["warning_diff"]["created"] == 1
+    assert prediction.calls == 1
+    assert "forecast_warning_reconciled" in caplog.text
+    with database.session() as session:
+        rows = session.query(WarningSchedule).all()
+        assert len(rows) == 1
+        assert rows[0].status == "pending"
+        assert rows[0].attempt_count == 0
+        assert rows[0].sent_at is None
+        assert rows[0].target_time < rows[0].risk_time
+        assert rows[0].valid_until < rows[0].risk_time
+        assert rows[0].next_attempt_at <= rows[0].valid_until
+        assert rows[0].next_attempt_at < rows[0].risk_time
+
+
+def test_consistent_exact_cache_hit_does_not_repair_or_duplicate_schedule():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-consistent-first"
+        )
+    )
+    second = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-consistent-second"
+        )
+    )
+
+    assert first["warning_reconciled"] is False
+    assert second["cache_hit"] is True
+    assert second["warning_reconciled"] is False
+    assert prediction.calls == 1
+    with database.session() as session:
+        assert session.query(WarningSchedule).count() == 1
+
+
+def test_exact_cache_hit_repairs_windows_when_selected_candidates_are_correct():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-window-damage-setup"
+        )
+    )
+    _damage_warning_derivatives(database, first["id"], windows=[])
+
+    repaired = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-window-damage-repair"
+        )
+    )
+
+    assert repaired["cache_hit"] is True
+    assert repaired["warning_reconciled"] is True
+    assert repaired["output"]["selected_warning_candidates"] == first["output"][
+        "selected_warning_candidates"
+    ]
+    assert repaired["warning_windows"] == first["warning_windows"]
+    assert prediction.calls == 1
+    with database.session() as session:
+        assert session.query(WarningSchedule).filter_by(status="pending").count() == 1
+
+
+def test_exact_cache_hit_rederives_selected_when_persisted_windows_still_exist():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-selected-damage-setup"
+        )
+    )
+    _damage_warning_derivatives(database, first["id"], selected=[])
+
+    repaired = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-selected-damage-repair"
+        )
+    )
+
+    assert repaired["cache_hit"] is True
+    assert repaired["warning_reconciled"] is True
+    assert repaired["output"]["selected_warning_candidates"] == first["output"][
+        "selected_warning_candidates"
+    ]
+    assert repaired["warning_windows"] == first["warning_windows"]
+    assert prediction.calls == 1
+
+
+def test_materiality_cache_hit_reconciles_persisted_warning_derivatives():
+    database, participant, _, semantics, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-materiality-setup"
+        )
+    )
+    _damage_warning_derivatives(
+        database,
+        first["id"],
+        selected=[],
+        windows=[],
+        delete_unsent_schedules=True,
+    )
+    persisted_semantic_events = [
+        {
+            "id": item.get("event_id"),
+            "metadata": {"semantic": item.get("semantic")},
+        }
+        for item in first["semantic_input"]
+    ]
+    semantics.prepare = lambda *_args, **_kwargs: (
+        persisted_semantic_events,
+        "changed-but-immaterial-semantic-revision",
+        "rules_only",
+        [],
+    )
+
+    repaired = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-materiality-repair"
+        )
+    )
+
+    assert repaired["cache_hit"] is True
+    assert repaired["material_change"] is False
+    assert repaired["warning_reconciled"] is True
+    assert len(repaired["output"]["selected_warning_candidates"]) == 1
+    assert len(repaired["warning_windows"]) == 1
+    assert prediction.calls == 1
+    with database.session() as session:
+        assert session.query(WarningSchedule).filter_by(status="pending").count() == 1
+
+
+def test_warning_reconciliation_preserves_core_forecast_fields():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-core-preserve-setup"
+        )
+    )
+    before = _warning_core(first)
+    _damage_warning_derivatives(
+        database, first["id"], selected=[], windows=[]
+    )
+
+    repaired = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-core-preserve-repair"
+        )
+    )
+
+    assert repaired["warning_reconciled"] is True
+    assert _warning_core(repaired) == before
+    assert prediction.calls == 1
+
+
+def test_warning_reconciliation_never_reopens_or_duplicates_sent_warning():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline(
+        [event()]
+    )
+    first = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-sent-preserve-setup"
+        )
+    )
+    with database.session() as session:
+        row = session.query(WarningSchedule).one()
+        row.status = "sent"
+        row.sent_at = TEST_NOW
+        original_id = row.id
+    _damage_warning_derivatives(
+        database, first["id"], selected=[], windows=[]
+    )
+
+    repaired = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "warning-sent-preserve-repair"
+        )
+    )
+
+    assert repaired["cache_hit"] is True
+    assert repaired["warning_reconciled"] is True
+    assert repaired["warning_diff"]["created"] == 0
+    assert prediction.calls == 1
+    with database.session() as session:
+        rows = session.query(WarningSchedule).all()
+        assert len(rows) == 1
+        assert rows[0].id == original_id
+        assert rows[0].status == "sent"
+        assert rows[0].sent_at.replace(tzinfo=timezone.utc) == TEST_NOW
+        assert session.query(WarningSchedule).filter_by(status="pending").count() == 0
+
+
 def test_warning_max_daily_sends_change_invalidates_forecast_cache():
     database, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
     coordinator.warning_policy = WarningPolicy(

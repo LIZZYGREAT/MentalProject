@@ -37,6 +37,16 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 @dataclass(frozen=True)
 class ParticipantView:
     id: uuid.UUID
@@ -645,6 +655,77 @@ class ForecastSnapshotRepository:
                 warnings=warnings, now=now,
             )
             return saved, warning_diff
+
+    def reconcile_warning_derivatives(
+        self,
+        warning_repository: "WarningScheduleRepository",
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        forecast_id: uuid.UUID,
+        forecast_version: str,
+        selected_candidates: list[dict[str, Any]],
+        warning_windows: list[dict[str, Any]],
+        warning_revision: str,
+        warning_policy_config: dict[str, object],
+        warnings: list[dict[str, Any]],
+        now: datetime,
+    ) -> tuple[dict[str, Any], dict[str, int], bool]:
+        """Repair deterministic warning derivatives without rerunning forecast."""
+
+        if warning_repository.database is not self.database:
+            raise ValueError("forecast and warning repositories must share a database")
+        empty_diff = {
+            "kept": 0,
+            "created": 0,
+            "rescheduled": 0,
+            "cancelled": 0,
+        }
+        with self.database.session() as session:
+            row = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.id == forecast_id,
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.forecast_version == forecast_version,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                raise ValueError("forecast snapshot changed before warning reconciliation")
+
+            current_output = dict(row.output_json)
+            derivatives_match = (
+                _canonical_json(current_output.get("selected_warning_candidates"))
+                == _canonical_json(selected_candidates)
+                and _canonical_json(row.warning_windows_json)
+                == _canonical_json(warning_windows)
+                and current_output.get("warning_revision") == warning_revision
+                and _canonical_json(current_output.get("warning_policy_config"))
+                == _canonical_json(warning_policy_config)
+            )
+            if derivatives_match:
+                return self._view(row), empty_diff, False
+
+            current_output["selected_warning_candidates"] = list(
+                selected_candidates
+            )
+            current_output["warning_revision"] = warning_revision
+            current_output["warning_policy_config"] = dict(
+                warning_policy_config
+            )
+            row.output_json = current_output
+            row.warning_windows_json = list(warning_windows)
+            warning_diff = warning_repository._sync_in_session(
+                session,
+                participant_id,
+                local_date,
+                forecast_id=row.id,
+                forecast_version=forecast_version,
+                warnings=warnings,
+                now=now,
+            )
+            session.flush()
+            return self._view(row), warning_diff, True
 
     def _save_in_session(
         self, session: Any, participant_id: uuid.UUID, local_date: date, *,
