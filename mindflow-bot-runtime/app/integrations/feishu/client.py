@@ -45,10 +45,14 @@ class FeishuClient:
             chat_id, "text", {"text": str(text)}, message_uuid=message_uuid,
         )
 
-    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+    def send_card(
+        self, chat_id: str, card: dict[str, Any], *, message_uuid: str | None = None
+    ) -> str:
         if not isinstance(card, dict) or not card:
             raise ValueError("Feishu card must be a non-empty object")
-        return self._send_message(chat_id, "interactive", card)
+        if message_uuid is None:
+            return self._send_message(chat_id, "interactive", card)
+        return self._send_message(chat_id, "interactive", card, message_uuid=message_uuid)
 
     def upload_image(self, png_bytes: bytes) -> str:
         if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:

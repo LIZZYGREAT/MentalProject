@@ -121,6 +121,7 @@ async def run() -> None:
         ClaudeSessionRepository, ParticipantRepository, RuntimeIncidentRepository,
     )
     from app.services.forecast_scheduler import ForecastScheduler
+    from app.services.daily_review_scheduler import DailyReviewScheduler
     from app.services.safety_service import SafetyService
     from app.presentation.presentation_agent import ProductionPresentationAgent
     from app.presentation.progress_presenter import ProgressPresenter
@@ -283,6 +284,18 @@ async def run() -> None:
         ),
         incidents=incidents,
     )
+    daily_review_scheduler = DailyReviewScheduler(
+        schedules=business.daily_review_schedules,
+        participants=ParticipantRepository(database),
+        bindings=bindings,
+        sender=sender,
+        timezone_name=settings.daily_review_timezone,
+        local_time=settings.daily_review_local_time,
+        poll_interval_seconds=settings.daily_review_poll_interval_seconds,
+        retry_base_seconds=settings.daily_review_retry_base_seconds,
+        max_attempts=settings.daily_review_max_attempts,
+        claim_lease_seconds=settings.daily_review_claim_lease_seconds,
+    )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.
     dispatcher = asyncio.create_task(worker.run_forever(), name="bot-dispatcher")
@@ -303,14 +316,21 @@ async def run() -> None:
         worker.resume_device_flow(participant_id)
 
     forecast_tasks: asyncio.Task | None = None
+    daily_review_tasks: asyncio.Task | None = None
 
     async def start_scheduler_after_gateway_ready() -> None:
-        nonlocal forecast_tasks
+        nonlocal forecast_tasks, daily_review_tasks
         _log_startup_phase("gateway_ready")
         forecast_tasks = asyncio.create_task(
             scheduler.run_forever(), name="forecast-scheduler"
         )
+        if settings.daily_review_enabled:
+            daily_review_tasks = asyncio.create_task(
+                daily_review_scheduler.run_forever(), name="daily-review-scheduler"
+            )
         await scheduler.started.wait()
+        if daily_review_tasks is not None:
+            await daily_review_scheduler.started.wait()
         _log_startup_phase("forecast_scheduler_ready")
 
     try:
@@ -329,12 +349,15 @@ async def run() -> None:
             if card_callback is not None:
                 await card_callback.stop()
             await scheduler.close()
+            await daily_review_scheduler.close()
             if forecast_tasks is not None:
                 forecast_tasks.cancel()
+            if daily_review_tasks is not None:
+                daily_review_tasks.cancel()
             dispatcher.cancel()
             await asyncio.gather(
                 dispatcher,
-                *(task for task in (forecast_tasks,) if task is not None),
+                *(task for task in (forecast_tasks, daily_review_tasks) if task is not None),
                 return_exceptions=True,
             )
             try:

@@ -29,6 +29,7 @@ from app.services.forecast_initial_state import (
 from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
+from app.repositories_daily_review import RetrospectiveCurveRepository
 from services.event_lifecycle import prepare_event_instances
 from services.semantic_model_inputs import semantic_model_inputs
 
@@ -74,6 +75,7 @@ class ForecastCoordinator:
         warning_max_daily_sends: int = 2,
         warning_min_interval_minutes: int = 240,
         learned_profiles: LearnedProfileRepository | None = None,
+        retrospective_curves: RetrospectiveCurveRepository | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -94,6 +96,7 @@ class ForecastCoordinator:
             min_interval_minutes=warning_min_interval_minutes,
         )
         self.learned_profiles = learned_profiles
+        self.retrospective_curves = retrospective_curves
         self.initial_states = ForecastInitialStateResolver()
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
@@ -474,10 +477,28 @@ class ForecastCoordinator:
                 refresh_calendar=refresh_calendar,
                 enqueue_enrichment=False,
             )
+        terminal_override = None
+        if previous is not None and self.retrospective_curves is not None:
+            previous_date = target - timedelta(days=1)
+            retrospective = await asyncio.to_thread(
+                self.retrospective_curves.latest, participant_id, previous_date
+            )
+            forward_state = dict(
+                ((retrospective or {}).get("analysis") or {}).get(
+                    "forward_terminal_state"
+                ) or {}
+            )
+            if forward_state:
+                terminal_override = {
+                    **forward_state,
+                    "retrospective_id": retrospective["id"],
+                    "daily_review_revision": retrospective["daily_review_revision"],
+                }
         return self.initial_states.resolve(
             target,
             local_today,
             previous_day_forecast=previous,
+            previous_day_terminal_override=terminal_override,
             baseline_state=self._profile_initial_state(effective_profile),
         )
 

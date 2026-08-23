@@ -23,6 +23,12 @@ from app.repositories import (
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+from app.repositories_daily_review import (
+    DailyReviewResponseRepository,
+    DailyReviewScheduleRepository,
+    RetrospectiveCurveRepository,
+)
+from app.services.daily_review_service import DailyReviewService
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
@@ -57,6 +63,10 @@ class BusinessServices:
     card_actions: CardActionService
     profile_calibration: ProfileCalibrationService
     pressure_curves: PressureCurveService
+    daily_review_schedules: DailyReviewScheduleRepository
+    daily_review_responses: DailyReviewResponseRepository
+    retrospective_curves: RetrospectiveCurveRepository
+    daily_reviews: DailyReviewService
 
 
 def build_business_services(
@@ -84,8 +94,16 @@ def build_business_services(
     )
     calendar = CalendarService(refresh, timezone_name=settings.timezone_name)
     presentations = PresentationOutbox()
+    daily_review_schedules = DailyReviewScheduleRepository(database)
+    daily_review_responses = DailyReviewResponseRepository(database)
+    retrospective_curves = RetrospectiveCurveRepository(database)
+    daily_reviews = DailyReviewService(
+        daily_review_responses, daily_review_schedules, retrospective_curves,
+        ForecastSnapshotRepository(database), observations, settings,
+    )
     card_actions = CardActionService(
-        observations, calendar, timezone_name=settings.timezone_name
+        observations, calendar, timezone_name=settings.timezone_name,
+        daily_reviews=daily_reviews,
     )
     prediction_service = PredictionService(
         AssessmentModel(settings.timezone_name), predictions
@@ -122,6 +140,7 @@ def build_business_services(
         warning_max_daily_sends=settings.warning_max_daily_sends,
         warning_min_interval_minutes=settings.warning_min_interval_minutes,
         learned_profiles=learned_profiles,
+        retrospective_curves=retrospective_curves,
     )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
@@ -159,4 +178,8 @@ def build_business_services(
         card_actions=card_actions,
         profile_calibration=profile_calibration,
         pressure_curves=pressure_curves,
+        daily_review_schedules=daily_review_schedules,
+        daily_review_responses=daily_review_responses,
+        retrospective_curves=retrospective_curves,
+        daily_reviews=daily_reviews,
     )

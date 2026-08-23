@@ -155,6 +155,41 @@ docker compose exec bot python -m app.admin set-llm-consent P001
 docker compose exec bot python -m app.admin set-llm-consent P001 --revoke
 ```
 
+## Admin 账号与密码 Hash
+
+`ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` 是环境根账号。Admin 启动时会把它
+同步到 `admin_users` 表，并强制保持 `superadmin + active`；数据库里的其他账号
+不能降权或停用它。生成 PBKDF2-SHA256 密码 Hash：
+
+```powershell
+conda activate MentalProject
+cd mindflow-bot-runtime
+python -c "from getpass import getpass; from app.admin_web.auth import hash_password; print(hash_password(getpass('Admin password: ')))"
+```
+
+把输出完整写入 `.env` 的 `ADMIN_PASSWORD_HASH`，不要把明文密码写进 `.env`。
+登录 `/admin/` 后，`superadmin` 可在“管理员”页面新增 `viewer`、`admin` 或
+其他 `superadmin`，也可停用非环境账号。`viewer` 只读，`admin` 可执行 Forecast
+刷新和回顾重建，`superadmin` 额外管理管理员账号。系统不提供公开注册入口。
+
+## Daily Review
+
+每日 22:00（默认 `Asia/Shanghai`）向所有 active 且已绑定飞书会话的参与者发送
+固定表单。投递具有数据库租约、指数退避和稳定消息 UUID，重启不会重复创建同日
+同版本任务。回调不进入大模型：后端验证字段、追加保存 revision，并使用
+`Fixed Lag Smoother + Anchor/Smooth Residual Kernel` 生成独立回顾曲线。
+
+- `forecast_snapshots` 与原预警记录保持不变；
+- 即时反馈只在自己的时间窗内参与回顾平滑；
+- 早晨、峰值时段、收尾状态作为软锚点；峰值不会作为提交时刻的当前状态；
+- 收尾状态以较低增益影响下一日初始状态，来源和 revision 会写入 Forecast provenance；
+- Admin 的 Forecast 页可叠加“预测 / 即时反馈 / 回顾反馈 / 回顾估计”，
+  Daily Review 页可查看 revision 并显式重建。
+
+部署前执行迁移；`compose.yaml` 已提供一次性的 `migrate` 服务，Bot 和 Admin 都会
+等待迁移成功。生产环境还需把飞书卡片回调配置为真实可访问的 HTTPS 地址；本地
+代码和测试无法替代域名、证书、反向代理及飞书后台的外部配置。
+
 ## 自动验证
 
 ```powershell

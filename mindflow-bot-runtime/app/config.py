@@ -107,6 +107,20 @@ class Settings:
     warning_max_daily_sends: int = 2
     warning_min_interval_minutes: int = 240
     profile_calibration_enabled: bool = False
+    daily_review_enabled: bool = True
+    daily_review_local_time: str = "22:00"
+    daily_review_timezone: str = "Asia/Shanghai"
+    daily_review_poll_interval_seconds: int = 60
+    daily_review_retry_base_seconds: int = 60
+    daily_review_max_attempts: int = 5
+    daily_review_claim_lease_seconds: int = 120
+    observation_smoothing_window_minutes: int = 90
+    retrospective_morning_sigma_minutes: float = 90.0
+    retrospective_end_sigma_minutes: float = 60.0
+    retrospective_peak_rise_minutes: float = 120.0
+    retrospective_peak_decay_minutes: float = 90.0
+    retrospective_max_delta_per_5_min: float = 0.35
+    daily_review_end_state_gain: float = 0.35
     admin_enabled: bool = True
     admin_host: str = "0.0.0.0"
     admin_port: int = 8081
@@ -330,6 +344,42 @@ class Settings:
             warning_max_daily_sends=_int(values, "WARNING_MAX_DAILY_SENDS", 2, minimum=0),
             warning_min_interval_minutes=_int(values, "WARNING_MIN_INTERVAL_MINUTES", 240, minimum=0),
             profile_calibration_enabled=_bool(values, "PROFILE_CALIBRATION_ENABLED", False),
+            daily_review_enabled=_bool(values, "DAILY_REVIEW_ENABLED", True),
+            daily_review_local_time=values.get("DAILY_REVIEW_LOCAL_TIME", "22:00").strip(),
+            daily_review_timezone=values.get(
+                "DAILY_REVIEW_TIMEZONE", "Asia/Shanghai"
+            ).strip(),
+            daily_review_poll_interval_seconds=_int(
+                values, "DAILY_REVIEW_POLL_INTERVAL_SECONDS", 60, minimum=30
+            ),
+            daily_review_retry_base_seconds=_int(
+                values, "DAILY_REVIEW_RETRY_BASE_SECONDS", 60
+            ),
+            daily_review_max_attempts=_int(values, "DAILY_REVIEW_MAX_ATTEMPTS", 5),
+            daily_review_claim_lease_seconds=_int(
+                values, "DAILY_REVIEW_CLAIM_LEASE_SECONDS", 120
+            ),
+            observation_smoothing_window_minutes=_int(
+                values, "OBSERVATION_SMOOTHING_WINDOW_MINUTES", 90
+            ),
+            retrospective_morning_sigma_minutes=_float(
+                values, "RETROSPECTIVE_MORNING_SIGMA_MINUTES", 90.0, minimum=1.0
+            ),
+            retrospective_end_sigma_minutes=_float(
+                values, "RETROSPECTIVE_END_SIGMA_MINUTES", 60.0, minimum=1.0
+            ),
+            retrospective_peak_rise_minutes=_float(
+                values, "RETROSPECTIVE_PEAK_RISE_MINUTES", 120.0, minimum=1.0
+            ),
+            retrospective_peak_decay_minutes=_float(
+                values, "RETROSPECTIVE_PEAK_DECAY_MINUTES", 90.0, minimum=1.0
+            ),
+            retrospective_max_delta_per_5_min=_float(
+                values, "RETROSPECTIVE_MAX_DELTA_PER_5_MIN", 0.35, minimum=0.01
+            ),
+            daily_review_end_state_gain=_float(
+                values, "DAILY_REVIEW_END_STATE_GAIN", 0.35, minimum=0.0
+            ),
             admin_enabled=_bool(values, "ADMIN_ENABLED", True),
             admin_host=values.get("ADMIN_HOST", "0.0.0.0").strip(),
             admin_port=_int(values, "ADMIN_PORT", 8081),
@@ -406,11 +456,27 @@ class Settings:
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"APP_TIMEZONE is invalid: {self.timezone_name}") from exc
         try:
+            ZoneInfo(self.daily_review_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(
+                f"DAILY_REVIEW_TIMEZONE is invalid: {self.daily_review_timezone}"
+            ) from exc
+        try:
             hour, minute = (int(part) for part in self.forecast_daily_prepare_local_time.split(":"))
         except (TypeError, ValueError) as exc:
             raise ValueError("FORECAST_DAILY_PREPARE_LOCAL_TIME must be HH:MM") from exc
         if not 0 <= hour <= 23 or not 0 <= minute <= 59:
             raise ValueError("FORECAST_DAILY_PREPARE_LOCAL_TIME must be HH:MM")
+        try:
+            review_hour, review_minute = (
+                int(part) for part in self.daily_review_local_time.split(":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("DAILY_REVIEW_LOCAL_TIME must be HH:MM") from exc
+        if not 0 <= review_hour <= 23 or not 0 <= review_minute <= 59:
+            raise ValueError("DAILY_REVIEW_LOCAL_TIME must be HH:MM")
+        if self.daily_review_end_state_gain > 1:
+            raise ValueError("DAILY_REVIEW_END_STATE_GAIN must be <= 1")
         if self.semantic_materiality_threshold > 1.0:
             raise ValueError("SEMANTIC_MATERIALITY_THRESHOLD must be <= 1")
         if self.response_segment_target_chars > self.response_segment_max_chars:

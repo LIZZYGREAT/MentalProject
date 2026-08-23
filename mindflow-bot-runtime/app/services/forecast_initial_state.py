@@ -28,6 +28,8 @@ class ForecastInitialState:
     source_local_date: str | None = None
     source_forecast_id: str | None = None
     source_forecast_version: str | None = None
+    source_retrospective_id: str | None = None
+    source_daily_review_revision: int | None = None
     revision: str = ""
 
     @property
@@ -89,6 +91,7 @@ class ForecastInitialStateResolver:
         local_today: date,
         *,
         previous_day_forecast: dict[str, Any] | None = None,
+        previous_day_terminal_override: dict[str, Any] | None = None,
         baseline_state: dict[str, Any] | None = None,
     ) -> ForecastInitialState:
         baseline_stress, baseline_vitality = self._baseline(baseline_state)
@@ -100,7 +103,16 @@ class ForecastInitialStateResolver:
             }
             return ForecastInitialState(**payload, revision=_revision(payload))
 
-        terminal = self._previous_terminal(previous_day_forecast)
+        terminal = None
+        if previous_day_terminal_override:
+            try:
+                terminal = (
+                    self._bounded(previous_day_terminal_override.get("stress_0_10"), baseline_stress),
+                    self._bounded(previous_day_terminal_override.get("vitality_0_10"), baseline_vitality),
+                )
+            except (TypeError, ValueError):
+                terminal = None
+        terminal = terminal or self._previous_terminal(previous_day_forecast)
         if terminal is None:
             payload = {
                 "mode": "profile_default",
@@ -110,14 +122,23 @@ class ForecastInitialStateResolver:
             return ForecastInitialState(**payload, revision=_revision(payload))
 
         stress, vitality = terminal
+        has_review = bool(previous_day_terminal_override)
         payload = {
-            "mode": "previous_day_forecast",
+            "mode": "previous_day_daily_review" if has_review else "previous_day_forecast",
             "stress_0_10": stress,
             "vitality_0_10": vitality,
             "source_local_date": (target - timedelta(days=1)).isoformat(),
             "source_forecast_id": str(previous_day_forecast.get("id") or ""),
             "source_forecast_version": str(
                 previous_day_forecast.get("forecast_version") or ""
+            ),
+            "source_retrospective_id": (
+                str(previous_day_terminal_override.get("retrospective_id") or "")
+                if has_review else None
+            ),
+            "source_daily_review_revision": (
+                int(previous_day_terminal_override.get("daily_review_revision") or 0)
+                if has_review else None
             ),
         }
         return ForecastInitialState(**payload, revision=_revision(payload))

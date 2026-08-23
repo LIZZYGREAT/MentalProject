@@ -1,4 +1,16 @@
 services:
+  migrate:
+    build:
+      context: ..
+      dockerfile: mindflow-bot-runtime/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
   claude-state-init:
     image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
     user: root
@@ -19,9 +31,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       claude-state-init:
         condition: service_completed_successfully
-    command: ["sh", "-c", "alembic upgrade head && exec python -m app.main"]
+    command: ["python", "-m", "app.main"]
     environment:
       CLAUDE_WORKDIR: /srv/claude-workspace
       CLAUDE_SETTINGS_PATH: /srv/claude-workspace/.claude/settings.json
@@ -45,6 +59,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command: ["python", "-m", "app.admin_web.main"]
     environment:
       ADMIN_PORT: 8081

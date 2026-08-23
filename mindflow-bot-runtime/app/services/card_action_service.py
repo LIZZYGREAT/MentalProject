@@ -43,10 +43,12 @@ class CardActionService:
         calendar: Any = None,
         *,
         timezone_name: str = "Asia/Shanghai",
+        daily_reviews: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
         self.timezone = ZoneInfo(timezone_name)
+        self.daily_reviews = daily_reviews
 
     @staticmethod
     def _fallback_event_id(
@@ -98,6 +100,28 @@ class CardActionService:
                 "ok": True,
                 "reply_text": "已加载今日日程。",
                 "card": today_calendar_card(events, local_date=today.isoformat()),
+            }
+        if action_name == "daily_review_submit":
+            if self.daily_reviews is None:
+                raise RuntimeError("daily review service is unavailable")
+            values = dict(form_value or {})
+            event_id = str(callback_event_id or "").strip() or self._fallback_event_id(
+                message_id, action, values
+            )
+            result = self.daily_reviews.submit(
+                participant_id,
+                callback_event_id=event_id,
+                action=action,
+                values=values,
+            )
+            response = result["response"]
+            return {
+                "ok": True,
+                "daily_review_response_id": response["id"],
+                "reply_text": (
+                    "每日回顾已记录并生成回顾估计。"
+                    if result["created"] else "这次每日回顾已记录，无需重复提交。"
+                ),
             }
         if (
             action_name != "submit_checkin"

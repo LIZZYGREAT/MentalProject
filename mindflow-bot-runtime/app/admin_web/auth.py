@@ -1,4 +1,4 @@
-"""Small single-admin password and signed-cookie authentication."""
+"""Password hashing and signed database-admin sessions."""
 
 from __future__ import annotations
 
@@ -54,6 +54,8 @@ class AdminSession:
     username: str
     expires_at: int
     csrf_token: str
+    user_id: str = ""
+    role: str = "viewer"
 
 
 class SessionSigner:
@@ -61,11 +63,15 @@ class SessionSigner:
         self.secret = secret.encode("utf-8")
         self.ttl_seconds = ttl_seconds
 
-    def issue(self, username: str) -> tuple[str, AdminSession]:
+    def issue(
+        self, username: str, *, user_id: str = "", role: str = "viewer"
+    ) -> tuple[str, AdminSession]:
         session = AdminSession(
             username=username,
             expires_at=int(time.time()) + self.ttl_seconds,
             csrf_token=secrets.token_urlsafe(24),
+            user_id=user_id,
+            role=role,
         )
         payload = _b64(
             json.dumps(
@@ -73,6 +79,8 @@ class SessionSigner:
                     "username": session.username,
                     "expires_at": session.expires_at,
                     "csrf_token": session.csrf_token,
+                    "user_id": session.user_id,
+                    "role": session.role,
                 },
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -93,6 +101,8 @@ class SessionSigner:
                 username=str(value["username"]),
                 expires_at=int(value["expires_at"]),
                 csrf_token=str(value["csrf_token"]),
+                user_id=str(value.get("user_id") or ""),
+                role=str(value.get("role") or "viewer"),
             )
             return session if session.expires_at >= int(time.time()) else None
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):

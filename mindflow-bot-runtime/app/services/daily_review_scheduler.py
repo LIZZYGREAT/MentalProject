@@ -1,0 +1,120 @@
+"""Durable, restart-safe 22:00 Daily Review card delivery."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, time, timezone
+import logging
+import uuid
+from zoneinfo import ZoneInfo
+
+from app.integrations.feishu.cards import daily_review_card
+from app.repositories import BindingRepository, ParticipantRepository
+from app.repositories_daily_review import DailyReviewScheduleRepository
+
+
+logger = logging.getLogger(__name__)
+
+
+class DailyReviewScheduler:
+    def __init__(
+        self, *, schedules: DailyReviewScheduleRepository,
+        participants: ParticipantRepository, bindings: BindingRepository,
+        sender: object, timezone_name: str = "Asia/Shanghai",
+        local_time: str = "22:00", poll_interval_seconds: int = 60,
+        retry_base_seconds: int = 60, max_attempts: int = 5,
+        claim_lease_seconds: int = 120,
+    ):
+        self.schedules = schedules
+        self.participants = participants
+        self.bindings = bindings
+        self.sender = sender
+        self.timezone = ZoneInfo(timezone_name)
+        hour, minute = (int(part) for part in local_time.split(":"))
+        self.local_time = time(hour, minute)
+        self.poll_interval_seconds = poll_interval_seconds
+        self.retry_base_seconds = retry_base_seconds
+        self.max_attempts = max_attempts
+        self.claim_lease_seconds = claim_lease_seconds
+        self._stop = asyncio.Event()
+        self.started = asyncio.Event()
+
+    async def run_once(self, now: datetime | None = None) -> dict[str, int]:
+        utc_now = now or datetime.now(timezone.utc)
+        if utc_now.tzinfo is None:
+            utc_now = utc_now.replace(tzinfo=timezone.utc)
+        local_now = utc_now.astimezone(self.timezone)
+        counts = {"ensured": 0, "sent": 0, "unavailable": 0, "failed": 0}
+        if local_now.time() >= self.local_time:
+            scheduled_local = datetime.combine(local_now.date(), self.local_time, self.timezone)
+            for participant_id in await asyncio.to_thread(self.participants.active_ids):
+                await asyncio.to_thread(
+                    self.schedules.ensure, participant_id, local_now.date(),
+                    scheduled_local.astimezone(timezone.utc),
+                )
+                counts["ensured"] += 1
+                binding = await asyncio.to_thread(
+                    self.bindings.get_for_participant, participant_id
+                )
+                if binding and binding.get("chat_id"):
+                    await asyncio.to_thread(
+                        self.schedules.reactivate_available, participant_id, utc_now
+                    )
+        claimed = await asyncio.to_thread(
+            self.schedules.claim_due, utc_now, self.claim_lease_seconds
+        )
+        for item in claimed:
+            binding = await asyncio.to_thread(
+                self.bindings.get_for_participant, uuid.UUID(item["participant_id"])
+            )
+            if not binding or not binding.get("chat_id"):
+                await asyncio.to_thread(
+                    self.schedules.mark_unavailable, item["id"], item["claim_token"],
+                    now=utc_now,
+                )
+                counts["unavailable"] += 1
+                continue
+            card = daily_review_card(
+                schedule_id=item["id"], local_date=item["local_date"],
+                card_version=item["card_version"],
+            )
+            try:
+                message_id = await asyncio.to_thread(
+                    self.sender.send_card, binding["chat_id"], card,
+                    message_uuid=item["id"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "daily_review_send_failed schedule_id=%s error_class=%s",
+                    item["id"], type(exc).__name__,
+                )
+                await asyncio.to_thread(
+                    self.schedules.mark_failed, item["id"], item["claim_token"],
+                    now=utc_now, error=exc, max_attempts=self.max_attempts,
+                    retry_base_seconds=self.retry_base_seconds,
+                )
+                counts["failed"] += 1
+                continue
+            await asyncio.to_thread(
+                self.schedules.mark_sent, item["id"], item["claim_token"],
+                now=utc_now, provider_message_id=message_id,
+            )
+            counts["sent"] += 1
+        return counts
+
+    async def run_forever(self) -> None:
+        self.started.set()
+        while not self._stop.is_set():
+            try:
+                await self.run_once()
+            except Exception:
+                logger.exception("daily_review_scheduler_iteration_failed")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.poll_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def close(self) -> None:
+        self._stop.set()

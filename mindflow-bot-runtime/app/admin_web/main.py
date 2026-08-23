@@ -11,12 +11,14 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from app.admin_web.api import AdminAPI
+from app.admin_web.admin_users import AdminUserRepository
 from app.admin_web.repositories import AdminRepository
 from app.bootstrap import build_business_services
 from app.config import Settings
 from app.db import Database, build_engine
 from app.repositories import AgentRunRepository
 from app.services.pressure_curve_service import PressureCurveService
+from app.services.daily_review_service import DailyReviewService
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -26,9 +28,17 @@ def create_app(
     database: Database,
     settings: Settings,
     pressure_curves: PressureCurveService | None = None,
+    daily_reviews: DailyReviewService | None = None,
 ) -> Starlette:
     settings.validate_admin()
-    api = AdminAPI(AdminRepository(database), settings, pressure_curves)
+    admin_users = AdminUserRepository(database)
+    admin_users.ensure_environment_superadmin(
+        settings.admin_username, settings.admin_password_hash
+    )
+    api = AdminAPI(
+        AdminRepository(database), settings, pressure_curves,
+        admin_users=admin_users, daily_reviews=daily_reviews,
+    )
 
     async def root(_request: Request):
         return RedirectResponse("/admin/")
@@ -59,7 +69,9 @@ def main() -> None:
     services = build_business_services(
         database, settings, AgentRunRepository(database)
     )
-    app = create_app(database, settings, services.pressure_curves)
+    app = create_app(
+        database, settings, services.pressure_curves, services.daily_reviews
+    )
     uvicorn.run(app, host=settings.admin_host, port=settings.admin_port)
 
 

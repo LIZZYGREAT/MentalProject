@@ -431,3 +431,131 @@ class RuntimeIncident(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class AdminUser(Base):
+    """Database-backed administrator; the environment account is the root of trust."""
+
+    __tablename__ = "admin_users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="viewer")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    is_environment_bootstrap: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class DailyReviewSchedule(Base):
+    __tablename__ = "daily_review_schedules"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "local_date", "card_version",
+            name="uq_daily_review_schedule_version",
+        ),
+        Index("ix_daily_review_schedule_due", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    card_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class DailyReviewResponse(Base):
+    __tablename__ = "daily_review_responses"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "callback_event_id", name="uq_daily_review_callback"),
+        UniqueConstraint("participant_id", "local_date", "revision", name="uq_daily_review_revision"),
+        Index("ix_daily_review_response_day", "participant_id", "local_date", "revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    card_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    schedule_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("daily_review_schedules.id", ondelete="SET NULL"), nullable=True
+    )
+    callback_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    start_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    start_energy: Mapped[float] = mapped_column(Float, nullable=False)
+    peak_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    peak_period: Mapped[str] = mapped_column(String(32), nullable=False)
+    end_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    end_energy: Mapped[float] = mapped_column(Float, nullable=False)
+    energy_consumption: Mapped[float] = mapped_column(Float, nullable=False)
+    main_stressor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recovery_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    free_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class RetrospectiveCurveSnapshot(Base):
+    __tablename__ = "retrospective_curve_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "local_date", "reconstruction_version",
+            name="uq_retrospective_reconstruction_version",
+        ),
+        Index("ix_retrospective_curve_day", "participant_id", "local_date", "generated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_forecast_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("forecast_snapshots.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    daily_review_response_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("daily_review_responses.id", ondelete="RESTRICT"), nullable=False
+    )
+    daily_review_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    observation_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    reconstruction_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    curve_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    analysis_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

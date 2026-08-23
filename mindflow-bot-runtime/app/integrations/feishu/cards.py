@@ -125,6 +125,78 @@ def daily_checkin_card() -> dict[str, Any]:
     }
 
 
+def daily_review_card(
+    *, schedule_id: str, local_date: str, card_version: str = "daily-review-v1"
+) -> dict[str, Any]:
+    """Fixed end-of-day review form; values are validated again server-side."""
+
+    scale_options = [
+        {"text": {"tag": "plain_text", "content": str(value)}, "value": str(value)}
+        for value in range(11)
+    ]
+    period_options = [
+        ("凌晨 00:00–06:00", "overnight"),
+        ("清晨 06:00–09:00", "early_morning"),
+        ("上午 09:00–12:00", "morning"),
+        ("中午 12:00–14:00", "noon"),
+        ("下午 14:00–18:00", "afternoon"),
+        ("晚上 18:00–22:00", "evening"),
+        ("夜间 22:00 以后", "late_night"),
+        ("不确定", "unknown"),
+    ]
+    fields = [
+        ("start_stress", "早晨起始压力"), ("start_energy", "早晨起始精力"),
+        ("peak_stress", "全天最高压力"), ("end_stress", "当前/收尾压力"),
+        ("end_energy", "当前/收尾精力"), ("energy_consumption", "全天精力消耗"),
+    ]
+    elements: list[dict[str, Any]] = []
+    for name, label in fields:
+        elements.append({
+            "tag": "select_static", "name": name, "required": True,
+            "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
+            "label": {"tag": "plain_text", "content": label},
+            "options": scale_options,
+        })
+    elements.insert(3, {
+        "tag": "select_static", "name": "peak_period", "required": True,
+        "placeholder": {"tag": "plain_text", "content": "选择大致时段"},
+        "label": {"tag": "plain_text", "content": "最高压力出现时段"},
+        "options": [
+            {"text": {"tag": "plain_text", "content": label}, "value": value}
+            for label, value in period_options
+        ],
+    })
+    for name, label, maximum in (
+        ("main_stressor", "主要压力来源（选填）", 300),
+        ("recovery_note", "有效恢复方式（选填）", 300),
+        ("free_text", "其他补充（选填）", 1000),
+    ):
+        elements.append({
+            "tag": "input", "name": name, "required": False, "max_length": maximum,
+            "placeholder": {"tag": "plain_text", "content": "可留空"},
+            "label": {"tag": "plain_text", "content": label},
+        })
+    elements.append({
+        "tag": "button", "name": "daily_review_submit",
+        "action_type": "form_submit", "type": "primary",
+        "text": {"tag": "plain_text", "content": "提交每日回顾"},
+        "value": {
+            "mindflow_action": "daily_review_submit", "version": "1",
+            "schedule_id": schedule_id, "local_date": local_date,
+            "card_version": card_version,
+        },
+    })
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": False, "enable_forward": False},
+        "header": {"template": "purple", "title": {"tag": "plain_text", "content": "MindFlow 每日回顾"}},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"回顾 **{local_date}**。这是回顾反馈，不会改写当天原始预测。"}},
+            {"tag": "form", "name": "mindflow_daily_review", "elements": elements},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "0 表示最低，10 表示最高；用于日常建模，不是医学诊断。"}]},
+        ],
+    }
+
+
 def pressure_curve_card(
     analysis: CurveAnalysis,
     *,
