@@ -16,6 +16,7 @@ from app.integrations.feishu.gateway import (
     InvalidBotEvent,
 )
 from app.integrations.feishu.receiver_process import receiver_process_main
+from app.integrations.feishu.receiver_process import _ExpectedLarkShutdownFilter
 from app.repositories import BindingRepository, BotEventRepository
 from helpers import memory_database
 
@@ -206,6 +207,31 @@ class DeviceFlowFakeChannel:
         self._bg_loop.close()
 
 
+class PendingBackgroundTaskFakeChannel(DeviceFlowFakeChannel):
+    """Expose an untracked SDK-loop task that must be cancelled and gathered."""
+
+    def __init__(self, task_started, task_cleaned, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.task_started = task_started
+        self.task_cleaned = task_cleaned
+
+    async def _background_task(self):
+        self.task_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.task_cleaned.set()
+
+    def start(self):
+        self._bg_thread.start()
+        asyncio.run_coroutine_threadsafe(
+            self._background_task(), self._bg_loop
+        )
+        assert self.task_started.wait(5.0)
+        self.is_ready = True
+        self._start_unblocked.wait(5.0)
+
+
 def receiver_exits_after_ready(
     _app_id, _app_secret, output_queue, _stop_event, _channel_factory, *_args
 ):
@@ -246,16 +272,16 @@ def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):
     )
 
     async def scenario():
-        await gateway.start()
-        assert gateway.is_running
-        event = await asyncio.wait_for(queue.get(), timeout=2)
-        assert event.event_id == "msg-channel"
-        await gateway.stop()
-        assert not gateway.is_running
-        await gateway.start()
-        assert gateway.is_running
-        await gateway.stop()
-        assert not gateway.is_running
+        for cycle in range(3):
+            await gateway.start()
+            assert gateway.is_running
+            process = gateway._process
+            if cycle == 0:
+                event = await asyncio.wait_for(queue.get(), timeout=2)
+                assert event.event_id == "msg-channel"
+            await gateway.stop()
+            assert not gateway.is_running
+            assert process is not None and process.exitcode == 0
 
     with caplog.at_level("INFO"):
         asyncio.run(scenario())
@@ -265,6 +291,33 @@ def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):
     ]
     assert ready_records
     assert all("receiver_pid=" in message for message in ready_records)
+    assert not any(
+        "feishu_receiver_graceful_stop_timed_out" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_lark_normal_close_is_filtered_only_during_shutdown():
+    shutdown_in_progress = threading.Event()
+    log_filter = _ExpectedLarkShutdownFilter(shutdown_in_progress)
+
+    def record(message):
+        return __import__("logging").LogRecord(
+            "Lark", __import__("logging").ERROR, __file__, 1, message, (), None
+        )
+
+    normal_close = record(
+        "receive message loop exit, err: sent 1000 (OK); "
+        "then received 1000 (OK) bye"
+    )
+    assert log_filter.filter(normal_close)
+
+    shutdown_in_progress.set()
+    assert not log_filter.filter(normal_close)
+    assert log_filter.filter(
+        record("receive message loop exit, err: received 1006 (abnormal closure)")
+    )
+    assert log_filter.filter(record("endpoint discovery failed with status 500"))
 
 
 def test_gateway_stop_waits_for_receiver_channel_cleanup():
@@ -375,6 +428,51 @@ def test_gateway_precloses_sdk_device_flow_before_public_stop():
     asyncio.run(scenario())
 
 
+def test_gateway_drains_untracked_sdk_background_tasks_before_loop_close():
+    context = multiprocessing.get_context("spawn")
+    close_started = context.Event()
+    close_allowed = context.Event()
+    close_finished = context.Event()
+    public_stop_called = context.Event()
+    task_started = context.Event()
+    task_cleaned = context.Event()
+    close_allowed.set()
+    database = memory_database()
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        asyncio.Queue(maxsize=2),
+        channel_factory=partial(
+            PendingBackgroundTaskFakeChannel,
+            task_started,
+            task_cleaned,
+            close_started,
+            close_allowed,
+            close_finished,
+            public_stop_called,
+        ),
+        process_context=context,
+        start_timeout_seconds=5,
+        stop_timeout_seconds=3,
+        device_flow_close_timeout_seconds=1,
+        channel_sdk_version="1.2.0",
+    )
+
+    async def scenario():
+        await gateway.start()
+        process = gateway._process
+        await gateway.stop()
+        assert task_started.is_set()
+        assert task_cleaned.is_set()
+        assert close_finished.is_set()
+        assert public_stop_called.is_set()
+        assert process is not None and process.exitcode == 0
+
+    asyncio.run(scenario())
+
+
 def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
     context = multiprocessing.get_context("spawn")
     close_started = context.Event()
@@ -413,7 +511,7 @@ def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
                 await gateway.stop()
             assert close_started.is_set()
             assert close_finished.is_set()
-            assert not public_stop_called.is_set()
+            assert public_stop_called.is_set()
             assert not gateway.is_running
             await asyncio.sleep(0)
             assert not any(

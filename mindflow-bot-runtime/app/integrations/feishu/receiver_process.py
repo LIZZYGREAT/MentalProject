@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 from typing import Any, Callable
 
@@ -24,6 +25,26 @@ def _drain_loop(loop: asyncio.AbstractEventLoop) -> None:
         task.cancel()
     if pending:
         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
+_WS_CLOSE_CODE = re.compile(r"\b(?:sent|received)\s+(\d{3,4})\b", re.IGNORECASE)
+
+
+class _ExpectedLarkShutdownFilter(logging.Filter):
+    """Drop only normal WebSocket closure errors emitted during teardown."""
+
+    def __init__(self, shutdown_in_progress: threading.Event):
+        super().__init__()
+        self._shutdown_in_progress = shutdown_in_progress
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self._shutdown_in_progress.is_set():
+            return True
+        message = record.getMessage()
+        if "receive message loop exit" not in message.lower():
+            return True
+        close_codes = _WS_CLOSE_CODE.findall(message)
+        return not close_codes or any(code != "1000" for code in close_codes)
 
 
 def receiver_process_main(
@@ -51,11 +72,16 @@ def receiver_process_main(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     logger = logging.getLogger(__name__)
+    shutdown_in_progress = threading.Event()
 
     if channel_factory is None:
         from lark_channel import FeishuChannel
 
         channel_factory = FeishuChannel
+
+    lark_logger = logging.getLogger("Lark")
+    shutdown_filter = _ExpectedLarkShutdownFilter(shutdown_in_progress)
+    lark_logger.addFilter(shutdown_filter)
 
     from app.integrations.feishu.gateway import (
         FeishuChannelMessageAdapter,
@@ -83,6 +109,7 @@ def receiver_process_main(
             if owns_stop:
                 stop_started = True
         if owns_stop:
+            shutdown_in_progress.set()
             try:
                 stop_feishu_channel_cleanly(
                     channel,
@@ -161,6 +188,7 @@ def receiver_process_main(
             monitor.join()
         _drain_loop(receiver_loop)
         receiver_loop.close()
+        lark_logger.removeFilter(shutdown_filter)
         if lifecycle_error is not None:
             output_queue.put(
                 {
