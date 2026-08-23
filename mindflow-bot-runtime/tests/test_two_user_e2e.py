@@ -341,6 +341,6 @@ def test_progress_is_backend_controlled_and_final_reply_remains_separate():
 
     asyncio.run(scenario())
     assert sender.sent[-2:] == [
-        ("oc_1", "正在读取今天的数据并进行评估……"),
+        ("oc_1", "我正在结合今天的信息进行评估。"),
         ("oc_1", "final assessment"),
     ]

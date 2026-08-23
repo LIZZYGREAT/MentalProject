@@ -9,6 +9,11 @@ from app.agent.sdk_adapter import (
     ToolProgressCallback,
 )
 from app.agent.session_manager import ParticipantSessionManager
+from app.presentation.contracts import (
+    AgentActivityCallback,
+    AgentActivityEvent,
+    RuntimeResponse,
+)
 from app.repositories import ConversationRepository
 from app.services.safety_service import SafetyService
 
@@ -38,8 +43,9 @@ class ClaudeAgentRuntime:
         text: str,
         *,
         chat_type: str = "p2p",
+        on_activity: AgentActivityCallback | None = None,
         on_tool_use: ToolProgressCallback | None = None,
-    ) -> str:
+    ) -> RuntimeResponse:
         self.conversations.add(
             ctx.participant_id,
             "user",
@@ -49,10 +55,20 @@ class ClaudeAgentRuntime:
         fixed = self.safety.precheck(text, chat_type=chat_type)
         if fixed is not None:
             self._save_answer(ctx, fixed)
-            return fixed
+            return RuntimeResponse(
+                text=fixed,
+                safety_locked=True,
+                response_kind="fixed",
+            )
+        if on_activity is None and on_tool_use is not None:
+            async def legacy_activity(event: AgentActivityEvent) -> None:
+                if event.kind == "tool_started" and event.tool_name:
+                    await on_tool_use(event.tool_name)
+
+            on_activity = legacy_activity
         try:
             result = await self.sessions.submit(
-                ctx, text, on_tool_use=on_tool_use
+                ctx, text, on_activity=on_activity
             )
         except ClaudeSDKTurnInterrupted as exc:
             self._save_answer(ctx, FALLBACK_INTERRUPTED)
@@ -62,7 +78,11 @@ class ClaudeAgentRuntime:
             raise
         answer = self.safety.postcheck(result.text)
         self._save_answer(ctx, answer)
-        return answer
+        return RuntimeResponse(
+            text=answer,
+            safety_locked=False,
+            response_kind="conversation",
+        )
 
     async def interrupt(self, participant_id) -> bool:
         return await self.sessions.interrupt(participant_id)

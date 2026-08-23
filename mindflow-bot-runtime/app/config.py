@@ -70,9 +70,20 @@ class Settings:
     agent_session_idle_seconds: int = 120
     claude_timeout_seconds: int = 90
     claude_max_turns: int = 8
-    progress_delay_seconds: int = 6
-    progress_cooldown_seconds: int = 8
+    progress_delay_seconds: int = 3
+    progress_cooldown_seconds: int = 3
     progress_max_messages: int = 2
+    response_segmentation_enabled: bool = True
+    response_segment_min_total_chars: int = 320
+    response_segment_target_chars: int = 260
+    response_segment_max_chars: int = 650
+    response_max_segments: int = 3
+    presentation_agent_enabled: bool = True
+    presentation_agent_min_chars: int = 600
+    presentation_agent_timeout_seconds: float = 4.0
+    presentation_agent_max_segments: int = 3
+    presentation_model: str = ""
+    claude_partial_messages_enabled: bool = False
     feishu_send_max_retries: int = 1
     feishu_gateway_start_timeout_seconds: int = 30
     feishu_gateway_stop_timeout_seconds: int = 8
@@ -225,11 +236,45 @@ class Settings:
             ),
             claude_timeout_seconds=_int(values, "CLAUDE_TIMEOUT_SECONDS", 90),
             claude_max_turns=_int(values, "CLAUDE_MAX_TURNS", 8),
-            progress_delay_seconds=_int(values, "PROGRESS_DELAY_SECONDS", 6),
+            progress_delay_seconds=_int(values, "PROGRESS_DELAY_SECONDS", 3),
             progress_cooldown_seconds=_int(
-                values, "PROGRESS_COOLDOWN_SECONDS", 8
+                values, "PROGRESS_COOLDOWN_SECONDS", 3
             ),
             progress_max_messages=_int(values, "PROGRESS_MAX_MESSAGES", 2),
+            response_segmentation_enabled=_bool(
+                values, "RESPONSE_SEGMENTATION_ENABLED", True
+            ),
+            response_segment_min_total_chars=_int(
+                values, "RESPONSE_SEGMENT_MIN_TOTAL_CHARS", 320
+            ),
+            response_segment_target_chars=_int(
+                values, "RESPONSE_SEGMENT_TARGET_CHARS", 260
+            ),
+            response_segment_max_chars=_int(
+                values, "RESPONSE_SEGMENT_MAX_CHARS", 650
+            ),
+            response_max_segments=_int(
+                values, "RESPONSE_MAX_SEGMENTS", 3
+            ),
+            presentation_agent_enabled=_bool(
+                values, "PRESENTATION_AGENT_ENABLED", True
+            ),
+            presentation_agent_min_chars=_int(
+                values, "PRESENTATION_AGENT_MIN_CHARS", 600
+            ),
+            presentation_agent_timeout_seconds=_float(
+                values, "PRESENTATION_AGENT_TIMEOUT_SECONDS", 4.0, minimum=0.1
+            ),
+            presentation_agent_max_segments=_int(
+                values, "PRESENTATION_AGENT_MAX_SEGMENTS", 3
+            ),
+            presentation_model=(
+                values.get("PRESENTATION_MODEL", "").strip()
+                or values.get("CLAUDE_CODE_SUBAGENT_MODEL", "").strip()
+            ),
+            claude_partial_messages_enabled=_bool(
+                values, "CLAUDE_PARTIAL_MESSAGES_ENABLED", False
+            ),
             feishu_send_max_retries=_int(
                 values, "FEISHU_SEND_MAX_RETRIES", 1, minimum=0
             ),
@@ -350,3 +395,11 @@ class Settings:
             raise ValueError("FORECAST_DAILY_PREPARE_LOCAL_TIME must be HH:MM")
         if self.semantic_materiality_threshold > 1.0:
             raise ValueError("SEMANTIC_MATERIALITY_THRESHOLD must be <= 1")
+        if self.response_segment_target_chars > self.response_segment_max_chars:
+            raise ValueError(
+                "RESPONSE_SEGMENT_TARGET_CHARS must be <= RESPONSE_SEGMENT_MAX_CHARS"
+            )
+        if self.response_max_segments > 3:
+            raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
+        if self.presentation_agent_max_segments > 3:
+            raise ValueError("PRESENTATION_AGENT_MAX_SEGMENTS must be <= 3")

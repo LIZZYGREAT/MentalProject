@@ -122,6 +122,10 @@ async def run() -> None:
     )
     from app.services.forecast_scheduler import ForecastScheduler
     from app.services.safety_service import SafetyService
+    from app.presentation.presentation_agent import ProductionPresentationAgent
+    from app.presentation.progress_presenter import ProgressPresenter
+    from app.presentation.response_orchestrator import ResponseOrchestrator
+    from app.presentation.semantic_segmenter import SemanticSegmenter
     from app.worker import BotWorker
     from app.logging_security import install_credential_redaction
 
@@ -160,6 +164,7 @@ async def run() -> None:
         base_url=settings.claude_anthropic_base_url,
         auth_token=settings.deepseek_api_key,
         max_turns=settings.claude_max_turns,
+        partial_messages_enabled=settings.claude_partial_messages_enabled,
     )
     factory.validate()
     sessions = ParticipantSessionManager(
@@ -174,6 +179,37 @@ async def run() -> None:
         sessions,
         business.conversations,
         SafetyService(),
+    )
+    presentation_agent = (
+        ProductionPresentationAgent(
+            workdir=settings.claude_workdir,
+            model=settings.presentation_model,
+            base_url=settings.claude_anthropic_base_url,
+            auth_token=settings.deepseek_api_key,
+            opus_model=settings.claude_default_opus_model,
+            sonnet_model=settings.claude_default_sonnet_model,
+            haiku_model=settings.claude_default_haiku_model,
+        )
+        if settings.presentation_agent_enabled
+        else None
+    )
+    response_orchestrator = ResponseOrchestrator(
+        segmenter=SemanticSegmenter(
+            enabled=settings.response_segmentation_enabled,
+            min_total_chars=settings.response_segment_min_total_chars,
+            target_chars=settings.response_segment_target_chars,
+            max_chars=settings.response_segment_max_chars,
+            max_segments=settings.response_max_segments,
+        ),
+        presentation_agent=presentation_agent,
+        presentation_agent_enabled=settings.presentation_agent_enabled,
+        presentation_agent_min_chars=settings.presentation_agent_min_chars,
+        presentation_agent_timeout_seconds=(
+            settings.presentation_agent_timeout_seconds
+        ),
+        presentation_agent_max_segments=(
+            settings.presentation_agent_max_segments
+        ),
     )
 
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(
@@ -191,6 +227,8 @@ async def run() -> None:
         business.device_flows,
         business.presentations,
         model=f"claude-code/{settings.claude_model}",
+        progress_presenter=ProgressPresenter(),
+        response_orchestrator=response_orchestrator,
         max_retries=settings.feishu_send_max_retries,
         progress_delay_seconds=settings.progress_delay_seconds,
         progress_cooldown_seconds=settings.progress_cooldown_seconds,

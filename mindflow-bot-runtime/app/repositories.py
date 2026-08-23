@@ -58,6 +58,16 @@ class RecoverableBotEvent:
 
 
 @dataclass(frozen=True)
+class PendingReplyPlan:
+    event_id: str
+    full_text: str
+    segments: tuple[str, ...]
+    next_segment: int
+    message_ids: tuple[str, ...]
+    plan_version: str
+
+
+@dataclass(frozen=True)
 class ClaudeSessionView:
     participant_id: uuid.UUID
     session_id: str
@@ -1572,12 +1582,119 @@ class BotEventRepository:
                 return None
             return row.reply_text
 
+    def pending_reply_plan(self, event_id: str) -> PendingReplyPlan | None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id)
+            if row is None or row.status != "reply_pending":
+                return None
+            raw_segments = row.reply_segments_json
+            if isinstance(raw_segments, list) and raw_segments:
+                segments = tuple(str(item) for item in raw_segments if str(item))
+                version = str(row.reply_plan_version or "response-plan-v1")
+            elif row.reply_text:
+                segments = (str(row.reply_text),)
+                version = "legacy-single-v1"
+            else:
+                return None
+            next_segment = max(0, min(int(row.reply_next_segment or 0), len(segments)))
+            message_ids = tuple(
+                str(item) for item in (row.reply_message_ids_json or []) if item
+            )
+            return PendingReplyPlan(
+                event_id=row.event_id,
+                full_text=str(row.reply_text or "\n\n".join(segments)),
+                segments=segments,
+                next_segment=next_segment,
+                message_ids=message_ids,
+                plan_version=version,
+            )
+
+    def stage_reply_plan(
+        self,
+        event_id: str,
+        *,
+        full_text: str,
+        segments: list[str] | tuple[str, ...],
+        plan_version: str = "response-plan-v1",
+    ) -> None:
+        normalized = [str(item) for item in segments if str(item)]
+        if not normalized:
+            raise ValueError("reply plan must contain at least one segment")
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None:
+                return
+            if row.status == "reply_pending" and row.reply_segments_json:
+                return
+            row.reply_text = str(full_text)
+            row.reply_segments_json = normalized
+            row.reply_next_segment = 0
+            row.reply_message_ids_json = []
+            row.reply_plan_version = str(plan_version)[:32]
+            row.status = "reply_pending"
+            row.error_code = None
+
+    def mark_reply_segment_sent(
+        self,
+        event_id: str,
+        *,
+        segment_index: int,
+        message_id: str,
+    ) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status != "reply_pending":
+                return
+            current = int(row.reply_next_segment or 0)
+            if current > segment_index:
+                return
+            if current != segment_index:
+                raise ValueError("reply segments must be recorded in order")
+            message_ids = list(row.reply_message_ids_json or [])
+            if len(message_ids) == segment_index:
+                message_ids.append(str(message_id)[:128])
+            elif len(message_ids) > segment_index:
+                message_ids[segment_index] = str(message_id)[:128]
+            else:
+                raise ValueError("reply message id history is inconsistent")
+            row.reply_message_ids_json = message_ids
+            row.reply_next_segment = segment_index + 1
+            row.reply_message_id = str(message_id)[:128]
+            row.error_code = None
+
+    def finish_reply_plan(self, event_id: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None:
+                return
+            segments = row.reply_segments_json or (
+                [row.reply_text] if row.reply_text else []
+            )
+            if int(row.reply_next_segment or 0) < len(segments):
+                raise ValueError("reply plan is not fully delivered")
+            row.status = "completed"
+            row.error_code = None
+            row.processed_at = utc_now()
+
+    def cancel_reply_plan(self, event_id: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "completed":
+                return
+            row.status = "interrupted"
+            row.error_code = "stopped"
+            row.processed_at = utc_now()
+
     def stage_reply(self, event_id: str, text: str) -> None:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
             row.reply_text = str(text)[:4000]
+            row.reply_segments_json = None
+            row.reply_next_segment = 0
+            row.reply_message_ids_json = None
+            row.reply_plan_version = None
             row.status = "reply_pending"
             row.error_code = None
 

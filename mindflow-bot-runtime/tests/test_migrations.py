@@ -44,3 +44,9 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0009_learned_model_profiles"
     )
     assert migration_0009.down_revision == "0008_forecast_observation_revision"
+    migration_0010 = next(
+        migration for migration in migrations
+        if migration.revision == "0010_response_delivery"
+    )
+    assert migration_0010.down_revision == "0009_learned_model_profiles"
+    assert len(migration_0010.revision) <= 32

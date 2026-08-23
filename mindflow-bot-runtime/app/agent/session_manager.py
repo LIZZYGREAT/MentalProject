@@ -17,6 +17,10 @@ from app.agent.sdk_adapter import (
     ToolProgressCallback,
 )
 from app.agent.sdk_mcp import TurnContextBinding
+from app.presentation.contracts import (
+    AgentActivityCallback,
+    AgentActivityEvent,
+)
 from app.repositories import ClaudeSessionRepository
 
 
@@ -28,7 +32,7 @@ class ParticipantQueueFull(ClaudeSDKInvocationError):
 class TurnRequest:
     ctx: AgentContext
     text: str
-    on_tool_use: ToolProgressCallback | None
+    on_activity: AgentActivityCallback | None
     future: asyncio.Future[ClaudeTurnResult]
 
 
@@ -71,6 +75,7 @@ class ParticipantSessionManager:
         ctx: AgentContext,
         text: str,
         *,
+        on_activity: AgentActivityCallback | None = None,
         on_tool_use: ToolProgressCallback | None = None,
     ) -> ClaudeTurnResult:
         if self._closing:
@@ -84,10 +89,16 @@ class ParticipantSessionManager:
                     queue=asyncio.Queue(maxsize=self.input_queue_size),
                 )
                 self._sessions[ctx.participant_id] = session
+            if on_activity is None and on_tool_use is not None:
+                async def legacy_activity(event: AgentActivityEvent) -> None:
+                    if event.kind == "tool_started" and event.tool_name:
+                        await on_tool_use(event.tool_name)
+
+                on_activity = legacy_activity
             request = TurnRequest(
                 ctx=ctx,
                 text=str(text),
-                on_tool_use=on_tool_use,
+                on_activity=on_activity,
                 future=loop.create_future(),
             )
             try:
@@ -139,10 +150,19 @@ class ParticipantSessionManager:
                 try:
                     client = await self._ensure_client(session)
                     session.binding.current = request.ctx
+                    session.binding.activity_callback = request.on_activity
                     async with self._lock:
                         session.state = "running"
+
+                    async def legacy_tool_started(tool_name: str) -> None:
+                        await session.binding.emit(
+                            AgentActivityEvent(
+                                kind="tool_started", tool_name=tool_name
+                            )
+                        )
+
                     result = await asyncio.wait_for(
-                        client.run_turn(request.text, request.on_tool_use),
+                        client.run_turn(request.text, legacy_tool_started),
                         timeout=self.turn_timeout_seconds,
                     )
                     self.repository.save(
@@ -173,6 +193,7 @@ class ParticipantSessionManager:
                         )
                 finally:
                     session.binding.current = None
+                    session.binding.activity_callback = None
                     session.active_request = None
                     session.last_active_at = time.monotonic()
                     async with self._lock:

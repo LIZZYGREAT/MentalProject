@@ -42,6 +42,26 @@ def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
     assert enabled.profile_calibration_enabled is True
 
 
+def test_response_ux_defaults_and_presentation_model_fallback():
+    settings = Settings.from_env(
+        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.progress_delay_seconds == 3
+    assert settings.progress_cooldown_seconds == 3
+    assert settings.progress_max_messages == 2
+    assert settings.response_segmentation_enabled is True
+    assert settings.response_segment_min_total_chars == 320
+    assert settings.response_segment_target_chars == 260
+    assert settings.response_segment_max_chars == 650
+    assert settings.response_max_segments == 3
+    assert settings.presentation_agent_enabled is True
+    assert settings.presentation_agent_min_chars == 600
+    assert settings.presentation_agent_timeout_seconds == 4
+    assert settings.presentation_model == "deepseek-v4-flash"
+    assert settings.claude_partial_messages_enabled is False
+
+
 def test_haiku_and_subagent_must_use_the_same_model():
     environment = valid_environment()
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = "wrong-model"

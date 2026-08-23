@@ -7,7 +7,9 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Protocol
 
 from app.agent.claude_runtime import (
@@ -22,6 +24,15 @@ from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
 from app.integrations.feishu.oauth import DeviceFlowService
 from app.repositories import AgentRunRepository, BotEventRepository
+from app.presentation.contracts import (
+    AgentActivityCallback,
+    AgentActivityEvent,
+    ResponsePlan,
+    ResponseSegment,
+    RuntimeResponse,
+)
+from app.presentation.progress_presenter import ProgressPresenter
+from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import PresentationOutbox
 from app.services.presentation_service import PendingImageCard
 
@@ -33,20 +44,6 @@ CALENDAR_CONNECT_PATTERN = re.compile(
 )
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
 
-TOOL_PROGRESS_TEXT = {
-    "care_get_today_context": "正在读取已记录的状态……",
-    "care_get_recent_state": "正在读取最近的状态记录……",
-    "care_run_today_assessment": "正在读取今天的数据并进行评估……",
-    "care_get_pressure_curve": "正在生成今天的压力曲线卡片……",
-    "care_get_checkin_card": "正在准备状态记录卡片……",
-    "calendar_connection_status": "正在检查日历连接状态……",
-    "calendar_list_calendars": "正在读取可用日历……",
-    "calendar_list_events": "正在读取日程……",
-    "calendar_create_event": "正在创建日程……",
-    "calendar_update_event": "正在更新日程……",
-    "calendar_delete_event": "正在删除日程……",
-}
-
 ProgressCallback = Callable[[str], Awaitable[None]]
 
 
@@ -57,8 +54,9 @@ class AgentRuntimeProtocol(Protocol):
         text: str,
         *,
         chat_type: str = "p2p",
+        on_activity: AgentActivityCallback | None = None,
         on_tool_use: ProgressCallback | None = None,
-    ) -> str: ...
+    ) -> RuntimeResponse: ...
 
     async def interrupt(self, participant_id) -> bool: ...
 
@@ -67,11 +65,19 @@ class AgentRuntimeProtocol(Protocol):
 class ProgressState:
     sent: int = 0
     last_sent_at: float = 0.0
+    used_tools: set[str] = field(default_factory=set)
+    sent_keys: set[str] = field(default_factory=set)
+    last_stage: str | None = None
+    first_activity_at: float | None = None
+    first_tool_started_at: float | None = None
+    tool_started_at: dict[str, float] = field(default_factory=dict)
+    tool_durations_ms: list[float] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _log(status: str, **fields: object) -> None:
-    safe = {
+    safe: dict[str, object] = {
+        "event": fields.get("event", "response_delivery_completed"),
         "status": status,
         "participant_id": fields.get("participant_id"),
         "message_id": fields.get("message_id"),
@@ -80,6 +86,21 @@ def _log(status: str, **fields: object) -> None:
         "tool_name": fields.get("tool_name"),
         "latency_ms": fields.get("latency_ms"),
     }
+    for name in (
+        "received_to_agent_start_ms",
+        "agent_start_to_first_activity_ms",
+        "first_tool_start_ms",
+        "tool_duration_ms",
+        "agent_result_ms",
+        "presentation_ms",
+        "card_upload_ms",
+        "first_final_send_ms",
+        "total_delivery_ms",
+        "segment_count",
+        "presentation_agent_used",
+    ):
+        if fields.get(name) is not None:
+            safe[name] = fields[name]
     logger.info(json.dumps(safe, ensure_ascii=False))
 
 
@@ -97,9 +118,11 @@ class BotWorker:
         presentations: PresentationOutbox | None = None,
         *,
         model: str,
+        progress_presenter: ProgressPresenter | None = None,
+        response_orchestrator: ResponseOrchestrator | None = None,
         max_retries: int = 1,
-        progress_delay_seconds: int = 6,
-        progress_cooldown_seconds: int = 8,
+        progress_delay_seconds: int = 3,
+        progress_cooldown_seconds: int = 3,
         progress_max_messages: int = 2,
     ):
         self.queue = queue
@@ -111,6 +134,8 @@ class BotWorker:
         self.sender = sender
         self.device_flows = device_flows
         self.presentations = presentations
+        self.progress_presenter = progress_presenter or ProgressPresenter()
+        self.response_orchestrator = response_orchestrator or ResponseOrchestrator()
         self.model = model
         self.max_retries = max_retries
         self.progress_delay_seconds = progress_delay_seconds
@@ -118,6 +143,8 @@ class BotWorker:
         self.progress_max_messages = progress_max_messages
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._active_event_by_participant: dict[object, str] = {}
+        self._cancelled_participants: set[object] = set()
 
     def resume_device_flow(self, participant_id) -> None:
         if self.device_flows is None:
@@ -178,9 +205,13 @@ class BotWorker:
         agent_task: asyncio.Task[None] | None = None
         async with lock:
             participant = self.identity.resolve(event.app_id, event.open_id)
-            pending_reply = self.events.pending_reply(event.event_id)
-            if pending_reply is not None:
-                await self._deliver(event, pending_reply)
+            pending_plan = self.events.pending_reply_plan(event.event_id)
+            if pending_plan is not None:
+                await self._resume_delivery_plan(
+                    event,
+                    pending_plan,
+                    participant_id=(participant.id if participant is not None else None),
+                )
                 return
             self.events.set_processing(
                 event.event_id, participant.id if participant is not None else None
@@ -219,6 +250,10 @@ class BotWorker:
                 await self._deliver(event, "当前飞书账号已经绑定。")
                 return
             if STOP_PATTERN.match(event.text):
+                self._cancelled_participants.add(participant.id)
+                active_event_id = self._active_event_by_participant.get(participant.id)
+                if active_event_id:
+                    self.events.cancel_reply_plan(active_event_id)
                 interrupt = getattr(self.runtime, "interrupt", None)
                 stopped = await interrupt(participant.id) if interrupt else False
                 await self._deliver(
@@ -253,6 +288,7 @@ class BotWorker:
                 return
 
             skill = self.skill_loader.current()
+            self._cancelled_participants.discard(participant.id)
             run_id = self.runs.start(
                 participant.id,
                 event.message_id,
@@ -273,17 +309,33 @@ class BotWorker:
                 self._run_agent(event, ctx, run_id),
                 name=f"agent-turn-{event.event_id}",
             )
+            self._active_event_by_participant[participant.id] = event.event_id
         if agent_task is not None:
             await agent_task
 
     async def _run_agent(self, event: BotEvent, ctx: AgentContext, run_id) -> None:
         started = time.monotonic()
         progress = ProgressState()
+        message_created_at = event.create_time
+        if message_created_at.tzinfo is None:
+            message_created_at = message_created_at.replace(tzinfo=timezone.utc)
+        metrics: dict[str, object] = {
+            "received_to_agent_start_ms": max(
+                0.0,
+                round(
+                    (datetime.now(timezone.utc) - message_created_at).total_seconds()
+                    * 1000,
+                    1,
+                ),
+            )
+        }
 
-        async def emit(text: str) -> None:
+        async def emit(text: str, *, key: str) -> None:
             async with progress.lock:
                 now = time.monotonic()
                 if progress.sent >= self.progress_max_messages:
+                    return
+                if key in progress.sent_keys:
                     return
                 if (
                     progress.sent
@@ -291,41 +343,86 @@ class BotWorker:
                 ):
                     return
                 try:
-                    await self._send(event.chat_id, text)
+                    await self._send(
+                        event.chat_id,
+                        text,
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:progress:{event.event_id}:{key}"
+                        ),
+                    )
                 except FeishuSendError:
                     return
                 progress.sent += 1
                 progress.last_sent_at = now
+                progress.sent_keys.add(key)
 
         async def delayed_progress() -> None:
             await asyncio.sleep(self.progress_delay_seconds)
-            await emit("正在处理，请稍候……")
+            suggestion = self.progress_presenter.delayed(
+                event.text, state=progress
+            )
+            if suggestion:
+                await emit(suggestion, key="delayed")
+
+        async def on_activity(activity: AgentActivityEvent) -> None:
+            now = time.monotonic()
+            if progress.first_activity_at is None:
+                progress.first_activity_at = now
+            tool_name = str(activity.tool_name or "")
+            if tool_name:
+                progress.used_tools.add(tool_name)
+            if activity.kind == "tool_started" and tool_name:
+                if progress.first_tool_started_at is None:
+                    progress.first_tool_started_at = now
+                progress.tool_started_at[tool_name] = now
+            elif activity.kind in {"tool_succeeded", "tool_failed"} and tool_name:
+                tool_started = progress.tool_started_at.pop(tool_name, None)
+                if tool_started is not None:
+                    progress.tool_durations_ms.append(
+                        round((now - tool_started) * 1000, 1)
+                    )
+            suggestion = self.progress_presenter.present(activity, state=progress)
+            if suggestion:
+                await emit(
+                    suggestion,
+                    key=self.progress_presenter.key_for(activity, state=progress),
+                )
 
         async def on_tool_use(tool_name: str) -> None:
-            text = TOOL_PROGRESS_TEXT.get(tool_name)
-            if text:
-                await emit(text)
+            await on_activity(
+                AgentActivityEvent(kind="tool_started", tool_name=tool_name)
+            )
 
         timer = asyncio.create_task(delayed_progress())
         try:
-            answer = await self.runtime.handle_message(
+            agent_started = time.monotonic()
+            response = await self.runtime.handle_message(
                 ctx,
                 event.text,
                 chat_type=event.chat_type,
+                on_activity=on_activity,
                 on_tool_use=on_tool_use,
             )
+            metrics["agent_result_ms"] = round(
+                (time.monotonic() - agent_started) * 1000, 1
+            )
+            if ctx.participant_id in self._cancelled_participants:
+                raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
             cards = (
                 self.presentations.take_cards(run_id)
                 if self.presentations is not None
                 else []
             )
             card_delivery_failed = False
+            delivered_cards: list[object] = []
+            card_started = time.monotonic()
             for card in cards:
                 try:
                     if isinstance(card, PendingImageCard):
                         await self._send_image_card(event.chat_id, card)
                     else:
                         await self._send_card(event.chat_id, card)
+                    delivered_cards.append(card)
                 except FeishuSendError as exc:
                     card_delivery_failed = True
                     logger.warning(
@@ -336,10 +433,39 @@ class BotWorker:
                         exc.code,
                         exc.retryable,
                     )
+            metrics["card_upload_ms"] = round(
+                (time.monotonic() - card_started) * 1000, 1
+            )
             if card_delivery_failed:
-                answer = answer + "\n\n卡片暂时未能发送，请稍后再试。"
+                authoritative = (
+                    response
+                    if isinstance(response, RuntimeResponse)
+                    else RuntimeResponse(text=str(response))
+                )
+                response = RuntimeResponse(
+                    text=authoritative.text + "\n\n卡片暂时未能发送，请稍后再试。",
+                    safety_locked=authoritative.safety_locked,
+                    response_kind=authoritative.response_kind,
+                )
+            presentation_started = time.monotonic()
+            plan = await self.response_orchestrator.build_plan(
+                response,
+                cards=delivered_cards,
+                used_tools=progress.used_tools,
+            )
+            metrics["presentation_ms"] = round(
+                (time.monotonic() - presentation_started) * 1000, 1
+            )
+            metrics["segment_count"] = len(plan.segments)
+            metrics["presentation_agent_used"] = plan.presentation_agent_used
             self.runs.finish(run_id, "succeeded")
-            delivered = await self._deliver(event, answer)
+            delivered = await self._deliver_plan(
+                event,
+                plan,
+                participant_id=ctx.participant_id,
+                metrics=metrics,
+                delivery_started_at=started,
+            )
             status = "completed" if delivered else "reply_pending"
         except ClaudeRuntimeInterrupted:
             if self.presentations is not None:
@@ -365,6 +491,18 @@ class BotWorker:
         finally:
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
+            if self._active_event_by_participant.get(ctx.participant_id) == event.event_id:
+                self._active_event_by_participant.pop(ctx.participant_id, None)
+        if progress.first_activity_at is not None:
+            metrics["agent_start_to_first_activity_ms"] = round(
+                (progress.first_activity_at - started) * 1000, 1
+            )
+        if progress.first_tool_started_at is not None:
+            metrics["first_tool_start_ms"] = round(
+                (progress.first_tool_started_at - started) * 1000, 1
+            )
+        if progress.tool_durations_ms:
+            metrics["tool_duration_ms"] = progress.tool_durations_ms
         _log(
             status,
             participant_id=str(ctx.participant_id),
@@ -372,36 +510,123 @@ class BotWorker:
             event_id=event.event_id,
             agent_run_id=str(run_id),
             latency_ms=round((time.monotonic() - started) * 1000, 1),
+            **metrics,
         )
 
     async def _deliver(self, event: BotEvent, text: str) -> bool:
-        """Persist the final reply before sending so restart can finish delivery."""
-
-        self.events.stage_reply(event.event_id, text)
-        try:
-            message_id = await self._send(event.chat_id, text)
-        except FeishuSendError as exc:
-            self.events.note_reply_failure(event.event_id)
-            logger.warning(
-                "feishu_reply_send_failed event_id=%s message_id=%s "
-                "error_code=%s retryable=%s attempt=%s",
-                event.event_id,
-                event.message_id,
-                exc.code,
-                exc.retryable,
-                getattr(exc, "attempt", 1),
-            )
-            return False
-        self.events.finish(
-            event.event_id,
-            status="completed",
-            reply_message_id=message_id,
+        plan = ResponsePlan(
+            kind="fixed",
+            full_text=str(text),
+            segments=(ResponseSegment(0, str(text)),),
+            use_cards=False,
         )
+        return await self._deliver_plan(event, plan)
+
+    async def _deliver_plan(
+        self,
+        event: BotEvent,
+        plan: ResponsePlan,
+        *,
+        participant_id=None,
+        metrics: dict[str, object] | None = None,
+        delivery_started_at: float | None = None,
+    ) -> bool:
+        if not plan.segments:
+            self.events.finish(event.event_id, status="completed")
+            return True
+        self.events.stage_reply_plan(
+            event.event_id,
+            full_text=plan.full_text,
+            segments=[segment.text for segment in plan.segments],
+        )
+        pending = self.events.pending_reply_plan(event.event_id)
+        if pending is None:
+            return False
+        return await self._resume_delivery_plan(
+            event,
+            pending,
+            participant_id=participant_id,
+            metrics=metrics,
+            delivery_started_at=delivery_started_at,
+        )
+
+    async def _resume_delivery_plan(
+        self,
+        event: BotEvent,
+        pending_plan,
+        *,
+        participant_id=None,
+        metrics: dict[str, object] | None = None,
+        delivery_started_at: float | None = None,
+    ) -> bool:
+        delivery_started = time.monotonic()
+        first_final_recorded = False
+        for index in range(pending_plan.next_segment, len(pending_plan.segments)):
+            if (
+                participant_id is not None
+                and participant_id in self._cancelled_participants
+            ):
+                self.events.cancel_reply_plan(event.event_id)
+                return False
+            try:
+                message_id = await self._send(
+                    event.chat_id,
+                    pending_plan.segments[index],
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:reply:{event.event_id}:{index}"
+                    ),
+                )
+            except FeishuSendError as exc:
+                self.events.note_reply_failure(event.event_id)
+                logger.warning(
+                    "feishu_reply_send_failed event_id=%s message_id=%s "
+                    "segment_index=%s error_code=%s retryable=%s attempt=%s",
+                    event.event_id,
+                    event.message_id,
+                    index,
+                    exc.code,
+                    exc.retryable,
+                    getattr(exc, "attempt", 1),
+                )
+                return False
+            if metrics is not None and not first_final_recorded:
+                metrics["first_final_send_ms"] = round(
+                    (
+                        time.monotonic()
+                        - (delivery_started_at or delivery_started)
+                    )
+                    * 1000,
+                    1,
+                )
+                first_final_recorded = True
+            self.events.mark_reply_segment_sent(
+                event.event_id,
+                segment_index=index,
+                message_id=message_id,
+            )
+        self.events.finish_reply_plan(event.event_id)
+        if metrics is not None:
+            metrics["total_delivery_ms"] = round(
+                (time.monotonic() - delivery_started) * 1000, 1
+            )
         return True
 
-    async def _send(self, chat_id: str, text: str) -> str:
+    async def _send(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        message_uuid: str | None = None,
+    ) -> str:
         for attempt in range(self.max_retries + 1):
             try:
+                if message_uuid and self._supports_message_uuid():
+                    return await asyncio.to_thread(
+                        self.sender.send_text,
+                        chat_id,
+                        text,
+                        message_uuid=message_uuid,
+                    )
                 return await asyncio.to_thread(self.sender.send_text, chat_id, text)
             except FeishuSendError as exc:
                 if not exc.retryable or attempt >= self.max_retries:
@@ -409,6 +634,23 @@ class BotWorker:
                     raise
                 await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
         raise FeishuSendError(FALLBACK_TEMPORARY)
+
+    def _supports_message_uuid(self) -> bool:
+        import inspect
+
+        try:
+            parameters = inspect.signature(self.sender.send_text).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(
+            parameter.name == "message_uuid"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    @staticmethod
+    def _stable_message_uuid(key: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, str(key)))
 
     async def _send_card(self, chat_id: str, card: dict) -> str:
         send_card = getattr(self.sender, "send_card", None)

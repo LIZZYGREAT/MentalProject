@@ -14,6 +14,7 @@ from app.agent.sdk_adapter import (
 )
 from app.agent.sdk_mcp import TurnContextBinding, build_sdk_mcp_server
 from app.agent.tool_registry import FORBIDDEN_FIELDS, ToolRegistry
+from app.presentation.contracts import AgentActivityEvent
 from app.tools.care import CareTools
 
 
@@ -77,6 +78,74 @@ def test_sdk_mcp_uses_registry_schema_and_backend_context_only():
     assert json.loads(response["content"][0]["text"])["value"] == "ok"
     schema_text = json.dumps(tool.parameters).lower()
     assert not any(field in schema_text for field in FORBIDDEN_FIELDS)
+
+
+def test_sdk_mcp_emits_one_real_start_and_success_lifecycle_event():
+    activities = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, _args):
+        return {"ok": True}
+
+    registry.register(
+        "safe_tool",
+        "safe",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+    )
+
+    async def activity(event: AgentActivityEvent):
+        activities.append(event)
+
+    binding = TurnContextBinding(
+        AgentContext(uuid.uuid4(), "P001", "ou", "oc", "msg", uuid.uuid4()),
+        activity_callback=activity,
+    )
+    tool = build_sdk_mcp_server(registry, binding, sdk=FakeSDK)["tools"][0]
+    asyncio.run(tool({}))
+
+    assert [(event.kind, event.tool_name, event.status) for event in activities] == [
+        ("tool_started", "safe_tool", None),
+        ("tool_succeeded", "safe_tool", "succeeded"),
+    ]
+
+
+def test_sdk_mcp_emits_failed_lifecycle_without_sensitive_payloads():
+    activities = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, _args):
+        raise RuntimeError("secret raw result")
+
+    registry.register(
+        "safe_tool",
+        "safe",
+        {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        handler,
+    )
+
+    async def activity(event: AgentActivityEvent):
+        activities.append(event)
+
+    binding = TurnContextBinding(
+        AgentContext(uuid.uuid4(), "P001", "ou", "oc", "msg", uuid.uuid4()),
+        activity_callback=activity,
+    )
+    tool = build_sdk_mcp_server(registry, binding, sdk=FakeSDK)["tools"][0]
+    response = asyncio.run(tool({"value": "private argument"}))
+
+    assert response["is_error"] is True
+    assert [(event.kind, event.tool_name, event.status) for event in activities] == [
+        ("tool_started", "safe_tool", None),
+        ("tool_failed", "safe_tool", "tool_exception"),
+    ]
+    assert all(not hasattr(event, "arguments") for event in activities)
+    assert "private argument" not in repr(activities)
 
 
 def test_all_production_tool_schemas_are_closed_and_identity_free():

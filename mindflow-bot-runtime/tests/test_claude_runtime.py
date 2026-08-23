@@ -103,6 +103,10 @@ def test_sessions_are_persistent_serial_and_participant_isolated():
             "second",
         ]
         assert first_factory.max_active <= 2
+        assert all(
+            client.binding.activity_callback is None
+            for client in first_factory.created
+        )
         await manager.close()
 
         resumed_factory = FakeFactory()
@@ -137,6 +141,44 @@ def test_explicit_interrupt_reaches_running_client():
     asyncio.run(scenario())
 
 
+def test_activity_callbacks_are_isolated_by_participant_and_cleared_after_turn():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    p2 = participant(database, "P002")
+    factory = FakeFactory()
+    manager = ParticipantSessionManager(
+        factory,
+        ClaudeSessionRepository(database),
+        max_active_sessions=2,
+    )
+    received = {p1.id: [], p2.id: []}
+
+    async def scenario():
+        async def callback_for(participant_id, event):
+            received[participant_id].append((event.kind, event.tool_name))
+
+        await asyncio.gather(
+            manager.submit(
+                context(p1.id, "activity-1"),
+                "one",
+                on_activity=lambda event: callback_for(p1.id, event),
+            ),
+            manager.submit(
+                context(p2.id, "activity-2"),
+                "two",
+                on_activity=lambda event: callback_for(p2.id, event),
+            ),
+        )
+        assert all(
+            client.binding.activity_callback is None for client in factory.created
+        )
+        await manager.close()
+
+    asyncio.run(scenario())
+    assert received[p1.id] == [("tool_started", "care_get_today_context")]
+    assert received[p2.id] == [("tool_started", "care_get_today_context")]
+
+
 def test_safety_precheck_never_submits_high_risk_text_to_sdk():
     database = memory_database()
     p1 = participant(database, "P001")
@@ -152,5 +194,7 @@ def test_safety_precheck_never_submits_high_risk_text_to_sdk():
         runtime.handle_message(context(p1.id, "risk"), "我想自杀")
     )
     assert result == FIXED_HIGH_RISK_RESPONSE
+    assert result.safety_locked is True
+    assert result.response_kind == "fixed"
     saved = ConversationRepository(database).recent(p1.id, 10)
     assert [item["role"] for item in saved] == ["user", "assistant"]

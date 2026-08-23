@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, MutableMapping, Protocol
@@ -81,6 +82,17 @@ When the user asks to fill in a state questionnaire or prefers buttons, send the
 If a tool fails, explain the limitation briefly. Failure is not permission to use another channel. Never request secrets, tokens, SQL, file paths, shell commands, arbitrary URLs, or hidden identifiers. For possible immediate self-harm or suicide, do not run ordinary tools or calculate scores; the runtime supplies reviewed fixed support text.
 
 Final responses must be concise, calm, optional, and suitable for a private Feishu chat."""
+
+SYSTEM_RULES += """
+
+The backend owns progress messages and final presentation formatting.
+Do not narrate tool execution before calling a tool. Do not say that an action
+succeeded until the tool result confirms ok=true.
+
+For normal final replies, prefer plain natural text. Do not use Markdown
+headings, bold markers, tables, or fenced blocks unless the user explicitly
+requests code or a literal Markdown artifact. Do not manage message chunking;
+the backend presentation layer owns segmentation and Feishu rendering."""
 
 ToolProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -175,6 +187,8 @@ class ProductionClaudeClient:
     ) -> ClaudeTurnResult:
         self._interrupted = False
         result_message = None
+        started_at = time.monotonic()
+        first_text_delta_ms = None
         try:
             await self.client.query(text)
             async for message in self.client.receive_response():
@@ -194,7 +208,20 @@ class ProductionClaudeClient:
                 if isinstance(message, self.sdk.AssistantMessage):
                     for block in message.content:
                         if isinstance(block, self.sdk.ToolUseBlock) and on_tool_use:
-                            await on_tool_use(block.name)
+                            # Real lifecycle events are emitted around
+                            # registry.execute() in sdk_mcp. This legacy path is
+                            # intentionally not user-visible.
+                            pass
+                stream_event = getattr(self.sdk, "StreamEvent", None)
+                if (
+                    first_text_delta_ms is None
+                    and stream_event is not None
+                    and isinstance(message, stream_event)
+                    and "text_delta" in str(getattr(message, "event", ""))
+                ):
+                    first_text_delta_ms = round(
+                        (time.monotonic() - started_at) * 1000, 1
+                    )
                 if isinstance(message, self.sdk.ResultMessage):
                     result_message = message
         except Exception as exc:
@@ -215,6 +242,11 @@ class ProductionClaudeClient:
         session_id = str(result_message.session_id or "").strip()
         if not answer or not session_id:
             raise ClaudeSDKInvocationError("empty result or session_id")
+        if first_text_delta_ms is not None:
+            logger.info(
+                "claude_partial_telemetry",
+                extra={"time_to_first_text_delta_ms": first_text_delta_ms},
+            )
         return ClaudeTurnResult(answer, session_id)
 
     async def interrupt(self) -> None:
@@ -247,6 +279,7 @@ class ProductionClaudeClientFactory:
         base_url: str,
         auth_token: str,
         max_turns: int,
+        partial_messages_enabled: bool = False,
     ):
         self.registry = registry
         self.workdir = Path(workdir)
@@ -260,6 +293,7 @@ class ProductionClaudeClientFactory:
         self.base_url = base_url
         self.auth_token = auth_token
         self.max_turns = max_turns
+        self.partial_messages_enabled = bool(partial_messages_enabled)
 
     def validate(self) -> None:
         _load_sdk()
@@ -335,6 +369,7 @@ class ProductionClaudeClientFactory:
             fallback_model=None,
             resume=resume_session_id,
             max_turns=self.max_turns,
+            include_partial_messages=self.partial_messages_enabled,
             env=self._environment(),
             stderr=_safe_stderr,
         )
