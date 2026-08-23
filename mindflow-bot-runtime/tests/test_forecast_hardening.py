@@ -18,6 +18,7 @@ from app.repositories import (
 )
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.forecast_scheduler import ForecastScheduler
+from app.services.warning_policy import WarningPolicy
 from app.tools.care import CareTools
 from helpers import memory_database
 from services.semantic_model_inputs import semantic_model_inputs
@@ -1159,6 +1160,160 @@ def test_calendar_refresh_failure_is_persisted_and_returned_as_stale():
         assert stale["calendar_last_refresh_success_at"] is not None
 
     asyncio.run(scenario())
+
+
+def test_warning_max_daily_sends_change_invalidates_forecast_cache():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
+    coordinator.warning_policy = WarningPolicy(
+        max_daily_sends=0, min_interval_minutes=240,
+    )
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-policy-disabled",
+    ))
+    assert first["output"]["alerts"]
+    assert first["output"]["selected_warning_candidates"] == []
+    assert first["warning_windows"] == []
+
+    coordinator.warning_policy = WarningPolicy(
+        max_daily_sends=2, min_interval_minutes=240,
+    )
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-policy-enabled",
+    ))
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != first["forecast_version"]
+    assert len(second["output"]["selected_warning_candidates"]) == 1
+    assert len(second["warning_windows"]) == 1
+    assert prediction.calls == 2
+    with database.session() as session:
+        assert session.query(WarningSchedule).filter_by(status="pending").count() == 1
+
+
+def test_warning_min_interval_change_invalidates_forecast_cache():
+    _, participant, _, _, _, _, coordinator = build_pipeline([event()])
+
+    class TwoAlertPrediction:
+        model = type("Model", (), {"MODEL_VERSION": "two-alert-model-v1"})()
+
+        def __init__(self):
+            self.calls = 0
+
+        def calculate(self, **kwargs):
+            self.calls += 1
+            return {
+                "model_version": self.model.MODEL_VERSION,
+                "local_date": kwargs["local_date"],
+                "trajectory": [],
+                "alerts": [
+                    {"time": "10:00", "tier": 2, "episode_index": 1},
+                    {"time": "12:00", "tier": 2, "episode_index": 2},
+                ],
+            }
+
+    prediction = TwoAlertPrediction()
+    coordinator.prediction = prediction
+    coordinator.warning_policy = WarningPolicy(
+        max_daily_sends=2, min_interval_minutes=240,
+    )
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-interval-240",
+    ))
+    assert len(first["output"]["selected_warning_candidates"]) == 1
+
+    coordinator.warning_policy = WarningPolicy(
+        max_daily_sends=2, min_interval_minutes=60,
+    )
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-interval-60",
+    ))
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != first["forecast_version"]
+    assert len(second["output"]["selected_warning_candidates"]) == 2
+    assert len(second["warning_windows"]) == 2
+    assert prediction.calls == 2
+
+
+def test_warning_window_config_change_invalidates_forecast_cache():
+    _, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-window-default",
+    ))
+    first_window = first["warning_windows"][0]
+
+    coordinator.warning_lead_minutes = 30
+    coordinator.warning_late_grace_minutes = 5
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-window-changed",
+    ))
+    second_window = second["warning_windows"][0]
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != first["forecast_version"]
+    assert second_window["target_time"] != first_window["target_time"]
+    assert second_window["valid_until"] != first_window["valid_until"]
+    assert datetime.fromisoformat(second_window["target_time"]) == (
+        datetime.fromisoformat(first_window["target_time"]) - timedelta(minutes=10)
+    )
+    assert datetime.fromisoformat(second_window["valid_until"]) == (
+        datetime.fromisoformat(first_window["valid_until"]) - timedelta(minutes=15)
+    )
+    assert prediction.calls == 2
+
+
+def test_warning_policy_version_bump_invalidates_forecast_cache():
+    _, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-policy-v1",
+    ))
+
+    class WarningPolicyV2(WarningPolicy):
+        POLICY_VERSION = "warning-policy-v2"
+
+    coordinator.warning_policy = WarningPolicyV2(
+        max_daily_sends=2, min_interval_minutes=240,
+    )
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "warning-policy-v2",
+    ))
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != first["forecast_version"]
+    assert first["output"]["warning_policy_config"]["policy_version"] == "warning-policy-v1"
+    assert second["output"]["warning_policy_config"]["policy_version"] == "warning-policy-v2"
+    assert prediction.calls == 2
+
+
+def test_legacy_forecast_without_warning_revision_is_recomputed():
+    database, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "legacy-warning-revision-setup",
+    ))
+    with database.session() as session:
+        row = session.get(ForecastSnapshot, uuid.UUID(first["id"]))
+        legacy_output = dict(row.output_json)
+        legacy_output.pop("warning_revision", None)
+        legacy_output.pop("warning_policy_config", None)
+        row.output_json = legacy_output
+        row.forecast_version = "legacy-forecast-version"
+
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "legacy-warning-revision-refresh",
+    ))
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != "legacy-forecast-version"
+    assert second["output"]["warning_revision"]
+    assert second["output"]["warning_policy_config"] == {
+        "policy_version": WarningPolicy.POLICY_VERSION,
+        "max_daily_sends": 2,
+        "min_interval_minutes": 240,
+        "lead_minutes": 20,
+        "late_grace_minutes": 10,
+        "episode_drift_minutes": 15,
+    }
+    assert prediction.calls == 2
 
 
 def test_log_record_factory_redacts_feishu_query_credentials():

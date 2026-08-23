@@ -9,7 +9,7 @@ by :class:`WarningScheduleRepository`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 
 def _minute(value: Any) -> int | None:
@@ -31,8 +31,17 @@ def _number(value: Any) -> float:
 
 @dataclass(frozen=True)
 class WarningPolicy:
+    POLICY_VERSION: ClassVar[str] = "warning-policy-v1"
+
     max_daily_sends: int = 2
     min_interval_minutes: int = 240
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "policy_version": self.POLICY_VERSION,
+            "max_daily_sends": self.max_daily_sends,
+            "min_interval_minutes": self.min_interval_minutes,
+        }
 
     @staticmethod
     def _episode_key(alert: dict[str, Any], fallback: int) -> str:

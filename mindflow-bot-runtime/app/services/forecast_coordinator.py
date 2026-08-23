@@ -89,6 +89,15 @@ class ForecastCoordinator:
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
 
+    def _warning_revision(self) -> tuple[str, dict[str, object]]:
+        payload = {
+            **self.warning_policy.identity_payload(),
+            "lead_minutes": self.warning_lead_minutes,
+            "late_grace_minutes": self.warning_late_grace_minutes,
+            "episode_drift_minutes": self.warning_episode_drift_minutes,
+        }
+        return _sha(payload), payload
+
     async def ensure_forecast(
         self, participant_id: uuid.UUID, local_date: date | str, reason: str,
         *, refresh_calendar: bool = True, enqueue_enrichment: bool = True,
@@ -214,12 +223,14 @@ class ForecastCoordinator:
         })
         latest = await asyncio.to_thread(self.forecasts.latest, participant_id, target)
         algorithm_version = str(self.prediction.model.MODEL_VERSION)
+        warning_revision, warning_policy_config = self._warning_revision()
         expected_version = _sha({
             "calendar_revision": calendar_snapshot["calendar_revision"],
             "semantic_revision": semantic_revision,
             "observation_revision": observation_revision,
             "profile_revision": profile_revision,
             "algorithm_version": algorithm_version,
+            "warning_revision": warning_revision,
         })
         if latest and latest["forecast_version"] == expected_version:
             result = {**latest, "cache_hit": True, "calendar_changed": calendar_changed, "reason": reason}
@@ -229,6 +240,7 @@ class ForecastCoordinator:
             and latest.get("observation_revision", "") == observation_revision
             and latest["algorithm_version"] == algorithm_version
             and (latest.get("output") or {}).get("profile_revision") == profile_revision
+            and (latest.get("output") or {}).get("warning_revision") == warning_revision
             and self._semantic_input_delta(latest["semantic_input"], semantic_events)
             < self.materiality_threshold
         ):
@@ -248,6 +260,8 @@ class ForecastCoordinator:
             )
             output["profile_layers"] = profile_layers
             output["profile_revision"] = profile_revision
+            output["warning_revision"] = warning_revision
+            output["warning_policy_config"] = warning_policy_config
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
             selected_alerts = self.warning_policy.select_daily_candidates(
