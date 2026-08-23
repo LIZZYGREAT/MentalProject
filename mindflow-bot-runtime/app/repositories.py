@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import uuid
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -309,12 +310,17 @@ class ObservationRepository:
                 existing = find_existing(session)
                 if existing is not None:
                     return existing.id
+                timestamp = observed_at or utc_now()
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
                 row = StateObservation(
                     participant_id=participant_id,
                     observation_type=observation_type,
                     source_message_id=source_message_id,
                     payload_json=dict(payload),
-                    observed_at=observed_at or utc_now(),
+                    observed_at=timestamp,
                 )
                 session.add(row)
                 session.flush()
@@ -341,16 +347,68 @@ class ObservationRepository:
                 )
                 .limit(max(1, min(int(limit), 100)))
             ).scalars()
-            return [
-                {
-                    "id": str(row.id),
-                    "type": row.observation_type,
-                    "payload": dict(row.payload_json),
-                    "observed_at": row.observed_at.isoformat(),
-                    "created_at": row.created_at.isoformat(),
-                }
-                for row in rows
-            ]
+            return [self._view(row) for row in rows]
+
+    def for_local_date(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        timezone_name: str,
+        as_of: datetime | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return only observations whose timestamp belongs to one local day."""
+
+        timezone_value = ZoneInfo(timezone_name)
+        day_start = datetime.combine(local_date, time.min, timezone_value).astimezone(
+            timezone.utc
+        )
+        day_end = datetime.combine(
+            local_date + timedelta(days=1), time.min, timezone_value
+        ).astimezone(timezone.utc)
+        conditions = [
+            StateObservation.participant_id == participant_id,
+            StateObservation.observed_at >= day_start,
+            StateObservation.observed_at < day_end,
+        ]
+        if as_of is not None:
+            cutoff = (
+                as_of.replace(tzinfo=timezone.utc)
+                if as_of.tzinfo is None
+                else as_of.astimezone(timezone.utc)
+            )
+            conditions.append(StateObservation.observed_at <= cutoff)
+        with self.database.session() as session:
+            rows = session.execute(
+                select(StateObservation)
+                .where(*conditions)
+                .order_by(
+                    desc(StateObservation.observed_at),
+                    desc(StateObservation.created_at),
+                    desc(StateObservation.id),
+                )
+                .limit(max(1, min(int(limit), 500)))
+            ).scalars()
+            return [self._view(row) for row in rows]
+
+    @staticmethod
+    def _view(row: StateObservation) -> dict[str, Any]:
+        def utc_iso(value: datetime) -> str:
+            aware = (
+                value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(timezone.utc)
+            )
+            return aware.isoformat()
+
+        return {
+            "id": str(row.id),
+            "type": row.observation_type,
+            "payload": dict(row.payload_json),
+            "observed_at": utc_iso(row.observed_at),
+            "created_at": utc_iso(row.created_at),
+        }
 
 
 class PredictionRepository:

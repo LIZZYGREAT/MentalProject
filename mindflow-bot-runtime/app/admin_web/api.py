@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import hmac
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -13,7 +14,10 @@ from starlette.routing import Route
 from app.admin_web.auth import COOKIE_NAME, AdminSession, SessionSigner, verify_password
 from app.admin_web.repositories import AdminRepository
 from app.config import Settings
-from app.services.pressure_curve_service import PressureCurveService
+from app.services.pressure_curve_service import (
+    HistoricalForecastNotFoundError,
+    PressureCurveService,
+)
 
 
 def _json_error(message: str, status: int) -> JSONResponse:
@@ -34,6 +38,32 @@ class AdminAPI:
             settings.admin_session_secret or "test-admin-session-secret",
             settings.admin_session_ttl_seconds,
         )
+
+    def _business_context(self) -> dict[str, str]:
+        return {
+            "timezone": self.settings.timezone_name,
+            "business_date": datetime.now(
+                ZoneInfo(self.settings.timezone_name)
+            ).date().isoformat(),
+        }
+
+    @staticmethod
+    def _query_int(
+        request: Request,
+        name: str,
+        default: int,
+        *,
+        minimum: int = 1,
+        maximum: int,
+    ) -> tuple[int | None, JSONResponse | None]:
+        raw = request.query_params.get(name)
+        try:
+            value = default if raw is None else int(raw)
+        except (TypeError, ValueError):
+            return None, _json_error("invalid_query_parameter", 400)
+        if value < minimum or value > maximum:
+            return None, _json_error("invalid_query_parameter", 400)
+        return value, None
 
     def _session(self, request: Request) -> AdminSession | None:
         session = self.signer.from_request(request)
@@ -71,7 +101,12 @@ class AdminAPI:
             return _json_error("invalid_credentials", 401)
         token, session = self.signer.issue(username)
         response = JSONResponse(
-            {"authenticated": True, "username": username, "csrf_token": session.csrf_token}
+            {
+                "authenticated": True,
+                "username": username,
+                "csrf_token": session.csrf_token,
+                **self._business_context(),
+            }
         )
         response.set_cookie(
             COOKIE_NAME,
@@ -94,6 +129,7 @@ class AdminAPI:
                 "username": session.username,
                 "csrf_token": session.csrf_token,
                 "expires_at": session.expires_at,
+                **self._business_context(),
             }
         )
 
@@ -113,12 +149,18 @@ class AdminAPI:
         if self._authorized(request) is None:
             return _json_error("unauthorized", 401)
         query = request.query_params
+        page, error = self._query_int(request, "page", 1, maximum=1_000_000)
+        if error:
+            return error
+        limit, error = self._query_int(request, "limit", 25, maximum=100)
+        if error:
+            return error
         return JSONResponse(
             self.repository.participants(
                 search=query.get("search", ""),
                 status=query.get("status", ""),
-                page=int(query.get("page", "1")),
-                limit=int(query.get("limit", "25")),
+                page=page,
+                limit=limit,
             )
         )
 
@@ -142,11 +184,16 @@ class AdminAPI:
         if error:
             return error
         query = request.query_params
+        limit, query_error = self._query_int(
+            request, "limit", 50, maximum=200
+        )
+        if query_error:
+            return query_error
         items = self.repository.messages(
             participant_id,
             status=query.get("status", ""),
             error_only=query.get("error_only", "").lower() in {"1", "true", "yes"},
-            limit=int(query.get("limit", "50")),
+            limit=limit,
         )
         return JSONResponse({"items": items})
 
@@ -194,12 +241,14 @@ class AdminAPI:
         )
         if participant_id is None:
             return _json_error("participant_not_found", 404)
-        if self.pressure_curves is None:
-            return _json_error("forecast_service_unavailable", 503)
         try:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
             return _json_error("invalid_local_date", 400)
+        if target < datetime.now(ZoneInfo(self.settings.timezone_name)).date():
+            return _json_error("historical_forecast_refresh_not_supported", 409)
+        if self.pressure_curves is None:
+            return _json_error("forecast_service_unavailable", 503)
         view = await self.pressure_curves.build(
             participant_id,
             target,
@@ -230,13 +279,16 @@ class AdminAPI:
         if self.pressure_curves is None:
             forecast = self.repository.forecast(participant_id, target)
             return JSONResponse(forecast) if forecast else _json_error("forecast_not_found", 404)
-        view = await self.pressure_curves.build(
-            participant_id,
-            target,
-            reason="admin_curve_view",
-            refresh_calendar=False,
-            stress_only=False,
-        )
+        try:
+            view = await self.pressure_curves.build(
+                participant_id,
+                target,
+                reason="admin_curve_view",
+                refresh_calendar=False,
+                stress_only=False,
+            )
+        except HistoricalForecastNotFoundError:
+            return _json_error("forecast_not_found", 404)
         output = dict(view.forecast.get("output") or {})
         return JSONResponse(
             {
@@ -263,13 +315,16 @@ class AdminAPI:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
             return _json_error("invalid_local_date", 400)
-        view = await self.pressure_curves.build(
-            participant_id,
-            target,
-            reason="admin_curve_png",
-            refresh_calendar=False,
-            stress_only=False,
-        )
+        try:
+            view = await self.pressure_curves.build(
+                participant_id,
+                target,
+                reason="admin_curve_png",
+                refresh_calendar=False,
+                stress_only=False,
+            )
+        except HistoricalForecastNotFoundError:
+            return _json_error("forecast_not_found", 404)
         return Response(
             view.png_bytes,
             media_type="image/png",
@@ -285,8 +340,11 @@ class AdminAPI:
     async def incidents(self, request: Request) -> Response:
         if self._authorized(request) is None:
             return _json_error("unauthorized", 401)
+        limit, error = self._query_int(request, "limit", 100, maximum=500)
+        if error:
+            return error
         return JSONResponse(
-            {"items": self.repository.incidents(int(request.query_params.get("limit", "100")))}
+            {"items": self.repository.incidents(limit)}
         )
 
     def routes(self) -> list[Route]:

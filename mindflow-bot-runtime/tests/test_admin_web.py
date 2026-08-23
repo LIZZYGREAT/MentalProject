@@ -1,5 +1,7 @@
 from pathlib import Path
+from dataclasses import replace
 
+import pytest
 from starlette.testclient import TestClient
 
 from app.admin_web.auth import hash_password
@@ -53,6 +55,8 @@ def test_admin_requires_login_and_lists_participants_after_login():
     assert response.status_code == 200
     assert response.json()["items"][0]["participant_code"] == "P001"
     assert session["csrf_token"]
+    assert session["timezone"] == "Asia/Shanghai"
+    assert len(session["business_date"]) == 10
 
 
 def test_admin_frontend_and_public_health_are_available():
@@ -77,3 +81,43 @@ def test_admin_login_rejects_wrong_password_and_session_cookie_is_httponly():
     )
     assert "HttpOnly" in good.headers["set-cookie"]
     assert "SameSite=strict" in good.headers["set-cookie"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/admin/api/participants?page=abc",
+        "/admin/api/participants?limit=0",
+        "/admin/api/participants/P001/messages?limit=nan",
+        "/admin/api/incidents?limit=999999",
+    ],
+)
+def test_invalid_integer_query_parameters_return_400(path):
+    browser = client()
+    login(browser)
+
+    response = browser.get(path)
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_query_parameter"}
+
+
+def test_admin_date_helpers_do_not_round_trip_calendar_dates_through_utc():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "admin_web"
+        / "static"
+        / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "function localDateString" in source
+    assert "function shiftDate" in source
+    assert "toISOString().slice(0,10)" not in source
+
+
+def test_disabled_admin_app_fails_closed():
+    value = replace(settings(), admin_enabled=False)
+
+    with pytest.raises(ValueError, match="ADMIN_ENABLED"):
+        create_app(memory_database(), value)

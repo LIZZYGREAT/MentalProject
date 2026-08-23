@@ -55,26 +55,24 @@ class PredictionResult:
 
 
 class AssessmentModel:
-    MODEL_VERSION = "mindflow-ctssm-runtime-v4"
+    MODEL_VERSION = "mindflow-ctssm-runtime-v5"
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
 
-    @staticmethod
-    def _latest_state(observations: list[dict[str, Any]]) -> tuple[float, float]:
-        initial_stress = 40.0
-        initial_vitality = 70.0
-        if not observations:
-            return initial_stress, initial_vitality
-        payload = dict(observations[0].get("payload") or {})
+    def _observation_target_time(self, value: Any) -> str | None:
+        text = str(value or "").strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
         try:
-            initial_stress = float(payload.get("stress_0_10", 4.0)) * 10.0
-            initial_vitality = float(payload.get("energy_0_10", 7.0)) * 10.0
-        except (TypeError, ValueError):
-            pass
-        return max(0.0, min(initial_stress, 100.0)), max(
-            0.0, min(initial_vitality, 100.0)
-        )
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=self.timezone)
+        else:
+            parsed = parsed.astimezone(self.timezone)
+        return parsed.isoformat()
 
     def predict(
         self,
@@ -133,7 +131,9 @@ class AssessmentModel:
             item["metadata"] = metadata
         events = EventFactory.create_from_json(prepared)
         if initial_state is None:
-            initial_stress, initial_vitality = self._latest_state(observations)
+            # Observations are measurements at their own timestamp, not an
+            # implicit midnight boundary condition.
+            initial_stress, initial_vitality = 40.0, 70.0
         else:
             try:
                 initial_stress = float(initial_state["stress_0_10"]) * 10.0
@@ -144,15 +144,20 @@ class AssessmentModel:
                 ) from exc
             initial_stress = max(0.0, min(initial_stress, 100.0))
             initial_vitality = max(0.0, min(initial_vitality, 100.0))
-        model_observations = [
-            {
-                "target_time": item.get("observed_at"),
-                "stress": (item.get("payload") or {}).get("stress_0_10"),
-                "vitality": (item.get("payload") or {}).get("energy_0_10"),
-            }
-            for item in reversed(observations)
-            if item.get("type") == "checkin"
-        ]
+        model_observations = []
+        for item in reversed(observations):
+            if item.get("type") != "checkin":
+                continue
+            target_time = self._observation_target_time(item.get("observed_at"))
+            if target_time is None:
+                continue
+            model_observations.append(
+                {
+                    "target_time": target_time,
+                    "stress": (item.get("payload") or {}).get("stress_0_10"),
+                    "vitality": (item.get("payload") or {}).get("energy_0_10"),
+                }
+            )
         result = user.solver.simulate_day(
             events,
             initial_stress,

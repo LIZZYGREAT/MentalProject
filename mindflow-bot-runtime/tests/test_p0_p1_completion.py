@@ -170,18 +170,36 @@ def test_concurrent_duplicate_card_callbacks_are_idempotent(tmp_path):
         assert session.query(StateObservation).count() == 1
 
 
-def test_recent_checkin_affects_initial_stress():
-    stress, _vitality = AssessmentModel._latest_state([{
-        "payload": {"stress_0_10": 8.5, "energy_0_10": 3.0}
-    }])
-    assert stress == 85.0
+def _prediction_with_optional_afternoon_checkin(include: bool):
+    observations = []
+    if include:
+        observations = [{
+            "type": "checkin",
+            "observed_at": "2030-01-15T15:00:00+08:00",
+            "payload": {"stress_0_10": 8.5, "energy_0_10": 3.0},
+        }]
+    return AssessmentModel("Asia/Shanghai").predict(
+        profile={},
+        observations=observations,
+        calendar_events=[],
+        local_date="2030-01-15",
+    )
 
 
-def test_recent_checkin_affects_initial_vitality():
-    _stress, vitality = AssessmentModel._latest_state([{
-        "payload": {"stress_0_10": 8.5, "energy_0_10": 3.0}
-    }])
-    assert vitality == 30.0
+def test_recent_checkin_does_not_affect_midnight_stress():
+    baseline = _prediction_with_optional_afternoon_checkin(False)
+    observed = _prediction_with_optional_afternoon_checkin(True)
+    assert observed.trajectory[0]["stress_0_10"] == baseline.trajectory[0][
+        "stress_0_10"
+    ]
+
+
+def test_recent_checkin_does_not_affect_midnight_vitality():
+    baseline = _prediction_with_optional_afternoon_checkin(False)
+    observed = _prediction_with_optional_afternoon_checkin(True)
+    assert observed.trajectory[0]["vitality_0_10"] == baseline.trajectory[0][
+        "vitality_0_10"
+    ]
 
 
 def test_forecast_changes_after_new_state_observation():
@@ -216,18 +234,20 @@ def test_forecast_changes_after_new_state_observation():
 
     prediction = ObservationPrediction()
     coordinator.prediction = prediction
+    local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    target = local_now.date()
     before = asyncio.run(
-        coordinator.ensure_forecast(person.id, TEST_LOCAL_DATE, "before_checkin")
+        coordinator.ensure_forecast(person.id, target, "before_checkin")
     )
     ObservationRepository(database).add(
         person.id,
         "checkin",
         {"stress_0_10": 9.0, "energy_0_10": 2.0},
-        observed_at=TEST_NOW,
+        observed_at=local_now - timedelta(minutes=1),
         source_message_id="new-checkin",
     )
     after = asyncio.run(
-        coordinator.ensure_forecast(person.id, TEST_LOCAL_DATE, "after_checkin")
+        coordinator.ensure_forecast(person.id, target, "after_checkin")
     )
     assert prediction.calls == 2
     assert before["forecast_version"] != after["forecast_version"]

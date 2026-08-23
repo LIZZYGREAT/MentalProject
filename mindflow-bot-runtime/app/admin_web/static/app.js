@@ -1,7 +1,19 @@
 const root = document.querySelector("#app");
+function localDateString(date=new Date()) {
+  const y=date.getFullYear();
+  const m=String(date.getMonth()+1).padStart(2,"0");
+  const d=String(date.getDate()).padStart(2,"0");
+  return `${y}-${m}-${d}`;
+}
+function shiftDate(yyyyMmDd,delta) {
+  const [y,m,d]=yyyyMmDd.split("-").map(Number);
+  const value=new Date(y,m-1,d,12,0,0,0);
+  value.setDate(value.getDate()+delta);
+  return localDateString(value);
+}
 const state = { session:null, page:"dashboard", dashboard:null, participants:null, selected:null,
   tab:"overview", messages:[], observations:[], calendars:[], forecasts:[], warnings:[], incidents:[], curve:null,
-  curveDate:new Date().toISOString().slice(0,10), toast:"" };
+  curveDate:localDateString(), toast:"" };
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = (v) => v ? new Date(v).toLocaleString("zh-CN", {hour12:false}) : "—";
@@ -18,7 +30,7 @@ async function api(path, options={}) {
 }
 function toast(message){ state.toast=message; render(); setTimeout(()=>{state.toast="";render()},2200); }
 
-async function restore(){ try{state.session=await api("/admin/api/session"); await loadDashboard();}catch{} render(); }
+async function restore(){ try{state.session=await api("/admin/api/session");state.curveDate=state.session.business_date||localDateString(); await loadDashboard();}catch{} render(); }
 function loginView(){ return `<main class="login-shell"><form class="login-card" id="login-form">
   <div class="brand-mark">MF</div><h1>MindFlow Admin</h1><p class="muted">管理员可视化后台</p>
   <label class="field">用户名<input name="username" autocomplete="username" required></label>
@@ -56,10 +68,10 @@ function curveSvg(){ const c=state.curve?.curve||[]; if(!c.length)return'<div cl
   <line class="axis" x1="58" y1="460" x2="870" y2="460"/>${hasV?`<path class="energy-line" d="${path(c,'vitality_0_10',58,290,812,170)}"/><text class="chart-label" x="58" y="278">活力（0–10）</text>`:`<path class="input-line" d="${path(c,'event_stress_input',58,290,812,170,1)}"/><text class="chart-label" x="58" y="278">压力影响强度（0–1）</text>`}
   ${[0,4,8,12,16,20,24].map(h=>`<text class="chart-label" x="${52+h*812/24}" y="490">${String(h).padStart(2,'0')}:00</text>`).join('')}</svg><div class="legend"><span><i style="background:var(--stress)"></i>压力</span><span><i style="background:${hasV?'var(--green)':'var(--amber)'}"></i>${hasV?'活力':'事件影响'}</span></div></div>`; }
 function forecastTab(){ const init=state.curve?.initial_state||{}; return `<article class="card"><div class="curve-toolbar"><label class="field">日期<input type="date" id="curve-date" value="${esc(state.curveDate)}"></label><button class="secondary" id="prev-day">← 前一天</button><button class="secondary" id="next-day">后一天 →</button><button class="primary" id="load-curve">查看</button><button class="secondary" id="refresh-forecast">Refresh Forecast</button></div>${curveSvg()}
-  ${state.curve?`<div class="provenance"><strong>初始化：${init.mode==='previous_day_forecast'?`继承 ${esc(init.source_local_date)} 预测终点`:(init.mode==='observation_default'?'实时 / 观测':'默认初始化')}</strong><br>初始压力 ${esc(init.stress_0_10??'模型默认')} · 初始活力 ${esc(init.vitality_0_10??'模型默认')}<br><small>forecast ${esc(state.curve.forecast_version)} · initial revision ${esc(state.curve.initial_state_revision||'—')}</small></div><div class="two-col"><article><h3>关键分析</h3><pre>${esc(pretty(state.curve.analysis))}</pre></article><article><h3>事件与预警</h3><pre>${esc(pretty({events:state.curve.events,warnings:state.curve.warnings}))}</pre></article></div>`:''}</article>`; }
+  ${state.curve?`<div class="provenance"><strong>初始化：${init.mode==='previous_day_forecast'?`继承 ${esc(init.source_local_date)} 预测终点`:(init.mode==='future_trend_default'?'远期画像基线':'画像 / 系统基线')}</strong><br>初始压力 ${esc(init.stress_0_10??'模型默认')} · 初始活力 ${esc(init.vitality_0_10??'模型默认')}<br><small>forecast ${esc(state.curve.forecast_version)} · initial revision ${esc(state.curve.initial_state_revision||'—')}</small></div><div class="two-col"><article><h3>关键分析</h3><pre>${esc(pretty(state.curve.analysis))}</pre></article><article><h3>事件与预警</h3><pre>${esc(pretty({events:state.curve.events,warnings:state.curve.warnings}))}</pre></article></div>`:''}</article>`; }
 function incidentsView(){ return `<div class="page-head"><div><p class="eyebrow">ERROR CENTER</p><h1>异常中心</h1><p class="muted">仅呈现需要管理员处理的持久化运行事件。</p></div></div><article class="card"><div class="table-wrap"><table><thead><tr><th>时间</th><th>严重度</th><th>子系统</th><th>事件</th><th>摘要</th><th>错误</th></tr></thead><tbody>${state.incidents.map(i=>`<tr><td>${fmt(i.created_at)}</td><td><span class="pill ${i.severity==='error'?'bad':''}">${esc(i.severity)}</span></td><td>${esc(i.subsystem)}</td><td>${esc(i.event_name)}</td><td>${esc(i.summary)}</td><td>${esc(i.error_code||i.error_class||'—')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">暂无异常</td></tr>'}</tbody></table></div></article>`; }
 function render(){ if(!state.session){root.innerHTML=loginView(); bindLogin(); return;} let content=state.page==='dashboard'?dashboardView():state.page==='incidents'?incidentsView():state.selected?userDetail():participantsView(); root.innerHTML=shell(content); bind(); }
-function bindLogin(){ document.querySelector('#login-form')?.addEventListener('submit',async e=>{e.preventDefault();const data=new FormData(e.currentTarget);try{state.session=await api('/admin/api/login',{method:'POST',body:JSON.stringify(Object.fromEntries(data))});await loadDashboard();render()}catch(err){document.querySelector('#login-error').textContent=err.message}}); }
+function bindLogin(){ document.querySelector('#login-form')?.addEventListener('submit',async e=>{e.preventDefault();const data=new FormData(e.currentTarget);try{state.session=await api('/admin/api/login',{method:'POST',body:JSON.stringify(Object.fromEntries(data))});state.curveDate=state.session.business_date||localDateString();await loadDashboard();render()}catch(err){document.querySelector('#login-error').textContent=err.message}}); }
 async function loadDashboard(){state.dashboard=await api('/admin/api/dashboard')}
 async function loadParticipants(search='',status=''){state.participants=await api(`/admin/api/participants?search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}`)}
 async function openUser(code){state.selected=await api(`/admin/api/participants/${encodeURIComponent(code)}`);state.page='participants';state.tab='overview';render()}
@@ -72,6 +84,6 @@ function bind(){ document.querySelectorAll('[data-page]').forEach(b=>b.onclick=a
   document.querySelectorAll('[data-user]').forEach(b=>b.onclick=()=>openUser(b.dataset.user));document.querySelector('#back-users')?.addEventListener('click',()=>{state.selected=null;render()});
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>loadTab(b.dataset.tab));document.querySelectorAll('[data-message]').forEach(b=>b.onclick=async()=>{const m=await api(`/admin/api/messages/${encodeURIComponent(b.dataset.message)}`);alert(pretty(m))});
   document.querySelector('#curve-date')?.addEventListener('change',e=>state.curveDate=e.target.value);document.querySelector('#load-curve')?.addEventListener('click',loadCurve);
-  const shift=n=>{const d=new Date(`${state.curveDate}T00:00:00`);d.setDate(d.getDate()+n);state.curveDate=d.toISOString().slice(0,10);loadCurve()};document.querySelector('#prev-day')?.addEventListener('click',()=>shift(-1));document.querySelector('#next-day')?.addEventListener('click',()=>shift(1));
+  const shift=n=>{state.curveDate=shiftDate(state.curveDate,n);loadCurve()};document.querySelector('#prev-day')?.addEventListener('click',()=>shift(-1));document.querySelector('#next-day')?.addEventListener('click',()=>shift(1));
   document.querySelector('#refresh-forecast')?.addEventListener('click',async()=>{const code=encodeURIComponent(state.selected.participant_code);await api(`/admin/api/participants/${code}/forecasts/${state.curveDate}/refresh`,{method:'POST',body:'{}'});await loadCurve();toast('Forecast 已刷新')}); }
 restore();

@@ -46,8 +46,10 @@ services:
       postgres:
         condition: service_healthy
     command: ["python", "-m", "app.admin_web.main"]
+    environment:
+      ADMIN_PORT: 8081
     ports:
-      - "127.0.0.1:${ADMIN_PORT:-8081}:8081"
+      - "127.0.0.1:${ADMIN_HOST_PORT:-8081}:8081"
     restart: unless-stopped
     cpus: ${ADMIN_CPU_LIMIT:-0.35}
     mem_limit: ${ADMIN_MEMORY_LIMIT:-384m}

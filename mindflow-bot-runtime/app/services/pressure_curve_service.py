@@ -21,6 +21,10 @@ class PressureCurveView:
     png_bytes: bytes
 
 
+class HistoricalForecastNotFoundError(LookupError):
+    """A past date is read-only and has no persisted original forecast."""
+
+
 class PressureCurveService:
     def __init__(
         self,
@@ -43,12 +47,38 @@ class PressureCurveService:
         stress_only: bool = False,
     ) -> PressureCurveView:
         target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
-        forecast = await self.coordinator.ensure_forecast(
-            participant_id,
-            target,
-            reason,
-            refresh_calendar=refresh_calendar,
-        )
+        if target < datetime.now(self.timezone).date():
+            forecast = await asyncio.to_thread(
+                self.coordinator.forecasts.latest, participant_id, target
+            )
+            if forecast is None:
+                raise HistoricalForecastNotFoundError(target.isoformat())
+            calendar_snapshot = await asyncio.to_thread(
+                self.coordinator.calendar_snapshots.get, participant_id, target
+            )
+            matching_calendar = bool(
+                calendar_snapshot
+                and calendar_snapshot.get("calendar_revision")
+                == forecast.get("calendar_revision")
+            )
+            forecast = {
+                **forecast,
+                "calendar_events": list(
+                    (calendar_snapshot or {}).get("events") or []
+                ),
+                "calendar_degraded": bool(
+                    (forecast.get("output") or {}).get("calendar_degraded")
+                ),
+            }
+            if not matching_calendar:
+                forecast["calendar_events"] = []
+        else:
+            forecast = await self.coordinator.ensure_forecast(
+                participant_id,
+                target,
+                reason,
+                refresh_calendar=refresh_calendar,
+            )
         curve = list(forecast.get("curve") or [])
         analysis = analyze_curve(
             curve,

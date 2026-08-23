@@ -1123,7 +1123,11 @@ def test_longitudinal_calibration_requires_seven_days_and_versions_learned_layer
 
 def _set_forecast_generated_at(database, forecast_id, value):
     with database.session() as session:
-        session.get(ForecastSnapshot, uuid.UUID(forecast_id)).generated_at = value
+        session.get(ForecastSnapshot, uuid.UUID(forecast_id)).generated_at = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
 
 
 def _add_observation_at(observations, database, participant_id, *, observed_at, actual, key):
@@ -1133,7 +1137,11 @@ def _add_observation_at(observations, database, participant_id, *, observed_at, 
         observed_at=observed_at, source_message_id=key,
     )
     with database.session() as session:
-        session.get(StateObservation, observation_id).created_at = observed_at
+        session.get(StateObservation, observation_id).created_at = (
+            observed_at.replace(tzinfo=timezone.utc)
+            if observed_at.tzinfo is None
+            else observed_at.astimezone(timezone.utc)
+        )
     return observation_id
 
 

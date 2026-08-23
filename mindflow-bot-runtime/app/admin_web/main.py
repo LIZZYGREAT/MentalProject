@@ -27,6 +27,7 @@ def create_app(
     settings: Settings,
     pressure_curves: PressureCurveService | None = None,
 ) -> Starlette:
+    settings.validate_admin()
     api = AdminAPI(AdminRepository(database), settings, pressure_curves)
 
     async def root(_request: Request):

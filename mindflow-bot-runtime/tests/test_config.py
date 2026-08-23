@@ -194,3 +194,51 @@ def test_card_callback_requires_verified_encrypted_configuration_when_enabled():
     assert settings.feishu_card_callback_enabled is True
     assert settings.feishu_card_callback_port == 8123
     assert settings.feishu_card_callback_path == "/feishu/card/callback"
+
+
+def test_bot_validation_is_not_coupled_to_admin_credentials():
+    environment = valid_environment()
+    environment["ADMIN_ENABLED"] = "true"
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.admin_enabled is True
+    with pytest.raises(ValueError, match="ADMIN_USERNAME"):
+        settings.validate_admin()
+
+
+def test_admin_validation_fails_closed_when_disabled_or_misconfigured():
+    environment = valid_environment()
+    environment.update(
+        {
+            "ADMIN_ENABLED": "false",
+            "ADMIN_USERNAME": "admin",
+            "ADMIN_PASSWORD_HASH": "hash",
+            "ADMIN_SESSION_SECRET": "long-enough-session-secret",
+        }
+    )
+    disabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    with pytest.raises(ValueError, match="ADMIN_ENABLED"):
+        disabled.validate_admin()
+
+    environment["ADMIN_ENABLED"] = "true"
+    environment["ADMIN_PORT"] = "70000"
+    bad_port = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    with pytest.raises(ValueError, match="ADMIN_PORT"):
+        bad_port.validate_admin()
+
+
+def test_compose_keeps_container_admin_port_stable():
+    compose = (
+        Path(__file__).resolve().parents[1] / "compose.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert 'ADMIN_PORT: 8081' in compose
+    assert '127.0.0.1:${ADMIN_HOST_PORT:-8081}:8081' in compose
+    assert '127.0.0.1:${ADMIN_PORT:-8081}:8081' not in compose

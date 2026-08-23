@@ -304,10 +304,17 @@ class ForecastCoordinator:
         self, participant_id: uuid.UUID, target: date, reason: str, *,
         refresh_calendar: bool, enqueue_enrichment: bool,
     ) -> dict[str, Any]:
+        profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
+        learned_row = (
+            await asyncio.to_thread(self.learned_profiles.current, participant_id)
+            if self.learned_profiles is not None else None
+        )
+        effective_profile, profile_layers = layered_profile(profile_row, learned_row)
         initial_state = await self._resolve_initial_state(
             participant_id,
             target,
             refresh_calendar=refresh_calendar,
+            effective_profile=effective_profile,
         )
         calendar_snapshot, calendar_changed = await self._calendar_snapshot(
             participant_id, target, refresh_calendar
@@ -318,16 +325,20 @@ class ForecastCoordinator:
         semantic_events, semantic_revision, semantic_status, misses = await asyncio.to_thread(
             self.semantics.prepare, participant_id, events, consent=consent
         )
-        observations = await asyncio.to_thread(
-            self.observations.recent, participant_id, 50
+        local_now = datetime.now(self.timezone)
+        observations = (
+            await asyncio.to_thread(
+                self.observations.for_local_date,
+                participant_id,
+                target,
+                timezone_name=self.timezone.key,
+                as_of=local_now,
+                limit=100,
+            )
+            if target == local_now.date()
+            else []
         )
         observation_revision = _sha(observations)
-        profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
-        learned_row = (
-            await asyncio.to_thread(self.learned_profiles.current, participant_id)
-            if self.learned_profiles is not None else None
-        )
-        effective_profile, profile_layers = layered_profile(profile_row, learned_row)
         profile_revision = _sha({
             "explicit": profile_row,
             "learned": learned_row,
@@ -445,10 +456,17 @@ class ForecastCoordinator:
         target: date,
         *,
         refresh_calendar: bool,
+        effective_profile: dict[str, Any],
     ) -> ForecastInitialState:
         local_today = datetime.now(self.timezone).date()
         previous = None
-        if target == local_today + timedelta(days=1):
+        if target == local_today:
+            previous = await asyncio.to_thread(
+                self.forecasts.latest,
+                participant_id,
+                target - timedelta(days=1),
+            )
+        elif target == local_today + timedelta(days=1):
             previous = await self.ensure_forecast(
                 participant_id,
                 local_today,
@@ -460,7 +478,25 @@ class ForecastCoordinator:
             target,
             local_today,
             previous_day_forecast=previous,
+            baseline_state=self._profile_initial_state(effective_profile),
         )
+
+    @staticmethod
+    def _profile_initial_state(profile: dict[str, Any]) -> dict[str, float]:
+        parameters = dict(profile.get("model_params") or profile.get("params") or {})
+        ctssm = dict(parameters.get("ctssm_params") or {})
+        try:
+            stress = float(parameters.get("S_star_init", 40.0)) / 10.0
+        except (TypeError, ValueError):
+            stress = 4.0
+        try:
+            vitality = float(ctssm.get("vitality_baseline", 70.0)) / 10.0
+        except (TypeError, ValueError):
+            vitality = 7.0
+        return {
+            "stress_0_10": max(0.0, min(stress, 10.0)),
+            "vitality_0_10": max(0.0, min(vitality, 10.0)),
+        }
 
     def _warning_windows(self, alerts: Any, target: date) -> list[dict[str, Any]]:
         result = []

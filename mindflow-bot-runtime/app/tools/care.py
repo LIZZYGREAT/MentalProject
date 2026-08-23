@@ -20,7 +20,10 @@ from app.repositories import (
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
-from app.services.pressure_curve_service import PressureCurveService
+from app.services.pressure_curve_service import (
+    HistoricalForecastNotFoundError,
+    PressureCurveService,
+)
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PresentationOutbox,
@@ -384,8 +387,14 @@ class CareTools:
             return {"ok": True, **result}
         profile_row = self.profiles.current(ctx.participant_id)
         profile = profile_row["profile"] if profile_row else {}
-        observations = self.observations.recent(ctx.participant_id, limit=50)
         now = datetime.now(self.timezone)
+        observations = self.observations.for_local_date(
+            ctx.participant_id,
+            now.date(),
+            timezone_name=self.timezone.key,
+            as_of=now,
+            limit=100,
+        )
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
             calendar_events = await self.calendar.get_events(
@@ -439,13 +448,20 @@ class CareTools:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("local_date must be YYYY-MM-DD") from exc
-        view = await self.pressure_curves.build(
-            ctx.participant_id,
-            target,
-            reason="user_curve_card_request",
-            refresh_calendar=True,
-            stress_only=True,
-        )
+        try:
+            view = await self.pressure_curves.build(
+                ctx.participant_id,
+                target,
+                reason="user_curve_card_request",
+                refresh_calendar=True,
+                stress_only=True,
+            )
+        except HistoricalForecastNotFoundError:
+            return {
+                "ok": False,
+                "error": "historical_forecast_not_found",
+                "local_date": target.isoformat(),
+            }
         result = view.forecast
         analysis = view.analysis
         card = pressure_curve_card(
@@ -484,10 +500,18 @@ class CareTools:
                 "forecast_refreshed_dates": [],
                 "forecast_refresh_errors": [],
             }
-        normalized = sorted(value for value in dates if value is not None)
-        if not normalized:
-            normalized = [datetime.now(self.timezone).date()]
         today = datetime.now(self.timezone).date()
+        supplied = sorted(value for value in dates if value is not None)
+        normalized = [value for value in supplied if value >= today]
+        if not supplied:
+            normalized = [today]
+        elif not normalized:
+            return {
+                "forecast_refresh": "historical_dates_skipped",
+                "forecast_refresh_degraded": False,
+                "forecast_refreshed_dates": [],
+                "forecast_refresh_errors": [],
+            }
         dependency = {}
         if today in normalized:
             tomorrow = today + timedelta(days=1)

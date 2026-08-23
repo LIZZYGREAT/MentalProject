@@ -15,6 +15,10 @@ from app.repositories import (
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.forecast_initial_state import ForecastInitialStateResolver
+from app.services.pressure_curve_service import (
+    HistoricalForecastNotFoundError,
+    PressureCurveService,
+)
 from app.tools.care import CareTools
 from helpers import memory_database
 
@@ -94,10 +98,155 @@ def test_tomorrow_inherits_today_terminal_and_third_day_does_not_roll():
     )
 
     assert tomorrow["output"]["initial_state"]["mode"] == "previous_day_forecast"
-    assert tomorrow["output"]["initial_state"]["stress_0_10"] == 6.25
-    assert tomorrow["output"]["initial_state"]["vitality_0_10"] == 4.75
-    assert third_day["output"]["initial_state"]["mode"] == "default"
-    assert prediction.calls[-1]["initial_state"] is None
+    assert tomorrow["output"]["initial_state"]["stress_0_10"] == 4.0
+    assert tomorrow["output"]["initial_state"]["vitality_0_10"] == 7.0
+    assert third_day["output"]["initial_state"]["mode"] == "future_trend_default"
+    assert prediction.calls[-1]["initial_state"] == {
+        "stress_0_10": 4.0,
+        "vitality_0_10": 7.0,
+    }
+
+
+def _save_forecast(database, participant_id, local_date, version, stress, vitality):
+    return ForecastSnapshotRepository(database).save(
+        participant_id,
+        local_date,
+        calendar_revision=f"calendar-{version}",
+        semantic_revision=f"semantic-{version}",
+        observation_revision=f"observation-{version}",
+        algorithm_version="seed",
+        forecast_version=version,
+        semantic_status="rules_only",
+        semantic_input=[],
+        curve=[
+            {
+                "time": "23:59",
+                "stress_0_10": stress,
+                "vitality_0_10": vitality,
+            }
+        ],
+        peaks=[],
+        warning_windows=[],
+        output={"stress_0_10": stress, "vitality_0_10": vitality},
+    )
+
+
+def test_today_inherits_persisted_yesterday_terminal_without_recomputing_yesterday():
+    database, participant, prediction, coordinator = pipeline()
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    yesterday = today - timedelta(days=1)
+    source = _save_forecast(
+        database, participant.id, yesterday, "yesterday-v1", 8.25, 2.5
+    )
+
+    result = asyncio.run(coordinator.ensure_forecast(participant.id, today, "test"))
+
+    initial = result["output"]["initial_state"]
+    assert initial["mode"] == "previous_day_forecast"
+    assert initial["stress_0_10"] == 8.25
+    assert initial["vitality_0_10"] == 2.5
+    assert initial["source_local_date"] == yesterday.isoformat()
+    assert initial["source_forecast_id"] == source["id"]
+    assert len(prediction.calls) == 1
+
+
+def test_today_without_yesterday_uses_profile_baseline():
+    database, participant, _, coordinator = pipeline()
+    ProfileRepository(database).save(
+        participant.id,
+        {
+            "model_params": {
+                "S_star_init": 55.0,
+                "ctssm_params": {"vitality_baseline": 62.0},
+            }
+        },
+    )
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+    result = asyncio.run(coordinator.ensure_forecast(participant.id, today, "test"))
+
+    initial = result["output"]["initial_state"]
+    assert initial["mode"] == "profile_default"
+    assert initial["stress_0_10"] == 5.5
+    assert initial["vitality_0_10"] == 6.2
+
+
+def test_past_curve_reads_persisted_snapshot_without_recalculation():
+    database, participant, prediction, coordinator = pipeline()
+    target = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=3)
+    _save_forecast(database, participant.id, target, "historical-v1", 6.0, 5.0)
+
+    class Renderer:
+        def render(self, *_args, **_kwargs):
+            return b"png"
+
+    service = PressureCurveService(
+        coordinator, timezone_name="Asia/Shanghai", renderer=Renderer()
+    )
+    view = asyncio.run(
+        service.build(
+            participant.id,
+            target,
+            reason="historical-view",
+            refresh_calendar=True,
+        )
+    )
+
+    assert view.forecast["forecast_version"] == "historical-v1"
+    assert prediction.calls == []
+
+
+def test_missing_past_curve_is_not_reconstructed_with_current_inputs():
+    _, participant, prediction, coordinator = pipeline()
+    target = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=3)
+    service = PressureCurveService(coordinator, timezone_name="Asia/Shanghai")
+
+    try:
+        asyncio.run(
+            service.build(
+                participant.id,
+                target,
+                reason="historical-view",
+                refresh_calendar=True,
+            )
+        )
+        assert False, "expected HistoricalForecastNotFoundError"
+    except HistoricalForecastNotFoundError:
+        pass
+
+    assert prediction.calls == []
+
+
+def test_calendar_mutation_does_not_recompute_past_forecast():
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def ensure_forecast(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    coordinator = Coordinator()
+    tools = CareTools(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "Asia/Shanghai",
+        forecast_coordinator=coordinator,
+        pressure_curves=object(),
+    )
+    yesterday = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+
+    result = asyncio.run(
+        tools._refresh_calendar_mutation_forecasts(
+            "participant", {yesterday}, "past-calendar-mutation"
+        )
+    )
+
+    assert result["forecast_refresh"] == "historical_dates_skipped"
+    assert coordinator.calls == []
 
 
 def test_tomorrow_cache_identity_tracks_today_forecast_version():

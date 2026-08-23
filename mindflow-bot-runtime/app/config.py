@@ -421,20 +421,27 @@ class Settings:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:
             raise ValueError("PRESENTATION_AGENT_MAX_SEGMENTS must be <= 3")
+
+    def validate_admin(self) -> None:
+        """Fail closed for the independent Admin process only."""
+
+        if not self.admin_enabled:
+            raise ValueError("ADMIN_ENABLED must be true to start Admin")
         if self.admin_port > 65535:
             raise ValueError("ADMIN_PORT must be <= 65535")
-        if self.admin_enabled and self.app_env == "production":
-            missing_admin = [
-                name
-                for name, value in {
-                    "ADMIN_USERNAME": self.admin_username,
-                    "ADMIN_PASSWORD_HASH": self.admin_password_hash,
-                    "ADMIN_SESSION_SECRET": self.admin_session_secret,
-                }.items()
-                if not value
-            ]
-            if missing_admin:
-                raise ValueError(
-                    "Missing required admin environment values: "
-                    + ", ".join(missing_admin)
-                )
+        missing_admin = [
+            name
+            for name, value in {
+                "ADMIN_USERNAME": self.admin_username,
+                "ADMIN_PASSWORD_HASH": self.admin_password_hash,
+                "ADMIN_SESSION_SECRET": self.admin_session_secret,
+            }.items()
+            if not value
+        ]
+        if missing_admin:
+            raise ValueError(
+                "Missing required admin environment values: "
+                + ", ".join(missing_admin)
+            )
+        if len(self.admin_session_secret) < 16:
+            raise ValueError("ADMIN_SESSION_SECRET must be at least 16 characters")

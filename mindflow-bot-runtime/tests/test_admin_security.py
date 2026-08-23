@@ -1,4 +1,6 @@
 from tests.test_admin_web import client, login
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 def test_participant_responses_do_not_expose_credentials_or_identity_ciphertext():
@@ -31,3 +33,22 @@ def test_refresh_requires_csrf_before_service_lookup():
         headers={"X-CSRF-Token": session["csrf_token"]},
     )
     assert response.status_code == 503
+
+
+def test_past_forecast_refresh_is_rejected_before_service_lookup():
+    browser = client()
+    session = login(browser)
+    yesterday = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+
+    response = browser.post(
+        f"/admin/api/participants/P001/forecasts/{yesterday}/refresh",
+        json={},
+        headers={"X-CSRF-Token": session["csrf_token"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "historical_forecast_refresh_not_supported"
+    }

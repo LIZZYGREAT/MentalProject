@@ -46,32 +46,75 @@ class ForecastInitialState:
 class ForecastInitialStateResolver:
     """Resolve today/default/tomorrow semantics without recursive day rolling."""
 
+    @staticmethod
+    def _bounded(value: Any, fallback: float) -> float:
+        try:
+            return max(0.0, min(float(value), 10.0))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _baseline(
+        self, baseline_state: dict[str, Any] | None
+    ) -> tuple[float, float]:
+        value = dict(baseline_state or {})
+        return (
+            self._bounded(value.get("stress_0_10"), 4.0),
+            self._bounded(value.get("vitality_0_10"), 7.0),
+        )
+
+    def _previous_terminal(
+        self, previous_day_forecast: dict[str, Any] | None
+    ) -> tuple[float, float] | None:
+        if previous_day_forecast is None:
+            return None
+        output = dict(previous_day_forecast.get("output") or {})
+        stress = output.get("stress_0_10")
+        vitality = output.get("vitality_0_10")
+        if stress is None or vitality is None:
+            curve = list(previous_day_forecast.get("curve") or [])
+            terminal = dict(curve[-1]) if curve else {}
+            stress = terminal.get("stress_0_10")
+            vitality = terminal.get("vitality_0_10")
+        try:
+            return (
+                max(0.0, min(float(stress), 10.0)),
+                max(0.0, min(float(vitality), 10.0)),
+            )
+        except (TypeError, ValueError):
+            return None
+
     def resolve(
         self,
         target: date,
         local_today: date,
         *,
         previous_day_forecast: dict[str, Any] | None = None,
+        baseline_state: dict[str, Any] | None = None,
     ) -> ForecastInitialState:
-        if target == local_today:
-            payload = {"mode": "observation_default"}
-            return ForecastInitialState(
-                mode="observation_default", revision=_revision(payload)
-            )
-        if target != local_today + timedelta(days=1):
-            payload = {"mode": "default"}
-            return ForecastInitialState(mode="default", revision=_revision(payload))
-        if previous_day_forecast is None:
-            raise ValueError("tomorrow forecast requires today's forecast")
+        baseline_stress, baseline_vitality = self._baseline(baseline_state)
+        if target > local_today + timedelta(days=1):
+            payload = {
+                "mode": "future_trend_default",
+                "stress_0_10": baseline_stress,
+                "vitality_0_10": baseline_vitality,
+            }
+            return ForecastInitialState(**payload, revision=_revision(payload))
 
-        output = dict(previous_day_forecast.get("output") or {})
-        stress = max(0.0, min(float(output["stress_0_10"]), 10.0))
-        vitality = max(0.0, min(float(output["vitality_0_10"]), 10.0))
+        terminal = self._previous_terminal(previous_day_forecast)
+        if terminal is None:
+            payload = {
+                "mode": "profile_default",
+                "stress_0_10": baseline_stress,
+                "vitality_0_10": baseline_vitality,
+            }
+            return ForecastInitialState(**payload, revision=_revision(payload))
+
+        stress, vitality = terminal
         payload = {
             "mode": "previous_day_forecast",
             "stress_0_10": stress,
             "vitality_0_10": vitality,
-            "source_local_date": local_today.isoformat(),
+            "source_local_date": (target - timedelta(days=1)).isoformat(),
             "source_forecast_id": str(previous_day_forecast.get("id") or ""),
             "source_forecast_version": str(
                 previous_day_forecast.get("forecast_version") or ""
