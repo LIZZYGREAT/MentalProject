@@ -113,6 +113,45 @@ def _set_retrospective_generated_at(
         row.generated_at = generated_at
 
 
+def _daily_review_action(
+    database, participant_id: uuid.UUID, target: date, scheduled_at: datetime
+) -> dict[str, str]:
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        participant_id, target, scheduled_at
+    )
+    return {
+        "version": "1",
+        "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+
+
+def _daily_review_scheduler(database, participant_id: uuid.UUID, sent: list):
+    class Participants:
+        def active_ids(self):
+            return [participant_id]
+
+    class Bindings:
+        def get_for_participant(self, _participant_id):
+            return {"chat_id": "chat-1"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "message-1"
+
+    return DailyReviewScheduler(
+        schedules=DailyReviewScheduleRepository(database),
+        participants=Participants(),
+        bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        retry_base_seconds=60,
+    )
+
+
 def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast():
     database = memory_database()
     person = participant(database, "DR001")
@@ -225,6 +264,7 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
         schedules=schedules,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -248,7 +288,8 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
     diagnostics = retrospective["diagnostics"]
 
     assert counts == {
-        "ensured": 1, "sent": 1, "unavailable": 0, "failed": 0,
+        "ensured": 1, "sent": 1, "unavailable": 0,
+        "source_forecast_unavailable": 0, "failed": 0,
     }
     assert response["local_date"] == "2030-01-15"
     assert response["submitted_at"].startswith("2030-01-15T16:06:00")
@@ -329,6 +370,7 @@ def test_next_morning_recovered_card_still_uses_previous_day_closing_anchor():
         schedules=schedules,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -473,6 +515,32 @@ def test_submission_before_scheduled_time_has_no_model_side_effects():
     assert RetrospectiveCurveRepository(database).latest(person.id, target) is None
 
 
+def test_direct_callback_without_forecast_does_not_persist_orphan_response():
+    database = memory_database()
+    person = participant(database, "DR-NO-SOURCE-FORECAST")
+    target = date(2030, 1, 15)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="source forecast unavailable"):
+        _service(database).submit(
+            person.id,
+            callback_event_id="callback-no-source-forecast",
+            action=_daily_review_action(
+                database, person.id, target, scheduled_at
+            ),
+            values=_values(),
+            submitted_at=scheduled_at + timedelta(minutes=5),
+        )
+
+    assert DailyReviewResponseRepository(database).latest(
+        person.id, target
+    ) is None
+    assert RetrospectiveCurveRepository(database).latest(
+        person.id, target
+    ) is None
+    assert _retrospective_count(database, person.id) == 0
+
+
 def test_duplicate_callback_does_not_rebuild_against_a_new_forecast_version():
     database = memory_database()
     person = participant(database, "DR-IDEMPOTENT-FORECAST")
@@ -565,6 +633,116 @@ def test_duplicate_callback_recovers_once_when_response_exists_without_retrospec
     assert recovered["response"]["id"] == response["id"]
     assert repeated["retrospective"]["id"] == recovered["retrospective"]["id"]
     assert _retrospective_count(database, person.id) == 1
+
+
+def test_reactivated_forecast_is_persisted_as_daily_review_causal_source():
+    database = memory_database()
+    person = participant(database, "DR-REACTIVATED-SOURCE")
+    target = date(2030, 1, 15)
+    t0 = datetime(2030, 1, 15, 13, 50, tzinfo=timezone.utc)
+    t1 = datetime(2030, 1, 15, 14, 10, tzinfo=timezone.utc)
+    submitted_at = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-reactivated-v1"
+    )
+    _set_forecast_timeline(database, forecast_v1["id"], t0)
+    forecast_v2 = _seed_forecast(
+        database, person.id, target, version="forecast-reactivated-v2"
+    )
+    _set_forecast_timeline(database, forecast_v2["id"], t1)
+    reactivated_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-reactivated-v1"
+    )
+
+    forecasts = ForecastSnapshotRepository(database)
+    assert reactivated_v1["id"] == forecast_v1["id"]
+    assert _utc_timestamp(reactivated_v1["generated_at"]) == t0
+    assert forecasts.latest(person.id, target)["id"] == forecast_v1["id"]
+
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-reactivated-source",
+        action=_daily_review_action(
+            database,
+            person.id,
+            target,
+            datetime(2030, 1, 15, 14, tzinfo=timezone.utc),
+        ),
+        values=_values(),
+        submitted_at=submitted_at,
+    )
+
+    assert result["response"]["causal_source_forecast_id"] == forecast_v1["id"]
+    assert (
+        result["response"]["causal_source_forecast_version"]
+        == "forecast-reactivated-v1"
+    )
+    assert result["retrospective"]["source_forecast_id"] == forecast_v1["id"]
+    assert (
+        result["retrospective"]["source_forecast_version"]
+        == "forecast-reactivated-v1"
+    )
+
+
+def test_reactivated_forecast_crash_recovery_uses_persisted_exact_source():
+    database = memory_database()
+    person = participant(database, "DR-REACTIVATED-RECOVERY")
+    target = date(2030, 1, 15)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-recovery-v1"
+    )
+    _seed_forecast(database, person.id, target, version="forecast-recovery-v2")
+    reactivated_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-recovery-v1"
+    )
+    assert reactivated_v1["id"] == forecast_v1["id"]
+
+    submitted_at = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    action = _daily_review_action(
+        database,
+        person.id,
+        target,
+        datetime(2030, 1, 15, 14, tzinfo=timezone.utc),
+    )
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated reactivation recovery crash")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="reactivation recovery crash"):
+        service.submit(
+            person.id,
+            callback_event_id="callback-reactivated-recovery",
+            action=action,
+            values=_values(),
+            submitted_at=submitted_at,
+        )
+    response = DailyReviewResponseRepository(database).latest(person.id, target)
+    assert response["causal_source_forecast_id"] == forecast_v1["id"]
+
+    forecast_v3 = _seed_forecast(
+        database, person.id, target, version="forecast-recovery-v3"
+    )
+    service.rebuild = rebuild
+    recovered = service.submit(
+        person.id,
+        callback_event_id="callback-reactivated-recovery",
+        action=action,
+        values={},
+        submitted_at=submitted_at + timedelta(minutes=10),
+    )
+
+    assert ForecastSnapshotRepository(database).latest(
+        person.id, target
+    )["id"] == forecast_v3["id"]
+    assert recovered["created"] is False
+    assert recovered["retrospective"]["source_forecast_id"] == forecast_v1["id"]
+    assert (
+        recovered["retrospective"]["source_forecast_id"]
+        == recovered["response"]["causal_source_forecast_id"]
+    )
 
 
 def test_crash_recovery_uses_forecast_visible_at_original_submission():
@@ -789,7 +967,9 @@ def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
     database = memory_database()
     person = participant(database, "DR-SAME-REVISION-REBUILD")
     target = date(2030, 1, 15)
-    _seed_forecast(database, person.id, target, version="forecast-admin-v1")
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-admin-v1"
+    )
     scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
     schedule = DailyReviewScheduleRepository(database).ensure(
         person.id, target, scheduled_at
@@ -820,7 +1000,15 @@ def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
     )
 
     latest = RetrospectiveCurveRepository(database).latest(person.id, target)
+    persisted_response = DailyReviewResponseRepository(database).latest(
+        person.id, target
+    )
     assert revision_two["retrospective"]["daily_review_revision"] == 2
+    assert revision_two["response"]["causal_source_forecast_id"] == forecast_v1["id"]
+    assert (
+        persisted_response["causal_source_forecast_version"]
+        == "forecast-admin-v1"
+    )
     assert rebuilt["daily_review_revision"] == 2
     assert rebuilt["id"] != revision_two["retrospective"]["id"]
     assert rebuilt["source_forecast_version"] == "forecast-admin-v2"
@@ -1025,11 +1213,71 @@ def test_duplicate_callback_identity_mismatch_is_rejected():
     assert first["response"]["local_date"] == first_date.isoformat()
 
 
+def test_scheduler_defers_daily_review_when_source_forecast_is_missing():
+    database = memory_database()
+    person = participant(database, "DR-SCHEDULER-NO-FORECAST")
+    target = date(2030, 1, 15)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    sent = []
+    scheduler = _daily_review_scheduler(database, person.id, sent)
+
+    counts = asyncio.run(scheduler.run_once(scheduled_at))
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, scheduled_at
+    )
+    stored = DailyReviewScheduleRepository(database).get(schedule["id"])
+
+    assert counts["sent"] == 0
+    assert counts["source_forecast_unavailable"] == 1
+    assert sent == []
+    assert stored["status"] == "pending"
+    assert stored["last_error_code"] == "source_forecast_unavailable"
+    assert stored["attempt_count"] == 0
+    assert stored["sent_at"] is None
+    schedules = DailyReviewScheduleRepository(database)
+    assert schedules.claim_due(
+        scheduled_at + timedelta(days=1), 120
+    ) == []
+    assert schedules.get(schedule["id"])["status"] == "expired"
+
+
+def test_scheduler_sends_once_after_source_forecast_recovers():
+    database = memory_database()
+    person = participant(database, "DR-SCHEDULER-FORECAST-RECOVERY")
+    target = date(2030, 1, 15)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    sent = []
+    scheduler = _daily_review_scheduler(database, person.id, sent)
+
+    missing = asyncio.run(scheduler.run_once(scheduled_at))
+    _seed_forecast(
+        database, person.id, target, version="forecast-delivery-recovered"
+    )
+    recovered = asyncio.run(
+        scheduler.run_once(scheduled_at + timedelta(minutes=6))
+    )
+    repeated = asyncio.run(
+        scheduler.run_once(scheduled_at + timedelta(minutes=7))
+    )
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, scheduled_at
+    )
+
+    assert missing["source_forecast_unavailable"] == 1
+    assert recovered["sent"] == 1
+    assert repeated["sent"] == 0
+    assert len(sent) == 1
+    assert DailyReviewScheduleRepository(database).get(
+        schedule["id"]
+    )["status"] == "sent"
+
+
 def test_schedule_claim_lease_retry_and_stable_message_uuid():
     database = memory_database()
     person = participant(database, "DR002")
     repo = DailyReviewScheduleRepository(database)
     due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    _seed_forecast(database, person.id, due.date())
     schedule = repo.ensure(person.id, due.date(), due)
     first = repo.claim_due(due, 120)
     assert len(first) == 1
@@ -1053,6 +1301,7 @@ def test_schedule_claim_lease_retry_and_stable_message_uuid():
     )
     scheduler = DailyReviewScheduler(
         schedules=repo, participants=Participants(), bindings=Bindings(), sender=Sender(),
+        forecasts=ForecastSnapshotRepository(database),
         timezone_name="Asia/Shanghai", local_time="22:00", poll_interval_seconds=60,
         retry_base_seconds=1, max_attempts=5, claim_lease_seconds=120,
     )
@@ -1066,6 +1315,7 @@ def test_old_unavailable_cards_expire_instead_of_batch_sending():
     database = memory_database()
     person = participant(database, "DR-EXPIRY")
     repo = DailyReviewScheduleRepository(database)
+    _seed_forecast(database, person.id, date(2030, 1, 15))
     old_schedules = []
     for day_number in (10, 11, 12, 13, 14):
         local_day = date(2030, 1, day_number)
@@ -1097,6 +1347,7 @@ def test_old_unavailable_cards_expire_instead_of_batch_sending():
         schedules=repo,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -1114,6 +1365,7 @@ def test_restart_shortly_after_midnight_catches_up_previous_day_once():
     database = memory_database()
     person = participant(database, "DR-CATCHUP")
     repo = DailyReviewScheduleRepository(database)
+    _seed_forecast(database, person.id, date(2030, 1, 15))
     sent = []
 
     class Participants:
@@ -1133,6 +1385,7 @@ def test_restart_shortly_after_midnight_catches_up_previous_day_once():
         schedules=repo,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -1156,6 +1409,7 @@ def test_yesterday_unavailable_card_sends_when_binding_recovers_within_validity(
     person = participant(database, "DR-RECOVER-VALID")
     repo = DailyReviewScheduleRepository(database)
     due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    _seed_forecast(database, person.id, due.date())
     schedule = repo.ensure(person.id, date(2030, 1, 15), due)
     claimed = repo.claim_due(due, 120)[0]
     repo.mark_unavailable(
@@ -1180,6 +1434,7 @@ def test_yesterday_unavailable_card_sends_when_binding_recovers_within_validity(
         schedules=repo,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -1218,6 +1473,7 @@ def test_restart_after_catch_up_window_does_not_create_old_schedule():
         schedules=repo,
         participants=Participants(),
         bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
         timezone_name="Asia/Shanghai",
         local_time="22:00",
@@ -1232,6 +1488,7 @@ def test_restart_after_catch_up_window_does_not_create_old_schedule():
         "ensured": 0,
         "sent": 0,
         "unavailable": 0,
+        "source_forecast_unavailable": 0,
         "failed": 0,
     }
 

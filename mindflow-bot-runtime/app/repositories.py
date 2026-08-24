@@ -631,6 +631,31 @@ class ForecastSnapshotRepository:
             ).scalar_one_or_none()
             return self._view(row) if row else None
 
+    def get(
+        self,
+        participant_id: uuid.UUID,
+        forecast_id: uuid.UUID | str,
+        *,
+        local_date: date | None = None,
+    ) -> Optional[dict[str, Any]]:
+        """Fetch one exact snapshot without requiring it to remain current."""
+
+        try:
+            snapshot_id = uuid.UUID(str(forecast_id))
+        except ValueError:
+            return None
+        conditions = [
+            ForecastSnapshot.id == snapshot_id,
+            ForecastSnapshot.participant_id == participant_id,
+        ]
+        if local_date is not None:
+            conditions.append(ForecastSnapshot.local_date == local_date)
+        with self.database.session() as session:
+            row = session.execute(
+                select(ForecastSnapshot).where(*conditions)
+            ).scalar_one_or_none()
+            return self._view(row) if row else None
+
     def history(
         self, participant_id: uuid.UUID, *, through: date, days: int = 14
     ) -> list[dict[str, Any]]:
@@ -667,26 +692,6 @@ class ForecastSnapshotRepository:
                 ForecastSnapshot.local_date == local_date,
                 ForecastSnapshot.generated_at < timestamp,
             ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
-            return self._view(row) if row is not None else None
-
-    def latest_at_or_before(
-        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
-    ) -> Optional[dict[str, Any]]:
-        """Return the newest snapshot visible at an inclusive causal cutoff.
-
-        Invalidated snapshots remain eligible because a later forecast may have
-        invalidated the version that was current when the callback was accepted.
-        """
-
-        with self.database.session() as session:
-            row = session.execute(select(ForecastSnapshot).where(
-                ForecastSnapshot.participant_id == participant_id,
-                ForecastSnapshot.local_date == local_date,
-                ForecastSnapshot.generated_at <= timestamp,
-            ).order_by(
-                desc(ForecastSnapshot.generated_at),
-                desc(ForecastSnapshot.id),
-            ).limit(1)).scalar_one_or_none()
             return self._view(row) if row is not None else None
 
     def save(

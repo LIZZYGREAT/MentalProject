@@ -55,3 +55,43 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0014_daily_review_expiry"
     )
     assert migration_0014.down_revision == "0013_daily_review_feedback"
+    migration_0015 = next(
+        migration for migration in migrations
+        if migration.revision == "0015_daily_review_causal_source"
+    )
+    assert migration_0015.down_revision == "0014_daily_review_expiry"
+
+
+def test_0015_backfills_causal_source_without_guessing_orphan_responses(
+    monkeypatch,
+):
+    migration = _migration(
+        VERSIONS / "0015_daily_review_causal_source.py"
+    )
+    columns = []
+    foreign_keys = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_foreign_key",
+        lambda *args, **kwargs: foreign_keys.append((args, kwargs)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert [column.name for _, column in columns] == [
+        "causal_source_forecast_id",
+        "causal_source_forecast_version",
+    ]
+    assert all(column.nullable for _, column in columns)
+    assert foreign_keys[0][1]["ondelete"] == "RESTRICT"
+    statement = statements[0]
+    assert "DISTINCT ON (daily_review_response_id)" in statement
+    assert "generated_at ASC, id ASC" in statement
+    assert "response.causal_source_forecast_id IS NULL" in statement

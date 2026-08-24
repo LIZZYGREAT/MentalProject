@@ -623,6 +623,39 @@ def test_create_delete_and_time_only_update_invalidate_forecast_not_semantic():
     asyncio.run(scenario())
 
 
+def test_forecast_pipeline_reactivates_original_snapshot_after_a_b_a_change():
+    original_event = event(description="calendar-state-a")
+    changed_event = event(description="calendar-state-b")
+    database, participant, calendar, _, _, _, coordinator = build_pipeline(
+        [original_event]
+    )
+
+    async def scenario():
+        first = await coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "daily_prepare"
+        )
+        calendar.events = [changed_event]
+        second = await coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "periodic_poll"
+        )
+        calendar.events = [original_event]
+        third = await coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "periodic_poll"
+        )
+        return first, second, third
+
+    first, second, third = asyncio.run(scenario())
+    latest = ForecastSnapshotRepository(database).latest(
+        participant.id, TEST_LOCAL_DATE
+    )
+
+    assert second["forecast_version"] != first["forecast_version"]
+    assert third["forecast_version"] == first["forecast_version"]
+    assert third["id"] == first["id"]
+    assert third["cache_hit"] is False
+    assert latest["id"] == first["id"]
+
+
 def test_warning_is_durable_deduped_and_stale_forecast_cannot_send():
     database, participant, calendar, _, _, warnings, coordinator = build_pipeline([event()])
 

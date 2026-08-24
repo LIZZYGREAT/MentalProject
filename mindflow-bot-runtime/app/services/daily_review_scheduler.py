@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 import uuid
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import daily_review_card
-from app.repositories import BindingRepository, ParticipantRepository
+from app.repositories import (
+    BindingRepository,
+    ForecastSnapshotRepository,
+    ParticipantRepository,
+)
 from app.repositories_daily_review import DailyReviewScheduleRepository
 
 
@@ -20,7 +24,8 @@ class DailyReviewScheduler:
     def __init__(
         self, *, schedules: DailyReviewScheduleRepository,
         participants: ParticipantRepository, bindings: BindingRepository,
-        sender: object, timezone_name: str = "Asia/Shanghai",
+        forecasts: ForecastSnapshotRepository, sender: object,
+        timezone_name: str = "Asia/Shanghai",
         local_time: str = "22:00", poll_interval_seconds: int = 60,
         retry_base_seconds: int = 60, max_attempts: int = 5,
         claim_lease_seconds: int = 120,
@@ -29,6 +34,7 @@ class DailyReviewScheduler:
         self.schedules = schedules
         self.participants = participants
         self.bindings = bindings
+        self.forecasts = forecasts
         self.sender = sender
         self.timezone = ZoneInfo(timezone_name)
         hour, minute = (int(part) for part in local_time.split(":"))
@@ -49,7 +55,13 @@ class DailyReviewScheduler:
         if utc_now.tzinfo is None:
             utc_now = utc_now.replace(tzinfo=timezone.utc)
         local_now = utc_now.astimezone(self.timezone)
-        counts = {"ensured": 0, "sent": 0, "unavailable": 0, "failed": 0}
+        counts = {
+            "ensured": 0,
+            "sent": 0,
+            "unavailable": 0,
+            "source_forecast_unavailable": 0,
+            "failed": 0,
+        }
         schedule_dates = []
         if local_now.time() >= self.local_time:
             schedule_dates.append(local_now.date())
@@ -89,8 +101,9 @@ class DailyReviewScheduler:
             self.schedules.claim_due, utc_now, self.claim_lease_seconds
         )
         for item in claimed:
+            participant_id = uuid.UUID(item["participant_id"])
             binding = await asyncio.to_thread(
-                self.bindings.get_for_participant, uuid.UUID(item["participant_id"])
+                self.bindings.get_for_participant, participant_id
             )
             if not binding or not binding.get("chat_id"):
                 await asyncio.to_thread(
@@ -98,6 +111,21 @@ class DailyReviewScheduler:
                     now=utc_now,
                 )
                 counts["unavailable"] += 1
+                continue
+            source_forecast = await asyncio.to_thread(
+                self.forecasts.latest,
+                participant_id,
+                date.fromisoformat(item["local_date"]),
+            )
+            if source_forecast is None:
+                await asyncio.to_thread(
+                    self.schedules.defer_missing_forecast,
+                    item["id"],
+                    item["claim_token"],
+                    now=utc_now,
+                    retry_after_seconds=self.retry_base_seconds,
+                )
+                counts["source_forecast_unavailable"] += 1
                 continue
             card = daily_review_card(
                 schedule_id=item["id"], local_date=item["local_date"],

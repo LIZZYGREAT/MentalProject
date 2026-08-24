@@ -55,6 +55,7 @@ class BusinessServices:
     calendar: CalendarService
     prediction_service: PredictionService
     forecast_coordinator: ForecastCoordinator
+    forecast_snapshots: ForecastSnapshotRepository
     warning_schedules: WarningScheduleRepository
     semantic_preprocessor: EventSemanticPreprocessor
     registry: ToolRegistry
@@ -170,6 +171,7 @@ def build_business_services(
         calendar=calendar,
         prediction_service=prediction_service,
         forecast_coordinator=forecast_coordinator,
+        forecast_snapshots=forecast_snapshots,
         warning_schedules=warning_schedules,
         semantic_preprocessor=semantic_preprocessor,
         registry=registry,

@@ -144,6 +144,38 @@ class DailyReviewScheduleRepository:
             error_code="missing_active_chat_binding",
         )
 
+    def defer_missing_forecast(
+        self,
+        schedule_id: uuid.UUID | str,
+        claim_token: uuid.UUID | str,
+        *,
+        now: datetime,
+        retry_after_seconds: int,
+    ) -> bool:
+        """Return a claimed schedule to pending without spending send retries."""
+
+        sid, token = uuid.UUID(str(schedule_id)), uuid.UUID(str(claim_token))
+        now = _aware(now)
+        with self.database.session() as session:
+            row = session.execute(select(DailyReviewSchedule).where(
+                DailyReviewSchedule.id == sid,
+                DailyReviewSchedule.claim_token == token,
+                DailyReviewSchedule.status == "claimed",
+            ).with_for_update()).scalar_one_or_none()
+            if row is None:
+                return False
+            row.status = "pending"
+            row.attempt_count = max(0, row.attempt_count - 1)
+            row.next_attempt_at = now + timedelta(
+                seconds=max(1, int(retry_after_seconds))
+            )
+            row.claim_token = None
+            row.lease_until = None
+            row.last_error_code = "source_forecast_unavailable"
+            row.last_error_class = None
+            row.updated_at = now
+            return True
+
     def mark_failed(
         self, schedule_id: uuid.UUID | str, claim_token: uuid.UUID | str, *, now: datetime,
         error: Exception, max_attempts: int, retry_base_seconds: int,
@@ -239,6 +271,8 @@ class DailyReviewResponseRepository:
     def add(
         self, participant_id: uuid.UUID, local_date: date, *, callback_event_id: str,
         submitted_at: datetime, card_version: str, schedule_id: uuid.UUID | None,
+        causal_source_forecast_id: uuid.UUID | str,
+        causal_source_forecast_version: str,
         values: dict[str, Any], raw: dict[str, Any],
     ) -> tuple[dict[str, Any], bool]:
         callback = str(callback_event_id)[:128]
@@ -258,6 +292,12 @@ class DailyReviewResponseRepository:
                     participant_id=participant_id, local_date=local_date,
                     revision=revision, card_version=card_version,
                     schedule_id=schedule_id, callback_event_id=callback,
+                    causal_source_forecast_id=uuid.UUID(
+                        str(causal_source_forecast_id)
+                    ),
+                    causal_source_forecast_version=str(
+                        causal_source_forecast_version
+                    ),
                     submitted_at=_aware(submitted_at), raw_json=dict(raw), **values,
                 )
                 session.add(row)
@@ -279,6 +319,8 @@ class DailyReviewResponseRepository:
                 submitted_at=submitted_at,
                 card_version=card_version,
                 schedule_id=schedule_id,
+                causal_source_forecast_id=causal_source_forecast_id,
+                causal_source_forecast_version=causal_source_forecast_version,
                 values=values,
                 raw=raw,
             )
@@ -308,6 +350,13 @@ class DailyReviewResponseRepository:
             "local_date": row.local_date.isoformat(), "revision": row.revision,
             "card_version": row.card_version,
             "schedule_id": str(row.schedule_id) if row.schedule_id else None,
+            "causal_source_forecast_id": (
+                str(row.causal_source_forecast_id)
+                if row.causal_source_forecast_id else None
+            ),
+            "causal_source_forecast_version": (
+                row.causal_source_forecast_version
+            ),
             "callback_event_id": row.callback_event_id,
             "submitted_at": row.submitted_at.isoformat(),
             "start_stress": row.start_stress, "start_energy": row.start_energy,

@@ -167,12 +167,17 @@ class DailyReviewService:
             "recovery_note": _text(values.get("recovery_note"), "recovery_note", 300),
             "free_text": _text(values.get("free_text"), "free_text", 1000),
         }
+        source_forecast = self.forecasts.latest(participant_id, local_date)
+        if source_forecast is None:
+            raise ValueError("source forecast unavailable for daily review")
         response, created = self.responses.add(
             participant_id, local_date,
             callback_event_id=callback_event_id,
             submitted_at=now,
             card_version=self.CARD_VERSION,
             schedule_id=schedule_id,
+            causal_source_forecast_id=source_forecast["id"],
+            causal_source_forecast_version=source_forecast["forecast_version"],
             values=normalized,
             raw=dict(values),
         )
@@ -187,13 +192,12 @@ class DailyReviewService:
         end_anchor = self._end_anchor(
             local_date, schedule, _stored_datetime(response["submitted_at"])
         )
-        causal_cutoff = _stored_datetime(response["submitted_at"])
         retrospective = self.rebuild(
             participant_id,
             local_date,
             response=response,
             end_anchor=end_anchor,
-            causal_cutoff=causal_cutoff,
+            use_response_causal_source=True,
         )
         return {
             "response": response,
@@ -232,7 +236,7 @@ class DailyReviewService:
                 local_date,
                 response=response,
                 end_anchor=end_anchor,
-                causal_cutoff=original_submitted_at,
+                use_response_causal_source=True,
             )
         return {
             "response": response,
@@ -244,7 +248,7 @@ class DailyReviewService:
         self, participant_id: uuid.UUID, local_date: date,
         *, response: dict[str, Any] | None = None,
         end_anchor: DailyReviewEndAnchor | None = None,
-        causal_cutoff: datetime | None = None,
+        use_response_causal_source: bool = False,
     ) -> dict[str, Any]:
         response = response or self.responses.latest(participant_id, local_date)
         if response is None:
@@ -259,13 +263,27 @@ class DailyReviewService:
             end_anchor = self._end_anchor(
                 local_date, schedule, _stored_datetime(response["submitted_at"])
             )
-        forecast = (
-            self.forecasts.latest_at_or_before(
-                participant_id, local_date, causal_cutoff
+        if use_response_causal_source:
+            causal_cutoff = _stored_datetime(response["submitted_at"])
+            forecast_id = response.get("causal_source_forecast_id")
+            forecast_version = response.get("causal_source_forecast_version")
+            if not forecast_id or not forecast_version:
+                raise ValueError(
+                    "daily review causal source forecast is unresolved"
+                )
+            forecast = self.forecasts.get(
+                participant_id, forecast_id, local_date=local_date
             )
-            if causal_cutoff is not None
-            else self.forecasts.latest(participant_id, local_date)
-        )
+            if (
+                forecast is None
+                or forecast["forecast_version"] != forecast_version
+            ):
+                raise ValueError(
+                    "daily review causal source forecast does not match response"
+                )
+        else:
+            causal_cutoff = None
+            forecast = self.forecasts.latest(participant_id, local_date)
         if forecast is None:
             raise ValueError("source forecast not found")
         observations = self.observations.for_local_date(

@@ -310,6 +310,7 @@ async def run() -> None:
         schedules=business.daily_review_schedules,
         participants=ParticipantRepository(database),
         bindings=bindings,
+        forecasts=business.forecast_snapshots,
         sender=sender,
         timezone_name=settings.daily_review_timezone,
         local_time=settings.daily_review_local_time,

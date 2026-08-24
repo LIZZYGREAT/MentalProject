@@ -514,6 +514,14 @@ class DailyReviewResponse(Base):
     schedule_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("daily_review_schedules.id", ondelete="SET NULL"), nullable=True
     )
+    causal_source_forecast_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("forecast_snapshots.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    causal_source_forecast_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     callback_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     start_stress: Mapped[float] = mapped_column(Float, nullable=False)
