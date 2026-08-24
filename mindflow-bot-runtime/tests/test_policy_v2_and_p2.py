@@ -5,13 +5,14 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import pressure_curve_card
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.models import ForecastSnapshot, StateObservation, WarningSchedule
 from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
     ObservationRepository,
     ParticipantRepository,
-    WarningScheduleRepository,
+    WarningScheduleRepository as RuntimeWarningScheduleRepository,
 )
 from app.services.curve_analysis import analyze_curve
 from app.services.forecast_coordinator import ForecastCoordinator
@@ -25,6 +26,12 @@ from utils.alert_monitor import AlertMonitor
 
 DAY = date(2030, 1, 15)
 NOW = datetime(2030, 1, 15, 1, 0, tzinfo=timezone.utc)
+DEFAULT_WARNING_DELIVERY = WarningDeliveryPolicyConfig(2, 240)
+
+
+class WarningScheduleRepository(RuntimeWarningScheduleRepository):
+    def __init__(self, database):
+        super().__init__(database, DEFAULT_WARNING_DELIVERY)
 
 
 def _alert(time_value, tier, risk, episode):
@@ -35,7 +42,7 @@ def _alert(time_value, tier, risk, episode):
 
 
 def test_warning_policy_ranks_dedupes_caps_and_never_uses_critical_exception():
-    selected = WarningPolicy().select_daily_candidates([
+    selected = WarningPolicy(DEFAULT_WARNING_DELIVERY).select_daily_candidates([
         _alert("09:00", 1, 0.5, 1),
         _alert("10:00", 3, 0.9, 1),  # same episode: higher candidate wins
         _alert("13:00", 2, 0.8, 2),  # too close to the best candidate
@@ -279,6 +286,111 @@ def test_durable_warning_guard_defers_or_suppresses_minimum_interval():
         assert deferred.next_attempt_at == (sent_at + timedelta(minutes=240)).replace(tzinfo=None)
         assert suppressed.status == "suppressed"
         assert suppressed.payload_json["suppression_reason"] == "minimum_interval"
+
+
+def test_configurable_three_send_sixty_minute_policy_is_shared_by_all_layers():
+    config = WarningDeliveryPolicyConfig(3, 60)
+    selected = WarningPolicy(config).select_daily_candidates([
+        _alert("08:00", 3, 0.9, 1),
+        _alert("10:00", 2, 0.8, 2),
+        _alert("12:00", 1, 0.7, 3),
+    ])
+    assert len(selected) == 3
+    assert all(item["warning_policy"] == config.identity_payload() for item in selected)
+
+    database = memory_database()
+    participant = ParticipantRepository(database).create("POLICY-CONFIG-3-60")
+    saved = _versioned_forecast(database, participant.id, "config-3-60")
+    forecast_id = uuid.UUID(saved["id"])
+    with database.session() as session:
+        session.add_all([
+            _warning_row(
+                participant.id,
+                forecast_id,
+                "sent-1",
+                target=NOW - timedelta(hours=3),
+                risk=NOW - timedelta(hours=2),
+                valid=NOW - timedelta(hours=2),
+                status="sent",
+                sent_at=NOW - timedelta(hours=2),
+            ),
+            _warning_row(
+                participant.id,
+                forecast_id,
+                "sent-2",
+                target=NOW - timedelta(minutes=90),
+                risk=NOW - timedelta(minutes=60),
+                valid=NOW - timedelta(minutes=60),
+                status="sent",
+                sent_at=NOW - timedelta(minutes=61),
+            ),
+        ])
+    repository = RuntimeWarningScheduleRepository(database, config)
+    assert repository.delivery_policy is config
+    repository.sync(
+        participant.id,
+        DAY,
+        forecast_id=forecast_id,
+        forecast_version="config-3-60",
+        warnings=[_window(
+            "third",
+            NOW,
+            NOW + timedelta(hours=1),
+            NOW + timedelta(hours=2),
+        )],
+        now=NOW,
+    )
+    with database.session() as session:
+        candidate = session.query(WarningSchedule).filter_by(
+            warning_identity="third"
+        ).one()
+        assert candidate.status == "pending"
+        candidate_id = candidate.id
+    assert repository.claim_if_current(candidate_id, now=NOW) is not None
+
+
+def test_configurable_one_send_three_hundred_minute_policy_caps_sync():
+    config = WarningDeliveryPolicyConfig(1, 300)
+    assert len(WarningPolicy(config).select_daily_candidates([
+        _alert("08:00", 3, 0.9, 1),
+        _alert("14:00", 2, 0.8, 2),
+    ])) == 1
+
+    database = memory_database()
+    participant = ParticipantRepository(database).create("POLICY-CONFIG-1-300")
+    saved = _versioned_forecast(database, participant.id, "config-1-300")
+    forecast_id = uuid.UUID(saved["id"])
+    with database.session() as session:
+        session.add(_warning_row(
+            participant.id,
+            forecast_id,
+            "sent",
+            target=NOW - timedelta(hours=1),
+            risk=NOW,
+            valid=NOW,
+            status="sent",
+            sent_at=NOW - timedelta(hours=1),
+        ))
+    repository = RuntimeWarningScheduleRepository(database, config)
+    repository.sync(
+        participant.id,
+        DAY,
+        forecast_id=forecast_id,
+        forecast_version="config-1-300",
+        warnings=[_window(
+            "capped",
+            NOW,
+            NOW + timedelta(hours=5),
+            NOW + timedelta(hours=6),
+        )],
+        now=NOW,
+    )
+    with database.session() as session:
+        candidate = session.query(WarningSchedule).filter_by(
+            warning_identity="capped"
+        ).one()
+        assert candidate.status == "suppressed"
+        assert candidate.payload_json["suppression_reason"] == "daily_cap"
 
 
 def test_cancelled_warning_reappearing_with_same_schedule_is_reactivated():
@@ -955,6 +1067,7 @@ def test_profile_calibration_failure_does_not_fail_forecast_scheduler_iteration(
         calendar_oauth_app_id="calendar-app", daily_prepare_local_time="00:00",
         calendar_sync_interval_seconds=999, warning_poll_interval_seconds=999,
         forecast_max_concurrency=2, profile_calibration=calibration,
+        warning_delivery_policy=DEFAULT_WARNING_DELIVERY,
     )
 
     async def scenario():
@@ -1233,7 +1346,7 @@ def test_warning_policy_full_pipeline_closes_candidate_interval_and_daily_cap():
             rows.append({"time": f"{minute // 60:02d}:{minute % 60:02d}", "S": 50, "V": 72, "F": 0, "state": "DAY_ACTIVE", "delta_S": -1})
     rows.sort(key=lambda row: row["time"])
     alerts, _ = AlertMonitor(params).analyze(rows)
-    selected = WarningPolicy().select_daily_candidates(alerts)
+    selected = WarningPolicy(DEFAULT_WARNING_DELIVERY).select_daily_candidates(alerts)
     assert 1 <= len(selected) <= 2
     selected_minutes = [int(item["time"][:2]) * 60 + int(item["time"][3:5]) for item in selected]
     assert all(

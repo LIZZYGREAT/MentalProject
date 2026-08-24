@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.agent.tool_registry import ToolRegistry
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.config import Settings
 from app.db import Database
 from app.integrations.feishu.calendar import CalendarService
@@ -119,7 +120,11 @@ def build_business_services(
         model=settings.semantic_api_model,
         max_concurrency=settings.semantic_max_concurrency,
     )
-    warning_schedules = WarningScheduleRepository(database)
+    warning_delivery_policy = WarningDeliveryPolicyConfig(
+        max_daily_sends=settings.warning_max_daily_sends,
+        min_interval_minutes=settings.warning_min_interval_minutes,
+    )
+    warning_schedules = WarningScheduleRepository(database, warning_delivery_policy)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
     profile_calibration = ProfileCalibrationService(
@@ -136,8 +141,6 @@ def build_business_services(
         warning_lead_minutes=settings.warning_lead_minutes,
         warning_late_grace_minutes=settings.warning_late_grace_minutes,
         warning_episode_drift_minutes=settings.warning_episode_drift_minutes,
-        warning_max_daily_sends=settings.warning_max_daily_sends,
-        warning_min_interval_minutes=settings.warning_min_interval_minutes,
         learned_profiles=learned_profiles,
         retrospective_curves=retrospective_curves,
     )

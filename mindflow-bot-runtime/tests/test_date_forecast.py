@@ -10,7 +10,6 @@ from app.repositories import (
     ObservationRepository,
     ParticipantRepository,
     ProfileRepository,
-    WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
@@ -20,7 +19,7 @@ from app.services.pressure_curve_service import (
     PressureCurveService,
 )
 from app.tools.care import CareTools
-from helpers import memory_database
+from helpers import memory_database, warning_repository
 
 
 class Calendar:
@@ -80,7 +79,7 @@ def pipeline():
         ),
         prediction=prediction,
         forecasts=ForecastSnapshotRepository(database),
-        warnings=WarningScheduleRepository(database),
+        warnings=warning_repository(database),
         timezone_name="Asia/Shanghai",
     )
     return database, participant, prediction, coordinator

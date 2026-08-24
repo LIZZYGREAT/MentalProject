@@ -14,6 +14,7 @@ from sqlalchemy import desc, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.models import (
     AgentRun,
     AgentToolCall,
@@ -934,11 +935,14 @@ class ForecastSnapshotRepository:
 class WarningScheduleRepository:
     ACTIVE = {"pending", "claimed", "delivery_unavailable"}
     SUCCESSFUL = {"sent", "escalated"}
-    MAX_DAILY_SENDS = 2
-    MIN_INTERVAL_MINUTES = 240
 
-    def __init__(self, database: Database):
+    def __init__(
+        self,
+        database: Database,
+        delivery_policy: WarningDeliveryPolicyConfig,
+    ):
         self.database = database
+        self.delivery_policy = delivery_policy
 
     @staticmethod
     def _aware(value: datetime) -> datetime:
@@ -1178,7 +1182,8 @@ class WarningScheduleRepository:
                         or self._aware(row.valid_until) != self._aware(item["valid_until"])
                     )
                     next_allowed = (
-                        latest_successful_at + timedelta(minutes=self.MIN_INTERVAL_MINUTES)
+                        latest_successful_at
+                        + timedelta(minutes=self.delivery_policy.min_interval_minutes)
                         if latest_successful_at is not None else now
                     )
                     due = max(self._aware(item["target_time"]), next_allowed, now)
@@ -1187,7 +1192,10 @@ class WarningScheduleRepository:
                         and due <= self._aware(item["valid_until"])
                         and due < self._aware(item["risk_time"])
                     )
-                    if legal_new_window and len(successful) < self.MAX_DAILY_SENDS:
+                    if (
+                        legal_new_window
+                        and len(successful) < self.delivery_policy.max_daily_sends
+                    ):
                         # Preserve the old suppressed audit row and create a
                         # distinct delivery opportunity below.
                         row = None
@@ -1222,7 +1230,7 @@ class WarningScheduleRepository:
                 next_attempt_at = new_next_attempt_at or max(
                     self._aware(item["target_time"]), now
                 )
-                if len(successful) >= self.MAX_DAILY_SENDS:
+                if len(successful) >= self.delivery_policy.max_daily_sends:
                     status = "suppressed"
                     payload["suppression_reason"] = "daily_cap"
                     next_attempt_at = None
@@ -1265,7 +1273,7 @@ class WarningScheduleRepository:
                 row.status == "cancelled"
                 and row.attempt_count == 0
                 and row.sent_at is None
-                and len(successful) < self.MAX_DAILY_SENDS
+                and len(successful) < self.delivery_policy.max_daily_sends
             ):
                 # Re-entering the latest desired set is enough to reactivate
                 # an untouched cancelled row; the schedule may be identical.
@@ -1409,8 +1417,7 @@ class WarningScheduleRepository:
 
     def claim_if_current(
         self, warning_id: uuid.UUID, *, now: datetime | None = None,
-        lease_seconds: int = 120, max_daily_sends: int = 2,
-        min_interval_minutes: int = 240,
+        lease_seconds: int = 120,
     ) -> Optional[dict[str, Any]]:
         now = self._aware(now or utc_now())
         with self.database.session() as session:
@@ -1460,17 +1467,17 @@ class WarningScheduleRepository:
                 WarningSchedule.local_date == row.local_date,
                 WarningSchedule.status.in_(("sent", "escalated")),
             ).order_by(desc(WarningSchedule.sent_at))).scalars().all()
-            if len(successful) >= max(0, max_daily_sends):
+            if len(successful) >= self.delivery_policy.max_daily_sends:
                 row.status = "suppressed"
                 row.payload_json = {**dict(row.payload_json), "suppression_reason": "daily_cap"}
                 row.next_attempt_at = None
                 row.updated_at = now
                 return None
-            if successful and min_interval_minutes > 0:
+            if successful and self.delivery_policy.min_interval_minutes > 0:
                 latest = next((item for item in successful if item.sent_at is not None), None)
                 if latest is not None:
                     next_allowed = self._aware(latest.sent_at) + timedelta(
-                        minutes=min_interval_minutes
+                        minutes=self.delivery_policy.min_interval_minutes
                     )
                     if next_allowed > now:
                         if (

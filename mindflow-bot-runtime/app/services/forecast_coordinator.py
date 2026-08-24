@@ -72,8 +72,6 @@ class ForecastCoordinator:
         timezone_name: str, materiality_threshold: float = 0.03,
         warning_lead_minutes: int = 20, warning_late_grace_minutes: int = 10,
         warning_episode_drift_minutes: int = 15,
-        warning_max_daily_sends: int = 2,
-        warning_min_interval_minutes: int = 240,
         learned_profiles: LearnedProfileRepository | None = None,
         retrospective_curves: RetrospectiveCurveRepository | None = None,
     ):
@@ -91,10 +89,7 @@ class ForecastCoordinator:
         self.warning_lead_minutes = warning_lead_minutes
         self.warning_late_grace_minutes = warning_late_grace_minutes
         self.warning_episode_drift_minutes = warning_episode_drift_minutes
-        self.warning_policy = WarningPolicy(
-            max_daily_sends=warning_max_daily_sends,
-            min_interval_minutes=warning_min_interval_minutes,
-        )
+        self.warning_policy = WarningPolicy(warnings.delivery_policy)
         self.learned_profiles = learned_profiles
         self.retrospective_curves = retrospective_curves
         self.initial_states = ForecastInitialStateResolver()

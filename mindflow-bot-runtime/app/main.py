@@ -299,8 +299,7 @@ async def run() -> None:
         warning_max_attempts=settings.warning_max_attempts,
         warning_retry_base_seconds=settings.warning_retry_base_seconds,
         warning_claim_lease_seconds=settings.warning_claim_lease_seconds,
-        warning_max_daily_sends=settings.warning_max_daily_sends,
-        warning_min_interval_minutes=settings.warning_min_interval_minutes,
+        warning_delivery_policy=business.warning_schedules.delivery_policy,
         profile_calibration=(
             business.profile_calibration
             if settings.profile_calibration_enabled else None

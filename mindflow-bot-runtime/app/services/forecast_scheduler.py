@@ -9,6 +9,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.repositories import (
     BindingRepository,
     ParticipantRepository,
@@ -31,7 +32,7 @@ class ForecastScheduler:
         calendar_oauth_app_id: str,
         forecast_max_concurrency: int = 1, warning_max_attempts: int = 5,
         warning_retry_base_seconds: int = 60, warning_claim_lease_seconds: int = 120,
-        warning_max_daily_sends: int = 2, warning_min_interval_minutes: int = 240,
+        warning_delivery_policy: WarningDeliveryPolicyConfig | None = None,
         profile_calibration: ProfileCalibrationService | None = None,
         incidents: RuntimeIncidentRepository | None = None,
     ):
@@ -50,8 +51,14 @@ class ForecastScheduler:
         self.warning_max_attempts = warning_max_attempts
         self.warning_retry_base_seconds = warning_retry_base_seconds
         self.warning_claim_lease_seconds = warning_claim_lease_seconds
-        self.warning_max_daily_sends = warning_max_daily_sends
-        self.warning_min_interval_minutes = warning_min_interval_minutes
+        delivery_policy = warning_delivery_policy or (
+            warnings.delivery_policy if warnings is not None else None
+        )
+        if delivery_policy is None:
+            raise ValueError("warning delivery policy is required")
+        self.warning_delivery_policy = delivery_policy
+        if warnings is not None and warnings.delivery_policy is not delivery_policy:
+            raise ValueError("warning scheduler and repository must share delivery policy")
         self.profile_calibration = profile_calibration
         self.incidents = incidents
         self._stop = asyncio.Event()
@@ -204,8 +211,6 @@ class ForecastScheduler:
         claimed = await asyncio.to_thread(
             self.warnings.claim_if_current, warning_id, now=now,
             lease_seconds=self.warning_claim_lease_seconds,
-            max_daily_sends=self.warning_max_daily_sends,
-            min_interval_minutes=self.warning_min_interval_minutes,
         )
         if not claimed:
             return

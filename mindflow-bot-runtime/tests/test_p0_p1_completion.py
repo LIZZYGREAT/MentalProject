@@ -19,7 +19,6 @@ from app.repositories import (
     ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
-    WarningScheduleRepository,
 )
 from app.services.card_action_service import CardActionService
 from app.services.forecast_scheduler import ForecastScheduler
@@ -32,7 +31,7 @@ from app.services.presentation_service import (
 )
 from app.tools.care import CareTools
 from app.worker import BotWorker
-from helpers import memory_database, participant
+from helpers import memory_database, participant, warning_repository
 from tests.test_forecast_hardening import (
     TEST_LOCAL_DATE,
     TEST_NOW,
@@ -206,7 +205,7 @@ def _warning_item(*, identity: str = "observation-refresh"):
 def test_observation_refresh_immediately_invalidates_forecast_and_warning():
     database = memory_database()
     person = participant(database, "OBS-REFRESH-INVALIDATE")
-    warnings = WarningScheduleRepository(database)
+    warnings = warning_repository(database)
     forecasts = ForecastSnapshotRepository(database)
     saved, _ = save_forecast_and_warnings(
         database,
@@ -258,7 +257,7 @@ def test_observation_refresh_duplicate_is_noop_and_fast_updates_are_serialized()
     person = participant(database, "OBS-REFRESH-COALESCE")
     observations = ObservationRepository(database)
     forecasts = ForecastSnapshotRepository(database)
-    warnings = WarningScheduleRepository(database)
+    warnings = warning_repository(database)
 
     class Coordinator:
         def __init__(self):
@@ -339,7 +338,7 @@ def test_observation_refresh_duplicate_is_noop_and_fast_updates_are_serialized()
 def test_observation_refresh_failure_stays_fail_closed_and_targets_observed_date():
     database = memory_database()
     person = participant(database, "OBS-REFRESH-DATE")
-    warnings = WarningScheduleRepository(database)
+    warnings = warning_repository(database)
     forecasts = ForecastSnapshotRepository(database)
     d1 = TEST_LOCAL_DATE
     d2 = d1 + timedelta(days=1)

@@ -15,12 +15,11 @@ from app.repositories import (
     ParticipantRepository,
     ProfileRepository,
     PredictionRepository,
-    WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator, normalized_calendar_revision
 from app.services.prediction_service import PredictionService
-from helpers import memory_database
+from helpers import memory_database, warning_repository
 from mindflow_core.assessment import AssessmentModel
 
 
@@ -88,7 +87,7 @@ def build_pipeline(
         max_concurrency=semantic_max_concurrency,
     )
     prediction = FakePrediction()
-    warnings = WarningScheduleRepository(database)
+    warnings = warning_repository(database)
     calendar = MutableCalendar(events)
     coordinator = ForecastCoordinator(
         participants=participants, profiles=ProfileRepository(database),
@@ -111,7 +110,7 @@ def test_real_forecast_pipeline_accepts_timezone_aware_calendar_snapshot():
     participants = ParticipantRepository(database)
     participant = participants.create("REAL-FORECAST-TEST")
     calendar = MutableCalendar([raw_event])
-    warnings = WarningScheduleRepository(database)
+    warnings = warning_repository(database)
     prediction = PredictionService(
         AssessmentModel("Asia/Shanghai"), PredictionRepository(database)
     )

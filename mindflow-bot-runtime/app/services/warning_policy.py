@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from app.contracts.warning import WarningDeliveryPolicyConfig
+
 
 def _minute(value: Any) -> int | None:
     try:
@@ -33,14 +35,20 @@ def _number(value: Any) -> float:
 class WarningPolicy:
     POLICY_VERSION: ClassVar[str] = "warning-policy-v1"
 
-    max_daily_sends: int = 2
-    min_interval_minutes: int = 240
+    delivery: WarningDeliveryPolicyConfig
+
+    @property
+    def max_daily_sends(self) -> int:
+        return self.delivery.max_daily_sends
+
+    @property
+    def min_interval_minutes(self) -> int:
+        return self.delivery.min_interval_minutes
 
     def identity_payload(self) -> dict[str, object]:
         return {
             "policy_version": self.POLICY_VERSION,
-            "max_daily_sends": self.max_daily_sends,
-            "min_interval_minutes": self.min_interval_minutes,
+            **self.delivery.identity_payload(),
         }
 
     @staticmethod

@@ -9,6 +9,7 @@ import pytest
 
 from algorithm.dynamic_state_model import assess_event
 from app.agent.context import AgentContext
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.integrations.feishu.client import FeishuSendError
 from app.integrations.feishu.gateway import FeishuGateway
 from app.logging_security import install_credential_redaction
@@ -365,6 +366,7 @@ def test_scheduler_queries_participants_for_current_calendar_app_and_bounds_conc
         calendar_oauth_app_id="calendar-app",
         daily_prepare_local_time="07:30", calendar_sync_interval_seconds=999,
         warning_poll_interval_seconds=999, forecast_max_concurrency=2,
+        warning_delivery_policy=WarningDeliveryPolicyConfig(2, 240),
     )
 
     async def scenario():
@@ -1442,9 +1444,7 @@ def test_warning_reconciliation_never_reopens_or_duplicates_sent_warning():
 
 def test_warning_max_daily_sends_change_invalidates_forecast_cache():
     database, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
-    coordinator.warning_policy = WarningPolicy(
-        max_daily_sends=0, min_interval_minutes=240,
-    )
+    coordinator.warning_policy = WarningPolicy(WarningDeliveryPolicyConfig(0, 240))
     first = asyncio.run(coordinator.ensure_forecast(
         participant.id, TEST_LOCAL_DATE, "warning-policy-disabled",
     ))
@@ -1452,9 +1452,7 @@ def test_warning_max_daily_sends_change_invalidates_forecast_cache():
     assert first["output"]["selected_warning_candidates"] == []
     assert first["warning_windows"] == []
 
-    coordinator.warning_policy = WarningPolicy(
-        max_daily_sends=2, min_interval_minutes=240,
-    )
+    coordinator.warning_policy = WarningPolicy(WarningDeliveryPolicyConfig(2, 240))
     second = asyncio.run(coordinator.ensure_forecast(
         participant.id, TEST_LOCAL_DATE, "warning-policy-enabled",
     ))
@@ -1491,17 +1489,13 @@ def test_warning_min_interval_change_invalidates_forecast_cache():
 
     prediction = TwoAlertPrediction()
     coordinator.prediction = prediction
-    coordinator.warning_policy = WarningPolicy(
-        max_daily_sends=2, min_interval_minutes=240,
-    )
+    coordinator.warning_policy = WarningPolicy(WarningDeliveryPolicyConfig(2, 240))
     first = asyncio.run(coordinator.ensure_forecast(
         participant.id, TEST_LOCAL_DATE, "warning-interval-240",
     ))
     assert len(first["output"]["selected_warning_candidates"]) == 1
 
-    coordinator.warning_policy = WarningPolicy(
-        max_daily_sends=2, min_interval_minutes=60,
-    )
+    coordinator.warning_policy = WarningPolicy(WarningDeliveryPolicyConfig(2, 60))
     second = asyncio.run(coordinator.ensure_forecast(
         participant.id, TEST_LOCAL_DATE, "warning-interval-60",
     ))
@@ -1550,7 +1544,7 @@ def test_warning_policy_version_bump_invalidates_forecast_cache():
         POLICY_VERSION = "warning-policy-v2"
 
     coordinator.warning_policy = WarningPolicyV2(
-        max_daily_sends=2, min_interval_minutes=240,
+        WarningDeliveryPolicyConfig(2, 240)
     )
     second = asyncio.run(coordinator.ensure_forecast(
         participant.id, TEST_LOCAL_DATE, "warning-policy-v2",
