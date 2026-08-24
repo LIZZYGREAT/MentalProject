@@ -30,29 +30,31 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
-- SDK MCP 只暴露十三个业务 Tool，participant identity 只来自 frozen `AgentContext`。
+- SDK MCP 只暴露十五个业务 Tool，participant identity 只来自 frozen `AgentContext`。
 - 飞书 `card.action.trigger` 通过独立的已验签 HTTPS 回调入口进入固定后端处理器；卡片回调不经过对话模型。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
-<!-- BUSINESS_TOOL_COUNT: 13 -->
+<!-- BUSINESS_TOOL_COUNT: 15 -->
 
-## 十三个业务 Tool
+## 十五个业务 Tool
 
 1. `care_get_today_context`
 2. `care_record_checkin`
 3. `care_get_recent_state`
 4. `care_run_today_assessment`
 5. `care_get_support`
-6. `care_get_pressure_curve`
-7. `care_get_checkin_card`
-8. `calendar_connection_status`
-9. `calendar_list_calendars`
-10. `calendar_list_events`
-11. `calendar_create_event`
-12. `calendar_update_event`
-13. `calendar_delete_event`
+6. `care_update_preferences`
+7. `care_respond_to_latest_intervention`
+8. `care_get_pressure_curve`
+9. `care_get_checkin_card`
+10. `calendar_connection_status`
+11. `calendar_list_calendars`
+12. `calendar_list_events`
+13. `calendar_create_event`
+14. `calendar_update_event`
+15. `calendar_delete_event`
 
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
 身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
@@ -76,7 +78,7 @@ LLM，而由固定后端 action allowlist 处理。
 - `FEISHU_BOT_APP_ID`、`FEISHU_BOT_APP_SECRET`：Lizzy 的 WebSocket ingress、回复和 Warning sender。
 - `FEISHU_CALENDAR_APP_ID`、`FEISHU_CALENDAR_APP_SECRET`：Calendar OAuth、Token 和 Calendar API provider（测试环境为“喵学姐”）。若正式 Bot App 已有 Calendar 权限，可将两项都留空，自动复用 Bot credential。
 - “喵学姐”需在开放平台开通 `calendar:calendar:readonly`、`calendar:calendar.event:create`、`calendar:calendar.event:update` 和 `calendar:calendar.event:delete` 用户权限并发布应用版本。新增权限后，已有参与者需要重新发送 `/calendar` 完成授权。
-- Bot 应用需要配置新版卡片回传交互请求地址（`https://你的域名/feishu/card/callback`），并把同一组 Verification Token 与 Encrypt Key 写入 Runtime。每日状态问卷是固定的非临床 check-in 表单，提交值由后端校验并幂等写入。
+- Bot 应用需要配置新版卡片回传交互请求地址（`https://你的域名/feishu/card/callback`），并把同一组 Verification Token 与 Encrypt Key 写入 Runtime。每日状态问卷与主动 Care 卡片都由固定后端校验；未启用可信回调时，主动 Care 自动降级为纯文本。
 - 设置 `FEISHU_CARD_CALLBACK_ENABLED=true`，并配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。生产环境应由反向代理提供公网 HTTPS，只把回调路径转发到 Bot 容器端口。
 - `DEEPSEEK_API_KEY`
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
@@ -218,7 +220,7 @@ Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以�
 1. `FeishuChannel` 长连接稳定，bot restart count 为 0；
 2. 容器内 Claude Agent SDK 能通过 DeepSeek 返回结果；
 3. 连续消息按 participant 排队，`/stop` 能中断 active turn；
-4. 十三个 MCP Tool 真实调用、审计和身份隔离正确；
+4. 十五个 MCP Tool 真实调用、审计和身份隔离正确；
 5. container recreate 后 session resume、pending reply 和 OAuth Token 均可恢复；
 6. 日志不含 Secret、Token、完整 Prompt 或 MCP 身份上下文。
 

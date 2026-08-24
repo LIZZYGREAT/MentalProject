@@ -69,6 +69,19 @@ def test_admin_frontend_and_public_health_are_available():
     }
 
 
+def test_admin_exposes_participant_bound_care_timeline_and_ui_tab():
+    browser = client()
+    login(browser)
+
+    response = browser.get("/admin/api/participants/P001/care-timeline")
+
+    assert response.status_code == 200
+    assert response.json() == {"preferences": None, "items": []}
+    script = browser.get("/admin/static/app.js").text
+    assert "Care Timeline" in script
+    assert "/care-timeline" in script
+
+
 def test_admin_login_rejects_wrong_password_and_session_cookie_is_httponly():
     browser = client()
     bad = browser.post(

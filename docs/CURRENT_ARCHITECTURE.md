@@ -3,9 +3,9 @@
 本文只描述 `production_runtime` 当前实现，不记录历史方案或未来设计。代码、迁移与
 自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 13 -->
+<!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v6 -->
-<!-- ALEMBIC_HEAD: 0015_daily_review_causal_source -->
+<!-- ALEMBIC_HEAD: 0016_care_intervention_feedback -->
 
 ## 运行边界
 
@@ -24,21 +24,23 @@ Claude Agent SDK / Claude Code Harness 使用 DeepSeek Anthropic-compatible endp
 Backend 禁用 Bash、文件系统、Web、Agent/Task 等内建工具，只加载 `mindflow-care` Skill
 和 participant-bound SDK MCP。
 
-当前 Registry 暴露 13 个业务 Tool：
+当前 Registry 暴露 15 个业务 Tool：
 
 1. `care_get_today_context`
 2. `care_record_checkin`
 3. `care_get_recent_state`
 4. `care_run_today_assessment`
 5. `care_get_support`
-6. `care_get_pressure_curve`
-7. `care_get_checkin_card`
-8. `calendar_connection_status`
-9. `calendar_list_calendars`
-10. `calendar_list_events`
-11. `calendar_create_event`
-12. `calendar_update_event`
-13. `calendar_delete_event`
+6. `care_update_preferences`
+7. `care_respond_to_latest_intervention`
+8. `care_get_pressure_curve`
+9. `care_get_checkin_card`
+10. `calendar_connection_status`
+11. `calendar_list_calendars`
+12. `calendar_list_events`
+13. `calendar_create_event`
+14. `calendar_update_event`
+15. `calendar_delete_event`
 
 所有 schema 都是封闭对象，并禁止参与者身份、飞书身份、Token、Secret、SQL、路径和任意
 URL 字段。身份只来自冻结的 `AgentContext`。工具生命周期统一通过
@@ -94,6 +96,14 @@ reviewed template 生成。非降级消息必须同时具有风险时间与日�
 包括 Warning/Forecast 标识、版本、模板、干预类型、日程 ID、Observation/Profile 版本。
 Scheduler 只发送已持久化文案，不让 LLM 决定是否推送，也不改变原有 durable delivery 状态机。
 
+每个 Warning 同一事务镜像为规范化 `CareInterventionEvent`，保留 Forecast、Warning、模板、
+上下文、文案与投递状态。参与者可以持久化关闭 Warning/Daily Review、设置安静时段、收紧
+每日上限、关闭跟进及选择受审查的支持偏好；系统上限始终是不可放宽的硬上限。偏好变化会
+取消不再允许的待发任务。已验签卡片回调可处理 Ack、30 分钟后提醒、今日静音、Helpful 和
+Not Relevant；卡片未配置可信回调时 Scheduler 只发纯文本。Snooze 复用稳定 Warning 状态机，
+可以跳过系统最小间隔但不能越过每日上限。所有反馈追加写入 `CareInterventionFeedback`，不写入
+Observation，也不修改原 Forecast。
+
 ## Daily Review
 
 Daily Review 是独立的回顾反馈链。Scheduler 为 active 且已绑定的参与者创建每日任务，并
@@ -107,7 +117,8 @@ Forecast provenance。该功能已经实现，但生产启用依赖可达的 HTT
 ## Admin
 
 Admin 是独立进程和独立 HTTP 服务。它提供角色化登录、参与者/Forecast/Warning/运行事件/
-Daily Review 查询，以及明确授权的 Forecast 刷新和回顾重建。环境根账号同步为 active
+Daily Review 查询，以及带偏好、来源、投递状态、动作和反馈的 Care Timeline，并支持明确
+授权的 Forecast 刷新和回顾重建。环境根账号同步为 active
 superadmin；其他账号使用 `viewer`、`admin`、`superadmin` 权限边界。生产部署只应通过
 loopback、SSH tunnel 或受保护的 HTTPS 入口访问。
 
@@ -125,10 +136,11 @@ Safety 后的权威回答先经本地 sanitizer 和确定性分段，再按
 ## PostgreSQL 与迁移
 
 PostgreSQL 保存参与者、绑定与授权、OAuth Token、对话、Agent run/tool call、Claude
-session、BotEvent、观测、预测输入/结果、Forecast、Warning、Daily Review、回顾曲线和
+session、BotEvent、观测、预测输入/结果、Forecast、Warning、Care 偏好/干预/反馈、
+Daily Review、回顾曲线和
 运维审计。OAuth Token 使用应用层加密，Secret 不进入 Prompt 或日志。
 
-当前 Alembic 单一 head 是 `0015_daily_review_causal_source`。Bot 与 Admin 启动依赖
+当前 Alembic 单一 head 是 `0016_care_intervention_feedback`。Bot 与 Admin 启动依赖
 `migrate` 服务成功，不在应用启动时隐式创建或升级 schema。
 
 ## Docker 服务

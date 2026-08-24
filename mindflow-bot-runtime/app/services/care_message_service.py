@@ -36,6 +36,7 @@ class CareMessageService:
         recent_observation: Mapping[str, Any] | None,
         profile: Mapping[str, Any] | None,
         profile_version: int | None,
+        care_preferences: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = self.contexts.build(
             source=source,
@@ -46,6 +47,7 @@ class CareMessageService:
             recent_observation=recent_observation,
             profile=profile,
             profile_version=profile_version,
+            care_preferences=care_preferences,
         )
         plan = self.policy.plan(context)
         rendered = self.templates.render(context, plan)
@@ -74,6 +76,7 @@ class CareMessageService:
                 if context.profile_fact_used
                 else None
             ),
+            "care_preference_version": context.care_preference_version,
             "context_quality": context.context_quality,
         }
         result = dict(alert)

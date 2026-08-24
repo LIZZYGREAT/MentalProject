@@ -36,6 +36,7 @@ from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
 from app.repositories_daily_review import RetrospectiveCurveRepository
+from app.repositories_care import ParticipantCarePreferenceRepository
 from services.course_catalog import COURSE_CATALOG_REVISION, COURSE_RESOLVER_VERSION
 from services.event_lifecycle import EVENT_SCHEMA_VERSION, prepare_event_instances
 from services.event_semantic_prompt import PROMPT_VERSION
@@ -118,6 +119,7 @@ class ForecastCoordinator:
         warning_episode_drift_minutes: int = 15,
         learned_profiles: LearnedProfileRepository | None = None,
         retrospective_curves: RetrospectiveCurveRepository | None = None,
+        care_preferences: ParticipantCarePreferenceRepository | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -138,6 +140,7 @@ class ForecastCoordinator:
         self.retrospective_curves = retrospective_curves
         self.initial_states = ForecastInitialStateResolver()
         self.care_messages = CareMessageService(timezone_name)
+        self.care_preferences = care_preferences
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
 
@@ -160,10 +163,41 @@ class ForecastCoordinator:
         list[dict[str, Any]],
         list[dict[str, Any]],
     ]:
-        selected_candidates = self.warning_policy.select_daily_candidates(
-            output.get("alerts") or []
-        )
+        raw_candidates = list(output.get("alerts") or [])
         facts = dict(care_inputs or {})
+        preferences = dict(facts.get("care_preferences") or {})
+        if self.care_preferences is not None:
+            allowed_candidates = []
+            for alert in raw_candidates:
+                try:
+                    hour, minute = (
+                        int(part)
+                        for part in str(alert.get("time") or "00:00")[:5].split(":")
+                    )
+                    risk_time = datetime.combine(
+                        target, time(hour, minute), self.timezone
+                    )
+                except (TypeError, ValueError):
+                    continue
+                scheduled_at = risk_time - timedelta(
+                    minutes=self.warning_lead_minutes
+                )
+                if self.care_preferences.allows_scheduled_at(
+                    preferences, scheduled_at
+                ):
+                    allowed_candidates.append(alert)
+            raw_candidates = allowed_candidates
+        selected_candidates = self.warning_policy.select_daily_candidates(
+            raw_candidates
+        )
+        if self.care_preferences is not None:
+            user_max = int(
+                preferences.get(
+                    "effective_max_proactive_care_per_day",
+                    self.warning_policy.max_daily_sends,
+                )
+            )
+            selected_candidates = selected_candidates[: max(0, user_max)]
         selected = [
             self.care_messages.contextualize_alert(
                 alert,
@@ -180,6 +214,7 @@ class ForecastCoordinator:
                 recent_observation=facts.get("recent_observation"),
                 profile=facts.get("profile"),
                 profile_version=facts.get("profile_version"),
+                care_preferences=preferences or None,
             )
             for alert in selected_candidates
         ]
@@ -433,6 +468,13 @@ class ForecastCoordinator:
             "recent_observation": recent_care_observation,
             "profile": effective_profile,
             "profile_version": profile_row.get("version") if profile_row else None,
+            "care_preferences": (
+                await asyncio.to_thread(
+                    self.care_preferences.get, participant_id
+                )
+                if self.care_preferences is not None
+                else None
+            ),
         }
         observation_revision = _sha(observations)
         profile_revision = _sha({

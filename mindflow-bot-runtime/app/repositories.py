@@ -30,6 +30,7 @@ from app.models import (
     FeishuBinding,
     FeishuOAuthToken,
     Participant,
+    ParticipantCarePreference,
     ParticipantProfile,
     LearnedModelProfile,
     ForecastSnapshot,
@@ -953,6 +954,12 @@ class WarningScheduleRepository:
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
     @staticmethod
+    def _mirror_care(session: Any, row: WarningSchedule) -> None:
+        from app.repositories_care import CareInterventionRepository
+
+        CareInterventionRepository.mirror_warning_in_session(session, row)
+
+    @staticmethod
     def episode_trigger_fingerprint(
         payload: dict[str, Any] | None, *, default_source: str | None = None,
     ) -> str | None:
@@ -1080,6 +1087,7 @@ class WarningScheduleRepository:
                 "cancellation_reason": str(reason)[:128],
             }
             row.updated_at = changed_at
+            self._mirror_care(session, row)
         return len(rows)
 
     def _sync_in_session(
@@ -1268,7 +1276,7 @@ class WarningScheduleRepository:
                     forecast_id=forecast_id,
                     forecast_version=forecast_version,
                 )
-                session.add(WarningSchedule(
+                created_row = WarningSchedule(
                     id=row_id,
                     participant_id=participant_id, local_date=local_date,
                     forecast_id=forecast_id, forecast_version=forecast_version,
@@ -1277,7 +1285,10 @@ class WarningScheduleRepository:
                     risk_time=item["risk_time"], valid_until=item["valid_until"],
                     warning_level=item["warning_level"], status=status,
                     payload_json=payload, next_attempt_at=next_attempt_at,
-                ))
+                )
+                session.add(created_row)
+                session.flush()
+                self._mirror_care(session, created_row)
                 counts["created"] += 1
                 continue
             unmatched.pop(row.id, None)
@@ -1285,6 +1296,7 @@ class WarningScheduleRepository:
                 # Terminal rows are immutable audit records.  A later valid
                 # opportunity is represented by a new row; an ordinary drift
                 # or tier change never revives or rewrites the old record.
+                self._mirror_care(session, row)
                 counts["kept"] += 1
                 continue
             desired_payload = self._payload_with_source_provenance(
@@ -1352,6 +1364,7 @@ class WarningScheduleRepository:
             # A desired, untouched cancelled row is reactivated even when the
             # timestamps are identical. Other active states retain semantics.
             row.updated_at = utc_now()
+            self._mirror_care(session, row)
             counts["rescheduled" if changed else "kept"] += 1
         for row in unmatched.values():
             if (
@@ -1364,6 +1377,7 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = now
+                self._mirror_care(session, row)
                 counts["cancelled"] += 1
         return counts
 
@@ -1414,6 +1428,7 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = now
+                self._mirror_care(session, row)
             rows = session.execute(
                 select(WarningSchedule).join(
                     ForecastSnapshot, ForecastSnapshot.id == WarningSchedule.forecast_id
@@ -1445,15 +1460,18 @@ class WarningScheduleRepository:
             if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
                 row.status = "expired"
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return False
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
                 row.status = "cancelled"
                 row.updated_at = utc_now()
+                self._mirror_care(session, row)
                 return False
             row.status = "sent"
             row.sent_at = now
             row.updated_at = now
+            self._mirror_care(session, row)
             return True
 
     def claim_if_current(
@@ -1462,7 +1480,22 @@ class WarningScheduleRepository:
     ) -> Optional[dict[str, Any]]:
         now = self._aware(now or utc_now())
         with self.database.session() as session:
-            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return None
+            # Participant is the per-user lock root. Preference updates take
+            # the same lock before cancelling Warning rows, preventing a
+            # preference/claim race and inconsistent lock ordering.
+            session.get(
+                Participant,
+                candidate.participant_id,
+                with_for_update=True,
+            )
+            row = session.execute(
+                select(WarningSchedule)
+                .where(WarningSchedule.id == warning_id)
+                .with_for_update()
+            ).scalar_one_or_none()
             if row is None or row.status not in {"pending", "claimed"}:
                 return None
             if row.status == "claimed" and row.lease_until and self._aware(row.lease_until) >= now:
@@ -1473,6 +1506,7 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return None
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
@@ -1481,12 +1515,12 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = utc_now()
+                self._mirror_care(session, row)
                 return None
             # Serialize claims for this participant.  Counting only sent rows
             # is semantically correct, while a live claim acts as a temporary
             # reservation so two workers cannot send concurrently before the
             # first one records success.
-            session.get(Participant, row.participant_id, with_for_update=True)
             live_claim = session.execute(select(WarningSchedule).where(
                 WarningSchedule.participant_id == row.participant_id,
                 WarningSchedule.local_date == row.local_date,
@@ -1501,6 +1535,7 @@ class WarningScheduleRepository:
                     self._aware(live_claim.lease_until),
                 )
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return None
 
             successful = session.execute(select(WarningSchedule).where(
@@ -1508,13 +1543,32 @@ class WarningScheduleRepository:
                 WarningSchedule.local_date == row.local_date,
                 WarningSchedule.status.in_(("sent", "escalated")),
             ).order_by(desc(WarningSchedule.sent_at))).scalars().all()
-            if len(successful) >= self.delivery_policy.max_daily_sends:
+            participant_preference = session.get(
+                ParticipantCarePreference, row.participant_id
+            )
+            participant_max = (
+                participant_preference.max_proactive_care_per_day
+                if participant_preference is not None else None
+            )
+            effective_daily_cap = min(
+                self.delivery_policy.max_daily_sends,
+                (
+                    self.delivery_policy.max_daily_sends
+                    if participant_max is None else max(0, participant_max)
+                ),
+            )
+            if len(successful) >= effective_daily_cap:
                 row.status = "suppressed"
                 row.payload_json = {**dict(row.payload_json), "suppression_reason": "daily_cap"}
                 row.next_attempt_at = None
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return None
-            if successful and self.delivery_policy.min_interval_minutes > 0:
+            if (
+                successful
+                and self.delivery_policy.min_interval_minutes > 0
+                and not bool(row.payload_json.get("user_requested_followup"))
+            ):
                 latest = next((item for item in successful if item.sent_at is not None), None)
                 if latest is not None:
                     next_allowed = self._aware(latest.sent_at) + timedelta(
@@ -1535,12 +1589,14 @@ class WarningScheduleRepository:
                             }
                             row.next_attempt_at = None
                         row.updated_at = now
+                        self._mirror_care(session, row)
                         return None
             row.status = "claimed"
             row.claimed_at = now
             row.lease_until = now + timedelta(seconds=max(1, lease_seconds))
             row.claim_token = uuid.uuid4()
             row.updated_at = now
+            self._mirror_care(session, row)
             return self._view(row)
 
     def validate_claim_current(
@@ -1567,6 +1623,7 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return False
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if (
@@ -1579,6 +1636,7 @@ class WarningScheduleRepository:
                 row.claimed_at = None
                 row.lease_until = None
                 row.updated_at = now
+                self._mirror_care(session, row)
                 return False
             return True
 
@@ -1627,6 +1685,7 @@ class WarningScheduleRepository:
                     row.status = "pending"
                     row.next_attempt_at = next_attempt
             row.updated_at = now
+            self._mirror_care(session, row)
             return True
 
     def block_delivery(
@@ -1660,6 +1719,7 @@ class WarningScheduleRepository:
             row.lease_until = None
             row.claim_token = None
             row.updated_at = now
+            self._mirror_care(session, row)
             return True
 
     def delivery_unavailable(
@@ -1677,6 +1737,7 @@ class WarningScheduleRepository:
             for row in expired:
                 row.status = "expired"
                 row.updated_at = now
+                self._mirror_care(session, row)
             rows = session.execute(select(WarningSchedule).where(
                 WarningSchedule.status == "delivery_unavailable",
                 WarningSchedule.valid_until >= now,
@@ -1709,6 +1770,7 @@ class WarningScheduleRepository:
                 else:
                     row.next_attempt_at = next_attempt
             row.updated_at = now
+            self._mirror_care(session, row)
 
 
 class ConversationRepository:

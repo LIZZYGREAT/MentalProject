@@ -135,6 +135,8 @@ class CareContext:
     context_quality: str
     fact_codes: tuple[str, ...]
     profile_fact_used: bool
+    care_preference_version: int | None
+    allow_follow_up: bool
 
     @property
     def calendar_context_ids(self) -> tuple[str, ...]:
@@ -166,6 +168,7 @@ class CareContextBuilder:
         recent_observation: Mapping[str, Any] | None,
         profile: Mapping[str, Any] | None,
         profile_version: int | None,
+        care_preferences: Mapping[str, Any] | None = None,
     ) -> CareContext:
         risk_time = self._risk_time(alert, local_date)
         previous_event, active_event, next_event = self._calendar_neighbours(
@@ -178,6 +181,7 @@ class CareContextBuilder:
             profile,
             profile_version=profile_version,
             observation=observation,
+            care_preferences=care_preferences,
         )
         current_events = self._bounded_list(alert.get("current_events"))
         dominant_stressors = self._bounded_list(alert.get("dominant_stressors"))
@@ -209,6 +213,12 @@ class CareContextBuilder:
             if len(fact_codes) >= 2
             else "degraded"
         )
+        try:
+            preference_version_value = int(
+                (care_preferences or {}).get("version") or 0
+            )
+        except (TypeError, ValueError):
+            preference_version_value = 0
         return CareContext(
             schema_version=CARE_CONTEXT_SCHEMA_VERSION,
             source=_text(source, 48) or "forecast_warning",
@@ -238,6 +248,12 @@ class CareContextBuilder:
             context_quality=context_quality,
             fact_codes=tuple(fact_codes),
             profile_fact_used=profile_fact_used,
+            care_preference_version=(
+                preference_version_value if preference_version_value > 0 else None
+            ),
+            allow_follow_up=bool(
+                (care_preferences or {}).get("allow_follow_up", True)
+            ),
         )
 
     def _risk_time(self, alert: Mapping[str, Any], local_date: date) -> datetime:
@@ -337,8 +353,10 @@ class CareContextBuilder:
         *,
         profile_version: int | None,
         observation: Mapping[str, Any] | None,
+        care_preferences: Mapping[str, Any] | None,
     ) -> CareProfileSummary:
         preferences: dict[str, str] = {}
+        controlled_preference_used = False
 
         def visit(value: Mapping[str, Any], depth: int = 0) -> None:
             if depth > 2:
@@ -353,7 +371,18 @@ class CareContextBuilder:
                 elif normalized in {"care_preferences", "preferences", "care"} and isinstance(raw, Mapping):
                     visit(raw, depth + 1)
 
-        if isinstance(profile, Mapping):
+        if isinstance(care_preferences, Mapping):
+            preferred_types = set(care_preferences.get("preferred_support_types") or [])
+            if "walk" in preferred_types:
+                preferences["recovery_preference"] = "短暂散步"
+            elif "hydration" in preferred_types:
+                preferences["recovery_preference"] = "补水"
+            elif "recovery" in preferred_types:
+                preferences["recovery_preference"] = "安静休息"
+            if "trusted_person" in preferred_types:
+                preferences["support_preference"] = "联系一位可信任的人"
+            controlled_preference_used = bool(preferences)
+        if not controlled_preference_used and isinstance(profile, Mapping):
             visit(profile)
         stress = observation.get("stress_0_10") if observation else None
         energy = observation.get("energy_0_10") if observation else None
@@ -372,7 +401,11 @@ class CareContextBuilder:
             recovery_preference=preferences.get("recovery_preference"),
             support_preference=preferences.get("support_preference"),
             care_preference=preferences.get("care_preference"),
-            profile_version=profile_version if preferences else None,
+            profile_version=(
+                profile_version
+                if preferences and not controlled_preference_used
+                else None
+            ),
         )
 
     @staticmethod

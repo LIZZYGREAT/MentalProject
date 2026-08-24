@@ -14,11 +14,14 @@ from app.models import (
     AgentToolCall,
     BotEvent,
     CalendarSnapshot,
+    CareInterventionEvent,
+    CareInterventionFeedback,
     FeishuBinding,
     FeishuOAuthToken,
     ForecastSnapshot,
     LearnedModelProfile,
     Participant,
+    ParticipantCarePreference,
     ParticipantProfile,
     RuntimeIncident,
     StateObservation,
@@ -442,6 +445,107 @@ class AdminRepository:
                 }
                 for row in rows
             ]
+
+    def care_timeline(
+        self, participant_id: uuid.UUID, limit: int = 100
+    ) -> dict[str, Any]:
+        """Return provenance-complete interventions and append-only feedback."""
+
+        with self.database.session() as session:
+            preference = session.get(ParticipantCarePreference, participant_id)
+            rows = session.execute(
+                select(CareInterventionEvent)
+                .where(CareInterventionEvent.participant_id == participant_id)
+                .order_by(
+                    desc(CareInterventionEvent.scheduled_at),
+                    desc(CareInterventionEvent.created_at),
+                )
+                .limit(max(1, min(limit, 500)))
+            ).scalars().all()
+            event_ids = [row.id for row in rows]
+            feedback_rows = (
+                session.execute(
+                    select(CareInterventionFeedback)
+                    .where(
+                        CareInterventionFeedback.intervention_id.in_(event_ids)
+                    )
+                    .order_by(CareInterventionFeedback.submitted_at)
+                ).scalars().all()
+                if event_ids
+                else []
+            )
+            feedback_by_event: dict[uuid.UUID, list[dict[str, Any]]] = {}
+            for feedback in feedback_rows:
+                feedback_by_event.setdefault(feedback.intervention_id, []).append(
+                    {
+                        "id": str(feedback.id),
+                        "helpfulness": feedback.helpfulness,
+                        "relevance": feedback.relevance,
+                        "timing_feedback": feedback.timing_feedback,
+                        "action_selected": feedback.action_selected,
+                        "optional_comment": feedback.optional_comment,
+                        "submitted_at": _iso(feedback.submitted_at),
+                        "callback_event_id": feedback.callback_event_id,
+                    }
+                )
+            return {
+                "preferences": self._care_preference_view(preference),
+                "items": [
+                    {
+                        "id": str(row.id),
+                        "source_warning_id": str(row.source_warning_id),
+                        "source_forecast_id": str(row.source_forecast_id),
+                        "forecast_version": row.forecast_version,
+                        "intervention_type": row.intervention_type,
+                        "template_id": row.template_id,
+                        "template_version": row.template_version,
+                        "reason_code": row.reason_code,
+                        "scheduled_at": _iso(row.scheduled_at),
+                        "sent_at": _iso(row.sent_at),
+                        "status": row.status,
+                        "delivery_status": row.delivery_status,
+                        "user_action": row.user_action,
+                        "action_at": _iso(row.action_at),
+                        "snoozed_until": _iso(row.snoozed_until),
+                        "message": row.message_text,
+                        "context": _redact(dict(row.context_json)),
+                        "actions": list(row.actions_json),
+                        "feedback": feedback_by_event.get(row.id, []),
+                        "created_at": _iso(row.created_at),
+                        "updated_at": _iso(row.updated_at),
+                    }
+                    for row in rows
+                ],
+            }
+
+    @staticmethod
+    def _care_preference_view(
+        row: ParticipantCarePreference | None,
+    ) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "care_enabled": bool(row.care_enabled),
+            "warning_enabled": bool(row.warning_enabled),
+            "daily_review_enabled": bool(row.daily_review_enabled),
+            "morning_brief_enabled": bool(row.morning_brief_enabled),
+            "weekly_summary_enabled": bool(row.weekly_summary_enabled),
+            "quiet_hours_start": (
+                row.quiet_hours_start.strftime("%H:%M")
+                if row.quiet_hours_start else None
+            ),
+            "quiet_hours_end": (
+                row.quiet_hours_end.strftime("%H:%M")
+                if row.quiet_hours_end else None
+            ),
+            "max_proactive_care_per_day": row.max_proactive_care_per_day,
+            "allow_schedule_suggestions": bool(row.allow_schedule_suggestions),
+            "allow_follow_up": bool(row.allow_follow_up),
+            "preferred_support_types": list(row.preferred_support_types or []),
+            "muted_until": _iso(row.muted_until),
+            "version": row.version,
+            "updated_at": _iso(row.updated_at),
+        }
 
     def incidents(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.database.session() as session:

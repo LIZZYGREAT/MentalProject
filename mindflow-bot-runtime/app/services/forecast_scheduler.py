@@ -9,6 +9,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
+from app.integrations.feishu.cards import care_intervention_card
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.repositories import (
     BindingRepository,
@@ -35,6 +36,7 @@ class ForecastScheduler:
         warning_delivery_policy: WarningDeliveryPolicyConfig | None = None,
         profile_calibration: ProfileCalibrationService | None = None,
         incidents: RuntimeIncidentRepository | None = None,
+        care_card_enabled: bool = False,
     ):
         self.coordinator = coordinator
         self.participants = participants
@@ -61,6 +63,7 @@ class ForecastScheduler:
             raise ValueError("warning scheduler and repository must share delivery policy")
         self.profile_calibration = profile_calibration
         self.incidents = incidents
+        self.care_card_enabled = bool(care_card_enabled)
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -242,10 +245,35 @@ class ForecastScheduler:
             or "预测到临近的高压时段，可以提前安排短暂休息。"
         )
         try:
-            await asyncio.to_thread(
-                self.sender.send_text, binding["chat_id"], text,
-                message_uuid=str(warning_id),
-            )
+            plan = dict(payload.get("care_plan") or {})
+            care_actions = [
+                action
+                for action in list(plan.get("actions") or [])
+                if action in {
+                    "ack",
+                    "snooze_30",
+                    "mute_today",
+                    "helpful",
+                    "not_relevant",
+                }
+            ]
+            if self.care_card_enabled and care_actions:
+                card = care_intervention_card(
+                    intervention_id=str(warning_id),
+                    message=text,
+                    actions=care_actions,
+                )
+                await asyncio.to_thread(
+                    self.sender.send_card,
+                    binding["chat_id"],
+                    card,
+                    message_uuid=str(warning_id),
+                )
+            else:
+                await asyncio.to_thread(
+                    self.sender.send_text, binding["chat_id"], text,
+                    message_uuid=str(warning_id),
+                )
         except FeishuSendError as exc:
             logger.warning(
                 "forecast_warning_send_failed warning_id=%s retryable=%s code=%s",

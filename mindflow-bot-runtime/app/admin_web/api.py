@@ -474,6 +474,19 @@ class AdminAPI:
             return error
         return JSONResponse({"items": self.repository.warnings(participant_id)})
 
+    async def care_timeline(self, request: Request) -> Response:
+        participant_id, error = self._participant(request)
+        if error:
+            return error
+        limit, query_error = self._query_int(
+            request, "limit", 100, maximum=500
+        )
+        if query_error:
+            return query_error
+        return JSONResponse(
+            self.repository.care_timeline(participant_id, limit=limit)
+        )
+
     async def incidents(self, request: Request) -> Response:
         if self._authorized(request) is None:
             return _json_error("unauthorized", 401)
@@ -555,6 +568,7 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/pressure-curve/{{local_date}}.png", self.curve_png, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/pressure-curve/{{local_date}}", self.curve_json, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/warnings", self.warnings, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/care-timeline", self.care_timeline, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/daily-reviews", self.daily_reviews_list, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/daily-reviews/{{local_date}}", self.daily_reviews_date, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}", self.retrospective_curve, methods=["GET"]),

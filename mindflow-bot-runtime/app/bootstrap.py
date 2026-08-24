@@ -30,6 +30,10 @@ from app.repositories_daily_review import (
     RetrospectiveCurveRepository,
 )
 from app.services.daily_review_service import DailyReviewService
+from app.repositories_care import (
+    CareInterventionRepository,
+    ParticipantCarePreferenceRepository,
+)
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
@@ -71,6 +75,8 @@ class BusinessServices:
     retrospective_curves: RetrospectiveCurveRepository
     daily_reviews: DailyReviewService
     observation_refresh: ObservationForecastRefreshService
+    care_preferences: ParticipantCarePreferenceRepository
+    care_interventions: CareInterventionRepository
 
 
 def build_business_services(
@@ -125,6 +131,12 @@ def build_business_services(
         min_interval_minutes=settings.warning_min_interval_minutes,
     )
     warning_schedules = WarningScheduleRepository(database, warning_delivery_policy)
+    care_preferences = ParticipantCarePreferenceRepository(
+        database,
+        system_max_daily_sends=warning_delivery_policy.max_daily_sends,
+        timezone_name=settings.timezone_name,
+    )
+    care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
     profile_calibration = ProfileCalibrationService(
@@ -143,6 +155,7 @@ def build_business_services(
         warning_episode_drift_minutes=settings.warning_episode_drift_minutes,
         learned_profiles=learned_profiles,
         retrospective_curves=retrospective_curves,
+        care_preferences=care_preferences,
     )
     observation_refresh = ObservationForecastRefreshService(
         forecast_snapshots,
@@ -156,6 +169,7 @@ def build_business_services(
         timezone_name=settings.timezone_name,
         daily_reviews=daily_reviews,
         observation_refresh=observation_refresh,
+        care_interventions=care_interventions,
     )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
@@ -175,6 +189,8 @@ def build_business_services(
         learned_profiles=learned_profiles,
         pressure_curves=pressure_curves,
         observation_refresh=observation_refresh,
+        care_preferences=care_preferences,
+        care_interventions=care_interventions,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -199,4 +215,6 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         daily_reviews=daily_reviews,
         observation_refresh=observation_refresh,
+        care_preferences=care_preferences,
+        care_interventions=care_interventions,
     )

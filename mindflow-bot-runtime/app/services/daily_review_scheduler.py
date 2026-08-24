@@ -30,6 +30,7 @@ class DailyReviewScheduler:
         retry_base_seconds: int = 60, max_attempts: int = 5,
         claim_lease_seconds: int = 120,
         validity_minutes: int = 1440, catch_up_minutes: int = 120,
+        care_preferences: object | None = None,
     ):
         self.schedules = schedules
         self.participants = participants
@@ -45,6 +46,7 @@ class DailyReviewScheduler:
         self.claim_lease_seconds = claim_lease_seconds
         self.validity_minutes = max(1, int(validity_minutes))
         self.catch_up_minutes = max(0, int(catch_up_minutes))
+        self.care_preferences = care_preferences
         if self.catch_up_minutes > self.validity_minutes:
             raise ValueError("catch_up_minutes must not exceed validity_minutes")
         self._stop = asyncio.Event()
@@ -83,6 +85,15 @@ class DailyReviewScheduler:
             if local_now >= valid_until:
                 continue
             for participant_id in participant_ids:
+                if self.care_preferences is not None:
+                    preferences = await asyncio.to_thread(
+                        self.care_preferences.get, participant_id
+                    )
+                    if not self.care_preferences.allows_daily_review_at(
+                        preferences,
+                        scheduled_local,
+                    ):
+                        continue
                 await asyncio.to_thread(
                     self.schedules.ensure, participant_id, schedule_date,
                     scheduled_local.astimezone(timezone.utc),
@@ -114,6 +125,23 @@ class DailyReviewScheduler:
                     error_code="participant_inactive",
                 )
                 continue
+            if self.care_preferences is not None:
+                preferences = await asyncio.to_thread(
+                    self.care_preferences.get, participant_id
+                )
+                scheduled_at = datetime.fromisoformat(item["scheduled_at"])
+                if not self.care_preferences.allows_daily_review_at(
+                    preferences,
+                    scheduled_at,
+                ):
+                    await asyncio.to_thread(
+                        self.schedules.mark_cancelled,
+                        item["id"],
+                        item["claim_token"],
+                        now=utc_now,
+                        error_code="participant_daily_review_disabled",
+                    )
+                    continue
             binding = await asyncio.to_thread(
                 self.bindings.get_for_participant, participant_id
             )

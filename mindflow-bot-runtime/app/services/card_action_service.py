@@ -46,12 +46,14 @@ class CardActionService:
         timezone_name: str = "Asia/Shanghai",
         daily_reviews: Any = None,
         observation_refresh: ObservationForecastRefreshService,
+        care_interventions: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
         self.timezone = ZoneInfo(timezone_name)
         self.daily_reviews = daily_reviews
         self.observation_refresh = observation_refresh
+        self.care_interventions = care_interventions
 
     @staticmethod
     def _fallback_event_id(
@@ -83,6 +85,43 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name.startswith("care_"):
+            if self.care_interventions is None:
+                raise RuntimeError("care intervention service is unavailable")
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            try:
+                intervention_id = uuid.UUID(str(action.get("intervention_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("care intervention id is invalid") from exc
+            event_id = str(callback_event_id or "").strip() or self._fallback_event_id(
+                message_id, action, dict(form_value or {})
+            )
+            care_action = action_name.removeprefix("care_")
+            result = self.care_interventions.apply_action(
+                participant_id,
+                intervention_id,
+                action=care_action,
+                callback_event_id=event_id,
+            )
+            reply = {
+                "ack": "知道了，本次提醒已确认。",
+                "helpful": "谢谢反馈，我已记录这条提醒有帮助。",
+                "not_relevant": "谢谢反馈，我已记录这条提醒不太相关。",
+                "mute_today": "已关闭今天剩余的主动关怀提醒。",
+                "snooze_30": (
+                    "已安排 30 分钟后再提醒。"
+                    if result.get("action_result") == "scheduled"
+                    else "已记录延后选择，但受当前提醒上限或设置限制，未新增提醒。"
+                ),
+            }.get(care_action, "关怀反馈已记录。")
+            return {
+                "ok": True,
+                "care_intervention_id": str(intervention_id),
+                "created": bool(result["created"]),
+                "action_result": result.get("action_result"),
+                "reply_text": reply,
+            }
         if action_name == "request_checkin":
             return {
                 "ok": True,

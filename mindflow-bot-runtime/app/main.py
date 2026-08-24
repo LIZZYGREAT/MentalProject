@@ -304,6 +304,7 @@ async def run() -> None:
             if settings.profile_calibration_enabled else None
         ),
         incidents=incidents,
+        care_card_enabled=bool(card_callback is not None),
     )
     daily_review_scheduler = DailyReviewScheduler(
         schedules=business.daily_review_schedules,
@@ -319,6 +320,7 @@ async def run() -> None:
         claim_lease_seconds=settings.daily_review_claim_lease_seconds,
         validity_minutes=settings.daily_review_validity_minutes,
         catch_up_minutes=settings.daily_review_catch_up_minutes,
+        care_preferences=business.care_preferences,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.

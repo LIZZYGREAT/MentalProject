@@ -27,6 +27,7 @@ class CareMessagePlan:
     care_action: str
     context_quality: str
     facts_used: tuple[str, ...]
+    actions: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,6 +116,13 @@ class CareInterventionPolicy:
             care_action=context.care_action,
             context_quality=context.context_quality,
             facts_used=context.fact_codes,
+            actions=(
+                "ack",
+                *(("snooze_30",) if context.allow_follow_up else ()),
+                "mute_today",
+                "helpful",
+                "not_relevant",
+            ),
         )
 
     @staticmethod

@@ -197,6 +197,77 @@ def daily_review_card(
     }
 
 
+def care_intervention_card(
+    *,
+    intervention_id: str,
+    message: str,
+    actions: list[str],
+) -> dict[str, Any]:
+    """Reviewed proactive-care card with an allowlisted action envelope."""
+
+    labels = {
+        "ack": ("知道了", "primary"),
+        "snooze_30": ("30 分钟后提醒", "default"),
+        "mute_today": ("今天不再提醒", "default"),
+        "helpful": ("有帮助", "default"),
+        "not_relevant": ("不太相关", "default"),
+    }
+    buttons = []
+    for action in actions:
+        if action not in labels:
+            continue
+        label, button_type = labels[action]
+        buttons.append(
+            {
+                "tag": "button",
+                "type": button_type,
+                "text": {"tag": "plain_text", "content": label},
+                "value": {
+                    "mindflow_action": f"care_{action}",
+                    "version": "1",
+                    "intervention_id": str(intervention_id),
+                },
+            }
+        )
+    return {
+        "schema": "2.0",
+        "config": {
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "MindFlow 关怀提醒"},
+        },
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "MindFlow 关怀提醒"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": str(message)[:1000]},
+                {
+                    "tag": "column_set",
+                    "flex_mode": "bisect",
+                    "horizontal_spacing": "8px",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [button],
+                        }
+                        for button in buttons
+                    ],
+                },
+                {
+                    "tag": "markdown",
+                    "text_size": "notation",
+                    "content": "这是非临床的趋势提醒；你可以忽略、延后或关闭今天的提醒。",
+                },
+            ],
+        },
+    }
+
+
 def pressure_curve_card(
     analysis: CurveAnalysis,
     *,

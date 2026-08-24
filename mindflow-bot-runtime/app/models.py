@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 import uuid
 
 from sqlalchemy import (
@@ -16,6 +16,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    Time,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -401,6 +402,103 @@ class WarningSchedule(Base):
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantCarePreference(Base):
+    __tablename__ = "participant_care_preferences"
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    care_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    warning_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    daily_review_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    morning_brief_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    weekly_summary_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    max_proactive_care_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    allow_schedule_suggestions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    allow_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    preferred_support_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class CareInterventionEvent(Base):
+    __tablename__ = "care_intervention_events"
+    __table_args__ = (
+        UniqueConstraint("source_warning_id", name="uq_care_intervention_warning"),
+        Index("ix_care_intervention_participant_scheduled", "participant_id", "scheduled_at"),
+        Index("ix_care_intervention_status_scheduled", "status", "scheduled_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_warning_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("warning_schedules.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_forecast_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("forecast_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    intervention_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    template_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    delivery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    user_action: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    context_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    actions_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class CareInterventionFeedback(Base):
+    __tablename__ = "care_intervention_feedback"
+    __table_args__ = (
+        Index("ix_care_feedback_participant_submitted", "participant_id", "submitted_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    intervention_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("care_intervention_events.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    helpfulness: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    relevance: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timing_feedback: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action_selected: Mapped[str] = mapped_column(String(32), nullable=False)
+    optional_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    callback_event_id: Mapped[str] = mapped_column(String(160), unique=True, nullable=False)
 
 
 class RuntimeIncident(Base):

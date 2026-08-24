@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+import uuid
 from zoneinfo import ZoneInfo
 
 from app.agent.context import AgentContext
@@ -118,6 +119,8 @@ class CareTools:
         learned_profiles: LearnedProfileRepository | None = None,
         pressure_curves: PressureCurveService | None = None,
         observation_refresh: ObservationForecastRefreshService | None = None,
+        care_preferences: Any = None,
+        care_interventions: Any = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -142,6 +145,8 @@ class CareTools:
             getattr(forecast_coordinator, "care_messages", None)
             or CareMessageService(timezone_name)
         )
+        self.care_preferences = care_preferences
+        self.care_interventions = care_interventions
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -202,6 +207,79 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_support,
+        )
+        registry.register(
+            "care_update_preferences",
+            "Update this participant's durable care, warning, review, quiet-hour, and follow-up preferences without exceeding backend safety limits.",
+            {
+                "type": "object",
+                "properties": {
+                    "care_enabled": {"type": "boolean"},
+                    "warning_enabled": {"type": "boolean"},
+                    "daily_review_enabled": {"type": "boolean"},
+                    "quiet_hours_start": {
+                        "type": "string",
+                        "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
+                    },
+                    "quiet_hours_end": {
+                        "type": "string",
+                        "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
+                    },
+                    "clear_quiet_hours": {"type": "boolean", "const": True},
+                    "max_proactive_care_per_day": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                    "allow_schedule_suggestions": {"type": "boolean"},
+                    "allow_follow_up": {"type": "boolean"},
+                    "preferred_support_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "micro_break",
+                                "hydration",
+                                "walk",
+                                "task_decomposition",
+                                "transition_buffer",
+                                "recovery",
+                                "trusted_person",
+                            ],
+                        },
+                        "uniqueItems": True,
+                        "maxItems": 7,
+                    },
+                },
+                "minProperties": 1,
+                "additionalProperties": False,
+            },
+            self.update_care_preferences,
+        )
+        registry.register(
+            "care_respond_to_latest_intervention",
+            "Record one explicit action or quick feedback for this participant's latest delivered care intervention.",
+            {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "ack",
+                            "snooze_30",
+                            "mute_today",
+                            "helpful",
+                            "not_relevant",
+                            "too_early",
+                            "too_late",
+                        ],
+                    },
+                    "comment": {"type": "string", "maxLength": 500},
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+            self.respond_to_latest_care,
         )
         registry.register(
             "care_get_pressure_curve",
@@ -349,6 +427,14 @@ class CareTools:
             "latest_checkin": recent[0] if recent else None,
             "latest_assessment": prediction,
             "latest_forecast": latest_forecast,
+            "care_preferences": (
+                self.care_preferences.get(ctx.participant_id)
+                if self.care_preferences is not None else None
+            ),
+            "latest_care_intervention": (
+                self.care_interventions.latest_sent(ctx.participant_id)
+                if self.care_interventions is not None else None
+            ),
         }
 
     def record_checkin(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -427,6 +513,10 @@ class CareTools:
             recent_observation=observation,
             profile=(profile_row or {}).get("profile"),
             profile_version=(profile_row or {}).get("version"),
+            care_preferences=(
+                self.care_preferences.get(ctx.participant_id)
+                if self.care_preferences is not None else None
+            ),
         )
         provenance = dict(contextual["care_provenance"])
         provenance.update(
@@ -443,6 +533,41 @@ class CareTools:
             "care_context": contextual["care_context"],
             "care_provenance": provenance,
             "context_acknowledged": bool(args.get("context")),
+        }
+
+    def update_care_preferences(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.care_preferences is None:
+            raise RuntimeError("care preference service is unavailable")
+        changes = dict(args)
+        if changes.pop("clear_quiet_hours", False):
+            changes["quiet_hours_start"] = None
+            changes["quiet_hours_end"] = None
+        preferences = self.care_preferences.update(ctx.participant_id, changes)
+        return {"ok": True, "care_preferences": preferences}
+
+    def respond_to_latest_care(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.care_interventions is None:
+            raise RuntimeError("care intervention service is unavailable")
+        latest = self.care_interventions.latest_sent(ctx.participant_id)
+        if latest is None:
+            return {"ok": False, "error": "no_delivered_care_intervention"}
+        action = str(args["action"])
+        result = self.care_interventions.apply_action(
+            ctx.participant_id,
+            uuid.UUID(latest["id"]),
+            action=action,
+            callback_event_id=f"agent:{ctx.message_id}:{action}"[:160],
+            optional_comment=args.get("comment"),
+        )
+        return {
+            "ok": True,
+            "created": result["created"],
+            "action_result": result["action_result"],
+            "care_intervention": result["intervention"],
         }
 
     def _support_alert(
