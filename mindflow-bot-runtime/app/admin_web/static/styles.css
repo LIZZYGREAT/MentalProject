@@ -2,7 +2,7 @@
   --ink: #29332f; --muted: #718078; --paper: #f6f5ef; --surface: #fff;
   --line: #e2e6df; --green: #245d52; --green-soft: #e6f0ec;
   --stress: #a45c4a; --stress-soft: #f5e8e3; --amber: #bd7b52;
-  --blue: #6d7fa8; --purple: #8f6b91; --danger: #a33f3f;
+  --blue: #6d7fa8; --purple: #8f6b91; --source-forecast: #596f78; --danger: #a33f3f;
   font-family: Inter, "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
   color: var(--ink); background: var(--paper);
 }
@@ -60,6 +60,8 @@ pre { white-space:pre-wrap; word-break:break-word; max-height:460px; overflow:au
 .curve-chart svg { display:block; width:100%; height:auto; }.chart-grid { stroke:#e7e9e3; stroke-width:1; }.axis { stroke:#aeb8b2; stroke-width:1; }
 .stress-line { fill:none; stroke:var(--stress); stroke-width:3; }.energy-line { fill:none; stroke:var(--green); stroke-width:3; }
 .posterior-line { fill:none; stroke:var(--purple); stroke-width:2.5; stroke-dasharray:7 4; }
+.retrospective-source-line { fill:none; stroke:var(--source-forecast); stroke-width:2.3; stroke-dasharray:2 5; }
+.curve-version-warning { margin-top:16px; padding:12px 14px; border:1px solid #d59b2d; border-radius:12px; background:#fff7df; color:#704d0b; }
 .instant-point { fill:var(--blue); stroke:white; stroke-width:1.5; }.review-point { fill:var(--amber); stroke:white; stroke-width:1.5; }
 .input-line { fill:none; stroke:var(--amber); stroke-width:2.3; }.chart-label { fill:var(--muted); font-size:12px; }
 .legend { display:flex; flex-wrap:wrap; gap:16px; padding:12px 18px; color:var(--muted); font-size:13px; }.legend i { width:10px; height:10px; display:inline-block; border-radius:50%; margin-right:6px; }

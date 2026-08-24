@@ -102,6 +102,18 @@ class DailyReviewScheduler:
         )
         for item in claimed:
             participant_id = uuid.UUID(item["participant_id"])
+            participant = await asyncio.to_thread(
+                self.participants.get, participant_id
+            )
+            if participant is None or participant.status != "active":
+                await asyncio.to_thread(
+                    self.schedules.mark_cancelled,
+                    item["id"],
+                    item["claim_token"],
+                    now=utc_now,
+                    error_code="participant_inactive",
+                )
+                continue
             binding = await asyncio.to_thread(
                 self.bindings.get_for_participant, participant_id
             )

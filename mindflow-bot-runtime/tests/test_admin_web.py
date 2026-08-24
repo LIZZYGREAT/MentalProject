@@ -116,6 +116,21 @@ def test_admin_date_helpers_do_not_round_trip_calendar_dates_through_utc():
     assert "toISOString().slice(0,10)" not in source
 
 
+def test_admin_curve_marks_and_draws_mismatched_retrospective_source():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "admin_web"
+        / "static"
+        / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "retrospective_matches_current_forecast===false" in source
+    assert "retrospective_source_curve" in source
+    assert "回顾估计基于 Forecast" in source
+    assert "回顾基准预测" in source
+
+
 def test_disabled_admin_app_fails_closed():
     value = replace(settings(), admin_enabled=False)
 

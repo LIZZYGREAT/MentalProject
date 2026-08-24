@@ -10,8 +10,12 @@ from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
 from app.integrations.feishu.cards import daily_review_card
-from app.models import ForecastSnapshot, RetrospectiveCurveSnapshot
-from app.repositories import ForecastSnapshotRepository, ObservationRepository
+from app.models import ForecastSnapshot, Participant, RetrospectiveCurveSnapshot
+from app.repositories import (
+    ForecastSnapshotRepository,
+    ObservationRepository,
+    ParticipantRepository,
+)
 from app.repositories_daily_review import (
     DailyReviewResponseRepository,
     DailyReviewScheduleRepository,
@@ -19,7 +23,9 @@ from app.repositories_daily_review import (
 )
 from app.services.daily_review_scheduler import DailyReviewScheduler
 from app.services.daily_review_service import DailyReviewService
+from app.services.curve_analysis import analyze_curve
 from app.services.forecast_initial_state import ForecastInitialStateResolver
+from app.services.pressure_curve_service import PressureCurveView
 from helpers import memory_database, participant
 from sqlalchemy import func, select
 from starlette.testclient import TestClient
@@ -57,11 +63,18 @@ def _service(database):
     )
 
 
-def _seed_forecast(database, person_id, target, *, version="forecast-original"):
+def _seed_forecast(
+    database,
+    person_id,
+    target,
+    *,
+    version="forecast-original",
+    curve=None,
+):
     return ForecastSnapshotRepository(database).save(
         person_id, target, calendar_revision="cal", semantic_revision="sem",
         algorithm_version="model-v1", forecast_version=version,
-        semantic_status="complete", semantic_input=[], curve=_curve(), peaks=[],
+        semantic_status="complete", semantic_input=[], curve=curve or _curve(), peaks=[],
         warning_windows=[{"risk": "unchanged"}], output={"stress_0_10": 4, "vitality_0_10": 5},
     )
 
@@ -127,10 +140,6 @@ def _daily_review_action(
 
 
 def _daily_review_scheduler(database, participant_id: uuid.UUID, sent: list):
-    class Participants:
-        def active_ids(self):
-            return [participant_id]
-
     class Bindings:
         def get_for_participant(self, _participant_id):
             return {"chat_id": "chat-1"}
@@ -142,7 +151,7 @@ def _daily_review_scheduler(database, participant_id: uuid.UUID, sent: list):
 
     return DailyReviewScheduler(
         schedules=DailyReviewScheduleRepository(database),
-        participants=Participants(),
+        participants=ParticipantRepository(database),
         bindings=Bindings(),
         forecasts=ForecastSnapshotRepository(database),
         sender=Sender(),
@@ -251,6 +260,9 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
         def active_ids(self):
             return [person.id]
 
+        def get(self, _participant_id):
+            return person
+
     class Bindings:
         def get_for_participant(self, _pid):
             return {"chat_id": "chat-1"}
@@ -356,6 +368,9 @@ def test_next_morning_recovered_card_still_uses_previous_day_closing_anchor():
     class Participants:
         def active_ids(self):
             return [person.id]
+
+        def get(self, _participant_id):
+            return person
 
     class Bindings:
         def get_for_participant(self, _pid):
@@ -1015,6 +1030,83 @@ def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
     assert latest["id"] == rebuilt["id"]
 
 
+def test_admin_curve_uses_exact_retrospective_source_for_stale_overlay():
+    database = memory_database()
+    person = participant(database, "DR-ADMIN-STALE-OVERLAY")
+    target = date(2030, 1, 15)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-overlay-v1"
+    )
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-admin-stale-overlay",
+        action=_daily_review_action(
+            database, person.id, target, scheduled_at
+        ),
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=20),
+    )
+    curve_v2 = [
+        {
+            **point,
+            "stress_0_10": min(10.0, point["stress_0_10"] + 1.0),
+        }
+        for point in _curve()
+    ]
+    forecast_v2 = _seed_forecast(
+        database,
+        person.id,
+        target,
+        version="forecast-overlay-v2",
+        curve=curve_v2,
+    )
+
+    class PressureCurves:
+        async def build(self, participant_id, local_date, **_kwargs):
+            forecast = ForecastSnapshotRepository(database).latest(
+                participant_id, local_date
+            )
+            return PressureCurveView(
+                forecast=forecast,
+                analysis=analyze_curve(forecast["curve"]),
+                png_bytes=b"",
+            )
+
+    browser = TestClient(
+        create_app(database, _settings(), pressure_curves=PressureCurves())
+    )
+    login = browser.post(
+        "/admin/api/login",
+        json={"username": "root-admin", "password": "correct-password"},
+    )
+    assert login.status_code == 200
+    response = browser.get(
+        f"/admin/api/participants/{person.participant_code}"
+        f"/pressure-curve/{target.isoformat()}"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["forecast_version"] == forecast_v2["forecast_version"]
+    assert payload["current_forecast_version"] == forecast_v2["forecast_version"]
+    assert (
+        payload["retrospective"]["source_forecast_version"]
+        == forecast_v1["forecast_version"]
+    )
+    assert (
+        payload["retrospective_source_forecast_id"]
+        == result["retrospective"]["source_forecast_id"]
+    )
+    assert (
+        payload["retrospective_source_forecast_version"]
+        == forecast_v1["forecast_version"]
+    )
+    assert payload["retrospective_matches_current_forecast"] is False
+    assert payload["retrospective_source_curve"] == forecast_v1["curve"]
+    assert payload["retrospective_source_curve"] != payload["curve"]
+
+
 def test_successful_callback_retry_after_expiry_returns_original_result():
     database = memory_database()
     person = participant(database, "DR-EXPIRED-RETRY-SUCCESS")
@@ -1213,6 +1305,113 @@ def test_duplicate_callback_identity_mismatch_is_rejected():
     assert first["response"]["local_date"] == first_date.isoformat()
 
 
+def test_scheduler_cancels_pending_review_for_inactive_participant():
+    database = memory_database()
+    person = participant(database, "DR-INACTIVE-PENDING")
+    target = date(2030, 1, 15)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedules = DailyReviewScheduleRepository(database)
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    _seed_forecast(database, person.id, target)
+    binding_calls = []
+    sent = []
+
+    class Bindings:
+        def get_for_participant(self, participant_id):
+            binding_calls.append(participant_id)
+            return {"chat_id": "inactive-chat"}
+
+    class Sender:
+        def send_card(self, *args, **kwargs):
+            sent.append((args, kwargs))
+            return "should-not-send"
+
+    with database.session() as session:
+        row = session.get(Participant, person.id)
+        assert row is not None
+        row.status = "inactive"
+    participants = ParticipantRepository(database)
+    assert person.id not in participants.active_ids()
+    scheduler = DailyReviewScheduler(
+        schedules=schedules,
+        participants=participants,
+        bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+    )
+
+    first = asyncio.run(scheduler.run_once(scheduled_at))
+    second = asyncio.run(
+        scheduler.run_once(scheduled_at + timedelta(minutes=1))
+    )
+    stored = schedules.get(schedule["id"])
+
+    assert first["sent"] == 0
+    assert second["sent"] == 0
+    assert sent == []
+    assert binding_calls == []
+    assert stored["status"] == "cancelled"
+    assert stored["last_error_code"] == "participant_inactive"
+    assert stored["next_attempt_at"] is None
+    assert stored["claim_token"] is None
+
+
+def test_scheduler_rechecks_participant_status_after_claim_before_send():
+    database = memory_database()
+    person = participant(database, "DR-INACTIVE-AFTER-CLAIM")
+    target = date(2030, 1, 15)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedules = DailyReviewScheduleRepository(database)
+    _seed_forecast(database, person.id, target)
+    repository = ParticipantRepository(database)
+    binding_calls = []
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+        def get(self, participant_id):
+            with database.session() as session:
+                row = session.get(Participant, participant_id)
+                assert row is not None
+                row.status = "inactive"
+            return repository.get(participant_id)
+
+    class Bindings:
+        def get_for_participant(self, participant_id):
+            binding_calls.append(participant_id)
+            return {"chat_id": "race-chat"}
+
+    class Sender:
+        def send_card(self, *args, **kwargs):
+            sent.append((args, kwargs))
+            return "should-not-send"
+
+    scheduler = DailyReviewScheduler(
+        schedules=schedules,
+        participants=Participants(),
+        bindings=Bindings(),
+        forecasts=ForecastSnapshotRepository(database),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+    )
+
+    counts = asyncio.run(scheduler.run_once(scheduled_at))
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    stored = schedules.get(schedule["id"])
+
+    assert counts["ensured"] == 1
+    assert counts["sent"] == 0
+    assert sent == []
+    assert len(binding_calls) == 1  # availability pass before the claim
+    assert stored["status"] == "cancelled"
+    assert stored["last_error_code"] == "participant_inactive"
+
+
 def test_scheduler_defers_daily_review_when_source_forecast_is_missing():
     database = memory_database()
     person = participant(database, "DR-SCHEDULER-NO-FORECAST")
@@ -1289,6 +1488,7 @@ def test_schedule_claim_lease_retry_and_stable_message_uuid():
     sent = []
     class Participants:
         def active_ids(self): return [person.id]
+        def get(self, _participant_id): return person
     class Bindings:
         def get_for_participant(self, _pid): return {"chat_id": "chat-1"}
     class Sender:
@@ -1334,6 +1534,9 @@ def test_old_unavailable_cards_expire_instead_of_batch_sending():
         def active_ids(self):
             return [person.id]
 
+        def get(self, _participant_id):
+            return person
+
     class Bindings:
         def get_for_participant(self, _pid):
             return {"chat_id": "chat-available"}
@@ -1371,6 +1574,9 @@ def test_restart_shortly_after_midnight_catches_up_previous_day_once():
     class Participants:
         def active_ids(self):
             return [person.id]
+
+        def get(self, _participant_id):
+            return person
 
     class Bindings:
         def get_for_participant(self, _pid):
@@ -1421,6 +1627,9 @@ def test_yesterday_unavailable_card_sends_when_binding_recovers_within_validity(
         def active_ids(self):
             return [person.id]
 
+        def get(self, _participant_id):
+            return person
+
     class Bindings:
         def get_for_participant(self, _pid):
             return {"chat_id": "restored-chat"}
@@ -1460,6 +1669,9 @@ def test_restart_after_catch_up_window_does_not_create_old_schedule():
     class Participants:
         def active_ids(self):
             return [person.id]
+
+        def get(self, _participant_id):
+            return person
 
     class Bindings:
         def get_for_participant(self, _pid):

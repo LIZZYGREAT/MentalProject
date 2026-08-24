@@ -144,6 +144,22 @@ class DailyReviewScheduleRepository:
             error_code="missing_active_chat_binding",
         )
 
+    def mark_cancelled(
+        self,
+        schedule_id: uuid.UUID | str,
+        claim_token: uuid.UUID | str,
+        *,
+        now: datetime,
+        error_code: str,
+    ) -> bool:
+        return self._finish(
+            schedule_id,
+            claim_token,
+            status="cancelled",
+            now=now,
+            error_code=error_code,
+        )
+
     def defer_missing_forecast(
         self,
         schedule_id: uuid.UUID | str,

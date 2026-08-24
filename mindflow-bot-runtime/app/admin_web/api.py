@@ -26,7 +26,7 @@ from app.repositories_daily_review import (
     DailyReviewResponseRepository, RetrospectiveCurveRepository,
 )
 from app.services.daily_review_service import DailyReviewService
-from app.repositories import ObservationRepository
+from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
 def _json_error(message: str, status: int) -> JSONResponse:
@@ -50,6 +50,9 @@ class AdminAPI:
         self.daily_reviews = daily_reviews
         self.review_responses = DailyReviewResponseRepository(repository.database)
         self.retrospectives = RetrospectiveCurveRepository(repository.database)
+        self.forecasts_repository = ForecastSnapshotRepository(
+            repository.database
+        )
         self.observations_repository = ObservationRepository(repository.database)
         self.signer = SessionSigner(
             settings.admin_session_secret or "test-admin-session-secret",
@@ -328,6 +331,25 @@ class AdminAPI:
             return _json_error("forecast_not_found", 404)
         output = dict(view.forecast.get("output") or {})
         retrospective = self.retrospectives.latest(participant_id, target)
+        current_forecast_version = view.forecast.get("forecast_version")
+        retrospective_source = None
+        retrospective_matches_current = None
+        if retrospective is not None:
+            retrospective_matches_current = (
+                retrospective.get("source_forecast_version")
+                == current_forecast_version
+            )
+            retrospective_source = self.forecasts_repository.get(
+                participant_id,
+                retrospective["source_forecast_id"],
+                local_date=target,
+            )
+            if (
+                retrospective_source is not None
+                and retrospective_source.get("forecast_version")
+                != retrospective.get("source_forecast_version")
+            ):
+                retrospective_source = None
         reviews = self.review_responses.list(participant_id, target)
         observations = self.observations_repository.for_local_date(
             participant_id, target, timezone_name=self.settings.timezone_name,
@@ -336,7 +358,8 @@ class AdminAPI:
         return JSONResponse(
             {
                 "local_date": str(view.forecast.get("local_date") or target),
-                "forecast_version": view.forecast.get("forecast_version"),
+                "forecast_version": current_forecast_version,
+                "current_forecast_version": current_forecast_version,
                 "curve": list(view.forecast.get("curve") or []),
                 "analysis": view.analysis.to_dict(),
                 "events": list(view.forecast.get("calendar_events") or []),
@@ -349,6 +372,21 @@ class AdminAPI:
                     list(retrospective.get("curve") or []) if retrospective else []
                 ),
                 "retrospective": retrospective,
+                "retrospective_source_forecast_id": (
+                    retrospective.get("source_forecast_id")
+                    if retrospective else None
+                ),
+                "retrospective_source_forecast_version": (
+                    retrospective.get("source_forecast_version")
+                    if retrospective else None
+                ),
+                "retrospective_source_curve": (
+                    list(retrospective_source.get("curve") or [])
+                    if retrospective_source else []
+                ),
+                "retrospective_matches_current_forecast": (
+                    retrospective_matches_current
+                ),
                 "daily_review_responses": reviews,
                 "instant_observations": observations,
                 "overlay_labels": {
