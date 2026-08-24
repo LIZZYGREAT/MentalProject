@@ -281,6 +281,13 @@ class LearnedProfileRepository:
             return self._view(row)
 
 
+@dataclass(frozen=True)
+class ObservationWriteResult:
+    observation_id: uuid.UUID
+    observed_at: datetime
+    created: bool
+
+
 class ObservationRepository:
     def __init__(self, database: Database):
         self.database = database
@@ -294,6 +301,23 @@ class ObservationRepository:
         observed_at: Optional[datetime] = None,
         source_message_id: Optional[str] = None,
     ) -> uuid.UUID:
+        return self.add_with_status(
+            participant_id,
+            observation_type,
+            payload,
+            observed_at=observed_at,
+            source_message_id=source_message_id,
+        ).observation_id
+
+    def add_with_status(
+        self,
+        participant_id: uuid.UUID,
+        observation_type: str,
+        payload: dict[str, Any],
+        *,
+        observed_at: Optional[datetime] = None,
+        source_message_id: Optional[str] = None,
+    ) -> "ObservationWriteResult":
         def find_existing(session: Any) -> StateObservation | None:
             if not source_message_id:
                 return None
@@ -309,7 +333,11 @@ class ObservationRepository:
             with self.database.session() as session:
                 existing = find_existing(session)
                 if existing is not None:
-                    return existing.id
+                    return ObservationWriteResult(
+                        observation_id=existing.id,
+                        observed_at=self._aware(existing.observed_at),
+                        created=False,
+                    )
                 timestamp = observed_at or utc_now()
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -324,7 +352,11 @@ class ObservationRepository:
                 )
                 session.add(row)
                 session.flush()
-                return row.id
+                return ObservationWriteResult(
+                    observation_id=row.id,
+                    observed_at=self._aware(row.observed_at),
+                    created=True,
+                )
         except IntegrityError:
             # A competing request can commit after the SELECT but before this
             # INSERT. The database constraint is authoritative; return the row
@@ -332,8 +364,20 @@ class ObservationRepository:
             with self.database.session() as session:
                 existing = find_existing(session)
                 if existing is not None:
-                    return existing.id
+                    return ObservationWriteResult(
+                        observation_id=existing.id,
+                        observed_at=self._aware(existing.observed_at),
+                        created=False,
+                    )
             raise
+
+    @staticmethod
+    def _aware(value: datetime) -> datetime:
+        return (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
 
     def recent(self, participant_id: uuid.UUID, limit: int = 20) -> list[dict[str, Any]]:
         with self.database.session() as session:
@@ -694,6 +738,39 @@ class ForecastSnapshotRepository:
             ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
             return self._view(row) if row is not None else None
 
+    def invalidate_current_for_date(
+        self,
+        warning_repository: "WarningScheduleRepository",
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Atomically invalidate active forecasts and cancel unsent derivatives."""
+
+        if warning_repository.database is not self.database:
+            raise ValueError("forecast and warning repositories must share a database")
+        changed_at = now or utc_now()
+        with self.database.session() as session:
+            rows = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.valid.is_(True),
+                ).with_for_update()
+            ).scalars().all()
+            forecast_ids = [row.id for row in rows]
+            for row in rows:
+                row.valid = False
+            cancelled = warning_repository._cancel_for_forecasts_in_session(
+                session,
+                forecast_ids,
+                reason=reason,
+                now=changed_at,
+            )
+            return {"forecasts_invalidated": len(rows), "warnings_cancelled": cancelled}
+
     def save(
         self, participant_id: uuid.UUID, local_date: date, *,
         calendar_revision: str, semantic_revision: str, algorithm_version: str,
@@ -943,6 +1020,36 @@ class WarningScheduleRepository:
                 session, participant_id, local_date, forecast_id=forecast_id,
                 forecast_version=forecast_version, warnings=warnings, now=now,
             )
+
+    def _cancel_for_forecasts_in_session(
+        self,
+        session: Any,
+        forecast_ids: list[uuid.UUID],
+        *,
+        reason: str,
+        now: datetime,
+    ) -> int:
+        if not forecast_ids:
+            return 0
+        changed_at = self._aware(now)
+        rows = session.execute(
+            select(WarningSchedule).where(
+                WarningSchedule.forecast_id.in_(forecast_ids),
+                WarningSchedule.status.in_(self.ACTIVE),
+            ).with_for_update()
+        ).scalars().all()
+        for row in rows:
+            row.status = "cancelled"
+            row.claim_token = None
+            row.claimed_at = None
+            row.lease_until = None
+            row.next_attempt_at = None
+            row.payload_json = {
+                **dict(row.payload_json),
+                "cancellation_reason": str(reason)[:128],
+            }
+            row.updated_at = changed_at
+        return len(rows)
 
     def _sync_in_session(
         self, session: Any, participant_id: uuid.UUID, local_date: date, *,

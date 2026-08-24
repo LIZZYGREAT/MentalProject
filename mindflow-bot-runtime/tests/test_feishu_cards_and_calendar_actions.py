@@ -444,7 +444,12 @@ def test_card_action_adapter_and_service_record_one_idempotent_checkin():
     database = memory_database()
     person = participant(database, "P001")
     observations = ObservationRepository(database)
-    service = CardActionService(observations)
+    service = CardActionService(
+        observations,
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+    )
     raw = SimpleNamespace(
         message_id="om-card",
         chat_id="oc-chat",

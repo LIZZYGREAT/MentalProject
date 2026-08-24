@@ -14,12 +14,16 @@ from app.integrations.feishu.cards import pressure_curve_card
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import FeishuCardActionAdapter
 from mindflow_core.assessment import AssessmentModel
-from app.models import StateObservation, WarningSchedule
+from app.models import ForecastSnapshot, StateObservation, WarningSchedule
 from app.repositories import (
+    ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
+    WarningScheduleRepository,
 )
 from app.services.card_action_service import CardActionService
+from app.services.forecast_scheduler import ForecastScheduler
+from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.curve_analysis import analyze_curve
 from app.services.pressure_curve_renderer import PressureCurveRenderer
 from app.services.presentation_service import (
@@ -122,23 +126,35 @@ def _handle_card(service, person_id, card_event):
     )
 
 
+class _RefreshSpy:
+    def __init__(self):
+        self.created_calls = []
+
+    def on_observation_committed(self, **values):
+        if values["created"]:
+            self.created_calls.append(values)
+        return {"forecasts_invalidated": 0, "warnings_cancelled": 0}
+
+
 def test_duplicate_identical_card_callback_is_idempotent():
     database = memory_database()
     person = participant(database, "CARD-IDENTICAL")
     repository = ObservationRepository(database)
-    service = CardActionService(repository)
+    refresh = _RefreshSpy()
+    service = CardActionService(repository, observation_refresh=refresh)
     card_event = _card_event("7")
     first = _handle_card(service, person.id, card_event)
     second = _handle_card(service, person.id, card_event)
     assert first["observation_id"] == second["observation_id"]
     assert len(repository.recent(person.id)) == 1
+    assert len(refresh.created_calls) == 1
 
 
 def test_same_card_with_changed_form_values_records_new_observation():
     database = memory_database()
     person = participant(database, "CARD-CHANGED")
     repository = ObservationRepository(database)
-    service = CardActionService(repository)
+    service = CardActionService(repository, observation_refresh=_RefreshSpy())
     first = _handle_card(service, person.id, _card_event("7", "4"))
     second = _handle_card(service, person.id, _card_event("2", "9"))
     assert first["observation_id"] != second["observation_id"]
@@ -155,7 +171,10 @@ def test_concurrent_duplicate_card_callbacks_are_idempotent(tmp_path):
     )
     database.create_schema_for_tests()
     person = ParticipantRepository(database).create("CARD-CONCURRENT")
-    service = CardActionService(ObservationRepository(database))
+    refresh = _RefreshSpy()
+    service = CardActionService(
+        ObservationRepository(database), observation_refresh=refresh
+    )
     card_event = _card_event("6")
     barrier = threading.Barrier(6)
 
@@ -168,6 +187,262 @@ def test_concurrent_duplicate_card_callbacks_are_idempotent(tmp_path):
     assert len(set(ids)) == 1
     with database.session() as session:
         assert session.query(StateObservation).count() == 1
+    assert len(refresh.created_calls) == 1
+
+
+def _warning_item(*, identity: str = "observation-refresh"):
+    return {
+        "warning_identity": identity,
+        "episode_identity": identity,
+        "target_time": TEST_NOW + timedelta(minutes=1),
+        "valid_until": TEST_NOW + timedelta(hours=1),
+        "risk_time": TEST_NOW + timedelta(hours=2),
+        "warning_level": "2",
+        "episode_drift_minutes": 15,
+        "payload": {"message": "stale warning"},
+    }
+
+
+def test_observation_refresh_immediately_invalidates_forecast_and_warning():
+    database = memory_database()
+    person = participant(database, "OBS-REFRESH-INVALIDATE")
+    warnings = WarningScheduleRepository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    saved, _ = save_forecast_and_warnings(
+        database,
+        person,
+        warnings,
+        version="before-observation",
+        items=[_warning_item()],
+    )
+
+    class Coordinator:
+        async def ensure_forecast(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    async def scenario():
+        refresh = ObservationForecastRefreshService(
+            forecasts,
+            warnings,
+            Coordinator(),
+            timezone_name="Asia/Shanghai",
+        )
+        refresh.start()
+        write = ObservationRepository(database).add_with_status(
+            person.id,
+            "checkin",
+            {"stress_0_10": 8.0},
+            observed_at=TEST_NOW,
+            source_message_id="invalidate-now",
+        )
+        result = refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=write.observed_at,
+            created=write.created,
+        )
+        assert result == {"forecasts_invalidated": 1, "warnings_cancelled": 1}
+        with database.session() as session:
+            assert session.get(ForecastSnapshot, uuid.UUID(saved["id"])).valid is False
+            warning = session.query(WarningSchedule).one()
+            assert warning.status == "cancelled"
+            assert warning.claim_token is None
+            assert warning.payload_json["cancellation_reason"] == "observation_committed"
+        assert warnings.pending(TEST_NOW + timedelta(minutes=2)) == []
+        await refresh.close()
+
+    asyncio.run(scenario())
+
+
+def test_observation_refresh_duplicate_is_noop_and_fast_updates_are_serialized():
+    database = memory_database()
+    person = participant(database, "OBS-REFRESH-COALESCE")
+    observations = ObservationRepository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    warnings = WarningScheduleRepository(database)
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ensure_forecast(self, *_args, **_kwargs):
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if self.calls == 1:
+                    self.started.set()
+                    await self.release.wait()
+                await asyncio.sleep(0)
+            finally:
+                self.active -= 1
+
+    async def scenario():
+        coordinator = Coordinator()
+        refresh = ObservationForecastRefreshService(
+            forecasts,
+            warnings,
+            coordinator,
+            timezone_name="Asia/Shanghai",
+        )
+        refresh.start()
+        first = observations.add_with_status(
+            person.id,
+            "checkin",
+            {"stress_0_10": 5.0},
+            observed_at=TEST_NOW,
+            source_message_id="coalesce-1",
+        )
+        refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=first.observed_at,
+            created=first.created,
+        )
+        await coordinator.started.wait()
+        duplicate = observations.add_with_status(
+            person.id,
+            "checkin",
+            {"stress_0_10": 5.0},
+            observed_at=TEST_NOW,
+            source_message_id="coalesce-1",
+        )
+        refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=duplicate.observed_at,
+            created=duplicate.created,
+        )
+        second = observations.add_with_status(
+            person.id,
+            "checkin",
+            {"stress_0_10": 9.0},
+            observed_at=TEST_NOW + timedelta(minutes=1),
+            source_message_id="coalesce-2",
+        )
+        refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=second.observed_at,
+            created=second.created,
+        )
+        coordinator.release.set()
+        await refresh.wait_idle()
+        assert duplicate.created is False
+        assert coordinator.calls == 2
+        assert coordinator.max_active == 1
+        await refresh.close()
+
+    asyncio.run(scenario())
+
+
+def test_observation_refresh_failure_stays_fail_closed_and_targets_observed_date():
+    database = memory_database()
+    person = participant(database, "OBS-REFRESH-DATE")
+    warnings = WarningScheduleRepository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    d1 = TEST_LOCAL_DATE
+    d2 = d1 + timedelta(days=1)
+    for local_date, version in ((d1, "d1"), (d2, "d2")):
+        forecasts.save(
+            person.id,
+            local_date,
+            calendar_revision=version,
+            semantic_revision=version,
+            algorithm_version="algorithm",
+            forecast_version=version,
+            semantic_status="rules_only",
+            semantic_input=[],
+            curve=[],
+            peaks=[],
+            warning_windows=[],
+            output={},
+        )
+
+    class FailingCoordinator:
+        async def ensure_forecast(self, *_args, **_kwargs):
+            raise RuntimeError("recompute failed")
+
+    async def scenario():
+        refresh = ObservationForecastRefreshService(
+            forecasts,
+            warnings,
+            FailingCoordinator(),
+            timezone_name="Asia/Shanghai",
+        )
+        refresh.start()
+        observed_at = datetime(2030, 1, 15, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=observed_at,
+            created=True,
+        )
+        await refresh.wait_idle()
+        assert forecasts.latest(person.id, d1) is None
+        assert forecasts.latest(person.id, d2)["forecast_version"] == "d2"
+        await refresh.close()
+
+        class RecoveringCoordinator:
+            async def ensure_forecast(self, participant_id, local_date, _reason):
+                return forecasts.save(
+                    participant_id,
+                    local_date,
+                    calendar_revision="recovered",
+                    semantic_revision="recovered",
+                    algorithm_version="algorithm",
+                    forecast_version="scheduler-recovered",
+                    semantic_status="rules_only",
+                    semantic_input=[],
+                    curve=[],
+                    peaks=[],
+                    warning_windows=[],
+                    output={},
+                )
+
+        scheduler = ForecastScheduler(
+            coordinator=RecoveringCoordinator(),
+            participants=None,
+            warnings=warnings,
+            bindings=None,
+            sender=None,
+            timezone_name="Asia/Shanghai",
+            daily_prepare_local_time="00:00",
+            calendar_sync_interval_seconds=300,
+            warning_poll_interval_seconds=15,
+            calendar_oauth_app_id="app",
+        )
+        await scheduler._run_forecast_phase(
+            [person.id], d1, "periodic_poll", calibrate=False
+        )
+        assert forecasts.latest(person.id, d1)["forecast_version"] == "scheduler-recovered"
+
+    asyncio.run(scenario())
+
+
+def test_care_record_checkin_uses_observation_refresh_service():
+    database = memory_database()
+    person = participant(database, "CARE-OBS-REFRESH")
+    refresh = _RefreshSpy()
+    tools = CareTools(
+        None,
+        ObservationRepository(database),
+        None,
+        None,
+        None,
+        None,
+        "Asia/Shanghai",
+        observation_refresh=refresh,
+    )
+    ctx = AgentContext(person.id, "P", "ou", "oc", "care-message", uuid.uuid4())
+    result = tools.record_checkin(ctx, {
+        "stress": 7,
+        "energy": 3,
+        "activity": "writing",
+        "stress_event_since_last": True,
+        "event_ongoing": False,
+    })
+    assert result["ok"] is True
+    assert len(refresh.created_calls) == 1
 
 
 def _prediction_with_optional_afternoon_checkin(include: bool):

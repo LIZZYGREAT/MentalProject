@@ -164,6 +164,7 @@ async def run() -> None:
     incidents = RuntimeIncidentRepository(database)
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
+    business.observation_refresh.start()
     _log_startup_phase("business_ready")
 
     skill_loader = SkillLoader(settings.care_skill_path)
@@ -389,11 +390,14 @@ async def run() -> None:
                 await worker.close()
             finally:
                 try:
-                    await business.semantic_preprocessor.close(
-                        settings.semantic_api_timeout_seconds + 2
-                    )
+                    await business.observation_refresh.close()
                 finally:
-                    await runtime.close()
+                    try:
+                        await business.semantic_preprocessor.close(
+                            settings.semantic_api_timeout_seconds + 2
+                        )
+                    finally:
+                        await runtime.close()
 
 
 def main() -> None:

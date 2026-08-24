@@ -34,6 +34,7 @@ from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
+from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.profile_calibration import ProfileCalibrationService
 from app.services.token_service import (
     TokenEncryptionService,
@@ -68,6 +69,7 @@ class BusinessServices:
     daily_review_responses: DailyReviewResponseRepository
     retrospective_curves: RetrospectiveCurveRepository
     daily_reviews: DailyReviewService
+    observation_refresh: ObservationForecastRefreshService
 
 
 def build_business_services(
@@ -101,10 +103,6 @@ def build_business_services(
     daily_reviews = DailyReviewService(
         daily_review_responses, daily_review_schedules, retrospective_curves,
         ForecastSnapshotRepository(database), observations, settings,
-    )
-    card_actions = CardActionService(
-        observations, calendar, timezone_name=settings.timezone_name,
-        daily_reviews=daily_reviews,
     )
     prediction_service = PredictionService(
         AssessmentModel(settings.timezone_name), predictions
@@ -143,6 +141,19 @@ def build_business_services(
         learned_profiles=learned_profiles,
         retrospective_curves=retrospective_curves,
     )
+    observation_refresh = ObservationForecastRefreshService(
+        forecast_snapshots,
+        warning_schedules,
+        forecast_coordinator,
+        timezone_name=settings.timezone_name,
+    )
+    card_actions = CardActionService(
+        observations,
+        calendar,
+        timezone_name=settings.timezone_name,
+        daily_reviews=daily_reviews,
+        observation_refresh=observation_refresh,
+    )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
@@ -161,6 +172,7 @@ def build_business_services(
         presentations,
         learned_profiles=learned_profiles,
         pressure_curves=pressure_curves,
+        observation_refresh=observation_refresh,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -184,4 +196,5 @@ def build_business_services(
         daily_review_responses=daily_review_responses,
         retrospective_curves=retrospective_curves,
         daily_reviews=daily_reviews,
+        observation_refresh=observation_refresh,
     )

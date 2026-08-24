@@ -20,6 +20,7 @@ from app.repositories import (
 )
 from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
     PressureCurveService,
@@ -118,6 +119,7 @@ class CareTools:
         presentations: PresentationOutbox | None = None,
         learned_profiles: LearnedProfileRepository | None = None,
         pressure_curves: PressureCurveService | None = None,
+        observation_refresh: ObservationForecastRefreshService | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -138,6 +140,7 @@ class CareTools:
             if forecast_coordinator is not None
             else None
         )
+        self.observation_refresh = observation_refresh
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -348,7 +351,9 @@ class CareTools:
         }
 
     def record_checkin(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
-        observation_id = self.observations.add(
+        if self.observation_refresh is None:
+            raise RuntimeError("observation forecast refresh service is unavailable")
+        write = self.observations.add_with_status(
             ctx.participant_id,
             "checkin",
             {
@@ -360,9 +365,14 @@ class CareTools:
             },
             source_message_id=ctx.message_id,
         )
+        self.observation_refresh.on_observation_committed(
+            participant_id=ctx.participant_id,
+            observed_at=write.observed_at,
+            created=write.created,
+        )
         return {
             "ok": True,
-            "observation_id": str(observation_id),
+            "observation_id": str(write.observation_id),
             "recorded": {"stress": args["stress"], "energy": args["energy"]},
         }
 

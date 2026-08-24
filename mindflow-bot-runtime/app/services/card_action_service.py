@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import daily_checkin_card, today_calendar_card
 from app.repositories import ObservationRepository
+from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 
 
 def _boolean(value: Any, field: str) -> bool:
@@ -44,11 +45,13 @@ class CardActionService:
         *,
         timezone_name: str = "Asia/Shanghai",
         daily_reviews: Any = None,
+        observation_refresh: ObservationForecastRefreshService,
     ):
         self.observations = observations
         self.calendar = calendar
         self.timezone = ZoneInfo(timezone_name)
         self.daily_reviews = daily_reviews
+        self.observation_refresh = observation_refresh
 
     @staticmethod
     def _fallback_event_id(
@@ -141,7 +144,7 @@ class CardActionService:
         event_id = str(callback_event_id or "").strip() or self._fallback_event_id(
             message_id, action, values
         )
-        observation_id = self.observations.add(
+        write = self.observations.add_with_status(
             participant_id,
             "checkin",
             {
@@ -155,8 +158,13 @@ class CardActionService:
             },
             source_message_id=event_id[:128],
         )
+        self.observation_refresh.on_observation_committed(
+            participant_id=participant_id,
+            observed_at=write.observed_at,
+            created=write.created,
+        )
         return {
             "ok": True,
-            "observation_id": str(observation_id),
+            "observation_id": str(write.observation_id),
             "reply_text": f"已记录这次状态：压力 {stress:g}/10，精力 {energy:g}/10。",
         }
