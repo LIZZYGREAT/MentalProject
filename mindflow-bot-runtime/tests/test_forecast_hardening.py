@@ -1045,7 +1045,7 @@ def test_today_context_returns_latest_forecast(monkeypatch):
         profiles=type("Profiles", (), {"current": lambda self, _pid: None})(),
         observations=type("Obs", (), {"recent": lambda self, _pid, limit=1: []})(),
         predictions=type("Pred", (), {"latest": lambda self, _pid: None})(),
-        prediction_service=None, calendar=None, tokens=None,
+        calendar=None, tokens=None,
         timezone_name="Asia/Shanghai", forecast_coordinator=coordinator,
         forecast_snapshots=ForecastSnapshotRepository(database),
     )

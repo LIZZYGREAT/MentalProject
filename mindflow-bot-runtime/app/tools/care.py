@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,7 +17,6 @@ from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
 )
-from app.services.prediction_service import PredictionService
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.pressure_curve_service import (
@@ -110,11 +108,10 @@ class CareTools:
         profiles: ProfileRepository,
         observations: ObservationRepository,
         predictions: PredictionRepository,
-        prediction_service: PredictionService,
         calendar: CalendarService,
         tokens: TokenRepository,
         timezone_name: str,
-        forecast_coordinator: ForecastCoordinator | None = None,
+        forecast_coordinator: ForecastCoordinator,
         forecast_snapshots: ForecastSnapshotRepository | None = None,
         presentations: PresentationOutbox | None = None,
         learned_profiles: LearnedProfileRepository | None = None,
@@ -124,7 +121,6 @@ class CareTools:
         self.profiles = profiles
         self.observations = observations
         self.predictions = predictions
-        self.prediction_service = prediction_service
         self.calendar = calendar
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
@@ -389,41 +385,11 @@ class CareTools:
     async def run_assessment(
         self, ctx: AgentContext, _args: dict[str, Any]
     ) -> dict[str, Any]:
-        if self.forecast_coordinator is not None:
-            result = await self.forecast_coordinator.ensure_forecast(
-                ctx.participant_id, datetime.now(self.timezone).date(),
-                "user_curve_request", refresh_calendar=True,
-            )
-            return {"ok": True, **result}
-        profile_row = self.profiles.current(ctx.participant_id)
-        profile = profile_row["profile"] if profile_row else {}
-        now = datetime.now(self.timezone)
-        observations = self.observations.for_local_date(
+        result = await self.forecast_coordinator.ensure_forecast(
             ctx.participant_id,
-            now.date(),
-            timezone_name=self.timezone.key,
-            as_of=now,
-            limit=100,
-        )
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        try:
-            calendar_events = await self.calendar.get_events(
-                ctx.participant_id, day_start, day_start + timedelta(days=1)
-            )
-            degraded = False
-        except Exception:
-            calendar_events = []
-            degraded = True
-        result = await asyncio.to_thread(
-            self.prediction_service.run,
-            participant_id=ctx.participant_id,
-            profile_version=profile_row["version"] if profile_row else None,
-            profile=profile,
-            observations=observations,
-            calendar_events=calendar_events,
-            calendar_degraded=degraded,
-            local_date=day_start.date().isoformat(),
-            source_message_id=ctx.message_id,
+            datetime.now(self.timezone).date(),
+            "user_curve_request",
+            refresh_calendar=True,
         )
         return {"ok": True, **result}
 

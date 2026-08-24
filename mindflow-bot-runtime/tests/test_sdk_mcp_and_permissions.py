@@ -150,7 +150,7 @@ def test_sdk_mcp_emits_failed_lifecycle_without_sensitive_payloads():
 
 def test_all_production_tool_schemas_are_closed_and_identity_free():
     registry = ToolRegistry()
-    CareTools(None, None, None, None, None, None, "Asia/Shanghai").register(registry)
+    CareTools(None, None, None, None, None, "Asia/Shanghai", object()).register(registry)
 
     assert set(registry.names) == {
         "care_get_today_context",

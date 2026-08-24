@@ -225,7 +225,7 @@ def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
     )
     outbox = PresentationOutbox()
     tools = CareTools(
-        None, None, None, None, None, None, "Asia/Shanghai",
+        None, None, None, None, None, "Asia/Shanghai",
         Coordinator(), None, outbox,
     )
 

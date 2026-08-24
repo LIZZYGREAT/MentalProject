@@ -101,7 +101,7 @@ class AssessmentModel:
                 **dict(GLOBAL_DEFAULT_CONFIG.get("ctssm_params") or {}),
                 **dict(parameters["ctssm_params"]),
             }
-        user = User(user_id="runtime", params=dict(parameters), load_from_file=False)
+        user = User(user_id="runtime", params=dict(parameters))
         time_step = int(
             user.get_param("time_step", DEFAULT_TIME_STEP_MINUTES)
             or DEFAULT_TIME_STEP_MINUTES

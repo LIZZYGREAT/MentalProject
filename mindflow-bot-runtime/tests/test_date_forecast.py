@@ -231,7 +231,6 @@ def test_calendar_mutation_does_not_recompute_past_forecast():
         None,
         None,
         None,
-        None,
         "Asia/Shanghai",
         forecast_coordinator=coordinator,
         pressure_curves=object(),
@@ -365,7 +364,7 @@ def test_rebuilt_retrospective_for_current_version_is_used():
 
 
 def test_pressure_curve_tool_has_optional_date_schema():
-    tools = CareTools(None, None, None, None, None, None, "Asia/Shanghai")
+    tools = CareTools(None, None, None, None, None, "Asia/Shanghai", object())
     registry = ToolRegistry()
     tools.register(registry)
     spec = next(item for item in registry.specs if item.name == "care_get_pressure_curve")

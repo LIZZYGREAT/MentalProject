@@ -166,7 +166,6 @@ def build_business_services(
         profiles,
         observations,
         predictions,
-        prediction_service,
         calendar,
         token_repository,
         settings.timezone_name,

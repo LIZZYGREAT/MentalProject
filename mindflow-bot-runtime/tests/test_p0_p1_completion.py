@@ -428,8 +428,8 @@ def test_care_record_checkin_uses_observation_refresh_service():
         None,
         None,
         None,
-        None,
         "Asia/Shanghai",
+        object(),
         observation_refresh=refresh,
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "care-message", uuid.uuid4())
@@ -847,7 +847,7 @@ class _MutationCalendar:
 def _mutation_tools():
     coordinator = _MutationCoordinator()
     tools = CareTools(
-        None, None, None, None, _MutationCalendar(), None, "Asia/Shanghai",
+        None, None, None, _MutationCalendar(), None, "Asia/Shanghai",
         coordinator,
     )
     ctx = AgentContext(uuid.uuid4(), "P", "ou", "oc", "message", uuid.uuid4())
@@ -907,7 +907,7 @@ def test_calendar_mutation_reschedules_warning():
     calendar.get_event = get_event
     calendar.delete_event = delete_event
     tools = CareTools(
-        None, None, None, None, calendar, None, "Asia/Shanghai", coordinator
+        None, None, None, calendar, None, "Asia/Shanghai", coordinator
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "message", uuid.uuid4())
     result = asyncio.run(tools.delete_calendar_event(ctx, {

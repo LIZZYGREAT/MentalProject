@@ -71,19 +71,7 @@ GLOBAL_DEFAULT_CONFIG = {
     "fatigue_acceleration_k": 0.15,
     
     # ==========================================
-    # 5. 旧模型兼容参数（不会进入 CTSSM）
-    # ==========================================
-    "legacy_model": {
-        "enabled": False,
-        "f_strategy": "sensitive",
-        "C_strategy": "high",
-        "night_strategy": "normal",
-        "rest_strategy": "relieved",
-        "time_preferences": [],
-    },
-    
-    # ==========================================
-    # 6. 非稳态负荷理论参数 (Allostatic Load Dynamics) 
+    # 5. 非稳态负荷理论参数 (Allostatic Load Dynamics)
     # ==========================================
     "allostatic_collapse_point": 0.35,     
     "allostatic_collapse_steepness": 10.0, 
