@@ -1,6 +1,6 @@
 """Shared time parsing and interval helpers for event and schedule logic."""
 
-from datetime import datetime
+from datetime import date, datetime, timedelta, tzinfo
 from typing import Any, Optional, Tuple
 
 from settings.model_defaults import (
@@ -23,6 +23,56 @@ def _parse_full_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def normalize_observation_to_model_step(
+    value: Any,
+    *,
+    step_minutes: int,
+    target_date: date | str,
+    timezone_value: tzinfo | None = None,
+) -> Optional[datetime]:
+    """Ceil one date-bearing observation to a causal model-grid timestamp.
+
+    The observation must belong to ``target_date`` before rounding and must
+    remain on that date afterwards.  A late observation such as 23:58 on a
+    five-minute grid therefore does not get moved backwards to 23:55 or
+    leaked into the following day's simulation.
+    """
+
+    parsed = _parse_full_datetime(value)
+    if parsed is None:
+        return None
+    if timezone_value is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone_value)
+        else:
+            parsed = parsed.astimezone(timezone_value)
+    requested_date = (
+        date.fromisoformat(target_date)
+        if isinstance(target_date, str)
+        else target_date
+    )
+    if parsed.date() != requested_date:
+        return None
+    step = int(step_minutes)
+    if step <= 0:
+        raise ValueError("step_minutes must be positive")
+
+    midnight = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = parsed - midnight
+    elapsed_microseconds = (
+        (elapsed.days * 24 * 60 * 60 + elapsed.seconds) * 1_000_000
+        + elapsed.microseconds
+    )
+    step_microseconds = step * 60 * 1_000_000
+    remainder = elapsed_microseconds % step_microseconds
+    if remainder:
+        elapsed_microseconds += step_microseconds - remainder
+    aligned = midnight + timedelta(microseconds=elapsed_microseconds)
+    if aligned.date() != requested_date:
+        return None
+    return aligned
 
 
 def extract_hhmm(value: Any, fallback: str = "00:00") -> str:
@@ -118,4 +168,3 @@ def overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
 def normalize_interval(start: Any, end: Any) -> Tuple[str, str]:
     """Return normalized start and end ``HH:MM`` strings."""
     return extract_hhmm(start), extract_hhmm(end)
-

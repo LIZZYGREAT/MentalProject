@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 import logging
 import uuid
 from zoneinfo import ZoneInfo
@@ -24,6 +24,7 @@ class DailyReviewScheduler:
         local_time: str = "22:00", poll_interval_seconds: int = 60,
         retry_base_seconds: int = 60, max_attempts: int = 5,
         claim_lease_seconds: int = 120,
+        validity_minutes: int = 1440, catch_up_minutes: int = 120,
     ):
         self.schedules = schedules
         self.participants = participants
@@ -36,6 +37,10 @@ class DailyReviewScheduler:
         self.retry_base_seconds = retry_base_seconds
         self.max_attempts = max_attempts
         self.claim_lease_seconds = claim_lease_seconds
+        self.validity_minutes = max(1, int(validity_minutes))
+        self.catch_up_minutes = max(0, int(catch_up_minutes))
+        if self.catch_up_minutes > self.validity_minutes:
+            raise ValueError("catch_up_minutes must not exceed validity_minutes")
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -45,21 +50,41 @@ class DailyReviewScheduler:
             utc_now = utc_now.replace(tzinfo=timezone.utc)
         local_now = utc_now.astimezone(self.timezone)
         counts = {"ensured": 0, "sent": 0, "unavailable": 0, "failed": 0}
+        schedule_dates = []
         if local_now.time() >= self.local_time:
-            scheduled_local = datetime.combine(local_now.date(), self.local_time, self.timezone)
-            for participant_id in await asyncio.to_thread(self.participants.active_ids):
+            schedule_dates.append(local_now.date())
+        elif self.catch_up_minutes > 0:
+            catch_up_deadline = datetime.combine(
+                local_now.date(), time.min, self.timezone
+            ) + timedelta(minutes=self.catch_up_minutes)
+            if local_now < catch_up_deadline:
+                schedule_dates.append(local_now.date() - timedelta(days=1))
+
+        participant_ids = await asyncio.to_thread(self.participants.active_ids)
+        for schedule_date in schedule_dates:
+            scheduled_local = datetime.combine(
+                schedule_date, self.local_time, self.timezone
+            )
+            valid_until = scheduled_local + timedelta(
+                minutes=self.validity_minutes
+            )
+            if local_now >= valid_until:
+                continue
+            for participant_id in participant_ids:
                 await asyncio.to_thread(
-                    self.schedules.ensure, participant_id, local_now.date(),
+                    self.schedules.ensure, participant_id, schedule_date,
                     scheduled_local.astimezone(timezone.utc),
+                    valid_until=valid_until.astimezone(timezone.utc),
                 )
                 counts["ensured"] += 1
-                binding = await asyncio.to_thread(
-                    self.bindings.get_for_participant, participant_id
+        for participant_id in participant_ids:
+            binding = await asyncio.to_thread(
+                self.bindings.get_for_participant, participant_id
+            )
+            if binding and binding.get("chat_id"):
+                await asyncio.to_thread(
+                    self.schedules.reactivate_available, participant_id, utc_now
                 )
-                if binding and binding.get("chat_id"):
-                    await asyncio.to_thread(
-                        self.schedules.reactivate_available, participant_id, utc_now
-                    )
         claimed = await asyncio.to_thread(
             self.schedules.claim_due, utc_now, self.claim_lease_seconds
         )

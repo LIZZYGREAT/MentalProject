@@ -483,17 +483,43 @@ class ForecastCoordinator:
             retrospective = await asyncio.to_thread(
                 self.retrospective_curves.latest, participant_id, previous_date
             )
-            forward_state = dict(
-                ((retrospective or {}).get("analysis") or {}).get(
-                    "forward_terminal_state"
-                ) or {}
+            previous_version = str(previous.get("forecast_version") or "")
+            retrospective_version = str(
+                (retrospective or {}).get("source_forecast_version") or ""
             )
-            if forward_state:
-                terminal_override = {
-                    **forward_state,
-                    "retrospective_id": retrospective["id"],
-                    "daily_review_revision": retrospective["daily_review_revision"],
-                }
+            versions_match = bool(previous_version) and (
+                retrospective_version == previous_version
+            )
+            if retrospective is not None and not versions_match:
+                logger.warning(
+                    "retrospective_terminal_override_stale "
+                    "participant_id=%s previous_forecast_version=%s "
+                    "retrospective_source_forecast_version=%s local_date=%s",
+                    participant_id,
+                    previous_version,
+                    retrospective_version,
+                    previous_date.isoformat(),
+                    extra={
+                        "participant_id": str(participant_id),
+                        "previous_forecast_version": previous_version,
+                        "retrospective_source_forecast_version": retrospective_version,
+                        "local_date": previous_date.isoformat(),
+                    },
+                )
+            elif retrospective is not None:
+                forward_state = dict(
+                    (retrospective.get("analysis") or {}).get(
+                        "forward_terminal_state"
+                    ) or {}
+                )
+                if forward_state:
+                    terminal_override = {
+                        **forward_state,
+                        "retrospective_id": retrospective["id"],
+                        "daily_review_revision": retrospective[
+                            "daily_review_revision"
+                        ],
+                    }
         return self.initial_states.resolve(
             target,
             local_today,

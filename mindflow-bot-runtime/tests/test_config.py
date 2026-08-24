@@ -42,6 +42,35 @@ def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
     assert enabled.profile_calibration_enabled is True
 
 
+def test_daily_review_is_disabled_by_default_and_requires_card_callback():
+    environment = valid_environment()
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.daily_review_enabled is False
+
+    environment["DAILY_REVIEW_ENABLED"] = "true"
+    with pytest.raises(
+        ValueError,
+        match="DAILY_REVIEW_ENABLED requires FEISHU_CARD_CALLBACK_ENABLED",
+    ):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+    environment.update(
+        {
+            "FEISHU_CARD_CALLBACK_ENABLED": "true",
+            "FEISHU_CARD_VERIFICATION_TOKEN": "verification-token",
+            "FEISHU_CARD_ENCRYPT_KEY": "encrypt-key",
+        }
+    )
+    enabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert enabled.daily_review_enabled is True
+
+
 def test_response_ux_defaults_and_presentation_model_fallback():
     settings = Settings.from_env(
         valid_environment(), base_dir=Path(__file__).resolve().parents[1]

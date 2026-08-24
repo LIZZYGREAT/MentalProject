@@ -185,6 +185,180 @@ def test_schedule_claim_lease_retry_and_stable_message_uuid():
     assert asyncio.run(scheduler.run_once(due + timedelta(seconds=124)))["sent"] == 0
 
 
+def test_old_unavailable_cards_expire_instead_of_batch_sending():
+    database = memory_database()
+    person = participant(database, "DR-EXPIRY")
+    repo = DailyReviewScheduleRepository(database)
+    old_schedules = []
+    for day_number in (10, 11, 12, 13, 14):
+        local_day = date(2030, 1, day_number)
+        due = datetime(2030, 1, day_number, 14, tzinfo=timezone.utc)
+        schedule = repo.ensure(person.id, local_day, due)
+        claimed = repo.claim_due(due, 120)
+        assert len(claimed) == 1
+        repo.mark_unavailable(
+            schedule["id"], claimed[0]["claim_token"], now=due
+        )
+        old_schedules.append(schedule)
+
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "chat-available"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "message-current"
+
+    scheduler = DailyReviewScheduler(
+        schedules=repo,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+    )
+    now = datetime(2030, 1, 15, 14, 5, tzinfo=timezone.utc)
+    counts = asyncio.run(scheduler.run_once(now))
+
+    assert counts["sent"] == 1
+    assert len(sent) == 1
+    assert "2030-01-15" in str(sent[0][1])
+    assert all(repo.get(item["id"])["status"] == "expired" for item in old_schedules)
+
+
+def test_restart_shortly_after_midnight_catches_up_previous_day_once():
+    database = memory_database()
+    person = participant(database, "DR-CATCHUP")
+    repo = DailyReviewScheduleRepository(database)
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "chat-1"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "message-1"
+
+    scheduler = DailyReviewScheduler(
+        schedules=repo,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        catch_up_minutes=120,
+        validity_minutes=1440,
+    )
+    # 2030-01-16 00:05 Asia/Shanghai: the process missed Jan 15 at 22:00.
+    restart = datetime(2030, 1, 15, 16, 5, tzinfo=timezone.utc)
+    first = asyncio.run(scheduler.run_once(restart))
+    second = asyncio.run(scheduler.run_once(restart + timedelta(minutes=1)))
+
+    assert first["ensured"] == 1
+    assert first["sent"] == 1
+    assert second["sent"] == 0
+    assert len(sent) == 1
+    assert "2030-01-15" in str(sent[0][1])
+
+
+def test_yesterday_unavailable_card_sends_when_binding_recovers_within_validity():
+    database = memory_database()
+    person = participant(database, "DR-RECOVER-VALID")
+    repo = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = repo.ensure(person.id, date(2030, 1, 15), due)
+    claimed = repo.claim_due(due, 120)[0]
+    repo.mark_unavailable(
+        schedule["id"], claimed["claim_token"], now=due
+    )
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "restored-chat"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "restored-message"
+
+    scheduler = DailyReviewScheduler(
+        schedules=repo,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        catch_up_minutes=120,
+        validity_minutes=1440,
+    )
+    # 10:00 the following local day is outside creation catch-up but still
+    # inside the existing card's 24-hour delivery window.
+    recovered_at = datetime(2030, 1, 16, 2, 0, tzinfo=timezone.utc)
+    counts = asyncio.run(scheduler.run_once(recovered_at))
+
+    assert counts["ensured"] == 0
+    assert counts["sent"] == 1
+    assert len(sent) == 1
+    assert repo.get(schedule["id"])["status"] == "sent"
+
+
+def test_restart_after_catch_up_window_does_not_create_old_schedule():
+    database = memory_database()
+    person = participant(database, "DR-NO-LATE-CATCHUP")
+    repo = DailyReviewScheduleRepository(database)
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "chat-1"}
+
+    class Sender:
+        def send_card(self, *_args, **_kwargs):
+            raise AssertionError("no stale card should be sent")
+
+    scheduler = DailyReviewScheduler(
+        schedules=repo,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        catch_up_minutes=120,
+        validity_minutes=1440,
+    )
+    # 03:00 local time is outside the bounded two-hour catch-up window.
+    restart = datetime(2030, 1, 15, 19, 0, tzinfo=timezone.utc)
+    counts = asyncio.run(scheduler.run_once(restart))
+
+    assert counts == {
+        "ensured": 0,
+        "sent": 0,
+        "unavailable": 0,
+        "failed": 0,
+    }
+
+
 def test_daily_review_terminal_override_changes_next_day_revision_without_peak_state():
     resolver = ForecastInitialStateResolver()
     target = date(2030, 1, 16)

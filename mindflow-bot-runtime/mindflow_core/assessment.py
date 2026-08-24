@@ -25,7 +25,12 @@ except ModuleNotFoundError:
     from entity.user import User
 from services.event_lifecycle import prepare_event_instances
 from algorithm.dynamic_state_model import model_variant_metadata
-from settings.model_defaults import DEFAULT_EVENT_END, DEFAULT_EVENT_START
+from algorithm.time_utils import normalize_observation_to_model_step
+from settings.model_defaults import (
+    DEFAULT_EVENT_END,
+    DEFAULT_EVENT_START,
+    DEFAULT_TIME_STEP_MINUTES,
+)
 from utils.event_factory import EventFactory
 
 
@@ -55,24 +60,25 @@ class PredictionResult:
 
 
 class AssessmentModel:
-    MODEL_VERSION = "mindflow-ctssm-runtime-v5"
+    MODEL_VERSION = "mindflow-ctssm-runtime-v6"
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
 
-    def _observation_target_time(self, value: Any) -> str | None:
-        text = str(value or "").strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=self.timezone)
-        else:
-            parsed = parsed.astimezone(self.timezone)
-        return parsed.isoformat()
+    def _observation_target_time(
+        self,
+        value: Any,
+        *,
+        target_date: str,
+        step_minutes: int,
+    ) -> str | None:
+        aligned = normalize_observation_to_model_step(
+            value,
+            step_minutes=step_minutes,
+            target_date=target_date,
+            timezone_value=self.timezone,
+        )
+        return aligned.isoformat() if aligned is not None else None
 
     def predict(
         self,
@@ -96,6 +102,10 @@ class AssessmentModel:
                 **dict(parameters["ctssm_params"]),
             }
         user = User(user_id="runtime", params=dict(parameters), load_from_file=False)
+        time_step = int(
+            user.get_param("time_step", DEFAULT_TIME_STEP_MINUTES)
+            or DEFAULT_TIME_STEP_MINUTES
+        )
         model_family = str(user.get_param("model_family", "stress-ctssm.m0"))
         model_info = model_variant_metadata(model_family)
         active_states = tuple(str(value) for value in model_info["active_states"])
@@ -148,7 +158,11 @@ class AssessmentModel:
         for item in reversed(observations):
             if item.get("type") != "checkin":
                 continue
-            target_time = self._observation_target_time(item.get("observed_at"))
+            target_time = self._observation_target_time(
+                item.get("observed_at"),
+                target_date=target_date,
+                step_minutes=time_step,
+            )
             if target_time is None:
                 continue
             model_observations.append(

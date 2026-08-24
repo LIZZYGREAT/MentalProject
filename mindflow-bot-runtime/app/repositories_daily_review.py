@@ -29,8 +29,13 @@ class DailyReviewScheduleRepository:
 
     def ensure(
         self, participant_id: uuid.UUID, local_date: date, scheduled_at: datetime,
-        *, card_version: str = CARD_VERSION,
+        *, valid_until: datetime | None = None,
+        card_version: str = CARD_VERSION,
     ) -> dict[str, Any]:
+        scheduled = _aware(scheduled_at)
+        validity_end = _aware(valid_until or (scheduled + timedelta(days=1)))
+        if validity_end <= scheduled:
+            raise ValueError("valid_until must be after scheduled_at")
         try:
             with self.database.session() as session:
                 row = session.execute(select(DailyReviewSchedule).where(
@@ -43,8 +48,9 @@ class DailyReviewScheduleRepository:
                         participant_id=participant_id,
                         local_date=local_date,
                         card_version=card_version,
-                        scheduled_at=_aware(scheduled_at),
-                        next_attempt_at=_aware(scheduled_at),
+                        scheduled_at=scheduled,
+                        valid_until=validity_end,
+                        next_attempt_at=scheduled,
                     )
                     session.add(row)
                     session.flush()
@@ -58,23 +64,45 @@ class DailyReviewScheduleRepository:
                 )).scalar_one()
                 return self._view(row)
 
+    @staticmethod
+    def _expire(row: DailyReviewSchedule, now: datetime) -> None:
+        row.status = "expired"
+        row.next_attempt_at = None
+        row.claim_token = None
+        row.lease_until = None
+        row.last_error_code = "delivery_window_expired"
+        row.updated_at = now
+
     def reactivate_available(self, participant_id: uuid.UUID, now: datetime) -> None:
+        now = _aware(now)
         with self.database.session() as session:
             rows = session.execute(select(DailyReviewSchedule).where(
                 DailyReviewSchedule.participant_id == participant_id,
                 DailyReviewSchedule.status == "delivery_unavailable",
             )).scalars().all()
             for row in rows:
+                if _aware(row.valid_until) <= now:
+                    self._expire(row, now)
+                    continue
                 row.status = "pending"
-                row.next_attempt_at = _aware(now)
-                row.updated_at = _aware(now)
+                row.next_attempt_at = now
+                row.updated_at = now
 
     def claim_due(self, now: datetime, lease_seconds: int, limit: int = 100) -> list[dict[str, Any]]:
         now = _aware(now)
         claimed: list[dict[str, Any]] = []
         with self.database.session() as session:
+            expired = session.execute(select(DailyReviewSchedule).where(
+                DailyReviewSchedule.valid_until <= now,
+                DailyReviewSchedule.status.in_((
+                    "pending", "claimed", "delivery_unavailable"
+                )),
+            ).with_for_update()).scalars().all()
+            for row in expired:
+                self._expire(row, now)
             rows = session.execute(select(DailyReviewSchedule).where(
                 DailyReviewSchedule.scheduled_at <= now,
+                DailyReviewSchedule.valid_until > now,
                 or_(
                     DailyReviewSchedule.status == "pending",
                     (
@@ -182,6 +210,7 @@ class DailyReviewScheduleRepository:
             "id": str(row.id), "participant_id": str(row.participant_id),
             "local_date": row.local_date.isoformat(), "card_version": row.card_version,
             "scheduled_at": row.scheduled_at.isoformat(), "status": row.status,
+            "valid_until": row.valid_until.isoformat(),
             "attempt_count": row.attempt_count,
             "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
             "claim_token": str(row.claim_token) if row.claim_token else None,

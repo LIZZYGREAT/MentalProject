@@ -20,6 +20,21 @@ def _log_startup_phase(name: str) -> None:
     )
 
 
+def _should_start_daily_review_scheduler(
+    settings: Any, card_callback: Any
+) -> bool:
+    """Fail closed if an interactive Daily Review card cannot submit."""
+
+    if not bool(settings.daily_review_enabled):
+        return False
+    if card_callback is None:
+        logging.getLogger(__name__).error(
+            "daily_review_scheduler_disabled callback_unavailable"
+        )
+        return False
+    return True
+
+
 def _build_bot_transport(
     settings: Any,
     identity: Any,
@@ -302,6 +317,8 @@ async def run() -> None:
         retry_base_seconds=settings.daily_review_retry_base_seconds,
         max_attempts=settings.daily_review_max_attempts,
         claim_lease_seconds=settings.daily_review_claim_lease_seconds,
+        validity_minutes=settings.daily_review_validity_minutes,
+        catch_up_minutes=settings.daily_review_catch_up_minutes,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.
@@ -331,7 +348,7 @@ async def run() -> None:
         forecast_tasks = asyncio.create_task(
             scheduler.run_forever(), name="forecast-scheduler"
         )
-        if settings.daily_review_enabled:
+        if _should_start_daily_review_scheduler(settings, card_callback):
             daily_review_tasks = asyncio.create_task(
                 daily_review_scheduler.run_forever(), name="daily-review-scheduler"
             )

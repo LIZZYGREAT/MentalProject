@@ -28,6 +28,7 @@ from algorithm.dynamic_state_model import (
     stress_semantic_label,
     vitality_semantic_label,
 )
+from algorithm.time_utils import normalize_observation_to_model_step
 from algorithm.micro_dynamics import (
     MicroDynamicState,
     apply_micro_dynamics,
@@ -574,36 +575,36 @@ class Simulator:
                 or observation.get("target_time")
                 or ""
             ).strip()
-            if raw_time.endswith("Z"):
-                raw_time = raw_time[:-1] + "+00:00"
-            try:
-                observed_time = datetime.fromisoformat(raw_time)
-            except ValueError:
-                # Clock-only observations are intentionally rejected. An EMA
-                # must carry its calendar date so another day cannot reuse it.
+            observed_time = normalize_observation_to_model_step(
+                raw_time,
+                step_minutes=self.time_step,
+                target_date=base_date.date(),
+            )
+            if observed_time is None:
+                # Clock-only, cross-date, and after-last-grid observations are
+                # intentionally rejected instead of being moved backwards.
                 continue
-            if len(raw_time) >= 10 and raw_time[4] == "-" and raw_time[7] == "-":
-                key = observed_time.strftime("%Y-%m-%d %H:%M")
-                normalized_observation = dict(observation)
-                payload = observation.get("payload")
-                if isinstance(payload, dict):
-                    normalized_observation.update(payload)
-                if "stress" not in normalized_observation:
-                    normalized_observation["stress"] = normalized_observation.get(
-                        "stress_0_10"
-                    )
-                if "vitality" not in normalized_observation:
-                    normalized_observation["vitality"] = normalized_observation.get(
-                        "vitality_0_10",
-                        normalized_observation.get("energy_0_10"),
-                    )
-                if "perseverative_cognition" not in normalized_observation:
-                    normalized_observation["perseverative_cognition"] = (
-                        normalized_observation.get("perseverative_cognition_0_10")
-                    )
-                observations_by_time.setdefault(key, []).append(
-                    normalized_observation
+            key = observed_time.strftime("%Y-%m-%d %H:%M")
+            normalized_observation = dict(observation)
+            payload = observation.get("payload")
+            if isinstance(payload, dict):
+                normalized_observation.update(payload)
+            if "stress" not in normalized_observation:
+                normalized_observation["stress"] = normalized_observation.get(
+                    "stress_0_10"
                 )
+            if "vitality" not in normalized_observation:
+                normalized_observation["vitality"] = normalized_observation.get(
+                    "vitality_0_10",
+                    normalized_observation.get("energy_0_10"),
+                )
+            if "perseverative_cognition" not in normalized_observation:
+                normalized_observation["perseverative_cognition"] = (
+                    normalized_observation.get("perseverative_cognition_0_10")
+                )
+            observations_by_time.setdefault(key, []).append(
+                normalized_observation
+            )
 
         profiles: Dict[str, Dict] = {}
         for event in events:

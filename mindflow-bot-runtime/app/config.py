@@ -110,13 +110,15 @@ class Settings:
     warning_max_daily_sends: int = 2
     warning_min_interval_minutes: int = 240
     profile_calibration_enabled: bool = False
-    daily_review_enabled: bool = True
+    daily_review_enabled: bool = False
     daily_review_local_time: str = "22:00"
     daily_review_timezone: str = "Asia/Shanghai"
     daily_review_poll_interval_seconds: int = 60
     daily_review_retry_base_seconds: int = 60
     daily_review_max_attempts: int = 5
     daily_review_claim_lease_seconds: int = 120
+    daily_review_validity_minutes: int = 1440
+    daily_review_catch_up_minutes: int = 120
     observation_smoothing_window_minutes: int = 90
     retrospective_morning_sigma_minutes: float = 90.0
     retrospective_end_sigma_minutes: float = 60.0
@@ -359,7 +361,7 @@ class Settings:
             warning_max_daily_sends=_int(values, "WARNING_MAX_DAILY_SENDS", 2, minimum=0),
             warning_min_interval_minutes=_int(values, "WARNING_MIN_INTERVAL_MINUTES", 240, minimum=0),
             profile_calibration_enabled=_bool(values, "PROFILE_CALIBRATION_ENABLED", False),
-            daily_review_enabled=_bool(values, "DAILY_REVIEW_ENABLED", True),
+            daily_review_enabled=_bool(values, "DAILY_REVIEW_ENABLED", False),
             daily_review_local_time=values.get("DAILY_REVIEW_LOCAL_TIME", "22:00").strip(),
             daily_review_timezone=values.get(
                 "DAILY_REVIEW_TIMEZONE", "Asia/Shanghai"
@@ -373,6 +375,12 @@ class Settings:
             daily_review_max_attempts=_int(values, "DAILY_REVIEW_MAX_ATTEMPTS", 5),
             daily_review_claim_lease_seconds=_int(
                 values, "DAILY_REVIEW_CLAIM_LEASE_SECONDS", 120
+            ),
+            daily_review_validity_minutes=_int(
+                values, "DAILY_REVIEW_VALIDITY_MINUTES", 1440
+            ),
+            daily_review_catch_up_minutes=_int(
+                values, "DAILY_REVIEW_CATCH_UP_MINUTES", 120, minimum=0
             ),
             observation_smoothing_window_minutes=_int(
                 values, "OBSERVATION_SMOOTHING_WINDOW_MINUTES", 90
@@ -448,6 +456,10 @@ class Settings:
                 raise ValueError("FEISHU_CARD_CALLBACK_PATH must start with /")
             if self.feishu_card_callback_port > 65535:
                 raise ValueError("FEISHU_CARD_CALLBACK_PORT must be <= 65535")
+        if self.daily_review_enabled and not self.feishu_card_callback_enabled:
+            raise ValueError(
+                "DAILY_REVIEW_ENABLED requires FEISHU_CARD_CALLBACK_ENABLED=true"
+            )
         if self.app_env == "production" and not self.database_url.startswith(
             ("postgresql://", "postgresql+psycopg://")
         ):
@@ -492,6 +504,11 @@ class Settings:
             raise ValueError("DAILY_REVIEW_LOCAL_TIME must be HH:MM")
         if self.daily_review_end_state_gain > 1:
             raise ValueError("DAILY_REVIEW_END_STATE_GAIN must be <= 1")
+        if self.daily_review_catch_up_minutes > self.daily_review_validity_minutes:
+            raise ValueError(
+                "DAILY_REVIEW_CATCH_UP_MINUTES must be <= "
+                "DAILY_REVIEW_VALIDITY_MINUTES"
+            )
         if self.semantic_materiality_threshold > 1.0:
             raise ValueError("SEMANTIC_MATERIALITY_THRESHOLD must be <= 1")
         if self.response_segment_target_chars > self.response_segment_max_chars:

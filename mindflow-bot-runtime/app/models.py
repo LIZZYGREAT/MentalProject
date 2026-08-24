@@ -481,6 +481,7 @@ class DailyReviewSchedule(Base):
     local_date: Mapped[date] = mapped_column(Date, nullable=False)
     card_version: Mapped[str] = mapped_column(String(32), nullable=False)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -50,3 +50,8 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
     )
     assert migration_0010.down_revision == "0009_learned_model_profiles"
     assert len(migration_0010.revision) <= 32
+    migration_0014 = next(
+        migration for migration in migrations
+        if migration.revision == "0014_daily_review_expiry"
+    )
+    assert migration_0014.down_revision == "0013_daily_review_feedback"

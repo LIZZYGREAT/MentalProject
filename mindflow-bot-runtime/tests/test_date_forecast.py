@@ -287,6 +287,84 @@ def test_initial_state_resolver_clamps_terminal_values():
     assert resolved.vitality_0_10 == 0
 
 
+class _Retrospectives:
+    def __init__(self, source_version, stress=5.0, vitality=4.0, revision=1):
+        self.source_version = source_version
+        self.stress = stress
+        self.vitality = vitality
+        self.revision = revision
+
+    def latest(self, _participant_id, _local_date):
+        return {
+            "id": f"retro-{self.revision}",
+            "source_forecast_version": self.source_version,
+            "daily_review_revision": self.revision,
+            "analysis": {
+                "forward_terminal_state": {
+                    "stress_0_10": self.stress,
+                    "vitality_0_10": self.vitality,
+                }
+            },
+        }
+
+
+def _resolved_today_with_retrospective(source_version, *, forecast_version="v1"):
+    database, participant, _, coordinator = pipeline()
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    _save_forecast(
+        database,
+        participant.id,
+        today - timedelta(days=1),
+        forecast_version,
+        8.0,
+        2.5,
+    )
+    coordinator.retrospective_curves = _Retrospectives(source_version)
+    resolved = asyncio.run(
+        coordinator._resolve_initial_state(
+            participant.id,
+            today,
+            refresh_calendar=False,
+            effective_profile={},
+        )
+    )
+    return resolved
+
+
+def test_matching_retrospective_can_override_previous_terminal():
+    resolved = _resolved_today_with_retrospective("v1")
+
+    assert resolved.mode == "previous_day_daily_review"
+    assert resolved.model_override == {
+        "stress_0_10": 5.0,
+        "vitality_0_10": 4.0,
+    }
+
+
+def test_stale_retrospective_is_rejected_for_newer_previous_forecast(caplog):
+    resolved = _resolved_today_with_retrospective(
+        "v1", forecast_version="v2"
+    )
+
+    assert resolved.mode == "previous_day_forecast"
+    assert resolved.model_override == {
+        "stress_0_10": 8.0,
+        "vitality_0_10": 2.5,
+    }
+    assert "retrospective_terminal_override_stale" in caplog.text
+    assert "previous_forecast_version=v2" in caplog.text
+    assert "retrospective_source_forecast_version=v1" in caplog.text
+
+
+def test_rebuilt_retrospective_for_current_version_is_used():
+    resolved = _resolved_today_with_retrospective(
+        "v2", forecast_version="v2"
+    )
+
+    assert resolved.mode == "previous_day_daily_review"
+    assert resolved.source_retrospective_id == "retro-1"
+
+
 def test_pressure_curve_tool_has_optional_date_schema():
     tools = CareTools(None, None, None, None, None, None, "Asia/Shanghai")
     registry = ToolRegistry()

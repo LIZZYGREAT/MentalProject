@@ -1,6 +1,16 @@
 import asyncio
+from types import SimpleNamespace
 
 from app import main as app_main
+
+
+def test_daily_review_scheduler_fails_closed_without_callback():
+    disabled = SimpleNamespace(daily_review_enabled=False)
+    enabled = SimpleNamespace(daily_review_enabled=True)
+
+    assert app_main._should_start_daily_review_scheduler(disabled, object()) is False
+    assert app_main._should_start_daily_review_scheduler(enabled, None) is False
+    assert app_main._should_start_daily_review_scheduler(enabled, object()) is True
 
 
 def test_sigterm_during_gateway_start_still_cancels_start(monkeypatch):

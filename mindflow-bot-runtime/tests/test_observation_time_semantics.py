@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.repositories import ObservationRepository, ParticipantRepository
+from algorithm.time_utils import normalize_observation_to_model_step
 from helpers import memory_database
 from mindflow_core.assessment import AssessmentModel
 from tests.test_date_forecast import pipeline
@@ -27,6 +28,70 @@ def predict(local_day: date, observations):
         local_date=local_day.isoformat(),
         initial_state={"stress_0_10": 4.0, "vitality_0_10": 7.0},
     )
+
+
+def test_observation_grid_normalization_uses_causal_ceiling():
+    target = date(2026, 8, 21)
+    cases = {
+        datetime(2026, 8, 21, 10, 30, tzinfo=SHANGHAI): "10:30",
+        datetime(2026, 8, 21, 10, 31, tzinfo=SHANGHAI): "10:35",
+        datetime(2026, 8, 21, 14, 23, tzinfo=SHANGHAI): "14:25",
+        datetime(2026, 8, 21, 14, 24, 59, tzinfo=SHANGHAI): "14:25",
+    }
+
+    for observed_at, expected in cases.items():
+        aligned = normalize_observation_to_model_step(
+            observed_at,
+            step_minutes=5,
+            target_date=target,
+            timezone_value=SHANGHAI,
+        )
+        assert aligned is not None
+        assert aligned.strftime("%H:%M") == expected
+
+
+def test_non_grid_observation_is_assimilated_once_at_next_model_step():
+    target = date(2026, 8, 21)
+    result = predict(
+        target,
+        [checkin(datetime(2026, 8, 21, 14, 23, tzinfo=SHANGHAI))],
+    )
+
+    applied = [
+        point["time"]
+        for point in result.trajectory
+        if point["observation_assimilated"]
+    ]
+    assert applied == ["14:25"]
+
+
+def test_observation_after_last_daily_grid_is_not_moved_backwards():
+    target = date(2026, 8, 21)
+    observed_at = datetime(2026, 8, 21, 23, 58, tzinfo=SHANGHAI)
+
+    assert normalize_observation_to_model_step(
+        observed_at,
+        step_minutes=5,
+        target_date=target,
+        timezone_value=SHANGHAI,
+    ) is None
+    result = predict(target, [checkin(observed_at)])
+    assert not any(point["observation_assimilated"] for point in result.trajectory)
+
+
+def test_utc_observation_is_aligned_after_business_timezone_conversion():
+    target = date(2026, 8, 21)
+    result = predict(
+        target,
+        [checkin(datetime(2026, 8, 21, 6, 23, 40, tzinfo=timezone.utc))],
+    )
+
+    applied = [
+        point["time"]
+        for point in result.trajectory
+        if point["observation_assimilated"]
+    ]
+    assert applied == ["14:25"]
 
 
 def test_repository_filters_by_business_local_date_and_as_of():
