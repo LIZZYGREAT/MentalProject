@@ -36,6 +36,8 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
+<!-- BUSINESS_TOOL_COUNT: 13 -->
+
 ## 十三个业务 Tool
 
 1. `care_get_today_context`
@@ -88,8 +90,9 @@ LLM，而由固定后端 action allowlist 处理。
 不要保留旧的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BOT_HISTORY_LIMIT`、
 `AGENT_MAX_TOOL_STEPS` 或 Direct API retry 配置。
 
-旧 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 仅作为已有单 App 部署的临时兼容
-回退，不再是推荐配置。Calendar credential 若显式配置，ID 与 Secret 必须同时提供。
+Bot credential 必须使用 `FEISHU_BOT_APP_ID` / `FEISHU_BOT_APP_SECRET`，缺失时
+Runtime 会拒绝启动。Calendar credential 若显式配置，ID 与 Secret 必须同时提供；
+两项都留空时复用 Bot credential。
 
 测试阶段的身份关系是：Lizzy 下的 `open_id` 只用于 Bot binding，“喵学姐”只负责
 Calendar OAuth。`open_id` 是 App-scoped identity，不能跨 App join；MindFlow 内部统一
@@ -198,8 +201,8 @@ python -c "from getpass import getpass; from app.admin_web.auth import hash_pass
 
 诊断时查看 BotEvent telemetry 的 `presentation_agent_outcome`，可区分
 `skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
-`cleanup_backpressure` 和 `used`。详细复验步骤见
-[`MindFlow_P3A_Performance_Issue.md`](../docs/MindFlow_P3A_Performance_Issue.md)。
+`cleanup_backpressure` 和 `used`。当前运行边界、模型版本和各持久化链路统一见
+[`CURRENT_ARCHITECTURE.md`](../docs/CURRENT_ARCHITECTURE.md)。
 
 ## 自动验证
 
@@ -215,7 +218,7 @@ Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以�
 1. `FeishuChannel` 长连接稳定，bot restart count 为 0；
 2. 容器内 Claude Agent SDK 能通过 DeepSeek 返回结果；
 3. 连续消息按 participant 排队，`/stop` 能中断 active turn；
-4. 六个 MCP Tool 真实调用、审计和身份隔离正确；
+4. 十三个 MCP Tool 真实调用、审计和身份隔离正确；
 5. container recreate 后 session resume、pending reply 和 OAuth Token 均可恢复；
 6. 日志不含 Secret、Token、完整 Prompt 或 MCP 身份上下文。
 
