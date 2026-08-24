@@ -14,11 +14,14 @@ import hashlib
 import re
 from typing import Any, Iterable, Mapping, Optional
 
-from entry.class_info_data import CLASS_INFO_DICT
-from settings.event_routing import COURSE_HINT_PATTERN, ROUTINE_PATTERNS, TASK_PATTERNS
+from services.event_classifier import (
+    COMPLETION_RELEVANT_POLICIES,
+    classify_event,
+    completion_policy,
+)
 
 
-EVENT_SCHEMA_VERSION = "event_instance.v2"
+EVENT_SCHEMA_VERSION = "event_instance.v3"
 OUTCOME_SCHEMA_VERSION = "event_outcome.v1"
 
 CONFIRMED_COMPLETED = {"confirmed_completed", "completed", "done"}
@@ -28,16 +31,6 @@ CONFIRMED_INCOMPLETE = {
     "partial",
     "rescheduled",
 }
-COMPLETION_RELEVANT_POLICIES = {"work_session", "deliverable", "progress"}
-
-_COURSE_ALIASES = re.compile(
-    r"^(?:高数|高等数学|线代|线性代数|离散数学|概率论|大学英语|英语课)$",
-    flags=re.IGNORECASE,
-)
-_WORK_VERBS = re.compile(
-    r"完成|写|做|改|赶|准备|复习|预习|整理|制作|修改|推进|finish|write|prepare|review",
-    flags=re.IGNORECASE,
-)
 _SUBMISSION_WORDS = re.compile(
     r"交作业|提交|上交|截止|ddl|deadline|due|答辩|汇报",
     flags=re.IGNORECASE,
@@ -96,64 +89,6 @@ def _due_date(text: str, target_date: str) -> Optional[date]:
     return None
 
 
-def _classify(summary: str, description: str, explicit_type: str, explicit_task: str) -> tuple[str, str, str]:
-    title = summary.casefold()
-    combined = f"{summary} {description}".casefold()
-    explicit_type = explicit_type.casefold()
-    explicit_task = explicit_task.casefold()
-    if explicit_type in {"rest", "meal", "nap", "sleep", "gym", "library"}:
-        return explicit_type, explicit_task or "general", explicit_type
-    if explicit_type == "course":
-        return "course", "course", "course_session"
-    if explicit_type == "task" and explicit_task:
-        kind = "work_session" if explicit_task in {"homework", "ddl", "general"} else explicit_task
-        return "task", explicit_task, kind
-
-    for routine_type, pattern in ROUTINE_PATTERNS.items():
-        if re.search(pattern, title):
-            mapped = "nap" if routine_type == "nap" else routine_type
-            return mapped, "general", mapped
-
-    has_work_verb = bool(_WORK_VERBS.search(combined))
-    if not has_work_verb and (
-        summary in CLASS_INFO_DICT
-        or _COURSE_ALIASES.search(summary)
-        or re.search(COURSE_HINT_PATTERN, title)
-    ):
-        return "course", "course", "course_session"
-    if re.search(TASK_PATTERNS["exam"], title):
-        return "task", "exam", "exam"
-    if has_work_verb and re.search(r"作业|报告|论文|项目|实验|代码|算法|复习|课程", combined):
-        return "task", "homework", "work_session"
-    if re.search(TASK_PATTERNS["ddl"], title):
-        return "task", "ddl", "deadline"
-    if re.search(TASK_PATTERNS["meeting"], title):
-        return "task", "meeting", "meeting"
-    if re.search(TASK_PATTERNS["homework"], title):
-        return "task", "homework", "work_session"
-    return "task", "general", "work_session" if has_work_verb else "general_task"
-
-
-def _completion_policy(event_kind: str, task_type: str) -> str:
-    if event_kind in {
-        "course_session",
-        "meeting",
-        "exam",
-        "rest",
-        "meal",
-        "nap",
-        "sleep",
-        "gym",
-        "library",
-    }:
-        return "none"
-    if event_kind == "deadline" or task_type == "ddl":
-        return "deliverable"
-    if event_kind == "work_session":
-        return "work_session"
-    return "progress"
-
-
 def prepare_event_instances(
     raw_events: Iterable[Mapping[str, Any]],
     target_date: str,
@@ -171,17 +106,24 @@ def prepare_event_instances(
         if not summary:
             continue
         description = _text(item.get("description"), 800)
-        event_type, task_type, event_kind = _classify(
+        classified = classify_event(
             summary,
             description,
             _text(item.get("event_type"), 32),
             _text(item.get("task_type") or item.get("level"), 32),
         )
+        classification = dict(classified.pop("classification"))
+        classified_metadata = dict(classified.pop("metadata", {}))
+        event_type = str(classified["event_type"])
+        task_type = str(classified["task_type"])
+        event_kind = str(classified.pop("event_kind"))
         event_id = _stable_event_id(item, target_date)
         combined = f"{summary} {description}"
         due = _due_date(combined, target_date)
-        policy = _completion_policy(event_kind, task_type)
+        policy = completion_policy(event_kind, task_type)
         metadata = dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), Mapping) else {}
+        metadata.update(classified_metadata)
+        metadata["classification"] = classification
         obligation = None
         if due or _SUBMISSION_WORDS.search(combined):
             obligation_seed = f"{summary.casefold()}|{due.isoformat() if due else 'unknown'}"
@@ -206,6 +148,7 @@ def prepare_event_instances(
         }
         metadata["lifecycle"] = lifecycle
         metadata["task_type"] = task_type
+        item.update(classified)
         item.update(
             {
                 "id": event_id,

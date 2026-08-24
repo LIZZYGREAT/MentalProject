@@ -56,6 +56,16 @@ URL 字段。身份只来自冻结的 `AgentContext`。工具生命周期统一�
 持久化版本化 `ForecastSnapshot`，然后基于当前快照协调 Warning。旧 Markov、RK4、策略栈
 和 SQLite 语义推理引擎不在运行路径中。
 
+日历事件先经过确定性分类与本地课程目录检索。本地 resolver 基于生成的课程目录、受审查
+的缩写别名和有界 Top-K 候选工作；显式类型、固定日常规则和精确课程匹配优先于外部语义
+判断。课程相关作业、复习和考试仍是 task，只记录 related course。需要外部增强时，事件
+分类、候选内课程选择和客观语义由同一次调用返回并进入同一版本化缓存；候选外课程会被
+拒绝。缓存指纹包含事件、候选集、课程目录 revision、resolver、schema、prompt 和模型版本。
+
+最终分类在生命周期和模型语义计算前完成。每个新 Forecast 的 `output_json` 都持久化
+`classified_calendar_events` 以及分类、课程目录和语义版本，因此当前压力曲线、Warning、
+Admin 和历史曲线复用同一份事件事实；历史展示不使用当前规则重新解释旧日历标题。
+
 ## Observation
 
 即时 check-in 只允许通过受控卡片动作或 `care_record_checkin` 写入。仓储以参与者、来源和

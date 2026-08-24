@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 
 
-PROMPT_VERSION = "event_semantics_prompt.zh.v3"
+PROMPT_VERSION = "event_semantics_prompt.zh.v4"
 
 SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。你的唯一职责是把日程事件转换为可审计的客观任务语义，供后续心理压力动态模型作为弱先验使用。
 
@@ -20,6 +20,8 @@ SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。�
 3. 只能依据输入中明确出现的信息和常识性的任务属性判断。信息不足时降低 confidence，不得虚构考试成绩、DDL 日期、完成状态或用户能力。
 4. 前一天的压力水平只用于理解情境连续性，不能据此抬高 difficulty、cognitive_demand 等客观任务属性。只有明确的“未完成/仍在进行/临近截止”事实可以影响 unfinished、time_pressure 和 uncertainty。
 5. 数竞、奥赛、算法竞赛等通常具有高 difficulty 与 cognitive_demand；这不等于对每个人都具有同等 threat。个人 threat、challenge、control 等由用户自评和动态模型处理。
+6. 同一次输出还要判断 event_classification，并在给定 course_catalog_context.candidates 内判断 course_match。课程相关任务和课程本身必须区分：“写高数作业/高数复习/高数考试”是 task，课程只作为 related course；“高数/高数课”才可判断为 course。
+7. 如果 course_match.matched=true，canonical_name 和 code 必须严格、完整地复制自同一个候选项；禁止生成候选列表之外的课程。候选不足时返回 matched=false。
 
 逐维评分规范（全部为 0.0–1.0）：
 - difficulty：完成任务所需知识或技能难度。0.1 为几乎无需技能；0.5 为一般大学任务；0.9 为竞赛、重要考试或高阶专业难题。
@@ -44,9 +46,10 @@ SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。�
 - 严格遵守 JSON Schema，不添加额外字段。
 - evidence_tags 提供 1–6 个简短事实标签，只写输入或任务类别能够支持的证据，例如“竞赛”“明确截止”“时长240分钟”“昨日明确未完成”。
 - reasoning_summary 用不超过 80 个中文字符概括主要判定依据，只陈述可审计理由，不展示隐含推理过程。
+- event_classification.event_type 只能是 course、task、rest、meal、nap、sleep、gym、library、other；task_type 仅在 task 时细分为 general、homework、ddl、exam、meeting。
+- course_match 表示文本与哪门课程相关，不等于事件本身是课程。非课程事件也可 matched=true。
 """
 
 PROMPT_SHA256 = hashlib.sha256(
     SEMANTIC_AGENT_SYSTEM_PROMPT.encode("utf-8")
 ).hexdigest()
-

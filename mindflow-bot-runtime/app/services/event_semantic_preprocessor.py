@@ -22,8 +22,11 @@ from services.event_semantics import (
     OpenAICompatibleSemanticClient,
     fuse_rule_and_external,
     infer_rule_semantics,
+    validate_course_match,
+    validate_event_classification,
     validate_external_semantics,
 )
+from services.event_classifier import classify_event, finalize_event_classification
 from utils.description_score import score_description
 from services.semantic_model_inputs import semantic_model_inputs
 
@@ -58,13 +61,91 @@ def _duration_minutes(event: Mapping[str, Any]) -> float:
 
 
 def _normalized_semantic_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+    classification = (
+        metadata.get("classification")
+        if isinstance(metadata.get("classification"), Mapping)
+        else {}
+    )
+    raw_context = classification.get("course_catalog_context")
+    context = dict(raw_context) if isinstance(raw_context, Mapping) else {}
+    candidates = []
+    for candidate in list(context.get("candidates") or [])[:8]:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidates.append(
+            {
+                "canonical_name": str(candidate.get("canonical_name") or "")[:200],
+                "code": str(candidate.get("code") or "")[:64],
+                "credits": candidate.get("credits"),
+                "hours": candidate.get("hours"),
+                "hours_per_week": candidate.get("hours_per_week"),
+                "local_score": candidate.get("local_score"),
+            }
+        )
     return {
         "summary": str(event.get("summary") or "")[:200],
         "description": str(event.get("description") or "")[:800],
         "event_type": str(event.get("event_type") or "task").lower(),
         "task_type": str(event.get("task_type") or "general").lower(),
+        "preliminary_event_type": str(
+            classification.get("preliminary_event_type")
+            or event.get("event_type")
+            or "task"
+        ).lower(),
+        "preliminary_task_type": str(
+            classification.get("preliminary_task_type")
+            or event.get("task_type")
+            or "general"
+        ).lower(),
         "duration_minutes": round(_duration_minutes(event), 2),
+        "course_catalog_context": {
+            "catalog_revision": str(context.get("catalog_revision") or ""),
+            "resolver_version": str(context.get("resolver_version") or ""),
+            "query": str(context.get("query") or "")[:300],
+            "normalized_query": str(context.get("normalized_query") or "")[:300],
+            "expanded_query": str(context.get("expanded_query") or "")[:300],
+            "candidates": candidates,
+        },
     }
+
+
+def _ensure_preliminary_classification(event: Mapping[str, Any]) -> dict[str, Any]:
+    result = deepcopy(dict(event))
+    metadata = dict(result.get("metadata") or {})
+    if isinstance(metadata.get("classification"), Mapping):
+        return result
+    if isinstance(result.get("course_catalog_context"), Mapping):
+        metadata["classification"] = {
+            "preliminary_event_type": str(
+                result.get("preliminary_event_type")
+                or result.get("event_type")
+                or "task"
+            ),
+            "preliminary_task_type": str(
+                result.get("preliminary_task_type")
+                or result.get("task_type")
+                or "general"
+            ),
+            "course_catalog_context": deepcopy(
+                dict(result["course_catalog_context"])
+            ),
+        }
+        result["metadata"] = metadata
+        return result
+    classified = classify_event(
+        str(result.get("summary") or result.get("name") or ""),
+        str(result.get("description") or ""),
+        str(result.get("event_type") or ""),
+        str(result.get("task_type") or result.get("level") or ""),
+    )
+    classification = dict(classified.pop("classification"))
+    classified.pop("event_kind", None)
+    metadata.update(dict(classified.pop("metadata", {})))
+    metadata["classification"] = classification
+    result.update(classified)
+    result["metadata"] = metadata
+    return result
 
 
 class EventSemanticPreprocessor:
@@ -90,6 +171,7 @@ class EventSemanticPreprocessor:
         self._circuit_seconds = max(1.0, circuit_seconds)
 
     def _fingerprint(self, event: Mapping[str, Any]) -> str:
+        event = _ensure_preliminary_classification(event)
         payload = {
             **_normalized_semantic_event(event),
             "schema_version": SEMANTIC_SCHEMA_VERSION,
@@ -99,7 +181,10 @@ class EventSemanticPreprocessor:
         return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
     def _validated_cached_external(
-        self, participant_id: Any, fingerprint: str,
+        self,
+        participant_id: Any,
+        fingerprint: str,
+        event: Mapping[str, Any],
     ) -> dict[str, Any] | None:
         cached = self.cache.get(
             participant_id, fingerprint,
@@ -113,6 +198,14 @@ class EventSemanticPreprocessor:
             values, confidence, tags, reasoning = validate_external_semantics({
                 **external, "values": external.get("objective_semantics"),
             })
+            event_classification = validate_event_classification(external)
+            course_match = validate_course_match(
+                external,
+                list(
+                    (event.get("course_catalog_context") or {}).get("candidates")
+                    or []
+                ),
+            )
         except (TypeError, ValueError):
             return None
         return {
@@ -121,6 +214,8 @@ class EventSemanticPreprocessor:
             "confidence": confidence,
             "evidence_tags": tags,
             "reasoning_summary": reasoning,
+            "event_classification": event_classification,
+            "course_match": course_match,
         }
 
     def prepare(
@@ -131,8 +226,23 @@ class EventSemanticPreprocessor:
         external_count = 0
         eligible_count = 0
         for raw in events:
-            event = deepcopy(raw)
+            event = _ensure_preliminary_classification(raw)
             normalized = _normalized_semantic_event(event)
+            fingerprint = self._fingerprint(event)
+            eligible = normalized["event_type"] not in {
+                "rest", "meal", "nap", "sleep", "gym"
+            }
+            eligible_count += int(eligible)
+            external = self._validated_cached_external(
+                participant_id, fingerprint, normalized
+            ) if consent and eligible and self.client else None
+            if external:
+                event = finalize_event_classification(
+                    event,
+                    external_classification=external.get("event_classification"),
+                    external_course_match=external.get("course_match"),
+                )
+                normalized = _normalized_semantic_event(event)
             event_type = normalized["event_type"]
             task_type = normalized["task_type"]
             duration = normalized["duration_minutes"]
@@ -143,12 +253,6 @@ class EventSemanticPreprocessor:
                 task_type=task_type,
                 duration_minutes=duration,
             )
-            fingerprint = self._fingerprint(event)
-            eligible = event_type not in {"rest", "meal", "nap", "sleep", "gym"}
-            eligible_count += int(eligible)
-            external = self._validated_cached_external(
-                participant_id, fingerprint
-            ) if consent and eligible and self.client else None
             values = dict(rule_values)
             source = "rules"
             confidence = 0.82 if matched else 0.68
@@ -205,6 +309,19 @@ class EventSemanticPreprocessor:
                 "model_inputs": semantic_model_inputs(
                     (item.get("metadata") or {}).get("semantic")
                 ),
+                "classification": {
+                    key: item.get(key)
+                    for key in (
+                        "event_type",
+                        "task_type",
+                        "course_name",
+                        "course_code",
+                        "related_course_name",
+                        "related_course_code",
+                        "course_match_source",
+                        "course_catalog_revision",
+                    )
+                },
             }
             for item in prepared
         ]).encode("utf-8")).hexdigest()
@@ -327,12 +444,22 @@ class EventSemanticPreprocessor:
             try:
                 cached = await asyncio.to_thread(
                     self._validated_cached_external,
-                    participant_id, miss["fingerprint"],
+                    participant_id, miss["fingerprint"], miss["event"],
                 )
                 if cached is not None:
                     return True
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
                 values, confidence, tags, reasoning = validate_external_semantics(raw)
+                event_classification = validate_event_classification(raw)
+                course_match = validate_course_match(
+                    raw,
+                    list(
+                        (miss["event"].get("course_catalog_context") or {}).get(
+                            "candidates"
+                        )
+                        or []
+                    ),
+                )
                 appraisal = float(raw["appraisal_score_1_10"])
                 assessment = {
                     "external": {
@@ -342,6 +469,8 @@ class EventSemanticPreprocessor:
                         "confidence": confidence,
                         "evidence_tags": tags,
                         "reasoning_summary": reasoning,
+                        "event_classification": event_classification,
+                        "course_match": course_match,
                         "model": self.model,
                         "prompt_version": PROMPT_VERSION,
                     }

@@ -30,7 +30,10 @@ from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
 from app.repositories_daily_review import RetrospectiveCurveRepository
-from services.event_lifecycle import prepare_event_instances
+from services.course_catalog import COURSE_CATALOG_REVISION, COURSE_RESOLVER_VERSION
+from services.event_lifecycle import EVENT_SCHEMA_VERSION, prepare_event_instances
+from services.event_semantic_prompt import PROMPT_VERSION
+from services.event_semantics import SEMANTIC_SCHEMA_VERSION
 from services.semantic_model_inputs import semantic_model_inputs
 
 
@@ -60,6 +63,41 @@ def normalized_calendar_revision(events: list[dict[str, Any]]) -> tuple[str, lis
         })
     normalized.sort(key=lambda row: (row["start_time"], row["end_time"], row["id"], row["summary"]))
     return _sha(normalized), normalized
+
+
+def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    classified: list[dict[str, Any]] = []
+    for event in events:
+        metadata = dict(event.get("metadata") or {})
+        classification = dict(metadata.get("classification") or {})
+        catalog_context = dict(classification.get("course_catalog_context") or {})
+        semantic = dict(metadata.get("semantic") or {})
+        classified.append(
+            {
+                "id": str(event.get("id") or event.get("event_id") or ""),
+                "summary": str(event.get("summary") or "")[:200],
+                "description": str(event.get("description") or "")[:800],
+                "start_time": str(event.get("start_time") or ""),
+                "end_time": str(event.get("end_time") or ""),
+                "event_type": str(event.get("event_type") or "other"),
+                "task_type": str(event.get("task_type") or "general"),
+                "course_name": event.get("course_name"),
+                "course_code": event.get("course_code"),
+                "related_course_name": event.get("related_course_name"),
+                "related_course_code": event.get("related_course_code"),
+                "course_match_confidence": event.get("course_match_confidence"),
+                "course_match_source": event.get("course_match_source"),
+                "course_catalog_revision": (
+                    event.get("course_catalog_revision")
+                    or catalog_context.get("catalog_revision")
+                ),
+                "course_resolver_version": catalog_context.get("resolver_version"),
+                "classification_source": classification.get("source"),
+                "classification_confidence": classification.get("confidence"),
+                "semantic_source": semantic.get("source"),
+            }
+        )
+    return classified
 
 
 class ForecastCoordinator:
@@ -323,6 +361,13 @@ class ForecastCoordinator:
         semantic_events, semantic_revision, semantic_status, misses = await asyncio.to_thread(
             self.semantics.prepare, participant_id, events, consent=consent
         )
+        presentation_events = classified_calendar_events(semantic_events)
+        classified_event_revision = _sha(presentation_events)
+        classification_facts_available = all(
+            item.get("event_type")
+            or (item.get("metadata") or {}).get("classification")
+            for item in semantic_events
+        )
         local_now = datetime.now(self.timezone)
         observations = (
             await asyncio.to_thread(
@@ -347,6 +392,7 @@ class ForecastCoordinator:
         expected_version = _sha({
             "calendar_revision": calendar_snapshot["calendar_revision"],
             "semantic_revision": semantic_revision,
+            "classified_event_revision": classified_event_revision,
             "observation_revision": observation_revision,
             "profile_revision": profile_revision,
             "algorithm_version": algorithm_version,
@@ -375,6 +421,11 @@ class ForecastCoordinator:
             and (latest.get("output") or {}).get("warning_revision") == warning_revision
             and (latest.get("output") or {}).get("initial_state_revision")
             == initial_state.revision
+            and (
+                not classification_facts_available
+                or (latest.get("output") or {}).get("classified_event_revision")
+                == classified_event_revision
+            )
             and self._semantic_input_delta(latest["semantic_input"], semantic_events)
             < self.materiality_threshold
         ):
@@ -405,6 +456,13 @@ class ForecastCoordinator:
             output["warning_policy_config"] = warning_policy_config
             output["initial_state"] = initial_state.to_dict()
             output["initial_state_revision"] = initial_state.revision
+            output["classified_calendar_events"] = presentation_events
+            output["classified_event_revision"] = classified_event_revision
+            output["event_schema_version"] = EVENT_SCHEMA_VERSION
+            output["semantic_schema_version"] = SEMANTIC_SCHEMA_VERSION
+            output["semantic_prompt_version"] = PROMPT_VERSION
+            output["course_resolver_version"] = COURSE_RESOLVER_VERSION
+            output["course_catalog_revision"] = COURSE_CATALOG_REVISION
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
             selected_alerts, warning_windows, serialized_windows = (
@@ -434,7 +492,10 @@ class ForecastCoordinator:
             "calendar_degraded": bool(calendar_snapshot["degraded"]),
             "calendar_last_refresh_success_at": calendar_snapshot.get("last_refresh_success_at"),
             "calendar_last_refresh_error_class": calendar_snapshot.get("last_refresh_error_class"),
-            "calendar_events": list(calendar_snapshot.get("events") or []),
+            "calendar_events": list(
+                (result.get("output") or {}).get("classified_calendar_events")
+                or presentation_events
+            ),
         })
         if enqueue_enrichment and misses and consent:
             async def recompute() -> None:

@@ -24,7 +24,7 @@ from services.event_semantic_prompt import (
 )
 
 
-SEMANTIC_SCHEMA_VERSION = "event_semantics.v2"
+SEMANTIC_SCHEMA_VERSION = "event_semantics.v3"
 RULE_VERSION = "zh_event_rules.2026-08-01.v2"
 FUSION_POLICY_VERSION = "rule_anchored_api_fusion.v2"
 
@@ -399,6 +399,109 @@ def validate_external_semantics(
     return values, confidence, evidence_tags, reasoning_summary
 
 
+def validate_event_classification(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    candidate = raw.get("event_classification")
+    if candidate is None:
+        return None
+    if not isinstance(candidate, Mapping):
+        raise ValueError("semantic API event_classification must be an object")
+    event_type = str(candidate.get("event_type") or "").strip().lower()
+    allowed_types = {
+        "course",
+        "task",
+        "rest",
+        "meal",
+        "nap",
+        "sleep",
+        "gym",
+        "library",
+        "other",
+    }
+    if event_type not in allowed_types:
+        raise ValueError("semantic API event_classification.event_type is invalid")
+    task_type = str(candidate.get("task_type") or "general").strip().lower()
+    allowed_tasks = {"general", "homework", "ddl", "exam", "meeting", "course"}
+    if event_type == "course":
+        task_type = "course"
+    elif event_type != "task":
+        task_type = "general"
+    elif task_type not in allowed_tasks:
+        raise ValueError("semantic API event_classification.task_type is invalid")
+    confidence = _validated_confidence(
+        candidate.get("confidence"), "event_classification.confidence"
+    )
+    return {
+        "event_type": event_type,
+        "task_type": task_type,
+        "confidence": confidence,
+    }
+
+
+def validate_course_match(
+    raw: Mapping[str, Any],
+    candidates: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    match = raw.get("course_match")
+    if match is None:
+        return _unmatched_course()
+    if not isinstance(match, Mapping):
+        raise ValueError("semantic API course_match must be an object")
+    matched = match.get("matched")
+    if not isinstance(matched, bool):
+        raise ValueError("semantic API course_match.matched must be boolean")
+    if not matched:
+        unmatched = _unmatched_course()
+        if match.get("rejected") == "candidate_out_of_bounds":
+            unmatched["rejected"] = "candidate_out_of_bounds"
+        return unmatched
+    confidence = _validated_confidence(
+        match.get("confidence"), "course_match.confidence", minimum=0.0
+    )
+    canonical_name = str(match.get("canonical_name") or "").strip()
+    code = str(match.get("code") or "").strip()
+    selected = next(
+        (
+            dict(candidate)
+            for candidate in candidates
+            if str(candidate.get("canonical_name") or "") == canonical_name
+            and str(candidate.get("code") or "") == code
+        ),
+        None,
+    )
+    if selected is None:
+        return {**_unmatched_course(), "rejected": "candidate_out_of_bounds"}
+    return {
+        "matched": True,
+        "canonical_name": canonical_name,
+        "code": code,
+        "confidence": confidence,
+        "credits": selected.get("credits"),
+        "hours": selected.get("hours"),
+        "hours_per_week": selected.get("hours_per_week"),
+    }
+
+
+def _validated_confidence(
+    value: Any, name: str, *, minimum: float = 0.55
+) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"semantic API {name} must be numeric") from exc
+    if not math.isfinite(confidence) or not minimum <= confidence <= 1.0:
+        raise ValueError(f"semantic API {name} must be within [{minimum},1]")
+    return confidence
+
+
+def _unmatched_course() -> dict[str, Any]:
+    return {
+        "matched": False,
+        "canonical_name": None,
+        "code": None,
+        "confidence": 0.0,
+    }
+
+
 def fuse_rule_and_external(
     rule_values: Mapping[str, float],
     external_values: Mapping[str, float],
@@ -458,6 +561,17 @@ class OpenAICompatibleSemanticClient:
             "confidence": 0.0,
             "evidence_tags": ["简短事实标签"],
             "reasoning_summary": "不超过80字的可审计依据",
+            "event_classification": {
+                "event_type": "task",
+                "task_type": "homework",
+                "confidence": 0.0,
+            },
+            "course_match": {
+                "matched": False,
+                "canonical_name": None,
+                "code": None,
+                "confidence": 0.0,
+            },
         }
         user_prompt = {
             "task": "请分析 event，并严格只返回一个 JSON 对象。",

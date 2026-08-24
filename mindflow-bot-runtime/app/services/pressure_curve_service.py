@@ -64,13 +64,22 @@ class PressureCurveService:
             forecast = {
                 **forecast,
                 "calendar_events": list(
-                    (calendar_snapshot or {}).get("events") or []
+                    (forecast.get("output") or {}).get(
+                        "classified_calendar_events"
+                    )
+                    or (calendar_snapshot or {}).get("events")
+                    or []
                 ),
                 "calendar_degraded": bool(
                     (forecast.get("output") or {}).get("calendar_degraded")
                 ),
             }
-            if not matching_calendar:
+            if (
+                not (forecast.get("output") or {}).get(
+                    "classified_calendar_events"
+                )
+                and not matching_calendar
+            ):
                 forecast["calendar_events"] = []
         else:
             forecast = await self.coordinator.ensure_forecast(
