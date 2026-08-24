@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Protocol
@@ -55,6 +56,7 @@ class ProductionPresentationAgent:
         opus_model: str,
         sonnet_model: str,
         haiku_model: str,
+        disconnect_timeout_seconds: float = 0.5,
     ):
         self.workdir = Path(workdir)
         self.model = str(model)
@@ -63,6 +65,10 @@ class ProductionPresentationAgent:
         self.opus_model = str(opus_model)
         self.sonnet_model = str(sonnet_model)
         self.haiku_model = str(haiku_model)
+        self.disconnect_timeout_seconds = max(
+            0.05, float(disconnect_timeout_seconds)
+        )
+        self._disconnect_cleanups: set[asyncio.Task[None]] = set()
 
     def _environment(self) -> dict[str, str]:
         return {
@@ -119,10 +125,7 @@ class ProductionPresentationAgent:
                 if isinstance(message, sdk.ResultMessage):
                     result_message = message
         finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await self._disconnect_bounded(client)
         if result_message is None or result_message.is_error:
             raise ValueError("presentation agent returned no successful result")
         payload = json.loads(str(result_message.result or ""))
@@ -131,3 +134,40 @@ class ProductionPresentationAgent:
             raise ValueError("presentation agent result has no segments")
         return tuple(str(item) for item in segments)
 
+    async def _disconnect_bounded(self, client: object) -> None:
+        """Do not let SDK process cleanup extend the user-visible deadline."""
+
+        try:
+            task = asyncio.create_task(
+                client.disconnect(), name="presentation-agent-disconnect"
+            )
+        except Exception:
+            return
+        self._disconnect_cleanups.add(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            self._disconnect_cleanups.discard(done)
+            if getattr(done, "cancelled", lambda: False)():
+                return
+            try:
+                done.exception()
+            except BaseException:
+                pass
+
+        task.add_done_callback(finished)
+        try:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=self.disconnect_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if task not in done:
+            task.cancel()
+
+    async def close(self) -> None:
+        tasks = set(self._disconnect_cleanups)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=self.disconnect_timeout_seconds)

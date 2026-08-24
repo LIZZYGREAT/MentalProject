@@ -209,6 +209,23 @@ def test_bot_validation_is_not_coupled_to_admin_credentials():
         settings.validate_admin()
 
 
+def test_presentation_agent_performance_policy_defaults_and_validation():
+    environment = valid_environment()
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.presentation_agent_mode == "adaptive"
+    assert settings.presentation_agent_timeout_seconds == 4.0
+    assert settings.presentation_agent_disconnect_timeout_seconds == 0.5
+    assert settings.presentation_agent_max_pending_cleanups == 1
+
+    environment["PRESENTATION_AGENT_MODE"] = "invalid"
+    with pytest.raises(ValueError, match="PRESENTATION_AGENT_MODE"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
 def test_admin_validation_fails_closed_when_disabled_or_misconfigured():
     environment = valid_environment()
     environment.update(

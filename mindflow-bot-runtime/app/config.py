@@ -79,8 +79,11 @@ class Settings:
     response_segment_max_chars: int = 650
     response_max_segments: int = 3
     presentation_agent_enabled: bool = True
+    presentation_agent_mode: str = "adaptive"
     presentation_agent_min_chars: int = 600
     presentation_agent_timeout_seconds: float = 4.0
+    presentation_agent_disconnect_timeout_seconds: float = 0.5
+    presentation_agent_max_pending_cleanups: int = 1
     presentation_agent_max_segments: int = 3
     presentation_model: str = ""
     claude_partial_messages_enabled: bool = False
@@ -281,11 +284,23 @@ class Settings:
             presentation_agent_enabled=_bool(
                 values, "PRESENTATION_AGENT_ENABLED", True
             ),
+            presentation_agent_mode=values.get(
+                "PRESENTATION_AGENT_MODE", "adaptive"
+            ).strip().lower(),
             presentation_agent_min_chars=_int(
                 values, "PRESENTATION_AGENT_MIN_CHARS", 600
             ),
             presentation_agent_timeout_seconds=_float(
                 values, "PRESENTATION_AGENT_TIMEOUT_SECONDS", 4.0, minimum=0.1
+            ),
+            presentation_agent_disconnect_timeout_seconds=_float(
+                values,
+                "PRESENTATION_AGENT_DISCONNECT_TIMEOUT_SECONDS",
+                0.5,
+                minimum=0.05,
+            ),
+            presentation_agent_max_pending_cleanups=_int(
+                values, "PRESENTATION_AGENT_MAX_PENDING_CLEANUPS", 1
             ),
             presentation_agent_max_segments=_int(
                 values, "PRESENTATION_AGENT_MAX_SEGMENTS", 3
@@ -487,6 +502,10 @@ class Settings:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:
             raise ValueError("PRESENTATION_AGENT_MAX_SEGMENTS must be <= 3")
+        if self.presentation_agent_mode not in {"off", "adaptive", "always"}:
+            raise ValueError(
+                "PRESENTATION_AGENT_MODE must be off, adaptive, or always"
+            )
 
     def validate_admin(self) -> None:
         """Fail closed for the independent Admin process only."""

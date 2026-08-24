@@ -6,6 +6,7 @@ import asyncio
 from collections import Counter
 import json
 import re
+import time
 from typing import Any
 
 from app.presentation.contracts import (
@@ -46,6 +47,8 @@ class ResponseOrchestrator:
         presentation_agent_min_chars: int = 600,
         presentation_agent_timeout_seconds: float = 4.0,
         presentation_agent_max_segments: int = 3,
+        presentation_agent_mode: str = "adaptive",
+        presentation_agent_max_pending_cleanups: int = 1,
     ):
         self.sanitizer = sanitizer or MarkdownSanitizer()
         self.segmenter = segmenter or SemanticSegmenter()
@@ -53,11 +56,19 @@ class ResponseOrchestrator:
         self.presentation_agent_enabled = bool(presentation_agent_enabled)
         self.presentation_agent_min_chars = max(1, int(presentation_agent_min_chars))
         self.presentation_agent_timeout_seconds = max(
-            0.1, float(presentation_agent_timeout_seconds)
+            0.01, float(presentation_agent_timeout_seconds)
         )
         self.presentation_agent_max_segments = max(
             1, min(int(presentation_agent_max_segments), 3)
         )
+        normalized_mode = str(presentation_agent_mode).strip().lower()
+        if normalized_mode not in {"off", "adaptive", "always"}:
+            raise ValueError("presentation_agent_mode must be off, adaptive, or always")
+        self.presentation_agent_mode = normalized_mode
+        self.presentation_agent_max_pending_cleanups = max(
+            1, int(presentation_agent_max_pending_cleanups)
+        )
+        self._presentation_cleanups: set[asyncio.Task[Any]] = set()
 
     async def build_plan(
         self,
@@ -88,35 +99,114 @@ class ResponseOrchestrator:
             segments = (companion,) if companion else ()
             return self._plan(kind, segments, True, False)
 
-        agent_segments: tuple[str, ...] | None = None
-        if self._should_use_presentation_agent(kind, authoritative):
-            try:
-                raw = await asyncio.wait_for(
-                    self.presentation_agent.compose(
-                        authoritative.text,
-                        response_kind=kind,
-                        has_card=False,
-                        max_segments=self.presentation_agent_max_segments,
-                    ),
-                    timeout=self.presentation_agent_timeout_seconds,
-                )
-                raw_segments = self._parse_agent_output(raw)
-                sanitized_segments = tuple(
-                    self.sanitizer.sanitize(segment)
-                    for segment in raw_segments
-                )
-                agent_segments = self._validate_sanitized_agent_output(
-                    authoritative.text, sanitized_segments
-                )
-            except Exception:
-                agent_segments = None
-        if agent_segments is not None:
-            return self._plan(kind, agent_segments, False, True)
-
         deterministic = self.segmenter.segment(sanitized)
         if not deterministic and sanitized:
             deterministic = (sanitized,)
-        return self._plan(kind, deterministic, False, False)
+
+        should_attempt, skipped_outcome = self._presentation_agent_decision(
+            kind, authoritative, deterministic
+        )
+        agent_segments: tuple[str, ...] | None = None
+        attempted = False
+        outcome = skipped_outcome
+        agent_latency_ms = 0.0
+        if should_attempt:
+            attempted = True
+            started = time.monotonic()
+            try:
+                raw = await self._compose_with_hard_deadline(
+                    authoritative.text, kind=kind
+                )
+            except TimeoutError:
+                outcome = "timeout"
+            except Exception:
+                outcome = "agent_error"
+            else:
+                try:
+                    raw_segments = self._parse_agent_output(raw)
+                    sanitized_segments = tuple(
+                        self.sanitizer.sanitize(segment)
+                        for segment in raw_segments
+                    )
+                    agent_segments = self._validate_sanitized_agent_output(
+                        authoritative.text, sanitized_segments
+                    )
+                    outcome = "used"
+                except Exception:
+                    outcome = "validation_reject"
+            finally:
+                agent_latency_ms = round((time.monotonic() - started) * 1000, 1)
+        if agent_segments is not None:
+            return self._plan(
+                kind, agent_segments, False, True,
+                presentation_agent_attempted=attempted,
+                presentation_agent_outcome=outcome,
+                presentation_agent_latency_ms=agent_latency_ms,
+                presentation_cleanup_pending=len(self._presentation_cleanups),
+            )
+
+        return self._plan(
+            kind, deterministic, False, False,
+            presentation_agent_attempted=attempted,
+            presentation_agent_outcome=outcome,
+            presentation_agent_latency_ms=agent_latency_ms,
+            presentation_cleanup_pending=len(self._presentation_cleanups),
+        )
+
+    async def _compose_with_hard_deadline(
+        self, text: str, *, kind: ResponseKind
+    ) -> Any:
+        """Return at the deadline without waiting for slow SDK cancellation cleanup."""
+
+        task = asyncio.create_task(
+            self.presentation_agent.compose(
+                text,
+                response_kind=kind,
+                has_card=False,
+                max_segments=self.presentation_agent_max_segments,
+            ),
+            name="presentation-agent-compose",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=self.presentation_agent_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            self._track_cleanup(task)
+            raise
+        if task not in done:
+            task.cancel()
+            self._track_cleanup(task)
+            raise TimeoutError("presentation agent deadline exceeded")
+        return task.result()
+
+    def _track_cleanup(self, task: asyncio.Task[Any]) -> None:
+        self._presentation_cleanups.add(task)
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._presentation_cleanups.discard(done)
+            if done.cancelled():
+                return
+            try:
+                done.exception()
+            except BaseException:
+                pass
+
+        task.add_done_callback(finished)
+
+    async def close(self) -> None:
+        tasks = set(self._presentation_cleanups)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=0.5)
+        close = getattr(self.presentation_agent, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
 
     @staticmethod
     def _coerce(response: RuntimeResponse | str) -> RuntimeResponse:
@@ -143,15 +233,33 @@ class ResponseOrchestrator:
             return "analysis"
         return "conversation"
 
-    def _should_use_presentation_agent(
-        self, kind: ResponseKind, response: RuntimeResponse
-    ) -> bool:
+    def _presentation_agent_decision(
+        self,
+        kind: ResponseKind,
+        response: RuntimeResponse,
+        deterministic: tuple[str, ...],
+    ) -> tuple[bool, str]:
+        if self.presentation_agent_mode == "off" or not self.presentation_agent_enabled:
+            return False, "disabled"
+        if (
+            kind != "analysis"
+            or response.safety_locked
+            or len(response.text) < self.presentation_agent_min_chars
+            or self.presentation_agent is None
+        ):
+            return False, "not_eligible"
+        if len(self._presentation_cleanups) >= self.presentation_agent_max_pending_cleanups:
+            return False, "cleanup_backpressure"
+        if self.presentation_agent_mode == "adaptive" and self._within_delivery_envelope(
+            deterministic
+        ):
+            return False, "skipped_adaptive"
+        return True, "attempting"
+
+    def _within_delivery_envelope(self, segments: tuple[str, ...]) -> bool:
         return (
-            kind == "analysis"
-            and not response.safety_locked
-            and len(response.text) >= self.presentation_agent_min_chars
-            and self.presentation_agent_enabled
-            and self.presentation_agent is not None
+            1 <= len(segments) <= self.presentation_agent_max_segments
+            and all(0 < len(segment) <= self.segmenter.max_chars for segment in segments)
         )
 
     @staticmethod
@@ -200,6 +308,11 @@ class ResponseOrchestrator:
         texts: tuple[str, ...],
         use_cards: bool,
         presentation_agent_used: bool,
+        *,
+        presentation_agent_attempted: bool = False,
+        presentation_agent_outcome: str = "not_eligible",
+        presentation_agent_latency_ms: float = 0.0,
+        presentation_cleanup_pending: int = 0,
     ) -> ResponsePlan:
         normalized = tuple(text for text in (str(item).strip() for item in texts) if text)
         return ResponsePlan(
@@ -211,4 +324,8 @@ class ResponseOrchestrator:
             ),
             use_cards=use_cards,
             presentation_agent_used=presentation_agent_used,
+            presentation_agent_attempted=presentation_agent_attempted,
+            presentation_agent_outcome=presentation_agent_outcome,
+            presentation_agent_latency_ms=presentation_agent_latency_ms,
+            presentation_cleanup_pending=presentation_cleanup_pending,
         )

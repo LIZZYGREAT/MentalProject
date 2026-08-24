@@ -1894,6 +1894,10 @@ class BotEventRepository:
             "total_delivery_ms",
             "segment_count",
             "presentation_agent_used",
+            "presentation_agent_attempted",
+            "presentation_agent_outcome",
+            "presentation_agent_latency_ms",
+            "presentation_cleanup_pending",
         }
         payload = {key: metrics[key] for key in allowed if key in metrics}
         with self.database.session() as session:

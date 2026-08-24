@@ -190,6 +190,17 @@ python -c "from getpass import getpass; from app.admin_web.auth import hash_pass
 等待迁移成功。生产环境还需把飞书卡片回调配置为真实可访问的 HTTPS 地址；本地
 代码和测试无法替代域名、证书、反向代理及飞书后台的外部配置。
 
+## Response Presentation 性能策略
+
+生产默认使用 `PRESENTATION_AGENT_MODE=adaptive`：本地 sanitizer 与确定性分段
+已经可以无损生成 1–3 段时，不再串行等待第二个模型。只有本地结果超出投递容量
+才尝试 PresentationAgent；超时采用硬截止，SDK 断连清理不会继续阻塞最终回复。
+
+诊断时查看 BotEvent telemetry 的 `presentation_agent_outcome`，可区分
+`skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
+`cleanup_backpressure` 和 `used`。详细复验步骤见
+[`MindFlow_P3A_Performance_Issue.md`](../docs/MindFlow_P3A_Performance_Issue.md)。
+
 ## 自动验证
 
 ```powershell

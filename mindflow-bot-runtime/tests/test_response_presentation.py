@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 import pytest
 
@@ -13,6 +14,7 @@ from app.presentation.presentation_agent import ProductionPresentationAgent
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.presentation.semantic_segmenter import SemanticSegmenter
 from app.repositories import BotEventRepository
+from app.models import BotEvent as BotEventRow
 from app.worker import BotWorker, ProgressState
 from helpers import memory_database
 
@@ -142,6 +144,7 @@ def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent()
     agent = GoodPresentationAgent()
     orchestrator = ResponseOrchestrator(
         presentation_agent=agent,
+        presentation_agent_mode="always",
         presentation_agent_min_chars=10,
         segmenter=SemanticSegmenter(min_total_chars=10, max_chars=650),
     )
@@ -152,6 +155,8 @@ def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent()
     plan = asyncio.run(orchestrator.build_plan(source, cards=[], used_tools=set()))
 
     assert plan.presentation_agent_used is True
+    assert plan.presentation_agent_attempted is True
+    assert plan.presentation_agent_outcome == "used"
     assert len(plan.segments) == 2
     assert agent.calls == 1
 
@@ -194,29 +199,36 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
     )
     bad = ResponseOrchestrator(
         presentation_agent=BadNumericPresentationAgent(),
+        presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
     )
     bad_plan = asyncio.run(bad.build_plan(source, cards=[], used_tools=set()))
     assert bad_plan.presentation_agent_used is False
+    assert bad_plan.presentation_agent_attempted is True
+    assert bad_plan.presentation_agent_outcome == "validation_reject"
     assert "15:45" in bad_plan.full_text
     assert "74.06" in bad_plan.full_text
     assert "**" not in bad_plan.full_text
 
     slow = ResponseOrchestrator(
         presentation_agent=TimeoutPresentationAgent(),
+        presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         presentation_agent_timeout_seconds=0.01,
         segmenter=SemanticSegmenter(min_total_chars=1),
     )
     slow_plan = asyncio.run(slow.build_plan(source, cards=[], used_tools=set()))
     assert slow_plan.presentation_agent_used is False
+    assert slow_plan.presentation_agent_outcome == "timeout"
+    assert slow_plan.presentation_agent_latency_ms < 40
     assert "15:45" in slow_plan.full_text
 
 
 def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
     orchestrator = ResponseOrchestrator(
         presentation_agent=MarkdownPresentationAgent(),
+        presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
     )
@@ -248,6 +260,7 @@ def test_invalid_presentation_fallback_keeps_complete_authoritative_answer():
     )
     orchestrator = ResponseOrchestrator(
         presentation_agent=BadNumericPresentationAgent(),
+        presentation_agent_mode="always",
         presentation_agent_min_chars=1,
     )
     plan = asyncio.run(
@@ -264,6 +277,73 @@ def test_invalid_presentation_fallback_keeps_complete_authoritative_answer():
     assert plan.segments[0].text == expected
     assert "15:45" in plan.full_text
     assert "74.06" in plan.full_text
+
+
+def test_adaptive_mode_skips_secondary_model_when_local_plan_is_lossless_and_bounded():
+    agent = GoodPresentationAgent()
+    source = (
+        "今天的分析会完整保留。15:45 的数值是 74.06。"
+        "建议在连续任务之间留出十分钟缓冲。"
+    ) * 12
+    orchestrator = ResponseOrchestrator(
+        presentation_agent=agent,
+        presentation_agent_mode="adaptive",
+        presentation_agent_min_chars=100,
+        segmenter=SemanticSegmenter(
+            min_total_chars=100, target_chars=260, max_chars=650, max_segments=3
+        ),
+    )
+
+    plan = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse(source, response_kind="analysis"),
+        cards=[], used_tools=set(),
+    ))
+
+    assert agent.calls == 0
+    assert plan.presentation_agent_attempted is False
+    assert plan.presentation_agent_outcome == "skipped_adaptive"
+    assert plan.presentation_agent_latency_ms == 0
+    assert 1 <= len(plan.segments) <= 3
+    assert all(len(segment.text) <= 650 for segment in plan.segments)
+    assert "15:45" in plan.full_text and "74.06" in plan.full_text
+
+
+def test_timeout_is_a_hard_user_visible_deadline_and_cleanup_applies_backpressure():
+    class SlowCancellationAgent:
+        async def compose(self, *_args, **_kwargs):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0.3)
+
+    async def scenario():
+        orchestrator = ResponseOrchestrator(
+            presentation_agent=SlowCancellationAgent(),
+            presentation_agent_mode="always",
+            presentation_agent_min_chars=1,
+            presentation_agent_timeout_seconds=0.01,
+            presentation_agent_max_pending_cleanups=1,
+            segmenter=SemanticSegmenter(min_total_chars=1),
+        )
+        source = RuntimeResponse(
+            "完整权威结论：15:45 的数值是 74.06。", response_kind="analysis"
+        )
+        started = time.monotonic()
+        first = await orchestrator.build_plan(source, cards=[], used_tools=set())
+        elapsed = time.monotonic() - started
+        second = await orchestrator.build_plan(source, cards=[], used_tools=set())
+        await asyncio.sleep(0.35)
+        await orchestrator.close()
+        return first, second, elapsed
+
+    first, second, elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.18
+    assert first.presentation_agent_outcome == "timeout"
+    assert first.presentation_cleanup_pending == 1
+    assert "15:45" in first.full_text and "74.06" in first.full_text
+    assert second.presentation_agent_attempted is False
+    assert second.presentation_agent_outcome == "cleanup_backpressure"
 
 
 def test_safety_locked_response_is_byte_for_byte_and_never_rewritten():
@@ -343,6 +423,40 @@ def test_production_presentation_agent_is_stateless_toolless_and_skillless(monke
     assert "mcp_servers" not in options.__dict__
     assert "Skill" in options.disallowed_tools
     assert "participant_id" not in SDK.last_client.prompt
+
+
+def test_production_presentation_agent_disconnect_has_an_independent_deadline(
+    monkeypatch, tmp_path
+):
+    class SDK:
+        class ClaudeAgentOptions:
+            def __init__(self, **kwargs): self.__dict__.update(kwargs)
+        class ResultMessage:
+            is_error = False
+            result = '{"segments":["完整结果 15:45 / 74.06"]}'
+        class ClaudeSDKClient:
+            def __init__(self, options): self.options = options
+            async def connect(self): return None
+            async def query(self, _prompt): return None
+            async def receive_response(self): yield SDK.ResultMessage()
+            async def disconnect(self): await asyncio.sleep(0.3)
+
+    monkeypatch.setattr("app.presentation.presentation_agent._load_sdk", lambda: SDK)
+    agent = ProductionPresentationAgent(
+        workdir=tmp_path, model="flash", base_url="https://model.example",
+        auth_token="secret", opus_model="pro", sonnet_model="pro",
+        haiku_model="flash", disconnect_timeout_seconds=0.01,
+    )
+
+    started = time.monotonic()
+    result = asyncio.run(agent.compose(
+        "完整结果 15:45 / 74.06", response_kind="analysis",
+        has_card=False, max_segments=3,
+    ))
+    elapsed = time.monotonic() - started
+
+    assert result == ("完整结果 15:45 / 74.06",)
+    assert elapsed < 0.15
 
 
 class ProviderSender:
@@ -491,3 +605,28 @@ def test_legacy_single_reply_recovers_as_one_segment_plan():
     sender = ProviderSender()
     asyncio.run(_worker(repository, sender)._resume_delivery_plan(event, pending))
     assert [text for _chat, text, _uuid in sender.visible] == ["hello"]
+
+
+def test_presentation_outcome_metrics_are_persisted_without_unapproved_fields():
+    repository, event = _event_and_repository("presentation-telemetry")
+    repository.save_telemetry(event.event_id, {
+        "presentation_ms": 12.3,
+        "presentation_agent_used": False,
+        "presentation_agent_attempted": True,
+        "presentation_agent_outcome": "timeout",
+        "presentation_agent_latency_ms": 10.1,
+        "presentation_cleanup_pending": 1,
+        "provider_secret": "must-not-persist",
+    })
+
+    with repository.database.session() as session:
+        telemetry = dict(session.get(BotEventRow, event.event_id).telemetry_json)
+
+    assert telemetry == {
+        "presentation_ms": 12.3,
+        "presentation_agent_used": False,
+        "presentation_agent_attempted": True,
+        "presentation_agent_outcome": "timeout",
+        "presentation_agent_latency_ms": 10.1,
+        "presentation_cleanup_pending": 1,
+    }

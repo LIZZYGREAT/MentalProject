@@ -76,4 +76,7 @@ class ResponsePlan:
     segments: tuple[ResponseSegment, ...]
     use_cards: bool
     presentation_agent_used: bool = False
-
+    presentation_agent_attempted: bool = False
+    presentation_agent_outcome: str = "not_eligible"
+    presentation_agent_latency_ms: float = 0.0
+    presentation_cleanup_pending: int = 0

@@ -573,12 +573,17 @@ class Simulator:
                 observation.get("time")
                 or observation.get("target_time")
                 or ""
-            )
-            key = raw_time[:5] if len(raw_time) >= 5 and raw_time[2] == ":" else ""
-            if not key and "T" in raw_time:
-                clock = raw_time.split("T", 1)[1]
-                key = clock[:5] if len(clock) >= 5 and clock[2] == ":" else ""
-            if len(key) == 5 and key[2] == ":":
+            ).strip()
+            if raw_time.endswith("Z"):
+                raw_time = raw_time[:-1] + "+00:00"
+            try:
+                observed_time = datetime.fromisoformat(raw_time)
+            except ValueError:
+                # Clock-only observations are intentionally rejected. An EMA
+                # must carry its calendar date so another day cannot reuse it.
+                continue
+            if len(raw_time) >= 10 and raw_time[4] == "-" and raw_time[7] == "-":
+                key = observed_time.strftime("%Y-%m-%d %H:%M")
                 normalized_observation = dict(observation)
                 payload = observation.get("payload")
                 if isinstance(payload, dict):
@@ -676,6 +681,7 @@ class Simulator:
 
         while current_time <= end_of_day:
             cur_str = current_time.strftime("%H:%M")
+            current_observation_key = current_time.strftime("%Y-%m-%d %H:%M")
             active_high_loads = timeline.get_active_high_load_events(current_time)
             routine_ev = timeline.get_active_routine(current_time)
             has_high_load = bool(active_high_loads)
@@ -768,7 +774,9 @@ class Simulator:
             )
 
             observation_applied = False
-            for observation in observations_by_time.get(cur_str, []):
+            for observation in observations_by_time.get(
+                current_observation_key, []
+            ):
                 try:
                     latent, uncertainty = assimilate_observation_with_uncertainty(
                         latent,

@@ -191,6 +191,9 @@ async def run() -> None:
             opus_model=settings.claude_default_opus_model,
             sonnet_model=settings.claude_default_sonnet_model,
             haiku_model=settings.claude_default_haiku_model,
+            disconnect_timeout_seconds=(
+                settings.presentation_agent_disconnect_timeout_seconds
+            ),
         )
         if settings.presentation_agent_enabled
         else None
@@ -205,9 +208,13 @@ async def run() -> None:
         ),
         presentation_agent=presentation_agent,
         presentation_agent_enabled=settings.presentation_agent_enabled,
+        presentation_agent_mode=settings.presentation_agent_mode,
         presentation_agent_min_chars=settings.presentation_agent_min_chars,
         presentation_agent_timeout_seconds=(
             settings.presentation_agent_timeout_seconds
+        ),
+        presentation_agent_max_pending_cleanups=(
+            settings.presentation_agent_max_pending_cleanups
         ),
         presentation_agent_max_segments=(
             settings.presentation_agent_max_segments

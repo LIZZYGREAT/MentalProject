@@ -102,6 +102,10 @@ def _log(status: str, **fields: object) -> None:
         "total_delivery_ms",
         "segment_count",
         "presentation_agent_used",
+        "presentation_agent_attempted",
+        "presentation_agent_outcome",
+        "presentation_agent_latency_ms",
+        "presentation_cleanup_pending",
     ):
         if fields.get(name) is not None:
             safe[name] = fields[name]
@@ -490,6 +494,18 @@ class BotWorker:
             )
             metrics["segment_count"] = len(plan.segments)
             metrics["presentation_agent_used"] = plan.presentation_agent_used
+            metrics["presentation_agent_attempted"] = (
+                plan.presentation_agent_attempted
+            )
+            metrics["presentation_agent_outcome"] = (
+                plan.presentation_agent_outcome
+            )
+            metrics["presentation_agent_latency_ms"] = (
+                plan.presentation_agent_latency_ms
+            )
+            metrics["presentation_cleanup_pending"] = (
+                plan.presentation_cleanup_pending
+            )
             self.runs.finish(run_id, "succeeded")
             delivered = await self._deliver_plan(
                 event,
@@ -749,3 +765,6 @@ class BotWorker:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        close_orchestrator = getattr(self.response_orchestrator, "close", None)
+        if callable(close_orchestrator):
+            await close_orchestrator()
