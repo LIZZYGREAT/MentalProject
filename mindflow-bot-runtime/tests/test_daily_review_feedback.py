@@ -1511,6 +1511,104 @@ def test_schedule_claim_lease_retry_and_stable_message_uuid():
     assert asyncio.run(scheduler.run_once(due + timedelta(seconds=124)))["sent"] == 0
 
 
+def test_schedule_retry_success_clears_last_error_class():
+    database = memory_database()
+    person = participant(database, "DR-ERROR-CLEAR-SENT")
+    repo = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = repo.ensure(person.id, due.date(), due)
+
+    first_claim = repo.claim_due(due, 120)[0]
+    assert repo.mark_failed(
+        schedule["id"], first_claim["claim_token"], now=due,
+        error=TimeoutError("temporary timeout"), max_attempts=3,
+        retry_base_seconds=1,
+    ) is True
+    failed = repo.get(schedule["id"])
+    assert failed["last_error_code"] == "delivery_failed"
+    assert failed["last_error_class"] == "TimeoutError"
+
+    retry_claim = repo.claim_due(due + timedelta(seconds=1), 120)[0]
+    assert repo.mark_sent(
+        schedule["id"], retry_claim["claim_token"],
+        now=due + timedelta(seconds=1), provider_message_id="message-after-retry",
+    ) is True
+    sent = repo.get(schedule["id"])
+    assert sent["status"] == "sent"
+    assert sent["last_error_code"] is None
+    assert sent["last_error_class"] is None
+
+
+def test_schedule_cancel_after_failure_clears_last_error_class():
+    database = memory_database()
+    person = participant(database, "DR-ERROR-CLEAR-CANCELLED")
+    repo = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = repo.ensure(person.id, due.date(), due)
+
+    first_claim = repo.claim_due(due, 120)[0]
+    assert repo.mark_failed(
+        schedule["id"], first_claim["claim_token"], now=due,
+        error=RuntimeError("temporary failure"), max_attempts=3,
+        retry_base_seconds=1,
+    ) is True
+    assert repo.get(schedule["id"])["last_error_class"] == "RuntimeError"
+
+    retry_claim = repo.claim_due(due + timedelta(seconds=1), 120)[0]
+    assert repo.mark_cancelled(
+        schedule["id"], retry_claim["claim_token"],
+        now=due + timedelta(seconds=1), error_code="participant_inactive",
+    ) is True
+    cancelled = repo.get(schedule["id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error_code"] == "participant_inactive"
+    assert cancelled["last_error_class"] is None
+
+
+def test_schedule_failure_expiry_clears_last_error_class():
+    database = memory_database()
+    person = participant(database, "DR-ERROR-CLEAR-EXPIRED")
+    repo = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    valid_until = due + timedelta(seconds=2)
+    schedule = repo.ensure(
+        person.id, due.date(), due, valid_until=valid_until,
+    )
+
+    claim = repo.claim_due(due, 120)[0]
+    assert repo.mark_failed(
+        schedule["id"], claim["claim_token"], now=due,
+        error=TimeoutError("temporary timeout"), max_attempts=3,
+        retry_base_seconds=1,
+    ) is True
+    assert repo.get(schedule["id"])["last_error_class"] == "TimeoutError"
+
+    assert repo.claim_due(valid_until, 120) == []
+    expired = repo.get(schedule["id"])
+    assert expired["status"] == "expired"
+    assert expired["last_error_code"] == "delivery_window_expired"
+    assert expired["last_error_class"] is None
+
+
+def test_schedule_mark_failed_preserves_exception_class():
+    database = memory_database()
+    person = participant(database, "DR-ERROR-PRESERVE-FAILED")
+    repo = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = repo.ensure(person.id, due.date(), due)
+
+    claim = repo.claim_due(due, 120)[0]
+    assert repo.mark_failed(
+        schedule["id"], claim["claim_token"], now=due,
+        error=ConnectionError("delivery failed"), max_attempts=1,
+        retry_base_seconds=1,
+    ) is True
+    failed = repo.get(schedule["id"])
+    assert failed["status"] == "failed"
+    assert failed["last_error_code"] == "delivery_failed"
+    assert failed["last_error_class"] == "ConnectionError"
+
+
 def test_old_unavailable_cards_expire_instead_of_batch_sending():
     database = memory_database()
     person = participant(database, "DR-EXPIRY")

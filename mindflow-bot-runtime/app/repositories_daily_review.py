@@ -71,6 +71,7 @@ class DailyReviewScheduleRepository:
         row.claim_token = None
         row.lease_until = None
         row.last_error_code = "delivery_window_expired"
+        row.last_error_class = None
         row.updated_at = now
 
     def reactivate_available(self, participant_id: uuid.UUID, now: datetime) -> None:
@@ -237,6 +238,7 @@ class DailyReviewScheduleRepository:
             row.sent_at = now if status == "sent" else None
             row.provider_message_id = str(provider_message_id)[:128] if provider_message_id else None
             row.last_error_code = error_code
+            row.last_error_class = None
             row.claim_token = None
             row.lease_until = None
             row.next_attempt_at = None
