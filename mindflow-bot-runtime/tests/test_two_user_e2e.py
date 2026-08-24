@@ -3,6 +3,7 @@ import asyncio
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
+from app.presentation.contracts import AgentActivityEvent
 from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
 from app.worker import BotWorker
 from helpers import memory_database, participant, skill_path
@@ -314,8 +315,19 @@ def test_progress_is_backend_controlled_and_final_reply_remains_separate():
     gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
 
     class ProgressRuntime:
-        async def handle_message(self, _ctx, _text, *, on_tool_use, **_kwargs):
-            await on_tool_use("care_run_today_assessment")
+        async def handle_message(self, _ctx, _text, *, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="care_run_today_assessment"
+                )
+            )
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_succeeded",
+                    tool_name="care_run_today_assessment",
+                    status="succeeded",
+                )
+            )
             return "final assessment"
 
     sender = FakeSender()

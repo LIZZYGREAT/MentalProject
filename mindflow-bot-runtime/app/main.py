@@ -211,7 +211,7 @@ async def run() -> None:
                 settings.presentation_agent_disconnect_timeout_seconds
             ),
         )
-        if settings.presentation_agent_enabled
+        if settings.presentation_agent_mode != "off"
         else None
     )
     response_orchestrator = ResponseOrchestrator(
@@ -223,7 +223,6 @@ async def run() -> None:
             max_segments=settings.response_max_segments,
         ),
         presentation_agent=presentation_agent,
-        presentation_agent_enabled=settings.presentation_agent_enabled,
         presentation_agent_mode=settings.presentation_agent_mode,
         presentation_agent_min_chars=settings.presentation_agent_min_chars,
         presentation_agent_timeout_seconds=(

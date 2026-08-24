@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, MutableMapping, Protocol
+from typing import MutableMapping, Protocol
 
 from app.agent.sdk_mcp import TurnContextBinding, build_sdk_mcp_server
 from app.agent.tool_registry import ToolRegistry
@@ -94,9 +94,6 @@ headings, bold markers, tables, or fenced blocks unless the user explicitly
 requests code or a literal Markdown artifact. Do not manage message chunking;
 the backend presentation layer owns segmentation and Feishu rendering."""
 
-ToolProgressCallback = Callable[[str], Awaitable[None]]
-
-
 class ClaudeSDKUnavailable(RuntimeError):
     pass
 
@@ -118,9 +115,7 @@ class ClaudeTurnResult:
 class ClaudeClient(Protocol):
     async def connect(self) -> None: ...
 
-    async def run_turn(
-        self, text: str, on_tool_use: ToolProgressCallback | None = None
-    ) -> ClaudeTurnResult: ...
+    async def run_turn(self, text: str) -> ClaudeTurnResult: ...
 
     async def interrupt(self) -> None: ...
 
@@ -182,9 +177,7 @@ class ProductionClaudeClient:
         except Exception as exc:
             raise ClaudeSDKInvocationError(type(exc).__name__) from exc
 
-    async def run_turn(
-        self, text: str, on_tool_use: ToolProgressCallback | None = None
-    ) -> ClaudeTurnResult:
+    async def run_turn(self, text: str) -> ClaudeTurnResult:
         self._interrupted = False
         result_message = None
         started_at = time.monotonic()
@@ -205,13 +198,6 @@ class ProductionClaudeClient:
                             "required production Skill was not loaded"
                         )
                     self._capabilities_verified = True
-                if isinstance(message, self.sdk.AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, self.sdk.ToolUseBlock) and on_tool_use:
-                            # Real lifecycle events are emitted around
-                            # registry.execute() in sdk_mcp. This legacy path is
-                            # intentionally not user-visible.
-                            pass
                 stream_event = getattr(self.sdk, "StreamEvent", None)
                 if (
                     first_text_delta_ms is None

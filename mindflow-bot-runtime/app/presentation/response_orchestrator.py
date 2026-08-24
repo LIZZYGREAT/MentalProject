@@ -43,7 +43,6 @@ class ResponseOrchestrator:
         sanitizer: MarkdownSanitizer | None = None,
         segmenter: SemanticSegmenter | None = None,
         presentation_agent: PresentationAgentProtocol | None = None,
-        presentation_agent_enabled: bool = True,
         presentation_agent_min_chars: int = 600,
         presentation_agent_timeout_seconds: float = 4.0,
         presentation_agent_max_segments: int = 3,
@@ -53,7 +52,6 @@ class ResponseOrchestrator:
         self.sanitizer = sanitizer or MarkdownSanitizer()
         self.segmenter = segmenter or SemanticSegmenter()
         self.presentation_agent = presentation_agent
-        self.presentation_agent_enabled = bool(presentation_agent_enabled)
         self.presentation_agent_min_chars = max(1, int(presentation_agent_min_chars))
         self.presentation_agent_timeout_seconds = max(
             0.01, float(presentation_agent_timeout_seconds)
@@ -239,7 +237,7 @@ class ResponseOrchestrator:
         response: RuntimeResponse,
         deterministic: tuple[str, ...],
     ) -> tuple[bool, str]:
-        if self.presentation_agent_mode == "off" or not self.presentation_agent_enabled:
+        if self.presentation_agent_mode == "off":
             return False, "disabled"
         if (
             kind != "analysis"

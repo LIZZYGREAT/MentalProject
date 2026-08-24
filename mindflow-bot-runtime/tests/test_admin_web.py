@@ -14,8 +14,8 @@ def settings():
     return Settings.from_env(
         {
             "APP_ENV": "test",
-            "FEISHU_APP_ID": "app",
-            "FEISHU_APP_SECRET": "secret",
+            "FEISHU_BOT_APP_ID": "app",
+            "FEISHU_BOT_APP_SECRET": "secret",
             "DEEPSEEK_API_KEY": "key",
             "DATABASE_URL": "sqlite:///:memory:",
             "TOKEN_ENCRYPTION_KEY": "test-key",

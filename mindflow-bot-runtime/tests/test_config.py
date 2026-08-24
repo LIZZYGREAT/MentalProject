@@ -8,8 +8,8 @@ from app.config import Settings
 def valid_environment() -> dict[str, str]:
     return {
         "APP_ENV": "test",
-        "FEISHU_APP_ID": "app",
-        "FEISHU_APP_SECRET": "secret",
+        "FEISHU_BOT_APP_ID": "app",
+        "FEISHU_BOT_APP_SECRET": "secret",
         "DEEPSEEK_API_KEY": "key",
         "DATABASE_URL": "sqlite:///:memory:",
         "TOKEN_ENCRYPTION_KEY": "test-key",
@@ -84,7 +84,6 @@ def test_response_ux_defaults_and_presentation_model_fallback():
     assert settings.response_segment_target_chars == 260
     assert settings.response_segment_max_chars == 650
     assert settings.response_max_segments == 3
-    assert settings.presentation_agent_enabled is True
     assert settings.presentation_agent_min_chars == 600
     assert settings.presentation_agent_timeout_seconds == 4
     assert settings.presentation_model == "deepseek-v4-flash"
@@ -134,15 +133,6 @@ def test_calendar_app_falls_back_to_bot_app():
     assert settings.feishu_calendar_app_secret == "bot-secret"
 
 
-def test_legacy_feishu_app_config_still_works():
-    settings = Settings.from_env(
-        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
-    )
-
-    assert settings.feishu_bot_app_id == "app"
-    assert settings.feishu_calendar_app_id == "app"
-
-
 @pytest.mark.parametrize(
     "name,value",
     [
@@ -150,8 +140,10 @@ def test_legacy_feishu_app_config_still_works():
         ("FEISHU_BOT_APP_SECRET", "bot-secret"),
     ],
 )
-def test_partial_bot_credentials_are_rejected_even_with_legacy_pair(name, value):
+def test_partial_bot_credentials_are_rejected(name, value):
     environment = valid_environment()
+    environment.pop("FEISHU_BOT_APP_ID")
+    environment.pop("FEISHU_BOT_APP_SECRET")
     environment[name] = value
 
     with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID.*configured together"):
@@ -160,25 +152,13 @@ def test_partial_bot_credentials_are_rejected_even_with_legacy_pair(name, value)
         )
 
 
-def test_explicit_bot_pair_does_not_mix_with_legacy_pair():
+def test_legacy_feishu_pair_is_not_a_runtime_fallback():
     environment = valid_environment()
-    environment.update(
-        {"FEISHU_BOT_APP_ID": "bot-app", "FEISHU_BOT_APP_SECRET": "bot-secret"}
-    )
+    environment.pop("FEISHU_BOT_APP_ID")
+    environment.pop("FEISHU_BOT_APP_SECRET")
+    environment.update({"FEISHU_APP_ID": "legacy", "FEISHU_APP_SECRET": "legacy"})
 
-    settings = Settings.from_env(
-        environment, base_dir=Path(__file__).resolve().parents[1]
-    )
-
-    assert settings.feishu_bot_app_id == "bot-app"
-    assert settings.feishu_bot_app_secret == "bot-secret"
-
-
-def test_partial_legacy_feishu_pair_is_rejected():
-    environment = valid_environment()
-    environment.pop("FEISHU_APP_SECRET")
-
-    with pytest.raises(ValueError, match="FEISHU_BOT_APP_SECRET"):
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID"):
         Settings.from_env(
             environment, base_dir=Path(__file__).resolve().parents[1]
         )
@@ -253,6 +233,38 @@ def test_presentation_agent_performance_policy_defaults_and_validation():
         Settings.from_env(
             environment, base_dir=Path(__file__).resolve().parents[1]
         )
+
+
+def test_legacy_presentation_enabled_maps_to_mode_and_warns_once(caplog, monkeypatch):
+    import app.config as config_module
+
+    monkeypatch.setattr(config_module, "_legacy_presentation_warning_emitted", False)
+    environment = valid_environment()
+    environment["PRESENTATION_AGENT_ENABLED"] = "false"
+    with caplog.at_level("WARNING"):
+        disabled = Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+        Settings.from_env(environment, base_dir=Path(__file__).resolve().parents[1])
+    assert disabled.presentation_agent_mode == "off"
+    assert sum("PRESENTATION_AGENT_ENABLED is deprecated" in item for item in caplog.messages) == 1
+
+    environment["PRESENTATION_AGENT_ENABLED"] = "true"
+    enabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert enabled.presentation_agent_mode == "adaptive"
+
+
+def test_explicit_presentation_mode_is_authoritative_over_legacy_flag():
+    environment = valid_environment()
+    environment.update(
+        {"PRESENTATION_AGENT_MODE": "always", "PRESENTATION_AGENT_ENABLED": "false"}
+    )
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.presentation_agent_mode == "always"
 
 
 def test_admin_validation_fails_closed_when_disabled_or_misconfigured():

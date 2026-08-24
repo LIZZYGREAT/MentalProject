@@ -595,12 +595,21 @@ def test_second_segment_failure_persists_next_index_and_resume_sends_only_remain
     assert [text for _chat, text, _uuid in second_sender.visible] == ["B", "C"]
 
 
-def test_legacy_single_reply_recovers_as_one_segment_plan():
+def test_legacy_single_reply_recovers_as_one_segment_plan(caplog):
     repository, event = _event_and_repository("legacy")
-    repository.stage_reply(event.event_id, "hello")
-    pending = repository.pending_reply_plan(event.event_id)
+    with repository.database.session() as session:
+        row = session.get(BotEventRow, event.event_id)
+        row.reply_text = "hello"
+        row.reply_segments_json = None
+        row.reply_next_segment = 0
+        row.reply_message_ids_json = None
+        row.reply_plan_version = None
+        row.status = "reply_pending"
+    with caplog.at_level("WARNING"):
+        pending = repository.pending_reply_plan(event.event_id)
     assert pending.segments == ("hello",)
     assert pending.plan_version == "legacy-single-v1"
+    assert "legacy_reply_plan_recovered" in caplog.messages
 
     sender = ProviderSender()
     asyncio.run(_worker(repository, sender)._resume_delivery_plan(event, pending))

@@ -7,6 +7,7 @@ from app.agent.claude_runtime import ClaudeAgentRuntime
 from app.agent.context import AgentContext
 from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
 from app.agent.session_manager import ParticipantSessionManager
+from app.presentation.contracts import AgentActivityEvent
 from app.repositories import ClaudeSessionRepository, ConversationRepository
 from app.services.safety_service import FIXED_HIGH_RISK_RESPONSE, SafetyService
 from helpers import memory_database, participant
@@ -36,7 +37,7 @@ class FakeClient:
     async def connect(self):
         self.connected = True
 
-    async def run_turn(self, text, on_tool_use=None):
+    async def run_turn(self, text):
         ctx = self.binding.require()
         self.factory.active += 1
         self.factory.max_active = max(self.factory.max_active, self.factory.active)
@@ -45,8 +46,18 @@ class FakeClient:
             await self.release.wait()
             if self.interrupted:
                 raise ClaudeSDKTurnInterrupted("interrupted")
-            if on_tool_use:
-                await on_tool_use("care_get_today_context")
+            await self.binding.emit(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="care_get_today_context"
+                )
+            )
+            await self.binding.emit(
+                AgentActivityEvent(
+                    kind="tool_succeeded",
+                    tool_name="care_get_today_context",
+                    status="succeeded",
+                )
+            )
             session_id = self.resume or f"session-{ctx.participant_id}"
             return ClaudeTurnResult(f"answer:{text}", session_id)
         finally:
@@ -175,8 +186,12 @@ def test_activity_callbacks_are_isolated_by_participant_and_cleared_after_turn()
         await manager.close()
 
     asyncio.run(scenario())
-    assert received[p1.id] == [("tool_started", "care_get_today_context")]
-    assert received[p2.id] == [("tool_started", "care_get_today_context")]
+    expected = [
+        ("tool_started", "care_get_today_context"),
+        ("tool_succeeded", "care_get_today_context"),
+    ]
+    assert received[p1.id] == expected
+    assert received[p2.id] == expected
 
 
 def test_safety_precheck_never_submits_high_risk_text_to_sdk():

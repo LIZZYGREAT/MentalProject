@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+logger = logging.getLogger(__name__)
+_legacy_presentation_warning_emitted = False
 
 
 def _int(env: Mapping[str, str], name: str, default: int, minimum: int = 1) -> int:
@@ -36,6 +41,23 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     if value not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
         raise ValueError(f"{name} must be a boolean")
     return value in {"1", "true", "yes", "on"}
+
+
+def _presentation_agent_mode(env: Mapping[str, str]) -> str:
+    explicit = env.get("PRESENTATION_AGENT_MODE", "").strip().lower()
+    if explicit:
+        return explicit
+    if "PRESENTATION_AGENT_ENABLED" not in env:
+        return "adaptive"
+
+    global _legacy_presentation_warning_emitted
+    if not _legacy_presentation_warning_emitted:
+        logger.warning(
+            "PRESENTATION_AGENT_ENABLED is deprecated; "
+            "use PRESENTATION_AGENT_MODE=off|adaptive|always"
+        )
+        _legacy_presentation_warning_emitted = True
+    return "adaptive" if _bool(env, "PRESENTATION_AGENT_ENABLED") else "off"
 
 
 @dataclass(frozen=True)
@@ -78,7 +100,6 @@ class Settings:
     response_segment_target_chars: int = 260
     response_segment_max_chars: int = 650
     response_max_segments: int = 3
-    presentation_agent_enabled: bool = True
     presentation_agent_mode: str = "adaptive"
     presentation_agent_min_chars: int = 600
     presentation_agent_timeout_seconds: float = 4.0
@@ -179,21 +200,13 @@ class Settings:
         if not settings_path.is_absolute():
             settings_path = (root / settings_path).resolve()
 
-        legacy_app_id = values.get("FEISHU_APP_ID", "").strip()
-        legacy_app_secret = values.get("FEISHU_APP_SECRET", "").strip()
-        explicit_bot_app_id = values.get("FEISHU_BOT_APP_ID", "").strip()
-        explicit_bot_app_secret = values.get("FEISHU_BOT_APP_SECRET", "").strip()
-        if bool(explicit_bot_app_id) != bool(explicit_bot_app_secret):
+        bot_app_id = values.get("FEISHU_BOT_APP_ID", "").strip()
+        bot_app_secret = values.get("FEISHU_BOT_APP_SECRET", "").strip()
+        if bool(bot_app_id) != bool(bot_app_secret):
             raise ValueError(
                 "FEISHU_BOT_APP_ID and FEISHU_BOT_APP_SECRET "
                 "must be configured together"
             )
-        if explicit_bot_app_id:
-            bot_app_id = explicit_bot_app_id
-            bot_app_secret = explicit_bot_app_secret
-        else:
-            bot_app_id = legacy_app_id
-            bot_app_secret = legacy_app_secret
         explicit_calendar_app_id = values.get("FEISHU_CALENDAR_APP_ID", "").strip()
         explicit_calendar_app_secret = values.get(
             "FEISHU_CALENDAR_APP_SECRET", ""
@@ -283,12 +296,7 @@ class Settings:
             response_max_segments=_int(
                 values, "RESPONSE_MAX_SEGMENTS", 3
             ),
-            presentation_agent_enabled=_bool(
-                values, "PRESENTATION_AGENT_ENABLED", True
-            ),
-            presentation_agent_mode=values.get(
-                "PRESENTATION_AGENT_MODE", "adaptive"
-            ).strip().lower(),
+            presentation_agent_mode=_presentation_agent_mode(values),
             presentation_agent_min_chars=_int(
                 values, "PRESENTATION_AGENT_MIN_CHARS", 600
             ),

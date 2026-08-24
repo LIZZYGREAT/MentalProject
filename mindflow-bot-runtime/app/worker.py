@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Protocol
+from typing import Protocol
 
 from app.agent.claude_runtime import (
     FALLBACK_INTERRUPTED,
@@ -48,9 +48,6 @@ CALENDAR_CONNECT_PATTERN = re.compile(
 )
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
 
-ProgressCallback = Callable[[str], Awaitable[None]]
-
-
 class AgentRuntimeProtocol(Protocol):
     async def handle_message(
         self,
@@ -59,7 +56,6 @@ class AgentRuntimeProtocol(Protocol):
         *,
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
-        on_tool_use: ProgressCallback | None = None,
     ) -> RuntimeResponse: ...
 
     async def interrupt(self, participant_id) -> bool: ...
@@ -414,11 +410,6 @@ class BotWorker:
                     key=self.progress_presenter.key_for(activity, state=progress),
                 )
 
-        async def on_tool_use(tool_name: str) -> None:
-            await on_activity(
-                AgentActivityEvent(kind="tool_started", tool_name=tool_name)
-            )
-
         timer = asyncio.create_task(delayed_progress())
         try:
             agent_started = time.monotonic()
@@ -427,7 +418,6 @@ class BotWorker:
                 event.text,
                 chat_type=event.chat_type,
                 on_activity=on_activity,
-                on_tool_use=on_tool_use,
             )
             metrics["agent_result_ms"] = round(
                 (time.monotonic() - agent_started) * 1000, 1

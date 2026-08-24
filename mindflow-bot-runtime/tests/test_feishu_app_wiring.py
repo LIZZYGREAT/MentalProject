@@ -90,7 +90,7 @@ def test_runtime_oauth_client_and_repository_use_calendar_credentials():
     assert str(services.prediction_service.model.timezone) == "Asia/Shanghai"
 
 
-def test_gateway_smoke_uses_bot_credentials_with_legacy_fallback():
+def test_gateway_smoke_uses_bot_credentials_only():
     assert _bot_credentials(
         {
             "FEISHU_BOT_APP_ID": "bot-app",
@@ -99,13 +99,14 @@ def test_gateway_smoke_uses_bot_credentials_with_legacy_fallback():
             "FEISHU_CALENDAR_APP_SECRET": "calendar-secret",
         }
     ) == ("bot-app", "bot-secret")
-    assert _bot_credentials(
-        {"FEISHU_APP_ID": "legacy-app", "FEISHU_APP_SECRET": "legacy-secret"}
-    ) == ("legacy-app", "legacy-secret")
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID"):
+        _bot_credentials(
+            {"FEISHU_APP_ID": "legacy-app", "FEISHU_APP_SECRET": "legacy-secret"}
+        )
 
 
-def test_gateway_smoke_rejects_partial_explicit_bot_pair():
-    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID.*configured together"):
+def test_gateway_smoke_rejects_partial_bot_pair():
+    with pytest.raises(ValueError, match="FEISHU_BOT_APP_ID.*configured"):
         _bot_credentials(
             {
                 "FEISHU_BOT_APP_ID": "bot-app",

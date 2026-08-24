@@ -6,12 +6,10 @@ from app.agent.context import AgentContext
 from app.agent.sdk_adapter import (
     ClaudeSDKInvocationError,
     ClaudeSDKTurnInterrupted,
-    ToolProgressCallback,
 )
 from app.agent.session_manager import ParticipantSessionManager
 from app.presentation.contracts import (
     AgentActivityCallback,
-    AgentActivityEvent,
     RuntimeResponse,
 )
 from app.repositories import ConversationRepository
@@ -44,7 +42,6 @@ class ClaudeAgentRuntime:
         *,
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
-        on_tool_use: ToolProgressCallback | None = None,
     ) -> RuntimeResponse:
         self.conversations.add(
             ctx.participant_id,
@@ -60,12 +57,6 @@ class ClaudeAgentRuntime:
                 safety_locked=True,
                 response_kind="fixed",
             )
-        if on_activity is None and on_tool_use is not None:
-            async def legacy_activity(event: AgentActivityEvent) -> None:
-                if event.kind == "tool_started" and event.tool_name:
-                    await on_tool_use(event.tool_name)
-
-            on_activity = legacy_activity
         try:
             result = await self.sessions.submit(
                 ctx, text, on_activity=on_activity

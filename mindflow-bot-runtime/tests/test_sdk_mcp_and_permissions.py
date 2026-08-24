@@ -241,7 +241,7 @@ def test_parent_environment_is_reduced_to_runtime_allowlist():
     environment = {
         "PATH": "/usr/bin",
         "HOME": "/home/mindflow",
-        "FEISHU_APP_SECRET": "feishu-secret",
+        "FEISHU_BOT_APP_SECRET": "feishu-secret",
         "DATABASE_URL": "postgresql://secret",
         "TOKEN_ENCRYPTION_KEY": "encryption-secret",
         "DEEPSEEK_API_KEY": "model-secret",

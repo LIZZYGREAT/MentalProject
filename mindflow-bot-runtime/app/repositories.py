@@ -6,12 +6,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, or_, select
 from sqlalchemy.exc import IntegrityError
+
+
+logger = logging.getLogger(__name__)
 
 from app.db import Database
 from app.contracts.warning import WarningDeliveryPolicyConfig
@@ -1854,13 +1858,6 @@ class BotEventRepository:
                 for row in rows
             ]
 
-    def pending_reply(self, event_id: str) -> Optional[str]:
-        with self.database.session() as session:
-            row = session.get(BotEvent, event_id)
-            if row is None or row.status != "reply_pending" or not row.reply_text:
-                return None
-            return row.reply_text
-
     def pending_reply_plan(self, event_id: str) -> PendingReplyPlan | None:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id)
@@ -1871,6 +1868,10 @@ class BotEventRepository:
                 segments = tuple(str(item) for item in raw_segments if str(item))
                 version = str(row.reply_plan_version or "response-plan-v1")
             elif row.reply_text:
+                logger.warning(
+                    "legacy_reply_plan_recovered",
+                    extra={"event_id": row.event_id},
+                )
                 segments = (str(row.reply_text),)
                 version = "legacy-single-v1"
             else:
@@ -1963,19 +1964,6 @@ class BotEventRepository:
             row.status = "interrupted"
             row.error_code = "stopped"
             row.processed_at = utc_now()
-
-    def stage_reply(self, event_id: str, text: str) -> None:
-        with self.database.session() as session:
-            row = session.get(BotEvent, event_id, with_for_update=True)
-            if row is None:
-                return
-            row.reply_text = str(text)[:4000]
-            row.reply_segments_json = None
-            row.reply_next_segment = 0
-            row.reply_message_ids_json = None
-            row.reply_plan_version = None
-            row.status = "reply_pending"
-            row.error_code = None
 
     def note_reply_failure(self, event_id: str) -> None:
         with self.database.session() as session:

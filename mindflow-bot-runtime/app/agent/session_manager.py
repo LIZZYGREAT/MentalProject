@@ -14,12 +14,10 @@ from app.agent.sdk_adapter import (
     ClaudeSDKInvocationError,
     ClaudeSDKTurnInterrupted,
     ClaudeTurnResult,
-    ToolProgressCallback,
 )
 from app.agent.sdk_mcp import TurnContextBinding
 from app.presentation.contracts import (
     AgentActivityCallback,
-    AgentActivityEvent,
 )
 from app.repositories import ClaudeSessionRepository
 
@@ -76,7 +74,6 @@ class ParticipantSessionManager:
         text: str,
         *,
         on_activity: AgentActivityCallback | None = None,
-        on_tool_use: ToolProgressCallback | None = None,
     ) -> ClaudeTurnResult:
         if self._closing:
             raise ClaudeSDKInvocationError("session manager is closing")
@@ -89,12 +86,6 @@ class ParticipantSessionManager:
                     queue=asyncio.Queue(maxsize=self.input_queue_size),
                 )
                 self._sessions[ctx.participant_id] = session
-            if on_activity is None and on_tool_use is not None:
-                async def legacy_activity(event: AgentActivityEvent) -> None:
-                    if event.kind == "tool_started" and event.tool_name:
-                        await on_tool_use(event.tool_name)
-
-                on_activity = legacy_activity
             request = TurnRequest(
                 ctx=ctx,
                 text=str(text),
@@ -154,15 +145,8 @@ class ParticipantSessionManager:
                     async with self._lock:
                         session.state = "running"
 
-                    async def legacy_tool_started(tool_name: str) -> None:
-                        await session.binding.emit(
-                            AgentActivityEvent(
-                                kind="tool_started", tool_name=tool_name
-                            )
-                        )
-
                     result = await asyncio.wait_for(
-                        client.run_turn(request.text, legacy_tool_started),
+                        client.run_turn(request.text),
                         timeout=self.turn_timeout_seconds,
                     )
                     self.repository.save(
