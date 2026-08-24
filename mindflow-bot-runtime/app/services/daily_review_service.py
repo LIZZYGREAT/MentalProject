@@ -109,19 +109,47 @@ class DailyReviewService:
             raise ValueError("daily review date does not match schedule")
         if schedule["card_version"] != self.CARD_VERSION:
             raise ValueError("daily review card is no longer supported")
+
+        existing_response = self.responses.get_by_callback_event_id(
+            participant_id, callback_event_id
+        )
+        if existing_response is not None:
+            return self._accepted_callback_result(
+                participant_id,
+                local_date,
+                schedule_id,
+                schedule,
+                existing_response,
+            )
+
         now = submitted_at or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         else:
             now = now.astimezone(timezone.utc)
-        today = now.astimezone(self.timezone).date()
-        if local_date > today or (today - local_date).days > 1:
-            raise ValueError("daily review date is outside the accepted window")
-        # Validate the model-time semantics before persisting an append-only
-        # response. The persisted response is used again below so duplicate
-        # callbacks retain their original audit timestamp and anchor.
-        self._end_anchor(local_date, schedule, now)
-        self._validate_submission_window(schedule, now)
+        try:
+            today = now.astimezone(self.timezone).date()
+            if local_date > today or (today - local_date).days > 1:
+                raise ValueError("daily review date is outside the accepted window")
+            # Validate model-time and submission-window semantics before a new
+            # append-only response is accepted.
+            self._end_anchor(local_date, schedule, now)
+            self._validate_submission_window(schedule, now)
+        except ValueError:
+            # A concurrent request may have accepted this callback just before
+            # the validity boundary. Re-check before rejecting it as a new event.
+            concurrent_response = self.responses.get_by_callback_event_id(
+                participant_id, callback_event_id
+            )
+            if concurrent_response is not None:
+                return self._accepted_callback_result(
+                    participant_id,
+                    local_date,
+                    schedule_id,
+                    schedule,
+                    concurrent_response,
+                )
+            raise
         peak_period = str(values.get("peak_period") or "")
         if peak_period not in PEAK_PERIODS:
             raise ValueError("peak_period is invalid")
@@ -148,21 +176,58 @@ class DailyReviewService:
             values=normalized,
             raw=dict(values),
         )
-        retrospective = None
         if not created:
-            retrospective = self.retrospectives.latest_for_response(
-                participant_id, response["id"]
+            return self._accepted_callback_result(
+                participant_id,
+                local_date,
+                schedule_id,
+                schedule,
+                response,
             )
+        end_anchor = self._end_anchor(
+            local_date, schedule, _stored_datetime(response["submitted_at"])
+        )
+        retrospective = self.rebuild(
+            participant_id, local_date, response=response, end_anchor=end_anchor
+        )
+        return {
+            "response": response,
+            "created": created,
+            "retrospective": retrospective,
+        }
+
+    def _accepted_callback_result(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date,
+        schedule_id: uuid.UUID,
+        schedule: dict[str, Any],
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            response["local_date"] != local_date.isoformat()
+            or response.get("schedule_id") != str(schedule_id)
+            or response["card_version"] != self.CARD_VERSION
+        ):
+            raise ValueError(
+                "daily review callback identity does not match persisted response"
+            )
+        original_submitted_at = _stored_datetime(response["submitted_at"])
+        # Validate the persisted audit fact, never the transport retry time.
+        self._validate_submission_window(schedule, original_submitted_at)
+        end_anchor = self._end_anchor(
+            local_date, schedule, original_submitted_at
+        )
+        retrospective = self.retrospectives.latest_for_response(
+            participant_id, response["id"]
+        )
         if retrospective is None:
-            end_anchor = self._end_anchor(
-                local_date, schedule, _stored_datetime(response["submitted_at"])
-            )
             retrospective = self.rebuild(
                 participant_id, local_date, response=response, end_anchor=end_anchor
             )
         return {
             "response": response,
-            "created": created,
+            "created": False,
             "retrospective": retrospective,
         }
 

@@ -86,6 +86,13 @@ def _retrospective_count(database, participant_id) -> int:
         )) or 0)
 
 
+def _utc_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast():
     database = memory_database()
     person = participant(database, "DR001")
@@ -538,6 +545,204 @@ def test_duplicate_callback_recovers_once_when_response_exists_without_retrospec
     assert recovered["response"]["id"] == response["id"]
     assert repeated["retrospective"]["id"] == recovered["retrospective"]["id"]
     assert _retrospective_count(database, person.id) == 1
+
+
+def test_successful_callback_retry_after_expiry_returns_original_result():
+    database = memory_database()
+    person = participant(database, "DR-EXPIRED-RETRY-SUCCESS")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    valid_until = scheduled_at + timedelta(days=1)
+    schedule = schedules.ensure(
+        person.id, target, scheduled_at, valid_until=valid_until
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    first = service.submit(
+        person.id,
+        callback_event_id="callback-expired-retry-success",
+        action=action,
+        values=_values(),
+        submitted_at=valid_until - timedelta(seconds=1),
+    )
+    retry = service.submit(
+        person.id,
+        callback_event_id="callback-expired-retry-success",
+        action=action,
+        values={"this": "retry payload must not be normalized"},
+        submitted_at=valid_until + timedelta(seconds=1),
+    )
+
+    assert retry["created"] is False
+    assert retry["response"]["id"] == first["response"]["id"]
+    assert _utc_timestamp(retry["response"]["submitted_at"]) == _utc_timestamp(
+        first["response"]["submitted_at"]
+    )
+    assert retry["retrospective"]["id"] == first["retrospective"]["id"]
+    assert _retrospective_count(database, person.id) == 1
+
+
+def test_reconstruction_crash_recovers_from_same_callback_after_expiry():
+    database = memory_database()
+    person = participant(database, "DR-EXPIRED-RETRY-RECOVERY")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    valid_until = scheduled_at + timedelta(days=1)
+    schedule = schedules.ensure(
+        person.id, target, scheduled_at, valid_until=valid_until
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated reconstruction crash at expiry")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="crash at expiry"):
+        service.submit(
+            person.id,
+            callback_event_id="callback-expired-retry-recovery",
+            action=action,
+            values=_values(),
+            submitted_at=valid_until - timedelta(seconds=1),
+        )
+    response = DailyReviewResponseRepository(database).latest(person.id, target)
+    assert response is not None
+    assert _retrospective_count(database, person.id) == 0
+
+    service.rebuild = rebuild
+    recovered = service.submit(
+        person.id,
+        callback_event_id="callback-expired-retry-recovery",
+        action=action,
+        values={"invalid": "ignored for an accepted callback"},
+        submitted_at=valid_until + timedelta(seconds=1),
+    )
+    repeated = service.submit(
+        person.id,
+        callback_event_id="callback-expired-retry-recovery",
+        action=action,
+        values={},
+        submitted_at=valid_until + timedelta(minutes=5),
+    )
+
+    assert recovered["created"] is False
+    assert recovered["response"]["id"] == response["id"]
+    assert _utc_timestamp(recovered["response"]["submitted_at"]) == _utc_timestamp(
+        response["submitted_at"]
+    )
+    assert repeated["retrospective"]["id"] == recovered["retrospective"]["id"]
+    assert _retrospective_count(database, person.id) == 1
+
+
+def test_expiry_rejection_rechecks_callback_for_boundary_race():
+    database = memory_database()
+    person = participant(database, "DR-EXPIRY-RACE")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    valid_until = scheduled_at + timedelta(days=1)
+    schedule = schedules.ensure(
+        person.id, target, scheduled_at, valid_until=valid_until
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    first = service.submit(
+        person.id,
+        callback_event_id="callback-expiry-race",
+        action=action,
+        values=_values(),
+        submitted_at=valid_until - timedelta(seconds=1),
+    )
+    lookup = service.responses.get_by_callback_event_id
+    calls = 0
+
+    def miss_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return lookup(*args, **kwargs)
+
+    service.responses.get_by_callback_event_id = miss_once
+    retry = service.submit(
+        person.id,
+        callback_event_id="callback-expiry-race",
+        action=action,
+        values=_values(),
+        submitted_at=valid_until + timedelta(seconds=1),
+    )
+
+    assert calls == 2
+    assert retry["created"] is False
+    assert retry["retrospective"]["id"] == first["retrospective"]["id"]
+    assert _retrospective_count(database, person.id) == 1
+
+
+def test_duplicate_callback_identity_mismatch_is_rejected():
+    database = memory_database()
+    person = participant(database, "DR-CALLBACK-IDENTITY")
+    first_date = date(2030, 1, 15)
+    second_date = date(2030, 1, 16)
+    _seed_forecast(database, person.id, first_date)
+    schedules = DailyReviewScheduleRepository(database)
+    first_schedule = schedules.ensure(
+        person.id,
+        first_date,
+        datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc),
+    )
+    second_schedule = schedules.ensure(
+        person.id,
+        second_date,
+        datetime(2030, 1, 16, 14, 0, tzinfo=timezone.utc),
+    )
+    service = _service(database)
+    first = service.submit(
+        person.id,
+        callback_event_id="callback-identity-collision",
+        action={
+            "version": "1", "schedule_id": first_schedule["id"],
+            "local_date": first_date.isoformat(),
+        },
+        values=_values(),
+        submitted_at=datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match="identity does not match"):
+        service.submit(
+            person.id,
+            callback_event_id="callback-identity-collision",
+            action={
+                "version": "1", "schedule_id": second_schedule["id"],
+                "local_date": second_date.isoformat(),
+            },
+            values={},
+            submitted_at=datetime(2030, 1, 16, 14, 0, tzinfo=timezone.utc),
+        )
+
+    assert DailyReviewResponseRepository(database).latest(
+        person.id, second_date
+    ) is None
+    assert RetrospectiveCurveRepository(database).latest(
+        person.id, second_date
+    ) is None
+    assert _retrospective_count(database, person.id) == 1
+    assert first["response"]["local_date"] == first_date.isoformat()
 
 
 def test_schedule_claim_lease_retry_and_stable_message_uuid():

@@ -225,6 +225,17 @@ class DailyReviewResponseRepository:
     def __init__(self, database: Database):
         self.database = database
 
+    def get_by_callback_event_id(
+        self, participant_id: uuid.UUID, callback_event_id: str
+    ) -> dict[str, Any] | None:
+        callback = str(callback_event_id)[:128]
+        with self.database.session() as session:
+            row = session.execute(select(DailyReviewResponse).where(
+                DailyReviewResponse.participant_id == participant_id,
+                DailyReviewResponse.callback_event_id == callback,
+            )).scalar_one_or_none()
+            return self._view(row) if row else None
+
     def add(
         self, participant_id: uuid.UUID, local_date: date, *, callback_event_id: str,
         submitted_at: datetime, card_version: str, schedule_id: uuid.UUID | None,
