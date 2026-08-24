@@ -91,10 +91,10 @@ def test_production_ctssm_fixture_is_stable_after_legacy_removal():
         "aef29bf7ee092bf19d76ee193834e16800f6a741f63925ffed60303f0197917e"
     )
     assert _sha(result.alerts) == (
-        "76589eb6ad7736b2c1470a13ac52d67c39558c79c99344586b88c5be9d2c82d0"
+        "e77199a7f4e5467d50ddddfbc11785b7cb9526bb34369b084bc5d67c02254864"
     )
     assert _sha(warning_windows) == (
-        "bf605c640bb30feb352f6fc8912f68fd5d7364136abd86d1cd8fdf448a51ddda"
+        "013e1cb6d97cd3ccfe2b675bc2ca8bcf568b7cf2b0e3448eb529562bb71297b5"
     )
     assert _sha(result.confidence_series) == (
         "08ca5a9fb9fb688311a54a6e917c7b61d24a8eb33a42ab3eee3244bfeac4e295"

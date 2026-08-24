@@ -18,6 +18,7 @@ from app.repositories import (
     LearnedProfileRepository,
 )
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.care_message_service import CareMessageService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
@@ -137,6 +138,10 @@ class CareTools:
             else None
         )
         self.observation_refresh = observation_refresh
+        self.care_messages = (
+            getattr(forecast_coordinator, "care_messages", None)
+            or CareMessageService(timezone_name)
+        )
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -188,7 +193,7 @@ class CareTools:
         )
         registry.register(
             "care_get_support",
-            "Return a brief optional support suggestion based on recorded state.",
+            "Return optional support using the same reviewed calendar, forecast, and recent-state care policy as proactive warnings.",
             {
                 "type": "object",
                 "properties": {
@@ -393,22 +398,98 @@ class CareTools:
         )
         return {"ok": True, **result}
 
-    def get_support(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    async def get_support(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.forecast_coordinator is None:
+            raise RuntimeError("forecast care context is unavailable")
+        target = datetime.now(self.timezone).date()
+        forecast = await self.forecast_coordinator.ensure_forecast(
+            ctx.participant_id,
+            target,
+            "user_requested_support",
+            refresh_calendar=True,
+        )
         recent = self.observations.recent(ctx.participant_id, limit=1)
-        payload = recent[0]["payload"] if recent else {}
-        stress = float(payload.get("stress_0_10", 0.0))
-        energy = float(payload.get("energy_0_10", 10.0))
-        if stress >= 7:
-            suggestion = "如果方便，可以先离开当前任务两分钟，缓慢呼吸并确认下一件最小可做的事。"
-        elif energy <= 3:
-            suggestion = "如果方便，可以先补水并安排一小段不带任务的休息。"
-        else:
-            suggestion = "可以按当前节奏继续；如果状态变化，随时做一次简短打卡。"
+        observation = recent[0] if recent else None
+        profile_row = self.profiles.current(ctx.participant_id)
+        output = dict(forecast.get("output") or {})
+        raw_alerts = [
+            item for item in (output.get("alerts") or []) if isinstance(item, dict)
+        ]
+        alert = self._support_alert(raw_alerts, observation)
+        contextual = self.care_messages.contextualize_alert(
+            alert,
+            source="user_requested_support",
+            local_date=target,
+            calendar_events=list(forecast.get("calendar_events") or []),
+            calendar_degraded=bool(forecast.get("calendar_degraded")),
+            recent_observation=observation,
+            profile=(profile_row or {}).get("profile"),
+            profile_version=(profile_row or {}).get("version"),
+        )
+        provenance = dict(contextual["care_provenance"])
+        provenance.update(
+            {
+                "source_forecast_id": forecast.get("id"),
+                "forecast_version": forecast.get("forecast_version"),
+            }
+        )
         return {
             "ok": True,
-            "support_type": "optional_brief_support",
-            "suggestion": suggestion,
+            "support_type": contextual["care_plan"]["intervention_type"],
+            "suggestion": contextual["message"],
+            "care_plan": contextual["care_plan"],
+            "care_context": contextual["care_context"],
+            "care_provenance": provenance,
             "context_acknowledged": bool(args.get("context")),
+        }
+
+    def _support_alert(
+        self,
+        alerts: list[dict[str, Any]],
+        observation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = datetime.now(self.timezone)
+
+        def alert_minute(item: dict[str, Any]) -> int:
+            try:
+                hour, minute = (
+                    int(part)
+                    for part in str(item.get("time") or "23:59")[:5].split(":")
+                )
+                return hour * 60 + minute
+            except (TypeError, ValueError):
+                return 1439
+
+        now_minute = now.hour * 60 + now.minute
+        future = [item for item in alerts if alert_minute(item) >= now_minute]
+        if future:
+            return min(future, key=alert_minute)
+
+        payload = dict((observation or {}).get("payload") or {})
+        try:
+            stress = float(payload.get("stress_0_10", 0.0))
+        except (TypeError, ValueError):
+            stress = 0.0
+        try:
+            energy = float(payload.get("energy_0_10", 10.0))
+        except (TypeError, ValueError):
+            energy = 10.0
+        return {
+            "time": now.strftime("%H:%M"),
+            "tier": 2 if stress >= 7.0 else 1,
+            "S": stress,
+            "V": energy,
+            "F": 0.0,
+            "trigger_source": "user_requested_support",
+            "care_action": (
+                "protected_break"
+                if stress >= 7.0 or energy <= 3.5
+                else "brief_check_in"
+            ),
+            "current_events": [],
+            "dominant_stressors": [],
         }
 
     async def get_pressure_curve(

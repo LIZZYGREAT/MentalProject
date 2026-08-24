@@ -238,6 +238,7 @@ class ForecastScheduler:
         payload = claimed["payload"]
         text = str(
             payload.get("message")
+            or payload.get("fallback_message")
             or "预测到临近的高压时段，可以提前安排短暂休息。"
         )
         try:

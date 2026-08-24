@@ -83,6 +83,17 @@ Warning 的发送上限、最小间隔、提前量、迟到宽限、重试和 cl
 仓储仍负责跨进程 claim、当前 Forecast 校验、每日发送上限、最小间隔和幂等约束，避免只靠
 进程内判断。
 
+模型告警通过显式、有界的 DTO 保留 `current_events` 与 `dominant_stressors`，但模型侧文案
+只作为降级 fallback。正常主动关怀由 Backend 根据风险时间查找前一项、进行中和下一项
+日程，只抽取近期 check-in 与明确的关怀偏好，再经确定性 `CareInterventionPolicy` 和版本化
+reviewed template 生成。非降级消息必须同时具有风险时间与日程/近期状态中的至少一项事实；
+上下文不足时标记 `context_quality=degraded` 并使用通用降级模板。
+
+`care_get_support` 与主动 Warning 复用同一 CareContext、Policy 和 Template 服务，区别仅在
+来源是用户主动请求。Warning payload 持久化 message、plan、context 和 provenance；其中
+包括 Warning/Forecast 标识、版本、模板、干预类型、日程 ID、Observation/Profile 版本。
+Scheduler 只发送已持久化文案，不让 LLM 决定是否推送，也不改变原有 durable delivery 状态机。
+
 ## Daily Review
 
 Daily Review 是独立的回顾反馈链。Scheduler 为 active 且已绑定的参与者创建每日任务，并

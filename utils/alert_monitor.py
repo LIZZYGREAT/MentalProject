@@ -304,22 +304,24 @@ class AlertMonitor:
     ) -> Dict[str, Any]:
         if tier == 3:
             title = "[红] 很高压力趋势"
-            message = "建议先暂停手头任务，确认自己的感受，并考虑联系可信任的人获得支持。"
+            fallback_message = "建议先暂停手头任务，确认自己的感受，并考虑联系可信任的人获得支持。"
             action = "pause_and_seek_support"
         elif tier == 2:
             title = "[橙] 持续高压提醒"
-            message = "如果条件允许，安排 10–15 分钟真正脱离任务的休息，再决定下一步。"
+            fallback_message = "如果条件允许，安排 10–15 分钟真正脱离任务的休息，再决定下一步。"
             action = "protected_break"
         else:
             title = "[黄] 压力偏高提醒"
-            message = "可以用几分钟检查任务优先级、补水或活动一下；若不需要，也可忽略本次提示。"
+            fallback_message = "可以用几分钟检查任务优先级、补水或活动一下；若不需要，也可忽略本次提示。"
             action = "brief_check_in"
 
         current_events = list(row.get("current_events", []))
         dominant_stressors = list(row.get("dominant_stressors", []))
         return {
             "type": title,
-            "message": message,
+            # This is a delivery-safe fallback, not the normal user-facing
+            # message. The runtime care planner adds contextual wording.
+            "fallback_message": fallback_message,
             "care_action": action,
             "time": row.get("time", "00:00"),
             "S": round(float(row.get("S", 0.0)), 2),

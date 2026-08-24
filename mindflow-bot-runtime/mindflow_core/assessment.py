@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import math
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -32,6 +33,80 @@ from settings.model_defaults import (
     DEFAULT_TIME_STEP_MINUTES,
 )
 from utils.event_factory import EventFactory
+
+
+ALERT_SCHEMA_VERSION = "forecast_alert.v2"
+_ALERT_TEXT_FIELDS = {
+    "type": 120,
+    "care_action": 64,
+    "time": 16,
+    "state": 64,
+    "trigger_source": 64,
+    "intensity_zone": 32,
+    "episode_identity": 128,
+}
+_ALERT_NUMBER_FIELDS = {
+    "S",
+    "V",
+    "E",
+    "P",
+    "F",
+    "C",
+    "tier",
+    "continuous_hours",
+    "elevated_auc",
+    "episode_index",
+}
+_ALERT_POLICY_FIELDS = {
+    "persistence_confirmed",
+    "daily_budgeted",
+    "episode_deduplicated",
+    "candidate_only",
+    "clinical_alert",
+}
+
+
+def sanitize_forecast_alert(value: Any) -> dict[str, Any]:
+    """Return the explicit, bounded alert DTO used by the runtime boundary."""
+
+    if not isinstance(value, dict):
+        return {
+            "alert_schema_version": ALERT_SCHEMA_VERSION,
+            "fallback_message": str(value or "")[:500],
+            "current_events": [],
+            "dominant_stressors": [],
+        }
+
+    result: dict[str, Any] = {"alert_schema_version": ALERT_SCHEMA_VERSION}
+    for field, limit in _ALERT_TEXT_FIELDS.items():
+        if value.get(field) is not None:
+            result[field] = str(value[field])[:limit]
+    fallback = value.get("fallback_message") or value.get("message")
+    if fallback is not None:
+        result["fallback_message"] = str(fallback)[:500]
+    for field in _ALERT_NUMBER_FIELDS:
+        raw = value.get(field)
+        if (
+            isinstance(raw, (int, float))
+            and not isinstance(raw, bool)
+            and math.isfinite(float(raw))
+        ):
+            result[field] = raw
+    for field in ("current_events", "dominant_stressors"):
+        raw = value.get(field)
+        result[field] = (
+            [str(item)[:160] for item in raw[:8]]
+            if isinstance(raw, (list, tuple))
+            else []
+        )
+    policy = value.get("policy")
+    if isinstance(policy, dict):
+        result["policy"] = {
+            field: bool(policy[field])
+            for field in _ALERT_POLICY_FIELDS
+            if isinstance(policy.get(field), bool)
+        }
+    return result
 
 
 @dataclass(frozen=True)
@@ -229,16 +304,7 @@ class AssessmentModel:
             }
             for index, point in enumerate(points or [])
         )
-        safe_alerts = tuple(
-            {
-                str(key): value
-                for key, value in alert.items()
-                if isinstance(value, (str, int, float, bool, type(None)))
-            }
-            if isinstance(alert, dict)
-            else {"message": str(alert)[:500]}
-            for alert in (alerts or [])
-        )
+        safe_alerts = tuple(sanitize_forecast_alert(alert) for alert in (alerts or []))
         return PredictionResult(
             model_version=self.MODEL_VERSION,
             model_family=model_family,

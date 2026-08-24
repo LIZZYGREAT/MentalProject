@@ -22,6 +22,12 @@ from app.repositories import (
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+from app.services.care_message_service import (
+    CARE_MESSAGE_SCHEMA_VERSION,
+    CareMessageService,
+)
+from app.services.care_intervention_policy import CARE_INTERVENTION_POLICY_VERSION
+from app.services.care_templates import CARE_TEMPLATE_LIBRARY_VERSION
 from app.services.forecast_initial_state import (
     ForecastInitialState,
     ForecastInitialStateResolver,
@@ -131,6 +137,7 @@ class ForecastCoordinator:
         self.learned_profiles = learned_profiles
         self.retrospective_curves = retrospective_curves
         self.initial_states = ForecastInitialStateResolver()
+        self.care_messages = CareMessageService(timezone_name)
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
 
@@ -144,15 +151,38 @@ class ForecastCoordinator:
         return _sha(payload), payload
 
     def _derive_warning_state(
-        self, output: dict[str, Any], target: date
+        self,
+        output: dict[str, Any],
+        target: date,
+        care_inputs: dict[str, Any] | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
     ]:
-        selected = self.warning_policy.select_daily_candidates(
+        selected_candidates = self.warning_policy.select_daily_candidates(
             output.get("alerts") or []
         )
+        facts = dict(care_inputs or {})
+        selected = [
+            self.care_messages.contextualize_alert(
+                alert,
+                source="forecast_warning",
+                local_date=target,
+                calendar_events=list(
+                    facts.get("calendar_events")
+                    or output.get("classified_calendar_events")
+                    or []
+                ),
+                calendar_degraded=bool(
+                    facts.get("calendar_degraded", output.get("calendar_degraded"))
+                ),
+                recent_observation=facts.get("recent_observation"),
+                profile=facts.get("profile"),
+                profile_version=facts.get("profile_version"),
+            )
+            for alert in selected_candidates
+        ]
         windows = self._warning_windows(selected, target)
         serialized_windows = [
             self._serializable_warning(item) for item in windows
@@ -186,10 +216,11 @@ class ForecastCoordinator:
         *,
         warning_revision: str,
         warning_policy_config: dict[str, object],
+        care_inputs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         output = dict(snapshot.get("output") or {})
         selected, windows, serialized_windows = self._derive_warning_state(
-            output, target
+            output, target, care_inputs
         )
         if self._warning_derivatives_match(
             snapshot,
@@ -381,6 +412,28 @@ class ForecastCoordinator:
             if target == local_now.date()
             else []
         )
+        recent_care_observation = None
+        recent_reader = getattr(self.observations, "recent", None)
+        if callable(recent_reader):
+            try:
+                recent_rows = await asyncio.to_thread(
+                    recent_reader, participant_id, limit=1
+                )
+                recent_care_observation = recent_rows[0] if recent_rows else None
+            except Exception as exc:
+                logger.warning(
+                    "care_recent_observation_unavailable participant_id=%s "
+                    "error_class=%s",
+                    participant_id,
+                    type(exc).__name__,
+                )
+        care_inputs = {
+            "calendar_events": presentation_events,
+            "calendar_degraded": bool(calendar_snapshot["degraded"]),
+            "recent_observation": recent_care_observation,
+            "profile": effective_profile,
+            "profile_version": profile_row.get("version") if profile_row else None,
+        }
         observation_revision = _sha(observations)
         profile_revision = _sha({
             "explicit": profile_row,
@@ -405,6 +458,7 @@ class ForecastCoordinator:
                 target,
                 warning_revision=warning_revision,
                 warning_policy_config=warning_policy_config,
+                care_inputs=care_inputs,
             )
             result = {
                 **cached,
@@ -437,6 +491,7 @@ class ForecastCoordinator:
                 target,
                 warning_revision=warning_revision,
                 warning_policy_config=warning_policy_config,
+                care_inputs=care_inputs,
             )
             result = {
                 **cached, "cache_hit": True, "calendar_changed": calendar_changed,
@@ -463,10 +518,15 @@ class ForecastCoordinator:
             output["semantic_prompt_version"] = PROMPT_VERSION
             output["course_resolver_version"] = COURSE_RESOLVER_VERSION
             output["course_catalog_revision"] = COURSE_CATALOG_REVISION
+            output["care_message_schema_version"] = CARE_MESSAGE_SCHEMA_VERSION
+            output["care_intervention_policy_version"] = (
+                CARE_INTERVENTION_POLICY_VERSION
+            )
+            output["care_template_library_version"] = CARE_TEMPLATE_LIBRARY_VERSION
             curve = list(output.get("trajectory") or [])
             peaks = sorted(curve, key=lambda point: float(point.get("stress_0_10") or 0.0), reverse=True)[:5]
             selected_alerts, warning_windows, serialized_windows = (
-                self._derive_warning_state(output, target)
+                self._derive_warning_state(output, target, care_inputs)
             )
             output["selected_warning_candidates"] = selected_alerts
             semantic_input = [

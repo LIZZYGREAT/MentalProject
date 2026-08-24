@@ -1018,6 +1018,29 @@ class WarningScheduleRepository:
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
         }
 
+    @staticmethod
+    def _payload_with_source_provenance(
+        payload: dict[str, Any],
+        *,
+        warning_id: uuid.UUID,
+        forecast_id: uuid.UUID,
+        forecast_version: str,
+    ) -> dict[str, Any]:
+        result = dict(payload)
+        raw_provenance = result.get("care_provenance")
+        provenance = (
+            dict(raw_provenance) if isinstance(raw_provenance, dict) else {}
+        )
+        provenance.update(
+            {
+                "source_warning_id": str(warning_id),
+                "source_forecast_id": str(forecast_id),
+                "forecast_version": str(forecast_version),
+            }
+        )
+        result["care_provenance"] = provenance
+        return result
+
     def sync(
         self, participant_id: uuid.UUID, local_date: date, *, forecast_id: uuid.UUID,
         forecast_version: str, warnings: list[dict[str, Any]], now: datetime,
@@ -1238,7 +1261,15 @@ class WarningScheduleRepository:
                     status = "suppressed"
                     payload["suppression_reason"] = "daily_cap"
                     next_attempt_at = None
+                row_id = uuid.uuid4()
+                payload = self._payload_with_source_provenance(
+                    payload,
+                    warning_id=row_id,
+                    forecast_id=forecast_id,
+                    forecast_version=forecast_version,
+                )
                 session.add(WarningSchedule(
+                    id=row_id,
                     participant_id=participant_id, local_date=local_date,
                     forecast_id=forecast_id, forecast_version=forecast_version,
                     warning_identity=identity, target_time=item["target_time"],
@@ -1256,6 +1287,12 @@ class WarningScheduleRepository:
                 # or tier change never revives or rewrites the old record.
                 counts["kept"] += 1
                 continue
+            desired_payload = self._payload_with_source_provenance(
+                dict(item["payload"]),
+                warning_id=row.id,
+                forecast_id=forecast_id,
+                forecast_version=forecast_version,
+            )
             schedule_changed = (
                 self._aware(row.target_time) != self._aware(item["target_time"])
                 or self._aware(row.risk_time) != self._aware(item["risk_time"])
@@ -1263,7 +1300,7 @@ class WarningScheduleRepository:
             )
             changed = (
                 row.forecast_version != forecast_version
-                or dict(row.payload_json) != dict(item["payload"])
+                or dict(row.payload_json) != desired_payload
                 or row.warning_level != item["warning_level"]
                 or schedule_changed
             )
@@ -1306,7 +1343,7 @@ class WarningScheduleRepository:
                     row.next_attempt_at = due
             row.forecast_id = forecast_id
             row.forecast_version = forecast_version
-            row.payload_json = dict(item["payload"])
+            row.payload_json = desired_payload
             row.target_time = item["target_time"]
             row.risk_time = item["risk_time"]
             row.valid_until = item["valid_until"]
