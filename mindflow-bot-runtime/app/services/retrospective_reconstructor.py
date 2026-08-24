@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
 import math
 from typing import Any
-from zoneinfo import ZoneInfo
 
 
 PEAK_PERIODS: dict[str, tuple[int, int] | None] = {
@@ -35,7 +33,7 @@ def _gaussian(delta: float, sigma: float) -> float:
 
 
 class RetrospectiveReconstructor:
-    ALGORITHM_VERSION = "anchor-residual-kernel-v1"
+    ALGORITHM_VERSION = "anchor-residual-kernel-v2"
 
     def __init__(
         self, *, morning_sigma: float = 90, end_sigma: float = 60,
@@ -50,18 +48,29 @@ class RetrospectiveReconstructor:
         self.end_state_gain = end_state_gain
 
     def reconstruct(
-        self, curve: list[dict], review: dict[str, Any], *, timezone_name: str,
+        self,
+        curve: list[dict],
+        review: dict[str, Any],
+        *,
+        end_anchor_minute: int,
+        end_anchor_source: str,
+        review_local_date: str,
+        submitted_local_date: str,
     ) -> tuple[list[dict], dict, dict]:
         if not curve:
             raise ValueError("source forecast curve is empty")
+        if not 0 <= end_anchor_minute < 24 * 60:
+            raise ValueError("end anchor minute must be within the review day")
+        if end_anchor_source not in {
+            "same_day_submission", "scheduled_review_time"
+        }:
+            raise ValueError("end anchor source is invalid")
         base = deepcopy(curve)
         result = deepcopy(curve)
-        submitted = datetime.fromisoformat(review["submitted_at"].replace("Z", "+00:00"))
-        local = submitted.astimezone(ZoneInfo(timezone_name))
-        end_minute = local.hour * 60 + local.minute
+        end_minute = end_anchor_minute
         wake_minute = self._wake_minute(review)
         peak_minute, peak_reason = self._peak_minute(
-            base, review["peak_period"], submitted_minute=end_minute
+            base, review["peak_period"], end_anchor_minute=end_minute
         )
 
         anchors = [
@@ -149,6 +158,10 @@ class RetrospectiveReconstructor:
             "peak_anchor_time": result[_nearest(result, peak_minute)]["time"],
             "wake_anchor_time": result[_nearest(result, wake_minute)]["time"],
             "end_anchor_time": result[_nearest(result, end_minute)]["time"],
+            "end_anchor_minute": end_minute,
+            "end_anchor_source": end_anchor_source,
+            "submitted_local_date": submitted_local_date,
+            "review_local_date": review_local_date,
             "slope_limit_applied_count": limited,
             "energy_consumption_diagnostic": float(review["energy_consumption"]),
             "energy_consumption_used_as_hard_anchor": False,
@@ -168,7 +181,7 @@ class RetrospectiveReconstructor:
 
     @staticmethod
     def _peak_minute(
-        curve: list[dict], period: str, *, submitted_minute: int
+        curve: list[dict], period: str, *, end_anchor_minute: int
     ) -> tuple[int, str]:
         bounds = PEAK_PERIODS.get(period)
         candidates = curve
@@ -178,14 +191,14 @@ class RetrospectiveReconstructor:
             candidates = [point for point in curve if start <= _minute(point["time"]) < end]
             reason = "forecast_drive_max_within_reported_period"
         else:
-            # "Unknown" is not evidence that the peak happened when the form
-            # was submitted. Avoid manufacturing that exact anchor.
-            away_from_submit = [
+            # "Unknown" is not evidence that the peak happened at the reported
+            # closing state. Avoid manufacturing that exact anchor.
+            away_from_end_anchor = [
                 point for point in candidates
-                if abs(_minute(point["time"]) - submitted_minute) > 30
+                if abs(_minute(point["time"]) - end_anchor_minute) > 30
             ]
-            if away_from_submit:
-                candidates = away_from_submit
+            if away_from_end_anchor:
+                candidates = away_from_end_anchor
         if not candidates:
             candidates = curve
             reason = "forecast_drive_max_fallback"

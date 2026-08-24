@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -35,6 +36,27 @@ def _text(value: Any, field: str, maximum: int) -> str | None:
     if len(result) > maximum:
         raise ValueError(f"{field} must be at most {maximum} characters")
     return result or None
+
+
+def _stored_datetime(value: str | datetime) -> datetime:
+    """Parse repository timestamps, treating SQLite's naive values as UTC."""
+
+    parsed = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    )
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class DailyReviewEndAnchor:
+    minute: int
+    source: str
+    review_local_date: date
+    submitted_local_date: date
 
 
 class DailyReviewService:
@@ -90,9 +112,16 @@ class DailyReviewService:
         now = submitted_at or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
         today = now.astimezone(self.timezone).date()
         if local_date > today or (today - local_date).days > 1:
             raise ValueError("daily review date is outside the accepted window")
+        # Validate the model-time semantics before persisting an append-only
+        # response. The persisted response is used again below so duplicate
+        # callbacks retain their original audit timestamp and anchor.
+        self._end_anchor(local_date, schedule, now)
+        self._validate_submission_window(schedule, now)
         peak_period = str(values.get("peak_period") or "")
         if peak_period not in PEAK_PERIODS:
             raise ValueError("peak_period is invalid")
@@ -119,7 +148,18 @@ class DailyReviewService:
             values=normalized,
             raw=dict(values),
         )
-        retrospective = self.rebuild(participant_id, local_date, response=response)
+        retrospective = None
+        if not created:
+            retrospective = self.retrospectives.latest_for_response(
+                participant_id, response["id"]
+            )
+        if retrospective is None:
+            end_anchor = self._end_anchor(
+                local_date, schedule, _stored_datetime(response["submitted_at"])
+            )
+            retrospective = self.rebuild(
+                participant_id, local_date, response=response, end_anchor=end_anchor
+            )
         return {
             "response": response,
             "created": created,
@@ -129,10 +169,21 @@ class DailyReviewService:
     def rebuild(
         self, participant_id: uuid.UUID, local_date: date,
         *, response: dict[str, Any] | None = None,
+        end_anchor: DailyReviewEndAnchor | None = None,
     ) -> dict[str, Any]:
         response = response or self.responses.latest(participant_id, local_date)
         if response is None:
             raise ValueError("daily review response not found")
+        if end_anchor is None:
+            schedule_id = response.get("schedule_id")
+            schedule = self.schedules.get(schedule_id) if schedule_id else None
+            if schedule is None or schedule["participant_id"] != str(participant_id):
+                raise ValueError("daily review schedule not found for reconstruction")
+            if schedule["local_date"] != local_date.isoformat():
+                raise ValueError("daily review date does not match schedule")
+            end_anchor = self._end_anchor(
+                local_date, schedule, _stored_datetime(response["submitted_at"])
+            )
         forecast = self.forecasts.latest(participant_id, local_date)
         if forecast is None:
             raise ValueError("source forecast not found")
@@ -150,7 +201,12 @@ class DailyReviewService:
             timezone_name=self.settings.daily_review_timezone,
         )
         curve, analysis, diagnostics = self.reconstructor.reconstruct(
-            smoothed, response, timezone_name=self.settings.daily_review_timezone
+            smoothed,
+            response,
+            end_anchor_minute=end_anchor.minute,
+            end_anchor_source=end_anchor.source,
+            review_local_date=end_anchor.review_local_date.isoformat(),
+            submitted_local_date=end_anchor.submitted_local_date.isoformat(),
         )
         reconstruction_version = self._revision({
             "forecast_version": forecast["forecast_version"],
@@ -159,6 +215,10 @@ class DailyReviewService:
             "observation_revision": observation_revision,
             "smoother": smoothing_diagnostics["version"],
             "algorithm": self.reconstructor.ALGORITHM_VERSION,
+            "end_anchor_minute": end_anchor.minute,
+            "end_anchor_source": end_anchor.source,
+            "review_local_date": end_anchor.review_local_date.isoformat(),
+            "submitted_local_date": end_anchor.submitted_local_date.isoformat(),
         })
         diagnostics["observation_smoothing"] = smoothing_diagnostics
         diagnostics["original_forecast_immutable"] = True
@@ -175,6 +235,47 @@ class DailyReviewService:
             analysis_json=analysis,
             diagnostics_json=diagnostics,
         )
+
+    def _end_anchor(
+        self,
+        local_date: date,
+        schedule: dict[str, Any],
+        submitted_at: datetime,
+    ) -> DailyReviewEndAnchor:
+        submitted_local = _stored_datetime(submitted_at).astimezone(self.timezone)
+        scheduled_local = _stored_datetime(schedule["scheduled_at"]).astimezone(
+            self.timezone
+        )
+        if scheduled_local.date() != local_date:
+            raise ValueError("daily review scheduled time does not match local date")
+        if submitted_local.date() < local_date:
+            raise ValueError("daily review was submitted before its local date")
+        if submitted_local.date() == local_date:
+            anchor_local = submitted_local
+            source = "same_day_submission"
+        else:
+            anchor_local = scheduled_local
+            source = "scheduled_review_time"
+        return DailyReviewEndAnchor(
+            minute=anchor_local.hour * 60 + anchor_local.minute,
+            source=source,
+            review_local_date=local_date,
+            submitted_local_date=submitted_local.date(),
+        )
+
+    @staticmethod
+    def _validate_submission_window(
+        schedule: dict[str, Any], submitted_at: datetime
+    ) -> None:
+        scheduled_at = _stored_datetime(schedule["scheduled_at"])
+        valid_until = _stored_datetime(schedule["valid_until"])
+        submitted = _stored_datetime(submitted_at)
+        if valid_until < scheduled_at:
+            raise ValueError("daily review schedule has an invalid validity window")
+        if submitted < scheduled_at:
+            raise ValueError("daily review was submitted before its scheduled time")
+        if submitted > valid_until:
+            raise ValueError("daily review submission window has expired")
 
     @staticmethod
     def _revision(value: Any) -> str:

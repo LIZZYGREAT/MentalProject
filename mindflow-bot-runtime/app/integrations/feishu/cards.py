@@ -146,8 +146,8 @@ def daily_review_card(
     ]
     fields = [
         ("start_stress", "早晨起始压力"), ("start_energy", "早晨起始精力"),
-        ("peak_stress", "全天最高压力"), ("end_stress", "当前/收尾压力"),
-        ("end_energy", "当前/收尾精力"), ("energy_consumption", "全天精力消耗"),
+        ("peak_stress", "全天最高压力"), ("end_stress", "当天收尾压力"),
+        ("end_energy", "当天收尾精力"), ("energy_consumption", "全天精力消耗"),
     ]
     elements: list[dict[str, Any]] = []
     for name, label in fields:

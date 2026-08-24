@@ -4,10 +4,13 @@ from pathlib import Path
 import asyncio
 import uuid
 
+import pytest
+
 from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
 from app.integrations.feishu.cards import daily_review_card
+from app.models import RetrospectiveCurveSnapshot
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 from app.repositories_daily_review import (
     DailyReviewResponseRepository,
@@ -18,6 +21,7 @@ from app.services.daily_review_scheduler import DailyReviewScheduler
 from app.services.daily_review_service import DailyReviewService
 from app.services.forecast_initial_state import ForecastInitialStateResolver
 from helpers import memory_database, participant
+from sqlalchemy import func, select
 from starlette.testclient import TestClient
 
 
@@ -53,10 +57,10 @@ def _service(database):
     )
 
 
-def _seed_forecast(database, person_id, target):
+def _seed_forecast(database, person_id, target, *, version="forecast-original"):
     return ForecastSnapshotRepository(database).save(
         person_id, target, calendar_revision="cal", semantic_revision="sem",
-        algorithm_version="model-v1", forecast_version="forecast-original",
+        algorithm_version="model-v1", forecast_version=version,
         semantic_status="complete", semantic_input=[], curve=_curve(), peaks=[],
         warning_windows=[{"risk": "unchanged"}], output={"stress_0_10": 4, "vitality_0_10": 5},
     )
@@ -71,6 +75,15 @@ def _values(**updates):
     }
     values.update(updates)
     return values
+
+
+def _retrospective_count(database, participant_id) -> int:
+    with database.session() as session:
+        return int(session.scalar(select(func.count()).select_from(
+            RetrospectiveCurveSnapshot
+        ).where(
+            RetrospectiveCurveSnapshot.participant_id == participant_id
+        )) or 0)
 
 
 def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast():
@@ -102,6 +115,11 @@ def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast(
     assert duplicate["created"] is False
     assert duplicate["response"]["id"] == first["response"]["id"]
     assert revised["response"]["revision"] == 2
+    assert first["retrospective"]["diagnostics"]["end_anchor_time"] == "22:30"
+    assert (
+        first["retrospective"]["diagnostics"]["end_anchor_source"]
+        == "same_day_submission"
+    )
     latest = ForecastSnapshotRepository(database).latest(person.id, target)
     assert latest["id"] == original["id"]
     assert latest["forecast_version"] == "forecast-original"
@@ -110,6 +128,10 @@ def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast(
     assert posterior["source_forecast_id"] == original["id"]
     assert posterior["diagnostics"]["peak_used_as_current_state"] is False
     assert posterior["diagnostics"]["peak_anchor_reason"] == "forecast_drive_max_within_reported_period"
+    assert posterior["diagnostics"]["end_anchor_time"] == "22:40"
+    assert posterior["diagnostics"]["end_anchor_source"] == "same_day_submission"
+    assert posterior["diagnostics"]["review_local_date"] == "2030-01-15"
+    assert posterior["diagnostics"]["submitted_local_date"] == "2030-01-15"
     assert posterior["analysis"]["forward_terminal_state"]["source"] == "daily_review_end_state"
     assert max(abs(a["stress_0_10"] - b["stress_0_10"]) for a, b in zip(_curve(), posterior["curve"])) > 0
     slopes = [
@@ -146,6 +168,376 @@ def test_daily_review_validation_and_card_contract():
         "end_stress", "end_energy", "energy_consumption", "daily_review_submit",
     ):
         assert field in serialized
+    assert "当天收尾压力" in serialized
+    assert "当天收尾精力" in serialized
+    assert "当前/收尾" not in serialized
+
+
+def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_time():
+    database = memory_database()
+    person = participant(database, "DR-CROSS-MIDNIGHT")
+    target = date(2030, 1, 15)
+    original = _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "chat-1"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "message-1"
+
+    scheduler = DailyReviewScheduler(
+        schedules=schedules,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        catch_up_minutes=120,
+        validity_minutes=1440,
+    )
+    restart = datetime(2030, 1, 15, 16, 5, tzinfo=timezone.utc)
+    counts = asyncio.run(scheduler.run_once(restart))
+    action = sent[0][1]["elements"][1]["elements"][-1]["value"]
+
+    service = _service(database)
+    result = service.submit(
+        person.id,
+        callback_event_id="callback-cross-midnight",
+        action=action,
+        values=_values(end_stress="9", end_energy="2"),
+        submitted_at=datetime(2030, 1, 15, 16, 6, tzinfo=timezone.utc),
+    )
+    response = result["response"]
+    retrospective = result["retrospective"]
+    diagnostics = retrospective["diagnostics"]
+
+    assert counts == {
+        "ensured": 1, "sent": 1, "unavailable": 0, "failed": 0,
+    }
+    assert response["local_date"] == "2030-01-15"
+    assert response["submitted_at"].startswith("2030-01-15T16:06:00")
+    assert diagnostics["review_local_date"] == "2030-01-15"
+    assert diagnostics["submitted_local_date"] == "2030-01-16"
+    assert diagnostics["end_anchor_time"] == "22:00"
+    assert diagnostics["end_anchor_time"] not in {"00:05", "00:06"}
+    assert diagnostics["end_anchor_source"] == "scheduled_review_time"
+    assert retrospective["source_forecast_id"] == original["id"]
+    assert diagnostics["original_forecast_immutable"] is True
+
+    _, correct_analysis, _ = service.reconstructor.reconstruct(
+        _curve(), response,
+        end_anchor_minute=22 * 60,
+        end_anchor_source="scheduled_review_time",
+        review_local_date="2030-01-15",
+        submitted_local_date="2030-01-16",
+    )
+    _, midnight_analysis, _ = service.reconstructor.reconstruct(
+        _curve(), response,
+        end_anchor_minute=5,
+        end_anchor_source="scheduled_review_time",
+        review_local_date="2030-01-15",
+        submitted_local_date="2030-01-16",
+    )
+    forward = retrospective["analysis"]["forward_terminal_state"]
+    assert forward == correct_analysis["forward_terminal_state"]
+    assert forward != midnight_analysis["forward_terminal_state"]
+
+    next_day = ForecastInitialStateResolver().resolve(
+        target + timedelta(days=1),
+        target,
+        previous_day_forecast=original,
+        previous_day_terminal_override={
+            **forward,
+            "retrospective_id": retrospective["id"],
+            "daily_review_revision": response["revision"],
+        },
+    )
+    assert next_day.mode == "previous_day_daily_review"
+    assert next_day.model_override == {
+        "stress_0_10": forward["stress_0_10"],
+        "vitality_0_10": forward["vitality_0_10"],
+    }
+    rebuilt = service.rebuild(person.id, target)
+    assert rebuilt["diagnostics"]["end_anchor_time"] == "22:00"
+    assert rebuilt["diagnostics"]["end_anchor_source"] == "scheduled_review_time"
+
+
+def test_next_morning_recovered_card_still_uses_previous_day_closing_anchor():
+    database = memory_database()
+    person = participant(database, "DR-LATE-RECOVERY-ANCHOR")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    due = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    schedule = schedules.ensure(person.id, target, due)
+    claimed = schedules.claim_due(due, 120)[0]
+    schedules.mark_unavailable(
+        schedule["id"], claimed["claim_token"], now=due
+    )
+    sent = []
+
+    class Participants:
+        def active_ids(self):
+            return [person.id]
+
+    class Bindings:
+        def get_for_participant(self, _pid):
+            return {"chat_id": "recovered-chat"}
+
+    class Sender:
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            sent.append((chat_id, card, message_uuid))
+            return "recovered-message"
+
+    scheduler = DailyReviewScheduler(
+        schedules=schedules,
+        participants=Participants(),
+        bindings=Bindings(),
+        sender=Sender(),
+        timezone_name="Asia/Shanghai",
+        local_time="22:00",
+        catch_up_minutes=120,
+        validity_minutes=1440,
+    )
+    recovered_at = datetime(2030, 1, 16, 2, 0, tzinfo=timezone.utc)
+    assert asyncio.run(scheduler.run_once(recovered_at))["sent"] == 1
+    action = sent[0][1]["elements"][1]["elements"][-1]["value"]
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-late-recovery",
+        action=action,
+        values=_values(),
+        submitted_at=datetime(2030, 1, 16, 2, 5, tzinfo=timezone.utc),
+    )
+
+    diagnostics = result["retrospective"]["diagnostics"]
+    assert result["response"]["submitted_at"].startswith("2030-01-16T02:05:00")
+    assert diagnostics["submitted_local_date"] == "2030-01-16"
+    assert diagnostics["end_anchor_time"] == "22:00"
+    assert diagnostics["end_anchor_time"] != "10:05"
+    assert diagnostics["end_anchor_source"] == "scheduled_review_time"
+
+
+def test_schedule_date_mismatch_fails_closed_before_response_is_saved():
+    database = memory_database()
+    person = participant(database, "DR-BAD-SCHEDULE-DATE")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    schedule = schedules.ensure(
+        person.id,
+        target,
+        # This is Jan 16 at 22:00 in the configured business timezone.
+        datetime(2030, 1, 16, 14, 0, tzinfo=timezone.utc),
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+
+    with pytest.raises(
+        ValueError, match="scheduled time does not match local date"
+    ):
+        _service(database).submit(
+            person.id,
+            callback_event_id="callback-bad-schedule-date",
+            action=action,
+            values=_values(),
+            submitted_at=datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc),
+        )
+    assert DailyReviewResponseRepository(database).latest(person.id, target) is None
+
+
+def test_expired_sent_card_cannot_save_response_or_retrospective():
+    database = memory_database()
+    person = participant(database, "DR-EXPIRED-CALLBACK")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    claim = schedules.claim_due(scheduled_at, 120)[0]
+    assert schedules.mark_sent(
+        schedule["id"], claim["claim_token"],
+        now=scheduled_at, provider_message_id="sent-card",
+    ) is True
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+
+    # Jan 16 at 23:00 Asia/Shanghai is one hour after default validity.
+    with pytest.raises(ValueError, match="submission window has expired"):
+        _service(database).submit(
+            person.id,
+            callback_event_id="callback-expired-card",
+            action=action,
+            values=_values(),
+            submitted_at=datetime(2030, 1, 16, 15, 0, tzinfo=timezone.utc),
+        )
+
+    assert DailyReviewResponseRepository(database).latest(person.id, target) is None
+    assert RetrospectiveCurveRepository(database).latest(person.id, target) is None
+
+
+@pytest.mark.parametrize("boundary_minutes", [0, 24 * 60])
+def test_submission_window_includes_both_scheduled_and_valid_until_boundaries(
+    boundary_minutes,
+):
+    database = memory_database()
+    person = participant(database, f"DR-VALID-BOUNDARY-{boundary_minutes}")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    valid_until = scheduled_at + timedelta(days=1)
+    schedule = schedules.ensure(
+        person.id, target, scheduled_at, valid_until=valid_until
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+
+    result = _service(database).submit(
+        person.id,
+        callback_event_id=f"callback-boundary-{boundary_minutes}",
+        action=action,
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=boundary_minutes),
+    )
+
+    assert result["created"] is True
+    assert result["retrospective"]["daily_review_response_id"] == result["response"]["id"]
+
+
+def test_submission_before_scheduled_time_has_no_model_side_effects():
+    database = memory_database()
+    person = participant(database, "DR-BEFORE-SCHEDULE")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+
+    with pytest.raises(ValueError, match="before its scheduled time"):
+        _service(database).submit(
+            person.id,
+            callback_event_id="callback-too-early",
+            action=action,
+            values=_values(),
+            submitted_at=scheduled_at - timedelta(minutes=1),
+        )
+
+    assert DailyReviewResponseRepository(database).latest(person.id, target) is None
+    assert RetrospectiveCurveRepository(database).latest(person.id, target) is None
+
+
+def test_duplicate_callback_does_not_rebuild_against_a_new_forecast_version():
+    database = memory_database()
+    person = participant(database, "DR-IDEMPOTENT-FORECAST")
+    target = date(2030, 1, 15)
+    original = _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    first = service.submit(
+        person.id,
+        callback_event_id="callback-idempotent",
+        action=action,
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=30),
+    )
+    assert _retrospective_count(database, person.id) == 1
+
+    latest_forecast = _seed_forecast(
+        database, person.id, target, version="forecast-v2"
+    )
+    assert latest_forecast["id"] != original["id"]
+    duplicate = service.submit(
+        person.id,
+        callback_event_id="callback-idempotent",
+        action=action,
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=35),
+    )
+
+    assert duplicate["created"] is False
+    assert duplicate["response"]["id"] == first["response"]["id"]
+    assert duplicate["retrospective"]["id"] == first["retrospective"]["id"]
+    assert duplicate["retrospective"]["source_forecast_version"] == "forecast-original"
+    assert _retrospective_count(database, person.id) == 1
+
+
+def test_duplicate_callback_recovers_once_when_response_exists_without_retrospective():
+    database = memory_database()
+    person = participant(database, "DR-IDEMPOTENT-RECOVERY")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    schedules = DailyReviewScheduleRepository(database)
+    scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
+    schedule = schedules.ensure(person.id, target, scheduled_at)
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated reconstruction crash")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="simulated reconstruction crash"):
+        service.submit(
+            person.id,
+            callback_event_id="callback-recovery",
+            action=action,
+            values=_values(),
+            submitted_at=scheduled_at + timedelta(minutes=30),
+        )
+    response = DailyReviewResponseRepository(database).latest(person.id, target)
+    assert response is not None
+    assert RetrospectiveCurveRepository(database).latest(person.id, target) is None
+
+    service.rebuild = rebuild
+    recovered = service.submit(
+        person.id,
+        callback_event_id="callback-recovery",
+        action=action,
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=31),
+    )
+    repeated = service.submit(
+        person.id,
+        callback_event_id="callback-recovery",
+        action=action,
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=32),
+    )
+
+    assert recovered["created"] is False
+    assert recovered["response"]["id"] == response["id"]
+    assert repeated["retrospective"]["id"] == recovered["retrospective"]["id"]
+    assert _retrospective_count(database, person.id) == 1
 
 
 def test_schedule_claim_lease_retry_and_stable_message_uuid():

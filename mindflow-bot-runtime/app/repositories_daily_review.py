@@ -345,6 +345,25 @@ class RetrospectiveCurveRepository:
             ).order_by(desc(RetrospectiveCurveSnapshot.generated_at)).limit(1)).scalar_one_or_none()
             return self._view(row) if row else None
 
+    def latest_for_response(
+        self,
+        participant_id: uuid.UUID,
+        daily_review_response_id: uuid.UUID | str,
+    ) -> dict[str, Any] | None:
+        try:
+            response_id = uuid.UUID(str(daily_review_response_id))
+        except ValueError:
+            return None
+        with self.database.session() as session:
+            row = session.execute(select(RetrospectiveCurveSnapshot).where(
+                RetrospectiveCurveSnapshot.participant_id == participant_id,
+                RetrospectiveCurveSnapshot.daily_review_response_id == response_id,
+            ).order_by(
+                desc(RetrospectiveCurveSnapshot.generated_at),
+                desc(RetrospectiveCurveSnapshot.id),
+            ).limit(1)).scalar_one_or_none()
+            return self._view(row) if row else None
+
     @staticmethod
     def _view(row: RetrospectiveCurveSnapshot) -> dict[str, Any]:
         return {
