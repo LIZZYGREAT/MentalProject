@@ -187,8 +187,13 @@ class DailyReviewService:
         end_anchor = self._end_anchor(
             local_date, schedule, _stored_datetime(response["submitted_at"])
         )
+        causal_cutoff = _stored_datetime(response["submitted_at"])
         retrospective = self.rebuild(
-            participant_id, local_date, response=response, end_anchor=end_anchor
+            participant_id,
+            local_date,
+            response=response,
+            end_anchor=end_anchor,
+            causal_cutoff=causal_cutoff,
         )
         return {
             "response": response,
@@ -223,7 +228,11 @@ class DailyReviewService:
         )
         if retrospective is None:
             retrospective = self.rebuild(
-                participant_id, local_date, response=response, end_anchor=end_anchor
+                participant_id,
+                local_date,
+                response=response,
+                end_anchor=end_anchor,
+                causal_cutoff=original_submitted_at,
             )
         return {
             "response": response,
@@ -235,6 +244,7 @@ class DailyReviewService:
         self, participant_id: uuid.UUID, local_date: date,
         *, response: dict[str, Any] | None = None,
         end_anchor: DailyReviewEndAnchor | None = None,
+        causal_cutoff: datetime | None = None,
     ) -> dict[str, Any]:
         response = response or self.responses.latest(participant_id, local_date)
         if response is None:
@@ -249,12 +259,19 @@ class DailyReviewService:
             end_anchor = self._end_anchor(
                 local_date, schedule, _stored_datetime(response["submitted_at"])
             )
-        forecast = self.forecasts.latest(participant_id, local_date)
+        forecast = (
+            self.forecasts.latest_at_or_before(
+                participant_id, local_date, causal_cutoff
+            )
+            if causal_cutoff is not None
+            else self.forecasts.latest(participant_id, local_date)
+        )
         if forecast is None:
             raise ValueError("source forecast not found")
         observations = self.observations.for_local_date(
             participant_id, local_date,
             timezone_name=self.settings.daily_review_timezone,
+            as_of=causal_cutoff,
             limit=500,
         )
         observation_revision = self._revision([

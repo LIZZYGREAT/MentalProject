@@ -10,7 +10,7 @@ from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
 from app.integrations.feishu.cards import daily_review_card
-from app.models import RetrospectiveCurveSnapshot
+from app.models import ForecastSnapshot, RetrospectiveCurveSnapshot
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 from app.repositories_daily_review import (
     DailyReviewResponseRepository,
@@ -91,6 +91,26 @@ def _utc_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _set_forecast_timeline(
+    database, forecast_id: str, generated_at: datetime, *, valid: bool | None = None
+) -> None:
+    with database.session() as session:
+        row = session.get(ForecastSnapshot, uuid.UUID(forecast_id))
+        assert row is not None
+        row.generated_at = generated_at
+        if valid is not None:
+            row.valid = valid
+
+
+def _set_retrospective_generated_at(
+    database, retrospective_id: str, generated_at: datetime
+) -> None:
+    with database.session() as session:
+        row = session.get(RetrospectiveCurveSnapshot, uuid.UUID(retrospective_id))
+        assert row is not None
+        row.generated_at = generated_at
 
 
 def test_daily_review_is_append_only_idempotent_and_preserves_original_forecast():
@@ -545,6 +565,266 @@ def test_duplicate_callback_recovers_once_when_response_exists_without_retrospec
     assert recovered["response"]["id"] == response["id"]
     assert repeated["retrospective"]["id"] == recovered["retrospective"]["id"]
     assert _retrospective_count(database, person.id) == 1
+
+
+def test_crash_recovery_uses_forecast_visible_at_original_submission():
+    database = memory_database()
+    person = participant(database, "DR-CAUSAL-FORECAST")
+    target = date(2030, 1, 15)
+    t0 = datetime(2030, 1, 15, 14, 10, tzinfo=timezone.utc)
+    t1 = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    t2 = datetime(2030, 1, 15, 14, 40, tzinfo=timezone.utc)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-causal-v1"
+    )
+    _set_forecast_timeline(database, forecast_v1["id"], t0)
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated causal forecast crash")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="causal forecast crash"):
+        service.submit(
+            person.id, callback_event_id="callback-causal-forecast",
+            action=action, values=_values(), submitted_at=t1,
+        )
+
+    forecast_v2 = _seed_forecast(
+        database, person.id, target, version="forecast-causal-v2"
+    )
+    _set_forecast_timeline(database, forecast_v2["id"], t2)
+    with database.session() as session:
+        stored_v1 = session.get(ForecastSnapshot, uuid.UUID(forecast_v1["id"]))
+        assert stored_v1 is not None and stored_v1.valid is False
+
+    service.rebuild = rebuild
+    recovered = service.submit(
+        person.id, callback_event_id="callback-causal-forecast",
+        action=action, values={}, submitted_at=t2 + timedelta(minutes=1),
+    )
+
+    assert recovered["created"] is False
+    assert recovered["retrospective"]["source_forecast_version"] == "forecast-causal-v1"
+    assert recovered["retrospective"]["source_forecast_id"] == forecast_v1["id"]
+
+
+def test_crash_recovery_excludes_observations_after_original_submission():
+    database = memory_database()
+    person = participant(database, "DR-CAUSAL-OBSERVATION")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    t1 = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    observations = ObservationRepository(database)
+    observation_o1 = observations.add(
+        person.id, "check_in", {"stress_0_10": 4},
+        observed_at=t1 - timedelta(minutes=20),
+    )
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated causal observation crash")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="causal observation crash"):
+        service.submit(
+            person.id, callback_event_id="callback-causal-observation",
+            action=action, values=_values(), submitted_at=t1,
+        )
+
+    observation_o2 = observations.add(
+        person.id, "check_in", {"stress_0_10": 9},
+        observed_at=t1 + timedelta(minutes=1),
+    )
+    service.rebuild = rebuild
+    recovered = service.submit(
+        person.id, callback_event_id="callback-causal-observation",
+        action=action, values={}, submitted_at=t1 + timedelta(minutes=2),
+    )
+    used = recovered["retrospective"]["diagnostics"][
+        "observation_smoothing"
+    ]["observation_ids"]
+
+    assert str(observation_o1) in used
+    assert str(observation_o2) not in used
+
+
+def test_crash_recovery_matches_non_crash_causal_sources():
+    database = memory_database()
+    normal_person = participant(database, "DR-CAUSAL-NORMAL")
+    recovery_person = participant(database, "DR-CAUSAL-RECOVERY")
+    target = date(2030, 1, 15)
+    t0 = datetime(2030, 1, 15, 14, 10, tzinfo=timezone.utc)
+    t1 = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    t2 = datetime(2030, 1, 15, 14, 40, tzinfo=timezone.utc)
+    schedules = DailyReviewScheduleRepository(database)
+
+    cases = []
+    for person, callback in (
+        (normal_person, "callback-causal-normal"),
+        (recovery_person, "callback-causal-recovery"),
+    ):
+        forecast_v1 = _seed_forecast(
+            database, person.id, target, version="forecast-shared-v1"
+        )
+        _set_forecast_timeline(database, forecast_v1["id"], t0)
+        schedule = schedules.ensure(
+            person.id, target, datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+        )
+        cases.append((person, callback, {
+            "version": "1", "schedule_id": schedule["id"],
+            "local_date": target.isoformat(),
+        }))
+
+    normal_service = _service(database)
+    normal = normal_service.submit(
+        normal_person.id, callback_event_id=cases[0][1],
+        action=cases[0][2], values=_values(), submitted_at=t1,
+    )
+
+    recovery_service = _service(database)
+    rebuild = recovery_service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated comparison crash")
+
+    recovery_service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="comparison crash"):
+        recovery_service.submit(
+            recovery_person.id, callback_event_id=cases[1][1],
+            action=cases[1][2], values=_values(), submitted_at=t1,
+        )
+
+    for person in (normal_person, recovery_person):
+        forecast_v2 = _seed_forecast(
+            database, person.id, target, version="forecast-shared-v2"
+        )
+        _set_forecast_timeline(database, forecast_v2["id"], t2)
+
+    recovery_service.rebuild = rebuild
+    recovered = recovery_service.submit(
+        recovery_person.id, callback_event_id=cases[1][1],
+        action=cases[1][2], values={}, submitted_at=t2 + timedelta(minutes=1),
+    )
+
+    assert normal["retrospective"]["source_forecast_version"] == "forecast-shared-v1"
+    assert recovered["retrospective"]["source_forecast_version"] == "forecast-shared-v1"
+    assert (
+        normal["retrospective"]["observation_revision"]
+        == recovered["retrospective"]["observation_revision"]
+    )
+
+
+def test_late_recovery_of_old_revision_does_not_replace_new_revision():
+    database = memory_database()
+    person = participant(database, "DR-REVISION-RECOVERY")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, scheduled_at
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    rebuild = service.rebuild
+
+    def crash_after_response(*_args, **_kwargs):
+        raise RuntimeError("simulated revision one crash")
+
+    service.rebuild = crash_after_response
+    with pytest.raises(RuntimeError, match="revision one crash"):
+        service.submit(
+            person.id, callback_event_id="callback-revision-1",
+            action=action, values=_values(end_stress="4"),
+            submitted_at=scheduled_at + timedelta(minutes=20),
+        )
+
+    service.rebuild = rebuild
+    revision_two = service.submit(
+        person.id, callback_event_id="callback-revision-2",
+        action=action, values=_values(end_stress="7"),
+        submitted_at=scheduled_at + timedelta(minutes=25),
+    )
+    recovered_revision_one = service.submit(
+        person.id, callback_event_id="callback-revision-1",
+        action=action, values={},
+        submitted_at=scheduled_at + timedelta(minutes=30),
+    )
+    _set_retrospective_generated_at(
+        database, revision_two["retrospective"]["id"],
+        scheduled_at + timedelta(hours=1),
+    )
+    _set_retrospective_generated_at(
+        database, recovered_revision_one["retrospective"]["id"],
+        scheduled_at + timedelta(hours=2),
+    )
+
+    latest = RetrospectiveCurveRepository(database).latest(person.id, target)
+    assert revision_two["response"]["revision"] == 2
+    assert recovered_revision_one["retrospective"]["daily_review_revision"] == 1
+    assert latest["daily_review_revision"] == 2
+    assert latest["id"] == revision_two["retrospective"]["id"]
+
+
+def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
+    database = memory_database()
+    person = participant(database, "DR-SAME-REVISION-REBUILD")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target, version="forecast-admin-v1")
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id, target, scheduled_at
+    )
+    action = {
+        "version": "1", "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+    }
+    service = _service(database)
+    service.submit(
+        person.id, callback_event_id="callback-admin-revision-1",
+        action=action, values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=20),
+    )
+    revision_two = service.submit(
+        person.id, callback_event_id="callback-admin-revision-2",
+        action=action, values=_values(end_stress="7"),
+        submitted_at=scheduled_at + timedelta(minutes=25),
+    )
+    _seed_forecast(database, person.id, target, version="forecast-admin-v2")
+    rebuilt = service.rebuild(person.id, target)
+    _set_retrospective_generated_at(
+        database, revision_two["retrospective"]["id"],
+        scheduled_at + timedelta(hours=1),
+    )
+    _set_retrospective_generated_at(
+        database, rebuilt["id"], scheduled_at + timedelta(hours=2),
+    )
+
+    latest = RetrospectiveCurveRepository(database).latest(person.id, target)
+    assert revision_two["retrospective"]["daily_review_revision"] == 2
+    assert rebuilt["daily_review_revision"] == 2
+    assert rebuilt["id"] != revision_two["retrospective"]["id"]
+    assert rebuilt["source_forecast_version"] == "forecast-admin-v2"
+    assert latest["id"] == rebuilt["id"]
 
 
 def test_successful_callback_retry_after_expiry_returns_original_result():

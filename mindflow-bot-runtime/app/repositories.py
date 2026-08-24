@@ -669,6 +669,26 @@ class ForecastSnapshotRepository:
             ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
             return self._view(row) if row is not None else None
 
+    def latest_at_or_before(
+        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
+    ) -> Optional[dict[str, Any]]:
+        """Return the newest snapshot visible at an inclusive causal cutoff.
+
+        Invalidated snapshots remain eligible because a later forecast may have
+        invalidated the version that was current when the callback was accepted.
+        """
+
+        with self.database.session() as session:
+            row = session.execute(select(ForecastSnapshot).where(
+                ForecastSnapshot.participant_id == participant_id,
+                ForecastSnapshot.local_date == local_date,
+                ForecastSnapshot.generated_at <= timestamp,
+            ).order_by(
+                desc(ForecastSnapshot.generated_at),
+                desc(ForecastSnapshot.id),
+            ).limit(1)).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
     def save(
         self, participant_id: uuid.UUID, local_date: date, *,
         calendar_revision: str, semantic_revision: str, algorithm_version: str,

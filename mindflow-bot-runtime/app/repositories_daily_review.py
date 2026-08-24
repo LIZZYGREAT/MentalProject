@@ -353,7 +353,11 @@ class RetrospectiveCurveRepository:
             row = session.execute(select(RetrospectiveCurveSnapshot).where(
                 RetrospectiveCurveSnapshot.participant_id == participant_id,
                 RetrospectiveCurveSnapshot.local_date == local_date,
-            ).order_by(desc(RetrospectiveCurveSnapshot.generated_at)).limit(1)).scalar_one_or_none()
+            ).order_by(
+                desc(RetrospectiveCurveSnapshot.daily_review_revision),
+                desc(RetrospectiveCurveSnapshot.generated_at),
+                desc(RetrospectiveCurveSnapshot.id),
+            ).limit(1)).scalar_one_or_none()
             return self._view(row) if row else None
 
     def latest_for_response(
