@@ -89,6 +89,7 @@ class Settings:
     queue_max_size: int = 100
     participant_input_queue_size: int = 20
     max_active_agent_sessions: int = 2
+    tool_sync_max_concurrency: int = 8
     agent_session_idle_seconds: int = 120
     claude_timeout_seconds: int = 90
     claude_max_turns: int = 8
@@ -270,6 +271,9 @@ class Settings:
             ),
             max_active_agent_sessions=_int(
                 values, "MAX_ACTIVE_AGENT_SESSIONS", 2
+            ),
+            tool_sync_max_concurrency=_int(
+                values, "TOOL_SYNC_MAX_CONCURRENCY", 8
             ),
             agent_session_idle_seconds=_int(
                 values, "AGENT_SESSION_IDLE_SECONDS", 120

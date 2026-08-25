@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +14,8 @@ from app.db import Database
 from app.models import (
     DailyReviewResponse,
     DailyReviewSchedule,
+    Participant,
+    ParticipantCarePreference,
     RetrospectiveCurveSnapshot,
 )
 
@@ -24,8 +27,40 @@ def _aware(value: datetime) -> datetime:
 class DailyReviewScheduleRepository:
     CARD_VERSION = "daily-review-v1"
 
-    def __init__(self, database: Database):
+    def __init__(
+        self,
+        database: Database,
+        *,
+        timezone_name: str = "Asia/Shanghai",
+    ):
         self.database = database
+        self.timezone = ZoneInfo(timezone_name)
+
+    def _hard_authorization_reason(
+        self,
+        preference: ParticipantCarePreference | None,
+        now: datetime,
+    ) -> str | None:
+        if preference is None:
+            return None
+        if not bool(preference.care_enabled):
+            return "care_disabled"
+        if not bool(preference.daily_review_enabled):
+            return "daily_review_disabled"
+        if preference.muted_until is not None and _aware(preference.muted_until) > now:
+            return "muted"
+        start = preference.quiet_hours_start
+        end = preference.quiet_hours_end
+        if start is not None and end is not None and start != end:
+            local_clock = now.astimezone(self.timezone).time().replace(tzinfo=None)
+            in_quiet_hours = (
+                start <= local_clock < end
+                if start < end
+                else local_clock >= start or local_clock < end
+            )
+            if in_quiet_hours:
+                return "quiet_hours"
+        return None
 
     def ensure(
         self, participant_id: uuid.UUID, local_date: date, scheduled_at: datetime,
@@ -38,6 +73,19 @@ class DailyReviewScheduleRepository:
             raise ValueError("valid_until must be after scheduled_at")
         try:
             with self.database.session() as session:
+                participant = session.get(
+                    Participant, participant_id, with_for_update=True
+                )
+                if participant is None:
+                    raise ValueError("participant does not exist")
+                preference = session.get(
+                    ParticipantCarePreference, participant_id
+                )
+                authorization_reason = (
+                    "inactive"
+                    if participant.status != "active"
+                    else self._hard_authorization_reason(preference, scheduled)
+                )
                 row = session.execute(select(DailyReviewSchedule).where(
                     DailyReviewSchedule.participant_id == participant_id,
                     DailyReviewSchedule.local_date == local_date,
@@ -50,10 +98,53 @@ class DailyReviewScheduleRepository:
                         card_version=card_version,
                         scheduled_at=scheduled,
                         valid_until=validity_end,
-                        next_attempt_at=scheduled,
+                        status=(
+                            "cancelled"
+                            if authorization_reason is not None else "pending"
+                        ),
+                        next_attempt_at=(
+                            None
+                            if authorization_reason is not None else scheduled
+                        ),
+                        last_error_code=(
+                            f"participant_{authorization_reason}"
+                            if authorization_reason is not None else None
+                        ),
                     )
                     session.add(row)
                     session.flush()
+                elif (
+                    authorization_reason is not None
+                    and row.status in {
+                        "pending", "claimed", "delivery_unavailable"
+                    }
+                    and row.authorized_at is None
+                ):
+                    row.status = "cancelled"
+                    row.claimed_at = None
+                    row.lease_until = None
+                    row.claim_token = None
+                    row.next_attempt_at = None
+                    row.last_error_code = f"participant_{authorization_reason}"
+                    row.last_error_class = None
+                    row.updated_at = scheduled
+                elif (
+                    authorization_reason is None
+                    and row.status == "cancelled"
+                    and str(row.last_error_code or "") in {
+                        "participant_care_disabled",
+                        "participant_daily_review_disabled",
+                        "participant_muted",
+                        "participant_quiet_hours",
+                        "participant_care_preference",
+                    }
+                    and _aware(row.valid_until) > datetime.now(timezone.utc)
+                ):
+                    row.status = "pending"
+                    row.next_attempt_at = row.scheduled_at
+                    row.last_error_code = None
+                    row.last_error_class = None
+                    row.updated_at = datetime.now(timezone.utc)
                 return self._view(row)
         except IntegrityError:
             with self.database.session() as session:
@@ -70,6 +161,7 @@ class DailyReviewScheduleRepository:
         row.next_attempt_at = None
         row.claim_token = None
         row.lease_until = None
+        row.authorized_at = None
         row.last_error_code = "delivery_window_expired"
         row.last_error_class = None
         row.updated_at = now
@@ -92,6 +184,9 @@ class DailyReviewScheduleRepository:
     def claim_due(self, now: datetime, lease_seconds: int, limit: int = 100) -> list[dict[str, Any]]:
         now = _aware(now)
         claimed: list[dict[str, Any]] = []
+        # Expiry is an independent transaction so the subsequent claim path
+        # always acquires Participant before Schedule, matching preference
+        # updates and avoiding cross-feature lock inversion.
         with self.database.session() as session:
             expired = session.execute(select(DailyReviewSchedule).where(
                 DailyReviewSchedule.valid_until <= now,
@@ -101,7 +196,9 @@ class DailyReviewScheduleRepository:
             ).with_for_update()).scalars().all()
             for row in expired:
                 self._expire(row, now)
-            rows = session.execute(select(DailyReviewSchedule).where(
+
+        with self.database.session() as session:
+            candidates = session.execute(select(DailyReviewSchedule.id).where(
                 DailyReviewSchedule.scheduled_at <= now,
                 DailyReviewSchedule.valid_until > now,
                 or_(
@@ -115,18 +212,119 @@ class DailyReviewScheduleRepository:
                     DailyReviewSchedule.next_attempt_at.is_(None),
                     DailyReviewSchedule.next_attempt_at <= now,
                 ),
-            ).order_by(DailyReviewSchedule.scheduled_at).limit(limit).with_for_update()).scalars().all()
-            for row in rows:
+            ).order_by(DailyReviewSchedule.scheduled_at).limit(limit)).scalars().all()
+
+        for schedule_id in candidates:
+            with self.database.session() as session:
+                candidate = session.get(DailyReviewSchedule, schedule_id)
+                if candidate is None:
+                    continue
+                participant = session.get(
+                    Participant, candidate.participant_id, with_for_update=True
+                )
+                row = session.get(DailyReviewSchedule, schedule_id, with_for_update=True)
+                if row is None or _aware(row.valid_until) <= now:
+                    if row is not None and row.status in {
+                        "pending", "claimed", "delivery_unavailable"
+                    }:
+                        self._expire(row, now)
+                    continue
+                claimable = (
+                    row.status == "pending"
+                    or (
+                        row.status == "claimed"
+                        and row.lease_until is not None
+                        and _aware(row.lease_until) <= now
+                    )
+                )
+                if (
+                    not claimable
+                    or _aware(row.scheduled_at) > now
+                    or (
+                        row.next_attempt_at is not None
+                        and _aware(row.next_attempt_at) > now
+                    )
+                ):
+                    continue
+                preference = session.get(
+                    ParticipantCarePreference, row.participant_id
+                )
+                authorization_reason = (
+                    "inactive"
+                    if participant is None or participant.status != "active"
+                    else self._hard_authorization_reason(preference, now)
+                )
+                if authorization_reason is not None:
+                    row.status = "cancelled"
+                    row.claimed_at = None
+                    row.lease_until = None
+                    row.claim_token = None
+                    row.authorized_at = None
+                    row.next_attempt_at = None
+                    row.last_error_code = f"participant_{authorization_reason}"
+                    row.last_error_class = None
+                    row.updated_at = now
+                    continue
                 token = uuid.uuid4()
                 row.status = "claimed"
                 row.claimed_at = now
                 row.lease_until = now + timedelta(seconds=lease_seconds)
                 row.claim_token = token
+                row.authorized_at = None
                 row.attempt_count += 1
                 row.updated_at = now
                 session.flush()
                 claimed.append(self._view(row))
         return claimed
+
+    def authorize_claim_current(
+        self,
+        schedule_id: uuid.UUID | str,
+        claim_token: uuid.UUID | str,
+        *,
+        now: datetime,
+    ) -> bool:
+        sid, token = uuid.UUID(str(schedule_id)), uuid.UUID(str(claim_token))
+        now = _aware(now)
+        with self.database.session() as session:
+            candidate = session.get(DailyReviewSchedule, sid)
+            if candidate is None:
+                return False
+            participant = session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
+            row = session.get(DailyReviewSchedule, sid, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.lease_until is None
+                or _aware(row.lease_until) < now
+                or _aware(row.valid_until) <= now
+            ):
+                return False
+            preference = session.get(
+                ParticipantCarePreference, row.participant_id
+            )
+            authorization_reason = (
+                "inactive"
+                if participant is None or participant.status != "active"
+                else self._hard_authorization_reason(preference, now)
+            )
+            if authorization_reason is not None:
+                row.status = "cancelled"
+                row.claimed_at = None
+                row.lease_until = None
+                row.claim_token = None
+                row.authorized_at = None
+                row.next_attempt_at = None
+                row.last_error_code = f"participant_{authorization_reason}"
+                row.last_error_class = None
+                row.updated_at = now
+                return False
+            row.authorized_at = now
+            row.updated_at = now
+            return True
 
     def mark_sent(
         self, schedule_id: uuid.UUID | str, claim_token: uuid.UUID | str,
@@ -188,6 +386,7 @@ class DailyReviewScheduleRepository:
             )
             row.claim_token = None
             row.lease_until = None
+            row.authorized_at = None
             row.last_error_code = "source_forecast_unavailable"
             row.last_error_class = None
             row.updated_at = now
@@ -216,6 +415,7 @@ class DailyReviewScheduleRepository:
             )
             row.claim_token = None
             row.lease_until = None
+            row.authorized_at = None
             row.updated_at = now
             return True
 
@@ -241,6 +441,8 @@ class DailyReviewScheduleRepository:
             row.last_error_class = None
             row.claim_token = None
             row.lease_until = None
+            if status != "sent":
+                row.authorized_at = None
             row.next_attempt_at = None
             row.updated_at = now
             return True
@@ -264,6 +466,9 @@ class DailyReviewScheduleRepository:
             "attempt_count": row.attempt_count,
             "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
             "claim_token": str(row.claim_token) if row.claim_token else None,
+            "authorized_at": (
+                row.authorized_at.isoformat() if row.authorized_at else None
+            ),
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
             "provider_message_id": row.provider_message_id,
             "last_error_code": row.last_error_code,

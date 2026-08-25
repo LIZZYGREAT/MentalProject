@@ -384,6 +384,12 @@ class WarningSchedule(Base):
         Uuid(as_uuid=True), ForeignKey("forecast_snapshots.id", ondelete="CASCADE"), nullable=False
     )
     forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    snoozed_from_intervention_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("care_intervention_events.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
     warning_identity: Mapped[str] = mapped_column(String(64), nullable=False)
     episode_identity: Mapped[str] = mapped_column(String(64), nullable=False)
     target_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -400,6 +406,9 @@ class WarningSchedule(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    authorized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
@@ -586,6 +595,9 @@ class DailyReviewSchedule(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    authorized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)

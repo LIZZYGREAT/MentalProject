@@ -20,11 +20,16 @@ from app.repositories import (
     ProfileRepository,
     LearnedProfileRepository,
     WarningScheduleRepository,
+    ForecastInputChangedError,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.care_message_service import (
     CARE_MESSAGE_SCHEMA_VERSION,
     CareMessageService,
+)
+from app.services.care_context import (
+    CARE_CONTEXT_SCHEMA_VERSION,
+    CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES,
 )
 from app.services.care_intervention_policy import CARE_INTERVENTION_POLICY_VERSION
 from app.services.care_templates import CARE_TEMPLATE_LIBRARY_VERSION
@@ -150,6 +155,13 @@ class ForecastCoordinator:
             "lead_minutes": self.warning_lead_minutes,
             "late_grace_minutes": self.warning_late_grace_minutes,
             "episode_drift_minutes": self.warning_episode_drift_minutes,
+            "care_context_schema_version": CARE_CONTEXT_SCHEMA_VERSION,
+            "care_recent_observation_max_age_minutes": (
+                CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+            ),
+            "care_message_schema_version": CARE_MESSAGE_SCHEMA_VERSION,
+            "care_intervention_policy_version": CARE_INTERVENTION_POLICY_VERSION,
+            "care_template_library_version": CARE_TEMPLATE_LIBRARY_VERSION,
         }
         return _sha(payload), payload
 
@@ -309,6 +321,7 @@ class ForecastCoordinator:
     async def ensure_forecast(
         self, participant_id: uuid.UUID, local_date: date | str, reason: str,
         *, refresh_calendar: bool = True, enqueue_enrichment: bool = True,
+        force_followup: bool = False,
     ) -> dict[str, Any]:
         target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
         key = (participant_id, target)
@@ -316,59 +329,101 @@ class ForecastCoordinator:
             flight = self._inflight.get(key)
             if flight is None:
                 flight = {
-                    "refresh_calendar": refresh_calendar,
-                    "followup_refresh": False,
-                    "followup_reason": reason,
-                    "followup_enrichment": enqueue_enrichment,
+                    "generation": 1,
+                    "pending_refresh": refresh_calendar,
+                    "pending_enrichment": enqueue_enrichment,
+                    "active_refresh": False,
+                    "active_enrichment": False,
+                    "reason": reason,
                 }
                 task = asyncio.create_task(
-                    self._run_flight(
-                        key, flight, participant_id, target, reason,
-                        refresh_calendar=refresh_calendar,
-                        enqueue_enrichment=enqueue_enrichment,
-                    ),
+                    self._run_flight(key, flight, participant_id, target),
                     name=f"forecast-{participant_id}-{target.isoformat()}",
                 )
                 flight["task"] = task
                 self._inflight[key] = flight
-            elif refresh_calendar and not flight["refresh_calendar"]:
-                flight["followup_refresh"] = True
-                flight["followup_reason"] = reason
-                flight["followup_enrichment"] = (
-                    flight["followup_enrichment"] or enqueue_enrichment
+            else:
+                refresh_upgrade = bool(
+                    refresh_calendar
+                    and not flight["pending_refresh"]
+                    and not flight["active_refresh"]
                 )
+                enrichment_upgrade = bool(
+                    enqueue_enrichment
+                    and not flight["pending_enrichment"]
+                    and not flight["active_enrichment"]
+                )
+                if force_followup or refresh_upgrade or enrichment_upgrade:
+                    flight["generation"] += 1
+                    flight["pending_refresh"] = bool(
+                        flight["pending_refresh"] or refresh_calendar
+                    )
+                    flight["pending_enrichment"] = bool(
+                        flight["pending_enrichment"] or enqueue_enrichment
+                    )
+                    flight["reason"] = reason
             task = flight["task"]
         return await asyncio.shield(task)
 
     async def _run_flight(
         self, key: tuple[uuid.UUID, date], flight: dict[str, Any],
-        participant_id: uuid.UUID, target: date, reason: str, *,
-        refresh_calendar: bool, enqueue_enrichment: bool,
+        participant_id: uuid.UUID, target: date,
     ) -> dict[str, Any]:
         try:
-            result = await self._ensure_once(
-                participant_id, target, reason,
-                refresh_calendar=refresh_calendar,
-                enqueue_enrichment=enqueue_enrichment,
-            )
-            async with self._guard:
-                followup_refresh = bool(
-                    flight["followup_refresh"] and not flight["refresh_calendar"]
-                )
-                followup_reason = flight["followup_reason"]
-                followup_enrichment = flight["followup_enrichment"]
-                if followup_refresh:
-                    flight["refresh_calendar"] = True
-                    flight["followup_refresh"] = False
-                elif self._inflight.get(key) is flight:
-                    self._inflight.pop(key, None)
-            if followup_refresh:
-                result = await self._ensure_once(
-                    participant_id, target, followup_reason,
-                    refresh_calendar=True,
-                    enqueue_enrichment=followup_enrichment,
-                )
-            return result
+            while True:
+                async with self._guard:
+                    generation = int(flight["generation"])
+                    refresh_calendar = bool(flight["pending_refresh"])
+                    enqueue_enrichment = bool(flight["pending_enrichment"])
+                    reason = str(flight["reason"])
+                    flight["pending_refresh"] = False
+                    flight["pending_enrichment"] = False
+                    flight["active_refresh"] = refresh_calendar
+                    flight["active_enrichment"] = enqueue_enrichment
+                try:
+                    result = await self._ensure_once(
+                        participant_id,
+                        target,
+                        reason,
+                        refresh_calendar=refresh_calendar,
+                        enqueue_enrichment=enqueue_enrichment,
+                    )
+                except ForecastInputChangedError as exc:
+                    # The repository is the final authority. Retry inside the
+                    # same flight so callers cannot observe a stale completion.
+                    async with self._guard:
+                        if int(flight["generation"]) <= generation:
+                            flight["generation"] = generation + 1
+                        if exc.input_name == "calendar":
+                            flight["pending_refresh"] = True
+                        flight["pending_enrichment"] = bool(
+                            flight["pending_enrichment"] or enqueue_enrichment
+                        )
+                        flight["reason"] = f"{exc.input_name}_changed_during_forecast"
+                        flight["active_refresh"] = False
+                        flight["active_enrichment"] = False
+                    continue
+                except Exception:
+                    # A transient failure must not erase an input mutation that
+                    # arrived while this generation was running. If a newer
+                    # generation is already dirty, consume it before deciding
+                    # the shared flight has failed. With no newer work, preserve
+                    # the original exception for every joined caller.
+                    async with self._guard:
+                        flight["active_refresh"] = False
+                        flight["active_enrichment"] = False
+                        retry_dirty = int(flight["generation"]) > generation
+                    if retry_dirty:
+                        continue
+                    raise
+                async with self._guard:
+                    flight["active_refresh"] = False
+                    flight["active_enrichment"] = False
+                    if int(flight["generation"]) > generation:
+                        continue
+                    if self._inflight.get(key) is flight:
+                        self._inflight.pop(key, None)
+                    return result
         finally:
             async with self._guard:
                 if self._inflight.get(key) is flight:
@@ -435,6 +490,15 @@ class ForecastCoordinator:
             for item in semantic_events
         )
         local_now = datetime.now(self.timezone)
+        observation_window_start = None
+        observation_window_end = None
+        if target == local_now.date():
+            observation_window_start = datetime.combine(
+                target, time.min, self.timezone
+            ).astimezone(timezone.utc)
+            observation_window_end = datetime.combine(
+                target + timedelta(days=1), time.min, self.timezone
+            ).astimezone(timezone.utc)
         observations = (
             await asyncio.to_thread(
                 self.observations.for_local_date,
@@ -448,20 +512,24 @@ class ForecastCoordinator:
             else []
         )
         recent_care_observation = None
-        recent_reader = getattr(self.observations, "recent", None)
-        if callable(recent_reader):
-            try:
-                recent_rows = await asyncio.to_thread(
-                    recent_reader, participant_id, limit=1
-                )
-                recent_care_observation = recent_rows[0] if recent_rows else None
-            except Exception as exc:
-                logger.warning(
-                    "care_recent_observation_unavailable participant_id=%s "
-                    "error_class=%s",
-                    participant_id,
-                    type(exc).__name__,
-                )
+        try:
+            recent_rows = await asyncio.to_thread(
+                self.observations.recent_before,
+                participant_id,
+                before=local_now,
+                max_age=timedelta(
+                    minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+                ),
+                limit=1,
+            )
+            recent_care_observation = recent_rows[0] if recent_rows else None
+        except Exception as exc:
+            logger.warning(
+                "care_recent_observation_unavailable participant_id=%s "
+                "error_class=%s",
+                participant_id,
+                type(exc).__name__,
+            )
         care_inputs = {
             "calendar_events": presentation_events,
             "calendar_degraded": bool(calendar_snapshot["degraded"]),
@@ -584,6 +652,9 @@ class ForecastCoordinator:
                 semantic_input=semantic_input, curve=curve, peaks=peaks,
                 warning_windows=serialized_windows,
                 output=output, warnings=warning_windows, now=datetime.now(timezone.utc),
+                observation_window_start=observation_window_start,
+                observation_window_end=observation_window_end,
+                verify_current_inputs=True,
             )
             result = {**saved, "cache_hit": False, "calendar_changed": calendar_changed,
                       "warning_reconciled": False, "warning_diff": warning_diff,
@@ -604,6 +675,7 @@ class ForecastCoordinator:
                 await self.ensure_forecast(
                     participant_id, target, "semantic_enrichment_completion",
                     refresh_calendar=False, enqueue_enrichment=False,
+                    force_followup=True,
                 )
             await self.semantics.enqueue(
                 participant_id, misses, recompute,

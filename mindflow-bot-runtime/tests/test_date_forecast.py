@@ -230,7 +230,6 @@ def test_calendar_mutation_does_not_recompute_past_forecast():
         None,
         None,
         None,
-        None,
         "Asia/Shanghai",
         forecast_coordinator=coordinator,
         pressure_curves=object(),
@@ -245,6 +244,48 @@ def test_calendar_mutation_does_not_recompute_past_forecast():
 
     assert result["forecast_refresh"] == "historical_dates_skipped"
     assert coordinator.calls == []
+
+
+def test_today_calendar_mutation_invalidates_today_and_tomorrow_before_refresh():
+    operations = []
+
+    class Forecasts:
+        def invalidate_for_calendar_mutation(
+            self, _warnings, _participant_id, local_date, *, reason
+        ):
+            operations.append(("invalidate", local_date, reason))
+
+    class Coordinator:
+        warnings = object()
+
+        async def ensure_forecast(
+            self, _participant_id, local_date, reason, **_kwargs
+        ):
+            operations.append(("refresh", local_date, reason))
+            return {"local_date": local_date.isoformat()}
+
+    tools = object.__new__(CareTools)
+    tools.timezone = ZoneInfo("Asia/Shanghai")
+    tools.forecast_snapshots = Forecasts()
+    tools.forecast_coordinator = Coordinator()
+    today = datetime.now(tools.timezone).date()
+    tomorrow = today + timedelta(days=1)
+
+    result = asyncio.run(
+        tools._refresh_calendar_mutation_forecasts(
+            "participant", {today}, "calendar_update_event"
+        )
+    )
+
+    assert operations == [
+        ("invalidate", today, "calendar_update_event"),
+        ("invalidate", tomorrow, "calendar_update_event"),
+        ("refresh", today, "calendar_update_event"),
+        ("refresh", tomorrow, "calendar_update_event"),
+    ]
+    assert result["forecast_refreshed_dates"] == [
+        today.isoformat(), tomorrow.isoformat()
+    ]
 
 
 def test_tomorrow_cache_identity_tracks_today_forecast_version():
@@ -364,7 +405,7 @@ def test_rebuilt_retrospective_for_current_version_is_used():
 
 
 def test_pressure_curve_tool_has_optional_date_schema():
-    tools = CareTools(None, None, None, None, None, "Asia/Shanghai", object())
+    tools = CareTools(None, None, None, None, "Asia/Shanghai", object())
     registry = ToolRegistry()
     tools.register(registry)
     spec = next(item for item in registry.specs if item.name == "care_get_pressure_curve")

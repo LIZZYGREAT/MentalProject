@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 import uuid
@@ -13,13 +14,13 @@ from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_car
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.repositories import (
     ObservationRepository,
-    PredictionRepository,
     ProfileRepository,
     ForecastSnapshotRepository,
     LearnedProfileRepository,
 )
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_message_service import CareMessageService
+from app.services.care_context import CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
@@ -53,6 +54,13 @@ def _safe_profile(profile: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return clean(profile)
+
+
+def _public_care_preferences(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    reserved = {"morning_brief_enabled", "weekly_summary_enabled"}
+    return {key: item for key, item in value.items() if key not in reserved}
 
 
 def _parse_datetime(value: Any, timezone_value: ZoneInfo) -> datetime:
@@ -109,7 +117,6 @@ class CareTools:
         self,
         profiles: ProfileRepository,
         observations: ObservationRepository,
-        predictions: PredictionRepository,
         calendar: CalendarService,
         tokens: TokenRepository,
         timezone_name: str,
@@ -124,7 +131,6 @@ class CareTools:
     ):
         self.profiles = profiles
         self.observations = observations
-        self.predictions = predictions
         self.calendar = calendar
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
@@ -151,7 +157,7 @@ class CareTools:
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "care_get_today_context",
-            "Return this participant's current profile, recent check-in, and latest assessment.",
+            "Return this participant's current profile, recent check-in, and latest forecast.",
             _empty_schema(),
             self.get_today_context,
         )
@@ -408,8 +414,14 @@ class CareTools:
             self.learned_profiles.current(ctx.participant_id)
             if self.learned_profiles is not None else None
         )
-        recent = self.observations.recent(ctx.participant_id, limit=1)
-        prediction = self.predictions.latest(ctx.participant_id)
+        recent = self.observations.recent_before(
+            ctx.participant_id,
+            before=datetime.now(timezone.utc),
+            max_age=timedelta(
+                minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+            ),
+            limit=1,
+        )
         latest_forecast = (
             self.forecast_snapshots.latest(
                 ctx.participant_id, datetime.now(self.timezone).date()
@@ -425,10 +437,11 @@ class CareTools:
                 "learned": learned_profile,
             },
             "latest_checkin": recent[0] if recent else None,
-            "latest_assessment": prediction,
             "latest_forecast": latest_forecast,
             "care_preferences": (
-                self.care_preferences.get(ctx.participant_id)
+                _public_care_preferences(
+                    self.care_preferences.get(ctx.participant_id)
+                )
                 if self.care_preferences is not None else None
             ),
             "latest_care_intervention": (
@@ -440,16 +453,17 @@ class CareTools:
     def record_checkin(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
         if self.observation_refresh is None:
             raise RuntimeError("observation forecast refresh service is unavailable")
+        payload = {
+            "stress_0_10": float(args["stress"]),
+            "energy_0_10": float(args["energy"]),
+            "activity": str(args["activity"]),
+            "stress_event_since_last": bool(args["stress_event_since_last"]),
+            "event_ongoing": bool(args["event_ongoing"]),
+        }
         write = self.observations.add_with_status(
             ctx.participant_id,
             "checkin",
-            {
-                "stress_0_10": float(args["stress"]),
-                "energy_0_10": float(args["energy"]),
-                "activity": str(args["activity"]),
-                "stress_event_since_last": bool(args["stress_event_since_last"]),
-                "event_ongoing": bool(args["event_ongoing"]),
-            },
+            payload,
             source_message_id=ctx.message_id,
         )
         self.observation_refresh.on_observation_committed(
@@ -457,10 +471,22 @@ class CareTools:
             observed_at=write.observed_at,
             created=write.created,
         )
+        if write.idempotency_conflict:
+            return {
+                "ok": False,
+                "error": "idempotency_conflict",
+                "observation_id": str(write.observation_id),
+                "recorded": dict(write.persisted_payload),
+            }
+        persisted = write.persisted_payload
         return {
             "ok": True,
             "observation_id": str(write.observation_id),
-            "recorded": {"stress": args["stress"], "energy": args["energy"]},
+            "created": write.created,
+            "recorded": {
+                "stress": persisted.get("stress_0_10"),
+                "energy": persisted.get("energy_0_10"),
+            },
         }
 
     def get_recent_state(
@@ -496,7 +522,14 @@ class CareTools:
             "user_requested_support",
             refresh_calendar=True,
         )
-        recent = self.observations.recent(ctx.participant_id, limit=1)
+        recent = self.observations.recent_before(
+            ctx.participant_id,
+            before=datetime.now(timezone.utc),
+            max_age=timedelta(
+                minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+            ),
+            limit=1,
+        )
         observation = recent[0] if recent else None
         profile_row = self.profiles.current(ctx.participant_id)
         output = dict(forecast.get("output") or {})
@@ -545,7 +578,10 @@ class CareTools:
             changes["quiet_hours_start"] = None
             changes["quiet_hours_end"] = None
         preferences = self.care_preferences.update(ctx.participant_id, changes)
-        return {"ok": True, "care_preferences": preferences}
+        return {
+            "ok": True,
+            "care_preferences": _public_care_preferences(preferences),
+        }
 
     def respond_to_latest_care(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -702,8 +738,30 @@ class CareTools:
                 normalized.sort()
             dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
 
-        # Preserve dependency order for today -> tomorrow. Other independent
-        # dates remain deterministic and are inexpensive at mutation time.
+        forecast_repository = (
+            getattr(self, "forecast_snapshots", None)
+            or getattr(self.forecast_coordinator, "forecasts", None)
+        )
+        invalidation_errors: list[tuple[Any, Exception]] = []
+        if forecast_repository is not None:
+            # Fail closed for every affected date before starting any expensive
+            # recomputation. In particular, tomorrow must stop exposing a stale
+            # Today terminal while today's refresh is still in flight.
+            for target in normalized:
+                try:
+                    await asyncio.to_thread(
+                        forecast_repository.invalidate_for_calendar_mutation,
+                        self.forecast_coordinator.warnings,
+                        participant_id,
+                        target,
+                        reason=reason,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    invalidation_errors.append((target, exc))
+
+        # Preserve dependency order for today -> tomorrow during recomputation.
         results = []
         for target in normalized:
             try:
@@ -712,18 +770,24 @@ class CareTools:
                     target,
                     reason,
                     refresh_calendar=True,
+                    force_followup=True,
                 )
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 result = exc
             results.append(result)
         refreshed = [
             target.isoformat() for target, result in zip(normalized, results)
-            if not isinstance(result, BaseException)
+            if not isinstance(result, Exception)
         ]
         errors = [
+            {"local_date": target.isoformat(), "error_class": type(error).__name__}
+            for target, error in invalidation_errors
+        ] + [
             {"local_date": target.isoformat(), "error_class": type(result).__name__}
             for target, result in zip(normalized, results)
-            if isinstance(result, BaseException)
+            if isinstance(result, Exception)
         ]
         return {
             "forecast_refresh": (

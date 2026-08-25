@@ -202,8 +202,21 @@ class CardActionService:
             observed_at=write.observed_at,
             created=write.created,
         )
+        persisted = dict(write.persisted_payload)
+        if write.idempotency_conflict:
+            return {
+                "ok": False,
+                "error": "idempotency_conflict",
+                "observation_id": str(write.observation_id),
+                "reply_text": "这次提交标识已用于另一组状态数据，请重新打开卡片提交。",
+            }
         return {
             "ok": True,
             "observation_id": str(write.observation_id),
-            "reply_text": f"已记录这次状态：压力 {stress:g}/10，精力 {energy:g}/10。",
+            "created": write.created,
+            "reply_text": (
+                "已记录这次状态：压力 "
+                f"{float(persisted['stress_0_10']):g}/10，精力 "
+                f"{float(persisted['energy_0_10']):g}/10。"
+            ),
         }

@@ -10,7 +10,7 @@ from typing import Any
 from app.services.care_context import CareContext
 
 
-CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v1"
+CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v2"
 _DEADLINE = re.compile(
     r"ddl|deadline|截止|提交|交作业|报告|论文|答辩",
     flags=re.IGNORECASE,
@@ -28,6 +28,8 @@ class CareMessagePlan:
     context_quality: str
     facts_used: tuple[str, ...]
     actions: tuple[str, ...]
+    ranking_score: float
+    preference_matched: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -54,48 +56,108 @@ class CareInterventionPolicy:
                 action_minutes=10,
             )
 
+        dense = self._dense_transition(context)
+        deadline = self._has_deadline(context)
+        has_workload = bool(
+            context.current_events
+            or context.dominant_stressors
+            or context.previous_event
+            or context.active_event
+            or context.next_event
+        )
+        candidates: list[dict[str, Any]] = [
+            {
+                "intervention_type": "brief_check_in",
+                "template_id": "brief-check-in-v1",
+                "reason_code": "elevated_pressure_with_context",
+                "action_minutes": 5,
+                "score": 0.40,
+            }
+        ]
         if context.profile_summary.recent_energy_tendency == "low":
-            return self._plan(
-                context,
-                intervention_type="recovery",
-                template_id="recovery-v1",
-                reason_code="low_recent_energy_before_risk",
-                action_minutes=10,
-            )
+            candidates.append({
+                "intervention_type": "recovery",
+                "template_id": "recovery-v1",
+                "reason_code": "low_recent_energy_before_risk",
+                "action_minutes": 10,
+                "score": 0.90,
+            })
+        if dense or has_workload:
+            candidates.append({
+                "intervention_type": "transition_buffer",
+                "template_id": "transition-buffer-v1",
+                "reason_code": (
+                    "dense_schedule_before_high_risk"
+                    if dense else "transition_support_preference"
+                ),
+                "action_minutes": 10,
+                "score": 0.80 if dense else 0.31,
+            })
+        if deadline or has_workload:
+            candidates.append({
+                "intervention_type": "workload_decomposition",
+                "template_id": "workload-decomposition-v1",
+                "reason_code": (
+                    "deadline_workload_near_risk"
+                    if deadline else "decomposition_support_preference"
+                ),
+                "action_minutes": 15,
+                "score": 0.78 if deadline else 0.32,
+            })
+        candidates.append({
+            "intervention_type": "protected_break",
+            "template_id": "protected-break-v1",
+            "reason_code": (
+                "sustained_high_pressure"
+                if level >= 2 or context.care_action == "protected_break"
+                else "micro_break_support_preference"
+            ),
+            "action_minutes": 15,
+            "score": (
+                0.72
+                if level >= 2 or context.care_action == "protected_break"
+                else 0.33
+            ),
+        })
+        if context.allow_schedule_suggestions and (dense or deadline):
+            candidates.append({
+                "intervention_type": "schedule_adjustment",
+                "template_id": "schedule-adjustment-v1",
+                "reason_code": "schedule_adjustment_allowed",
+                "action_minutes": 10,
+                "score": 0.86,
+            })
 
-        if self._dense_transition(context):
-            return self._plan(
-                context,
-                intervention_type="transition_buffer",
-                template_id="transition-buffer-v1",
-                reason_code="dense_schedule_before_high_risk",
-                action_minutes=10,
+        preference_boosts = {
+            "micro_break": "protected_break",
+            "task_decomposition": "workload_decomposition",
+            "transition_buffer": "transition_buffer",
+        }
+        preferred = set(context.profile_summary.preferred_support_types)
+        for candidate in candidates:
+            matched = next(
+                (
+                    preference
+                    for preference, intervention_type in preference_boosts.items()
+                    if preference in preferred
+                    and candidate["intervention_type"] == intervention_type
+                ),
+                None,
             )
-
-        if self._has_deadline(context):
-            return self._plan(
-                context,
-                intervention_type="workload_decomposition",
-                template_id="workload-decomposition-v1",
-                reason_code="deadline_workload_near_risk",
-                action_minutes=15,
+            candidate["preference_matched"] = matched
+            candidate["score"] = min(
+                1.0,
+                float(candidate["score"]) + (0.12 if matched else 0.0),
             )
-
-        if level >= 2 or context.care_action == "protected_break":
-            return self._plan(
-                context,
-                intervention_type="protected_break",
-                template_id="protected-break-v1",
-                reason_code="sustained_high_pressure",
-                action_minutes=15,
-            )
-
+        selected = max(candidates, key=lambda candidate: float(candidate["score"]))
         return self._plan(
             context,
-            intervention_type="brief_check_in",
-            template_id="brief-check-in-v1",
-            reason_code="elevated_pressure_with_context",
-            action_minutes=5,
+            intervention_type=str(selected["intervention_type"]),
+            template_id=str(selected["template_id"]),
+            reason_code=str(selected["reason_code"]),
+            action_minutes=int(selected["action_minutes"]),
+            ranking_score=float(selected["score"]),
+            preference_matched=selected.get("preference_matched"),
         )
 
     @staticmethod
@@ -106,6 +168,8 @@ class CareInterventionPolicy:
         template_id: str,
         reason_code: str,
         action_minutes: int,
+        ranking_score: float = 1.0,
+        preference_matched: str | None = None,
     ) -> CareMessagePlan:
         return CareMessagePlan(
             policy_version=CARE_INTERVENTION_POLICY_VERSION,
@@ -123,6 +187,8 @@ class CareInterventionPolicy:
                 "helpful",
                 "not_relevant",
             ),
+            ranking_score=round(max(0.0, min(ranking_score, 1.0)), 3),
+            preference_matched=preference_matched,
         )
 
     @staticmethod

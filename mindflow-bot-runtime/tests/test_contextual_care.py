@@ -3,6 +3,8 @@ from datetime import date, datetime
 import uuid
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from app.agent.context import AgentContext
 from app.models import WarningSchedule
 from app.repositories import (
@@ -67,7 +69,7 @@ def _calendar():
 def _observation(*, energy: float, stress: float = 5.0):
     return {
         "id": f"observation-{energy}",
-        "observed_at": f"{TARGET.isoformat()}T08:00:00+08:00",
+        "observed_at": f"{TARGET.isoformat()}T12:00:00+08:00",
         "payload": {
             "stress_0_10": stress,
             "energy_0_10": energy,
@@ -228,6 +230,121 @@ def test_same_calendar_low_energy_uses_recovery_instead_of_transition_buffer():
     assert 80 <= len(normal["message"]) <= 220
 
 
+def test_recent_observation_window_is_inclusive_at_six_hours_and_rejects_older():
+    care = CareMessageService("Asia/Shanghai")
+
+    def contextual(observed_at: str):
+        observation = _observation(energy=2.0)
+        observation["observed_at"] = observed_at
+        return care.contextualize_alert(
+            _alert(time="16:30"),
+            source="forecast_warning",
+            local_date=TARGET,
+            calendar_events=_calendar(),
+            calendar_degraded=False,
+            recent_observation=observation,
+            profile=None,
+            profile_version=None,
+        )
+
+    boundary = contextual(f"{TARGET.isoformat()}T10:30:00+08:00")
+    stale = contextual(f"{TARGET.isoformat()}T10:29:59+08:00")
+
+    assert boundary["care_context"]["recent_observation"] is not None
+    assert boundary["care_plan"]["intervention_type"] == "recovery"
+    assert stale["care_context"]["recent_observation"] is None
+    assert stale["care_plan"]["intervention_type"] == "transition_buffer"
+    assert stale["care_provenance"]["recent_observation_max_age_minutes"] == 360
+
+
+def test_versioned_empty_controlled_preferences_do_not_fall_back_to_profile():
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        _alert(),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=_calendar(),
+        calendar_degraded=False,
+        recent_observation=None,
+        profile={"care_preferences": {"recovery_preference": "我喜欢散步"}},
+        profile_version=11,
+        care_preferences={
+            "version": 1,
+            "preferred_support_types": [],
+            "allow_follow_up": True,
+            "allow_schedule_suggestions": False,
+        },
+    )
+
+    assert contextual["care_provenance"]["care_preference_version"] == 1
+    assert contextual["care_provenance"]["profile_version"] is None
+    assert contextual["care_context"]["profile_summary"][
+        "recovery_preference"
+    ] is None
+    assert "短暂散步" not in contextual["message"]
+
+
+@pytest.mark.parametrize(
+    ("preference", "expected"),
+    [
+        ("micro_break", "protected_break"),
+        ("task_decomposition", "workload_decomposition"),
+        ("transition_buffer", "transition_buffer"),
+    ],
+)
+def test_soft_support_preferences_apply_bounded_candidate_boost(
+    preference, expected
+):
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        _alert(current_events=["一项安排"], dominant_stressors=[]),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=[
+            _event("single", "普通安排", "15:30", "17:00", event_type="task")
+        ],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+        care_preferences={
+            "version": 1,
+            "preferred_support_types": [preference],
+            "allow_schedule_suggestions": False,
+        },
+    )
+
+    assert contextual["care_plan"]["intervention_type"] == expected
+    assert contextual["care_plan"]["preference_matched"] == preference
+    assert contextual["care_plan"]["ranking_score"] <= 1.0
+
+
+def test_schedule_adjustment_candidate_is_strictly_gated_by_hard_preference():
+    care = CareMessageService("Asia/Shanghai")
+
+    def contextual(allowed: bool):
+        return care.contextualize_alert(
+            _alert(),
+            source="forecast_warning",
+            local_date=TARGET,
+            calendar_events=_calendar(),
+            calendar_degraded=False,
+            recent_observation=None,
+            profile=None,
+            profile_version=None,
+            care_preferences={
+                "version": 1,
+                "preferred_support_types": [],
+                "allow_schedule_suggestions": allowed,
+            },
+        )
+
+    assert contextual(False)["care_plan"]["intervention_type"] == (
+        "transition_buffer"
+    )
+    assert contextual(True)["care_plan"]["intervention_type"] == (
+        "schedule_adjustment"
+    )
+
+
 def test_missing_calendar_state_and_preference_uses_audited_generic_fallback():
     contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
         _alert(current_events=[], dominant_stressors=[]),
@@ -376,14 +493,13 @@ def test_user_requested_support_reuses_context_policy_and_templates(monkeypatch)
             }
 
     class Observations:
-        def recent(self, _participant_id, limit=1):
+        def recent_before(self, _participant_id, **_kwargs):
             return [_observation(energy=2.0)]
 
     monkeypatch.setattr("app.tools.care.datetime", FixedDateTime)
     tools = CareTools(
         profiles=Profiles(),
         observations=Observations(),
-        predictions=None,
         calendar=None,
         tokens=None,
         timezone_name="Asia/Shanghai",

@@ -101,6 +101,7 @@ class ObservationForecastRefreshService:
                         local_date,
                         "observation_committed",
                         refresh_calendar=False,
+                        force_followup=True,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -133,4 +134,3 @@ class ObservationForecastRefreshService:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._requested.clear()
-

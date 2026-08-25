@@ -427,7 +427,6 @@ def test_care_record_checkin_uses_observation_refresh_service():
         ObservationRepository(database),
         None,
         None,
-        None,
         "Asia/Shanghai",
         object(),
         observation_refresh=refresh,
@@ -442,6 +441,19 @@ def test_care_record_checkin_uses_observation_refresh_service():
     })
     assert result["ok"] is True
     assert len(refresh.created_calls) == 1
+    conflict = tools.record_checkin(ctx, {
+        "stress": 2,
+        "energy": 9,
+        "activity": "different payload",
+        "stress_event_since_last": False,
+        "event_ongoing": False,
+    })
+    assert conflict["ok"] is False
+    assert conflict["error"] == "idempotency_conflict"
+    assert conflict["recorded"]["stress_0_10"] == 7.0
+    assert len(refresh.created_calls) == 1
+    with database.session() as session:
+        assert session.query(StateObservation).count() == 1
 
 
 def _prediction_with_optional_afternoon_checkin(include: bool):
@@ -809,6 +821,17 @@ def test_worker_uploads_then_sends_materialized_image_card():
 class _MutationCoordinator:
     def __init__(self):
         self.calls = []
+        self.warnings = object()
+        self.forecasts = type(
+            "Forecasts",
+            (),
+            {
+                "invalidate_for_calendar_mutation": lambda *_args, **_kwargs: {
+                    "forecasts_invalidated": 0,
+                    "warnings_cancelled": 0,
+                }
+            },
+        )()
 
     async def ensure_forecast(self, participant_id, target, reason, **kwargs):
         self.calls.append((participant_id, target, reason, kwargs))
@@ -847,7 +870,7 @@ class _MutationCalendar:
 def _mutation_tools():
     coordinator = _MutationCoordinator()
     tools = CareTools(
-        None, None, None, _MutationCalendar(), None, "Asia/Shanghai",
+        None, None, _MutationCalendar(), None, "Asia/Shanghai",
         coordinator,
     )
     ctx = AgentContext(uuid.uuid4(), "P", "ou", "oc", "message", uuid.uuid4())
@@ -907,7 +930,7 @@ def test_calendar_mutation_reschedules_warning():
     calendar.get_event = get_event
     calendar.delete_event = delete_event
     tools = CareTools(
-        None, None, None, calendar, None, "Asia/Shanghai", coordinator
+        None, None, calendar, None, "Asia/Shanghai", coordinator
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "message", uuid.uuid4())
     result = asyncio.run(tools.delete_calendar_event(ctx, {

@@ -16,7 +16,7 @@ from app.services.care_templates import (
 )
 
 
-CARE_MESSAGE_SCHEMA_VERSION = "care_message.v1"
+CARE_MESSAGE_SCHEMA_VERSION = "care_message.v2"
 
 
 class CareMessageService:
@@ -77,6 +77,9 @@ class CareMessageService:
                 else None
             ),
             "care_preference_version": context.care_preference_version,
+            "recent_observation_max_age_minutes": (
+                context.recent_observation_max_age_minutes
+            ),
             "context_quality": context.context_quality,
         }
         result = dict(alert)

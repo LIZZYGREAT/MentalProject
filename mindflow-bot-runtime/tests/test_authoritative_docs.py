@@ -20,7 +20,7 @@ def _marker(path: Path, name: str) -> str:
 
 def _tool_count() -> int:
     registry = ToolRegistry()
-    CareTools(None, None, None, None, None, "Asia/Shanghai", None).register(
+    CareTools(None, None, None, None, "Asia/Shanghai", None).register(
         registry
     )
     return len(registry.names)

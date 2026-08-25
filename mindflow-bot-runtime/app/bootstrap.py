@@ -18,7 +18,6 @@ from app.repositories import (
     ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
-    PredictionRepository,
     ProfileRepository,
     LearnedProfileRepository,
     WarningScheduleRepository,
@@ -55,7 +54,6 @@ from services.event_semantics import OpenAICompatibleSemanticClient
 class BusinessServices:
     profiles: ProfileRepository
     observations: ObservationRepository
-    predictions: PredictionRepository
     conversations: ConversationRepository
     token_repository: TokenRepository
     calendar: CalendarService
@@ -84,7 +82,6 @@ def build_business_services(
 ) -> BusinessServices:
     profiles = ProfileRepository(database)
     observations = ObservationRepository(database)
-    predictions = PredictionRepository(database)
     conversations = ConversationRepository(database)
     encryption = TokenEncryptionService(settings.token_encryption_key)
     token_repository = TokenRepository(
@@ -104,16 +101,16 @@ def build_business_services(
     )
     calendar = CalendarService(refresh, timezone_name=settings.timezone_name)
     presentations = PresentationOutbox()
-    daily_review_schedules = DailyReviewScheduleRepository(database)
+    daily_review_schedules = DailyReviewScheduleRepository(
+        database, timezone_name=settings.timezone_name
+    )
     daily_review_responses = DailyReviewResponseRepository(database)
     retrospective_curves = RetrospectiveCurveRepository(database)
     daily_reviews = DailyReviewService(
         daily_review_responses, daily_review_schedules, retrospective_curves,
         ForecastSnapshotRepository(database), observations, settings,
     )
-    prediction_service = PredictionService(
-        AssessmentModel(settings.timezone_name), predictions
-    )
+    prediction_service = PredictionService(AssessmentModel(settings.timezone_name))
     semantic_client = None
     if settings.semantic_api_enabled and settings.deepseek_api_key:
         semantic_client = OpenAICompatibleSemanticClient(
@@ -130,7 +127,11 @@ def build_business_services(
         max_daily_sends=settings.warning_max_daily_sends,
         min_interval_minutes=settings.warning_min_interval_minutes,
     )
-    warning_schedules = WarningScheduleRepository(database, warning_delivery_policy)
+    warning_schedules = WarningScheduleRepository(
+        database,
+        warning_delivery_policy,
+        timezone_name=settings.timezone_name,
+    )
     care_preferences = ParticipantCarePreferenceRepository(
         database,
         system_max_daily_sends=warning_delivery_policy.max_daily_sends,
@@ -175,11 +176,12 @@ def build_business_services(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
     )
-    registry = ToolRegistry(runs)
+    registry = ToolRegistry(
+        runs, sync_max_concurrency=settings.tool_sync_max_concurrency
+    )
     CareTools(
         profiles,
         observations,
-        predictions,
         calendar,
         token_repository,
         settings.timezone_name,
@@ -195,7 +197,6 @@ def build_business_services(
     return BusinessServices(
         profiles=profiles,
         observations=observations,
-        predictions=predictions,
         conversations=conversations,
         token_repository=token_repository,
         calendar=calendar,

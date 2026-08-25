@@ -129,10 +129,9 @@ class DailyReviewScheduler:
                 preferences = await asyncio.to_thread(
                     self.care_preferences.get, participant_id
                 )
-                scheduled_at = datetime.fromisoformat(item["scheduled_at"])
                 if not self.care_preferences.allows_daily_review_at(
                     preferences,
-                    scheduled_at,
+                    utc_now,
                 ):
                     await asyncio.to_thread(
                         self.schedules.mark_cancelled,
@@ -171,6 +170,13 @@ class DailyReviewScheduler:
                 schedule_id=item["id"], local_date=item["local_date"],
                 card_version=item["card_version"],
             )
+            if not await asyncio.to_thread(
+                self.schedules.authorize_claim_current,
+                item["id"],
+                item["claim_token"],
+                now=datetime.now(timezone.utc),
+            ):
+                continue
             try:
                 message_id = await asyncio.to_thread(
                     self.sender.send_card, binding["chat_id"], card,

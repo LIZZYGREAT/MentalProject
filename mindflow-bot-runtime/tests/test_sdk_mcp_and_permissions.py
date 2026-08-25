@@ -1,5 +1,7 @@
 import asyncio
 import json
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -47,6 +49,64 @@ class FakeSDK:
     @staticmethod
     def create_sdk_mcp_server(name, version, tools):
         return {"type": "sdk", "name": name, "version": version, "tools": tools}
+
+
+def test_sync_io_tool_runs_off_event_loop_and_respects_bounded_concurrency():
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+    registry = ToolRegistry(sync_max_concurrency=1)
+
+    def blocking_handler(_ctx, args):
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(float(args["delay"]))
+        with state_lock:
+            active -= 1
+        return {"ok": True}
+
+    registry.register(
+        "blocking_io",
+        "test blocking I/O",
+        {
+            "type": "object",
+            "properties": {"delay": {"type": "number"}},
+            "required": ["delay"],
+            "additionalProperties": False,
+        },
+        blocking_handler,
+        execution_mode="sync_io",
+    )
+    context = AgentContext(
+        uuid.uuid4(), "P001", "ou", "oc", "msg", uuid.uuid4()
+    )
+
+    async def scenario():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        pulse = asyncio.create_task(heartbeat())
+        results = await asyncio.gather(*(
+            registry.execute(context, "blocking_io", {"delay": 0.06})
+            for _ in range(3)
+        ))
+        stop.set()
+        await pulse
+        return ticks, results
+
+    ticks, results = asyncio.run(scenario())
+
+    assert ticks >= 10
+    assert maximum_active == 1
+    assert all(result.status == "succeeded" for result in results)
 
 
 def test_sdk_mcp_uses_registry_schema_and_backend_context_only():
@@ -150,7 +210,7 @@ def test_sdk_mcp_emits_failed_lifecycle_without_sensitive_payloads():
 
 def test_all_production_tool_schemas_are_closed_and_identity_free():
     registry = ToolRegistry()
-    CareTools(None, None, None, None, None, "Asia/Shanghai", object()).register(registry)
+    CareTools(None, None, None, None, "Asia/Shanghai", object()).register(registry)
 
     assert set(registry.names) == {
         "care_get_today_context",

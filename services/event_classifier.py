@@ -14,7 +14,7 @@ from services.course_catalog import (
 from settings.event_routing import COURSE_HINT_PATTERN, ROUTINE_PATTERNS, TASK_PATTERNS
 
 
-EVENT_CLASSIFICATION_VERSION = "event_classification.v1"
+EVENT_CLASSIFICATION_VERSION = "event_classification.v2"
 CLASSIFIABLE_EVENT_TYPES = {
     "course",
     "task",
@@ -50,11 +50,12 @@ def classify_event(
     resolver = resolver or DEFAULT_COURSE_CATALOG_RESOLVER
     title = str(summary or "").strip()
     description = str(description or "").strip()
-    combined = f"{title} {description}".strip()
     folded_title = title.casefold()
     explicit_type = str(explicit_type or "").strip().casefold()
     explicit_task = str(explicit_task or "").strip().casefold()
-    resolution = resolver.resolve(combined)
+    # The title owns event intent. Description text may provide context later,
+    # but it cannot turn a task into a course or vice versa.
+    resolution = resolver.resolve(title)
 
     event_type = "task"
     task_type = "general"
@@ -75,7 +76,7 @@ def classify_event(
             source = "routine_rule"
             lock = "routine"
         else:
-            task_rule = _task_classification(folded_title, combined)
+            task_rule = _task_classification(folded_title, folded_title)
             if task_rule is not None:
                 event_type, task_type, event_kind = task_rule
                 source = "task_rule"
@@ -84,9 +85,13 @@ def classify_event(
                 event_type, task_type, event_kind = "course", "course", "course_session"
                 source = _candidate_source(resolution.exact_match)
                 lock = "catalog_exact"
-            elif resolution.likely_course:
+            elif resolution.strong_course_evidence:
                 event_type, task_type, event_kind = "course", "course", "course_session"
-                source = "catalog_candidates"
+                source = (
+                    "catalog_alias"
+                    if resolution.alias_match_kind else "catalog_exact"
+                )
+                lock = "catalog_strong_evidence"
             elif re.search(COURSE_HINT_PATTERN, folded_title):
                 event_type, task_type, event_kind = "course", "course", "course_session"
                 source = "course_keyword_rule"
@@ -108,6 +113,13 @@ def classify_event(
         },
     }
     selected = resolution.exact_match
+    if (
+        selected is None
+        and event_type == "course"
+        and resolution.alias_match_kind == "controlled_variant"
+        and resolution.candidates
+    ):
+        selected = resolution.candidates[0]
     if selected is not None:
         _apply_course_identity(
             result,
@@ -117,7 +129,11 @@ def classify_event(
             event_type=event_type,
             catalog_revision=resolution.catalog_revision,
         )
-    elif event_type == "task" and resolution.likely_course:
+    elif (
+        event_type == "task"
+        and resolution.likely_course
+        and lock == "course_related_task"
+    ):
         selected = resolution.candidates[0]
         _apply_course_identity(
             result,
@@ -149,6 +165,7 @@ def finalize_event_classification(
         "explicit",
         "routine",
         "catalog_exact",
+        "catalog_strong_evidence",
         "course_related_task",
     }:
         proposed_type = str(external_classification.get("event_type") or "").casefold()
@@ -170,7 +187,7 @@ def finalize_event_classification(
     if (
         external_course_match
         and external_course_match.get("matched")
-        and lock != "catalog_exact"
+        and lock not in {"catalog_exact", "catalog_strong_evidence"}
     ):
         candidate = CourseCandidate(
             canonical_name=str(external_course_match["canonical_name"]),

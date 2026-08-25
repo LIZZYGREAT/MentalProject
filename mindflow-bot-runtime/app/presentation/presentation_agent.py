@@ -15,20 +15,19 @@ PRESENTATION_SYSTEM_RULES = """You are MindFlow's presentation compiler.
 You do not make decisions and you do not add facts. Input is an already-reviewed
 authoritative answer from another agent.
 
-Your only tasks:
-- remove redundancy,
-- make the Chinese natural and concise,
-- order information for readability,
-- split long content into 1-3 user-facing message segments.
+Your only task is to choose 1-3 delivery boundaries in the supplied authoritative
+answer. You are a boundary selector, not a writer.
 
 Hard rules:
-- preserve every numeric value, date, time, status, and business outcome,
-- do not introduce new facts,
-- do not soften or reverse a success/failure result,
-- do not use Markdown syntax,
+- never output or rewrite answer text,
+- spans must cover the complete answer exactly once, in its original order,
+- the first start is 0, adjacent spans touch, and the final end equals the
+  Python character length supplied in authoritative_answer_length,
+- offsets use Python Unicode character indexes and end is exclusive,
 - do not call tools,
 - do not mention internal systems,
-- output JSON only in the form {"segments":["first", "second"]}.
+- output JSON only in the form
+  {"spans":[{"start":0,"end":120},{"start":120,"end":240}]}.
 """
 
 
@@ -40,7 +39,7 @@ class PresentationAgentProtocol(Protocol):
         response_kind: str,
         has_card: bool,
         max_segments: int,
-    ) -> tuple[str, ...]: ...
+    ) -> tuple[tuple[int, int], ...]: ...
 
 
 class ProductionPresentationAgent:
@@ -89,7 +88,7 @@ class ProductionPresentationAgent:
         response_kind: str,
         has_card: bool,
         max_segments: int,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[int, int], ...]:
         sdk = _load_sdk()
         options = sdk.ClaudeAgentOptions(
             tools=[],
@@ -112,6 +111,7 @@ class ProductionPresentationAgent:
         prompt = json.dumps(
             {
                 "authoritative_answer": str(text),
+                "authoritative_answer_length": len(str(text)),
                 "response_kind": str(response_kind),
                 "has_card": bool(has_card),
                 "max_segments": int(max_segments),
@@ -129,10 +129,24 @@ class ProductionPresentationAgent:
         if result_message is None or result_message.is_error:
             raise ValueError("presentation agent returned no successful result")
         payload = json.loads(str(result_message.result or ""))
-        segments = payload.get("segments") if isinstance(payload, dict) else None
-        if not isinstance(segments, list):
-            raise ValueError("presentation agent result has no segments")
-        return tuple(str(item) for item in segments)
+        spans = payload.get("spans") if isinstance(payload, dict) else None
+        if not isinstance(spans, list):
+            raise ValueError("presentation agent result has no spans")
+        parsed = []
+        for span in spans:
+            if not isinstance(span, dict):
+                raise ValueError("presentation span must be an object")
+            start = span.get("start")
+            end = span.get("end")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+            ):
+                raise ValueError("presentation span offsets must be integers")
+            parsed.append((start, end))
+        return tuple(parsed)
 
     async def _disconnect_bounded(self, client: object) -> None:
         """Do not let SDK process cleanup extend the user-visible deadline."""

@@ -111,9 +111,7 @@ def test_real_forecast_pipeline_accepts_timezone_aware_calendar_snapshot():
     participant = participants.create("REAL-FORECAST-TEST")
     calendar = MutableCalendar([raw_event])
     warnings = warning_repository(database)
-    prediction = PredictionService(
-        AssessmentModel("Asia/Shanghai"), PredictionRepository(database)
-    )
+    prediction = PredictionService(AssessmentModel("Asia/Shanghai"))
     coordinator = ForecastCoordinator(
         participants=participants, profiles=ProfileRepository(database),
         observations=ObservationRepository(database), calendar=calendar,

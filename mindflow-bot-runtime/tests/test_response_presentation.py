@@ -116,14 +116,15 @@ class GoodPresentationAgent:
     def __init__(self):
         self.calls = 0
 
-    async def compose(self, *_args, **_kwargs):
+    async def compose(self, text, **_kwargs):
         self.calls += 1
-        return ("先说结论：峰值在 15:45，数值为 74.06。", "接下来可以留出缓冲。")
+        split = text.find("，", max(1, len(text) // 3)) + 1
+        return ((0, split), (split, len(text)))
 
 
 class BadNumericPresentationAgent:
-    async def compose(self, *_args, **_kwargs):
-        return ("峰值改成了 16:00，数值为 80。",)
+    async def compose(self, text, **_kwargs):
+        return ((0, len(text) - 1),)
 
 
 class TimeoutPresentationAgent:
@@ -133,11 +134,14 @@ class TimeoutPresentationAgent:
 
 
 class MarkdownPresentationAgent:
+    async def compose(self, text, **_kwargs):
+        split = text.index("\n") + 1
+        return ((0, split), (split, len(text)))
+
+
+class SameNumbersSemanticReversalAgent:
     async def compose(self, *_args, **_kwargs):
-        return (
-            "- 第一项：15:45 压力值 74.06",
-            "`inline` [帮助](https://example.com)",
-        )
+        return ("结论相反：15:45 不会出现压力峰值，数值仍写 74.06。",)
 
 
 def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent():
@@ -225,6 +229,24 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
     assert "15:45" in slow_plan.full_text
 
 
+def test_presentation_rejects_free_text_even_when_all_numbers_are_preserved():
+    source = RuntimeResponse(
+        "权威结论：15:45 会出现压力峰值，数值为 74.06。",
+        response_kind="analysis",
+    )
+    plan = asyncio.run(ResponseOrchestrator(
+        presentation_agent=SameNumbersSemanticReversalAgent(),
+        presentation_agent_mode="always",
+        presentation_agent_min_chars=1,
+        segmenter=SemanticSegmenter(min_total_chars=1),
+    ).build_plan(source, cards=[], used_tools=set()))
+
+    assert plan.presentation_agent_used is False
+    assert plan.presentation_agent_outcome == "validation_reject"
+    assert plan.full_text == source.text
+    assert "不会出现" not in plan.full_text
+
+
 def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
     orchestrator = ResponseOrchestrator(
         presentation_agent=MarkdownPresentationAgent(),
@@ -235,7 +257,8 @@ def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
     plan = asyncio.run(
         orchestrator.build_plan(
             RuntimeResponse(
-                "第一项：15:45 压力值 74.06。inline 帮助内容。",
+                "- 第一项：15:45 压力值 74.06\n"
+                "`inline` [帮助](https://example.com)",
                 response_kind="analysis",
             ),
             cards=[],
@@ -374,7 +397,7 @@ def test_production_presentation_agent_is_stateless_toolless_and_skillless(monke
         class ResultMessage:
             def __init__(self):
                 self.is_error = False
-                self.result = '{"segments":["整理后的回复"]}'
+                self.result = '{"spans":[{"start":0,"end":13}]}'
 
         class ClaudeSDKClient:
             def __init__(self, options):
@@ -413,7 +436,7 @@ def test_production_presentation_agent_is_stateless_toolless_and_skillless(monke
         )
     )
 
-    assert result == ("整理后的回复",)
+    assert result == ((0, 13),)
     options = SDK.last_client.options
     assert options.tools == []
     assert options.skills == []
@@ -433,7 +456,7 @@ def test_production_presentation_agent_disconnect_has_an_independent_deadline(
             def __init__(self, **kwargs): self.__dict__.update(kwargs)
         class ResultMessage:
             is_error = False
-            result = '{"segments":["完整结果 15:45 / 74.06"]}'
+            result = '{"spans":[{"start":0,"end":18}]}'
         class ClaudeSDKClient:
             def __init__(self, options): self.options = options
             async def connect(self): return None
@@ -455,7 +478,7 @@ def test_production_presentation_agent_disconnect_has_an_independent_deadline(
     ))
     elapsed = time.monotonic() - started
 
-    assert result == ("完整结果 15:45 / 74.06",)
+    assert result == ((0, 18),)
     assert elapsed < 0.15
 
 

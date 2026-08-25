@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 import math
 import re
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 
-CARE_CONTEXT_SCHEMA_VERSION = "care_context.v1"
+CARE_CONTEXT_SCHEMA_VERSION = "care_context.v2"
+CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES = 360
 _SPACE = re.compile(r"\s+")
 _PREFERENCE_KEYS = {
     "recovery_preference": "recovery_preference",
@@ -106,6 +107,7 @@ class CareProfileSummary:
     recovery_preference: str | None
     support_preference: str | None
     care_preference: str | None
+    preferred_support_types: tuple[str, ...]
     profile_version: int | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -137,6 +139,8 @@ class CareContext:
     profile_fact_used: bool
     care_preference_version: int | None
     allow_follow_up: bool
+    allow_schedule_suggestions: bool
+    recent_observation_max_age_minutes: int
 
     @property
     def calendar_context_ids(self) -> tuple[str, ...]:
@@ -148,7 +152,6 @@ class CareContext:
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
-        result["profile_summary"] = self.profile_summary.to_dict()
         result["calendar_context_ids"] = list(self.calendar_context_ids)
         return result
 
@@ -254,6 +257,12 @@ class CareContextBuilder:
             allow_follow_up=bool(
                 (care_preferences or {}).get("allow_follow_up", True)
             ),
+            allow_schedule_suggestions=bool(
+                (care_preferences or {}).get("allow_schedule_suggestions", False)
+            ),
+            recent_observation_max_age_minutes=(
+                CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+            ),
         )
 
     def _risk_time(self, alert: Mapping[str, Any], local_date: date) -> datetime:
@@ -333,7 +342,12 @@ class CareContextBuilder:
             local_date=risk_time.date(),
             timezone_value=self.timezone,
         )
-        if observed_at is not None and observed_at > risk_time:
+        if observed_at is None:
+            return None
+        age = risk_time - observed_at
+        if age < timedelta(0) or age > timedelta(
+            minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+        ):
             return None
         stress = payload.get("stress_0_10")
         energy = payload.get("energy_0_10")
@@ -341,7 +355,7 @@ class CareContextBuilder:
             return None
         return {
             "id": _text(value.get("id") or value.get("observation_id"), 160),
-            "observed_at": observed_at.isoformat() if observed_at else None,
+            "observed_at": observed_at.isoformat(),
             "stress_0_10": _zero_to_ten(stress) if stress is not None else None,
             "energy_0_10": _zero_to_ten(energy) if energy is not None else None,
             "activity": _text(payload.get("activity"), 80) or None,
@@ -357,6 +371,7 @@ class CareContextBuilder:
     ) -> CareProfileSummary:
         preferences: dict[str, str] = {}
         controlled_preference_used = False
+        preferred_types: set[str] = set()
 
         def visit(value: Mapping[str, Any], depth: int = 0) -> None:
             if depth > 2:
@@ -372,7 +387,10 @@ class CareContextBuilder:
                     visit(raw, depth + 1)
 
         if isinstance(care_preferences, Mapping):
-            preferred_types = set(care_preferences.get("preferred_support_types") or [])
+            preferred_types = {
+                str(value)
+                for value in (care_preferences.get("preferred_support_types") or [])
+            }
             if "walk" in preferred_types:
                 preferences["recovery_preference"] = "短暂散步"
             elif "hydration" in preferred_types:
@@ -381,7 +399,12 @@ class CareContextBuilder:
                 preferences["recovery_preference"] = "安静休息"
             if "trusted_person" in preferred_types:
                 preferences["support_preference"] = "联系一位可信任的人"
-            controlled_preference_used = bool(preferences)
+            try:
+                controlled_preference_used = int(
+                    care_preferences.get("version") or 0
+                ) > 0
+            except (TypeError, ValueError):
+                controlled_preference_used = False
         if not controlled_preference_used and isinstance(profile, Mapping):
             visit(profile)
         stress = observation.get("stress_0_10") if observation else None
@@ -401,6 +424,7 @@ class CareContextBuilder:
             recovery_preference=preferences.get("recovery_preference"),
             support_preference=preferences.get("support_preference"),
             care_preference=preferences.get("care_preference"),
+            preferred_support_types=tuple(sorted(preferred_types)),
             profile_version=(
                 profile_version
                 if preferences and not controlled_preference_used

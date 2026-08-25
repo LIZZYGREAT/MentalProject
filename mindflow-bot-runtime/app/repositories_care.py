@@ -15,6 +15,7 @@ from app.db import Database
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    DailyReviewSchedule,
     Participant,
     ParticipantCarePreference,
     WarningSchedule,
@@ -32,6 +33,7 @@ CARE_ACTIONS = {
     "too_late",
 }
 CARE_CARD_ACTIONS = ["ack", "snooze_30", "mute_today", "helpful", "not_relevant"]
+OPERATIONAL_CARE_ACTIONS = {"ack", "snooze_30", "mute_today"}
 PREFERRED_SUPPORT_TYPES = {
     "micro_break",
     "hydration",
@@ -134,6 +136,7 @@ class ParticipantCarePreferenceRepository:
             row = session.get(
                 ParticipantCarePreference, participant_id, with_for_update=True
             )
+            created_preference = row is None
             if row is None:
                 row = ParticipantCarePreference(
                     participant_id=participant_id,
@@ -145,7 +148,13 @@ class ParticipantCarePreferenceRepository:
             self._apply_changes(row, changes)
             after_values = self._view(row)
             material_keys = allowed
-            if any(before.get(key) != after_values.get(key) for key in material_keys):
+            if (
+                (created_preference and bool(changes))
+                or any(
+                    before.get(key) != after_values.get(key)
+                    for key in material_keys
+                )
+            ):
                 row.version = int(row.version or 0) + 1
                 row.updated_at = changed_at
             self._cancel_disallowed_in_session(
@@ -308,6 +317,15 @@ class ParticipantCarePreferenceRepository:
         kept_by_date: dict[date, int] = {}
         sent_by_date: dict[date, int] = {}
         for warning in sorted(rows, key=lambda item: item.target_time):
+            if (
+                warning.status == "claimed"
+                and warning.authorized_at is not None
+                and warning.lease_until is not None
+                and _aware(warning.lease_until) >= now
+            ):
+                # Authorization is the commit point for an in-flight provider
+                # request. Preference changes apply to later deliveries.
+                continue
             if warning.local_date not in sent_by_date:
                 sent_by_date[warning.local_date] = len(
                     session.execute(
@@ -331,6 +349,7 @@ class ParticipantCarePreferenceRepository:
             warning.claim_token = None
             warning.claimed_at = None
             warning.lease_until = None
+            warning.authorized_at = None
             warning.next_attempt_at = None
             warning.payload_json = {
                 **dict(warning.payload_json),
@@ -338,6 +357,34 @@ class ParticipantCarePreferenceRepository:
             }
             warning.updated_at = now
             CareInterventionRepository.mirror_warning_in_session(session, warning)
+
+        daily_reviews = session.execute(
+            select(DailyReviewSchedule).where(
+                DailyReviewSchedule.participant_id == participant_id,
+                DailyReviewSchedule.status.in_(
+                    ("pending", "claimed", "delivery_unavailable")
+                ),
+            ).with_for_update()
+        ).scalars().all()
+        for review in daily_reviews:
+            if (
+                review.status == "claimed"
+                and review.authorized_at is not None
+                and review.lease_until is not None
+                and _aware(review.lease_until) >= now
+            ):
+                continue
+            if self.allows_daily_review_at(view, review.scheduled_at):
+                continue
+            review.status = "cancelled"
+            review.claim_token = None
+            review.claimed_at = None
+            review.lease_until = None
+            review.authorized_at = None
+            review.next_attempt_at = None
+            review.last_error_code = "participant_care_preference"
+            review.last_error_class = None
+            review.updated_at = now
 
     def _view(self, row: ParticipantCarePreference) -> dict[str, Any]:
         configured_max = row.max_proactive_care_per_day
@@ -522,6 +569,15 @@ class CareInterventionRepository:
                 ).scalar_one()
                 if intervention.delivery_status not in {"sent", "escalated"}:
                     raise ValueError("care intervention has not been delivered")
+                if (
+                    normalized_action in OPERATIONAL_CARE_ACTIONS
+                    and intervention.user_action is not None
+                ):
+                    return self._resolved_operational_result(
+                        session,
+                        intervention,
+                        requested_action=normalized_action,
+                    )
 
                 feedback = CareInterventionFeedback(
                     intervention_id=intervention.id,
@@ -581,14 +637,28 @@ class CareInterventionRepository:
                     select(CareInterventionFeedback).where(
                         CareInterventionFeedback.callback_event_id == event_key
                     )
-                ).scalar_one()
-                return self._existing_action_result(
-                    session,
-                    existing,
-                    participant_id=participant_id,
-                    intervention_id=intervention_id,
-                    action=normalized_action,
-                )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return self._existing_action_result(
+                        session,
+                        existing,
+                        participant_id=participant_id,
+                        intervention_id=intervention_id,
+                        action=normalized_action,
+                    )
+                intervention = session.get(CareInterventionEvent, intervention_id)
+                if (
+                    intervention is not None
+                    and intervention.participant_id == participant_id
+                    and normalized_action in OPERATIONAL_CARE_ACTIONS
+                    and intervention.user_action is not None
+                ):
+                    return self._resolved_operational_result(
+                        session,
+                        intervention,
+                        requested_action=normalized_action,
+                    )
+            raise
 
     def _create_snooze_in_session(
         self,
@@ -596,6 +666,13 @@ class CareInterventionRepository:
         intervention: CareInterventionEvent,
         now: datetime,
     ) -> tuple[str | None, str]:
+        existing_follow_up = session.execute(
+            select(WarningSchedule).where(
+                WarningSchedule.snoozed_from_intervention_id == intervention.id
+            )
+        ).scalar_one_or_none()
+        if existing_follow_up is not None:
+            return str(existing_follow_up.id), "scheduled"
         preference = session.get(
             ParticipantCarePreference, intervention.participant_id
         )
@@ -635,7 +712,7 @@ class CareInterventionRepository:
         provenance = dict(payload.get("care_provenance") or {})
         provenance.update(
             {
-                "source_warning_id": str(warning_id),
+                "source_warning_id": str(original.id),
                 "source_forecast_id": str(original.forecast_id),
                 "forecast_version": original.forecast_version,
             }
@@ -653,6 +730,7 @@ class CareInterventionRepository:
             local_date=original.local_date,
             forecast_id=original.forecast_id,
             forecast_version=original.forecast_version,
+            snoozed_from_intervention_id=intervention.id,
             warning_identity=identity,
             episode_identity=identity,
             target_time=target,
@@ -668,6 +746,34 @@ class CareInterventionRepository:
         session.flush()
         self.mirror_warning_in_session(session, follow_up)
         return str(warning_id), "scheduled"
+
+    def _resolved_operational_result(
+        self,
+        session: Any,
+        intervention: CareInterventionEvent,
+        *,
+        requested_action: str,
+    ) -> dict[str, Any]:
+        recorded_action = str(intervention.user_action)
+        follow_up = session.execute(
+            select(WarningSchedule).where(
+                WarningSchedule.snoozed_from_intervention_id == intervention.id
+            )
+        ).scalar_one_or_none()
+        same_action = recorded_action == requested_action
+        return {
+            "created": False,
+            "action_result": (
+                "scheduled"
+                if same_action and requested_action == "snooze_30" and follow_up
+                else "already_recorded" if same_action else "already_resolved"
+            ),
+            "requested_action": requested_action,
+            "recorded_action": recorded_action,
+            "follow_up_warning_id": str(follow_up.id) if follow_up else None,
+            "feedback": None,
+            "intervention": self._view(intervention),
+        }
 
     def _mute_in_session(
         self,
@@ -722,21 +828,14 @@ class CareInterventionRepository:
         follow_up_warning_id = None
         action_result = "already_recorded"
         if action == "snooze_30":
-            warnings = session.execute(
+            warning = session.execute(
                 select(WarningSchedule).where(
-                    WarningSchedule.participant_id == participant_id
+                    WarningSchedule.snoozed_from_intervention_id == intervention_id
                 )
-            ).scalars().all()
-            for warning in warnings:
-                if str(
-                    dict(warning.payload_json or {}).get(
-                        "snoozed_from_intervention_id"
-                    )
-                    or ""
-                ) == str(intervention_id):
-                    follow_up_warning_id = str(warning.id)
-                    action_result = "scheduled"
-                    break
+            ).scalar_one_or_none()
+            if warning is not None:
+                follow_up_warning_id = str(warning.id)
+                action_result = "scheduled"
         return {
             "created": False,
             "action_result": action_result,

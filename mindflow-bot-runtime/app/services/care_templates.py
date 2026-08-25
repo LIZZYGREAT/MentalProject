@@ -10,7 +10,7 @@ from app.services.care_context import CareContext
 from app.services.care_intervention_policy import CareMessagePlan
 
 
-CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v1"
+CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v2"
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class CareTemplateLibrary:
         "workload-decomposition-v1": "1.0.0",
         "protected-break-v1": "1.0.0",
         "brief-check-in-v1": "1.0.0",
+        "schedule-adjustment-v1": "1.0.0",
     }
 
     def render(
@@ -149,6 +150,11 @@ class CareTemplateLibrary:
             return (
                 f"可以先只确定一个 {plan.action_minutes} 分钟内能推进的小任务，"
                 "其余待办暂时放到后面，避免同时盯着所有事情。"
+            )
+        if plan.intervention_type == "schedule_adjustment":
+            return (
+                f"如果你愿意，可以考虑给相邻安排留出约 {plan.action_minutes} 分钟缓冲，"
+                "或把其中一项移到压力较低的时段；是否调整由你决定。"
             )
         if plan.intervention_type == "protected_break":
             recovery = (

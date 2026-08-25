@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -36,6 +37,7 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    execution_mode: Literal["async", "sync_io"]
 
 
 @dataclass(frozen=True)
@@ -75,9 +77,15 @@ def _safe_summary(value: Any, depth: int = 0) -> Any:
 
 
 class ToolRegistry:
-    def __init__(self, runs: AgentRunRepository | None = None):
+    def __init__(
+        self,
+        runs: AgentRunRepository | None = None,
+        *,
+        sync_max_concurrency: int = 8,
+    ):
         self._tools: dict[str, ToolSpec] = {}
         self.runs = runs
+        self._sync_slots = asyncio.Semaphore(max(1, int(sync_max_concurrency)))
 
     def register(
         self,
@@ -85,6 +93,8 @@ class ToolRegistry:
         description: str,
         parameters: dict[str, Any],
         handler: ToolHandler,
+        *,
+        execution_mode: Literal["async", "sync_io"] | None = None,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"duplicate tool: {name}")
@@ -95,7 +105,12 @@ class ToolRegistry:
         if schema.get("type") != "object" or schema.get("additionalProperties") is not False:
             raise ValueError("tool schema must be an object with additionalProperties=false")
         Draft202012Validator.check_schema(schema)
-        self._tools[name] = ToolSpec(name, description, schema, handler)
+        mode = execution_mode or (
+            "async" if inspect.iscoroutinefunction(handler) else "sync_io"
+        )
+        if mode not in {"async", "sync_io"}:
+            raise ValueError("execution_mode must be async or sync_io")
+        self._tools[name] = ToolSpec(name, description, schema, handler, mode)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -124,11 +139,11 @@ class ToolRegistry:
         spec = self._tools.get(str(name))
         if spec is None:
             result = {"ok": False, "error": "invalid_tool"}
-            self._log(ctx, name, None, result, "invalid_tool")
+            await self._log(ctx, name, None, result, "invalid_tool")
             return ToolExecution(result, "invalid_tool")
         if not isinstance(arguments, dict):
             result = {"ok": False, "error": "invalid_arguments"}
-            self._log(ctx, name, None, result, "invalid_arguments")
+            await self._log(ctx, name, None, result, "invalid_arguments")
             return ToolExecution(result, "invalid_arguments")
         errors = sorted(
             Draft202012Validator(
@@ -142,22 +157,26 @@ class ToolRegistry:
                 "error": "invalid_arguments",
                 "detail": errors[0].message[:300],
             }
-            self._log(ctx, name, arguments, result, "invalid_arguments")
+            await self._log(ctx, name, arguments, result, "invalid_arguments")
             return ToolExecution(result, "invalid_arguments")
         try:
-            value = spec.handler(ctx, arguments)
+            if spec.execution_mode == "async":
+                value = spec.handler(ctx, arguments)
+            else:
+                async with self._sync_slots:
+                    value = await asyncio.to_thread(spec.handler, ctx, arguments)
             if inspect.isawaitable(value):
                 value = await value
             result = value if isinstance(value, dict) else {"value": value}
             safe = _safe_summary(result)
-            self._log(ctx, name, arguments, safe, "succeeded")
+            await self._log(ctx, name, arguments, safe, "succeeded")
             return ToolExecution(safe, "succeeded")
         except Exception:
             result = {"ok": False, "error": "tool_exception"}
-            self._log(ctx, name, arguments, result, "tool_exception")
+            await self._log(ctx, name, arguments, result, "tool_exception")
             return ToolExecution(result, "tool_exception")
 
-    def _log(
+    async def _log(
         self,
         ctx: AgentContext,
         name: str,
@@ -166,10 +185,12 @@ class ToolRegistry:
         status: str,
     ) -> None:
         if self.runs is not None:
-            self.runs.tool_call(
-                ctx.agent_run_id,
-                name,
-                _safe_summary(arguments) if arguments is not None else None,
-                _safe_summary(result),
-                status,
-            )
+            async with self._sync_slots:
+                await asyncio.to_thread(
+                    self.runs.tool_call,
+                    ctx.agent_run_id,
+                    name,
+                    _safe_summary(arguments) if arguments is not None else None,
+                    _safe_summary(result),
+                    status,
+                )

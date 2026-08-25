@@ -11,6 +11,7 @@ from app.integrations.feishu.cards import care_intervention_card
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    Participant,
     StateObservation,
     WarningSchedule,
 )
@@ -23,12 +24,14 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.card_action_service import CardActionService
 from app.services.care_message_service import CareMessageService
 from app.services.daily_review_scheduler import DailyReviewScheduler
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.forecast_scheduler import ForecastScheduler
 from app.services.warning_policy import WarningPolicy
+from app.tools.care import _public_care_preferences
 from helpers import memory_database, warning_repository
 
 
@@ -232,6 +235,60 @@ def test_controlled_care_preference_has_distinct_provenance_and_actions():
     assert legacy_fallback["care_provenance"]["care_preference_version"] is None
 
 
+def test_repository_persists_first_explicit_empty_support_preference_as_authoritative():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("CARE-EXPLICIT-EMPTY")
+    preferences = ParticipantCarePreferenceRepository(
+        database,
+        system_max_daily_sends=2,
+        timezone_name="Asia/Shanghai",
+    )
+
+    stored = preferences.update(
+        participant.id,
+        {"preferred_support_types": []},
+        now=NOW,
+    )
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        {
+            "time": "10:00",
+            "tier": 2,
+            "S": 7.8,
+            "V": 2.5,
+            "F": 0.7,
+            "trigger_source": "sustained_intensity",
+            "care_action": "brief_check_in",
+        },
+        source="forecast_warning",
+        local_date=DAY,
+        calendar_events=[],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile={"care_preferences": {"recovery_preference": "我喜欢散步"}},
+        profile_version=7,
+        care_preferences=stored,
+    )
+
+    assert stored["version"] == 1
+    assert stored["preferred_support_types"] == []
+    assert contextual["care_provenance"]["care_preference_version"] == 1
+    assert contextual["care_provenance"]["profile_version"] is None
+    assert contextual["care_context"]["profile_summary"][
+        "recovery_preference"
+    ] is None
+
+
+def test_future_reserved_preferences_are_not_exposed_by_user_tools():
+    public = _public_care_preferences({
+        "care_enabled": True,
+        "morning_brief_enabled": False,
+        "weekly_summary_enabled": False,
+        "version": 1,
+    })
+
+    assert public == {"care_enabled": True, "version": 1}
+
+
 def test_quiet_hours_filter_before_policy_so_later_allowed_risks_are_considered():
     database = memory_database()
     preferences = ParticipantCarePreferenceRepository(
@@ -373,16 +430,40 @@ def test_snooze_is_idempotent_restart_safe_and_bypasses_only_minimum_interval():
         callback_event_id="callback-snooze-1",
         now=sent_at + timedelta(minutes=2),
     )
+    replay_with_new_callback = interventions.apply_action(
+        participant.id,
+        intervention_id,
+        action="snooze_30",
+        callback_event_id="callback-snooze-2",
+        now=sent_at + timedelta(minutes=3),
+    )
+    conflicting_action = interventions.apply_action(
+        participant.id,
+        intervention_id,
+        action="ack",
+        callback_event_id="callback-ack-after-snooze",
+        now=sent_at + timedelta(minutes=4),
+    )
 
     assert first["created"] is True
     assert first["action_result"] == "scheduled"
     assert replay["created"] is False
     assert replay["follow_up_warning_id"] == first["follow_up_warning_id"]
+    assert replay_with_new_callback["created"] is False
+    assert replay_with_new_callback["follow_up_warning_id"] == first[
+        "follow_up_warning_id"
+    ]
+    assert conflicting_action["action_result"] == "already_resolved"
+    assert conflicting_action["recorded_action"] == "snooze_30"
     with database.session() as session:
         assert session.query(WarningSchedule).count() == 2
         assert session.query(CareInterventionFeedback).count() == 1
         follow_up = session.get(
             WarningSchedule, uuid.UUID(first["follow_up_warning_id"])
+        )
+        assert follow_up.snoozed_from_intervention_id == intervention_id
+        assert follow_up.payload_json["care_provenance"]["source_warning_id"] == str(
+            intervention_id
         )
         claim_at = follow_up.target_time.replace(tzinfo=timezone.utc)
 
@@ -391,6 +472,173 @@ def test_snooze_is_idempotent_restart_safe_and_bypasses_only_minimum_interval():
     # remains authoritative.
     claimed = warnings.claim_if_current(follow_up.id, now=claim_at)
     assert claimed is not None
+
+
+def test_warning_preference_change_before_final_authorization_cancels_claim():
+    database, _, participant, warnings, preferences, _ = _setup()
+    with database.session() as session:
+        warning = session.query(WarningSchedule).one()
+        warning_id = warning.id
+        target = warning.target_time.replace(tzinfo=timezone.utc)
+        version = warning.forecast_version
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+
+    preferences.update(
+        participant.id,
+        {"warning_enabled": False},
+        now=target + timedelta(seconds=1),
+    )
+
+    assert not warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        now=target + timedelta(seconds=2),
+    )
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "cancelled"
+
+
+def test_warning_participant_deactivation_before_final_authorization_cancels_claim():
+    database, _, participant, warnings, _, _ = _setup()
+    with database.session() as session:
+        warning = session.query(WarningSchedule).one()
+        warning_id = warning.id
+        target = warning.target_time.replace(tzinfo=timezone.utc)
+        version = warning.forecast_version
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+    with database.session() as session:
+        session.get(Participant, participant.id).status = "inactive"
+
+    assert not warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        now=target + timedelta(seconds=1),
+    )
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "cancelled"
+        assert warning.payload_json["cancellation_reason"] == "participant_inactive"
+
+
+def test_warning_authorization_commit_defines_in_flight_preference_boundary():
+    database, _, participant, warnings, preferences, _ = _setup()
+    with database.session() as session:
+        warning = session.query(WarningSchedule).one()
+        warning_id = warning.id
+        target = warning.target_time.replace(tzinfo=timezone.utc)
+        version = warning.forecast_version
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        now=target + timedelta(seconds=1),
+    )
+
+    preferences.update(
+        participant.id,
+        {"warning_enabled": False},
+        now=target + timedelta(seconds=2),
+    )
+    with database.session() as session:
+        authorized = session.get(WarningSchedule, warning_id)
+        assert authorized.status == "claimed"
+        assert authorized.authorized_at is not None
+    assert warnings.finish_claim(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        sent=True,
+        now=target + timedelta(seconds=3),
+    )
+
+
+def test_daily_review_preferences_cancel_queued_and_preserve_authorized_in_flight():
+    database = memory_database()
+    participants = ParticipantRepository(database)
+    participant = participants.create("CARE-DAILY-AUTH")
+    preferences = ParticipantCarePreferenceRepository(
+        database,
+        system_max_daily_sends=2,
+        timezone_name="Asia/Shanghai",
+    )
+    schedules = DailyReviewScheduleRepository(
+        database, timezone_name="Asia/Shanghai"
+    )
+    scheduled = NOW - timedelta(minutes=1)
+    first = schedules.ensure(
+        participant.id,
+        DAY,
+        scheduled,
+        valid_until=NOW + timedelta(hours=1),
+    )
+    preferences.update(
+        participant.id,
+        {"daily_review_enabled": False},
+        now=NOW,
+    )
+    assert schedules.get(first["id"])["status"] == "cancelled"
+
+    preferences.update(
+        participant.id,
+        {"daily_review_enabled": True},
+        now=NOW + timedelta(seconds=1),
+    )
+    second = schedules.ensure(
+        participant.id,
+        DAY + timedelta(days=1),
+        scheduled,
+        valid_until=NOW + timedelta(hours=1),
+    )
+    claimed = schedules.claim_due(NOW, lease_seconds=120)
+    claimed_second = next(item for item in claimed if item["id"] == second["id"])
+    assert schedules.authorize_claim_current(
+        second["id"], claimed_second["claim_token"], now=NOW
+    )
+
+    preferences.update(
+        participant.id,
+        {"daily_review_enabled": False},
+        now=NOW + timedelta(seconds=2),
+    )
+    assert schedules.get(second["id"])["status"] == "claimed"
+    assert schedules.mark_sent(
+        second["id"],
+        claimed_second["claim_token"],
+        now=NOW + timedelta(seconds=3),
+        provider_message_id="om-authorized",
+    )
+
+
+def test_daily_review_final_authorization_rejects_inactive_participant():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("CARE-DAILY-INACTIVE-AUTH")
+    schedules = DailyReviewScheduleRepository(
+        database, timezone_name="Asia/Shanghai"
+    )
+    scheduled = NOW - timedelta(minutes=1)
+    review = schedules.ensure(
+        participant.id,
+        DAY,
+        scheduled,
+        valid_until=NOW + timedelta(hours=1),
+    )
+    claimed = schedules.claim_due(NOW, lease_seconds=120)
+    claim = next(item for item in claimed if item["id"] == review["id"])
+    with database.session() as session:
+        session.get(Participant, participant.id).status = "inactive"
+
+    assert not schedules.authorize_claim_current(
+        review["id"], claim["claim_token"], now=NOW + timedelta(seconds=1)
+    )
+    stored = schedules.get(review["id"])
+    assert stored["status"] == "cancelled"
+    assert stored["last_error_code"] == "participant_inactive"
 
 
 def test_mute_today_persists_and_cancels_only_the_same_participant():

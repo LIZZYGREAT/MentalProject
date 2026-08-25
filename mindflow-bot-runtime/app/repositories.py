@@ -55,6 +55,14 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+class ForecastInputChangedError(RuntimeError):
+    """The inputs used by a forecast changed before it could be committed."""
+
+    def __init__(self, input_name: str):
+        self.input_name = input_name
+        super().__init__(f"{input_name} revision changed before forecast save")
+
+
 @dataclass(frozen=True)
 class ParticipantView:
     id: uuid.UUID
@@ -292,6 +300,8 @@ class ObservationWriteResult:
     observation_id: uuid.UUID
     observed_at: datetime
     created: bool
+    persisted_payload: dict[str, Any]
+    idempotency_conflict: bool = False
 
 
 class ObservationRepository:
@@ -337,12 +347,21 @@ class ObservationRepository:
 
         try:
             with self.database.session() as session:
+                # Participant is the shared lock root for observations,
+                # forecast invalidation, and forecast publication.
+                session.get(Participant, participant_id, with_for_update=True)
                 existing = find_existing(session)
                 if existing is not None:
+                    persisted_payload = dict(existing.payload_json)
                     return ObservationWriteResult(
                         observation_id=existing.id,
                         observed_at=self._aware(existing.observed_at),
                         created=False,
+                        persisted_payload=persisted_payload,
+                        idempotency_conflict=(
+                            _canonical_json(persisted_payload)
+                            != _canonical_json(dict(payload))
+                        ),
                     )
                 timestamp = observed_at or utc_now()
                 if timestamp.tzinfo is None:
@@ -362,6 +381,7 @@ class ObservationRepository:
                     observation_id=row.id,
                     observed_at=self._aware(row.observed_at),
                     created=True,
+                    persisted_payload=dict(row.payload_json),
                 )
         except IntegrityError:
             # A competing request can commit after the SELECT but before this
@@ -370,10 +390,16 @@ class ObservationRepository:
             with self.database.session() as session:
                 existing = find_existing(session)
                 if existing is not None:
+                    persisted_payload = dict(existing.payload_json)
                     return ObservationWriteResult(
                         observation_id=existing.id,
                         observed_at=self._aware(existing.observed_at),
                         created=False,
+                        persisted_payload=persisted_payload,
+                        idempotency_conflict=(
+                            _canonical_json(persisted_payload)
+                            != _canonical_json(dict(payload))
+                        ),
                     )
             raise
 
@@ -390,6 +416,35 @@ class ObservationRepository:
             rows = session.execute(
                 select(StateObservation)
                 .where(StateObservation.participant_id == participant_id)
+                .order_by(
+                    desc(StateObservation.observed_at),
+                    desc(StateObservation.created_at),
+                    desc(StateObservation.id),
+                )
+                .limit(max(1, min(int(limit), 100)))
+            ).scalars()
+            return [self._view(row) for row in rows]
+
+    def recent_before(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        before: datetime,
+        max_age: timedelta,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return observations in the closed interval ``before-max_age..before``."""
+
+        cutoff = self._aware(before)
+        age = max(timedelta(0), max_age)
+        with self.database.session() as session:
+            rows = session.execute(
+                select(StateObservation)
+                .where(
+                    StateObservation.participant_id == participant_id,
+                    StateObservation.observed_at >= cutoff - age,
+                    StateObservation.observed_at <= cutoff,
+                )
                 .order_by(
                     desc(StateObservation.observed_at),
                     desc(StateObservation.created_at),
@@ -759,6 +814,68 @@ class ForecastSnapshotRepository:
             raise ValueError("forecast and warning repositories must share a database")
         changed_at = now or utc_now()
         with self.database.session() as session:
+            session.get(Participant, participant_id, with_for_update=True)
+            rows = session.execute(
+                select(ForecastSnapshot).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.valid.is_(True),
+                ).with_for_update()
+            ).scalars().all()
+            forecast_ids = [row.id for row in rows]
+            for row in rows:
+                row.valid = False
+            cancelled = warning_repository._cancel_for_forecasts_in_session(
+                session,
+                forecast_ids,
+                reason=reason,
+                now=changed_at,
+            )
+            return {"forecasts_invalidated": len(rows), "warnings_cancelled": cancelled}
+
+    def invalidate_for_calendar_mutation(
+        self,
+        warning_repository: "WarningScheduleRepository",
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Fence stale calculations after a successful remote calendar write."""
+
+        if warning_repository.database is not self.database:
+            raise ValueError("forecast and warning repositories must share a database")
+        changed_at = now or utc_now()
+        with self.database.session() as session:
+            session.get(Participant, participant_id, with_for_update=True)
+            calendar = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            marker = f"mutation:{uuid.uuid4().hex}"
+            if calendar is None:
+                calendar = CalendarSnapshot(
+                    participant_id=participant_id,
+                    local_date=local_date,
+                    calendar_revision=marker,
+                    events_json=[],
+                    degraded=True,
+                    last_refresh_attempt_at=changed_at,
+                    last_refresh_error_class="calendar_mutation_refresh_pending",
+                    updated_at=changed_at,
+                )
+                session.add(calendar)
+            else:
+                calendar.calendar_revision = marker
+                calendar.events_json = []
+                calendar.degraded = True
+                calendar.last_refresh_attempt_at = changed_at
+                calendar.last_refresh_error_class = "calendar_mutation_refresh_pending"
+                calendar.updated_at = changed_at
+
             rows = session.execute(
                 select(ForecastSnapshot).where(
                     ForecastSnapshot.participant_id == participant_id,
@@ -784,6 +901,9 @@ class ForecastSnapshotRepository:
         curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
         observation_revision: str = "",
+        observation_window_start: datetime | None = None,
+        observation_window_end: datetime | None = None,
+        verify_current_inputs: bool = False,
     ) -> dict[str, Any]:
         with self.database.session() as session:
             return self._save_in_session(
@@ -793,6 +913,9 @@ class ForecastSnapshotRepository:
                 algorithm_version=algorithm_version, forecast_version=forecast_version,
                 semantic_status=semantic_status, semantic_input=semantic_input,
                 curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
+                observation_window_start=observation_window_start,
+                observation_window_end=observation_window_end,
+                verify_current_inputs=verify_current_inputs,
             )
 
     def save_and_sync_warnings(
@@ -804,6 +927,9 @@ class ForecastSnapshotRepository:
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
         warnings: list[dict[str, Any]], now: datetime,
         observation_revision: str = "",
+        observation_window_start: datetime | None = None,
+        observation_window_end: datetime | None = None,
+        verify_current_inputs: bool = False,
     ) -> tuple[dict[str, Any], dict[str, int]]:
         if warning_repository.database is not self.database:
             raise ValueError("forecast and warning repositories must share a database")
@@ -815,6 +941,9 @@ class ForecastSnapshotRepository:
                 algorithm_version=algorithm_version, forecast_version=forecast_version,
                 semantic_status=semantic_status, semantic_input=semantic_input,
                 curve=curve, peaks=peaks, warning_windows=warning_windows, output=output,
+                observation_window_start=observation_window_start,
+                observation_window_end=observation_window_end,
+                verify_current_inputs=verify_current_inputs,
             )
             warning_diff = warning_repository._sync_in_session(
                 session, participant_id, local_date,
@@ -901,7 +1030,51 @@ class ForecastSnapshotRepository:
         curve: list[dict[str, Any]], peaks: list[dict[str, Any]],
         warning_windows: list[dict[str, Any]], output: dict[str, Any],
         observation_revision: str = "",
+        observation_window_start: datetime | None = None,
+        observation_window_end: datetime | None = None,
+        verify_current_inputs: bool = False,
     ) -> dict[str, Any]:
+        session.get(Participant, participant_id, with_for_update=True)
+
+        calendar = session.execute(
+            select(CalendarSnapshot).where(
+                CalendarSnapshot.participant_id == participant_id,
+                CalendarSnapshot.local_date == local_date,
+            ).with_for_update()
+        ).scalar_one_or_none()
+        if (
+            verify_current_inputs
+            and calendar is not None
+            and calendar.calendar_revision != calendar_revision
+        ):
+            raise ForecastInputChangedError("calendar")
+
+        if observation_window_start is not None and observation_window_end is not None:
+            start = ObservationRepository._aware(observation_window_start)
+            end = ObservationRepository._aware(observation_window_end)
+            rows = session.execute(
+                select(StateObservation)
+                .where(
+                    StateObservation.participant_id == participant_id,
+                    StateObservation.observed_at >= start,
+                    StateObservation.observed_at < end,
+                    StateObservation.observed_at <= utc_now(),
+                )
+                .order_by(
+                    desc(StateObservation.observed_at),
+                    desc(StateObservation.created_at),
+                    desc(StateObservation.id),
+                )
+                .limit(100)
+            ).scalars().all()
+            current_revision = hashlib.sha256(
+                _canonical_json(
+                    [ObservationRepository._view(row) for row in rows]
+                ).encode("utf-8")
+            ).hexdigest()
+            if current_revision != observation_revision:
+                raise ForecastInputChangedError("observation")
+
         existing = session.execute(
             select(ForecastSnapshot).where(
                 ForecastSnapshot.participant_id == participant_id,
@@ -945,9 +1118,12 @@ class WarningScheduleRepository:
         self,
         database: Database,
         delivery_policy: WarningDeliveryPolicyConfig,
+        *,
+        timezone_name: str = "Asia/Shanghai",
     ):
         self.database = database
         self.delivery_policy = delivery_policy
+        self.timezone = ZoneInfo(timezone_name)
 
     @staticmethod
     def _aware(value: datetime) -> datetime:
@@ -1013,6 +1189,10 @@ class WarningScheduleRepository:
             "id": str(row.id), "participant_id": str(row.participant_id),
             "local_date": row.local_date.isoformat(), "forecast_id": str(row.forecast_id),
             "forecast_version": row.forecast_version, "warning_identity": row.warning_identity,
+            "snoozed_from_intervention_id": (
+                str(row.snoozed_from_intervention_id)
+                if row.snoozed_from_intervention_id else None
+            ),
             "episode_identity": row.episode_identity,
             "target_time": row.target_time.isoformat(), "risk_time": row.risk_time.isoformat(),
             "valid_until": row.valid_until.isoformat(), "warning_level": row.warning_level,
@@ -1022,8 +1202,38 @@ class WarningScheduleRepository:
             "claimed_at": row.claimed_at.isoformat() if row.claimed_at else None,
             "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
             "lease_until": row.lease_until.isoformat() if row.lease_until else None,
+            "authorized_at": row.authorized_at.isoformat() if row.authorized_at else None,
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
         }
+
+    def _hard_authorization_reason(
+        self,
+        preference: ParticipantCarePreference | None,
+        now: datetime,
+    ) -> str | None:
+        if preference is None:
+            return None
+        if not bool(preference.care_enabled):
+            return "care_disabled"
+        if not bool(preference.warning_enabled):
+            return "warning_disabled"
+        if (
+            preference.muted_until is not None
+            and self._aware(preference.muted_until) > now
+        ):
+            return "muted"
+        start = preference.quiet_hours_start
+        end = preference.quiet_hours_end
+        if start is not None and end is not None and start != end:
+            local_clock = now.astimezone(self.timezone).time().replace(tzinfo=None)
+            in_quiet_hours = (
+                start <= local_clock < end
+                if start < end
+                else local_clock >= start or local_clock < end
+            )
+            if in_quiet_hours:
+                return "quiet_hours"
+        return None
 
     @staticmethod
     def _payload_with_source_provenance(
@@ -1451,29 +1661,6 @@ class WarningScheduleRepository:
             ).scalars().all()
             return [self._view(row) for row in rows]
 
-    def mark_sent_if_current(self, warning_id: uuid.UUID, now: datetime) -> bool:
-        now = self._aware(now)
-        with self.database.session() as session:
-            row = session.get(WarningSchedule, warning_id, with_for_update=True)
-            if row is None or row.status != "pending":
-                return False
-            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
-                row.status = "expired"
-                row.updated_at = now
-                self._mirror_care(session, row)
-                return False
-            forecast = session.get(ForecastSnapshot, row.forecast_id)
-            if forecast is None or not forecast.valid or forecast.forecast_version != row.forecast_version:
-                row.status = "cancelled"
-                row.updated_at = utc_now()
-                self._mirror_care(session, row)
-                return False
-            row.status = "sent"
-            row.sent_at = now
-            row.updated_at = now
-            self._mirror_care(session, row)
-            return True
-
     def claim_if_current(
         self, warning_id: uuid.UUID, *, now: datetime | None = None,
         lease_seconds: int = 120,
@@ -1486,7 +1673,7 @@ class WarningScheduleRepository:
             # Participant is the per-user lock root. Preference updates take
             # the same lock before cancelling Warning rows, preventing a
             # preference/claim race and inconsistent lock ordering.
-            session.get(
+            participant = session.get(
                 Participant,
                 candidate.participant_id,
                 with_for_update=True,
@@ -1505,6 +1692,29 @@ class WarningScheduleRepository:
                 row.claim_token = None
                 row.claimed_at = None
                 row.lease_until = None
+                row.authorized_at = None
+                row.updated_at = now
+                self._mirror_care(session, row)
+                return None
+            participant_preference = session.get(
+                ParticipantCarePreference, row.participant_id
+            )
+            authorization_reason = (
+                "inactive"
+                if participant is None or participant.status != "active"
+                else self._hard_authorization_reason(participant_preference, now)
+            )
+            if authorization_reason is not None:
+                row.status = "cancelled"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.authorized_at = None
+                row.next_attempt_at = None
+                row.payload_json = {
+                    **dict(row.payload_json),
+                    "cancellation_reason": f"participant_{authorization_reason}",
+                }
                 row.updated_at = now
                 self._mirror_care(session, row)
                 return None
@@ -1543,9 +1753,6 @@ class WarningScheduleRepository:
                 WarningSchedule.local_date == row.local_date,
                 WarningSchedule.status.in_(("sent", "escalated")),
             ).order_by(desc(WarningSchedule.sent_at))).scalars().all()
-            participant_preference = session.get(
-                ParticipantCarePreference, row.participant_id
-            )
             participant_max = (
                 participant_preference.max_proactive_care_per_day
                 if participant_preference is not None else None
@@ -1595,6 +1802,7 @@ class WarningScheduleRepository:
             row.claimed_at = now
             row.lease_until = now + timedelta(seconds=max(1, lease_seconds))
             row.claim_token = uuid.uuid4()
+            row.authorized_at = None
             row.updated_at = now
             self._mirror_care(session, row)
             return self._view(row)
@@ -1606,6 +1814,12 @@ class WarningScheduleRepository:
         now = self._aware(now)
         token = uuid.UUID(str(claim_token))
         with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return False
+            participant = session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if (
                 row is None
@@ -1625,6 +1839,28 @@ class WarningScheduleRepository:
                 row.updated_at = now
                 self._mirror_care(session, row)
                 return False
+            preference = session.get(
+                ParticipantCarePreference, row.participant_id
+            )
+            authorization_reason = (
+                "inactive"
+                if participant is None or participant.status != "active"
+                else self._hard_authorization_reason(preference, now)
+            )
+            if authorization_reason is not None:
+                row.status = "cancelled"
+                row.claim_token = None
+                row.claimed_at = None
+                row.lease_until = None
+                row.authorized_at = None
+                row.next_attempt_at = None
+                row.payload_json = {
+                    **dict(row.payload_json),
+                    "cancellation_reason": f"participant_{authorization_reason}",
+                }
+                row.updated_at = now
+                self._mirror_care(session, row)
+                return False
             forecast = session.get(ForecastSnapshot, row.forecast_id)
             if (
                 forecast is None
@@ -1638,6 +1874,8 @@ class WarningScheduleRepository:
                 row.updated_at = now
                 self._mirror_care(session, row)
                 return False
+            row.authorized_at = now
+            row.updated_at = now
             return True
 
     def finish_claim(
@@ -1684,6 +1922,7 @@ class WarningScheduleRepository:
                 else:
                     row.status = "pending"
                     row.next_attempt_at = next_attempt
+                    row.authorized_at = None
             row.updated_at = now
             self._mirror_care(session, row)
             return True

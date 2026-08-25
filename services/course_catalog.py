@@ -14,9 +14,13 @@ from entry.class_info_data import CLASS_INFO_DICT
 from entry.course_aliases import COURSE_ALIASES
 
 
-COURSE_RESOLVER_VERSION = "course_catalog_resolver.v1"
+COURSE_RESOLVER_VERSION = "course_catalog_resolver.v2"
 _PUNCTUATION = re.compile(r"[\s·•,，。.!！?？:：;；_—–－()（）\[\]【】{}《》<>]+")
 _COURSE_SUFFIX = re.compile(r"(?:课程|上课|课堂|课)$", flags=re.IGNORECASE)
+_CONTROLLED_ALIAS_SUFFIXES = {
+    "a", "a类", "b", "b类",
+    "i", "ii", "iii", "1", "2", "3", "一", "二", "三", "2-2",
+}
 
 
 def normalize_course_text(value: Any) -> str:
@@ -67,12 +71,19 @@ class CourseResolution:
     alias: str | None
     candidates: tuple[CourseCandidate, ...]
     exact_match: CourseCandidate | None
+    alias_match_kind: str | None
     catalog_revision: str
     resolver_version: str = COURSE_RESOLVER_VERSION
 
     @property
     def likely_course(self) -> bool:
         return bool(self.candidates and self.candidates[0].local_score >= 0.62)
+
+    @property
+    def strong_course_evidence(self) -> bool:
+        return self.exact_match is not None or self.alias_match_kind in {
+            "exact", "controlled_variant"
+        }
 
     def context(self) -> dict[str, Any]:
         return {
@@ -82,6 +93,8 @@ class CourseResolution:
             "normalized_query": self.normalized_query,
             "expanded_query": self.expanded_query,
             "alias": self.alias,
+            "alias_match_kind": self.alias_match_kind,
+            "strong_course_evidence": self.strong_course_evidence,
             "candidates": [candidate.to_dict() for candidate in self.candidates],
         }
 
@@ -128,6 +141,7 @@ class CourseCatalogResolver:
         normalized = normalize_course_text(raw_query)
         course_query = _COURSE_SUFFIX.sub("", normalized)
         alias_key = None
+        alias_match_kind = None
         expanded = course_query
         alias_suffix = ""
         for normalized_alias, expansion, original_alias in self._normalized_aliases:
@@ -137,6 +151,12 @@ class CourseCatalogResolver:
             alias_key = original_alias
             alias_suffix = course_query[position + len(normalized_alias) :]
             expanded = course_query[:position] + expansion + alias_suffix
+            if position == 0 and not alias_suffix:
+                alias_match_kind = "exact"
+            elif position == 0 and alias_suffix in _CONTROLLED_ALIAS_SUFFIXES:
+                alias_match_kind = "controlled_variant"
+            else:
+                alias_match_kind = "retrieval_only"
             break
 
         scored: list[tuple[float, str, CourseCandidate]] = []
@@ -167,9 +187,11 @@ class CourseCatalogResolver:
         candidates = tuple(item[2] for item in scored[: self.max_candidates])
         if exact_match is None and candidates:
             top = candidates[0]
-            if top.local_score >= 0.97 and (
+            if "course_code_exact" in top.match_reasons or (
+                top.local_score >= 0.97 and (
                 normalize_course_text(top.canonical_name) == expanded
                 or normalize_course_text(top.canonical_name) == course_query
+                )
             ):
                 exact_match = top
         return CourseResolution(
@@ -179,6 +201,7 @@ class CourseCatalogResolver:
             alias=alias_key,
             candidates=candidates,
             exact_match=exact_match,
+            alias_match_kind=alias_match_kind,
             catalog_revision=self.catalog_revision,
         )
 

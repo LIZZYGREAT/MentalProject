@@ -134,6 +134,34 @@ def test_repository_filters_by_business_local_date_and_as_of():
     assert after[0]["observed_at"].endswith("+00:00")
 
 
+def test_repository_recent_before_enforces_closed_age_window_and_future_cutoff():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("OBS-RECENT-WINDOW")
+    observations = ObservationRepository(database)
+    context_time = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    for source, observed_at in (
+        ("boundary", context_time - timedelta(hours=6)),
+        ("too-old", context_time - timedelta(hours=6, seconds=1)),
+        ("future", context_time + timedelta(seconds=1)),
+    ):
+        observations.add(
+            participant.id,
+            "checkin",
+            {"source": source, "stress_0_10": 5},
+            observed_at=observed_at,
+            source_message_id=source,
+        )
+
+    recent = observations.recent_before(
+        participant.id,
+        before=context_time,
+        max_age=timedelta(hours=6),
+        limit=10,
+    )
+
+    assert [item["payload"]["source"] for item in recent] == ["boundary"]
+
+
 def test_same_clock_observation_from_another_date_is_not_assimilated():
     target = date(2026, 8, 21)
     result = predict(

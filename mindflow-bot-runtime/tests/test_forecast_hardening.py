@@ -4,6 +4,7 @@ import io
 import inspect
 import logging
 import uuid
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -15,9 +16,14 @@ from app.integrations.feishu.gateway import FeishuGateway
 from app.logging_security import install_credential_redaction
 from app.models import FeishuOAuthToken, ForecastSnapshot, WarningSchedule
 from app.repositories import (
-    BindingRepository, ForecastSnapshotRepository, ParticipantRepository,
+    BindingRepository,
+    CalendarSnapshotRepository,
+    ForecastInputChangedError,
+    ForecastSnapshotRepository,
+    ObservationRepository,
+    ParticipantRepository,
 )
-from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.forecast_coordinator import ForecastCoordinator, _sha
 from app.services.forecast_scheduler import ForecastScheduler
 from app.services.warning_policy import WarningPolicy
 from app.tools.care import CareTools
@@ -30,6 +36,160 @@ from utils.event_factory import EventFactory
 
 TEST_LOCAL_DATE = date(2030, 1, 15)
 TEST_NOW = datetime(2030, 1, 15, 5, 45, tzinfo=timezone.utc)
+
+
+def test_single_flight_forced_same_mode_update_runs_followup_before_completion():
+    async def scenario():
+        coordinator = object.__new__(ForecastCoordinator)
+        coordinator._inflight = {}
+        coordinator._guard = asyncio.Lock()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def ensure_once(_participant_id, _target, reason, **kwargs):
+            calls.append((reason, kwargs))
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            return {"call": len(calls), "reason": reason}
+
+        coordinator._ensure_once = ensure_once
+        participant_id = uuid.uuid4()
+        first = asyncio.create_task(coordinator.ensure_forecast(
+            participant_id,
+            TEST_LOCAL_DATE,
+            "initial",
+            refresh_calendar=False,
+        ))
+        await started.wait()
+        forced = asyncio.create_task(coordinator.ensure_forecast(
+            participant_id,
+            TEST_LOCAL_DATE,
+            "observation_committed",
+            refresh_calendar=False,
+            force_followup=True,
+        ))
+        await asyncio.sleep(0)
+        release.set()
+        return await first, await forced, calls
+
+    first, forced, calls = asyncio.run(scenario())
+
+    assert len(calls) == 2
+    assert calls[1][0] == "observation_committed"
+    assert calls[1][1]["refresh_calendar"] is False
+    assert first == forced == {"call": 2, "reason": "observation_committed"}
+
+
+def test_single_flight_failure_does_not_drop_already_dirty_followup():
+    async def scenario():
+        coordinator = object.__new__(ForecastCoordinator)
+        coordinator._inflight = {}
+        coordinator._guard = asyncio.Lock()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def ensure_once(_participant_id, _target, reason, **kwargs):
+            calls.append((reason, kwargs))
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+                raise RuntimeError("transient first-generation failure")
+            return {"call": len(calls), "reason": reason}
+
+        coordinator._ensure_once = ensure_once
+        participant_id = uuid.uuid4()
+        first = asyncio.create_task(coordinator.ensure_forecast(
+            participant_id,
+            TEST_LOCAL_DATE,
+            "initial",
+            refresh_calendar=False,
+        ))
+        await started.wait()
+        forced = asyncio.create_task(coordinator.ensure_forecast(
+            participant_id,
+            TEST_LOCAL_DATE,
+            "observation_committed",
+            refresh_calendar=False,
+            force_followup=True,
+        ))
+        await asyncio.sleep(0)
+        release.set()
+        return await first, await forced, calls
+
+    first, forced, calls = asyncio.run(scenario())
+
+    assert len(calls) == 2
+    assert calls[1][0] == "observation_committed"
+    assert first == forced == {"call": 2, "reason": "observation_committed"}
+
+
+def test_forecast_save_rejects_observation_revision_that_lost_a_race():
+    database = memory_database()
+    participant = ParticipantRepository(database).create("FORECAST-REVISION-FENCE")
+    observations = ObservationRepository(database)
+    snapshots = CalendarSnapshotRepository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    local_timezone = ZoneInfo("Asia/Shanghai")
+    observed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    target = observed_at.astimezone(local_timezone).date()
+    day_start = datetime.combine(target, datetime.min.time(), local_timezone).astimezone(
+        timezone.utc
+    )
+    day_end = day_start + timedelta(days=1)
+    snapshots.upsert(
+        participant.id,
+        target,
+        revision="calendar-current",
+        events=[],
+        degraded=False,
+    )
+    observations.add(
+        participant.id,
+        "checkin",
+        {"stress_0_10": 4, "energy_0_10": 6},
+        observed_at=observed_at,
+        source_message_id="before-calculation",
+    )
+    calculated_rows = observations.for_local_date(
+        participant.id,
+        target,
+        timezone_name="Asia/Shanghai",
+        as_of=datetime.now(timezone.utc),
+    )
+    calculated_revision = _sha(calculated_rows)
+    observations.add(
+        participant.id,
+        "checkin",
+        {"stress_0_10": 8, "energy_0_10": 2},
+        observed_at=datetime.now(timezone.utc),
+        source_message_id="won-race",
+    )
+
+    with pytest.raises(ForecastInputChangedError) as error:
+        forecasts.save(
+            participant.id,
+            target,
+            calendar_revision="calendar-current",
+            semantic_revision="semantic",
+            observation_revision=calculated_revision,
+            algorithm_version="model",
+            forecast_version="stale-version",
+            semantic_status="rules_only",
+            semantic_input=[],
+            curve=[],
+            peaks=[],
+            warning_windows=[],
+            output={},
+            observation_window_start=day_start,
+            observation_window_end=day_end,
+            verify_current_inputs=True,
+        )
+
+    assert error.value.input_name == "observation"
+    assert forecasts.latest(participant.id, target) is None
 
 
 def save_forecast_and_warnings(
@@ -632,7 +792,7 @@ def test_warning_retry_crossing_risk_time_expires_instead_of_rescheduling():
         assert row.next_attempt_at is None
 
 
-def test_mark_sent_rechecks_risk_time_after_delivery_race():
+def test_delivery_authorization_rechecks_risk_time_after_claim_race():
     database, participant, _, _, _, warnings, coordinator = build_pipeline([event()])
 
     async def prepare():
@@ -645,7 +805,18 @@ def test_mark_sent_rechecks_risk_time_after_delivery_race():
         row.risk_time = TEST_NOW
         row.valid_until = TEST_NOW + timedelta(minutes=5)
         warning_id = row.id
-    assert warnings.mark_sent_if_current(warning_id, TEST_NOW) is False
+        forecast_version = row.forecast_version
+    claim = warnings.claim_if_current(
+        warning_id,
+        now=TEST_NOW - timedelta(seconds=1),
+    )
+    assert claim is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claim["claim_token"],
+        expected_forecast_version=forecast_version,
+        now=TEST_NOW,
+    ) is False
     with database.session() as session:
         assert session.get(WarningSchedule, warning_id).status == "expired"
 
@@ -1043,8 +1214,11 @@ def test_today_context_returns_latest_forecast(monkeypatch):
     monkeypatch.setattr("app.tools.care.datetime", FixedDateTime)
     tools = CareTools(
         profiles=type("Profiles", (), {"current": lambda self, _pid: None})(),
-        observations=type("Obs", (), {"recent": lambda self, _pid, limit=1: []})(),
-        predictions=type("Pred", (), {"latest": lambda self, _pid: None})(),
+        observations=type(
+            "Obs",
+            (),
+            {"recent_before": lambda self, _pid, **_kwargs: []},
+        )(),
         calendar=None, tokens=None,
         timezone_name="Asia/Shanghai", forecast_coordinator=coordinator,
         forecast_snapshots=ForecastSnapshotRepository(database),
@@ -1584,6 +1758,11 @@ def test_legacy_forecast_without_warning_revision_is_recomputed():
         "lead_minutes": 20,
         "late_grace_minutes": 10,
         "episode_drift_minutes": 15,
+        "care_context_schema_version": "care_context.v2",
+        "care_recent_observation_max_age_minutes": 360,
+        "care_message_schema_version": "care_message.v2",
+        "care_intervention_policy_version": "care_intervention_policy.v2",
+        "care_template_library_version": "care_template_library.v2",
     }
     assert prediction.calls == 2
 

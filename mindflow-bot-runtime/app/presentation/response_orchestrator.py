@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 import json
-import re
 import time
 from typing import Any
 
@@ -30,12 +28,6 @@ _ANALYSIS_TOOLS = {
     "care_get_pressure_curve",
 }
 _CHECKIN_TOOLS = {"care_get_checkin_card"}
-_MARKDOWN_MARKERS = re.compile(r"```|\*\*|^\s*#{1,6}\s+", re.MULTILINE)
-_NUMBER = re.compile(
-    r"(?<![\w])(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}:\d{2}|-?\d+(?:\.\d+)?%?)(?![\w])"
-)
-
-
 class ResponseOrchestrator:
     def __init__(
         self,
@@ -113,7 +105,7 @@ class ResponseOrchestrator:
             started = time.monotonic()
             try:
                 raw = await self._compose_with_hard_deadline(
-                    authoritative.text, kind=kind
+                    sanitized, kind=kind
                 )
             except TimeoutError:
                 outcome = "timeout"
@@ -121,13 +113,9 @@ class ResponseOrchestrator:
                 outcome = "agent_error"
             else:
                 try:
-                    raw_segments = self._parse_agent_output(raw)
-                    sanitized_segments = tuple(
-                        self.sanitizer.sanitize(segment)
-                        for segment in raw_segments
-                    )
-                    agent_segments = self._validate_sanitized_agent_output(
-                        authoritative.text, sanitized_segments
+                    spans = self._parse_agent_output(raw)
+                    agent_segments = self._materialize_authoritative_spans(
+                        sanitized, spans
                     )
                     outcome = "used"
                 except Exception:
@@ -261,32 +249,52 @@ class ResponseOrchestrator:
         )
 
     @staticmethod
-    def _parse_agent_output(raw: Any) -> tuple[str, ...]:
+    def _parse_agent_output(raw: Any) -> tuple[tuple[int, int], ...]:
         if isinstance(raw, str):
             payload = json.loads(raw)
-            raw = payload.get("segments") if isinstance(payload, dict) else None
+            raw = payload.get("spans") if isinstance(payload, dict) else None
         elif isinstance(raw, dict):
-            raw = raw.get("segments")
+            raw = raw.get("spans")
         if not isinstance(raw, (list, tuple)):
-            raise ValueError("segments must be a list")
-        return tuple(str(item) for item in raw)
+            raise ValueError("spans must be a list")
+        spans = []
+        for item in raw:
+            if isinstance(item, dict):
+                start, end = item.get("start"), item.get("end")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                start, end = item
+            else:
+                raise ValueError("span must contain start and end")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+            ):
+                raise ValueError("span offsets must be integers")
+            spans.append((start, end))
+        return tuple(spans)
 
-    def _validate_sanitized_agent_output(
-        self, source_text: str, segments: tuple[str, ...]
+    def _materialize_authoritative_spans(
+        self, source_text: str, spans: tuple[tuple[int, int], ...]
     ) -> tuple[str, ...]:
-        segments = tuple(str(item).strip() for item in segments)
-        if not 1 <= len(segments) <= self.presentation_agent_max_segments:
+        if not 1 <= len(spans) <= self.presentation_agent_max_segments:
             raise ValueError("invalid segment count")
-        if any(not item for item in segments):
-            raise ValueError("empty segment")
+        cursor = 0
+        segments = []
+        for start, end in spans:
+            if start != cursor or end <= start or end > len(source_text):
+                raise ValueError("spans must be contiguous and ordered")
+            segment = source_text[start:end].strip()
+            if not segment:
+                raise ValueError("empty segment")
+            segments.append(segment)
+            cursor = end
+        if cursor != len(source_text):
+            raise ValueError("spans must cover the authoritative answer")
         if any(len(item) > self.segmenter.max_chars for item in segments):
             raise ValueError("oversized segment")
-        joined = "\n\n".join(segments)
-        if _MARKDOWN_MARKERS.search(joined):
-            raise ValueError("Markdown is not allowed")
-        if Counter(_NUMBER.findall(source_text)) != Counter(_NUMBER.findall(joined)):
-            raise ValueError("numeric values changed")
-        return segments
+        return tuple(segments)
 
     @staticmethod
     def _rich_companion(text: str, used_tools: set[str]) -> str:

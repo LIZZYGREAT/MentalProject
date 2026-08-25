@@ -1,4 +1,5 @@
 from services.course_catalog import CourseCatalogResolver
+from services.event_classifier import finalize_event_classification
 from services.event_lifecycle import prepare_event_instances
 
 
@@ -62,3 +63,84 @@ def test_course_exam_remains_exam_with_related_course():
     assert event["event_type"] == "task"
     assert event["task_type"] == "exam"
     assert event["related_course_name"].startswith("高等数学")
+
+
+def test_fuzzy_catalog_candidate_cannot_authoritatively_create_course_event():
+    resolution = CourseCatalogResolver().resolve("提高数学能力")
+    event = prepare_event_instances(
+        [_event("提高数学能力")], "2030-01-15"
+    )[0]
+
+    assert resolution.alias_match_kind == "retrieval_only"
+    assert resolution.strong_course_evidence is False
+    assert event["event_type"] == "task"
+    assert not event.get("course_name")
+    assert not event.get("related_course_name")
+
+
+def test_title_course_identity_wins_over_task_language_only_in_description():
+    event = prepare_event_instances(
+        [_event("高数", description="课后完成作业")], "2030-01-15"
+    )[0]
+
+    assert event["event_type"] == "course"
+    assert event["task_type"] == "course"
+
+
+def test_title_task_intent_wins_even_when_description_calls_it_a_course():
+    event = prepare_event_instances(
+        [_event("写高数作业", description="高数课程相关")], "2030-01-15"
+    )[0]
+
+    assert event["event_type"] == "task"
+    assert event["task_type"] == "homework"
+    assert event["related_course_name"].startswith("高等数学")
+
+
+def test_controlled_alias_identity_cannot_be_replaced_by_external_candidate():
+    event = prepare_event_instances([_event("高数A")], "2030-01-15")[0]
+    finalized = finalize_event_classification(
+        event,
+        external_course_match={
+            "matched": True,
+            "canonical_name": "高等数学（B类）II",
+            "code": "AMTD0035",
+            "confidence": 0.99,
+        },
+    )
+
+    assert finalized["course_name"] == "高等数学（A类）II"
+    assert finalized["course_code"] == "AMTD0034"
+
+
+def test_non_course_negative_corpus_has_zero_authoritative_course_false_positives():
+    seed_titles = (
+        "看电影", "中国", "管理", "经济", "文化", "政治", "数学", "英语",
+        "提高数学能力", "买菜", "吃晚饭", "晨跑", "健身", "洗衣服", "取快递",
+        "朋友聚会", "家庭电话", "团队沟通", "整理房间", "阅读新闻", "预算复盘",
+        "旅行规划", "医院预约", "银行办事", "打印材料", "设备维修", "看展览",
+        "听音乐", "午休", "散步", "喝水", "准备早餐", "周末采购", "缴纳账单",
+        "更新密码", "备份照片", "清理邮箱", "回复消息", "项目讨论", "工作周会",
+    )
+    generic_subjects = (
+        "生活安排", "团队进度", "个人预算", "旅行计划", "健康状态", "饮食习惯",
+        "运动目标", "家庭事务", "工作流程", "设备情况", "新闻内容", "电影清单",
+        "音乐收藏", "房间收纳", "购物需求", "交通路线", "沟通方式", "时间管理",
+    )
+    generated_titles = tuple(
+        f"{verb}{subject}"
+        for verb in ("讨论", "整理", "了解", "提高", "规划")
+        for subject in generic_subjects
+    )
+    titles = seed_titles + generated_titles
+    rows = prepare_event_instances(
+        [_event(title) for title in titles], "2030-01-15"
+    )
+    false_positives = [
+        title
+        for title, row in zip(titles, rows)
+        if row["event_type"] == "course"
+    ]
+
+    assert len(set(titles)) >= 100
+    assert false_positives == []
