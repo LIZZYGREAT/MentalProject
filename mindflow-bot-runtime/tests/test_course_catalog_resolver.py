@@ -48,21 +48,23 @@ def test_linear_algebra_alias_resolves_exact_canonical_identity():
     assert event["course_match_source"] == "catalog_alias"
 
 
-def test_course_related_homework_remains_task_with_related_course():
+def test_ambiguous_course_related_homework_defers_canonical_identity():
     event = prepare_event_instances([_event("写高数作业")], "2030-01-15")[0]
 
     assert event["event_type"] == "task"
     assert event["task_type"] == "homework"
-    assert event["related_course_name"].startswith("高等数学")
+    assert not event.get("related_course_name")
+    assert event["metadata"]["classification"]["course_catalog_context"]["candidates"]
     assert not event.get("course_name")
 
 
-def test_course_exam_remains_exam_with_related_course():
+def test_ambiguous_course_exam_defers_canonical_identity():
     event = prepare_event_instances([_event("高数期末考试")], "2030-01-15")[0]
 
     assert event["event_type"] == "task"
     assert event["task_type"] == "exam"
-    assert event["related_course_name"].startswith("高等数学")
+    assert not event.get("related_course_name")
+    assert event["metadata"]["classification"]["course_catalog_context"]["candidates"]
 
 
 def test_fuzzy_catalog_candidate_cannot_authoritatively_create_course_event():
@@ -94,7 +96,17 @@ def test_title_task_intent_wins_even_when_description_calls_it_a_course():
 
     assert event["event_type"] == "task"
     assert event["task_type"] == "homework"
-    assert event["related_course_name"].startswith("高等数学")
+    assert not event.get("related_course_name")
+
+
+def test_exact_course_related_homework_keeps_canonical_identity():
+    event = prepare_event_instances([_event("写线性代数作业")], "2030-01-15")[0]
+
+    assert event["event_type"] == "task"
+    assert event["task_type"] == "homework"
+    assert event["related_course_name"] == "线性代数"
+    assert event["related_course_code"] == "SCIE0038"
+    assert event["metadata"]["classification"]["course_identity_locked"] is True
 
 
 def test_controlled_alias_locks_type_but_allows_candidate_bounded_identity():

@@ -46,6 +46,31 @@ class MutableCalendar:
         return [dict(item) for item in self.events]
 
 
+class FencedCalendar:
+    def __init__(self, first_result, second_result):
+        self.first_result = first_result
+        self.second_result = second_result
+        self.calls = 0
+        self.first_started = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def get_events(self, _participant_id, _start, _end):
+        self.calls += 1
+        if self.calls == 1:
+            self.first_started.set()
+            await self.release_first.wait()
+            result = self.first_result
+        else:
+            self.second_started.set()
+            await self.release_second.wait()
+            result = self.second_result
+        if isinstance(result, Exception):
+            raise result
+        return [dict(item) for item in result]
+
+
 class FakeModel:
     MODEL_VERSION = "fake-algorithm-v1"
 
@@ -223,6 +248,64 @@ def test_ordinary_provider_timeout_keeps_stable_snapshot_degraded_fallback():
     )
     assert snapshot["snapshot_state"] == "provider_degraded"
     assert len(snapshot["events"]) == 1
+
+
+@pytest.mark.parametrize("stale_result", [[event()], TimeoutError("stale timeout")])
+def test_provider_read_started_before_mutation_cannot_cross_fence(stale_result):
+    database, participant, _calendar, _semantics, _prediction, warnings, coordinator = (
+        build_pipeline([event()])
+    )
+    forecasts = ForecastSnapshotRepository(database)
+    calendars = CalendarSnapshotRepository(database)
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "initial"))
+    fresh_event = event(summary="更新后的日程", event_id="event-new")
+
+    async def scenario():
+        fenced = FencedCalendar(stale_result, [fresh_event])
+        coordinator.calendar = fenced
+        first = asyncio.create_task(
+            coordinator.ensure_forecast(
+                participant.id,
+                TEST_LOCAL_DATE,
+                "scheduled_refresh",
+                refresh_calendar=True,
+            )
+        )
+        await fenced.first_started.wait()
+        await asyncio.to_thread(
+            forecasts.invalidate_for_calendar_mutation,
+            warnings,
+            participant.id,
+            TEST_LOCAL_DATE,
+            reason="calendar_update_event",
+        )
+        followup = asyncio.create_task(
+            coordinator.ensure_forecast(
+                participant.id,
+                TEST_LOCAL_DATE,
+                "calendar_update_event",
+                refresh_calendar=True,
+                force_followup=True,
+            )
+        )
+        fenced.release_first.set()
+        await fenced.second_started.wait()
+
+        assert forecasts.latest(participant.id, TEST_LOCAL_DATE) is None
+        pending = calendars.get(participant.id, TEST_LOCAL_DATE)
+        assert pending["snapshot_state"] == "mutation_refresh_pending"
+        assert pending["calendar_revision"].startswith("mutation:")
+
+        fenced.release_second.set()
+        first_result, followup_result = await asyncio.gather(first, followup)
+        return first_result, followup_result
+
+    first_result, followup_result = asyncio.run(scenario())
+    assert first_result["valid"] is True
+    assert followup_result["valid"] is True
+    current = calendars.get(participant.id, TEST_LOCAL_DATE)
+    assert current["snapshot_state"] == "current"
+    assert current["events"][0]["summary"] == "更新后的日程"
 
 
 def test_semantic_fingerprint_reuses_time_only_update_but_changes_duration_or_text():

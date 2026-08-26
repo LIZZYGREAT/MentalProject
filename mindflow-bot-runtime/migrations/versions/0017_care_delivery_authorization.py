@@ -49,6 +49,13 @@ def upgrade() -> None:
         "warning_schedules",
         ["snoozed_from_intervention_id"],
     )
+    op.execute(
+        """
+        UPDATE calendar_snapshots
+        SET snapshot_state = 'provider_degraded'
+        WHERE degraded = true
+        """
+    )
     # 0016 stored snooze provenance in JSON. Join on text so malformed or
     # missing historical values remain NULL instead of aborting the migration.
     op.execute(

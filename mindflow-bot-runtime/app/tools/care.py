@@ -736,8 +736,17 @@ class CareTools:
             }
         direct_dates = set(normalized)
         dependency = {}
+        dependency_refresh = getattr(
+            self.forecast_coordinator, "dependency_refresh", None
+        )
         if today in normalized:
-            tomorrow = today + timedelta(days=1)
+            tomorrow = (
+                dependency_refresh.dependent_date(today)
+                if dependency_refresh is not None
+                else today + timedelta(days=1)
+            )
+            if tomorrow is None:
+                tomorrow = today + timedelta(days=1)
             if tomorrow not in direct_dates:
                 normalized.append(tomorrow)
                 normalized.sort()
@@ -763,12 +772,20 @@ class CareTools:
                             reason=reason,
                         )
                     else:
-                        await asyncio.to_thread(
-                            self.forecast_coordinator.mark_dependency_dirty,
-                            participant_id,
-                            target,
-                            reason="previous_day_terminal_changed",
-                        )
+                        if dependency_refresh is not None:
+                            await asyncio.to_thread(
+                                dependency_refresh.invalidate_dependent_now,
+                                participant_id,
+                                today,
+                                reason="previous_day_terminal_changed",
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                self.forecast_coordinator.mark_dependency_dirty,
+                                participant_id,
+                                target,
+                                reason="previous_day_terminal_changed",
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -778,13 +795,30 @@ class CareTools:
         results = []
         for target in normalized:
             try:
-                result = await self.forecast_coordinator.ensure_forecast(
-                    participant_id,
-                    target,
-                    reason,
-                    refresh_calendar=target in direct_dates,
-                    force_followup=True,
-                )
+                if target not in direct_dates:
+                    today_index = normalized.index(today)
+                    if (
+                        today_index >= len(results)
+                        or isinstance(results[today_index], Exception)
+                    ):
+                        raise RuntimeError("source forecast refresh failed")
+                if (
+                    target not in direct_dates
+                    and dependency_refresh is not None
+                ):
+                    result = await dependency_refresh.refresh_dependent_after_source(
+                        participant_id,
+                        today,
+                        reason="previous_day_terminal_changed",
+                    )
+                else:
+                    result = await self.forecast_coordinator.ensure_forecast(
+                        participant_id,
+                        target,
+                        reason,
+                        refresh_calendar=target in direct_dates,
+                        force_followup=True,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -94,6 +94,25 @@ def test_semantic_segmenter_never_drops_authoritative_tail():
     assert "74.06" in combined
 
 
+def test_safe_boundaries_do_not_split_links_or_code_fences():
+    segmenter = SemanticSegmenter()
+    source = (
+        "结论。\n"
+        "[帮助链接](https://example.com/path?a=1,b=2)\n"
+        "```python\nvalue = 'a,b'\n```\n"
+        "后续建议。"
+    )
+    boundaries = segmenter.safe_boundary_positions(source)
+    link_start = source.index("[帮助链接]")
+    link_end = source.index("\n", link_start)
+    code_start = source.index("```python")
+    code_end = source.index("```", code_start + 3) + 3
+
+    assert not any(link_start < item < link_end for item in boundaries)
+    assert not any(code_start < item < code_end for item in boundaries)
+    assert source.index("\n") + 1 in boundaries
+
+
 def test_progress_presenter_uses_task_stage_and_avoids_generic_after_activity():
     presenter = ProgressPresenter()
     state = ProgressState()
@@ -268,9 +287,10 @@ def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
 
     assert plan.presentation_agent_used is True
     assert tuple(segment.text for segment in plan.segments) == (
-        "• 第一项：15:45 压力值 74.06",
+        "• 第一项：15:45 压力值 74.06\n",
         "inline 帮助：https://example.com",
     )
+    assert "".join(segment.text for segment in plan.segments) == plan.full_text
     assert "`" not in plan.full_text
     assert "[帮助](" not in plan.full_text
     assert "- 第一项" not in plan.full_text

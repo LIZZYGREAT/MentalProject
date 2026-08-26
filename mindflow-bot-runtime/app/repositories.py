@@ -602,6 +602,136 @@ class CalendarSnapshotRepository:
             session.flush()
             return self._view(row), changed
 
+    @staticmethod
+    def _matches_expected(
+        row: CalendarSnapshot | None,
+        *,
+        expected_snapshot_id: str | None,
+        expected_revision: str | None,
+        expected_state: str | None,
+    ) -> bool:
+        if expected_snapshot_id is None:
+            return row is None
+        return bool(
+            row is not None
+            and str(row.id) == str(expected_snapshot_id)
+            and row.calendar_revision == expected_revision
+            and row.snapshot_state == expected_state
+        )
+
+    def commit_provider_read(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        expected_snapshot_id: str | None,
+        expected_revision: str | None,
+        expected_state: str | None,
+        revision: str,
+        events: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit a provider response only if its read fence is still current."""
+
+        with self.database.session() as session:
+            # Calendar mutation invalidation uses the same participant-level
+            # serialization root and then locks CalendarSnapshot.
+            session.get(Participant, participant_id, with_for_update=True)
+            row = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            if not self._matches_expected(
+                row,
+                expected_snapshot_id=expected_snapshot_id,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+            ):
+                raise ForecastInputChangedError("calendar")
+
+            now = utc_now()
+            changed = row is None or row.calendar_revision != revision
+            if row is None:
+                row = CalendarSnapshot(
+                    participant_id=participant_id,
+                    local_date=local_date,
+                    calendar_revision=revision,
+                    events_json=list(events),
+                    degraded=False,
+                    snapshot_state=self.CURRENT,
+                    last_refresh_attempt_at=now,
+                    last_refresh_success_at=now,
+                    last_refresh_error_class=None,
+                )
+                session.add(row)
+            else:
+                row.calendar_revision = revision
+                row.events_json = list(events)
+                row.degraded = False
+                row.snapshot_state = self.CURRENT
+                row.last_refresh_attempt_at = now
+                row.last_refresh_success_at = now
+                row.last_refresh_error_class = None
+                row.updated_at = now
+            session.flush()
+            return self._view(row), changed
+
+    def commit_provider_failure(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        expected_snapshot_id: str | None,
+        expected_revision: str | None,
+        expected_state: str | None,
+        error_class: str,
+        empty_revision: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Record a provider failure without crossing a newer read fence."""
+
+        with self.database.session() as session:
+            session.get(Participant, participant_id, with_for_update=True)
+            row = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            if not self._matches_expected(
+                row,
+                expected_snapshot_id=expected_snapshot_id,
+                expected_revision=expected_revision,
+                expected_state=expected_state,
+            ):
+                raise ForecastInputChangedError("calendar")
+
+            now = utc_now()
+            if row is None:
+                row = CalendarSnapshot(
+                    participant_id=participant_id,
+                    local_date=local_date,
+                    calendar_revision=empty_revision,
+                    events_json=[],
+                    degraded=True,
+                    snapshot_state=self.PROVIDER_DEGRADED,
+                    last_refresh_attempt_at=now,
+                    last_refresh_success_at=None,
+                    last_refresh_error_class=str(error_class)[:128],
+                )
+                session.add(row)
+            else:
+                # A read-back that started from mutation_refresh_pending may
+                # record diagnostics, but cannot make retained events usable.
+                if row.snapshot_state != self.MUTATION_REFRESH_PENDING:
+                    row.snapshot_state = self.PROVIDER_DEGRADED
+                    row.degraded = True
+                row.last_refresh_attempt_at = now
+                row.last_refresh_error_class = str(error_class)[:128]
+                row.updated_at = now
+            session.flush()
+            return self._view(row), False
+
     def record_refresh_failure(
         self,
         participant_id: uuid.UUID,

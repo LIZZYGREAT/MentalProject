@@ -33,6 +33,7 @@ def test_real_postgres_upgrade_0016_to_0017_preserves_and_backfills():
     schema = f"mindflow_migration_{uuid.uuid4().hex}"
     participant_id = uuid.uuid4()
     calendar_id = uuid.uuid4()
+    degraded_calendar_id = uuid.uuid4()
     forecast_id = uuid.uuid4()
     source_warning_id = uuid.uuid4()
     child_warning_id = uuid.uuid4()
@@ -73,6 +74,24 @@ def test_real_postgres_upgrade_0016_to_0017_preserves_and_backfills():
                     "participant_id": participant_id,
                     "local_date": date(2030, 1, 15),
                     "events": json.dumps([{"id": "event-1"}]),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO calendar_snapshots (
+                        id, participant_id, local_date, calendar_revision,
+                        events_json, degraded
+                    ) VALUES (
+                        :id, :participant_id, :local_date, 'calendar-degraded',
+                        '[]'::jsonb, true
+                    )
+                    """
+                ),
+                {
+                    "id": degraded_calendar_id,
+                    "participant_id": participant_id,
+                    "local_date": date(2030, 1, 16),
                 },
             )
             connection.execute(
@@ -200,6 +219,13 @@ def test_real_postgres_upgrade_0016_to_0017_preserves_and_backfills():
                 ),
                 {"id": calendar_id},
             ) == "current"
+            assert connection.scalar(
+                text(
+                    "SELECT snapshot_state FROM calendar_snapshots "
+                    "WHERE id = :id"
+                ),
+                {"id": degraded_calendar_id},
+            ) == "provider_degraded"
             assert connection.scalar(
                 text(
                     "SELECT snoozed_from_intervention_id FROM warning_schedules "

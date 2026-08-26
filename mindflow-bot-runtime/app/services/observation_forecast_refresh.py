@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from app.repositories import ForecastSnapshotRepository, WarningScheduleRepository
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 
 
 logger = logging.getLogger(__name__)
@@ -25,11 +26,13 @@ class ObservationForecastRefreshService:
         coordinator: ForecastCoordinator,
         *,
         timezone_name: str,
+        dependency_refresh: ForecastDependencyRefreshService | None = None,
     ) -> None:
         self.forecasts = forecasts
         self.warnings = warnings
         self.coordinator = coordinator
         self.timezone = ZoneInfo(timezone_name)
+        self.dependency_refresh = dependency_refresh
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: dict[tuple[uuid.UUID, date], asyncio.Task[None]] = {}
         self._requested: dict[tuple[uuid.UUID, date], int] = {}
@@ -61,6 +64,16 @@ class ObservationForecastRefreshService:
             local_date,
             reason="observation_committed",
         )
+        if self.dependency_refresh is not None:
+            dependent_invalidated = self.dependency_refresh.invalidate_dependent_now(
+                participant_id,
+                local_date,
+                reason="previous_day_observation_input_changed",
+            )
+            invalidated = {
+                key: invalidated.get(key, 0) + dependent_invalidated.get(key, 0)
+                for key in {**invalidated, **dependent_invalidated}
+            }
         loop = self._loop
         if loop is None or loop.is_closed() or self._closed:
             logger.error(
@@ -103,20 +116,27 @@ class ObservationForecastRefreshService:
                         refresh_calendar=False,
                         force_followup=True,
                     )
-                    dependent_date = local_date + timedelta(days=1)
-                    await asyncio.to_thread(
-                        self.coordinator.mark_dependency_dirty,
-                        participant_id,
-                        dependent_date,
-                        reason="previous_day_observation_terminal_changed",
-                    )
-                    await self.coordinator.ensure_forecast(
-                        participant_id,
-                        dependent_date,
-                        "previous_day_observation_terminal_changed",
-                        refresh_calendar=False,
-                        force_followup=True,
-                    )
+                    if self.dependency_refresh is not None:
+                        await self.dependency_refresh.refresh_dependent_after_source(
+                            participant_id,
+                            local_date,
+                            reason="previous_day_observation_terminal_changed",
+                        )
+                    else:
+                        dependent_date = local_date + timedelta(days=1)
+                        await asyncio.to_thread(
+                            self.coordinator.mark_dependency_dirty,
+                            participant_id,
+                            dependent_date,
+                            reason="previous_day_observation_terminal_changed",
+                        )
+                        await self.coordinator.ensure_forecast(
+                            participant_id,
+                            dependent_date,
+                            "previous_day_observation_terminal_changed",
+                            refresh_calendar=False,
+                            force_followup=True,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:

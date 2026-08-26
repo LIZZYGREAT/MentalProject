@@ -23,6 +23,7 @@ from app.repositories_daily_review import (
 )
 from app.services.observation_smoother import FixedLagObservationSmoother
 from app.services.retrospective_reconstructor import PEAK_PERIODS, RetrospectiveReconstructor
+from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 
 
 def _score(value: Any, field: str) -> float:
@@ -82,6 +83,7 @@ class DailyReviewService:
         self.observations = observations
         self.settings = settings
         self.warning_repository: WarningScheduleRepository | None = None
+        self.dependency_refresh: ForecastDependencyRefreshService | None = None
         self.timezone = ZoneInfo(settings.daily_review_timezone)
         self.smoother = FixedLagObservationSmoother(
             settings.observation_smoothing_window_minutes
@@ -340,7 +342,25 @@ class DailyReviewService:
             analysis_json=analysis,
             diagnostics_json=diagnostics,
         )
-        if self.warning_repository is not None:
+        if self.dependency_refresh is not None:
+            self.dependency_refresh.invalidate_dependent_now(
+                participant_id,
+                local_date,
+                reason="previous_day_retrospective_terminal_changed",
+            )
+            self.dependency_refresh.enqueue_dependent_after_source(
+                participant_id,
+                local_date,
+                reason="previous_day_retrospective_terminal_changed",
+            )
+        elif (
+            self.warning_repository is not None
+            and local_date
+            in {
+                datetime.now(self.timezone).date() - timedelta(days=1),
+                datetime.now(self.timezone).date(),
+            }
+        ):
             self.forecasts.invalidate_current_for_date(
                 self.warning_repository,
                 participant_id,

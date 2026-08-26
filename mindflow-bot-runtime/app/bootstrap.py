@@ -39,6 +39,7 @@ from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
+from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.profile_calibration import ProfileCalibrationService
 from app.services.token_service import (
     TokenEncryptionService,
@@ -73,6 +74,7 @@ class BusinessServices:
     retrospective_curves: RetrospectiveCurveRepository
     daily_reviews: DailyReviewService
     observation_refresh: ObservationForecastRefreshService
+    dependency_refresh: ForecastDependencyRefreshService
     care_preferences: ParticipantCarePreferenceRepository
     care_interventions: CareInterventionRepository
 
@@ -159,11 +161,20 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         care_preferences=care_preferences,
     )
+    dependency_refresh = ForecastDependencyRefreshService(
+        forecast_snapshots,
+        warning_schedules,
+        forecast_coordinator,
+        timezone_name=settings.timezone_name,
+    )
+    forecast_coordinator.dependency_refresh = dependency_refresh
+    daily_reviews.dependency_refresh = dependency_refresh
     observation_refresh = ObservationForecastRefreshService(
         forecast_snapshots,
         warning_schedules,
         forecast_coordinator,
         timezone_name=settings.timezone_name,
+        dependency_refresh=dependency_refresh,
     )
     card_actions = CardActionService(
         observations,
@@ -217,6 +228,7 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         daily_reviews=daily_reviews,
         observation_refresh=observation_refresh,
+        dependency_refresh=dependency_refresh,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
     )

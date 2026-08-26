@@ -22,6 +22,7 @@ from app.repositories import (
 )
 from app.services.card_action_service import CardActionService
 from app.services.forecast_scheduler import ForecastScheduler
+from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.curve_analysis import analyze_curve
 from app.services.pressure_curve_renderer import PressureCurveRenderer
@@ -414,6 +415,149 @@ def test_observation_refresh_failure_stays_fail_closed_and_targets_observed_date
             [person.id], d1, "periodic_poll", calibrate=False
         )
         assert forecasts.latest(person.id, d1)["forecast_version"] == "scheduler-recovered"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source_fails", [False, True])
+def test_observation_invalidates_dependent_before_source_recompute(source_fails):
+    database = memory_database()
+    person = participant(database, "OBS-DEPENDENCY-FENCE")
+    warnings = warning_repository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    timezone_value = ZoneInfo("Asia/Shanghai")
+    source_date = datetime.now(timezone_value).date()
+    dependent_date = source_date + timedelta(days=1)
+    for target, version in (
+        (source_date, "source-old"),
+        (dependent_date, "dependent-old"),
+    ):
+        forecasts.save(
+            person.id,
+            target,
+            calendar_revision=version,
+            semantic_revision=version,
+            algorithm_version="algorithm",
+            forecast_version=version,
+            semantic_status="rules_only",
+            semantic_input=[],
+            curve=[],
+            peaks=[],
+            warning_windows=[],
+            output={},
+        )
+
+    class Coordinator:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ensure_forecast(self, participant_id, target, _reason, **_kwargs):
+            if target == source_date:
+                self.started.set()
+                await self.release.wait()
+                if source_fails:
+                    raise RuntimeError("source recompute failed")
+            return forecasts.save(
+                participant_id,
+                target,
+                calendar_revision=f"new-{target}",
+                semantic_revision=f"new-{target}",
+                algorithm_version="algorithm",
+                forecast_version=f"new-{target}",
+                semantic_status="rules_only",
+                semantic_input=[],
+                curve=[],
+                peaks=[],
+                warning_windows=[],
+                output={},
+            )
+
+    async def scenario():
+        coordinator = Coordinator()
+        dependency = ForecastDependencyRefreshService(
+            forecasts,
+            warnings,
+            coordinator,
+            timezone_name="Asia/Shanghai",
+        )
+        refresh = ObservationForecastRefreshService(
+            forecasts,
+            warnings,
+            coordinator,
+            timezone_name="Asia/Shanghai",
+            dependency_refresh=dependency,
+        )
+        dependency.start()
+        refresh.start()
+        observed_at = datetime.now(timezone_value) - timedelta(minutes=1)
+        refresh.on_observation_committed(
+            participant_id=person.id,
+            observed_at=observed_at,
+            created=True,
+        )
+        await coordinator.started.wait()
+
+        assert forecasts.latest(person.id, source_date) is None
+        assert forecasts.latest(person.id, dependent_date) is None
+
+        coordinator.release.set()
+        await refresh.wait_idle()
+        if source_fails:
+            assert forecasts.latest(person.id, source_date) is None
+            assert forecasts.latest(person.id, dependent_date) is None
+        else:
+            assert forecasts.latest(person.id, source_date)["forecast_version"].startswith("new-")
+            assert forecasts.latest(person.id, dependent_date)["forecast_version"].startswith("new-")
+        assert dependency.dependent_date(dependent_date) is None
+        assert dependency.dependent_date(source_date - timedelta(days=30)) is None
+        await refresh.close()
+        await dependency.close()
+
+    asyncio.run(scenario())
+
+
+def test_managed_dependency_refresh_does_not_drop_a_new_generation():
+    database = memory_database()
+    warnings = warning_repository(database)
+    forecasts = ForecastSnapshotRepository(database)
+    person = participant(database, "DEPENDENCY-COALESCE")
+    source_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ensure_forecast(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                await self.release.wait()
+            await asyncio.sleep(0)
+            return {"valid": True}
+
+    async def scenario():
+        coordinator = Coordinator()
+        dependency = ForecastDependencyRefreshService(
+            forecasts,
+            warnings,
+            coordinator,
+            timezone_name="Asia/Shanghai",
+        )
+        dependency.start()
+        assert dependency.enqueue_dependent_after_source(
+            person.id, source_date, reason="first_retrospective"
+        )
+        await coordinator.started.wait()
+        assert dependency.enqueue_dependent_after_source(
+            person.id, source_date, reason="newer_retrospective"
+        )
+        coordinator.release.set()
+        await dependency.wait_idle()
+        assert coordinator.calls == 2
+        await dependency.close()
 
     asyncio.run(scenario())
 

@@ -7,6 +7,7 @@ import re
 
 _STRONG_BOUNDARY = re.compile(r"(?<=[。！？!?；;])(?:\s+|(?=[^\s]))|\n{2,}")
 _URL = re.compile(r"https?://\S+")
+_MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\([^\n)]*\)")
 _WEAK_CHARS = "，、,：: \n"
 
 
@@ -102,6 +103,46 @@ class SemanticSegmenter:
             ):
                 return index
         return min(limit, len(value))
+
+    def safe_boundary_positions(self, value: str) -> frozenset[int]:
+        """Return lossless cut positions that do not split protected syntax."""
+
+        text = str(value)
+        protected = [(match.start(), match.end()) for match in _URL.finditer(text)]
+        protected.extend(
+            (match.start(), match.end()) for match in _MARKDOWN_LINK.finditer(text)
+        )
+        boundaries = {0, len(text)}
+        in_fence = False
+        fence_start: int | None = None
+        line_start = 0
+        for line in text.splitlines(keepends=True):
+            line_end = line_start + len(line)
+            if line.lstrip().startswith("```"):
+                if not in_fence:
+                    in_fence = True
+                    fence_start = line_start
+                else:
+                    in_fence = False
+                    protected.append((fence_start or 0, line_end))
+                    fence_start = None
+            elif not in_fence and line_end < len(text):
+                boundaries.add(line_end)
+            line_start = line_end
+        if in_fence:
+            protected.append((fence_start or 0, len(text)))
+        for index, character in enumerate(text, start=1):
+            if character not in "。！？!?；;，,：: \n":
+                continue
+            if self._inside(index, protected):
+                continue
+            if character == "\n" and index < len(text):
+                next_line = text[index:].lstrip(" \t")
+                if next_line.startswith(("```", ")", "]")):
+                    continue
+            if self._balanced(text[:index]):
+                boundaries.add(index)
+        return frozenset(boundaries)
 
     @staticmethod
     def _inside(index: int, spans: list[tuple[int, int]]) -> bool:

@@ -121,25 +121,20 @@ def classify_event(
         },
     }
     selected = resolution.exact_match
+    if selected is None and event_type == "task" and lock == "course_related_task":
+        # Task intent words are not part of course identity. A second,
+        # deterministic lookup may bind an exact course (for example
+        # “写线性代数作业” → “线性代数”), while ambiguous aliases such as
+        # “高数” remain candidate context only.
+        identity_query = _COURSE_TASK_WORDS.sub("", _WORK_VERBS.sub("", title)).strip()
+        if identity_query:
+            selected = resolver.resolve(identity_query).exact_match
     if selected is not None:
+        result["classification"]["course_identity_locked"] = True
         _apply_course_identity(
             result,
             selected,
             source=_candidate_source(selected),
-            confidence=selected.local_score,
-            event_type=event_type,
-            catalog_revision=resolution.catalog_revision,
-        )
-    elif (
-        event_type == "task"
-        and resolution.likely_course
-        and lock == "course_related_task"
-    ):
-        selected = resolution.candidates[0]
-        _apply_course_identity(
-            result,
-            selected,
-            source="catalog_candidates",
             confidence=selected.local_score,
             event_type=event_type,
             catalog_revision=resolution.catalog_revision,

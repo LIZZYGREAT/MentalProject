@@ -120,8 +120,16 @@ def test_0017_adds_calendar_state_and_safe_snooze_backfill(monkeypatch):
     assert columns[0][0] == "calendar_snapshots"
     assert columns[0][1].name == "snapshot_state"
     assert columns[0][1].nullable is False
-    backfill = statements[0]
-    assert "snoozed_from_intervention_id = candidate.intervention_id" in backfill
-    assert "intervention.id::text" in backfill
-    assert "candidate.candidate_rank = 1" in backfill
-    assert "::uuid" not in backfill
+    calendar_backfill = next(
+        statement for statement in statements
+        if "UPDATE calendar_snapshots" in statement
+    )
+    assert "snapshot_state = 'provider_degraded'" in calendar_backfill
+    assert "WHERE degraded = true" in calendar_backfill
+    snooze_backfill = next(
+        statement for statement in statements
+        if "snoozed_from_intervention_id = candidate.intervention_id" in statement
+    )
+    assert "intervention.id::text" in snooze_backfill
+    assert "candidate.candidate_rank = 1" in snooze_backfill
+    assert "::uuid" not in snooze_backfill

@@ -282,11 +282,14 @@ class ResponseOrchestrator:
             raise ValueError("invalid segment count")
         cursor = 0
         segments = []
+        approved_boundaries = self.segmenter.safe_boundary_positions(source_text)
         for start, end in spans:
             if start != cursor or end <= start or end > len(source_text):
                 raise ValueError("spans must be contiguous and ordered")
-            segment = source_text[start:end].strip()
-            if not segment:
+            if start not in approved_boundaries or end not in approved_boundaries:
+                raise ValueError("span boundary is not approved")
+            segment = source_text[start:end]
+            if not segment.strip():
                 raise ValueError("empty segment")
             segments.append(segment)
             cursor = end
@@ -320,10 +323,17 @@ class ResponseOrchestrator:
         presentation_agent_latency_ms: float = 0.0,
         presentation_cleanup_pending: int = 0,
     ) -> ResponsePlan:
-        normalized = tuple(text for text in (str(item).strip() for item in texts) if text)
+        if presentation_agent_used:
+            normalized = tuple(str(item) for item in texts if str(item).strip())
+            full_text = "".join(normalized)
+        else:
+            normalized = tuple(
+                text for text in (str(item).strip() for item in texts) if text
+            )
+            full_text = "\n\n".join(normalized)
         return ResponsePlan(
             kind=kind,
-            full_text="\n\n".join(normalized),
+            full_text=full_text,
             segments=tuple(
                 ResponseSegment(index=index, text=text)
                 for index, text in enumerate(normalized)

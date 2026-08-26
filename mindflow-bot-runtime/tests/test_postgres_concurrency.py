@@ -420,6 +420,81 @@ def test_postgres_calendar_mutation_race_never_reactivates_old_revision(
     assert forecasts.latest(participant.id, local_date) is None
 
 
+@pytest.mark.parametrize("provider_outcome", ["success", "failure"])
+def test_postgres_provider_readback_cas_cannot_cross_calendar_mutation(
+    postgres_database,
+    provider_outcome,
+):
+    participant = ParticipantRepository(postgres_database).create(
+        f"PG-CALENDAR-CAS-{provider_outcome}"
+    )
+    warnings, _preferences = _runtime_repositories(postgres_database)
+    forecasts = ForecastSnapshotRepository(postgres_database)
+    calendars = CalendarSnapshotRepository(postgres_database)
+    local_date = datetime.now(timezone.utc).astimezone(
+        ZoneInfo("Asia/Shanghai")
+    ).date()
+    calendars.upsert(
+        participant.id,
+        local_date,
+        revision="calendar-before-provider-read",
+        events=[{"id": "old-event"}],
+        degraded=False,
+    )
+    expected = calendars.get(participant.id, local_date)
+    barrier = threading.Barrier(2)
+    provider_rejected = []
+
+    def commit_provider_result():
+        barrier.wait()
+        try:
+            kwargs = {
+                "expected_snapshot_id": expected["id"],
+                "expected_revision": expected["calendar_revision"],
+                "expected_state": expected["snapshot_state"],
+            }
+            if provider_outcome == "success":
+                calendars.commit_provider_read(
+                    participant.id,
+                    local_date,
+                    **kwargs,
+                    revision="stale-provider-response",
+                    events=[{"id": "stale-event"}],
+                )
+            else:
+                calendars.commit_provider_failure(
+                    participant.id,
+                    local_date,
+                    **kwargs,
+                    error_class="TimeoutError",
+                    empty_revision="empty",
+                )
+        except ForecastInputChangedError:
+            provider_rejected.append(True)
+
+    def mutate_calendar():
+        barrier.wait()
+        forecasts.invalidate_for_calendar_mutation(
+            warnings,
+            participant.id,
+            local_date,
+            reason="postgres_provider_readback_cas",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(commit_provider_result),
+            executor.submit(mutate_calendar),
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    final = calendars.get(participant.id, local_date)
+    assert final["snapshot_state"] == "mutation_refresh_pending"
+    assert final["calendar_revision"].startswith("mutation:")
+    assert provider_rejected in ([], [True])
+
+
 def test_postgres_daily_review_disable_and_claim_race_ends_cancelled(
     postgres_database,
 ):
