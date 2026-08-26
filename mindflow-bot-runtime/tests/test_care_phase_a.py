@@ -474,6 +474,56 @@ def test_snooze_is_idempotent_restart_safe_and_bypasses_only_minimum_interval():
     assert claimed is not None
 
 
+def test_rejected_snooze_does_not_mark_intervention_snoozed():
+    database, _, participant, warnings, preferences, interventions = _setup()
+    intervention_id, sent_at = _send_first(database, warnings)
+    preferences.update(
+        participant.id, {"allow_follow_up": False}, now=sent_at
+    )
+
+    result = interventions.apply_action(
+        participant.id,
+        intervention_id,
+        action="snooze_30",
+        callback_event_id="callback-snooze-disabled",
+        now=sent_at + timedelta(minutes=1),
+    )
+
+    assert result["action_result"] == "follow_up_disabled"
+    assert result["follow_up_warning_id"] is None
+    assert result["intervention"]["status"] == "sent"
+    assert result["intervention"]["user_action"] is None
+    with database.session() as session:
+        assert session.query(WarningSchedule).count() == 1
+
+
+def test_disabling_follow_up_cancels_pending_user_requested_warning():
+    database, _, participant, warnings, preferences, interventions = _setup()
+    intervention_id, sent_at = _send_first(database, warnings)
+    snoozed = interventions.apply_action(
+        participant.id,
+        intervention_id,
+        action="snooze_30",
+        callback_event_id="callback-snooze-before-disable",
+        now=sent_at + timedelta(minutes=1),
+    )
+
+    preferences.update(
+        participant.id,
+        {"allow_follow_up": False},
+        now=sent_at + timedelta(minutes=2),
+    )
+
+    with database.session() as session:
+        child = session.get(
+            WarningSchedule, uuid.UUID(snoozed["follow_up_warning_id"])
+        )
+        assert child.status == "cancelled"
+        assert child.payload_json["cancellation_reason"] == (
+            "participant_care_preference"
+        )
+
+
 def test_warning_preference_change_before_final_authorization_cancels_claim():
     database, _, participant, warnings, preferences, _ = _setup()
     with database.session() as session:

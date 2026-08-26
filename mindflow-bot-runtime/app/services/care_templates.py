@@ -10,7 +10,7 @@ from app.services.care_context import CareContext
 from app.services.care_intervention_policy import CareMessagePlan
 
 
-CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v2"
+CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v3"
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class CareTemplateLibrary:
         "transition-buffer-v1": "1.0.0",
         "workload-decomposition-v1": "1.0.0",
         "protected-break-v1": "1.0.0",
+        "micro-break-v1": "1.0.0",
         "brief-check-in-v1": "1.0.0",
         "schedule-adjustment-v1": "1.0.0",
     }
@@ -165,6 +166,11 @@ class CareTemplateLibrary:
             return (
                 f"如果条件允许，先安排 {plan.action_minutes} 分钟真正脱离任务的休息，"
                 f"回来后再只选一件最小可做的事{recovery}。"
+            )
+        if plan.intervention_type == "micro_break":
+            return (
+                f"如果方便，可以先留 {min(5, max(2, plan.action_minutes))} 分钟不处理任务，"
+                "喝点水、站起来活动一下或看向远处，再进入下一项安排。"
             )
         if plan.intervention_type == "generic_fallback":
             return "如果方便，可以先用几分钟补水、活动一下，再确认下一件最小可做的事。"

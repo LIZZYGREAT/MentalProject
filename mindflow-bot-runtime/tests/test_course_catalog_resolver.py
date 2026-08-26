@@ -97,7 +97,7 @@ def test_title_task_intent_wins_even_when_description_calls_it_a_course():
     assert event["related_course_name"].startswith("高等数学")
 
 
-def test_controlled_alias_identity_cannot_be_replaced_by_external_candidate():
+def test_controlled_alias_locks_type_but_allows_candidate_bounded_identity():
     event = prepare_event_instances([_event("高数A")], "2030-01-15")[0]
     finalized = finalize_event_classification(
         event,
@@ -109,8 +109,27 @@ def test_controlled_alias_identity_cannot_be_replaced_by_external_candidate():
         },
     )
 
-    assert finalized["course_name"] == "高等数学（A类）II"
-    assert finalized["course_code"] == "AMTD0034"
+    assert event["metadata"]["classification"]["event_type_locked"] is True
+    assert event["metadata"]["classification"]["course_identity_locked"] is False
+    assert finalized["course_name"] == "高等数学（B类）II"
+    assert finalized["course_code"] == "AMTD0035"
+
+
+def test_ambiguous_high_math_suffixes_never_lock_a_wrong_identity():
+    for title in ("高数", "高数I", "高数II", "高数1", "高数2", "高数3"):
+        event = prepare_event_instances([_event(title)], "2030-01-15")[0]
+        classification = event["metadata"]["classification"]
+        assert event["event_type"] == "course"
+        assert classification["event_type_locked"] is True
+        assert classification["course_identity_locked"] is False
+        assert not event.get("course_name")
+
+
+def test_exact_course_identity_is_independently_locked():
+    event = prepare_event_instances([_event("线代")], "2030-01-15")[0]
+    classification = event["metadata"]["classification"]
+    assert classification["event_type_locked"] is True
+    assert classification["course_identity_locked"] is True
 
 
 def test_non_course_negative_corpus_has_zero_authoritative_course_false_positives():

@@ -34,7 +34,6 @@ from app.models import (
     ParticipantProfile,
     LearnedModelProfile,
     ForecastSnapshot,
-    PredictionRun,
     RuntimeIncident,
     StateObservation,
     WarningSchedule,
@@ -516,76 +515,11 @@ class ObservationRepository:
         }
 
 
-class PredictionRepository:
-    def __init__(self, database: Database):
-        self.database = database
-
-    def save(
-        self,
-        participant_id: uuid.UUID,
-        *,
-        profile_version: Optional[int],
-        model_version: str,
-        input_snapshot: dict[str, Any],
-        output: dict[str, Any],
-        source_message_id: Optional[str] = None,
-    ) -> uuid.UUID:
-        with self.database.session() as session:
-            if source_message_id:
-                existing = session.execute(
-                    select(PredictionRun).where(
-                        PredictionRun.participant_id == participant_id,
-                        PredictionRun.source_message_id == source_message_id,
-                    )
-                ).scalar_one_or_none()
-                if existing is not None:
-                    return existing.id
-            row = PredictionRun(
-                participant_id=participant_id,
-                profile_version=profile_version,
-                source_message_id=source_message_id,
-                model_version=model_version,
-                input_snapshot_json=dict(input_snapshot),
-                output_json=dict(output),
-            )
-            session.add(row)
-            session.flush()
-            return row.id
-
-    def by_source_message(
-        self, participant_id: uuid.UUID, source_message_id: str
-    ) -> Optional[dict[str, Any]]:
-        with self.database.session() as session:
-            row = session.execute(
-                select(PredictionRun).where(
-                    PredictionRun.participant_id == participant_id,
-                    PredictionRun.source_message_id == source_message_id,
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            return {"prediction_run_id": str(row.id), **dict(row.output_json)}
-
-    def latest(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
-        with self.database.session() as session:
-            row = session.execute(
-                select(PredictionRun)
-                .where(PredictionRun.participant_id == participant_id)
-                .order_by(desc(PredictionRun.created_at))
-                .limit(1)
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            return {
-                "id": str(row.id),
-                "profile_version": row.profile_version,
-                "model_version": row.model_version,
-                "output": dict(row.output_json),
-                "created_at": row.created_at.isoformat(),
-            }
-
-
 class CalendarSnapshotRepository:
+    CURRENT = "current"
+    PROVIDER_DEGRADED = "provider_degraded"
+    MUTATION_REFRESH_PENDING = "mutation_refresh_pending"
+
     def __init__(self, database: Database):
         self.database = database
 
@@ -597,6 +531,7 @@ class CalendarSnapshotRepository:
             "local_date": row.local_date.isoformat(),
             "calendar_revision": row.calendar_revision,
             "events": list(row.events_json),
+            "snapshot_state": row.snapshot_state,
             "degraded": row.degraded,
             "last_refresh_attempt_at": (
                 row.last_refresh_attempt_at.isoformat() if row.last_refresh_attempt_at else None
@@ -622,7 +557,17 @@ class CalendarSnapshotRepository:
         self, participant_id: uuid.UUID, local_date: date, *, revision: str,
         events: list[dict[str, Any]], degraded: bool,
         refresh_error_class: str | None = None,
+        snapshot_state: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        state = snapshot_state or (
+            self.PROVIDER_DEGRADED if degraded else self.CURRENT
+        )
+        if state not in {
+            self.CURRENT,
+            self.PROVIDER_DEGRADED,
+            self.MUTATION_REFRESH_PENDING,
+        }:
+            raise ValueError("invalid calendar snapshot state")
         with self.database.session() as session:
             row = session.execute(
                 select(CalendarSnapshot).where(
@@ -636,14 +581,16 @@ class CalendarSnapshotRepository:
                 row = CalendarSnapshot(
                     participant_id=participant_id, local_date=local_date,
                     calendar_revision=revision, events_json=list(events), degraded=degraded,
+                    snapshot_state=state,
                     last_refresh_attempt_at=now,
                     last_refresh_success_at=None if degraded else now,
                     last_refresh_error_class=refresh_error_class,
                 )
                 session.add(row)
-            elif changed or row.degraded != degraded:
+            elif changed or row.degraded != degraded or row.snapshot_state != state:
                 row.calendar_revision = revision
                 row.events_json = list(events)
+                row.snapshot_state = state
                 row.degraded = degraded
                 row.updated_at = now
             row.last_refresh_attempt_at = now
@@ -654,6 +601,31 @@ class CalendarSnapshotRepository:
                 row.last_refresh_error_class = refresh_error_class
             session.flush()
             return self._view(row), changed
+
+    def record_refresh_failure(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date,
+        *,
+        error_class: str,
+    ) -> dict[str, Any] | None:
+        """Record a provider failure without making mutation-pending data usable."""
+
+        with self.database.session() as session:
+            row = session.execute(
+                select(CalendarSnapshot).where(
+                    CalendarSnapshot.participant_id == participant_id,
+                    CalendarSnapshot.local_date == local_date,
+                ).with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            now = utc_now()
+            row.last_refresh_attempt_at = now
+            row.last_refresh_error_class = str(error_class)[:128]
+            row.updated_at = now
+            session.flush()
+            return self._view(row)
 
 
 class EventSemanticCacheRepository:
@@ -862,6 +834,7 @@ class ForecastSnapshotRepository:
                     local_date=local_date,
                     calendar_revision=marker,
                     events_json=[],
+                    snapshot_state=CalendarSnapshotRepository.MUTATION_REFRESH_PENDING,
                     degraded=True,
                     last_refresh_attempt_at=changed_at,
                     last_refresh_error_class="calendar_mutation_refresh_pending",
@@ -870,7 +843,11 @@ class ForecastSnapshotRepository:
                 session.add(calendar)
             else:
                 calendar.calendar_revision = marker
-                calendar.events_json = []
+                # Retain the last known events for diagnostics only.  The
+                # explicit pending state prevents Forecast from consuming them.
+                calendar.snapshot_state = (
+                    CalendarSnapshotRepository.MUTATION_REFRESH_PENDING
+                )
                 calendar.degraded = True
                 calendar.last_refresh_attempt_at = changed_at
                 calendar.last_refresh_error_class = "calendar_mutation_refresh_pending"
@@ -1045,7 +1022,11 @@ class ForecastSnapshotRepository:
         if (
             verify_current_inputs
             and calendar is not None
-            and calendar.calendar_revision != calendar_revision
+            and (
+                calendar.calendar_revision != calendar_revision
+                or calendar.snapshot_state
+                == CalendarSnapshotRepository.MUTATION_REFRESH_PENDING
+            )
         ):
             raise ForecastInputChangedError("calendar")
 
@@ -1702,6 +1683,10 @@ class WarningScheduleRepository:
             authorization_reason = (
                 "inactive"
                 if participant is None or participant.status != "active"
+                else "follow_up_disabled"
+                if bool(row.payload_json.get("user_requested_followup"))
+                and participant_preference is not None
+                and not participant_preference.allow_follow_up
                 else self._hard_authorization_reason(participant_preference, now)
             )
             if authorization_reason is not None:
@@ -1845,6 +1830,10 @@ class WarningScheduleRepository:
             authorization_reason = (
                 "inactive"
                 if participant is None or participant.status != "active"
+                else "follow_up_disabled"
+                if bool(row.payload_json.get("user_requested_followup"))
+                and preference is not None
+                and not preference.allow_follow_up
                 else self._hard_authorization_reason(preference, now)
             )
             if authorization_reason is not None:
@@ -1888,6 +1877,12 @@ class WarningScheduleRepository:
         now = self._aware(now)
         token = uuid.UUID(str(claim_token))
         with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return False
+            session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if (
                 row is None
@@ -1933,6 +1928,12 @@ class WarningScheduleRepository:
     ) -> bool:
         token = uuid.UUID(str(claim_token))
         with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return False
+            session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if (
                 row is None
@@ -1990,6 +1991,12 @@ class WarningScheduleRepository:
     ) -> None:
         now = self._aware(now)
         with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return
+            session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if row is None or row.status != "delivery_unavailable":
                 return

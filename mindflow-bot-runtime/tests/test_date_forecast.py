@@ -258,6 +258,11 @@ def test_today_calendar_mutation_invalidates_today_and_tomorrow_before_refresh()
     class Coordinator:
         warnings = object()
 
+        def mark_dependency_dirty(
+            self, _participant_id, local_date, *, reason
+        ):
+            operations.append(("dependency_dirty", local_date, reason))
+
         async def ensure_forecast(
             self, _participant_id, local_date, reason, **_kwargs
         ):
@@ -279,7 +284,7 @@ def test_today_calendar_mutation_invalidates_today_and_tomorrow_before_refresh()
 
     assert operations == [
         ("invalidate", today, "calendar_update_event"),
-        ("invalidate", tomorrow, "calendar_update_event"),
+        ("dependency_dirty", tomorrow, "previous_day_terminal_changed"),
         ("refresh", today, "calendar_update_event"),
         ("refresh", tomorrow, "calendar_update_event"),
     ]

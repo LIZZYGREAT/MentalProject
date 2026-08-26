@@ -132,6 +132,7 @@ def build_business_services(
         warning_delivery_policy,
         timezone_name=settings.timezone_name,
     )
+    daily_reviews.warning_repository = warning_schedules
     care_preferences = ParticipantCarePreferenceRepository(
         database,
         system_max_daily_sends=warning_delivery_policy.max_daily_sends,

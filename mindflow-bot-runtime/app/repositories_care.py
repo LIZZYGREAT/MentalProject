@@ -341,6 +341,10 @@ class ParticipantCarePreferenceRepository:
             permitted = (
                 kept < remaining
                 and self.allows_scheduled_at(view, warning.target_time)
+                and not (
+                    bool(warning.payload_json.get("user_requested_followup"))
+                    and not bool(view["allow_follow_up"])
+                )
             )
             if permitted:
                 kept_by_date[warning.local_date] = kept + 1
@@ -562,6 +566,13 @@ class CareInterventionRepository:
                 ):
                     raise ValueError("care intervention is not owned by participant")
                 session.get(Participant, participant_id, with_for_update=True)
+                # Warning is always locked before Care so delivery completion,
+                # mute and snooze cannot form a Warning/Care lock cycle.
+                session.execute(
+                    select(WarningSchedule).where(
+                        WarningSchedule.participant_id == participant_id
+                    ).with_for_update()
+                ).scalars().all()
                 intervention = session.execute(
                     select(CareInterventionEvent)
                     .where(CareInterventionEvent.id == intervention_id)
@@ -602,14 +613,15 @@ class CareInterventionRepository:
                 follow_up_id = None
                 action_result = "feedback_recorded"
                 if normalized_action == "snooze_30":
-                    intervention.user_action = normalized_action
-                    intervention.action_at = changed_at
-                    intervention.updated_at = changed_at
-                    intervention.status = "snoozed"
-                    intervention.snoozed_until = changed_at + timedelta(minutes=30)
                     follow_up_id, action_result = self._create_snooze_in_session(
                         session, intervention, changed_at
                     )
+                    if follow_up_id is not None and action_result == "scheduled":
+                        intervention.user_action = normalized_action
+                        intervention.action_at = changed_at
+                        intervention.updated_at = changed_at
+                        intervention.status = "snoozed"
+                        intervention.snoozed_until = changed_at + timedelta(minutes=30)
                 elif normalized_action == "mute_today":
                     intervention.user_action = normalized_action
                     intervention.action_at = changed_at

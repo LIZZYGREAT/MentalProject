@@ -10,7 +10,7 @@ from typing import Any
 from app.services.care_context import CareContext
 
 
-CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v2"
+CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v3"
 _DEADLINE = re.compile(
     r"ddl|deadline|截止|提交|交作业|报告|论文|答辩",
     flags=re.IGNORECASE,
@@ -110,7 +110,7 @@ class CareInterventionPolicy:
             "reason_code": (
                 "sustained_high_pressure"
                 if level >= 2 or context.care_action == "protected_break"
-                else "micro_break_support_preference"
+                else "protected_break_option"
             ),
             "action_minutes": 15,
             "score": (
@@ -118,6 +118,13 @@ class CareInterventionPolicy:
                 if level >= 2 or context.care_action == "protected_break"
                 else 0.33
             ),
+        })
+        candidates.append({
+            "intervention_type": "micro_break",
+            "template_id": "micro-break-v1",
+            "reason_code": "short_transition_recovery",
+            "action_minutes": 3,
+            "score": 0.34,
         })
         if context.allow_schedule_suggestions and (dense or deadline):
             candidates.append({
@@ -129,7 +136,7 @@ class CareInterventionPolicy:
             })
 
         preference_boosts = {
-            "micro_break": "protected_break",
+            "micro_break": "micro_break",
             "task_decomposition": "workload_decomposition",
             "transition_buffer": "transition_buffer",
         }

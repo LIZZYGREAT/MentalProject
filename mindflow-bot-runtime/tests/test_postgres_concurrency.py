@@ -17,7 +17,11 @@ from sqlalchemy.engine import make_url
 
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.db import Base, Database, build_engine
-from app.models import CareInterventionFeedback, WarningSchedule
+from app.models import (
+    CareInterventionEvent,
+    CareInterventionFeedback,
+    WarningSchedule,
+)
 from app.repositories import (
     CalendarSnapshotRepository,
     ForecastInputChangedError,
@@ -185,6 +189,102 @@ def test_postgres_preference_and_claim_race_cannot_leave_claimed_warning(
         row = session.get(WarningSchedule, warning_id)
         assert row.status == "cancelled"
         assert row.claim_token is None
+
+
+def test_postgres_mute_today_and_finish_claim_share_lock_order(postgres_database):
+    participant = ParticipantRepository(postgres_database).create("PG-MUTE-FINISH")
+    warnings, preferences, warning_id, now = _warning(
+        postgres_database, participant.id
+    )
+    claimed = warnings.claim_if_current(warning_id, now=now)
+    assert claimed is not None
+    barrier = threading.Barrier(2)
+
+    def finish():
+        barrier.wait()
+        return warnings.finish_claim(
+            warning_id,
+            claim_token=claimed["claim_token"],
+            expected_forecast_version=claimed["forecast_version"],
+            sent=True,
+            now=now + timedelta(seconds=1),
+        )
+
+    def mute():
+        barrier.wait()
+        return preferences.mute_today(
+            participant.id,
+            now.astimezone(ZoneInfo("Asia/Shanghai")).date(),
+            now=now + timedelta(seconds=1),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        finish_future = executor.submit(finish)
+        mute_future = executor.submit(mute)
+        finish_future.result(timeout=10)
+        mute_future.result(timeout=10)
+
+    with postgres_database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        intervention = session.execute(
+            session.query(CareInterventionEvent).filter(
+                CareInterventionEvent.source_warning_id == warning_id
+            ).statement
+        ).scalar_one()
+        assert warning.status in {"sent", "cancelled"}
+        assert intervention.delivery_status == warning.status
+
+
+def test_postgres_disable_follow_up_and_snooze_are_serialized(postgres_database):
+    participant = ParticipantRepository(postgres_database).create("PG-FOLLOWUP-RACE")
+    warnings, preferences, warning_id, now = _warning(
+        postgres_database, participant.id
+    )
+    claimed = warnings.claim_if_current(warning_id, now=now)
+    assert claimed is not None
+    assert warnings.finish_claim(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"],
+        sent=True,
+        now=now + timedelta(seconds=1),
+    )
+    interventions = CareInterventionRepository(postgres_database, preferences)
+    barrier = threading.Barrier(2)
+
+    def snooze():
+        barrier.wait()
+        return interventions.apply_action(
+            participant.id,
+            warning_id,
+            action="snooze_30",
+            callback_event_id="pg-followup-race",
+            now=now + timedelta(seconds=2),
+        )
+
+    def disable():
+        barrier.wait()
+        return preferences.update(
+            participant.id,
+            {"allow_follow_up": False},
+            now=now + timedelta(seconds=2),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        snooze_future = executor.submit(snooze)
+        disable_future = executor.submit(disable)
+        result = snooze_future.result(timeout=10)
+        disable_future.result(timeout=10)
+
+    with postgres_database.session() as session:
+        children = session.query(WarningSchedule).filter(
+            WarningSchedule.snoozed_from_intervention_id == warning_id
+        ).all()
+        assert len(children) <= 1
+        if children:
+            assert children[0].status == "cancelled"
+        else:
+            assert result["action_result"] == "follow_up_disabled"
 
 
 def test_postgres_observation_save_race_never_leaves_stale_forecast_valid(

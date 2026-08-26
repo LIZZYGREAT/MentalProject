@@ -14,7 +14,7 @@ from services.course_catalog import (
 from settings.event_routing import COURSE_HINT_PATTERN, ROUTINE_PATTERNS, TASK_PATTERNS
 
 
-EVENT_CLASSIFICATION_VERSION = "event_classification.v2"
+EVENT_CLASSIFICATION_VERSION = "event_classification.v3"
 CLASSIFIABLE_EVENT_TYPES = {
     "course",
     "task",
@@ -104,6 +104,14 @@ def classify_event(
             "schema_version": EVENT_CLASSIFICATION_VERSION,
             "source": source,
             "lock": lock,
+            "event_type_locked": lock in {
+                "explicit",
+                "routine",
+                "catalog_exact",
+                "catalog_strong_evidence",
+                "course_related_task",
+            },
+            "course_identity_locked": lock == "catalog_exact",
             "explicit_event_type": explicit_type or None,
             "explicit_task_type": explicit_task or None,
             "preliminary_event_type": event_type,
@@ -113,13 +121,6 @@ def classify_event(
         },
     }
     selected = resolution.exact_match
-    if (
-        selected is None
-        and event_type == "course"
-        and resolution.alias_match_kind == "controlled_variant"
-        and resolution.candidates
-    ):
-        selected = resolution.candidates[0]
     if selected is not None:
         _apply_course_identity(
             result,
@@ -158,16 +159,23 @@ def finalize_event_classification(
     metadata = dict(result.get("metadata") or {})
     classification = dict(metadata.get("classification") or {})
     lock = str(classification.get("lock") or "")
+    event_type_locked = bool(
+        classification.get("event_type_locked")
+        or lock in {
+            "explicit",
+            "routine",
+            "catalog_exact",
+            "catalog_strong_evidence",
+            "course_related_task",
+        }
+    )
+    course_identity_locked = bool(
+        classification.get("course_identity_locked") or lock == "catalog_exact"
+    )
     event_type = str(result.get("event_type") or "task").casefold()
     task_type = str(result.get("task_type") or "general").casefold()
 
-    if external_classification and lock not in {
-        "explicit",
-        "routine",
-        "catalog_exact",
-        "catalog_strong_evidence",
-        "course_related_task",
-    }:
+    if external_classification and not event_type_locked:
         proposed_type = str(external_classification.get("event_type") or "").casefold()
         proposed_task = str(external_classification.get("task_type") or "general").casefold()
         if proposed_type in CLASSIFIABLE_EVENT_TYPES:
@@ -187,7 +195,7 @@ def finalize_event_classification(
     if (
         external_course_match
         and external_course_match.get("matched")
-        and lock not in {"catalog_exact", "catalog_strong_evidence"}
+        and not course_identity_locked
     ):
         candidate = CourseCandidate(
             canonical_name=str(external_course_match["canonical_name"]),
@@ -216,6 +224,8 @@ def finalize_event_classification(
     metadata = dict(result.get("metadata") or metadata)
     classification["final_event_type"] = event_type
     classification["final_task_type"] = task_type
+    classification["event_type_locked"] = event_type_locked
+    classification["course_identity_locked"] = course_identity_locked
     metadata["classification"] = classification
     metadata["task_type"] = task_type
     result["metadata"] = metadata

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import logging
 import uuid
 from zoneinfo import ZoneInfo
@@ -100,6 +100,20 @@ class ObservationForecastRefreshService:
                         participant_id,
                         local_date,
                         "observation_committed",
+                        refresh_calendar=False,
+                        force_followup=True,
+                    )
+                    dependent_date = local_date + timedelta(days=1)
+                    await asyncio.to_thread(
+                        self.coordinator.mark_dependency_dirty,
+                        participant_id,
+                        dependent_date,
+                        reason="previous_day_observation_terminal_changed",
+                    )
+                    await self.coordinator.ensure_forecast(
+                        participant_id,
+                        dependent_date,
+                        "previous_day_observation_terminal_changed",
                         refresh_calendar=False,
                         force_followup=True,
                     )

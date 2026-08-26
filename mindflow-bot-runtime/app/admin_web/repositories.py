@@ -364,6 +364,7 @@ class AdminRepository:
                 {
                     "local_date": row.local_date.isoformat(),
                     "calendar_revision": row.calendar_revision,
+                    "snapshot_state": row.snapshot_state,
                     "degraded": row.degraded,
                     "last_refresh_success_at": _iso(row.last_refresh_success_at),
                     "last_refresh_error_class": row.last_refresh_error_class,

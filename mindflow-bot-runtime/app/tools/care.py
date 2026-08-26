@@ -389,6 +389,10 @@ class CareTools:
                     **_recurrence_schema_properties(),
                 },
                 "required": ["event_id"],
+                "dependentRequired": {
+                    "start_time": ["end_time"],
+                    "end_time": ["start_time"],
+                },
                 "additionalProperties": False,
             },
             self.update_calendar_event,
@@ -730,13 +734,14 @@ class CareTools:
                 "forecast_refreshed_dates": [],
                 "forecast_refresh_errors": [],
             }
+        direct_dates = set(normalized)
         dependency = {}
         if today in normalized:
             tomorrow = today + timedelta(days=1)
-            if tomorrow not in normalized:
+            if tomorrow not in direct_dates:
                 normalized.append(tomorrow)
                 normalized.sort()
-            dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
+                dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
 
         forecast_repository = (
             getattr(self, "forecast_snapshots", None)
@@ -749,13 +754,21 @@ class CareTools:
             # Today terminal while today's refresh is still in flight.
             for target in normalized:
                 try:
-                    await asyncio.to_thread(
-                        forecast_repository.invalidate_for_calendar_mutation,
-                        self.forecast_coordinator.warnings,
-                        participant_id,
-                        target,
-                        reason=reason,
-                    )
+                    if target in direct_dates:
+                        await asyncio.to_thread(
+                            forecast_repository.invalidate_for_calendar_mutation,
+                            self.forecast_coordinator.warnings,
+                            participant_id,
+                            target,
+                            reason=reason,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self.forecast_coordinator.mark_dependency_dirty,
+                            participant_id,
+                            target,
+                            reason="previous_day_terminal_changed",
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -769,7 +782,7 @@ class CareTools:
                     participant_id,
                     target,
                     reason,
-                    refresh_calendar=True,
+                    refresh_calendar=target in direct_dates,
                     force_followup=True,
                 )
             except asyncio.CancelledError:
@@ -900,6 +913,8 @@ class CareTools:
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
+        if ("start_time" in args) != ("end_time" in args):
+            raise ValueError("start_time and end_time must be provided together")
         start_time = (
             _parse_datetime(args["start_time"], self.timezone)
             if args.get("start_time") is not None

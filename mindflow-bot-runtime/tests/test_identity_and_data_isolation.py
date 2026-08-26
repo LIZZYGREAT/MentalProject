@@ -10,7 +10,6 @@ from app.repositories import (
     BindingRepository,
     ConversationRepository,
     ObservationRepository,
-    PredictionRepository,
     ProfileRepository,
 )
 from helpers import memory_database, participant
@@ -50,39 +49,23 @@ def test_one_time_binding_and_identity_isolation():
     assert bound2.id == p2.id
 
 
-def test_profile_observation_prediction_and_conversation_are_scoped():
+def test_profile_observation_and_conversation_are_scoped():
     database = memory_database()
     p1 = participant(database, "P001")
     p2 = participant(database, "P002")
     profiles = ProfileRepository(database)
     observations = ObservationRepository(database)
-    predictions = PredictionRepository(database)
     conversations = ConversationRepository(database)
 
     profiles.save(p1.id, {"memory": "apple"})
     profiles.save(p2.id, {"memory": "banana"})
     observations.add(p1.id, "checkin", {"stress_0_10": 2})
     observations.add(p2.id, "checkin", {"stress_0_10": 8})
-    predictions.save(
-        p1.id,
-        profile_version=1,
-        model_version="test",
-        input_snapshot={},
-        output={"marker": "apple"},
-    )
-    predictions.save(
-        p2.id,
-        profile_version=1,
-        model_version="test",
-        input_snapshot={},
-        output={"marker": "banana"},
-    )
     conversations.add(p1.id, "user", "remember apple")
     conversations.add(p2.id, "user", "remember banana")
 
     assert profiles.current(p1.id)["profile"]["memory"] == "apple"
     assert observations.recent(p1.id)[0]["payload"]["stress_0_10"] == 2
-    assert predictions.latest(p1.id)["output"]["marker"] == "apple"
     assert conversations.recent(p1.id, 10)[0]["content"] == "remember apple"
     assert "banana" not in str(conversations.recent(p1.id, 10))
 

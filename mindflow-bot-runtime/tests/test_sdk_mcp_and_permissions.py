@@ -243,6 +243,13 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "type": "boolean",
         "const": True,
     }
+    update_spec = next(
+        spec for spec in registry.specs if spec.name == "calendar_update_event"
+    )
+    assert update_spec.parameters["dependentRequired"] == {
+        "start_time": ["end_time"],
+        "end_time": ["start_time"],
+    }
 
 
 def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):

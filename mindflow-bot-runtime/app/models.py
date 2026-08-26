@@ -310,6 +310,9 @@ class CalendarSnapshot(Base):
     local_date: Mapped[date] = mapped_column(Date, nullable=False)
     calendar_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     events_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    snapshot_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="current"
+    )
     degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_refresh_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_refresh_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

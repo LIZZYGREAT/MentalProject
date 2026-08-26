@@ -143,7 +143,7 @@ def test_catalog_revision_changes_semantic_fingerprint():
     assert preprocessor._fingerprint(first) != preprocessor._fingerprint(changed)
 
 
-def test_api_course_outside_candidates_cannot_replace_strong_local_identity():
+def test_api_course_outside_candidates_cannot_create_ambiguous_identity():
     client = SemanticClient(_semantic_response(forged=True))
     _database, participant, preprocessor = _preprocessor(client)
     event = prepare_event_instances([_raw_event()], TARGET_DATE)[0]
@@ -152,8 +152,8 @@ def test_api_course_outside_candidates_cannot_replace_strong_local_identity():
     prepared = preprocessor.prepare(participant.id, [event], consent=True)[0][0]
 
     assert prepared["event_type"] == "course"
-    assert prepared["course_name"] == "高等数学（A类）II"
-    assert prepared["course_code"] == "AMTD0034"
+    assert not prepared.get("course_name")
+    assert not prepared.get("course_code")
     course_match = prepared["metadata"]["semantic"]["external"]["course_match"]
     assert course_match["matched"] is False
     assert course_match["rejected"] == "candidate_out_of_bounds"

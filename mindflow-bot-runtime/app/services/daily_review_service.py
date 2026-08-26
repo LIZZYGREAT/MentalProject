@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any
@@ -11,7 +11,11 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
-from app.repositories import ForecastSnapshotRepository, ObservationRepository
+from app.repositories import (
+    ForecastSnapshotRepository,
+    ObservationRepository,
+    WarningScheduleRepository,
+)
 from app.repositories_daily_review import (
     DailyReviewResponseRepository,
     DailyReviewScheduleRepository,
@@ -77,6 +81,7 @@ class DailyReviewService:
         self.forecasts = forecasts
         self.observations = observations
         self.settings = settings
+        self.warning_repository: WarningScheduleRepository | None = None
         self.timezone = ZoneInfo(settings.daily_review_timezone)
         self.smoother = FixedLagObservationSmoother(
             settings.observation_smoothing_window_minutes
@@ -322,7 +327,7 @@ class DailyReviewService:
         })
         diagnostics["observation_smoothing"] = smoothing_diagnostics
         diagnostics["original_forecast_immutable"] = True
-        return self.retrospectives.save(
+        saved = self.retrospectives.save(
             participant_id, local_date,
             source_forecast_id=uuid.UUID(forecast["id"]),
             source_forecast_version=forecast["forecast_version"],
@@ -335,6 +340,14 @@ class DailyReviewService:
             analysis_json=analysis,
             diagnostics_json=diagnostics,
         )
+        if self.warning_repository is not None:
+            self.forecasts.invalidate_current_for_date(
+                self.warning_repository,
+                participant_id,
+                local_date + timedelta(days=1),
+                reason="previous_day_retrospective_terminal_changed",
+            )
+        return saved
 
     def _end_anchor(
         self,

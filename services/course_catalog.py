@@ -14,11 +14,13 @@ from entry.class_info_data import CLASS_INFO_DICT
 from entry.course_aliases import COURSE_ALIASES
 
 
-COURSE_RESOLVER_VERSION = "course_catalog_resolver.v2"
+COURSE_RESOLVER_VERSION = "course_catalog_resolver.v3"
 _PUNCTUATION = re.compile(r"[\s·•,，。.!！?？:：;；_—–－()（）\[\]【】{}《》<>]+")
 _COURSE_SUFFIX = re.compile(r"(?:课程|上课|课堂|课)$", flags=re.IGNORECASE)
 _CONTROLLED_ALIAS_SUFFIXES = {
     "a", "a类", "b", "b类",
+}
+_AMBIGUOUS_ALIAS_SUFFIXES = {
     "i", "ii", "iii", "1", "2", "3", "一", "二", "三", "2-2",
 }
 
@@ -82,7 +84,7 @@ class CourseResolution:
     @property
     def strong_course_evidence(self) -> bool:
         return self.exact_match is not None or self.alias_match_kind in {
-            "exact", "controlled_variant"
+            "exact", "controlled_variant", "ambiguous_variant"
         }
 
     def context(self) -> dict[str, Any]:
@@ -155,6 +157,8 @@ class CourseCatalogResolver:
                 alias_match_kind = "exact"
             elif position == 0 and alias_suffix in _CONTROLLED_ALIAS_SUFFIXES:
                 alias_match_kind = "controlled_variant"
+            elif position == 0 and alias_suffix in _AMBIGUOUS_ALIAS_SUFFIXES:
+                alias_match_kind = "ambiguous_variant"
             else:
                 alias_match_kind = "retrieval_only"
             break

@@ -52,6 +52,10 @@ from services.semantic_model_inputs import semantic_model_inputs
 logger = logging.getLogger(__name__)
 
 
+class CalendarRefreshPendingError(RuntimeError):
+    """A calendar write succeeded but its authoritative read-back did not."""
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -148,6 +152,22 @@ class ForecastCoordinator:
         self.care_preferences = care_preferences
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
+
+    def mark_dependency_dirty(
+        self,
+        participant_id: uuid.UUID,
+        affected_date: date,
+        *,
+        reason: str,
+    ) -> dict[str, int]:
+        """Invalidate a dependent Forecast without mutating its Calendar input."""
+
+        return self.forecasts.invalidate_current_for_date(
+            self.warnings,
+            participant_id,
+            affected_date,
+            reason=reason,
+        )
 
     def _warning_revision(self) -> tuple[str, dict[str, object]]:
         payload = {
@@ -434,6 +454,13 @@ class ForecastCoordinator:
     ) -> tuple[dict[str, Any], bool]:
         current = await asyncio.to_thread(self.calendar_snapshots.get, participant_id, target)
         if not refresh and current is not None:
+            if (
+                current.get("snapshot_state")
+                == CalendarSnapshotRepository.MUTATION_REFRESH_PENDING
+            ):
+                raise CalendarRefreshPendingError(
+                    f"calendar refresh pending for {target.isoformat()}"
+                )
             return current, False
         day_start = datetime.combine(target, time.min, self.timezone)
         try:
@@ -442,19 +469,36 @@ class ForecastCoordinator:
             return await asyncio.to_thread(
                 self.calendar_snapshots.upsert, participant_id, target,
                 revision=revision, events=normalized, degraded=False,
+                snapshot_state=CalendarSnapshotRepository.CURRENT,
             )
         except Exception as exc:
+            if (
+                current is not None
+                and current.get("snapshot_state")
+                == CalendarSnapshotRepository.MUTATION_REFRESH_PENDING
+            ):
+                await asyncio.to_thread(
+                    self.calendar_snapshots.record_refresh_failure,
+                    participant_id,
+                    target,
+                    error_class=type(exc).__name__,
+                )
+                raise CalendarRefreshPendingError(
+                    f"calendar refresh pending for {target.isoformat()}"
+                ) from exc
             if current is not None:
                 return await asyncio.to_thread(
                     self.calendar_snapshots.upsert, participant_id, target,
                     revision=current["calendar_revision"], events=current["events"],
                     degraded=True, refresh_error_class=type(exc).__name__,
+                    snapshot_state=CalendarSnapshotRepository.PROVIDER_DEGRADED,
                 )
             revision, normalized = normalized_calendar_revision([])
             return await asyncio.to_thread(
                 self.calendar_snapshots.upsert, participant_id, target,
                 revision=revision, events=normalized, degraded=True,
                 refresh_error_class=type(exc).__name__,
+                snapshot_state=CalendarSnapshotRepository.PROVIDER_DEGRADED,
             )
 
     async def _ensure_once(
@@ -677,6 +721,21 @@ class ForecastCoordinator:
                     refresh_calendar=False, enqueue_enrichment=False,
                     force_followup=True,
                 )
+                if target == datetime.now(self.timezone).date():
+                    dependent_date = target + timedelta(days=1)
+                    await asyncio.to_thread(
+                        self.mark_dependency_dirty,
+                        participant_id,
+                        dependent_date,
+                        reason="previous_day_semantic_terminal_changed",
+                    )
+                    await self.ensure_forecast(
+                        participant_id,
+                        dependent_date,
+                        "previous_day_semantic_terminal_changed",
+                        refresh_calendar=False,
+                        force_followup=True,
+                    )
             await self.semantics.enqueue(
                 participant_id, misses, recompute,
                 completion_key=(participant_id, target),

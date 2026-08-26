@@ -286,7 +286,7 @@ def test_versioned_empty_controlled_preferences_do_not_fall_back_to_profile():
 @pytest.mark.parametrize(
     ("preference", "expected"),
     [
-        ("micro_break", "protected_break"),
+        ("micro_break", "micro_break"),
         ("task_decomposition", "workload_decomposition"),
         ("transition_buffer", "transition_buffer"),
     ],
@@ -314,6 +314,8 @@ def test_soft_support_preferences_apply_bounded_candidate_boost(
 
     assert contextual["care_plan"]["intervention_type"] == expected
     assert contextual["care_plan"]["preference_matched"] == preference
+    if preference == "micro_break":
+        assert contextual["care_plan"]["action_minutes"] <= 5
     assert contextual["care_plan"]["ranking_score"] <= 1.0
 
 

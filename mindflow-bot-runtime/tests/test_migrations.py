@@ -95,3 +95,33 @@ def test_0015_backfills_causal_source_without_guessing_orphan_responses(
     assert "DISTINCT ON (daily_review_response_id)" in statement
     assert "generated_at ASC, id ASC" in statement
     assert "response.causal_source_forecast_id IS NULL" in statement
+
+
+def test_0017_adds_calendar_state_and_safe_snooze_backfill(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0017_care_delivery_authorization.py"
+    )
+    columns = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(migration.op, "create_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(
+        migration.op, "create_unique_constraint", lambda *a, **k: None
+    )
+    monkeypatch.setattr(migration.op, "alter_column", lambda *a, **k: None)
+
+    migration.upgrade()
+
+    assert columns[0][0] == "calendar_snapshots"
+    assert columns[0][1].name == "snapshot_state"
+    assert columns[0][1].nullable is False
+    backfill = statements[0]
+    assert "snoozed_from_intervention_id = candidate.intervention_id" in backfill
+    assert "intervention.id::text" in backfill
+    assert "candidate.candidate_rank = 1" in backfill
+    assert "::uuid" not in backfill

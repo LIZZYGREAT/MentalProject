@@ -1761,8 +1761,8 @@ def test_legacy_forecast_without_warning_revision_is_recomputed():
         "care_context_schema_version": "care_context.v2",
         "care_recent_observation_max_age_minutes": 360,
         "care_message_schema_version": "care_message.v2",
-        "care_intervention_policy_version": "care_intervention_policy.v2",
-        "care_template_library_version": "care_template_library.v2",
+        "care_intervention_policy_version": "care_intervention_policy.v3",
+        "care_template_library_version": "care_template_library.v3",
     }
     assert prediction.calls == 2
 

@@ -6,7 +6,11 @@ import sys
 import threading
 import uuid
 
+import pytest
+from sqlalchemy import select
+
 from app import main as app_main
+from app.models import WarningSchedule
 from app.repositories import (
     CalendarSnapshotRepository,
     EventSemanticCacheRepository,
@@ -14,10 +18,13 @@ from app.repositories import (
     ObservationRepository,
     ParticipantRepository,
     ProfileRepository,
-    PredictionRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
-from app.services.forecast_coordinator import ForecastCoordinator, normalized_calendar_revision
+from app.services.forecast_coordinator import (
+    CalendarRefreshPendingError,
+    ForecastCoordinator,
+    normalized_calendar_revision,
+)
 from app.services.prediction_service import PredictionService
 from helpers import memory_database, warning_repository
 from mindflow_core.assessment import AssessmentModel
@@ -30,9 +37,12 @@ class MutableCalendar:
     def __init__(self, events):
         self.events = events
         self.calls = 0
+        self.error = None
 
     async def get_events(self, _participant_id, _start, _end):
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         return [dict(item) for item in self.events]
 
 
@@ -148,6 +158,71 @@ def test_calendar_revision_is_canonical_and_detects_time_or_text_change():
     assert normalized_calendar_revision([first])[0] == normalized_calendar_revision([same_reordered])[0]
     assert normalized_calendar_revision([first])[0] != normalized_calendar_revision([event(start="11:00", end="12:00")])[0]
     assert normalized_calendar_revision([first])[0] != normalized_calendar_revision([event(description="修改描述")])[0]
+
+
+def test_calendar_mutation_timeout_fails_closed_until_readback_succeeds():
+    database, participant, calendar, _semantics, _prediction, warnings, coordinator = (
+        build_pipeline([event()])
+    )
+    forecasts = ForecastSnapshotRepository(database)
+    calendars = CalendarSnapshotRepository(database)
+    first = asyncio.run(
+        coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "initial")
+    )
+    assert first["valid"] is True
+
+    forecasts.invalidate_for_calendar_mutation(
+        warnings,
+        participant.id,
+        TEST_LOCAL_DATE,
+        reason="calendar_update_event",
+    )
+    calendar.error = TimeoutError("provider timeout")
+    with pytest.raises(CalendarRefreshPendingError):
+        asyncio.run(
+            coordinator.ensure_forecast(
+                participant.id, TEST_LOCAL_DATE, "calendar_update_event"
+            )
+        )
+
+    assert forecasts.latest(participant.id, TEST_LOCAL_DATE) is None
+    pending = calendars.get(participant.id, TEST_LOCAL_DATE)
+    assert pending["snapshot_state"] == "mutation_refresh_pending"
+    assert len(pending["events"]) == 1
+    with database.session() as session:
+        statuses = session.execute(select(WarningSchedule.status)).scalars().all()
+    assert statuses and set(statuses) == {"cancelled"}
+
+    calendar.error = None
+    calendar.events = [event(summary="更新后的日程", event_id="event-2")]
+    recovered = asyncio.run(
+        coordinator.ensure_forecast(
+            participant.id, TEST_LOCAL_DATE, "calendar_refresh_retry"
+        )
+    )
+    assert recovered["valid"] is True
+    assert calendars.get(participant.id, TEST_LOCAL_DATE)["snapshot_state"] == "current"
+    assert recovered["calendar_events"][0]["summary"] == "更新后的日程"
+
+
+def test_ordinary_provider_timeout_keeps_stable_snapshot_degraded_fallback():
+    database, participant, calendar, _semantics, _prediction, _warnings, coordinator = (
+        build_pipeline([event()])
+    )
+    asyncio.run(coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "initial"))
+    calendar.error = TimeoutError("provider timeout")
+
+    degraded = asyncio.run(
+        coordinator.ensure_forecast(participant.id, TEST_LOCAL_DATE, "scheduled_retry")
+    )
+
+    assert degraded["valid"] is True
+    assert degraded["calendar_degraded"] is True
+    snapshot = CalendarSnapshotRepository(database).get(
+        participant.id, TEST_LOCAL_DATE
+    )
+    assert snapshot["snapshot_state"] == "provider_degraded"
+    assert len(snapshot["events"]) == 1
 
 
 def test_semantic_fingerprint_reuses_time_only_update_but_changes_duration_or_text():
