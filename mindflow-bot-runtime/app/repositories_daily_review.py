@@ -24,6 +24,46 @@ def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+_SQLITE_UNIQUE_SIGNATURES = {
+    "uq_daily_review_schedule_version": (
+        "daily_review_schedules.participant_id",
+        "daily_review_schedules.local_date",
+        "daily_review_schedules.card_version",
+    ),
+    "uq_daily_review_callback": (
+        "daily_review_responses.participant_id",
+        "daily_review_responses.callback_event_id",
+    ),
+    "uq_daily_review_revision": (
+        "daily_review_responses.participant_id",
+        "daily_review_responses.local_date",
+        "daily_review_responses.revision",
+    ),
+    "uq_retrospective_reconstruction_version": (
+        "retrospective_curve_snapshots.participant_id",
+        "retrospective_curve_snapshots.local_date",
+        "retrospective_curve_snapshots.reconstruction_version",
+    ),
+}
+
+
+def _is_constraint(exc: IntegrityError, expected: str) -> bool:
+    original = getattr(exc, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name is not None:
+        return str(constraint_name) == expected
+    message = str(original or exc).casefold()
+    if expected.casefold() in message:
+        return True
+    signature = _SQLITE_UNIQUE_SIGNATURES.get(expected, ())
+    return bool(signature) and all(column.casefold() in message for column in signature)
+
+
+class DailyReviewRevisionConflict(RuntimeError):
+    """Concurrent revision allocation did not converge within the retry bound."""
+
+
 class DailyReviewScheduleRepository:
     CARD_VERSION = "daily-review-v1"
 
@@ -145,14 +185,32 @@ class DailyReviewScheduleRepository:
                     row.last_error_code = None
                     row.last_error_class = None
                     row.updated_at = datetime.now(timezone.utc)
+                if (
+                    row.authorized_at is None
+                    and row.sent_at is None
+                    and row.status in {"pending", "cancelled", "delivery_unavailable"}
+                ):
+                    row.scheduled_at = scheduled
+                    row.valid_until = validity_end
+                    if row.status == "pending":
+                        row.next_attempt_at = max(
+                            scheduled,
+                            _aware(row.next_attempt_at)
+                            if row.next_attempt_at is not None
+                            else scheduled,
+                        )
                 return self._view(row)
-        except IntegrityError:
+        except IntegrityError as exc:
+            if not _is_constraint(exc, "uq_daily_review_schedule_version"):
+                raise
             with self.database.session() as session:
                 row = session.execute(select(DailyReviewSchedule).where(
                     DailyReviewSchedule.participant_id == participant_id,
                     DailyReviewSchedule.local_date == local_date,
                     DailyReviewSchedule.card_version == card_version,
-                )).scalar_one()
+                )).scalar_one_or_none()
+                if row is None:
+                    raise
                 return self._view(row)
 
     @staticmethod
@@ -407,12 +465,14 @@ class DailyReviewScheduleRepository:
             if row is None:
                 return False
             terminal = row.attempt_count >= max_attempts
-            row.status = "failed" if terminal else "pending"
-            row.last_error_code = "delivery_failed"
-            row.last_error_class = type(error).__name__[:128]
-            row.next_attempt_at = None if terminal else now + timedelta(
+            retry_at = now + timedelta(
                 seconds=retry_base_seconds * 2 ** max(0, row.attempt_count - 1)
             )
+            expired = not terminal and retry_at >= _aware(row.valid_until)
+            row.status = "failed" if terminal else "expired" if expired else "pending"
+            row.last_error_code = "delivery_failed"
+            row.last_error_class = type(error).__name__[:128]
+            row.next_attempt_at = None if terminal or expired else retry_at
             row.claim_token = None
             row.lease_until = None
             row.authorized_at = None
@@ -433,6 +493,11 @@ class DailyReviewScheduleRepository:
                 DailyReviewSchedule.status == "claimed",
             ).with_for_update()).scalar_one_or_none()
             if row is None:
+                return False
+            if status == "sent" and (
+                row.authorized_at is None
+                or now < _aware(row.authorized_at)
+            ):
                 return False
             row.status = status
             row.sent_at = now if status == "sent" else None
@@ -473,10 +538,13 @@ class DailyReviewScheduleRepository:
             "provider_message_id": row.provider_message_id,
             "last_error_code": row.last_error_code,
             "last_error_class": row.last_error_class,
+            "updated_at": row.updated_at.isoformat(),
         }
 
 
 class DailyReviewResponseRepository:
+    MAX_REVISION_RETRIES = 5
+
     def __init__(self, database: Database):
         self.database = database
 
@@ -499,54 +567,49 @@ class DailyReviewResponseRepository:
         values: dict[str, Any], raw: dict[str, Any],
     ) -> tuple[dict[str, Any], bool]:
         callback = str(callback_event_id)[:128]
-        try:
-            with self.database.session() as session:
-                existing = session.execute(select(DailyReviewResponse).where(
-                    DailyReviewResponse.participant_id == participant_id,
-                    DailyReviewResponse.callback_event_id == callback,
-                )).scalar_one_or_none()
-                if existing:
-                    return self._view(existing), False
-                revision = (session.scalar(select(func.max(DailyReviewResponse.revision)).where(
-                    DailyReviewResponse.participant_id == participant_id,
-                    DailyReviewResponse.local_date == local_date,
-                )) or 0) + 1
-                row = DailyReviewResponse(
-                    participant_id=participant_id, local_date=local_date,
-                    revision=revision, card_version=card_version,
-                    schedule_id=schedule_id, callback_event_id=callback,
-                    causal_source_forecast_id=uuid.UUID(
-                        str(causal_source_forecast_id)
-                    ),
-                    causal_source_forecast_version=str(
-                        causal_source_forecast_version
-                    ),
-                    submitted_at=_aware(submitted_at), raw_json=dict(raw), **values,
-                )
-                session.add(row)
-                session.flush()
-                return self._view(row), True
-        except IntegrityError:
-            with self.database.session() as session:
-                row = session.execute(select(DailyReviewResponse).where(
-                    DailyReviewResponse.participant_id == participant_id,
-                    DailyReviewResponse.callback_event_id == callback,
-                )).scalar_one_or_none()
-                if row:
-                    return self._view(row), False
-            # A distinct callback may have won the same next revision. Retry
-            # after rollback so it receives the following append-only number.
-            return self.add(
-                participant_id, local_date,
-                callback_event_id=callback_event_id,
-                submitted_at=submitted_at,
-                card_version=card_version,
-                schedule_id=schedule_id,
-                causal_source_forecast_id=causal_source_forecast_id,
-                causal_source_forecast_version=causal_source_forecast_version,
-                values=values,
-                raw=raw,
-            )
+        last_conflict: IntegrityError | None = None
+        for _attempt in range(self.MAX_REVISION_RETRIES):
+            try:
+                with self.database.session() as session:
+                    existing = session.execute(select(DailyReviewResponse).where(
+                        DailyReviewResponse.participant_id == participant_id,
+                        DailyReviewResponse.callback_event_id == callback,
+                    )).scalar_one_or_none()
+                    if existing:
+                        return self._view(existing), False
+                    revision = (session.scalar(select(func.max(DailyReviewResponse.revision)).where(
+                        DailyReviewResponse.participant_id == participant_id,
+                        DailyReviewResponse.local_date == local_date,
+                    )) or 0) + 1
+                    row = DailyReviewResponse(
+                        participant_id=participant_id, local_date=local_date,
+                        revision=revision, card_version=card_version,
+                        schedule_id=schedule_id, callback_event_id=callback,
+                        causal_source_forecast_id=uuid.UUID(
+                            str(causal_source_forecast_id)
+                        ),
+                        causal_source_forecast_version=str(
+                            causal_source_forecast_version
+                        ),
+                        submitted_at=_aware(submitted_at), raw_json=dict(raw), **values,
+                    )
+                    session.add(row)
+                    session.flush()
+                    return self._view(row), True
+            except IntegrityError as exc:
+                with self.database.session() as session:
+                    row = session.execute(select(DailyReviewResponse).where(
+                        DailyReviewResponse.participant_id == participant_id,
+                        DailyReviewResponse.callback_event_id == callback,
+                    )).scalar_one_or_none()
+                    if row:
+                        return self._view(row), False
+                if not _is_constraint(exc, "uq_daily_review_revision"):
+                    raise
+                last_conflict = exc
+        raise DailyReviewRevisionConflict(
+            "daily review revision allocation exhausted bounded retries"
+        ) from last_conflict
 
     def latest(self, participant_id: uuid.UUID, local_date: date) -> dict[str, Any] | None:
         with self.database.session() as session:
@@ -611,13 +674,19 @@ class RetrospectiveCurveRepository:
                 session.add(row)
                 session.flush()
                 return self._view(row)
-        except IntegrityError:
+        except IntegrityError as exc:
+            if not _is_constraint(
+                exc, "uq_retrospective_reconstruction_version"
+            ):
+                raise
             with self.database.session() as session:
                 row = session.execute(select(RetrospectiveCurveSnapshot).where(
                     RetrospectiveCurveSnapshot.participant_id == participant_id,
                     RetrospectiveCurveSnapshot.local_date == local_date,
                     RetrospectiveCurveSnapshot.reconstruction_version == values["reconstruction_version"],
-                )).scalar_one()
+                )).scalar_one_or_none()
+                if row is None:
+                    raise
                 return self._view(row)
 
     def latest(self, participant_id: uuid.UUID, local_date: date) -> dict[str, Any] | None:

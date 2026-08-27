@@ -7,6 +7,7 @@ import threading
 import uuid
 
 import pytest
+import requests
 from sqlalchemy import select
 
 from app import main as app_main
@@ -573,7 +574,7 @@ def test_circuit_recheck_after_semaphore_stops_queued_request_storm():
             with self.lock:
                 self.calls += 1
             self.first_batch.wait()
-            raise RuntimeError("429")
+            raise requests.HTTPError("429")
 
     events = [
         event(summary=f"任务 {index}", event_id=f"event-{index}")

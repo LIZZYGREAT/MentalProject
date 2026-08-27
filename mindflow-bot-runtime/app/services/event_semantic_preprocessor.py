@@ -12,6 +12,8 @@ import re
 import time
 from typing import Any, Awaitable, Callable, Hashable, Mapping
 
+import requests
+
 from app.repositories import EventSemanticCacheRepository
 from services.event_semantic_prompt import PROMPT_VERSION
 from services.event_semantics import (
@@ -20,6 +22,9 @@ from services.event_semantics import (
     RULE_VERSION,
     SEMANTIC_SCHEMA_VERSION,
     OpenAICompatibleSemanticClient,
+    SemanticContentRejected,
+    SemanticError,
+    SemanticProviderError,
     fuse_rule_and_external,
     infer_rule_semantics,
     validate_course_match,
@@ -105,6 +110,9 @@ def _normalized_semantic_event(event: Mapping[str, Any]) -> dict[str, Any]:
             "query": str(context.get("query") or "")[:300],
             "normalized_query": str(context.get("normalized_query") or "")[:300],
             "expanded_query": str(context.get("expanded_query") or "")[:300],
+            "identity_constraints": dict(
+                context.get("identity_constraints") or {}
+            ),
             "candidates": candidates,
         },
     }
@@ -185,14 +193,19 @@ class EventSemanticPreprocessor:
         participant_id: Any,
         fingerprint: str,
         event: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        cached = self.cache.get(
+    ) -> tuple[str, dict[str, Any] | None]:
+        entry = self.cache.get_entry(
             participant_id, fingerprint,
             schema_version=SEMANTIC_SCHEMA_VERSION,
             prompt_version=PROMPT_VERSION, model=self.model,
         )
-        if not cached:
-            return None
+        if not entry:
+            return "missing", None
+        if entry["status"] == "rejected":
+            return "rejected", None
+        if entry["status"] != "complete":
+            return "missing", None
+        cached = entry["assessment"]
         external = dict(cached.get("external") or {})
         try:
             values, confidence, tags, reasoning = validate_external_semantics({
@@ -206,9 +219,9 @@ class EventSemanticPreprocessor:
                     or []
                 ),
             )
-        except (TypeError, ValueError):
-            return None
-        return {
+        except (SemanticError, TypeError, ValueError):
+            return "missing", None
+        return "complete", {
             **external,
             "objective_semantics": values,
             "confidence": confidence,
@@ -233,9 +246,9 @@ class EventSemanticPreprocessor:
                 "rest", "meal", "nap", "sleep", "gym"
             }
             eligible_count += int(eligible)
-            external = self._validated_cached_external(
+            cache_status, external = self._validated_cached_external(
                 participant_id, fingerprint, normalized
-            ) if consent and eligible and self.client else None
+            ) if consent and eligible and self.client else ("missing", None)
             if external:
                 event = finalize_event_classification(
                     event,
@@ -273,7 +286,13 @@ class EventSemanticPreprocessor:
                 fused_appraisal = max(
                     1.0, min(10.0, appraisal + max(-1.2, min(1.2, weight * (external_appraisal - appraisal))))
                 )
-            if not external and consent and eligible and self.client:
+            if (
+                not external
+                and cache_status != "rejected"
+                and consent
+                and eligible
+                and self.client
+            ):
                 misses.append({
                     "fingerprint": fingerprint,
                     "event": normalized,
@@ -442,12 +461,14 @@ class EventSemanticPreprocessor:
             if time.monotonic() < self._circuit_until:
                 return False
             try:
-                cached = await asyncio.to_thread(
+                cache_status, cached = await asyncio.to_thread(
                     self._validated_cached_external,
                     participant_id, miss["fingerprint"], miss["event"],
                 )
                 if cached is not None:
                     return True
+                if cache_status == "rejected":
+                    return False
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
                 values, confidence, tags, reasoning = validate_external_semantics(raw)
                 event_classification = validate_event_classification(raw)
@@ -476,12 +497,34 @@ class EventSemanticPreprocessor:
                     }
                 }
                 await asyncio.to_thread(
-                    self.cache.put, participant_id, miss["fingerprint"], assessment,
+                    self.cache.put_complete,
+                    participant_id,
+                    miss["fingerprint"],
+                    assessment,
                     schema_version=SEMANTIC_SCHEMA_VERSION,
                     prompt_version=PROMPT_VERSION, model=self.model,
                 )
                 return True
-            except Exception as exc:
+            except SemanticContentRejected as exc:
+                await asyncio.to_thread(
+                    self.cache.put_rejected,
+                    participant_id,
+                    miss["fingerprint"],
+                    reason=exc.reason,
+                    confidence=exc.confidence,
+                    schema_version=SEMANTIC_SCHEMA_VERSION,
+                    prompt_version=PROMPT_VERSION,
+                    model=self.model,
+                )
+                logger.info(
+                    "semantic_enrichment_rejected fingerprint_prefix=%s "
+                    "reason=%s confidence=%s",
+                    str(miss.get("fingerprint") or "")[:12],
+                    exc.reason,
+                    exc.confidence,
+                )
+                return False
+            except (SemanticProviderError, requests.RequestException) as exc:
                 self._circuit_until = time.monotonic() + self._circuit_seconds
                 provider = str(getattr(self.client, "provider", "unknown"))[:48]
                 model = str(getattr(self.client, "model", self.model))[:80]
@@ -491,5 +534,19 @@ class EventSemanticPreprocessor:
                     "model=%s error_class=%s message=%s circuit_open_seconds=%s",
                     str(miss.get("fingerprint") or "")[:12], provider, model,
                     type(exc).__name__, message, self._circuit_seconds,
+                )
+                return False
+            except Exception as exc:
+                provider = str(getattr(self.client, "provider", "unknown"))[:48]
+                model = str(getattr(self.client, "model", self.model))[:80]
+                logger.warning(
+                    "semantic_enrichment_unclassified_failure "
+                    "fingerprint_prefix=%s provider=%s model=%s "
+                    "error_class=%s message=%s circuit_open_seconds=0",
+                    str(miss.get("fingerprint") or "")[:12],
+                    provider,
+                    model,
+                    type(exc).__name__,
+                    _safe_error_message(exc),
                 )
                 return False

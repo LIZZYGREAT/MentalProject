@@ -263,16 +263,16 @@ def test_today_calendar_mutation_invalidates_today_and_tomorrow_before_refresh()
         ):
             operations.append(("dependency_dirty", local_date, reason))
 
-        async def ensure_forecast(
-            self, _participant_id, local_date, reason, **_kwargs
-        ):
-            operations.append(("refresh", local_date, reason))
-            return {"local_date": local_date.isoformat()}
+    class MutationRefresh:
+        def enqueue(self, _participant_id, dates, *, reason):
+            operations.append(("enqueue", dict(dates), reason))
+            return True
 
     tools = object.__new__(CareTools)
     tools.timezone = ZoneInfo("Asia/Shanghai")
     tools.forecast_snapshots = Forecasts()
     tools.forecast_coordinator = Coordinator()
+    tools.mutation_refresh = MutationRefresh()
     today = datetime.now(tools.timezone).date()
     tomorrow = today + timedelta(days=1)
 
@@ -285,10 +285,14 @@ def test_today_calendar_mutation_invalidates_today_and_tomorrow_before_refresh()
     assert operations == [
         ("invalidate", today, "calendar_update_event"),
         ("dependency_dirty", tomorrow, "previous_day_terminal_changed"),
-        ("refresh", today, "calendar_update_event"),
-        ("refresh", tomorrow, "calendar_update_event"),
+        (
+            "enqueue",
+            {today: True, tomorrow: False},
+            "calendar_update_event",
+        ),
     ]
-    assert result["forecast_refreshed_dates"] == [
+    assert result["forecast_refresh"] == "queued"
+    assert result["forecast_refresh_queued_dates"] == [
         today.isoformat(), tomorrow.isoformat()
     ]
 

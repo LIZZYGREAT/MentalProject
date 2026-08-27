@@ -28,6 +28,9 @@ from app.repositories_daily_review import (
     DailyReviewScheduleRepository,
     RetrospectiveCurveRepository,
 )
+from app.repositories_calendar_mutation import (
+    CalendarMutationReconciliationRepository,
+)
 from app.services.daily_review_service import DailyReviewService
 from app.repositories_care import (
     CareInterventionRepository,
@@ -40,6 +43,7 @@ from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from app.services.profile_calibration import ProfileCalibrationService
 from app.services.token_service import (
     TokenEncryptionService,
@@ -75,6 +79,7 @@ class BusinessServices:
     daily_reviews: DailyReviewService
     observation_refresh: ObservationForecastRefreshService
     dependency_refresh: ForecastDependencyRefreshService
+    mutation_refresh: ForecastMutationRefreshQueue
     care_preferences: ParticipantCarePreferenceRepository
     care_interventions: CareInterventionRepository
 
@@ -169,6 +174,10 @@ def build_business_services(
     )
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
+    mutation_refresh = ForecastMutationRefreshQueue(
+        forecast_coordinator,
+        reconciliations=CalendarMutationReconciliationRepository(database),
+    )
     observation_refresh = ObservationForecastRefreshService(
         forecast_snapshots,
         warning_schedules,
@@ -203,6 +212,7 @@ def build_business_services(
         learned_profiles=learned_profiles,
         pressure_curves=pressure_curves,
         observation_refresh=observation_refresh,
+        mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
     ).register(registry)
@@ -229,6 +239,7 @@ def build_business_services(
         daily_reviews=daily_reviews,
         observation_refresh=observation_refresh,
         dependency_refresh=dependency_refresh,
+        mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
     )

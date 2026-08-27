@@ -12,6 +12,7 @@ from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
     Participant,
+    ParticipantCarePreference,
     StateObservation,
     WarningSchedule,
 )
@@ -143,6 +144,22 @@ def _send_first(database, warnings):
         now=target + timedelta(seconds=1),
     )
     return warning_id, target + timedelta(seconds=1)
+
+
+def _set_warning_intervention(database, intervention_type):
+    with database.session() as session:
+        warning = session.query(WarningSchedule).one()
+        payload = dict(warning.payload_json)
+        payload["care_plan"] = {
+            **dict(payload.get("care_plan") or {}),
+            "intervention_type": intervention_type,
+        }
+        warning.payload_json = payload
+        return (
+            warning.id,
+            warning.target_time.replace(tzinfo=timezone.utc),
+            warning.forecast_version,
+        )
 
 
 def test_warning_lifecycle_is_mirrored_to_normalized_care_event():
@@ -606,6 +623,163 @@ def test_warning_authorization_commit_defines_in_flight_preference_boundary():
         sent=True,
         now=target + timedelta(seconds=3),
     )
+
+
+def test_disabling_schedule_suggestions_cancels_pending_schedule_adjustment():
+    database, _, participant, _, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, _target, _version = _set_warning_intervention(
+        database, "schedule_adjustment"
+    )
+
+    preferences.update(
+        participant.id,
+        {"allow_schedule_suggestions": False},
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "cancelled"
+        assert warning.payload_json["cancellation_reason"] == (
+            "participant_schedule_suggestions_disabled"
+        )
+
+
+def test_disabling_schedule_suggestions_cancels_uncommitted_claim():
+    database, _, participant, warnings, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, target, _version = _set_warning_intervention(
+        database, "schedule_adjustment"
+    )
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+    assert claimed["authorized_at"] is None
+
+    preferences.update(
+        participant.id,
+        {"allow_schedule_suggestions": False},
+        now=target + timedelta(seconds=1),
+    )
+
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "cancelled"
+        assert warning.claim_token is None
+        assert warning.payload_json["cancellation_reason"] == (
+            "participant_schedule_suggestions_disabled"
+        )
+
+
+def test_authorized_schedule_suggestion_can_finish_after_preference_change():
+    database, _, participant, warnings, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, target, version = _set_warning_intervention(
+        database, "schedule_adjustment"
+    )
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        now=target + timedelta(seconds=1),
+    )
+
+    preferences.update(
+        participant.id,
+        {"allow_schedule_suggestions": False},
+        now=target + timedelta(seconds=2),
+    )
+
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "claimed"
+        assert warning.authorized_at is not None
+    assert warnings.finish_claim(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        sent=True,
+        now=target + timedelta(seconds=3),
+    )
+
+
+def test_disabling_schedule_suggestions_does_not_cancel_other_care_types():
+    database, _, participant, _, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, _target, _version = _set_warning_intervention(
+        database, "transition_buffer"
+    )
+
+    preferences.update(
+        participant.id,
+        {"allow_schedule_suggestions": False},
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with database.session() as session:
+        assert session.get(WarningSchedule, warning_id).status == "pending"
+
+
+def test_final_claim_rejects_stale_schedule_adjustment_when_disabled():
+    database, _, participant, warnings, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, target, _version = _set_warning_intervention(
+        database, "schedule_adjustment"
+    )
+    # Simulate a persisted warning racing with a preference update after plan
+    # generation. This intentionally bypasses the eager cancellation hook so
+    # the independent final-authorization defense is exercised.
+    with database.session() as session:
+        preference = session.get(ParticipantCarePreference, participant.id)
+        preference.allow_schedule_suggestions = False
+
+    assert warnings.claim_if_current(warning_id, now=target) is None
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "cancelled"
+        assert warning.payload_json["cancellation_reason"] == (
+            "participant_schedule_suggestions_disabled"
+        )
+
+
+def test_final_authorization_rejects_claimed_schedule_adjustment_when_disabled():
+    database, _, participant, warnings, preferences, _ = _setup()
+    preferences.update(
+        participant.id, {"allow_schedule_suggestions": True}, now=NOW
+    )
+    warning_id, target, version = _set_warning_intervention(
+        database, "schedule_adjustment"
+    )
+    claimed = warnings.claim_if_current(warning_id, now=target)
+    assert claimed is not None
+    with database.session() as session:
+        preference = session.get(ParticipantCarePreference, participant.id)
+        preference.allow_schedule_suggestions = False
+
+    assert not warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=version,
+        now=target + timedelta(seconds=1),
+    )
+    with database.session() as session:
+        warning = session.get(WarningSchedule, warning_id)
+        assert warning.status == "cancelled"
+        assert warning.payload_json["cancellation_reason"] == (
+            "participant_schedule_suggestions_disabled"
+        )
 
 
 def test_daily_review_preferences_cancel_queued_and_preserve_authorized_in_flight():

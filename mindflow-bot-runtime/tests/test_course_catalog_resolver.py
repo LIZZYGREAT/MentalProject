@@ -109,7 +109,7 @@ def test_exact_course_related_homework_keeps_canonical_identity():
     assert event["metadata"]["classification"]["course_identity_locked"] is True
 
 
-def test_controlled_alias_locks_type_but_allows_candidate_bounded_identity():
+def test_high_math_a_variant_rejects_b_candidate():
     event = prepare_event_instances([_event("高数A")], "2030-01-15")[0]
     finalized = finalize_event_classification(
         event,
@@ -123,8 +123,60 @@ def test_controlled_alias_locks_type_but_allows_candidate_bounded_identity():
 
     assert event["metadata"]["classification"]["event_type_locked"] is True
     assert event["metadata"]["classification"]["course_identity_locked"] is False
-    assert finalized["course_name"] == "高等数学（B类）II"
-    assert finalized["course_code"] == "AMTD0035"
+    context = event["metadata"]["classification"]["course_catalog_context"]
+    assert context["identity_constraints"] == {"variant": "A"}
+    assert context["candidates"]
+    assert all("A类" in item["canonical_name"] for item in context["candidates"])
+    assert not finalized.get("course_name")
+    assert not finalized.get("course_code")
+
+
+def test_high_math_a_variant_accepts_a_candidate():
+    event = prepare_event_instances([_event("高数A")], "2030-01-15")[0]
+    candidate = event["metadata"]["classification"]["course_catalog_context"][
+        "candidates"
+    ][0]
+    finalized = finalize_event_classification(
+        event,
+        external_course_match={
+            "matched": True,
+            "canonical_name": candidate["canonical_name"],
+            "code": candidate["code"],
+            "confidence": 0.99,
+        },
+    )
+
+    assert "A类" in finalized["course_name"]
+    assert finalized["course_code"] == candidate["code"]
+
+
+def test_high_math_b_variant_rejects_a_candidate():
+    event = prepare_event_instances([_event("高数B")], "2030-01-15")[0]
+    context = event["metadata"]["classification"]["course_catalog_context"]
+    finalized = finalize_event_classification(
+        event,
+        external_course_match={
+            "matched": True,
+            "canonical_name": "高等数学（A类）II",
+            "code": "AMTD0034",
+            "confidence": 0.99,
+        },
+    )
+
+    assert context["identity_constraints"] == {"variant": "B"}
+    assert context["candidates"]
+    assert all("B类" in item["canonical_name"] for item in context["candidates"])
+    assert not finalized.get("course_name")
+
+
+def test_unconstrained_high_math_keeps_multiple_variants():
+    event = prepare_event_instances([_event("高数")], "2030-01-15")[0]
+    context = event["metadata"]["classification"]["course_catalog_context"]
+    names = {item["canonical_name"] for item in context["candidates"]}
+
+    assert context["identity_constraints"] == {}
+    assert any("A类" in name for name in names)
+    assert any("B类" in name for name in names)
 
 
 def test_ambiguous_high_math_suffixes_never_lock_a_wrong_identity():

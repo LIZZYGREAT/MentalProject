@@ -60,6 +60,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0015_daily_review_causal_source"
     )
     assert migration_0015.down_revision == "0014_daily_review_expiry"
+    migration_0018 = next(
+        migration for migration in migrations
+        if migration.revision == "0018_calendar_mutation_reconciliation"
+    )
+    assert migration_0018.down_revision == "0017_care_delivery_authorization"
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

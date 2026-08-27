@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime
 import hmac
 import uuid
@@ -437,7 +438,9 @@ class AdminAPI:
             return _json_error("daily_review_service_unavailable", 503)
         try:
             target = date.fromisoformat(request.path_params["local_date"])
-            value = self.daily_reviews.rebuild(participant_id, target)
+            value = await asyncio.to_thread(
+                self.daily_reviews.rebuild, participant_id, target
+            )
         except ValueError as exc:
             return _json_error(str(exc), 409)
         return JSONResponse(value)

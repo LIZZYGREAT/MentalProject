@@ -326,6 +326,12 @@ class ParticipantCarePreferenceRepository:
                 # Authorization is the commit point for an in-flight provider
                 # request. Preference changes apply to later deliveries.
                 continue
+            care_plan = warning.payload_json.get("care_plan")
+            schedule_suggestion_disallowed = bool(
+                isinstance(care_plan, dict)
+                and care_plan.get("intervention_type") == "schedule_adjustment"
+                and not bool(view["allow_schedule_suggestions"])
+            )
             if warning.local_date not in sent_by_date:
                 sent_by_date[warning.local_date] = len(
                     session.execute(
@@ -345,6 +351,7 @@ class ParticipantCarePreferenceRepository:
                     bool(warning.payload_json.get("user_requested_followup"))
                     and not bool(view["allow_follow_up"])
                 )
+                and not schedule_suggestion_disallowed
             )
             if permitted:
                 kept_by_date[warning.local_date] = kept + 1
@@ -357,7 +364,11 @@ class ParticipantCarePreferenceRepository:
             warning.next_attempt_at = None
             warning.payload_json = {
                 **dict(warning.payload_json),
-                "cancellation_reason": "participant_care_preference",
+                "cancellation_reason": (
+                    "participant_schedule_suggestions_disabled"
+                    if schedule_suggestion_disallowed
+                    else "participant_care_preference"
+                ),
             }
             warning.updated_at = now
             CareInterventionRepository.mirror_warning_in_session(session, warning)

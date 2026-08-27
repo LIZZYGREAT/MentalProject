@@ -88,16 +88,16 @@ def test_production_ctssm_fixture_is_stable_after_legacy_removal():
     assert result.model_family == "stress-ctssm.m0"
     assert result.point_count == 288
     assert _sha(result.trajectory) == (
-        "aef29bf7ee092bf19d76ee193834e16800f6a741f63925ffed60303f0197917e"
+        "fe0ee74f0bf5fe47619477d1543ca5141bce5229fb4da7dbff561a70daf17d0b"
     )
     assert _sha(result.alerts) == (
-        "e77199a7f4e5467d50ddddfbc11785b7cb9526bb34369b084bc5d67c02254864"
+        "b4fa656a60fe503af0394d4c75bb0ca7cd9258f8c81b01018c85564d525c628a"
     )
     assert _sha(warning_windows) == (
-        "013e1cb6d97cd3ccfe2b675bc2ca8bcf568b7cf2b0e3448eb529562bb71297b5"
+        "f18fd1eb56c581d0d215c2c815506834c52d297fb65171b6c957384a66076cd4"
     )
     assert _sha(result.confidence_series) == (
-        "08ca5a9fb9fb688311a54a6e917c7b61d24a8eb33a42ab3eee3244bfeac4e295"
+        "9540d25537c7c84ebb2ed08cc6124f8ab2936d66e8bdb3861e526ab55be14f14"
     )
     assert (result.stress_0_10, result.vitality_0_10) == (4.98, 7.2)
     assert result.active_states == ("S",)

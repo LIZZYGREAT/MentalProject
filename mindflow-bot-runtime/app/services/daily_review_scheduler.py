@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 import logging
+from typing import Callable
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,7 @@ class DailyReviewScheduler:
         claim_lease_seconds: int = 120,
         validity_minutes: int = 1440, catch_up_minutes: int = 120,
         care_preferences: object | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.schedules = schedules
         self.participants = participants
@@ -47,15 +49,32 @@ class DailyReviewScheduler:
         self.validity_minutes = max(1, int(validity_minutes))
         self.catch_up_minutes = max(0, int(catch_up_minutes))
         self.care_preferences = care_preferences
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock_is_explicit = clock is not None
         if self.catch_up_minutes > self.validity_minutes:
             raise ValueError("catch_up_minutes must not exceed validity_minutes")
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _clock_now(self) -> datetime:
+        return self._as_utc(self._clock())
+
     async def run_once(self, now: datetime | None = None) -> dict[str, int]:
-        utc_now = now or datetime.now(timezone.utc)
-        if utc_now.tzinfo is None:
-            utc_now = utc_now.replace(tzinfo=timezone.utc)
+        utc_now = self._as_utc(now) if now is not None else self._clock_now()
+        # An explicit run_once(now=...) without a Clock is a frozen-time test.
+        # Production and tests that inject a Clock read the actual transition
+        # time separately for authorization, completion, and failure.
+        operation_now = (
+            self._clock_now
+            if now is None or self._clock_is_explicit
+            else lambda: utc_now
+        )
         local_now = utc_now.astimezone(self.timezone)
         counts = {
             "ensured": 0,
@@ -106,10 +125,12 @@ class DailyReviewScheduler:
             )
             if binding and binding.get("chat_id"):
                 await asyncio.to_thread(
-                    self.schedules.reactivate_available, participant_id, utc_now
+                    self.schedules.reactivate_available,
+                    participant_id,
+                    operation_now(),
                 )
         claimed = await asyncio.to_thread(
-            self.schedules.claim_due, utc_now, self.claim_lease_seconds
+            self.schedules.claim_due, operation_now(), self.claim_lease_seconds
         )
         for item in claimed:
             participant_id = uuid.UUID(item["participant_id"])
@@ -121,7 +142,7 @@ class DailyReviewScheduler:
                     self.schedules.mark_cancelled,
                     item["id"],
                     item["claim_token"],
-                    now=utc_now,
+                    now=operation_now(),
                     error_code="participant_inactive",
                 )
                 continue
@@ -131,13 +152,13 @@ class DailyReviewScheduler:
                 )
                 if not self.care_preferences.allows_daily_review_at(
                     preferences,
-                    utc_now,
+                    operation_now(),
                 ):
                     await asyncio.to_thread(
                         self.schedules.mark_cancelled,
                         item["id"],
                         item["claim_token"],
-                        now=utc_now,
+                        now=operation_now(),
                         error_code="participant_daily_review_disabled",
                     )
                     continue
@@ -147,7 +168,7 @@ class DailyReviewScheduler:
             if not binding or not binding.get("chat_id"):
                 await asyncio.to_thread(
                     self.schedules.mark_unavailable, item["id"], item["claim_token"],
-                    now=utc_now,
+                    now=operation_now(),
                 )
                 counts["unavailable"] += 1
                 continue
@@ -161,7 +182,7 @@ class DailyReviewScheduler:
                     self.schedules.defer_missing_forecast,
                     item["id"],
                     item["claim_token"],
-                    now=utc_now,
+                    now=operation_now(),
                     retry_after_seconds=self.retry_base_seconds,
                 )
                 counts["source_forecast_unavailable"] += 1
@@ -174,7 +195,7 @@ class DailyReviewScheduler:
                 self.schedules.authorize_claim_current,
                 item["id"],
                 item["claim_token"],
-                now=datetime.now(timezone.utc),
+                now=operation_now(),
             ):
                 continue
             try:
@@ -189,14 +210,14 @@ class DailyReviewScheduler:
                 )
                 await asyncio.to_thread(
                     self.schedules.mark_failed, item["id"], item["claim_token"],
-                    now=utc_now, error=exc, max_attempts=self.max_attempts,
+                    now=operation_now(), error=exc, max_attempts=self.max_attempts,
                     retry_base_seconds=self.retry_base_seconds,
                 )
                 counts["failed"] += 1
                 continue
             await asyncio.to_thread(
                 self.schedules.mark_sent, item["id"], item["claim_token"],
-                now=utc_now, provider_message_id=message_id,
+                now=operation_now(), provider_message_id=message_id,
             )
             counts["sent"] += 1
         return counts

@@ -450,6 +450,9 @@ def test_expired_sent_card_cannot_save_response_or_retrospective():
     scheduled_at = datetime(2030, 1, 15, 14, 0, tzinfo=timezone.utc)
     schedule = schedules.ensure(person.id, target, scheduled_at)
     claim = schedules.claim_due(scheduled_at, 120)[0]
+    assert schedules.authorize_claim_current(
+        schedule["id"], claim["claim_token"], now=scheduled_at
+    )
     assert schedules.mark_sent(
         schedule["id"], claim["claim_token"],
         now=scheduled_at, provider_message_id="sent-card",
@@ -978,7 +981,7 @@ def test_late_recovery_of_old_revision_does_not_replace_new_revision():
     assert latest["id"] == revision_two["retrospective"]["id"]
 
 
-def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
+def test_admin_rebuild_remains_causal_within_same_revision():
     database = memory_database()
     person = participant(database, "DR-SAME-REVISION-REBUILD")
     target = date(2030, 1, 15)
@@ -1025,9 +1028,9 @@ def test_latest_retrospective_uses_newest_rebuild_within_same_revision():
         == "forecast-admin-v1"
     )
     assert rebuilt["daily_review_revision"] == 2
-    assert rebuilt["id"] != revision_two["retrospective"]["id"]
-    assert rebuilt["source_forecast_version"] == "forecast-admin-v2"
-    assert latest["id"] == rebuilt["id"]
+    assert rebuilt["id"] == revision_two["retrospective"]["id"]
+    assert rebuilt["source_forecast_version"] == "forecast-admin-v1"
+    assert latest["id"] == revision_two["retrospective"]["id"]
 
 
 def test_admin_curve_uses_exact_retrospective_source_for_stale_overlay():
@@ -1529,6 +1532,9 @@ def test_schedule_retry_success_clears_last_error_class():
     assert failed["last_error_class"] == "TimeoutError"
 
     retry_claim = repo.claim_due(due + timedelta(seconds=1), 120)[0]
+    assert repo.authorize_claim_current(
+        schedule["id"], retry_claim["claim_token"], now=due + timedelta(seconds=1)
+    )
     assert repo.mark_sent(
         schedule["id"], retry_claim["claim_token"],
         now=due + timedelta(seconds=1), provider_message_id="message-after-retry",

@@ -165,6 +165,7 @@ async def run() -> None:
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
     business.dependency_refresh.start()
+    business.mutation_refresh.start()
     business.observation_refresh.start()
     _log_startup_phase("business_ready")
 
@@ -391,17 +392,20 @@ async def run() -> None:
                 await worker.close()
             finally:
                 try:
-                    await business.observation_refresh.close()
+                    await business.mutation_refresh.close()
                 finally:
                     try:
-                        await business.dependency_refresh.close()
+                        await business.observation_refresh.close()
                     finally:
                         try:
-                            await business.semantic_preprocessor.close(
-                                settings.semantic_api_timeout_seconds + 2
-                            )
+                            await business.dependency_refresh.close()
                         finally:
-                            await runtime.close()
+                            try:
+                                await business.semantic_preprocessor.close(
+                                    settings.semantic_api_timeout_seconds + 2
+                                )
+                            finally:
+                                await runtime.close()
 
 
 def main() -> None:

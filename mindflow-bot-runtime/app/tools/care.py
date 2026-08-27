@@ -22,6 +22,8 @@ from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_message_service import CareMessageService
 from app.services.care_context import CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
+from app.services.calendar_mutation_impact import CalendarMutationImpactResolver
+from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
     PressureCurveService,
@@ -126,6 +128,7 @@ class CareTools:
         learned_profiles: LearnedProfileRepository | None = None,
         pressure_curves: PressureCurveService | None = None,
         observation_refresh: ObservationForecastRefreshService | None = None,
+        mutation_refresh: ForecastMutationRefreshQueue | None = None,
         care_preferences: Any = None,
         care_interventions: Any = None,
     ):
@@ -147,12 +150,16 @@ class CareTools:
             else None
         )
         self.observation_refresh = observation_refresh
+        self.mutation_refresh = mutation_refresh
         self.care_messages = (
             getattr(forecast_coordinator, "care_messages", None)
             or CareMessageService(timezone_name)
         )
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.calendar_mutation_impact = CalendarMutationImpactResolver(
+            timezone_name
+        )
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -526,16 +533,26 @@ class CareTools:
             "user_requested_support",
             refresh_calendar=True,
         )
-        recent = self.observations.recent_before(
-            ctx.participant_id,
-            before=datetime.now(timezone.utc),
-            max_age=timedelta(
-                minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+        before = datetime.now(timezone.utc)
+        preference_read = (
+            asyncio.to_thread(self.care_preferences.get, ctx.participant_id)
+            if self.care_preferences is not None
+            else asyncio.sleep(0, result=None)
+        )
+        recent, profile_row, care_preferences = await asyncio.gather(
+            asyncio.to_thread(
+                self.observations.recent_before,
+                ctx.participant_id,
+                before=before,
+                max_age=timedelta(
+                    minutes=CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+                ),
+                limit=1,
             ),
-            limit=1,
+            asyncio.to_thread(self.profiles.current, ctx.participant_id),
+            preference_read,
         )
         observation = recent[0] if recent else None
-        profile_row = self.profiles.current(ctx.participant_id)
         output = dict(forecast.get("output") or {})
         raw_alerts = [
             item for item in (output.get("alerts") or []) if isinstance(item, dict)
@@ -550,10 +567,7 @@ class CareTools:
             recent_observation=observation,
             profile=(profile_row or {}).get("profile"),
             profile_version=(profile_row or {}).get("version"),
-            care_preferences=(
-                self.care_preferences.get(ctx.participant_id)
-                if self.care_preferences is not None else None
-            ),
+            care_preferences=care_preferences,
         )
         provenance = dict(contextual["care_provenance"])
         provenance.update(
@@ -752,18 +766,62 @@ class CareTools:
                 normalized.sort()
                 dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
 
+        refresh_targets = {
+            target: target in direct_dates
+            for target in normalized
+        }
+        dependency_sources = {
+            target: today for target in set(normalized) - direct_dates
+        }
+        mutation_refresh = getattr(self, "mutation_refresh", None)
+        reconciliations = getattr(mutation_refresh, "reconciliations", None)
+        reconciliation = None
+        # The remote provider mutation has committed by the time this method is
+        # called. Persist the complete local work set before attempting any
+        # invalidation so a process crash cannot consume the mutation.
+        if reconciliations is not None:
+            reconciliation = await asyncio.to_thread(
+                reconciliations.create,
+                participant_id,
+                mutation_kind=reason,
+                direct_dates=direct_dates,
+                refresh_targets=refresh_targets,
+                dependency_sources=dependency_sources,
+            )
+
         forecast_repository = (
             getattr(self, "forecast_snapshots", None)
             or getattr(self.forecast_coordinator, "forecasts", None)
         )
         invalidation_errors: list[tuple[Any, Exception]] = []
+        failed_dependency_sources: dict[date, date] = {}
         if forecast_repository is not None:
             # Fail closed for every affected date before starting any expensive
             # recomputation. In particular, tomorrow must stop exposing a stale
             # Today terminal while today's refresh is still in flight.
-            for target in normalized:
+            batch_invalidate = getattr(
+                forecast_repository,
+                "invalidate_for_calendar_mutation_dates",
+                None,
+            )
+            if direct_dates and callable(batch_invalidate):
                 try:
-                    if target in direct_dates:
+                    await asyncio.to_thread(
+                        batch_invalidate,
+                        self.forecast_coordinator.warnings,
+                        participant_id,
+                        direct_dates,
+                        reason=reason,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    invalidation_errors.extend(
+                        (target, exc) for target in sorted(direct_dates)
+                    )
+            elif direct_dates:
+                for target in sorted(direct_dates):
+                    try:
                         await asyncio.to_thread(
                             forecast_repository.invalidate_for_calendar_mutation,
                             self.forecast_coordinator.warnings,
@@ -771,93 +829,111 @@ class CareTools:
                             target,
                             reason=reason,
                         )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        invalidation_errors.append((target, exc))
+            for target in sorted(set(normalized) - direct_dates):
+                try:
+                    if dependency_refresh is not None:
+                        await asyncio.to_thread(
+                            dependency_refresh.invalidate_dependent_now,
+                            participant_id,
+                            today,
+                            reason="previous_day_terminal_changed",
+                        )
                     else:
-                        if dependency_refresh is not None:
-                            await asyncio.to_thread(
-                                dependency_refresh.invalidate_dependent_now,
-                                participant_id,
-                                today,
-                                reason="previous_day_terminal_changed",
-                            )
-                        else:
-                            await asyncio.to_thread(
-                                self.forecast_coordinator.mark_dependency_dirty,
-                                participant_id,
-                                target,
-                                reason="previous_day_terminal_changed",
-                            )
+                        await asyncio.to_thread(
+                            self.forecast_coordinator.mark_dependency_dirty,
+                            participant_id,
+                            target,
+                            reason="previous_day_terminal_changed",
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     invalidation_errors.append((target, exc))
+                    failed_dependency_sources[target] = today
 
-        # Preserve dependency order for today -> tomorrow during recomputation.
-        results = []
-        for target in normalized:
-            try:
-                if target not in direct_dates:
-                    today_index = normalized.index(today)
-                    if (
-                        today_index >= len(results)
-                        or isinstance(results[today_index], Exception)
-                    ):
-                        raise RuntimeError("source forecast refresh failed")
-                if (
-                    target not in direct_dates
-                    and dependency_refresh is not None
-                ):
-                    result = await dependency_refresh.refresh_dependent_after_source(
-                        participant_id,
-                        today,
-                        reason="previous_day_terminal_changed",
-                    )
-                else:
-                    result = await self.forecast_coordinator.ensure_forecast(
-                        participant_id,
-                        target,
-                        reason,
-                        refresh_calendar=target in direct_dates,
-                        force_followup=True,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                result = exc
-            results.append(result)
-        refreshed = [
-            target.isoformat() for target, result in zip(normalized, results)
-            if not isinstance(result, Exception)
-        ]
+        failed_dates = {target for target, _error in invalidation_errors}
+        queued = False
+        if mutation_refresh is not None:
+            enqueue_kwargs: dict[str, Any] = {"reason": reason}
+            failed_direct_dates = failed_dates & direct_dates
+            if failed_direct_dates:
+                enqueue_kwargs["invalidation_dates"] = failed_direct_dates
+            if failed_dependency_sources:
+                enqueue_kwargs["dependency_invalidation_sources"] = (
+                    failed_dependency_sources
+                )
+            if reconciliation is not None:
+                enqueue_kwargs["reconciliation_id"] = reconciliation["id"]
+            queued = bool(
+                mutation_refresh.enqueue(
+                    participant_id,
+                    refresh_targets,
+                    **enqueue_kwargs,
+                )
+            )
+        if reconciliation is not None and not invalidation_errors:
+            await asyncio.to_thread(
+                reconciliations.mark_fenced, reconciliation["id"]
+            )
         errors = [
             {"local_date": target.isoformat(), "error_class": type(error).__name__}
             for target, error in invalidation_errors
-        ] + [
-            {"local_date": target.isoformat(), "error_class": type(result).__name__}
-            for target, result in zip(normalized, results)
-            if isinstance(result, Exception)
         ]
         return {
             "forecast_refresh": (
-                "succeeded" if not errors else "failed" if not refreshed else "partial"
+                "partial" if errors and queued
+                else "failed" if errors
+                else "queued" if queued
+                else "deferred"
             ),
             "forecast_refresh_degraded": bool(errors),
-            "forecast_refreshed_dates": refreshed,
+            "forecast_invalidation": "failed" if errors else "succeeded",
+            "forecast_invalidation_retry": bool(errors and queued),
+            "forecast_refreshed_dates": [],
+            "forecast_refresh_queued_dates": (
+                [target.isoformat() for target in sorted(refresh_targets)]
+                if queued
+                else []
+            ),
             "forecast_refresh_errors": errors,
             "forecast_dependency_refresh": dependency,
+            "calendar_mutation_reconciliation_id": (
+                reconciliation["id"] if reconciliation is not None else None
+            ),
         }
 
-    def _event_dates(self, event: dict[str, Any] | None) -> set[Any]:
-        if not event:
-            return set()
-        result = set()
-        for key in ("start_time", "end_time"):
-            value = event.get(key)
-            if value:
-                try:
-                    result.add(_parse_datetime(value, self.timezone).date())
-                except ValueError:
-                    continue
-        return result
+    async def _calendar_mutation_dates(
+        self,
+        participant_id: Any,
+        *,
+        previous: dict[str, Any] | None,
+        updated: dict[str, Any] | None,
+        updated_recurrence: str | None = None,
+        clear_recurrence: bool = False,
+    ) -> set[date]:
+        forecast_repository = (
+            getattr(self, "forecast_snapshots", None)
+            or getattr(self.forecast_coordinator, "forecasts", None)
+        )
+        valid_dates = getattr(forecast_repository, "valid_dates", None)
+        persisted_dates = (
+            await asyncio.to_thread(
+                valid_dates, participant_id
+            )
+            if callable(valid_dates)
+            else set()
+        )
+        return self.calendar_mutation_impact.affected_dates(
+            previous=previous,
+            updated=updated,
+            persisted_dates=persisted_dates,
+            updated_recurrence=updated_recurrence,
+            clear_recurrence=clear_recurrence,
+        )
 
     def get_checkin_card(
         self, ctx: AgentContext, _args: dict[str, Any]
@@ -937,9 +1013,20 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        impact_event = {
+            **dict(event),
+            "start_time": event.get("start_time") or start_time.isoformat(),
+            "end_time": event.get("end_time") or end_time.isoformat(),
+        }
+        dates = await self._calendar_mutation_dates(
+            ctx.participant_id,
+            previous=None,
+            updated=impact_event,
+            updated_recurrence=recurrence,
+        )
         refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
-            self._event_dates(event) or {start_time.date(), end_time.date()},
+            dates,
             "calendar_create_event",
         )
         return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
@@ -977,9 +1064,40 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        dates = self._event_dates(previous) | self._event_dates(event)
-        if start_time is not None:
-            dates.update({start_time.date(), end_time.date()})
+        provider_event = dict(event or {})
+        previous_event = dict(previous or {})
+        clear_recurrence = bool(args.get("clear_recurrence", False))
+        impact_event = {
+            **previous_event,
+            **provider_event,
+            "start_time": (
+                start_time.isoformat()
+                if start_time is not None
+                else provider_event.get("start_time")
+                or previous_event.get("start_time")
+            ),
+            "end_time": (
+                end_time.isoformat()
+                if end_time is not None
+                else provider_event.get("end_time")
+                or previous_event.get("end_time")
+            ),
+            "recurrence": (
+                "" if clear_recurrence
+                else recurrence
+                if recurrence is not None
+                else provider_event.get("recurrence")
+                or previous_event.get("recurrence")
+                or ""
+            ),
+        }
+        dates = await self._calendar_mutation_dates(
+            ctx.participant_id,
+            previous=previous,
+            updated=impact_event,
+            updated_recurrence=recurrence,
+            clear_recurrence=clear_recurrence,
+        )
         refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id, dates, "calendar_update_event"
         )
@@ -999,9 +1117,14 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        dates = await self._calendar_mutation_dates(
+            ctx.participant_id,
+            previous=previous,
+            updated=None,
+        )
         refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
-            self._event_dates(previous),
+            dates,
             "calendar_delete_event",
         )
         return {"ok": True, "calendar_mutation": "succeeded", "deleted": deleted, **refresh}

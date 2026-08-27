@@ -17,6 +17,23 @@ from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
+
+def _integrity_matches(
+    exc: IntegrityError,
+    *,
+    constraint_names: set[str],
+    sqlite_columns: tuple[str, ...],
+) -> bool:
+    original = getattr(exc, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name is not None:
+        return str(constraint_name) in constraint_names
+    message = str(original or exc).casefold()
+    if any(name.casefold() in message for name in constraint_names):
+        return True
+    return all(column.casefold() in message for column in sqlite_columns)
+
 from app.db import Database
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.models import (
@@ -553,55 +570,6 @@ class CalendarSnapshotRepository:
             ).scalar_one_or_none()
             return self._view(row) if row else None
 
-    def upsert(
-        self, participant_id: uuid.UUID, local_date: date, *, revision: str,
-        events: list[dict[str, Any]], degraded: bool,
-        refresh_error_class: str | None = None,
-        snapshot_state: str | None = None,
-    ) -> tuple[dict[str, Any], bool]:
-        state = snapshot_state or (
-            self.PROVIDER_DEGRADED if degraded else self.CURRENT
-        )
-        if state not in {
-            self.CURRENT,
-            self.PROVIDER_DEGRADED,
-            self.MUTATION_REFRESH_PENDING,
-        }:
-            raise ValueError("invalid calendar snapshot state")
-        with self.database.session() as session:
-            row = session.execute(
-                select(CalendarSnapshot).where(
-                    CalendarSnapshot.participant_id == participant_id,
-                    CalendarSnapshot.local_date == local_date,
-                ).with_for_update()
-            ).scalar_one_or_none()
-            changed = row is None or row.calendar_revision != revision
-            now = utc_now()
-            if row is None:
-                row = CalendarSnapshot(
-                    participant_id=participant_id, local_date=local_date,
-                    calendar_revision=revision, events_json=list(events), degraded=degraded,
-                    snapshot_state=state,
-                    last_refresh_attempt_at=now,
-                    last_refresh_success_at=None if degraded else now,
-                    last_refresh_error_class=refresh_error_class,
-                )
-                session.add(row)
-            elif changed or row.degraded != degraded or row.snapshot_state != state:
-                row.calendar_revision = revision
-                row.events_json = list(events)
-                row.snapshot_state = state
-                row.degraded = degraded
-                row.updated_at = now
-            row.last_refresh_attempt_at = now
-            if not degraded:
-                row.last_refresh_success_at = now
-                row.last_refresh_error_class = None
-            elif refresh_error_class:
-                row.last_refresh_error_class = refresh_error_class
-            session.flush()
-            return self._view(row), changed
-
     @staticmethod
     def _matches_expected(
         row: CalendarSnapshot | None,
@@ -732,37 +700,11 @@ class CalendarSnapshotRepository:
             session.flush()
             return self._view(row), False
 
-    def record_refresh_failure(
-        self,
-        participant_id: uuid.UUID,
-        local_date: date,
-        *,
-        error_class: str,
-    ) -> dict[str, Any] | None:
-        """Record a provider failure without making mutation-pending data usable."""
-
-        with self.database.session() as session:
-            row = session.execute(
-                select(CalendarSnapshot).where(
-                    CalendarSnapshot.participant_id == participant_id,
-                    CalendarSnapshot.local_date == local_date,
-                ).with_for_update()
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            now = utc_now()
-            row.last_refresh_attempt_at = now
-            row.last_refresh_error_class = str(error_class)[:128]
-            row.updated_at = now
-            session.flush()
-            return self._view(row)
-
-
 class EventSemanticCacheRepository:
     def __init__(self, database: Database):
         self.database = database
 
-    def get(
+    def get_entry(
         self, participant_id: uuid.UUID, fingerprint: str, *,
         schema_version: str, prompt_version: str, model: str,
     ) -> Optional[dict[str, Any]]:
@@ -774,15 +716,96 @@ class EventSemanticCacheRepository:
                     EventSemanticCache.schema_version == schema_version,
                     EventSemanticCache.prompt_version == prompt_version,
                     EventSemanticCache.model == model,
-                    EventSemanticCache.status == "complete",
                 )
             ).scalar_one_or_none()
-            return dict(row.assessment_json) if row else None
+            if row is None:
+                return None
+            return {
+                "status": str(row.status),
+                "assessment": dict(row.assessment_json),
+            }
+
+    def get(
+        self, participant_id: uuid.UUID, fingerprint: str, *,
+        schema_version: str, prompt_version: str, model: str,
+    ) -> Optional[dict[str, Any]]:
+        """Backward-compatible complete-only cache read."""
+
+        entry = self.get_entry(
+            participant_id,
+            fingerprint,
+            schema_version=schema_version,
+            prompt_version=prompt_version,
+            model=model,
+        )
+        if entry is None or entry["status"] != "complete":
+            return None
+        return dict(entry["assessment"])
 
     def put(
         self, participant_id: uuid.UUID, fingerprint: str, assessment: dict[str, Any], *,
         schema_version: str, prompt_version: str, model: str,
     ) -> None:
+        self.put_complete(
+            participant_id,
+            fingerprint,
+            assessment,
+            schema_version=schema_version,
+            prompt_version=prompt_version,
+            model=model,
+        )
+
+    def put_complete(
+        self, participant_id: uuid.UUID, fingerprint: str, assessment: dict[str, Any], *,
+        schema_version: str, prompt_version: str, model: str,
+    ) -> None:
+        self._put(
+            participant_id,
+            fingerprint,
+            assessment,
+            status="complete",
+            schema_version=schema_version,
+            prompt_version=prompt_version,
+            model=model,
+        )
+
+    def put_rejected(
+        self,
+        participant_id: uuid.UUID,
+        fingerprint: str,
+        *,
+        reason: str,
+        confidence: float | None,
+        schema_version: str,
+        prompt_version: str,
+        model: str,
+    ) -> None:
+        rejection: dict[str, Any] = {"reason": str(reason)[:128]}
+        if confidence is not None:
+            rejection["confidence"] = float(confidence)
+        self._put(
+            participant_id,
+            fingerprint,
+            {"rejection": rejection},
+            status="rejected",
+            schema_version=schema_version,
+            prompt_version=prompt_version,
+            model=model,
+        )
+
+    def _put(
+        self,
+        participant_id: uuid.UUID,
+        fingerprint: str,
+        assessment: dict[str, Any],
+        *,
+        status: str,
+        schema_version: str,
+        prompt_version: str,
+        model: str,
+    ) -> None:
+        if status not in {"complete", "rejected"}:
+            raise ValueError("unsupported semantic cache status")
         with self.database.session() as session:
             row = session.execute(
                 select(EventSemanticCache).where(
@@ -797,11 +820,11 @@ class EventSemanticCacheRepository:
                 session.add(EventSemanticCache(
                     participant_id=participant_id, fingerprint=fingerprint,
                     schema_version=schema_version, prompt_version=prompt_version,
-                    model=model, assessment_json=dict(assessment), status="complete",
+                    model=model, assessment_json=dict(assessment), status=status,
                 ))
             else:
                 row.assessment_json = dict(assessment)
-                row.status = "complete"
+                row.status = status
                 row.updated_at = utc_now()
 
 
@@ -837,6 +860,18 @@ class ForecastSnapshotRepository:
                 ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)
             ).scalar_one_or_none()
             return self._view(row) if row else None
+
+    def valid_dates(self, participant_id: uuid.UUID) -> set[date]:
+        """Return only dates that already have a current persisted Forecast."""
+
+        with self.database.session() as session:
+            rows = session.execute(
+                select(ForecastSnapshot.local_date).where(
+                    ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.valid.is_(True),
+                ).distinct()
+            ).scalars().all()
+            return set(rows)
 
     def get(
         self,
@@ -946,32 +981,63 @@ class ForecastSnapshotRepository:
     ) -> dict[str, int]:
         """Fence stale calculations after a successful remote calendar write."""
 
+        return self.invalidate_for_calendar_mutation_dates(
+            warning_repository,
+            participant_id,
+            {local_date},
+            reason=reason,
+            now=now,
+        )
+
+    def invalidate_for_calendar_mutation_dates(
+        self,
+        warning_repository: "WarningScheduleRepository",
+        participant_id: uuid.UUID,
+        local_dates: set[date],
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Atomically fence all dates changed by one remote Calendar mutation."""
+
         if warning_repository.database is not self.database:
             raise ValueError("forecast and warning repositories must share a database")
+        targets = sorted(set(local_dates))
+        if not targets:
+            return {"forecasts_invalidated": 0, "warnings_cancelled": 0}
         changed_at = now or utc_now()
         with self.database.session() as session:
             session.get(Participant, participant_id, with_for_update=True)
-            calendar = session.execute(
+            calendars = session.execute(
                 select(CalendarSnapshot).where(
                     CalendarSnapshot.participant_id == participant_id,
-                    CalendarSnapshot.local_date == local_date,
+                    CalendarSnapshot.local_date.in_(targets),
                 ).with_for_update()
-            ).scalar_one_or_none()
-            marker = f"mutation:{uuid.uuid4().hex}"
-            if calendar is None:
-                calendar = CalendarSnapshot(
-                    participant_id=participant_id,
-                    local_date=local_date,
-                    calendar_revision=marker,
-                    events_json=[],
-                    snapshot_state=CalendarSnapshotRepository.MUTATION_REFRESH_PENDING,
-                    degraded=True,
-                    last_refresh_attempt_at=changed_at,
-                    last_refresh_error_class="calendar_mutation_refresh_pending",
-                    updated_at=changed_at,
-                )
-                session.add(calendar)
-            else:
+            ).scalars().all()
+            calendars_by_date = {row.local_date: row for row in calendars}
+            mutation_id = uuid.uuid4().hex
+            for local_date in targets:
+                calendar = calendars_by_date.get(local_date)
+                marker = f"mutation:{mutation_id}:{local_date.isoformat()}"
+                if calendar is None:
+                    session.add(
+                        CalendarSnapshot(
+                            participant_id=participant_id,
+                            local_date=local_date,
+                            calendar_revision=marker,
+                            events_json=[],
+                            snapshot_state=(
+                                CalendarSnapshotRepository.MUTATION_REFRESH_PENDING
+                            ),
+                            degraded=True,
+                            last_refresh_attempt_at=changed_at,
+                            last_refresh_error_class=(
+                                "calendar_mutation_refresh_pending"
+                            ),
+                            updated_at=changed_at,
+                        )
+                    )
+                    continue
                 calendar.calendar_revision = marker
                 # Retain the last known events for diagnostics only.  The
                 # explicit pending state prevents Forecast from consuming them.
@@ -986,7 +1052,7 @@ class ForecastSnapshotRepository:
             rows = session.execute(
                 select(ForecastSnapshot).where(
                     ForecastSnapshot.participant_id == participant_id,
-                    ForecastSnapshot.local_date == local_date,
+                    ForecastSnapshot.local_date.in_(targets),
                     ForecastSnapshot.valid.is_(True),
                 ).with_for_update()
             ).scalars().all()
@@ -1321,6 +1387,7 @@ class WarningScheduleRepository:
         self,
         preference: ParticipantCarePreference | None,
         now: datetime,
+        payload: dict[str, Any] | None = None,
     ) -> str | None:
         if preference is None:
             return None
@@ -1328,6 +1395,13 @@ class WarningScheduleRepository:
             return "care_disabled"
         if not bool(preference.warning_enabled):
             return "warning_disabled"
+        care_plan = (payload or {}).get("care_plan")
+        if (
+            isinstance(care_plan, dict)
+            and care_plan.get("intervention_type") == "schedule_adjustment"
+            and not bool(preference.allow_schedule_suggestions)
+        ):
+            return "schedule_suggestions_disabled"
         if (
             preference.muted_until is not None
             and self._aware(preference.muted_until) > now
@@ -1702,14 +1776,139 @@ class WarningScheduleRepository:
                 counts["cancelled"] += 1
         return counts
 
-    @staticmethod
-    def _level_rank(value: str) -> int:
-        normalized = str(value).lower()
-        if normalized in {"3", "red", "critical"}:
-            return 3
-        if normalized in {"2", "orange", "high"}:
-            return 2
-        return 1
+    def _materialize_same_day_late_care_in_session(
+        self, session: Any, now: datetime
+    ) -> int:
+        """Create a new factually current opportunity for missed proactive care."""
+
+        local_today = now.astimezone(self.timezone).date()
+        local_end = datetime.combine(
+            local_today + timedelta(days=1), time.min, self.timezone
+        ).astimezone(timezone.utc)
+        if now >= local_end:
+            return 0
+        sources = session.execute(
+            select(WarningSchedule).where(
+                WarningSchedule.local_date == local_today,
+                WarningSchedule.status.in_(("expired", "failed")),
+                WarningSchedule.sent_at.is_(None),
+                WarningSchedule.risk_time <= now,
+            ).with_for_update()
+        ).scalars().all()
+        created = 0
+        for source in sources:
+            source_payload = dict(source.payload_json or {})
+            if (
+                source_payload.get("delivery_kind") == "same_day_late_care"
+                or source_payload.get("user_requested_followup")
+            ):
+                continue
+            forecast = session.get(ForecastSnapshot, source.forecast_id)
+            if (
+                forecast is None
+                or not forecast.valid
+                or forecast.forecast_version != source.forecast_version
+            ):
+                continue
+            preference = session.get(
+                ParticipantCarePreference, source.participant_id
+            )
+            if preference is not None and (
+                not preference.care_enabled or not preference.warning_enabled
+            ):
+                continue
+            successful_count = len(
+                session.execute(
+                    select(WarningSchedule.id).where(
+                        WarningSchedule.participant_id == source.participant_id,
+                        WarningSchedule.local_date == local_today,
+                        WarningSchedule.status.in_(self.SUCCESSFUL),
+                    )
+                ).all()
+            )
+            participant_cap = (
+                preference.max_proactive_care_per_day
+                if preference is not None else None
+            )
+            effective_cap = min(
+                self.delivery_policy.max_daily_sends,
+                self.delivery_policy.max_daily_sends
+                if participant_cap is None
+                else max(0, int(participant_cap)),
+            )
+            if successful_count >= effective_cap:
+                continue
+            identity = hashlib.sha256(
+                f"{source.warning_identity}\0same_day_late_care".encode("utf-8")
+            ).hexdigest()
+            existing = session.execute(
+                select(WarningSchedule.id).where(
+                    WarningSchedule.participant_id == source.participant_id,
+                    WarningSchedule.local_date == local_today,
+                    WarningSchedule.warning_identity == identity,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                continue
+            row_id = uuid.uuid4()
+            late_message = (
+                "刚才这一时段的安排比较密集。如果你现在仍在连续处理任务，"
+                "可以先留几分钟缓冲，喝口水或短暂离开屏幕。"
+            )
+            plan = dict(source_payload.get("care_plan") or {})
+            plan.update(
+                {
+                    "intervention_type": "brief_check_in",
+                    "template_id": "same-day-late-care-v1",
+                    "reason_code": "missed_proactive_same_day_care",
+                }
+            )
+            provenance = dict(source_payload.get("care_provenance") or {})
+            provenance.update(
+                {
+                    "source_opportunity_id": str(source.id),
+                    "proactive_risk_time": self._aware(source.risk_time).isoformat(),
+                }
+            )
+            payload = {
+                **source_payload,
+                "message": late_message,
+                "fallback_message": late_message,
+                "delivery_kind": "same_day_late_care",
+                "source_opportunity_id": str(source.id),
+                "care_plan": plan,
+                "care_provenance": provenance,
+            }
+            payload = self._payload_with_source_provenance(
+                payload,
+                warning_id=row_id,
+                forecast_id=source.forecast_id,
+                forecast_version=source.forecast_version,
+            )
+            late_care = WarningSchedule(
+                id=row_id,
+                participant_id=source.participant_id,
+                local_date=local_today,
+                forecast_id=source.forecast_id,
+                forecast_version=source.forecast_version,
+                warning_identity=identity,
+                episode_identity=hashlib.sha256(
+                    f"{source.episode_identity}\0same_day_late_care".encode("utf-8")
+                ).hexdigest(),
+                target_time=now,
+                risk_time=local_end,
+                valid_until=local_end,
+                warning_level=source.warning_level,
+                status="pending",
+                payload_json=payload,
+                next_attempt_at=now,
+                updated_at=now,
+            )
+            session.add(late_care)
+            session.flush()
+            self._mirror_care(session, late_care)
+            created += 1
+        return created
 
     def count_successful_deliveries(
         self, participant_id: uuid.UUID, local_date: date
@@ -1737,7 +1936,7 @@ class WarningScheduleRepository:
         now = self._aware(now)
         with self.database.session() as session:
             expired = session.execute(select(WarningSchedule).where(
-                WarningSchedule.status.in_(("pending", "claimed")),
+                WarningSchedule.status.in_(self.ACTIVE),
                 or_(
                     WarningSchedule.valid_until < now,
                     WarningSchedule.risk_time <= now,
@@ -1750,6 +1949,8 @@ class WarningScheduleRepository:
                 row.lease_until = None
                 row.updated_at = now
                 self._mirror_care(session, row)
+            session.flush()
+            self._materialize_same_day_late_care_in_session(session, now)
             rows = session.execute(
                 select(WarningSchedule).join(
                     ForecastSnapshot, ForecastSnapshot.id == WarningSchedule.forecast_id
@@ -1817,9 +2018,30 @@ class WarningScheduleRepository:
                 if bool(row.payload_json.get("user_requested_followup"))
                 and participant_preference is not None
                 and not participant_preference.allow_follow_up
-                else self._hard_authorization_reason(participant_preference, now)
+                else self._hard_authorization_reason(
+                    participant_preference, now, dict(row.payload_json)
+                )
             )
             if authorization_reason is not None:
+                if (
+                    authorization_reason == "quiet_hours"
+                    and row.payload_json.get("delivery_kind")
+                    == "same_day_late_care"
+                ):
+                    row.status = "pending"
+                    row.claim_token = None
+                    row.claimed_at = None
+                    row.lease_until = None
+                    row.authorized_at = None
+                    retry_at = now + timedelta(minutes=5)
+                    if retry_at >= self._aware(row.risk_time):
+                        row.status = "expired"
+                        row.next_attempt_at = None
+                    else:
+                        row.next_attempt_at = retry_at
+                    row.updated_at = now
+                    self._mirror_care(session, row)
+                    return None
                 row.status = "cancelled"
                 row.claim_token = None
                 row.claimed_at = None
@@ -1964,7 +2186,9 @@ class WarningScheduleRepository:
                 if bool(row.payload_json.get("user_requested_followup"))
                 and preference is not None
                 and not preference.allow_follow_up
-                else self._hard_authorization_reason(preference, now)
+                else self._hard_authorization_reason(
+                    preference, now, dict(row.payload_json)
+                )
             )
             if authorization_reason is not None:
                 row.status = "cancelled"
@@ -2306,7 +2530,16 @@ class BotEventRepository:
                 )
                 session.flush()
             return True
-        except IntegrityError:
+        except IntegrityError as exc:
+            if not _integrity_matches(
+                exc,
+                constraint_names={"bot_events_pkey"},
+                sqlite_columns=("bot_events.event_id",),
+            ):
+                raise
+            with self.database.session() as session:
+                if session.get(BotEvent, event_id) is None:
+                    raise
             return False
 
     def recoverable(self, limit: int = 1000) -> list[RecoverableBotEvent]:

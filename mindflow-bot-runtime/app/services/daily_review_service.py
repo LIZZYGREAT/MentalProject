@@ -255,7 +255,7 @@ class DailyReviewService:
         self, participant_id: uuid.UUID, local_date: date,
         *, response: dict[str, Any] | None = None,
         end_anchor: DailyReviewEndAnchor | None = None,
-        use_response_causal_source: bool = False,
+        use_response_causal_source: bool = True,
     ) -> dict[str, Any]:
         response = response or self.responses.latest(participant_id, local_date)
         if response is None:

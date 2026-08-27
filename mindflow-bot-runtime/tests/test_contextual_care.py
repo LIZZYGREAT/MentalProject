@@ -367,6 +367,64 @@ def test_missing_calendar_state_and_preference_uses_audited_generic_fallback():
     assert 80 <= len(contextual["message"]) <= 220
 
 
+@pytest.mark.parametrize(
+    ("calendar_events", "calendar_degraded", "recent_observation", "quality"),
+    [
+        (_calendar(), False, _observation(energy=3.0, stress=8.0), "full"),
+        (_calendar(), True, None, "partial"),
+        ([], True, None, "degraded"),
+    ],
+)
+def test_tier_three_severity_is_preserved_at_every_context_quality(
+    calendar_events,
+    calendar_degraded,
+    recent_observation,
+    quality,
+):
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        _alert(
+            tier=3,
+            care_action="pause_and_seek_support",
+            current_events=[] if not calendar_events else ["高等数学"],
+            dominant_stressors=[],
+        ),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=calendar_events,
+        calendar_degraded=calendar_degraded,
+        recent_observation=recent_observation,
+        profile=None,
+        profile_version=None,
+    )
+
+    assert contextual["care_context"]["context_quality"] == quality
+    assert contextual["care_plan"]["intervention_type"] == (
+        "pause_and_seek_support"
+    )
+    assert contextual["care_plan"]["template_id"] == "pause-and-support-v1"
+    assert "暂停手头任务" in contextual["message"]
+    if quality == "degraded":
+        assert contextual["care_plan"]["facts_used"] == ("risk_window",)
+        assert "当前可用上下文较少" in contextual["message"]
+        assert "高等数学" not in contextual["message"]
+
+
+def test_tier_one_degraded_context_still_uses_generic_fallback():
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        _alert(current_events=[], dominant_stressors=[]),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=[],
+        calendar_degraded=True,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+    )
+
+    assert contextual["care_context"]["context_quality"] == "degraded"
+    assert contextual["care_plan"]["intervention_type"] == "generic_fallback"
+
+
 def test_unreviewed_profile_preference_is_never_injected_into_message():
     contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
         _alert(),

@@ -18,7 +18,7 @@ from app.services.forecast_coordinator import (
     classified_calendar_events,
 )
 from app.services.pressure_curve_service import PressureCurveService
-from helpers import memory_database, warning_repository
+from helpers import memory_database, seed_calendar_snapshot, warning_repository
 from services.event_lifecycle import prepare_event_instances
 from services.event_semantics import DIMENSIONS, validate_course_match
 from settings.visual_defaults import EVENT_COLOR_MAP
@@ -314,7 +314,8 @@ def test_historical_pressure_curve_uses_persisted_classification():
         output={"classified_calendar_events": [classified]},
     )
     calendars = CalendarSnapshotRepository(database)
-    calendars.upsert(
+    seed_calendar_snapshot(
+        database,
         participant.id,
         target,
         revision="changed-calendar",

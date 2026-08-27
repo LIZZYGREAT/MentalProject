@@ -37,15 +37,6 @@ class CareMessagePlan:
 
 class CareInterventionPolicy:
     def plan(self, context: CareContext) -> CareMessagePlan:
-        if context.context_quality == "degraded":
-            return self._plan(
-                context,
-                intervention_type="generic_fallback",
-                template_id="generic-fallback-v1",
-                reason_code="insufficient_context",
-                action_minutes=5,
-            )
-
         level = self._level(context.warning_level)
         if level >= 3 or context.care_action == "pause_and_seek_support":
             return self._plan(
@@ -54,6 +45,15 @@ class CareInterventionPolicy:
                 template_id="pause-and-support-v1",
                 reason_code="very_high_predicted_pressure",
                 action_minutes=10,
+            )
+
+        if context.context_quality == "degraded":
+            return self._plan(
+                context,
+                intervention_type="generic_fallback",
+                template_id="generic-fallback-v1",
+                reason_code="insufficient_context",
+                action_minutes=5,
             )
 
         dense = self._dense_transition(context)

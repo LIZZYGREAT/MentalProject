@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any
 from urllib.parse import quote
@@ -102,7 +102,7 @@ class CalendarService:
     ) -> list[dict[str, Any]]:
         if start_time.tzinfo is None or end_time.tzinfo is None:
             raise ValueError("calendar times must include a timezone")
-        if end_time <= start_time or (end_time - start_time).days > 31:
+        if end_time <= start_time or end_time - start_time > timedelta(days=31):
             raise ValueError("calendar range must be positive and no longer than 31 days")
         token = await self.tokens.get_access_token(participant_id)
         headers = {"Authorization": f"Bearer {token}"}
@@ -160,7 +160,7 @@ class CalendarService:
             raise ValueError("calendar event summary must be 1-200 characters")
         if start_time.tzinfo is None or end_time.tzinfo is None:
             raise ValueError("calendar times must include a timezone")
-        if end_time <= start_time or (end_time - start_time).days > 31:
+        if end_time <= start_time or end_time - start_time > timedelta(days=31):
             raise ValueError("calendar event range must be positive and no longer than 31 days")
         if reminder_minutes is not None and not 0 <= int(reminder_minutes) <= 1440:
             raise ValueError("calendar reminder must be between 0 and 1440 minutes")
@@ -254,7 +254,7 @@ class CalendarService:
         if start_time is not None and end_time is not None:
             if start_time.tzinfo is None or end_time.tzinfo is None:
                 raise ValueError("calendar times must include a timezone")
-            if end_time <= start_time or (end_time - start_time).days > 31:
+            if end_time <= start_time or end_time - start_time > timedelta(days=31):
                 raise ValueError("calendar event range must be positive and no longer than 31 days")
         if summary is not None and not 1 <= len(str(summary).strip()) <= 200:
             raise ValueError("calendar event summary must be 1-200 characters")

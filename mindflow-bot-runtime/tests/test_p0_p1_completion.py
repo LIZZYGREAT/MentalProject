@@ -1011,47 +1011,65 @@ class _MutationCalendar:
         return {"id": event_id, "deleted": True}
 
 
+class _RecordingMutationQueue:
+    def __init__(self):
+        self.requests = []
+
+    def enqueue(self, participant_id, dates, *, reason):
+        self.requests.append((participant_id, dict(dates), reason))
+        return True
+
+
 def _mutation_tools():
     coordinator = _MutationCoordinator()
+    mutation_refresh = _RecordingMutationQueue()
     tools = CareTools(
         None, None, _MutationCalendar(), None, "Asia/Shanghai",
-        coordinator,
+        coordinator, mutation_refresh=mutation_refresh,
     )
     ctx = AgentContext(uuid.uuid4(), "P", "ou", "oc", "message", uuid.uuid4())
-    return tools, coordinator, ctx
+    return tools, coordinator, mutation_refresh, ctx
 
 
-def test_calendar_create_triggers_forecast_refresh():
-    tools, coordinator, ctx = _mutation_tools()
+def test_calendar_create_queues_forecast_refresh():
+    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
     result = asyncio.run(tools.create_calendar_event(ctx, {
         "summary": "复盘",
         "start_time": "2030-01-15T09:00:00+08:00",
         "end_time": "2030-01-15T10:00:00+08:00",
     }))
-    assert result["forecast_refreshed_dates"] == ["2030-01-15"]
-    assert coordinator.calls[0][2] == "calendar_create_event"
-    assert coordinator.calls[0][3]["refresh_calendar"] is True
+    assert result["forecast_refresh"] == "queued"
+    assert result["forecast_refresh_queued_dates"] == ["2030-01-15"]
+    assert coordinator.calls == []
+    assert mutation_refresh.requests == [
+        (ctx.participant_id, {date(2030, 1, 15): True}, "calendar_create_event")
+    ]
 
 
-def test_calendar_update_triggers_forecast_refresh_and_handles_cross_date():
-    tools, coordinator, ctx = _mutation_tools()
+def test_calendar_update_queues_refresh_for_old_and_new_dates():
+    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
     result = asyncio.run(tools.update_calendar_event(ctx, {
         "event_id": "e1",
         "start_time": "2030-01-16T09:00:00+08:00",
         "end_time": "2030-01-16T10:00:00+08:00",
     }))
-    assert result["forecast_refreshed_dates"] == ["2030-01-15", "2030-01-16"]
-    assert {call[2] for call in coordinator.calls} == {"calendar_update_event"}
+    assert result["forecast_refresh_queued_dates"] == ["2030-01-15", "2030-01-16"]
+    assert coordinator.calls == []
+    assert mutation_refresh.requests[0][1] == {
+        date(2030, 1, 15): True,
+        date(2030, 1, 16): True,
+    }
 
 
-def test_calendar_delete_triggers_forecast_refresh():
-    tools, coordinator, ctx = _mutation_tools()
+def test_calendar_delete_queues_forecast_refresh():
+    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
     result = asyncio.run(tools.delete_calendar_event(ctx, {
         "event_id": "e1",
         "confirmed": True,
     }))
-    assert result["forecast_refreshed_dates"] == ["2030-01-15"]
-    assert coordinator.calls[0][2] == "calendar_delete_event"
+    assert result["forecast_refresh_queued_dates"] == ["2030-01-15"]
+    assert coordinator.calls == []
+    assert mutation_refresh.requests[0][2] == "calendar_delete_event"
 
 
 def test_calendar_mutation_reschedules_warning():
@@ -1073,14 +1091,17 @@ def test_calendar_mutation_reschedules_warning():
 
     calendar.get_event = get_event
     calendar.delete_event = delete_event
+    mutation_refresh = _RecordingMutationQueue()
     tools = CareTools(
-        None, None, calendar, None, "Asia/Shanghai", coordinator
+        None, None, calendar, None, "Asia/Shanghai", coordinator,
+        mutation_refresh=mutation_refresh,
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "message", uuid.uuid4())
     result = asyncio.run(tools.delete_calendar_event(ctx, {
         "event_id": old_event["id"],
         "confirmed": True,
     }))
-    assert result["forecast_refreshed_dates"] == ["2030-01-15"]
+    assert result["forecast_refresh_queued_dates"] == ["2030-01-15"]
+    assert mutation_refresh.requests[0][2] == "calendar_delete_event"
     with database.session() as session:
         assert session.query(WarningSchedule).one().status == "cancelled"

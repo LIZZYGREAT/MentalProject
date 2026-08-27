@@ -27,7 +27,7 @@ from app.services.forecast_coordinator import ForecastCoordinator, _sha
 from app.services.forecast_scheduler import ForecastScheduler
 from app.services.warning_policy import WarningPolicy
 from app.tools.care import CareTools
-from helpers import memory_database
+from helpers import memory_database, seed_calendar_snapshot
 from services.semantic_model_inputs import semantic_model_inputs
 from services.event_semantics import DIMENSIONS, validate_external_semantics
 from tests.test_forecast_pipeline import build_pipeline, event
@@ -139,7 +139,8 @@ def test_forecast_save_rejects_observation_revision_that_lost_a_race():
         timezone.utc
     )
     day_end = day_start + timedelta(days=1)
-    snapshots.upsert(
+    seed_calendar_snapshot(
+        database,
         participant.id,
         target,
         revision="calendar-current",
@@ -382,14 +383,14 @@ def test_invalid_appraisal_is_not_cached_and_rules_remain_available(caplog):
         [event()], consent=True, client=Client()
     )
     cache_put_calls = 0
-    original_put = preprocessor.cache.put
+    original_put = preprocessor.cache.put_complete
 
     def count_put(*args, **kwargs):
         nonlocal cache_put_calls
         cache_put_calls += 1
         return original_put(*args, **kwargs)
 
-    preprocessor.cache.put = count_put
+    preprocessor.cache.put_complete = count_put
 
     async def scenario():
         prepared, _, status, misses = preprocessor.prepare(
@@ -404,7 +405,7 @@ def test_invalid_appraisal_is_not_cached_and_rules_remain_available(caplog):
     asyncio.run(scenario())
     assert cache_put_calls == 0
     assert "semantic_enrichment_failed" in caplog.text
-    assert "error_class=ValueError" in caplog.text
+    assert "error_class=SemanticResponseMalformedError" in caplog.text
 
 
 def test_semantic_tasks_are_cleaned_and_close_is_bounded():
@@ -759,7 +760,11 @@ def test_warning_can_send_slightly_late_but_expires_at_risk_time():
         row = session.get(WarningSchedule, warning_id)
         row.status = "pending"
         row.next_attempt_at = TEST_NOW
-    assert warnings.pending(TEST_NOW + timedelta(minutes=15)) == []
+    late_due = warnings.pending(TEST_NOW + timedelta(minutes=15))
+    assert len(late_due) == 1
+    assert late_due[0]["id"] != str(warning_id)
+    assert late_due[0]["payload"]["delivery_kind"] == "same_day_late_care"
+    assert "即将" not in late_due[0]["payload"]["message"]
     with database.session() as session:
         assert session.get(WarningSchedule, warning_id).status == "expired"
 
@@ -790,6 +795,9 @@ def test_warning_retry_crossing_risk_time_expires_instead_of_rescheduling():
         row = session.get(WarningSchedule, warning_id)
         assert row.status == "expired"
         assert row.next_attempt_at is None
+    late_due = warnings.pending(TEST_NOW + timedelta(seconds=30))
+    assert len(late_due) == 1
+    assert late_due[0]["payload"]["source_opportunity_id"] == str(warning_id)
 
 
 def test_delivery_authorization_rechecks_risk_time_after_claim_race():

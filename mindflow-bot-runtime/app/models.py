@@ -320,6 +320,52 @@ class CalendarSnapshot(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class CalendarMutationReconciliation(Base):
+    """Durable local work required after a remote Calendar mutation commits."""
+
+    __tablename__ = "calendar_mutation_reconciliations"
+    __table_args__ = (
+        Index(
+            "ix_calendar_mutation_reconciliation_due",
+            "status",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_calendar_mutation_reconciliation_participant",
+            "participant_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    mutation_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    work_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class EventSemanticCache(Base):
     __tablename__ = "event_semantic_cache"
     __table_args__ = (

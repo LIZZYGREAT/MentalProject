@@ -187,10 +187,24 @@ def finalize_event_classification(
 
     result["event_type"] = event_type
     result["task_type"] = task_type
+    course_context = classification.get("course_catalog_context") or {}
+    allowed_course_candidates = {
+        (
+            str(candidate.get("canonical_name") or ""),
+            str(candidate.get("code") or ""),
+        )
+        for candidate in course_context.get("candidates") or []
+        if isinstance(candidate, Mapping)
+    }
     if (
         external_course_match
         and external_course_match.get("matched")
         and not course_identity_locked
+        and (
+            str(external_course_match.get("canonical_name") or ""),
+            str(external_course_match.get("code") or ""),
+        )
+        in allowed_course_candidates
     ):
         candidate = CourseCandidate(
             canonical_name=str(external_course_match["canonical_name"]),
@@ -203,7 +217,6 @@ def finalize_event_classification(
             local_score=float(external_course_match.get("confidence") or 0.0),
             match_reasons=("semantic_api_candidate",),
         )
-        course_context = classification.get("course_catalog_context") or {}
         _apply_course_identity(
             result,
             candidate,

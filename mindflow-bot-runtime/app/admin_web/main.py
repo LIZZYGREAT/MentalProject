@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -29,6 +31,7 @@ def create_app(
     settings: Settings,
     pressure_curves: PressureCurveService | None = None,
     daily_reviews: DailyReviewService | None = None,
+    dependency_refresh: Any = None,
 ) -> Starlette:
     settings.validate_admin()
     admin_users = AdminUserRepository(database)
@@ -58,7 +61,18 @@ def create_app(
             Route("/admin/{path:path}", frontend, methods=["GET"]),
         ]
     )
-    return Starlette(debug=False, routes=routes)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        if dependency_refresh is not None:
+            dependency_refresh.start()
+        try:
+            yield
+        finally:
+            if dependency_refresh is not None:
+                await dependency_refresh.close()
+
+    return Starlette(debug=False, routes=routes, lifespan=lifespan)
 
 
 def main() -> None:
@@ -70,7 +84,11 @@ def main() -> None:
         database, settings, AgentRunRepository(database)
     )
     app = create_app(
-        database, settings, services.pressure_curves, services.daily_reviews
+        database,
+        settings,
+        services.pressure_curves,
+        services.daily_reviews,
+        services.dependency_refresh,
     )
     uvicorn.run(app, host=settings.admin_host, port=settings.admin_port)
 

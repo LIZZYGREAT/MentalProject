@@ -14,7 +14,7 @@ from entry.class_info_data import CLASS_INFO_DICT
 from entry.course_aliases import COURSE_ALIASES
 
 
-COURSE_RESOLVER_VERSION = "course_catalog_resolver.v3"
+COURSE_RESOLVER_VERSION = "course_catalog_resolver.v4"
 _PUNCTUATION = re.compile(r"[\s·•,，。.!！?？:：;；_—–－()（）\[\]【】{}《》<>]+")
 _COURSE_SUFFIX = re.compile(r"(?:课程|上课|课堂|课)$", flags=re.IGNORECASE)
 _CONTROLLED_ALIAS_SUFFIXES = {
@@ -74,6 +74,7 @@ class CourseResolution:
     candidates: tuple[CourseCandidate, ...]
     exact_match: CourseCandidate | None
     alias_match_kind: str | None
+    identity_constraints: Mapping[str, str]
     catalog_revision: str
     resolver_version: str = COURSE_RESOLVER_VERSION
 
@@ -96,6 +97,7 @@ class CourseResolution:
             "expanded_query": self.expanded_query,
             "alias": self.alias,
             "alias_match_kind": self.alias_match_kind,
+            "identity_constraints": dict(self.identity_constraints),
             "strong_course_evidence": self.strong_course_evidence,
             "candidates": [candidate.to_dict() for candidate in self.candidates],
         }
@@ -188,6 +190,16 @@ class CourseCatalogResolver:
             scored.append((score, canonical_name, candidate))
 
         scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+        identity_constraints: dict[str, str] = {}
+        if alias_match_kind == "controlled_variant":
+            variant = alias_suffix[:1].upper()
+            identity_constraints["variant"] = variant
+            marker = normalize_course_text(f"{variant}类")
+            scored = [
+                item
+                for item in scored
+                if marker in normalize_course_text(item[1])
+            ]
         candidates = tuple(item[2] for item in scored[: self.max_candidates])
         if exact_match is None and candidates:
             top = candidates[0]
@@ -206,6 +218,7 @@ class CourseCatalogResolver:
             candidates=candidates,
             exact_match=exact_match,
             alias_match_kind=alias_match_kind,
+            identity_constraints=identity_constraints,
             catalog_revision=self.catalog_revision,
         )
 

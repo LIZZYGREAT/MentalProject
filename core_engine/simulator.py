@@ -364,25 +364,6 @@ class Simulator:
                 )
 
             previous = latent
-            latent, diagnostics = step_latent_state(
-                latent,
-                dynamic_inputs,
-                current_time=current_time,
-                dt_minutes=self.time_step,
-                stress_baseline=stress_baseline,
-                sleep_debt_hours=sleep_debt,
-                config=ctssm_cfg,
-                sleeping=sleeping,
-                model_variant=model_variant,
-            )
-            uncertainty = step_uncertainty(
-                uncertainty,
-                diagnostics=diagnostics,
-                dt_minutes=self.time_step,
-                config=ctssm_cfg,
-                model_variant=model_variant,
-            )
-
             observation_applied = False
             for observation in observations_by_time.get(
                 current_observation_key, []
@@ -401,8 +382,32 @@ class Simulator:
                         f"[{cur_str}] 忽略无法解析的 EMA 观测。"
                     )
 
+            # A trajectory point is the posterior state at its timestamp.
+            # Propagation with inputs at t advances a separate terminal state
+            # over [t, t + dt), which becomes the next trajectory point.
+            point_latent = latent
+            point_uncertainty = uncertainty
+            latent, diagnostics = step_latent_state(
+                point_latent,
+                dynamic_inputs,
+                current_time=current_time,
+                dt_minutes=self.time_step,
+                stress_baseline=stress_baseline,
+                sleep_debt_hours=sleep_debt,
+                config=ctssm_cfg,
+                sleeping=sleeping,
+                model_variant=model_variant,
+            )
+            uncertainty = step_uncertainty(
+                point_uncertainty,
+                diagnostics=diagnostics,
+                dt_minutes=self.time_step,
+                config=ctssm_cfg,
+                model_variant=model_variant,
+            )
+
             if not wake_recorded and current_time >= schedule["wake_time"]:
-                wake_s = latent.stress
+                wake_s = point_latent.stress
                 wake_recorded = True
                 trace_logs.append(
                     f"[{cur_str}] 清晨潜在压力参考={wake_s:.1f}"
@@ -440,21 +445,21 @@ class Simulator:
                     * dt_hours
                 )
 
-            delta_s = latent.stress - previous.stress
-            delta_v = latent.vitality - previous.vitality
+            delta_s = point_latent.stress - previous.stress
+            delta_v = point_latent.vitality - previous.vitality
             stress_interval = prediction_interval(
-                latent.stress,
-                uncertainty.stress_variance,
+                point_latent.stress,
+                point_uncertainty.stress_variance,
                 lower_bound=0.0,
                 upper_bound=100.0,
             )
             vitality_interval = prediction_interval(
-                latent.vitality,
-                uncertainty.vitality_variance,
+                point_latent.vitality,
+                point_uncertainty.vitality_variance,
                 lower_bound=0.0,
                 upper_bound=100.0,
             )
-            if latent.stress <= 0.001 or latent.stress >= 99.999:
+            if point_latent.stress <= 0.001 or point_latent.stress >= 99.999:
                 boundary_hits += 1
             dominant_stressors = [
                 item["name"]
@@ -476,16 +481,16 @@ class Simulator:
             results.append(
                 {
                     "time": cur_str,
-                    "S": latent.stress,
-                    "V": latent.vitality,
-                    "E": latent.vitality,
-                    "P": latent.perseverative_cognition,
-                    "F": latent.recovery_debt,
+                    "S": point_latent.stress,
+                    "V": point_latent.vitality,
+                    "E": point_latent.vitality,
+                    "P": point_latent.perseverative_cognition,
+                    "F": point_latent.recovery_debt,
                     "state": state_name,
                     "delta_S": delta_s,
                     "delta_V": delta_v,
                     "delta_E": delta_v,
-                    "f_pen": latent.recovery_debt,
+                    "f_pen": point_latent.recovery_debt,
                     "continuous_hours": continuous_load_hours,
                     "current_events": list(
                         dynamic_inputs.active_event_names
@@ -526,10 +531,10 @@ class Simulator:
                         else None
                     ),
                     "stress_label": stress_semantic_label(
-                        latent.stress
+                        point_latent.stress
                     ),
                     "vitality_label": vitality_semantic_label(
-                        latent.vitality
+                        point_latent.vitality
                     ),
                     "observation_assimilated": observation_applied,
                 }

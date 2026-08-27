@@ -42,6 +42,42 @@ DIMENSIONS = (
 )
 
 
+class SemanticError(ValueError):
+    """Base class for failures with an explicit semantic-enrichment meaning."""
+
+
+class SemanticProviderError(SemanticError):
+    """The external provider could not return a usable response."""
+
+
+class SemanticResponseMalformedError(SemanticProviderError):
+    """The provider response violated the documented JSON contract."""
+
+
+class SemanticContentRejected(SemanticError):
+    """A valid response is not reliable enough for this specific event."""
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        confidence: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = str(reason)
+        self.confidence = confidence
+
+
+class SemanticLowConfidence(SemanticContentRejected):
+    def __init__(self, confidence: float) -> None:
+        super().__init__(
+            "low_confidence",
+            "semantic API confidence below 0.55",
+            confidence=confidence,
+        )
+
+
 def _clamp(value: Any, default: float = 0.0) -> float:
     try:
         number = float(value)
@@ -355,41 +391,59 @@ def validate_external_semantics(
     raw: Mapping[str, Any],
 ) -> tuple[Dict[str, float], float, list[str], str]:
     if not isinstance(raw, Mapping):
-        raise ValueError("semantic API response must be an object")
+        raise SemanticResponseMalformedError("semantic API response must be an object")
     try:
         appraisal = float(raw["appraisal_score_1_10"])
     except KeyError as exc:
-        raise ValueError("semantic API appraisal_score_1_10 is required") from exc
+        raise SemanticResponseMalformedError(
+            "semantic API appraisal_score_1_10 is required"
+        ) from exc
     except (TypeError, ValueError) as exc:
-        raise ValueError("semantic API appraisal_score_1_10 must be numeric") from exc
+        raise SemanticResponseMalformedError(
+            "semantic API appraisal_score_1_10 must be numeric"
+        ) from exc
     if not math.isfinite(appraisal) or not 1.0 <= appraisal <= 10.0:
-        raise ValueError("semantic API appraisal_score_1_10 must be finite and within [1,10]")
+        raise SemanticResponseMalformedError(
+            "semantic API appraisal_score_1_10 must be finite and within [1,10]"
+        )
     candidate = raw.get("values", raw)
     if not isinstance(candidate, Mapping):
-        raise ValueError("semantic API values must be an object")
+        raise SemanticResponseMalformedError("semantic API values must be an object")
     missing = [key for key in DIMENSIONS if key not in candidate]
     if missing:
-        raise ValueError(f"semantic API response missing: {','.join(missing)}")
+        raise SemanticResponseMalformedError(
+            f"semantic API response missing: {','.join(missing)}"
+        )
     values: Dict[str, float] = {}
     for key in DIMENSIONS:
         try:
             value = float(candidate[key])
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"semantic API {key} must be numeric") from exc
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"semantic API {key} must be within [0,1]")
+            raise SemanticResponseMalformedError(
+                f"semantic API {key} must be numeric"
+            ) from exc
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise SemanticResponseMalformedError(
+                f"semantic API {key} must be finite and within [0,1]"
+            )
         values[key] = value
     try:
         confidence = float(raw.get("confidence", candidate.get("confidence", 0.0)))
     except (TypeError, ValueError) as exc:
-        raise ValueError("semantic API confidence must be numeric") from exc
-    if not 0.0 <= confidence <= 1.0:
-        raise ValueError("semantic API confidence must be within [0,1]")
+        raise SemanticResponseMalformedError(
+            "semantic API confidence must be numeric"
+        ) from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise SemanticResponseMalformedError(
+            "semantic API confidence must be finite and within [0,1]"
+        )
     if confidence < 0.55:
-        raise ValueError("semantic API confidence below 0.55")
+        raise SemanticLowConfidence(confidence)
     raw_tags = raw.get("evidence_tags", [])
     if not isinstance(raw_tags, list):
-        raise ValueError("semantic API evidence_tags must be an array")
+        raise SemanticResponseMalformedError(
+            "semantic API evidence_tags must be an array"
+        )
     evidence_tags = [
         str(item).strip()[:48]
         for item in raw_tags[:6]
@@ -404,7 +458,9 @@ def validate_event_classification(raw: Mapping[str, Any]) -> dict[str, Any] | No
     if candidate is None:
         return None
     if not isinstance(candidate, Mapping):
-        raise ValueError("semantic API event_classification must be an object")
+        raise SemanticResponseMalformedError(
+            "semantic API event_classification must be an object"
+        )
     event_type = str(candidate.get("event_type") or "").strip().lower()
     allowed_types = {
         "course",
@@ -418,7 +474,9 @@ def validate_event_classification(raw: Mapping[str, Any]) -> dict[str, Any] | No
         "other",
     }
     if event_type not in allowed_types:
-        raise ValueError("semantic API event_classification.event_type is invalid")
+        raise SemanticResponseMalformedError(
+            "semantic API event_classification.event_type is invalid"
+        )
     task_type = str(candidate.get("task_type") or "general").strip().lower()
     allowed_tasks = {"general", "homework", "ddl", "exam", "meeting", "course"}
     if event_type == "course":
@@ -426,7 +484,9 @@ def validate_event_classification(raw: Mapping[str, Any]) -> dict[str, Any] | No
     elif event_type != "task":
         task_type = "general"
     elif task_type not in allowed_tasks:
-        raise ValueError("semantic API event_classification.task_type is invalid")
+        raise SemanticResponseMalformedError(
+            "semantic API event_classification.task_type is invalid"
+        )
     confidence = _validated_confidence(
         candidate.get("confidence"), "event_classification.confidence"
     )
@@ -445,10 +505,14 @@ def validate_course_match(
     if match is None:
         return _unmatched_course()
     if not isinstance(match, Mapping):
-        raise ValueError("semantic API course_match must be an object")
+        raise SemanticResponseMalformedError(
+            "semantic API course_match must be an object"
+        )
     matched = match.get("matched")
     if not isinstance(matched, bool):
-        raise ValueError("semantic API course_match.matched must be boolean")
+        raise SemanticResponseMalformedError(
+            "semantic API course_match.matched must be boolean"
+        )
     if not matched:
         unmatched = _unmatched_course()
         if match.get("rejected") == "candidate_out_of_bounds":
@@ -487,9 +551,19 @@ def _validated_confidence(
     try:
         confidence = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"semantic API {name} must be numeric") from exc
-    if not math.isfinite(confidence) or not minimum <= confidence <= 1.0:
-        raise ValueError(f"semantic API {name} must be within [{minimum},1]")
+        raise SemanticResponseMalformedError(
+            f"semantic API {name} must be numeric"
+        ) from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise SemanticResponseMalformedError(
+            f"semantic API {name} must be finite and within [0,1]"
+        )
+    if confidence < minimum:
+        raise SemanticContentRejected(
+            f"{name.replace('.', '_')}_low_confidence",
+            f"semantic API {name} below {minimum}",
+            confidence=confidence,
+        )
     return confidence
 
 
@@ -595,17 +669,27 @@ class OpenAICompatibleSemanticClient:
             body["thinking"] = {
                 "type": "enabled" if self.thinking else "disabled"
             }
-        response = requests.post(
-            self.url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = requests.post(
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise SemanticProviderError(
+                f"semantic provider request failed: {type(exc).__name__}"
+            ) from exc
+        try:
+            data = response.json()
+        except (requests.JSONDecodeError, ValueError) as exc:
+            raise SemanticResponseMalformedError(
+                "semantic API response body is not JSON"
+            ) from exc
         if isinstance(data, Mapping) and all(key in data for key in DIMENSIONS):
             return data
         content = data.get("output_text") if isinstance(data, Mapping) else None
@@ -619,7 +703,21 @@ class OpenAICompatibleSemanticClient:
                 for item in content
             )
         if not isinstance(content, str):
-            raise ValueError("semantic API response has no JSON content")
+            raise SemanticResponseMalformedError(
+                "semantic API response has no JSON content"
+            )
         if not content.strip():
-            raise ValueError("semantic API returned empty JSON content")
-        return json.loads(content)
+            raise SemanticResponseMalformedError(
+                "semantic API returned empty JSON content"
+            )
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise SemanticResponseMalformedError(
+                "semantic API content is not valid JSON"
+            ) from exc
+        if not isinstance(parsed, Mapping):
+            raise SemanticResponseMalformedError(
+                "semantic API JSON content must be an object"
+            )
+        return parsed

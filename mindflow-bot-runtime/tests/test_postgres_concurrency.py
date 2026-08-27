@@ -34,6 +34,7 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.forecast_coordinator import _sha
 
@@ -302,7 +303,8 @@ def test_postgres_observation_save_race_never_leaves_stale_forecast_valid(
         local_date, datetime.min.time(), timezone_value
     ).astimezone(timezone.utc)
     day_end = day_start + timedelta(days=1)
-    calendars.upsert(
+    seed_calendar_snapshot(
+        postgres_database,
         participant.id,
         local_date,
         revision="calendar-current",
@@ -368,7 +370,8 @@ def test_postgres_calendar_mutation_race_never_reactivates_old_revision(
     calendars = CalendarSnapshotRepository(postgres_database)
     now = datetime.now(timezone.utc)
     local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
-    calendars.upsert(
+    seed_calendar_snapshot(
+        postgres_database,
         participant.id,
         local_date,
         revision="calendar-before-mutation",
@@ -434,7 +437,8 @@ def test_postgres_provider_readback_cas_cannot_cross_calendar_mutation(
     local_date = datetime.now(timezone.utc).astimezone(
         ZoneInfo("Asia/Shanghai")
     ).date()
-    calendars.upsert(
+    seed_calendar_snapshot(
+        postgres_database,
         participant.id,
         local_date,
         revision="calendar-before-provider-read",
@@ -443,7 +447,6 @@ def test_postgres_provider_readback_cas_cannot_cross_calendar_mutation(
     )
     expected = calendars.get(participant.id, local_date)
     barrier = threading.Barrier(2)
-    provider_rejected = []
 
     def commit_provider_result():
         barrier.wait()
@@ -470,7 +473,7 @@ def test_postgres_provider_readback_cas_cannot_cross_calendar_mutation(
                     empty_revision="empty",
                 )
         except ForecastInputChangedError:
-            provider_rejected.append(True)
+            pass
 
     def mutate_calendar():
         barrier.wait()
@@ -492,7 +495,6 @@ def test_postgres_provider_readback_cas_cannot_cross_calendar_mutation(
     final = calendars.get(participant.id, local_date)
     assert final["snapshot_state"] == "mutation_refresh_pending"
     assert final["calendar_revision"].startswith("mutation:")
-    assert provider_rejected in ([], [True])
 
 
 def test_postgres_daily_review_disable_and_claim_race_ends_cancelled(

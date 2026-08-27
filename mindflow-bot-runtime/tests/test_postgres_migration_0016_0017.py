@@ -1,4 +1,4 @@
-"""Opt-in proof that the real 0016 -> 0017 PostgreSQL migration is executable."""
+"""Opt-in proof that the real 0016 -> 0018 PostgreSQL migrations are executable."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from app.db import build_engine
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_postgres_upgrade_0016_to_0017_preserves_and_backfills():
+def test_real_postgres_upgrade_0016_to_0018_preserves_and_backfills():
     raw_url = os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip()
     if not raw_url:
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
@@ -261,6 +261,32 @@ def test_real_postgres_upgrade_0016_to_0017_preserves_and_backfills():
                 and key["referred_table"] == "care_intervention_events"
                 for key in foreign_keys
             )
+
+            command.upgrade(config, "0018_calendar_mutation_reconciliation")
+
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0018_calendar_mutation_reconciliation"
+            inspector = inspect(connection)
+            assert "calendar_mutation_reconciliations" in inspector.get_table_names()
+            reconciliation_columns = {
+                column["name"]
+                for column in inspector.get_columns(
+                    "calendar_mutation_reconciliations"
+                )
+            }
+            assert {
+                "participant_id",
+                "mutation_kind",
+                "status",
+                "affected_dates_json",
+                "direct_dates_json",
+                "refresh_dates_json",
+                "dependency_dates_json",
+                "next_attempt_at",
+                "attempt_count",
+                "last_error",
+            } <= reconciliation_columns
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

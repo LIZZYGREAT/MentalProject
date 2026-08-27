@@ -1169,24 +1169,52 @@ def test_card_priority_keeps_risk_peak_and_warning_visible_among_many_events():
     assert "主动关怀提醒窗口" in text
 
 
-def test_calendar_mutation_refresh_failure_is_degraded_success_metadata():
+def test_calendar_mutation_invalidation_failure_is_reported_before_queueing():
+    queued = []
+
+    class Forecasts:
+        def invalidate_for_calendar_mutation_dates(
+            self, _warnings, _participant_id, targets, *, reason
+        ):
+            assert set(targets) == {date(2030, 1, 15), date(2030, 1, 16)}
+            raise RuntimeError("invalidation failed")
+
     class Coordinator:
-        async def ensure_forecast(self, _participant_id, target, _reason, **_kwargs):
-            if target.day == 16:
-                raise RuntimeError("forecast failed")
-            return {"ok": True}
+        warnings = object()
+
+    class MutationRefresh:
+        def enqueue(
+            self, _participant_id, dates, *, reason, invalidation_dates
+        ):
+            queued.append((dict(dates), reason, set(invalidation_dates)))
+            return True
 
     tools = object.__new__(CareTools)
     tools.forecast_coordinator = Coordinator()
+    tools.forecast_snapshots = Forecasts()
+    tools.mutation_refresh = MutationRefresh()
     tools.timezone = ZoneInfo("Asia/Shanghai")
     result = asyncio.run(tools._refresh_calendar_mutation_forecasts(
         "participant", {date(2030, 1, 15), date(2030, 1, 16)}, "mutation"
     ))
     assert result["forecast_refresh"] == "partial"
     assert result["forecast_refresh_degraded"] is True
-    assert result["forecast_refreshed_dates"] == ["2030-01-15"]
+    assert result["forecast_refreshed_dates"] == []
+    assert result["forecast_refresh_queued_dates"] == [
+        "2030-01-15", "2030-01-16"
+    ]
+    assert result["forecast_invalidation"] == "failed"
+    assert result["forecast_invalidation_retry"] is True
     assert result["forecast_refresh_errors"] == [
+        {"local_date": "2030-01-15", "error_class": "RuntimeError"},
         {"local_date": "2030-01-16", "error_class": "RuntimeError"}
+    ]
+    assert queued == [
+        (
+            {date(2030, 1, 15): True, date(2030, 1, 16): True},
+            "mutation",
+            {date(2030, 1, 15), date(2030, 1, 16)},
+        )
     ]
 
 

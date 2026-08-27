@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v6 -->
-<!-- ALEMBIC_HEAD: 0017_care_delivery_authorization -->
+<!-- ALEMBIC_HEAD: 0018_calendar_mutation_reconciliation -->
 
 ## 运行边界
 
@@ -40,6 +40,20 @@ read-back 超时会抛出明确异常，不保存新 Forecast，也不会恢复�
 状态回到 `current`。每次 provider read 都携带读前 snapshot id、revision 和 state；成功与
 失败写回均在 `Participant -> CalendarSnapshot` 锁顺序下执行 CAS。mutation 前启动的旧请求
 不能覆盖新的 pending marker，也不能把旧 Calendar 重新发布为 current/degraded。
+多日事件按 `[start, end)` 覆盖全部本地日期；recurrence mutation 只检查数据库中已经存在
+有效 Forecast 的日期，并按系统允许生成的 DAILY/WEEKLY/MONTHLY/YEARLY 子集匹配旧规则与
+新规则的并集，不会预展开无限 recurrence。外部 Calendar 中超出该 reviewed subset 的规则
+不会被静默误解释，而会保守失效 DTSTART 之后已持久化的有效 Forecast。Calendar 事件持续
+时间严格限制为 `0 < duration <= 31 days`。带 `COUNT` 的规则通过目标日期的有界 occurrence
+序号判断，不生成目标之后的日期；recurrence-only PATCH 即使 provider 只返回部分字段，也会
+按“用户显式值 → provider 非空值 → mutation 前事件”合成完整逻辑事件后计算影响范围。
+
+Calendar mutation 在用户请求返回前用单一事务批量 fail-close 全部直接受影响的
+Forecast/Warning；重算由托管
+队列在后台执行，按参与者保持日期顺序、跨参与者限制并发并支持去重与 shutdown，避免周期
+事件影响日期数量线性增加用户请求时长。瞬时批量失效或 Today→Tomorrow dependency 失效
+失败会在同一托管队列中有限重试，成功后才开始对应 Forecast 重算。服务重启后仍为 invalid
+的日期由后续查询惰性恢复。
 
 Today Forecast terminal 是 Tomorrow initial state 的依赖。直接修改 Today Calendar 时，
 Today 使用 Calendar mutation invalidation；Tomorrow 只做 Forecast dependency dirty，不修改
@@ -59,7 +73,8 @@ Tomorrow 解析 Today terminal 时使用 `refresh_calendar=False`；Today 无快
 为 course，但 canonical identity 仍由 API 从 Top-K 候选中选择；“线代”精确解析为“线性
 代数”时才锁定 identity。API 返回的课程必须属于候选集合。
 
-`高数A/高数B` 只提高相应类别候选排序。`高数I/II/1/2/3` 仅作为模糊检索提示，不会用
+`高数A/高数B` 会分别把 semantic candidate set 限制为 A/B-compatible 课程，API 不能反转
+用户明确写出的类别。`高数I/II/1/2/3` 仅作为模糊检索提示，不会用
 `candidates[0]` 锁成错误课程。课程相关作业、复习和考试保持 task；rules-only 只有在去除
 任务意图词后仍能 exact resolve 时才写 canonical related course。模糊结果只保留 Top-K
 catalog context，等 semantic API 返回候选内的 validated match 后再写 canonical identity。
@@ -73,6 +88,8 @@ catalog context，等 semantic API 返回候选内的 validated match 后再写 
 Daily Review 是独立、追加写的回顾链。实际提交时间经过最终授权校验，回顾曲线保留因果
 Forecast，且不改写原 Forecast。新的 retrospective terminal 会立即 fail-close eligible
 下一日 Forecast，并进入托管后台重算；旧历史日期的 Admin rebuild 不触发无意义传播。
+Bot 与独立 Admin 进程都管理 dependency refresh 生命周期；Admin reconstruction 在线程中
+执行，不阻塞 HTTP event loop。
 
 ## Warning、Care 与 Snooze
 
@@ -84,6 +101,9 @@ Warning 的每日上限、最小间隔、提前量、宽限、重试与 claim le
 Snooze 只有在 durable child Warning 创建成功后，才把 intervention 写为 `snoozed`。关闭
 `allow_follow_up` 会取消尚未最终授权的 user-requested pending、claimed 或
 delivery-unavailable follow-up；claim 与 final validation 都重新检查当前偏好。
+`allow_schedule_suggestions=false` 同样是发送 Hard Control：未最终授权的旧
+`schedule_adjustment` 会立即取消，claim/final validation 也会重新检查；已 final-authorized
+且 lease 有效的 in-flight send 仍遵守现有 commit-point 语义。
 
 `micro_break` 是独立 intervention type，模板为 `micro-break-v1`，建议 2–5 分钟短暂补水、
 活动或看远处。`protected_break` 保持 10–15 分钟真正脱离任务。micro-break 偏好只提升
@@ -92,7 +112,9 @@ delivery-unavailable follow-up；claim 与 final validation 都重新检查当�
 ## Response、Admin 与历史兼容
 
 最终回复先经安全检查、清理与确定性分段，再按展示模式决定是否调用展示模型。回复计划、
-稳定消息 UUID 与发送进度均持久化，可在重启后恢复。历史 `reply_text` 只用于读取旧记录。
+稳定消息 UUID 与发送进度均持久化，可在重启后恢复。`reply_text` 保存当前回复计划的
+authoritative full text，`reply_segments_json` 保存当前分段；只有历史行缺少 segments 时，
+`reply_text` 才额外承担 legacy single-segment recovery。
 展示模型只能选择 SemanticSegmenter 批准的边界，权威 slice 不执行 `strip`，各段拼接后与
 清理后的权威正文逐字一致，且不会切断 URL、链接或未闭合结构。
 
