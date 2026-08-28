@@ -32,3 +32,5 @@ docs/
 docs/*
 !docs/MINDFLOW_DEPLOYMENT_RUNBOOK.md
 !docs/CURRENT_ARCHITECTURE.md
+
+referrence/*
