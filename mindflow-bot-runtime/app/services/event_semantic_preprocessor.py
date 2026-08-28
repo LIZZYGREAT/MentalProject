@@ -156,6 +156,117 @@ def _ensure_preliminary_classification(event: Mapping[str, Any]) -> dict[str, An
     return result
 
 
+def _component_rejection(exc: SemanticError) -> dict[str, Any]:
+    reason = getattr(exc, "reason", None) or type(exc).__name__
+    result: dict[str, Any] = {
+        "status": "rejected",
+        "reason": str(reason)[:128],
+    }
+    confidence = getattr(exc, "confidence", None)
+    if confidence is not None:
+        result["confidence"] = float(confidence)
+    return result
+
+
+def _validate_response_components(
+    raw: Mapping[str, Any],
+    event: Mapping[str, Any],
+    *,
+    model: str,
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    """Validate independent provider components without cascading rejection."""
+
+    objective_values: dict[str, float] | None = None
+    objective_confidence = 0.0
+    appraisal: float | None = None
+    tags: list[str] = []
+    reasoning = ""
+    try:
+        objective_values, objective_confidence, tags, reasoning = (
+            validate_external_semantics(raw)
+        )
+        appraisal = float(raw["appraisal_score_1_10"])
+        objective_state: dict[str, Any] = {"status": "complete"}
+    except SemanticContentRejected as exc:
+        objective_state = _component_rejection(exc)
+
+    try:
+        event_classification = validate_event_classification(raw)
+        if event_classification is None:
+            classification_state = {
+                "status": "rejected",
+                "reason": "event_classification_missing",
+            }
+        else:
+            classification_state = {"status": "complete"}
+    except SemanticError as exc:
+        event_classification = None
+        classification_state = _component_rejection(exc)
+
+    candidates = list(
+        (event.get("course_catalog_context") or {}).get("candidates") or []
+    )
+    try:
+        course_match = validate_course_match(raw, candidates)
+        if course_match.get("rejected"):
+            course_state = {
+                "status": "rejected",
+                "reason": str(course_match["rejected"])[:128],
+            }
+        else:
+            course_state = {"status": "complete"}
+    except SemanticError as exc:
+        course_match = {
+            "matched": False,
+            "canonical_name": None,
+            "code": None,
+            "confidence": 0.0,
+        }
+        course_state = _component_rejection(exc)
+
+    components = {
+        "objective": objective_state,
+        "classification": classification_state,
+        "course_match": course_state,
+    }
+    material_component = bool(
+        objective_values is not None
+        or event_classification is not None
+        or course_match.get("matched") is True
+    )
+    any_rejected = any(
+        component["status"] == "rejected" for component in components.values()
+    )
+    status = (
+        "rejected"
+        if not material_component
+        else "partial"
+        if any_rejected
+        else "complete"
+    )
+    primary_rejection = next(
+        (
+            component
+            for component in components.values()
+            if component["status"] == "rejected"
+        ),
+        None,
+    )
+    return status, {
+        "available": True,
+        "objective_semantics": objective_values,
+        "appraisal_score_1_10": appraisal,
+        "confidence": objective_confidence,
+        "evidence_tags": tags,
+        "reasoning_summary": reasoning,
+        "event_classification": event_classification,
+        "course_match": course_match,
+        "components": components,
+        "model": model,
+        "prompt_version": PROMPT_VERSION,
+    }, primary_rejection
+
+
 class EventSemanticPreprocessor:
     def __init__(
         self,
@@ -203,25 +314,51 @@ class EventSemanticPreprocessor:
             return "missing", None
         if entry["status"] == "rejected":
             return "rejected", None
-        if entry["status"] != "complete":
+        if entry["status"] not in {"complete", "partial"}:
             return "missing", None
         cached = entry["assessment"]
         external = dict(cached.get("external") or {})
+        components = dict(external.get("components") or {})
+        if not components:
+            # Cache rows written before component-wise validation contained a
+            # fully validated external payload and are still safe to reuse.
+            components = {
+                "objective": {"status": "complete"},
+                "classification": {"status": "complete"},
+                "course_match": {"status": "complete"},
+            }
         try:
-            values, confidence, tags, reasoning = validate_external_semantics({
-                **external, "values": external.get("objective_semantics"),
-            })
-            event_classification = validate_event_classification(external)
-            course_match = validate_course_match(
-                external,
-                list(
-                    (event.get("course_catalog_context") or {}).get("candidates")
-                    or []
-                ),
-            )
+            if (components.get("objective") or {}).get("status") == "complete":
+                values, confidence, tags, reasoning = validate_external_semantics({
+                    **external, "values": external.get("objective_semantics"),
+                })
+            else:
+                values, confidence, tags, reasoning = None, 0.0, [], ""
+            if (components.get("classification") or {}).get("status") == "complete":
+                event_classification = validate_event_classification(external)
+            else:
+                event_classification = None
+            if (components.get("course_match") or {}).get("status") == "complete":
+                course_match = validate_course_match(
+                    external,
+                    list(
+                        (event.get("course_catalog_context") or {}).get("candidates")
+                        or []
+                    ),
+                )
+            else:
+                course_match = dict(external.get("course_match") or {})
+                course_match.update(
+                    {
+                        "matched": False,
+                        "canonical_name": None,
+                        "code": None,
+                        "confidence": 0.0,
+                    }
+                )
         except (SemanticError, TypeError, ValueError):
             return "missing", None
-        return "complete", {
+        return entry["status"], {
             **external,
             "objective_semantics": values,
             "confidence": confidence,
@@ -237,6 +374,8 @@ class EventSemanticPreprocessor:
         prepared: list[dict[str, Any]] = []
         misses: list[dict[str, Any]] = []
         external_count = 0
+        partial_count = 0
+        assisted_count = 0
         eligible_count = 0
         for raw in events:
             event = _ensure_preliminary_classification(raw)
@@ -256,6 +395,8 @@ class EventSemanticPreprocessor:
                     external_course_match=external.get("course_match"),
                 )
                 normalized = _normalized_semantic_event(event)
+                assisted_count += 1
+                partial_count += int(cache_status == "partial")
             event_type = normalized["event_type"]
             task_type = normalized["task_type"]
             duration = normalized["duration_minutes"]
@@ -269,7 +410,7 @@ class EventSemanticPreprocessor:
             values = dict(rule_values)
             source = "rules"
             confidence = 0.82 if matched else 0.68
-            if external:
+            if external and external.get("objective_semantics") is not None:
                 values, _ = fuse_rule_and_external(
                     rule_values, external["objective_semantics"],
                     external["confidence"], floors,
@@ -344,9 +485,12 @@ class EventSemanticPreprocessor:
             }
             for item in prepared
         ]).encode("utf-8")).hexdigest()
-        if not eligible_count or external_count == eligible_count:
+        if (
+            not eligible_count
+            or (external_count == eligible_count and partial_count == 0)
+        ):
             status = "hybrid_complete" if external_count else "rules_only"
-        elif external_count:
+        elif external_count or assisted_count:
             status = "hybrid_partial"
         else:
             status = "rules_only"
@@ -470,41 +614,47 @@ class EventSemanticPreprocessor:
                 if cache_status == "rejected":
                     return False
                 raw = await asyncio.to_thread(self.client.infer, miss["event"])
-                values, confidence, tags, reasoning = validate_external_semantics(raw)
-                event_classification = validate_event_classification(raw)
-                course_match = validate_course_match(
+                status, external, rejection = _validate_response_components(
                     raw,
-                    list(
-                        (miss["event"].get("course_catalog_context") or {}).get(
-                            "candidates"
-                        )
-                        or []
-                    ),
+                    miss["event"],
+                    model=self.model,
                 )
-                appraisal = float(raw["appraisal_score_1_10"])
-                assessment = {
-                    "external": {
-                        "available": True,
-                        "objective_semantics": values,
-                        "appraisal_score_1_10": appraisal,
-                        "confidence": confidence,
-                        "evidence_tags": tags,
-                        "reasoning_summary": reasoning,
-                        "event_classification": event_classification,
-                        "course_match": course_match,
-                        "model": self.model,
-                        "prompt_version": PROMPT_VERSION,
-                    }
+                assessment = {"external": external}
+                common = {
+                    "schema_version": SEMANTIC_SCHEMA_VERSION,
+                    "prompt_version": PROMPT_VERSION,
+                    "model": self.model,
                 }
-                await asyncio.to_thread(
-                    self.cache.put_complete,
-                    participant_id,
-                    miss["fingerprint"],
-                    assessment,
-                    schema_version=SEMANTIC_SCHEMA_VERSION,
-                    prompt_version=PROMPT_VERSION, model=self.model,
-                )
-                return True
+                if status == "complete":
+                    await asyncio.to_thread(
+                        self.cache.put_complete,
+                        participant_id,
+                        miss["fingerprint"],
+                        assessment,
+                        **common,
+                    )
+                elif status == "partial":
+                    await asyncio.to_thread(
+                        self.cache.put_partial,
+                        participant_id,
+                        miss["fingerprint"],
+                        assessment,
+                        **common,
+                    )
+                else:
+                    rejection = rejection or {
+                        "reason": "all_components_rejected"
+                    }
+                    await asyncio.to_thread(
+                        self.cache.put_rejected,
+                        participant_id,
+                        miss["fingerprint"],
+                        reason=str(rejection["reason"]),
+                        confidence=rejection.get("confidence"),
+                        assessment=assessment,
+                        **common,
+                    )
+                return status != "rejected"
             except SemanticContentRejected as exc:
                 await asyncio.to_thread(
                     self.cache.put_rejected,

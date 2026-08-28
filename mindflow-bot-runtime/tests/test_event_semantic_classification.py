@@ -19,6 +19,7 @@ from app.services.forecast_coordinator import (
 )
 from app.services.pressure_curve_service import PressureCurveService
 from helpers import memory_database, seed_calendar_snapshot, warning_repository
+from services.event_semantic_prompt import PROMPT_VERSION
 from services.event_lifecycle import prepare_event_instances
 from services.event_semantics import DIMENSIONS, validate_course_match
 from settings.visual_defaults import EVENT_COLOR_MAP
@@ -157,6 +158,48 @@ def test_api_course_outside_candidates_cannot_create_ambiguous_identity():
     course_match = prepared["metadata"]["semantic"]["external"]["course_match"]
     assert course_match["matched"] is False
     assert course_match["rejected"] == "candidate_out_of_bounds"
+
+
+def test_optional_component_rejection_preserves_objective_semantics_and_cache():
+    response = _semantic_response(event_type="course", task_type="course")
+    response["event_classification"]["confidence"] = 0.30
+    response["course_match"]["confidence"] = 0.0
+    client = SemanticClient(response)
+    database, participant, preprocessor = _preprocessor(client)
+    event = prepare_event_instances(
+        [_raw_event("写高数作业", event_type="task", task_type="homework")],
+        TARGET_DATE,
+    )[0]
+
+    assert asyncio.run(_enrich(preprocessor, participant.id, event)) == 1
+    prepared, _revision, status, misses = preprocessor.prepare(
+        participant.id, [event], consent=True
+    )
+
+    assert status == "hybrid_partial"
+    assert misses == []
+    assert len(client.calls) == 1
+    assert prepared[0]["event_type"] == "task"
+    assert prepared[0]["task_type"] == "homework"
+    assert not prepared[0].get("related_course_name")
+    external = prepared[0]["metadata"]["semantic"]["external"]
+    assert external["objective_semantics"] == {
+        key: 0.6 for key in DIMENSIONS
+    }
+    assert external["components"]["objective"]["status"] == "complete"
+    assert external["components"]["classification"]["status"] == "rejected"
+    assert external["components"]["course_match"]["status"] == "rejected"
+
+    fingerprint = prepared[0]["metadata"]["semantic"]["fingerprint"]
+    cache = EventSemanticCacheRepository(database).get_entry(
+        participant.id,
+        fingerprint,
+        schema_version="event_semantics.v3",
+        prompt_version=PROMPT_VERSION,
+        model="semantic-test",
+    )
+    assert cache is not None
+    assert cache["status"] == "partial"
 
 
 def test_explicit_task_type_wins_over_api_course_classification():

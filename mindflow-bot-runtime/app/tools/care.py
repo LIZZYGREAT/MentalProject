@@ -8,10 +8,16 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
+
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
-from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
+from app.integrations.feishu.calendar import (
+    CalendarMutationOutcomeUnknown,
+    CalendarMutationRejected,
+    CalendarService,
+    build_recurrence_rule,
+)
 from app.repositories import (
     ObservationRepository,
     ProfileRepository,
@@ -105,13 +111,38 @@ def _recurrence_from_args(args: dict[str, Any], timezone_value: ZoneInfo) -> str
         if args.get("recurrence_until")
         else None
     )
-    return build_recurrence_rule(
+    recurrence = build_recurrence_rule(
         str(frequency),
         interval=int(args.get("recurrence_interval", 1)),
         weekdays=list(args.get("recurrence_weekdays") or []),
         count=args.get("recurrence_count"),
         until=until,
     )
+    if args.get("start_time") is not None:
+        _validate_generated_weekly_recurrence(
+            recurrence,
+            _parse_datetime(args["start_time"], timezone_value),
+        )
+    return recurrence
+
+
+def _validate_generated_weekly_recurrence(
+    recurrence: str | None, start_time: datetime
+) -> None:
+    if not recurrence:
+        return
+    parts = {}
+    for item in recurrence.split(";"):
+        name, separator, value = item.partition("=")
+        if separator:
+            parts[name.upper()] = value.upper()
+    if parts.get("FREQ") != "WEEKLY" or not parts.get("BYDAY"):
+        return
+    weekday = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")[
+        start_time.weekday()
+    ]
+    if weekday not in {item.strip() for item in parts["BYDAY"].split(",")}:
+        raise ValueError("weekly recurrence must include the local start weekday")
 
 
 class CareTools:
@@ -728,6 +759,8 @@ class CareTools:
         participant_id: Any,
         dates: set[Any],
         reason: str,
+        *,
+        reconciliation_id: str | None = None,
     ) -> dict[str, Any]:
         if self.forecast_coordinator is None:
             return {
@@ -736,50 +769,35 @@ class CareTools:
                 "forecast_refreshed_dates": [],
                 "forecast_refresh_errors": [],
             }
-        today = datetime.now(self.timezone).date()
-        supplied = sorted(value for value in dates if value is not None)
-        normalized = [value for value in supplied if value >= today]
-        if not supplied:
-            normalized = [today]
-        elif not normalized:
+        today, direct_dates, refresh_targets, dependency_sources = (
+            self._calendar_mutation_work(dates)
+        )
+        if not refresh_targets:
             return {
                 "forecast_refresh": "historical_dates_skipped",
                 "forecast_refresh_degraded": False,
                 "forecast_refreshed_dates": [],
                 "forecast_refresh_errors": [],
             }
-        direct_dates = set(normalized)
-        dependency = {}
+        normalized = sorted(refresh_targets)
         dependency_refresh = getattr(
             self.forecast_coordinator, "dependency_refresh", None
         )
-        if today in normalized:
-            tomorrow = (
-                dependency_refresh.dependent_date(today)
-                if dependency_refresh is not None
-                else today + timedelta(days=1)
-            )
-            if tomorrow is None:
-                tomorrow = today + timedelta(days=1)
-            if tomorrow not in direct_dates:
-                normalized.append(tomorrow)
-                normalized.sort()
-                dependency[tomorrow.isoformat()] = "previous_day_terminal_changed"
-
-        refresh_targets = {
-            target: target in direct_dates
-            for target in normalized
-        }
-        dependency_sources = {
-            target: today for target in set(normalized) - direct_dates
+        dependency = {
+            target.isoformat(): "previous_day_terminal_changed"
+            for target in dependency_sources
         }
         mutation_refresh = getattr(self, "mutation_refresh", None)
         reconciliations = getattr(mutation_refresh, "reconciliations", None)
-        reconciliation = None
+        reconciliation = (
+            await asyncio.to_thread(reconciliations.get, reconciliation_id)
+            if reconciliations is not None and reconciliation_id is not None
+            else None
+        )
         # The remote provider mutation has committed by the time this method is
         # called. Persist the complete local work set before attempting any
         # invalidation so a process crash cannot consume the mutation.
-        if reconciliations is not None:
+        if reconciliations is not None and reconciliation is None:
             reconciliation = await asyncio.to_thread(
                 reconciliations.create,
                 participant_id,
@@ -788,6 +806,24 @@ class CareTools:
                 refresh_targets=refresh_targets,
                 dependency_sources=dependency_sources,
             )
+
+        processing_claim_token: uuid.UUID | None = None
+        if reconciliation is not None:
+            processing_claim_token = uuid.uuid4()
+            claimed = await asyncio.to_thread(
+                reconciliations.claim_processing,
+                reconciliation["id"],
+                claim_token=processing_claim_token,
+            )
+            if claimed is None:
+                return {
+                    "forecast_refresh": "recovery_in_progress",
+                    "forecast_refresh_degraded": False,
+                    "forecast_refreshed_dates": [],
+                    "forecast_refresh_errors": [],
+                    "calendar_mutation_reconciliation_id": reconciliation["id"],
+                }
+            reconciliation = claimed
 
         forecast_repository = (
             getattr(self, "forecast_snapshots", None)
@@ -814,6 +850,12 @@ class CareTools:
                         reason=reason,
                     )
                 except asyncio.CancelledError:
+                    if processing_claim_token is not None:
+                        await asyncio.to_thread(
+                            reconciliations.release_processing,
+                            reconciliation["id"],
+                            claim_token=processing_claim_token,
+                        )
                     raise
                 except Exception as exc:
                     invalidation_errors.extend(
@@ -830,6 +872,12 @@ class CareTools:
                             reason=reason,
                         )
                     except asyncio.CancelledError:
+                        if processing_claim_token is not None:
+                            await asyncio.to_thread(
+                                reconciliations.release_processing,
+                                reconciliation["id"],
+                                claim_token=processing_claim_token,
+                            )
                         raise
                     except Exception as exc:
                         invalidation_errors.append((target, exc))
@@ -850,6 +898,12 @@ class CareTools:
                             reason="previous_day_terminal_changed",
                         )
                 except asyncio.CancelledError:
+                    if processing_claim_token is not None:
+                        await asyncio.to_thread(
+                            reconciliations.release_processing,
+                            reconciliation["id"],
+                            claim_token=processing_claim_token,
+                        )
                     raise
                 except Exception as exc:
                     invalidation_errors.append((target, exc))
@@ -876,8 +930,23 @@ class CareTools:
                 )
             )
         if reconciliation is not None and not invalidation_errors:
+            try:
+                await asyncio.to_thread(
+                    reconciliations.mark_fenced, reconciliation["id"]
+                )
+            except asyncio.CancelledError:
+                if processing_claim_token is not None:
+                    await asyncio.to_thread(
+                        reconciliations.release_processing,
+                        reconciliation["id"],
+                        claim_token=processing_claim_token,
+                    )
+                raise
+        if reconciliation is not None and not queued and processing_claim_token is not None:
             await asyncio.to_thread(
-                reconciliations.mark_fenced, reconciliation["id"]
+                reconciliations.release_processing,
+                reconciliation["id"],
+                claim_token=processing_claim_token,
             )
         errors = [
             {"local_date": target.isoformat(), "error_class": type(error).__name__}
@@ -905,6 +974,96 @@ class CareTools:
                 reconciliation["id"] if reconciliation is not None else None
             ),
         }
+
+    def _calendar_mutation_work(
+        self, dates: set[Any]
+    ) -> tuple[date, set[date], dict[date, bool], dict[date, date]]:
+        today = datetime.now(self.timezone).date()
+        supplied = sorted(value for value in dates if value is not None)
+        normalized = [value for value in supplied if value >= today]
+        if not supplied:
+            normalized = [today]
+        elif not normalized:
+            return today, set(), {}, {}
+        direct_dates = set(normalized)
+        dependency_refresh = getattr(
+            self.forecast_coordinator, "dependency_refresh", None
+        )
+        if today in direct_dates:
+            tomorrow = (
+                dependency_refresh.dependent_date(today)
+                if dependency_refresh is not None
+                else today + timedelta(days=1)
+            )
+            if tomorrow is None:
+                tomorrow = today + timedelta(days=1)
+            if tomorrow not in direct_dates:
+                normalized.append(tomorrow)
+        refresh_targets = {
+            target: target in direct_dates for target in sorted(set(normalized))
+        }
+        dependency_sources = {
+            target: today for target in refresh_targets if target not in direct_dates
+        }
+        return today, direct_dates, refresh_targets, dependency_sources
+
+    async def _prepare_calendar_mutation_reconciliation(
+        self,
+        participant_id: Any,
+        dates: set[Any],
+        reason: str,
+        operation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        mutation_refresh = getattr(self, "mutation_refresh", None)
+        reconciliations = getattr(mutation_refresh, "reconciliations", None)
+        if reconciliations is None:
+            return None
+        _today, direct_dates, refresh_targets, dependency_sources = (
+            self._calendar_mutation_work(dates)
+        )
+        return await asyncio.to_thread(
+            reconciliations.create,
+            participant_id,
+            mutation_kind=reason,
+            direct_dates=direct_dates,
+            refresh_targets=refresh_targets,
+            dependency_sources=dependency_sources,
+            operation=operation,
+        )
+
+    async def _finish_remote_mutation_intent(
+        self,
+        reconciliation: dict[str, Any] | None,
+        *,
+        provider_result: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if reconciliation is None:
+            return
+        reconciliations = self.mutation_refresh.reconciliations
+        if error is None:
+            await asyncio.to_thread(
+                reconciliations.mark_remote_committed,
+                reconciliation["id"],
+                provider_result=provider_result or {},
+            )
+        else:
+            outcome_unknown = isinstance(error, CalendarMutationOutcomeUnknown)
+            method = (
+                reconciliations.mark_remote_outcome_unknown
+                if outcome_unknown
+                else reconciliations.mark_remote_failed
+            )
+            await asyncio.to_thread(
+                method, reconciliation["id"], error_class=type(error).__name__
+            )
+
+    @staticmethod
+    def _calendar_outcome_unknown(error: BaseException) -> bool:
+        return isinstance(
+            error,
+            CalendarMutationOutcomeUnknown,
+        )
 
     async def _calendar_mutation_dates(
         self,
@@ -1000,6 +1159,30 @@ class CareTools:
         start_time = _parse_datetime(args["start_time"], self.timezone)
         end_time = _parse_datetime(args["end_time"], self.timezone)
         recurrence = _recurrence_from_args(args, self.timezone)
+        requested_event = {
+            "summary": str(args["summary"]),
+            "description": str(args.get("description") or ""),
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "recurrence": recurrence or "",
+            "reminder_minutes": args.get("reminder_minutes"),
+        }
+        dates = await self._calendar_mutation_dates(
+            ctx.participant_id,
+            previous=None,
+            updated=requested_event,
+            updated_recurrence=recurrence,
+        )
+        reconciliation = await self._prepare_calendar_mutation_reconciliation(
+            ctx.participant_id,
+            dates,
+            "calendar_create_event",
+            {
+                "operation_type": "create",
+                "source_message_id": ctx.message_id,
+                "requested": requested_event,
+            },
+        )
         try:
             event = await self.calendar.create_event(
                 ctx.participant_id,
@@ -1011,23 +1194,35 @@ class CareTools:
                 recurrence=recurrence,
                 source_message_id=ctx.message_id,
             )
-        except PermissionError:
+        except PermissionError as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        impact_event = {
-            **dict(event),
-            "start_time": event.get("start_time") or start_time.isoformat(),
-            "end_time": event.get("end_time") or end_time.isoformat(),
-        }
-        dates = await self._calendar_mutation_dates(
-            ctx.participant_id,
-            previous=None,
-            updated=impact_event,
-            updated_recurrence=recurrence,
+        except Exception as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
+            if self._calendar_outcome_unknown(exc):
+                await self._refresh_calendar_mutation_forecasts(
+                    ctx.participant_id,
+                    dates,
+                    "calendar_create_event_outcome_unknown",
+                    reconciliation_id=(
+                        reconciliation["id"] if reconciliation is not None else None
+                    ),
+                )
+            raise
+        await self._finish_remote_mutation_intent(
+            reconciliation, provider_result=dict(event or {})
         )
         refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
             dates,
             "calendar_create_event",
+            reconciliation_id=(
+                reconciliation["id"] if reconciliation is not None else None
+            ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
 
@@ -1051,6 +1246,66 @@ class CareTools:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])
             )
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        previous_event = dict(previous or {})
+        clear_recurrence = bool(args.get("clear_recurrence", False))
+        requested_event = {
+            **previous_event,
+            **({"summary": args["summary"]} if args.get("summary") is not None else {}),
+            **(
+                {"description": args["description"]}
+                if args.get("description") is not None
+                else {}
+            ),
+            "start_time": (
+                start_time.isoformat()
+                if start_time is not None
+                else previous_event.get("start_time")
+            ),
+            "end_time": (
+                end_time.isoformat()
+                if end_time is not None
+                else previous_event.get("end_time")
+            ),
+            "recurrence": (
+                "" if clear_recurrence
+                else recurrence
+                if recurrence is not None
+                else previous_event.get("recurrence") or ""
+            ),
+            **(
+                {"reminder_minutes": args.get("reminder_minutes")}
+                if "reminder_minutes" in args
+                else {}
+            ),
+        }
+        if recurrence is not None and start_time is None:
+            previous_start = requested_event.get("start_time")
+            if previous_start:
+                _validate_generated_weekly_recurrence(
+                    recurrence,
+                    _parse_datetime(previous_start, self.timezone),
+                )
+        dates = await self._calendar_mutation_dates(
+            ctx.participant_id,
+            previous=previous_event,
+            updated=requested_event,
+            updated_recurrence=recurrence,
+            clear_recurrence=clear_recurrence,
+        )
+        reconciliation = await self._prepare_calendar_mutation_reconciliation(
+            ctx.participant_id,
+            dates,
+            "calendar_update_event",
+            {
+                "operation_type": "update",
+                "event_id": str(args["event_id"]),
+                "previous": previous_event,
+                "requested": requested_event,
+            },
+        )
+        try:
             event = await self.calendar.update_event(
                 ctx.participant_id,
                 str(args["event_id"]),
@@ -1062,44 +1317,35 @@ class CareTools:
                 recurrence=recurrence,
                 clear_recurrence=bool(args.get("clear_recurrence", False)),
             )
-        except PermissionError:
+        except PermissionError as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        provider_event = dict(event or {})
-        previous_event = dict(previous or {})
-        clear_recurrence = bool(args.get("clear_recurrence", False))
-        impact_event = {
-            **previous_event,
-            **provider_event,
-            "start_time": (
-                start_time.isoformat()
-                if start_time is not None
-                else provider_event.get("start_time")
-                or previous_event.get("start_time")
-            ),
-            "end_time": (
-                end_time.isoformat()
-                if end_time is not None
-                else provider_event.get("end_time")
-                or previous_event.get("end_time")
-            ),
-            "recurrence": (
-                "" if clear_recurrence
-                else recurrence
-                if recurrence is not None
-                else provider_event.get("recurrence")
-                or previous_event.get("recurrence")
-                or ""
-            ),
-        }
-        dates = await self._calendar_mutation_dates(
-            ctx.participant_id,
-            previous=previous,
-            updated=impact_event,
-            updated_recurrence=recurrence,
-            clear_recurrence=clear_recurrence,
+        except Exception as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
+            if self._calendar_outcome_unknown(exc):
+                await self._refresh_calendar_mutation_forecasts(
+                    ctx.participant_id,
+                    dates,
+                    "calendar_update_event_outcome_unknown",
+                    reconciliation_id=(
+                        reconciliation["id"] if reconciliation is not None else None
+                    ),
+                )
+            raise
+        await self._finish_remote_mutation_intent(
+            reconciliation, provider_result=dict(event or {})
         )
         refresh = await self._refresh_calendar_mutation_forecasts(
-            ctx.participant_id, dates, "calendar_update_event"
+            ctx.participant_id,
+            dates,
+            "calendar_update_event",
+            reconciliation_id=(
+                reconciliation["id"] if reconciliation is not None else None
+            ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "updated": event, **refresh}
 
@@ -1112,9 +1358,6 @@ class CareTools:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])
             )
-            deleted = await self.calendar.delete_event(
-                ctx.participant_id, str(args["event_id"])
-            )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
         dates = await self._calendar_mutation_dates(
@@ -1122,9 +1365,49 @@ class CareTools:
             previous=previous,
             updated=None,
         )
+        reconciliation = await self._prepare_calendar_mutation_reconciliation(
+            ctx.participant_id,
+            dates,
+            "calendar_delete_event",
+            {
+                "operation_type": "delete",
+                "event_id": str(args["event_id"]),
+                "previous": dict(previous or {}),
+            },
+        )
+        try:
+            deleted = await self.calendar.delete_event(
+                ctx.participant_id, str(args["event_id"])
+            )
+        except PermissionError as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        except Exception as exc:
+            await self._finish_remote_mutation_intent(
+                reconciliation, error=exc
+            )
+            if self._calendar_outcome_unknown(exc):
+                await self._refresh_calendar_mutation_forecasts(
+                    ctx.participant_id,
+                    dates,
+                    "calendar_delete_event_outcome_unknown",
+                    reconciliation_id=(
+                        reconciliation["id"] if reconciliation is not None else None
+                    ),
+                )
+            raise
+        await self._finish_remote_mutation_intent(
+            reconciliation,
+            provider_result={"deleted": bool(deleted), "event_id": str(args["event_id"])},
+        )
         refresh = await self._refresh_calendar_mutation_forecasts(
             ctx.participant_id,
             dates,
             "calendar_delete_event",
+            reconciliation_id=(
+                reconciliation["id"] if reconciliation is not None else None
+            ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "deleted": deleted, **refresh}

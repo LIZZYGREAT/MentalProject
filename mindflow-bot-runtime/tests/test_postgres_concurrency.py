@@ -5,6 +5,7 @@ contains ``test``. Each test run uses and drops its own random schema.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import threading
@@ -20,15 +21,20 @@ from app.db import Base, Database, build_engine
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    ForecastCurrentnessEvent,
     WarningSchedule,
 )
 from app.repositories import (
     CalendarSnapshotRepository,
+    EventSemanticCacheRepository,
     ForecastInputChangedError,
     ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
     WarningScheduleRepository,
+)
+from app.repositories_calendar_mutation import (
+    CalendarMutationReconciliationRepository,
 )
 from app.repositories_care import (
     CareInterventionRepository,
@@ -37,6 +43,12 @@ from app.repositories_care import (
 from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.forecast_coordinator import _sha
+from app.services.token_service import (
+    OAuthTokenSet,
+    TokenEncryptionService,
+    TokenRefreshService,
+    TokenRepository,
+)
 
 
 @pytest.fixture
@@ -125,6 +137,101 @@ def _warning(database: Database, participant_id: uuid.UUID):
     return warnings, preferences, warning_id, now
 
 
+def test_postgres_calendar_recovery_claim_has_one_winner(postgres_database):
+    participant = ParticipantRepository(postgres_database).create(
+        "PG-CALENDAR-RECOVERY-CLAIM"
+    )
+    reconciliations = CalendarMutationReconciliationRepository(postgres_database)
+    target = datetime.now(ZoneInfo("Asia/Shanghai")).date() + timedelta(days=1)
+    intent = reconciliations.create(
+        participant.id,
+        mutation_kind="calendar_create_event",
+        direct_dates={target},
+        refresh_targets={target: True},
+        dependency_sources={},
+    )
+    reconciliations.mark_remote_committed(intent["id"])
+    barrier = threading.Barrier(2)
+    tokens = (uuid.uuid4(), uuid.uuid4())
+
+    def claim(token):
+        barrier.wait(timeout=2)
+        return reconciliations.claim_processing(
+            intent["id"], claim_token=token, lease_seconds=60
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, tokens))
+
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    winning_token = uuid.UUID(winners[0]["work"]["processing_claim_token"])
+    assert reconciliations.release_processing(
+        intent["id"], claim_token=winning_token
+    )
+    assert len(reconciliations.due()) == 1
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("complete", "rejected", "complete"),
+        ("complete", "partial", "complete"),
+        ("partial", "rejected", "partial"),
+        ("rejected", "complete", "complete"),
+    ],
+)
+def test_postgres_semantic_cache_concurrent_quality_is_monotonic(
+    postgres_database, left, right, expected
+):
+    participant = ParticipantRepository(postgres_database).create(
+        f"PG-SEMANTIC-{left}-{right}"
+    )
+    fingerprint = uuid.uuid4().hex * 2
+    barrier = threading.Barrier(2)
+
+    def write(status):
+        cache = EventSemanticCacheRepository(postgres_database)
+        barrier.wait(timeout=2)
+        common = {
+            "schema_version": "event_semantics.v3",
+            "prompt_version": "postgres-precedence.v1",
+            "model": "postgres-semantic-test",
+        }
+        if status == "complete":
+            cache.put_complete(
+                participant.id, fingerprint, {"writer": status}, **common
+            )
+        elif status == "partial":
+            cache.put_partial(
+                participant.id, fingerprint, {"writer": status}, **common
+            )
+        else:
+            cache.put_rejected(
+                participant.id,
+                fingerprint,
+                reason="postgres_race_rejection",
+                confidence=0.1,
+                assessment={"writer": status},
+                **common,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(write, status) for status in (left, right)]
+        for result in results:
+            result.result(timeout=5)
+
+    entry = EventSemanticCacheRepository(postgres_database).get_entry(
+        participant.id,
+        fingerprint,
+        schema_version="event_semantics.v3",
+        prompt_version="postgres-precedence.v1",
+        model="postgres-semantic-test",
+    )
+    assert entry["status"] == expected
+    assert entry["assessment"]["writer"] == expected
+
+
 def test_postgres_different_callback_snoozes_create_one_child(postgres_database):
     participant = ParticipantRepository(postgres_database).create("PG-SNOOZE")
     warnings, preferences, warning_id, now = _warning(
@@ -132,6 +239,12 @@ def test_postgres_different_callback_snoozes_create_one_child(postgres_database)
     )
     claimed = warnings.claim_if_current(warning_id, now=now)
     assert claimed is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"],
+        now=now + timedelta(milliseconds=500),
+    )
     assert warnings.finish_claim(
         warning_id,
         claim_token=claimed["claim_token"],
@@ -243,6 +356,12 @@ def test_postgres_disable_follow_up_and_snooze_are_serialized(postgres_database)
     )
     claimed = warnings.claim_if_current(warning_id, now=now)
     assert claimed is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=claimed["forecast_version"],
+        now=now + timedelta(milliseconds=500),
+    )
     assert warnings.finish_claim(
         warning_id,
         claim_token=claimed["claim_token"],
@@ -533,3 +652,107 @@ def test_postgres_daily_review_disable_and_claim_race_ends_cancelled(
     stored = schedules.get(review["id"])
     assert stored["status"] == "cancelled"
     assert stored["claim_token"] is None
+
+
+def test_postgres_forecast_currentness_activate_reactivate_history(
+    postgres_database,
+):
+    participant = ParticipantRepository(postgres_database).create("PG-CURRENTNESS")
+    repository = ForecastSnapshotRepository(postgres_database)
+    local_date = datetime.now(timezone.utc).astimezone(
+        ZoneInfo("Asia/Shanghai")
+    ).date()
+
+    def save(version):
+        return repository.save(
+            participant.id,
+            local_date,
+            calendar_revision="calendar",
+            semantic_revision="semantic",
+            algorithm_version="mindflow-ctssm-runtime-v7",
+            forecast_version=version,
+            semantic_status="complete",
+            semantic_input=[],
+            curve=[],
+            peaks=[],
+            warning_windows=[],
+            output={"stress_0_10": 4, "vitality_0_10": 5},
+        )
+
+    v1 = save("pg-currentness-v1")
+    v2 = save("pg-currentness-v2")
+    save("pg-currentness-v1")
+    with postgres_database.session() as session:
+        activation_times = [
+            event.occurred_at
+            for event in session.query(ForecastCurrentnessEvent).filter(
+                ForecastCurrentnessEvent.participant_id == participant.id,
+                ForecastCurrentnessEvent.local_date == local_date,
+                ForecastCurrentnessEvent.event_type == "activated",
+            ).order_by(ForecastCurrentnessEvent.id).all()
+        ]
+    t1, t2, t3 = activation_times
+
+    assert repository.current_at(participant.id, local_date, t1)["id"] == v1["id"]
+    assert repository.current_at(participant.id, local_date, t2)["id"] == v2["id"]
+    assert repository.current_at(participant.id, local_date, t3)["id"] == v1["id"]
+
+
+def test_postgres_oauth_refresh_lease_has_one_authoritative_owner(
+    postgres_database,
+):
+    participant = ParticipantRepository(postgres_database).create("PG-OAUTH-LEASE")
+    encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
+    repository = TokenRepository(
+        postgres_database, encryption, oauth_app_id="calendar-app"
+    )
+    now = datetime.now(timezone.utc)
+    repository.save(participant.id, OAuthTokenSet(
+        access_token="expired",
+        refresh_token="refresh-old",
+        access_token_expires_at=now - timedelta(seconds=1),
+        refresh_token_expires_at=now + timedelta(days=7),
+    ))
+    refresh_count = 0
+    network_started = asyncio.Event()
+
+    async def refresh(value):
+        nonlocal refresh_count
+        assert value == "refresh-old"
+        refresh_count += 1
+        network_started.set()
+        await asyncio.sleep(0.1)
+        return OAuthTokenSet(
+            access_token="access-new",
+            refresh_token="refresh-new",
+            access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            refresh_token_expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+        )
+
+    services = [
+        TokenRefreshService(
+            postgres_database,
+            encryption,
+            refresh,
+            expected_oauth_app_id="calendar-app",
+            refresh_poll_seconds=0.01,
+        )
+        for _ in range(2)
+    ]
+
+    async def scenario():
+        requests = [
+            asyncio.create_task(service.get_access_token(participant.id))
+            for service in services
+        ]
+        await asyncio.wait_for(network_started.wait(), timeout=2)
+        # If a row lock were held across HTTP, this status read would block.
+        status = await asyncio.wait_for(
+            asyncio.to_thread(repository.status, participant.id), timeout=0.5
+        )
+        assert status["connected"] is True
+        return await asyncio.gather(*requests)
+
+    assert asyncio.run(scenario()) == ["access-new", "access-new"]
+    assert refresh_count == 1
+    assert repository.status(participant.id)["token_version"] == 2

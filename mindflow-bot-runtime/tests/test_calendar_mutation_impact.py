@@ -446,6 +446,8 @@ def test_recurrence_only_update_invalidates_old_and_new_dates_with_provider_resp
 
     start = datetime.combine(monday, time(9, 0), TZ)
     end = start + timedelta(hours=1)
+    updated_start = datetime.combine(tuesday, time(9, 0), TZ)
+    updated_end = updated_start + timedelta(hours=1)
     previous = _event(
         start, end, "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO"
     )
@@ -463,7 +465,7 @@ def test_recurrence_only_update_invalidates_old_and_new_dates_with_provider_resp
                     "end_time": None,
                     "recurrence": new_rule,
                 }
-            return _event(start, end, new_rule)
+            return _event(updated_start, updated_end, new_rule)
 
     class Coordinator:
         def __init__(self):
@@ -493,6 +495,8 @@ def test_recurrence_only_update_invalidates_old_and_new_dates_with_provider_resp
             ctx,
             {
                 "event_id": "calendar-event",
+                "start_time": updated_start.isoformat(),
+                "end_time": updated_end.isoformat(),
                 "recurrence_frequency": "WEEKLY",
                 "recurrence_weekdays": ["TU"],
             },

@@ -189,7 +189,19 @@ python -c "from getpass import getpass; from app.admin_web.auth import hash_pass
 - 早晨、峰值时段、收尾状态作为软锚点；峰值不会作为提交时刻的当前状态；
 - 收尾状态以较低增益影响下一日初始状态，来源和 revision 会写入 Forecast provenance；
 - Admin 的 Forecast 页可叠加“预测 / 即时反馈 / 回顾反馈 / 回顾估计”，
-  Daily Review 页可查看 revision 并显式重建。
+  Daily Review 页可查看 revision，并区分“重建（因果）”与不落库的“重新分析（使用最新事实）”。
+
+CTSSM trajectory 采用 point-at-t：每个时间点表示该时刻吸收 Observation 后的状态，累计负荷
+不提前包含下一个五分钟区间。Semantic enrichment 对 objective、classification 与 course
+match 分别验证，并按 `complete > partial > rejected` 单调缓存结果。错过的主动 Warning 只有在同日重新
+读取当前 Calendar、Observation、Forecast 与偏好后仍相关时，才会生成 same-day late care。
+
+Calendar create/update/delete 在调用飞书前写入 durable `prepared` reconciliation intent；远端
+成功、本地 Forecast/Warning 隔离和后台重算分别推进状态；preflight 未发出的失败禁止 replay，只有
+event mutation 已发送后的未知结果保持 recoverable。`remote_committed` 立即 due，并由数据库 claim
+避免请求与恢复双重处理；进程重启会在 scheduler 前完成旧 intent fencing。Forecast currentness 使用 append-only history，
+OAuth refresh 使用不跨 HTTP 持锁的 expiring lease。当前唯一 Alembic head 为
+`0020_oauth_refresh_lease`，JSON 业务列在 PostgreSQL 使用 JSONB。
 
 部署前执行迁移；`compose.yaml` 已提供一次性的 `migrate` 服务，Bot 和 Admin 都会
 等待迁移成功。生产环境还需把飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

@@ -3,6 +3,7 @@ from datetime import datetime, time, timedelta, timezone
 import uuid
 
 from app.models import ParticipantCarePreference, WarningSchedule
+from app.repositories import ObservationRepository
 from tests.test_forecast_hardening import (
     TEST_LOCAL_DATE,
     TEST_NOW,
@@ -122,3 +123,45 @@ def test_previous_day_missed_warning_is_never_carried_into_next_day():
         assert len(rows) == 1
         assert rows[0].id == source_id
         assert rows[0].status == "expired"
+
+
+def test_fresh_low_stress_high_energy_context_vetoes_late_care():
+    database, person, warnings, source_id = _expired_warning()
+    ObservationRepository(database).add(
+        person.id,
+        "check_in",
+        {"stress_0_10": 1.0, "energy_0_10": 9.0},
+        observed_at=TEST_NOW - timedelta(minutes=1),
+    )
+
+    assert warnings.pending(TEST_NOW) == []
+    with database.session() as session:
+        rows = session.query(WarningSchedule).all()
+        assert len(rows) == 1
+        assert rows[0].id == source_id
+        assert rows[0].status == "expired"
+
+
+def test_tier_three_late_care_preserves_pause_and_support_severity():
+    database, _person, warnings, source_id = _expired_warning()
+    with database.session() as session:
+        source = session.get(WarningSchedule, source_id)
+        source.warning_level = "3"
+        payload = dict(source.payload_json)
+        payload["care_plan"] = {
+            **dict(payload.get("care_plan") or {}),
+            "intervention_type": "pause_and_seek_support",
+        }
+        source.payload_json = payload
+
+    due = warnings.pending(TEST_NOW)
+    assert len(due) == 1
+    with database.session() as session:
+        late = session.get(WarningSchedule, uuid.UUID(due[0]["id"]))
+        assert late.warning_level == "3"
+        assert (
+            late.payload_json["care_plan"]["intervention_type"]
+            == "pause_and_seek_support"
+        )
+        assert late.payload_json["care_plan"]["template_id"] == "pause-and-support-v1"
+        assert "暂停" in late.payload_json["message"]

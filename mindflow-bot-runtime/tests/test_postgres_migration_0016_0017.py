@@ -1,4 +1,4 @@
-"""Opt-in proof that the real 0016 -> 0018 PostgreSQL migrations are executable."""
+"""Opt-in proof that the real 0016 -> 0020 PostgreSQL migrations are executable."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from app.db import build_engine
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_postgres_upgrade_0016_to_0018_preserves_and_backfills():
+def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
     raw_url = os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip()
     if not raw_url:
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
@@ -98,13 +98,14 @@ def test_real_postgres_upgrade_0016_to_0018_preserves_and_backfills():
                 text(
                     """
                     INSERT INTO forecast_snapshots (
-                        id, participant_id, local_date, calendar_revision,
-                        semantic_revision, algorithm_version, forecast_version,
+                            id, participant_id, local_date, calendar_revision,
+                            semantic_revision, observation_revision,
+                            algorithm_version, forecast_version,
                         semantic_status, semantic_input_json, curve_json,
                         peaks_json, warning_windows_json, output_json
                     ) VALUES (
                         :id, :participant_id, :local_date, 'calendar-v1',
-                        'semantic-v1', 'algorithm-v1', 'forecast-v1',
+                            'semantic-v1', '', 'algorithm-v1', 'forecast-v1',
                         'rules_only', '[]'::jsonb, '[]'::jsonb,
                         '[]'::jsonb, '[]'::jsonb, '{}'::jsonb
                     )
@@ -269,24 +270,128 @@ def test_real_postgres_upgrade_0016_to_0018_preserves_and_backfills():
             ) == "0018_calendar_mutation_reconciliation"
             inspector = inspect(connection)
             assert "calendar_mutation_reconciliations" in inspector.get_table_names()
+            reconciliation_column_rows = inspector.get_columns(
+                "calendar_mutation_reconciliations"
+            )
             reconciliation_columns = {
-                column["name"]
-                for column in inspector.get_columns(
+                column["name"] for column in reconciliation_column_rows
+            }
+            assert {
+                "id",
+                "participant_id",
+                "mutation_kind",
+                "work_json",
+                "status",
+                "attempt_count",
+                "next_attempt_at",
+                "last_error_class",
+                "created_at",
+                "updated_at",
+                "resolved_at",
+            } <= reconciliation_columns
+            work_column = next(
+                column
+                for column in reconciliation_column_rows
+                if column["name"] == "work_json"
+            )
+            assert str(work_column["type"]).upper() == "JSONB"
+            assert any(
+                key["constrained_columns"] == ["participant_id"]
+                and key["referred_table"] == "participants"
+                for key in inspector.get_foreign_keys(
+                    "calendar_mutation_reconciliations"
+                )
+            )
+            assert {
+                "ix_calendar_mutation_reconciliation_due",
+                "ix_calendar_mutation_reconciliation_participant",
+            } <= {
+                index["name"]
+                for index in inspector.get_indexes(
                     "calendar_mutation_reconciliations"
                 )
             }
+
+            reconciliation_id = uuid.uuid4()
+            work = {
+                "operation": {"operation_type": "update", "event_id": "event-1"},
+                "targets": [
+                    {
+                        "local_date": "2030-01-15",
+                        "refresh_calendar": True,
+                        "requires_invalidation": True,
+                        "dependency_source": None,
+                    }
+                ],
+            }
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO calendar_mutation_reconciliations (
+                        id, participant_id, mutation_kind, work_json,
+                        status, attempt_count, next_attempt_at
+                    ) VALUES (
+                        :id, :participant_id, 'calendar_update_event',
+                        CAST(:work AS JSONB), 'prepared', 0, :next_attempt_at
+                    )
+                    """
+                ),
+                {
+                    "id": reconciliation_id,
+                    "participant_id": participant_id,
+                    "work": json.dumps(work),
+                    "next_attempt_at": now,
+                },
+            )
+            assert connection.scalar(
+                text(
+                    "SELECT work_json FROM calendar_mutation_reconciliations "
+                    "WHERE id = :id"
+                ),
+                {"id": reconciliation_id},
+            ) == work
+            connection.execute(
+                text(
+                    "UPDATE calendar_mutation_reconciliations "
+                    "SET status = 'remote_committed', attempt_count = 1 "
+                    "WHERE id = :id"
+                ),
+                {"id": reconciliation_id},
+            )
+            assert connection.execute(
+                text(
+                    "SELECT status, attempt_count "
+                    "FROM calendar_mutation_reconciliations WHERE id = :id"
+                ),
+                {"id": reconciliation_id},
+            ).one() == ("remote_committed", 1)
+
+            command.upgrade(config, "0020_oauth_refresh_lease")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0020_oauth_refresh_lease"
+            inspector = inspect(connection)
+            assert "forecast_currentness_events" in inspector.get_table_names()
+            currentness_columns = {
+                column["name"]
+                for column in inspector.get_columns("forecast_currentness_events")
+            }
             assert {
-                "participant_id",
-                "mutation_kind",
-                "status",
-                "affected_dates_json",
-                "direct_dates_json",
-                "refresh_dates_json",
-                "dependency_dates_json",
-                "next_attempt_at",
-                "attempt_count",
-                "last_error",
-            } <= reconciliation_columns
+                "id", "participant_id", "local_date", "forecast_id",
+                "forecast_version", "event_type", "reason", "occurred_at",
+                "created_at",
+            } <= currentness_columns
+            assert connection.scalar(text(
+                "SELECT count(*) FROM forecast_currentness_events "
+                "WHERE forecast_id = :forecast_id AND event_type = 'activated'"
+            ), {"forecast_id": forecast_id}) == 1
+            token_columns = {
+                column["name"]
+                for column in inspector.get_columns("feishu_oauth_tokens")
+            }
+            assert {
+                "refresh_lease_token", "refresh_lease_until", "refresh_started_at"
+            } <= token_columns
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

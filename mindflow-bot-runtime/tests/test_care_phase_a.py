@@ -136,6 +136,12 @@ def _send_first(database, warnings):
         target = warning.target_time.replace(tzinfo=timezone.utc)
     claimed = warnings.claim_if_current(warning_id, now=target)
     assert claimed is not None
+    assert warnings.validate_claim_current(
+        warning_id,
+        claim_token=claimed["claim_token"],
+        expected_forecast_version=forecast_version,
+        now=target + timedelta(milliseconds=500),
+    )
     assert warnings.finish_claim(
         warning_id,
         claim_token=claimed["claim_token"],

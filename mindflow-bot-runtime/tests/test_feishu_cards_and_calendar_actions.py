@@ -11,6 +11,7 @@ import httpx
 from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
+from app.tools.care import _recurrence_from_args
 from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.card_callback import FeishuCardCallbackServer
@@ -193,6 +194,29 @@ def test_recurrence_builder_exposes_only_reviewed_rfc5545_subset():
 
     with __import__("pytest").raises(ValueError, match="count and until"):
         build_recurrence_rule("DAILY", count=3, until=until)
+
+
+def test_generated_weekly_recurrence_requires_start_weekday_in_byday():
+    with __import__("pytest").raises(
+        ValueError, match="local start weekday"
+    ):
+        _recurrence_from_args(
+            {
+                "start_time": "2030-01-07T09:00:00+08:00",  # Monday
+                "recurrence_frequency": "WEEKLY",
+                "recurrence_weekdays": ["TU"],
+            },
+            TZ,
+        )
+
+    assert _recurrence_from_args(
+        {
+            "start_time": "2030-01-07T09:00:00+08:00",
+            "recurrence_frequency": "WEEKLY",
+            "recurrence_weekdays": ["MO", "WE"],
+        },
+        TZ,
+    ) == "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE"
 
 
 def test_feishu_client_sends_card_as_interactive_message():

@@ -1,9 +1,14 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
 
 import pytest
 import requests
+from sqlalchemy import func, select
 
+from app.db import Database, build_engine
+from app.models import EventSemanticCache
 from app.repositories import EventSemanticCacheRepository, ParticipantRepository
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from services.event_semantic_prompt import PROMPT_VERSION
@@ -33,7 +38,7 @@ def _response(confidence: float) -> dict:
         "event_classification": {
             "event_type": "task",
             "task_type": "general",
-            "confidence": max(confidence, 0.55),
+            "confidence": confidence,
         },
         "course_match": {"matched": False},
     }
@@ -71,6 +76,172 @@ def _preprocessor(client):
             circuit_seconds=60,
         ),
     )
+
+
+def test_sqlite_first_insert_race_upserts_one_semantic_cache_row(tmp_path):
+    database = Database(
+        build_engine(f"sqlite:///{(tmp_path / 'semantic-cache.db').as_posix()}")
+    )
+    database.create_schema_for_tests()
+    participant = ParticipantRepository(database).create("SEMANTIC-UPSERT-RACE")
+    barrier = threading.Barrier(2)
+
+    def write(status):
+        cache = EventSemanticCacheRepository(database)
+        barrier.wait(timeout=2)
+        if status == "complete":
+            cache.put_complete(
+                participant.id,
+                "f" * 64,
+                {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION,
+                model="semantic-test",
+            )
+        else:
+            cache.put_partial(
+                participant.id,
+                "f" * 64,
+                {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION,
+                model="semantic-test",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(write, status) for status in ("complete", "partial")]
+        for future in futures:
+            future.result(timeout=5)
+
+    with database.session() as session:
+        assert session.scalar(
+            select(func.count()).select_from(EventSemanticCache)
+        ) == 1
+    entry = EventSemanticCacheRepository(database).get_entry(
+        participant.id,
+        "f" * 64,
+        schema_version="event_semantics.v3",
+        prompt_version=PROMPT_VERSION,
+        model="semantic-test",
+    )
+    assert entry["status"] == "complete"
+    assert entry["assessment"]["writer"] == entry["status"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        ("complete", "rejected", "complete"),
+        ("complete", "partial", "complete"),
+        ("partial", "rejected", "partial"),
+        ("rejected", "complete", "complete"),
+    ],
+)
+def test_semantic_cache_quality_never_downgrades(first, second, expected):
+    database = memory_database()
+    participant = ParticipantRepository(database).create(
+        f"SEMANTIC-PRECEDENCE-{first}-{second}"
+    )
+    cache = EventSemanticCacheRepository(database)
+    fingerprint = "a" * 64
+
+    def write(status):
+        if status == "complete":
+            cache.put_complete(
+                participant.id, fingerprint, {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION,
+                model="semantic-test",
+            )
+        elif status == "partial":
+            cache.put_partial(
+                participant.id, fingerprint, {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION,
+                model="semantic-test",
+            )
+        else:
+            cache.put_rejected(
+                participant.id, fingerprint,
+                reason="test_rejection", confidence=0.1,
+                assessment={"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION,
+                model="semantic-test",
+            )
+
+    write(first)
+    write(second)
+    entry = cache.get_entry(
+        participant.id, fingerprint,
+        schema_version="event_semantics.v3",
+        prompt_version=PROMPT_VERSION,
+        model="semantic-test",
+    )
+    assert entry["status"] == expected
+    assert entry["assessment"]["writer"] == expected
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("complete", "rejected", "complete"),
+        ("complete", "partial", "complete"),
+        ("partial", "rejected", "partial"),
+        ("rejected", "complete", "complete"),
+    ],
+)
+def test_sqlite_semantic_cache_concurrent_quality_is_monotonic(
+    tmp_path, left, right, expected
+):
+    database = Database(
+        build_engine(
+            f"sqlite:///{(tmp_path / f'semantic-{left}-{right}.db').as_posix()}"
+        )
+    )
+    database.create_schema_for_tests()
+    participant = ParticipantRepository(database).create(
+        f"SEMANTIC-RACE-{left}-{right}"
+    )
+    barrier = threading.Barrier(2)
+    fingerprint = "b" * 64
+
+    def write(status):
+        cache = EventSemanticCacheRepository(database)
+        barrier.wait(timeout=2)
+        if status == "complete":
+            cache.put_complete(
+                participant.id, fingerprint, {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION, model="semantic-test",
+            )
+        elif status == "partial":
+            cache.put_partial(
+                participant.id, fingerprint, {"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION, model="semantic-test",
+            )
+        else:
+            cache.put_rejected(
+                participant.id, fingerprint,
+                reason="race_rejection", confidence=0.1,
+                assessment={"writer": status},
+                schema_version="event_semantics.v3",
+                prompt_version=PROMPT_VERSION, model="semantic-test",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(write, status) for status in (left, right)]
+        for future in futures:
+            future.result(timeout=5)
+
+    entry = EventSemanticCacheRepository(database).get_entry(
+        participant.id, fingerprint,
+        schema_version="event_semantics.v3",
+        prompt_version=PROMPT_VERSION, model="semantic-test",
+    )
+    assert entry["status"] == expected
+    assert entry["assessment"]["writer"] == expected
 
 
 def test_low_confidence_is_negative_cached_without_blocking_next_event():

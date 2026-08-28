@@ -154,6 +154,28 @@ class DeviceFlowService:
         verification_url = str(
             result.get("verification_uri_complete") or result.get("verification_uri") or ""
         )
+        await asyncio.to_thread(
+            self._save_device_flow,
+            participant_id,
+            result,
+            verification_url,
+            expires_at,
+            now,
+        )
+        return {
+            "user_code": str(result["user_code"]),
+            "verification_url": verification_url,
+            "expires_at": expires_at.isoformat(),
+        }
+
+    def _save_device_flow(
+        self,
+        participant_id: uuid.UUID,
+        result: dict[str, Any],
+        verification_url: str,
+        expires_at: datetime,
+        now: datetime,
+    ) -> None:
         with self.database.session() as session:
             row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
             values = {
@@ -175,57 +197,57 @@ class DeviceFlowService:
             else:
                 for key, value in values.items():
                     setattr(row, key, value)
-        return {
-            "user_code": str(result["user_code"]),
-            "verification_url": verification_url,
-            "expires_at": expires_at.isoformat(),
-        }
 
-    async def poll_until_complete(self, participant_id: uuid.UUID) -> None:
-        while True:
-            with self.database.session() as session:
-                row = session.get(FeishuDeviceFlow, participant_id)
-                if row is None or row.status != "pending":
-                    return
-                if row.oauth_app_id != self.oauth.app_id:
-                    row.status = "failed"
-                    return
-                expires_at = row.expires_at
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                if expires_at <= datetime.now(timezone.utc):
-                    row.status = "expired"
-                    return
-                interval = row.interval_seconds
-            await asyncio.sleep(max(1, interval))
-            with self.database.session() as session:
-                row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
-                if row is None or row.status != "pending":
-                    return
-                if row.oauth_app_id != self.oauth.app_id:
-                    row.status = "failed"
-                    return
-                device_code = self.encryption.decrypt(
+    def _poll_state(self, participant_id: uuid.UUID) -> dict[str, Any] | None:
+        with self.database.session() as session:
+            row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
+            if row is None or row.status != "pending":
+                return None
+            if row.oauth_app_id != self.oauth.app_id:
+                row.status = "failed"
+                return None
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                row.status = "expired"
+                return None
+            return {
+                "interval": row.interval_seconds,
+                "device_code": self.encryption.decrypt(
                     row.device_code_ciphertext,
                     participant_id=participant_id,
                     purpose="device_flow",
-                )
+                ),
+            }
+
+    def _set_flow_status(self, participant_id: uuid.UUID, status: str) -> None:
+        with self.database.session() as session:
+            row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
+            if row is not None and row.status == "pending":
+                row.status = status
+                row.updated_at = datetime.now(timezone.utc)
+
+    async def poll_until_complete(self, participant_id: uuid.UUID) -> None:
+        while True:
+            state = await asyncio.to_thread(self._poll_state, participant_id)
+            if state is None:
+                return
+            await asyncio.sleep(max(1, int(state["interval"])))
             try:
-                tokens = await self.oauth.poll_device_token(device_code)
+                tokens = await self.oauth.poll_device_token(str(state["device_code"]))
             except FeishuOAuthError as exc:
                 if exc.code in {"authorization_pending", 91031}:
                     continue
                 if exc.code in {"slow_down", 91032}:
                     await asyncio.sleep(5)
                     continue
-                with self.database.session() as session:
-                    row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
-                    if row is not None and row.status == "pending":
-                        row.status = "failed"
+                await asyncio.to_thread(
+                    self._set_flow_status, participant_id, "failed"
+                )
                 raise
-            self.tokens.save(participant_id, tokens)
-            with self.database.session() as session:
-                row = session.get(FeishuDeviceFlow, participant_id, with_for_update=True)
-                if row is not None:
-                    row.status = "complete"
+            await asyncio.to_thread(self.tokens.save, participant_id, tokens)
+            await asyncio.to_thread(
+                self._set_flow_status, participant_id, "complete"
+            )
             return

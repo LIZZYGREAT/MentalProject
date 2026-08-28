@@ -588,6 +588,11 @@ class CareInterventionRepository:
                     select(CareInterventionEvent)
                     .where(CareInterventionEvent.id == intervention_id)
                     .with_for_update()
+                    # The ownership pre-check above may have populated this
+                    # row before we waited on the participant lock. Refresh
+                    # the identity-map instance so a concurrent operational
+                    # action committed while waiting is visible here.
+                    .execution_options(populate_existing=True)
                 ).scalar_one()
                 if intervention.delivery_status not in {"sent", "escalated"}:
                     raise ValueError("care intervention has not been delivered")

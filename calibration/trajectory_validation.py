@@ -84,6 +84,12 @@ def build_event_trajectory_diagnostics(
 
         first_index = segment_indexes[0]
         pre_index = max(0, first_index - 1)
+        exit_indexes = []
+        for index, minute in enumerate(row_minutes):
+            comparable = minute + (24 * 60 if minute < start and end > 24 * 60 else 0)
+            if comparable >= end:
+                exit_indexes.append((comparable, index))
+        exit_index = min(exit_indexes)[1] if exit_indexes else segment_indexes[-1]
         segment = [float(rows[index].get("S", 0.0)) for index in segment_indexes]
         equilibria = [
             float(rows[index].get("stress_equilibrium", segment[offset]))
@@ -93,7 +99,8 @@ def build_event_trajectory_diagnostics(
         start_stress = segment[0]
         peak = max(segment)
         trough = min(segment)
-        end_stress = segment[-1]
+        in_event_last_stress = segment[-1]
+        end_stress = float(rows[exit_index].get("S", in_event_last_stress))
         peak_index = segment.index(peak)
         peak_time = str(rows[segment_indexes[peak_index]].get("time", ""))
         peak_delta = peak - pre
@@ -142,12 +149,16 @@ def build_event_trajectory_diagnostics(
             "event_id": event_id,
             "name": str(getattr(event, "name", "") or "未命名事件"),
             "event_type": assessment.event_type,
-            "time": f"{str(event.start_time)[-5:]}-{str(event.end_time)[-5:]}",
+            "time": (
+                f"{start % (24 * 60) // 60:02d}:{start % 60:02d}-"
+                f"{end % (24 * 60) // 60:02d}:{end % 60:02d}"
+            ),
             "stress_before": round(pre, 3),
             "stress_start": round(start_stress, 3),
             "stress_peak": round(peak, 3),
             "peak_time": peak_time,
             "stress_end": round(end_stress, 3),
+            "stress_in_event_last": round(in_event_last_stress, 3),
             "stress_trough": round(trough, 3),
             "peak_change": round(peak_delta, 3),
             "end_change": round(end_delta, 3),

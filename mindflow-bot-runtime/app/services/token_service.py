@@ -113,6 +113,9 @@ class TokenRepository:
                 row.refresh_token_expires_at = tokens.refresh_token_expires_at
                 row.granted_scopes = tokens.granted_scopes
                 row.token_version += 1
+                row.refresh_lease_token = None
+                row.refresh_lease_until = None
+                row.refresh_started_at = None
                 row.updated_at = datetime.now(timezone.utc)
 
     def status(self, participant_id: uuid.UUID) -> dict[str, Any]:
@@ -136,7 +139,7 @@ RefreshCallable = Callable[[str], Awaitable[OAuthTokenSet]]
 
 
 class TokenRefreshService:
-    """Database row lock is authoritative; local locks reduce same-process waits."""
+    """Serialize refresh with short DB leases and no transaction across HTTP."""
 
     def __init__(
         self,
@@ -146,58 +149,144 @@ class TokenRefreshService:
         *,
         expected_oauth_app_id: str,
         refresh_margin_seconds: int = 300,
+        refresh_lease_seconds: int = 30,
+        refresh_poll_seconds: float = 0.05,
     ):
         self.database = database
         self.encryption = encryption
         self.refresh = refresh
         self.expected_oauth_app_id = expected_oauth_app_id
         self.refresh_margin = timedelta(seconds=max(0, refresh_margin_seconds))
+        self.refresh_lease = timedelta(seconds=max(5, refresh_lease_seconds))
+        self.refresh_poll_seconds = max(0.01, float(refresh_poll_seconds))
         self._locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     async def get_access_token(self, participant_id: uuid.UUID) -> str:
         lock = self._locks.setdefault(participant_id, asyncio.Lock())
         async with lock:
-            with self.database.session() as session:
-                row = session.execute(
-                    select(FeishuOAuthToken)
-                    .where(FeishuOAuthToken.participant_id == participant_id)
-                    .with_for_update()
-                ).scalar_one_or_none()
-                if row is None:
-                    raise PermissionError("calendar is not connected")
-                if row.oauth_app_id != self.expected_oauth_app_id:
-                    raise PermissionError(
-                        "calendar authorization belongs to another Feishu app; "
-                        "reconnect required"
+            while True:
+                claim = await asyncio.to_thread(self._claim_refresh, participant_id)
+                if claim["state"] == "ready":
+                    return str(claim["access_token"])
+                if claim["state"] == "waiting":
+                    await asyncio.sleep(self.refresh_poll_seconds)
+                    continue
+
+                lease_token = str(claim["lease_token"])
+                expected_version = int(claim["token_version"])
+                try:
+                    tokens = await self.refresh(str(claim["refresh_token"]))
+                except BaseException:
+                    await asyncio.to_thread(
+                        self._release_refresh_lease,
+                        participant_id,
+                        lease_token,
                     )
-                now = datetime.now(timezone.utc)
+                    raise
+                access = await asyncio.to_thread(
+                    self._finalize_refresh,
+                    participant_id,
+                    lease_token,
+                    expected_version,
+                    tokens,
+                )
+                if access is not None:
+                    return access
+
+    def _claim_refresh(self, participant_id: uuid.UUID) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self.database.session() as session:
+            row = session.execute(
+                select(FeishuOAuthToken)
+                .where(FeishuOAuthToken.participant_id == participant_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                raise PermissionError("calendar is not connected")
+            if row.oauth_app_id != self.expected_oauth_app_id:
+                raise PermissionError(
+                    "calendar authorization belongs to another Feishu app; "
+                    "reconnect required"
+                )
+            if _aware(row.access_token_expires_at) > now + self.refresh_margin:
+                return {
+                    "state": "ready",
+                    "access_token": self.encryption.decrypt(
+                        row.access_token_ciphertext,
+                        participant_id=participant_id,
+                        purpose="access",
+                    ),
+                }
+            if row.refresh_token_expires_at and _aware(row.refresh_token_expires_at) <= now:
+                raise PermissionError("calendar authorization has expired")
+            if (
+                row.refresh_lease_token
+                and row.refresh_lease_until
+                and _aware(row.refresh_lease_until) > now
+            ):
+                return {"state": "waiting"}
+            lease_token = uuid.uuid4().hex
+            row.refresh_lease_token = lease_token
+            row.refresh_lease_until = now + self.refresh_lease
+            row.refresh_started_at = now
+            row.updated_at = now
+            return {
+                "state": "claimed",
+                "lease_token": lease_token,
+                "token_version": row.token_version,
+                "refresh_token": self.encryption.decrypt(
+                    row.refresh_token_ciphertext,
+                    participant_id=participant_id,
+                    purpose="refresh",
+                ),
+            }
+
+    def _release_refresh_lease(
+        self, participant_id: uuid.UUID, lease_token: str
+    ) -> None:
+        with self.database.session() as session:
+            row = session.get(FeishuOAuthToken, participant_id, with_for_update=True)
+            if row is not None and row.refresh_lease_token == lease_token:
+                row.refresh_lease_token = None
+                row.refresh_lease_until = None
+                row.refresh_started_at = None
+                row.updated_at = datetime.now(timezone.utc)
+
+    def _finalize_refresh(
+        self,
+        participant_id: uuid.UUID,
+        lease_token: str,
+        expected_version: int,
+        tokens: OAuthTokenSet,
+    ) -> str | None:
+        now = datetime.now(timezone.utc)
+        with self.database.session() as session:
+            row = session.get(FeishuOAuthToken, participant_id, with_for_update=True)
+            if row is None:
+                raise PermissionError("calendar is not connected")
+            if (
+                row.refresh_lease_token != lease_token
+                or row.token_version != expected_version
+            ):
                 if _aware(row.access_token_expires_at) > now + self.refresh_margin:
                     return self.encryption.decrypt(
                         row.access_token_ciphertext,
                         participant_id=participant_id,
                         purpose="access",
                     )
-                if row.refresh_token_expires_at and _aware(row.refresh_token_expires_at) <= now:
-                    raise PermissionError("calendar authorization has expired")
-                refresh_token = self.encryption.decrypt(
-                    row.refresh_token_ciphertext,
-                    participant_id=participant_id,
-                    purpose="refresh",
-                )
-                tokens = await self.refresh(refresh_token)
-                row.access_token_ciphertext = self.encryption.encrypt(
-                    tokens.access_token,
-                    participant_id=participant_id,
-                    purpose="access",
-                )
-                row.refresh_token_ciphertext = self.encryption.encrypt(
-                    tokens.refresh_token,
-                    participant_id=participant_id,
-                    purpose="refresh",
-                )
-                row.access_token_expires_at = tokens.access_token_expires_at
-                row.refresh_token_expires_at = tokens.refresh_token_expires_at
-                row.granted_scopes = tokens.granted_scopes
-                row.token_version += 1
-                row.updated_at = now
-                return tokens.access_token
+                return None
+            row.access_token_ciphertext = self.encryption.encrypt(
+                tokens.access_token, participant_id=participant_id, purpose="access"
+            )
+            row.refresh_token_ciphertext = self.encryption.encrypt(
+                tokens.refresh_token, participant_id=participant_id, purpose="refresh"
+            )
+            row.access_token_expires_at = tokens.access_token_expires_at
+            row.refresh_token_expires_at = tokens.refresh_token_expires_at
+            row.granted_scopes = tokens.granted_scopes
+            row.token_version += 1
+            row.refresh_lease_token = None
+            row.refresh_lease_until = None
+            row.refresh_started_at = None
+            row.updated_at = now
+            return tokens.access_token

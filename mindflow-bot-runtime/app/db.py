@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import threading
 from typing import Iterator
 
 from sqlalchemy import create_engine
@@ -32,6 +33,14 @@ def build_engine(database_url: str, *, echo: bool = False) -> Engine:
 class Database:
     def __init__(self, engine: Engine):
         self.engine = engine
+        # In-memory SQLite under StaticPool is one physical connection shared
+        # by every worker thread. Concurrent Session transactions on that one
+        # connection corrupt each other's unit-of-work state, so serialize
+        # only this test/local topology. PostgreSQL and file-backed pooled
+        # databases retain normal connection-level concurrency.
+        self._single_connection_lock = (
+            threading.RLock() if isinstance(engine.pool, StaticPool) else None
+        )
         self._sessions = sessionmaker(
             bind=engine,
             class_=Session,
@@ -41,15 +50,23 @@ class Database:
 
     @contextmanager
     def session(self) -> Iterator[Session]:
-        session = self._sessions()
+        lock = self._single_connection_lock
+        if lock is not None:
+            lock.acquire()
+        session: Session | None = None
         try:
+            session = self._sessions()
             yield session
             session.commit()
         except Exception:
-            session.rollback()
+            if session is not None:
+                session.rollback()
             raise
         finally:
-            session.close()
+            if session is not None:
+                session.close()
+            if lock is not None:
+                lock.release()
 
     def create_schema_for_tests(self) -> None:
         """Tests only; production schema is managed by Alembic."""

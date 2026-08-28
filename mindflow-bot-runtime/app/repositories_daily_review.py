@@ -188,17 +188,12 @@ class DailyReviewScheduleRepository:
                 if (
                     row.authorized_at is None
                     and row.sent_at is None
-                    and row.status in {"pending", "cancelled", "delivery_unavailable"}
+                    and row.status == "pending"
+                    and row.attempt_count == 0
                 ):
                     row.scheduled_at = scheduled
                     row.valid_until = validity_end
-                    if row.status == "pending":
-                        row.next_attempt_at = max(
-                            scheduled,
-                            _aware(row.next_attempt_at)
-                            if row.next_attempt_at is not None
-                            else scheduled,
-                        )
+                    row.next_attempt_at = scheduled
                 return self._view(row)
         except IntegrityError as exc:
             if not _is_constraint(exc, "uq_daily_review_schedule_version"):
@@ -562,8 +557,8 @@ class DailyReviewResponseRepository:
     def add(
         self, participant_id: uuid.UUID, local_date: date, *, callback_event_id: str,
         submitted_at: datetime, card_version: str, schedule_id: uuid.UUID | None,
-        causal_source_forecast_id: uuid.UUID | str,
-        causal_source_forecast_version: str,
+        causal_source_forecast_id: uuid.UUID | str | None,
+        causal_source_forecast_version: str | None,
         values: dict[str, Any], raw: dict[str, Any],
     ) -> tuple[dict[str, Any], bool]:
         callback = str(callback_event_id)[:128]
@@ -585,11 +580,15 @@ class DailyReviewResponseRepository:
                         participant_id=participant_id, local_date=local_date,
                         revision=revision, card_version=card_version,
                         schedule_id=schedule_id, callback_event_id=callback,
-                        causal_source_forecast_id=uuid.UUID(
-                            str(causal_source_forecast_id)
+                        causal_source_forecast_id=(
+                            uuid.UUID(str(causal_source_forecast_id))
+                            if causal_source_forecast_id is not None
+                            else None
                         ),
-                        causal_source_forecast_version=str(
-                            causal_source_forecast_version
+                        causal_source_forecast_version=(
+                            str(causal_source_forecast_version)
+                            if causal_source_forecast_version is not None
+                            else None
                         ),
                         submitted_at=_aware(submitted_at), raw_json=dict(raw), **values,
                     )
@@ -658,7 +657,9 @@ class RetrospectiveCurveRepository:
     def __init__(self, database: Database):
         self.database = database
 
-    def save(self, participant_id: uuid.UUID, local_date: date, **values: Any) -> dict[str, Any]:
+    def save(
+        self, participant_id: uuid.UUID, local_date: date, **values: Any
+    ) -> tuple[dict[str, Any], bool]:
         try:
             with self.database.session() as session:
                 existing = session.execute(select(RetrospectiveCurveSnapshot).where(
@@ -667,13 +668,13 @@ class RetrospectiveCurveRepository:
                     RetrospectiveCurveSnapshot.reconstruction_version == values["reconstruction_version"],
                 )).scalar_one_or_none()
                 if existing:
-                    return self._view(existing)
+                    return self._view(existing), False
                 row = RetrospectiveCurveSnapshot(
                     participant_id=participant_id, local_date=local_date, **values
                 )
                 session.add(row)
                 session.flush()
-                return self._view(row)
+                return self._view(row), True
         except IntegrityError as exc:
             if not _is_constraint(
                 exc, "uq_retrospective_reconstruction_version"
@@ -687,7 +688,7 @@ class RetrospectiveCurveRepository:
                 )).scalar_one_or_none()
                 if row is None:
                     raise
-                return self._view(row)
+                return self._view(row), False
 
     def latest(self, participant_id: uuid.UUID, local_date: date) -> dict[str, Any] | None:
         with self.database.session() as session:
@@ -734,5 +735,8 @@ class RetrospectiveCurveRepository:
             "reconstruction_version": row.reconstruction_version,
             "curve": list(row.curve_json), "analysis": dict(row.analysis_json),
             "diagnostics": dict(row.diagnostics_json),
+            "analysis_kind": str(
+                (row.diagnostics_json or {}).get("analysis_kind") or "causal"
+            ),
             "generated_at": row.generated_at.isoformat(),
         }

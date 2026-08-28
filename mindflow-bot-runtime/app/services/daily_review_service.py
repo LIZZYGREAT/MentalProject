@@ -24,6 +24,7 @@ from app.repositories_daily_review import (
 from app.services.observation_smoother import FixedLagObservationSmoother
 from app.services.retrospective_reconstructor import PEAK_PERIODS, RetrospectiveReconstructor
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.forecast_initial_state import forecast_terminal_state
 
 
 def _score(value: Any, field: str) -> float:
@@ -174,17 +175,23 @@ class DailyReviewService:
             "recovery_note": _text(values.get("recovery_note"), "recovery_note", 300),
             "free_text": _text(values.get("free_text"), "free_text", 1000),
         }
-        source_forecast = self.forecasts.latest(participant_id, local_date)
-        if source_forecast is None:
-            raise ValueError("source forecast unavailable for daily review")
+        source_forecast = self.forecasts.current_at(
+            participant_id, local_date, now
+        )
         response, created = self.responses.add(
             participant_id, local_date,
             callback_event_id=callback_event_id,
             submitted_at=now,
             card_version=self.CARD_VERSION,
             schedule_id=schedule_id,
-            causal_source_forecast_id=source_forecast["id"],
-            causal_source_forecast_version=source_forecast["forecast_version"],
+            causal_source_forecast_id=(
+                source_forecast["id"] if source_forecast is not None else None
+            ),
+            causal_source_forecast_version=(
+                source_forecast["forecast_version"]
+                if source_forecast is not None
+                else None
+            ),
             values=normalized,
             raw=dict(values),
         )
@@ -199,12 +206,16 @@ class DailyReviewService:
         end_anchor = self._end_anchor(
             local_date, schedule, _stored_datetime(response["submitted_at"])
         )
-        retrospective = self.rebuild(
-            participant_id,
-            local_date,
-            response=response,
-            end_anchor=end_anchor,
-            use_response_causal_source=True,
+        retrospective = (
+            self.rebuild(
+                participant_id,
+                local_date,
+                response=response,
+                end_anchor=end_anchor,
+                use_response_causal_source=True,
+            )
+            if source_forecast is not None
+            else None
         )
         return {
             "response": response,
@@ -237,7 +248,11 @@ class DailyReviewService:
         retrospective = self.retrospectives.latest_for_response(
             participant_id, response["id"]
         )
-        if retrospective is None:
+        if (
+            retrospective is None
+            and response.get("causal_source_forecast_id")
+            and response.get("causal_source_forecast_version")
+        ):
             retrospective = self.rebuild(
                 participant_id,
                 local_date,
@@ -310,6 +325,14 @@ class DailyReviewService:
         curve, analysis, diagnostics = self.reconstructor.reconstruct(
             smoothed,
             response,
+            source_terminal_state=(
+                {
+                    "stress_0_10": terminal[0],
+                    "vitality_0_10": terminal[1],
+                }
+                if (terminal := forecast_terminal_state(forecast)) is not None
+                else None
+            ),
             end_anchor_minute=end_anchor.minute,
             end_anchor_source=end_anchor.source,
             review_local_date=end_anchor.review_local_date.isoformat(),
@@ -329,7 +352,28 @@ class DailyReviewService:
         })
         diagnostics["observation_smoothing"] = smoothing_diagnostics
         diagnostics["original_forecast_immutable"] = True
-        saved = self.retrospectives.save(
+        diagnostics["analysis_kind"] = (
+            "causal" if use_response_causal_source else "reanalysis"
+        )
+        if not use_response_causal_source:
+            return {
+                "id": None,
+                "participant_id": str(participant_id),
+                "local_date": local_date.isoformat(),
+                "source_forecast_id": forecast["id"],
+                "source_forecast_version": forecast["forecast_version"],
+                "daily_review_response_id": response["id"],
+                "daily_review_revision": response["revision"],
+                "observation_revision": observation_revision,
+                "algorithm_version": self.reconstructor.ALGORITHM_VERSION,
+                "reconstruction_version": reconstruction_version,
+                "curve": curve,
+                "analysis": analysis,
+                "diagnostics": diagnostics,
+                "analysis_kind": "reanalysis",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        saved, created = self.retrospectives.save(
             participant_id, local_date,
             source_forecast_id=uuid.UUID(forecast["id"]),
             source_forecast_version=forecast["forecast_version"],
@@ -342,7 +386,7 @@ class DailyReviewService:
             analysis_json=analysis,
             diagnostics_json=diagnostics,
         )
-        if self.dependency_refresh is not None:
+        if created and self.dependency_refresh is not None:
             self.dependency_refresh.invalidate_dependent_now(
                 participant_id,
                 local_date,
@@ -353,7 +397,7 @@ class DailyReviewService:
                 local_date,
                 reason="previous_day_retrospective_terminal_changed",
             )
-        elif (
+        elif created and (
             self.warning_repository is not None
             and local_date
             in {
@@ -368,6 +412,17 @@ class DailyReviewService:
                 reason="previous_day_retrospective_terminal_changed",
             )
         return saved
+
+    def reanalysis(
+        self, participant_id: uuid.UUID, local_date: date
+    ) -> dict[str, Any]:
+        """Build a latest-facts analysis without persisting causal state."""
+
+        return self.rebuild(
+            participant_id,
+            local_date,
+            use_response_causal_source=False,
+        )
 
     def _end_anchor(
         self,

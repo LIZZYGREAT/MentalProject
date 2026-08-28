@@ -152,11 +152,11 @@ class BotWorker:
         self._active_event_by_participant: dict[object, str] = {}
         self._cancelled_participants: set[object] = set()
 
-    def _record_incident(self, **values) -> None:
+    async def _record_incident(self, **values) -> None:
         if self.incidents is None:
             return
         try:
-            self.incidents.record(**values)
+            await asyncio.to_thread(self.incidents.record, **values)
         except Exception:
             logger.warning("runtime_incident_persist_failed", exc_info=True)
 
@@ -205,12 +205,13 @@ class BotWorker:
                 "worker_event_unhandled",
                 extra={"event_id": event.event_id, "message_id": event.message_id},
             )
-            self.events.finish(
+            await asyncio.to_thread(
+                self.events.finish,
                 event.event_id,
                 status="failed",
                 error_code="unhandled_worker_failure",
             )
-            self._record_incident(
+            await self._record_incident(
                 severity="error",
                 subsystem="worker",
                 event_name="worker_event_unhandled",
@@ -226,8 +227,12 @@ class BotWorker:
         lock = self._routing_locks.setdefault(route_key, asyncio.Lock())
         agent_task: asyncio.Task[None] | None = None
         async with lock:
-            participant = self.identity.resolve(event.app_id, event.open_id)
-            pending_plan = self.events.pending_reply_plan(event.event_id)
+            participant = await asyncio.to_thread(
+                self.identity.resolve, event.app_id, event.open_id
+            )
+            pending_plan = await asyncio.to_thread(
+                self.events.pending_reply_plan, event.event_id
+            )
             if pending_plan is not None:
                 await self._resume_delivery_plan(
                     event,
@@ -235,8 +240,10 @@ class BotWorker:
                     participant_id=(participant.id if participant is not None else None),
                 )
                 return
-            self.events.set_processing(
-                event.event_id, participant.id if participant is not None else None
+            await asyncio.to_thread(
+                self.events.set_processing,
+                event.event_id,
+                participant.id if participant is not None else None,
             )
             if event.chat_type.lower() not in {"p2p", "private", "single"}:
                 await self._deliver(
@@ -253,7 +260,8 @@ class BotWorker:
                     await self._deliver(event, "请在 /bind 后填写一次性绑定码。")
                     return
                 try:
-                    participant = self.identity.bind(
+                    participant = await asyncio.to_thread(
+                        self.identity.bind,
                         raw_token=raw_token,
                         app_id=event.app_id,
                         open_id=event.open_id,
@@ -265,7 +273,9 @@ class BotWorker:
                 except Exception:
                     await self._deliver(event, "绑定服务暂时不可用，请稍后重试。")
                     return
-                self.events.assign_participant(event.event_id, participant.id)
+                await asyncio.to_thread(
+                    self.events.assign_participant, event.event_id, participant.id
+                )
                 await self._deliver(event, f"绑定成功：{participant.participant_code}")
                 return
             if bind_match is not None:
@@ -275,7 +285,9 @@ class BotWorker:
                 self._cancelled_participants.add(participant.id)
                 active_event_id = self._active_event_by_participant.get(participant.id)
                 if active_event_id:
-                    self.events.cancel_reply_plan(active_event_id)
+                    await asyncio.to_thread(
+                        self.events.cancel_reply_plan, active_event_id
+                    )
                 interrupt = getattr(self.runtime, "interrupt", None)
                 stopped = await interrupt(participant.id) if interrupt else False
                 await self._deliver(
@@ -311,7 +323,8 @@ class BotWorker:
 
             skill = self.skill_loader.current()
             self._cancelled_participants.discard(participant.id)
-            run_id = self.runs.start(
+            run_id = await asyncio.to_thread(
+                self.runs.start,
                 participant.id,
                 event.message_id,
                 self.model,
@@ -449,7 +462,7 @@ class BotWorker:
                         exc.code,
                         exc.retryable,
                     )
-                    self._record_incident(
+                    await self._record_incident(
                         severity="error",
                         subsystem="feishu",
                         event_name="feishu_card_send_failed",
@@ -496,7 +509,7 @@ class BotWorker:
             metrics["presentation_cleanup_pending"] = (
                 plan.presentation_cleanup_pending
             )
-            self.runs.finish(run_id, "succeeded")
+            await asyncio.to_thread(self.runs.finish, run_id, "succeeded")
             delivered = await self._deliver_plan(
                 event,
                 plan,
@@ -508,7 +521,7 @@ class BotWorker:
         except ClaudeRuntimeInterrupted:
             if self.presentations is not None:
                 self.presentations.discard(run_id)
-            self.runs.finish(run_id, "interrupted")
+            await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
             delivered = await self._deliver(event, FALLBACK_INTERRUPTED)
             status = "interrupted" if delivered else "reply_pending"
         except Exception:
@@ -523,7 +536,7 @@ class BotWorker:
                     "agent_run_id": str(run_id),
                 },
             )
-            self.runs.finish(run_id, "failed")
+            await asyncio.to_thread(self.runs.finish, run_id, "failed")
             delivered = await self._deliver(event, FALLBACK_TEMPORARY)
             status = "failed_replied" if delivered else "reply_pending"
         finally:
@@ -580,14 +593,19 @@ class BotWorker:
         delivery_started_at: float | None = None,
     ) -> bool:
         if not plan.segments:
-            self.events.finish(event.event_id, status="completed")
+            await asyncio.to_thread(
+                self.events.finish, event.event_id, status="completed"
+            )
             return True
-        self.events.stage_reply_plan(
+        await asyncio.to_thread(
+            self.events.stage_reply_plan,
             event.event_id,
             full_text=plan.full_text,
             segments=[segment.text for segment in plan.segments],
         )
-        pending = self.events.pending_reply_plan(event.event_id)
+        pending = await asyncio.to_thread(
+            self.events.pending_reply_plan, event.event_id
+        )
         if pending is None:
             return False
         return await self._resume_delivery_plan(
@@ -614,7 +632,9 @@ class BotWorker:
                 participant_id is not None
                 and participant_id in self._cancelled_participants
             ):
-                self.events.cancel_reply_plan(event.event_id)
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
                 return False
             try:
                 message_id = await self._send(
@@ -625,7 +645,9 @@ class BotWorker:
                     ),
                 )
             except FeishuSendError as exc:
-                self.events.note_reply_failure(event.event_id)
+                await asyncio.to_thread(
+                    self.events.note_reply_failure, event.event_id
+                )
                 logger.warning(
                     "feishu_reply_send_failed event_id=%s message_id=%s "
                     "segment_index=%s error_code=%s retryable=%s attempt=%s",
@@ -636,7 +658,7 @@ class BotWorker:
                     exc.retryable,
                     getattr(exc, "attempt", 1),
                 )
-                self._record_incident(
+                await self._record_incident(
                     severity="error",
                     subsystem="feishu",
                     event_name="feishu_reply_send_failed",
@@ -658,12 +680,13 @@ class BotWorker:
                     1,
                 )
                 first_final_recorded = True
-            self.events.mark_reply_segment_sent(
+            await asyncio.to_thread(
+                self.events.mark_reply_segment_sent,
                 event.event_id,
                 segment_index=index,
                 message_id=message_id,
             )
-        self.events.finish_reply_plan(event.event_id)
+        await asyncio.to_thread(self.events.finish_reply_plan, event.event_id)
         if metrics is not None:
             metrics["total_delivery_ms"] = round(
                 (time.monotonic() - delivery_started) * 1000, 1

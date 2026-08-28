@@ -6,6 +6,7 @@ Revises: 0017_care_delivery_authorization
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 revision = "0018_calendar_mutation_reconciliation"
@@ -20,12 +21,16 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("participant_id", sa.Uuid(), nullable=False),
         sa.Column("mutation_kind", sa.String(length=64), nullable=False),
-        sa.Column("work_json", sa.JSON(), nullable=False),
+        sa.Column(
+            "work_json",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=False,
+        ),
         sa.Column(
             "status",
             sa.String(length=32),
             nullable=False,
-            server_default="pending",
+            server_default="prepared",
         ),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("next_attempt_at", sa.DateTime(timezone=True), nullable=True),

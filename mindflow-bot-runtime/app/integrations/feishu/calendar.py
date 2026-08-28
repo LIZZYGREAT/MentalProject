@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 import uuid
 
@@ -15,6 +15,37 @@ from app.services.token_service import TokenRefreshService
 
 _RECURRENCE_FREQUENCIES = {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
 _RECURRENCE_WEEKDAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+
+
+class CalendarProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: Any = None,
+        request_kind: str,
+    ) -> None:
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.request_kind = request_kind
+        super().__init__(message)
+
+
+class CalendarMutationRejected(CalendarProviderError):
+    """The provider definitively rejected a Calendar mutation."""
+
+
+class CalendarMutationNotSent(CalendarProviderError):
+    """The Calendar mutation request was never dispatched."""
+
+
+class CalendarMutationOutcomeUnknown(CalendarProviderError):
+    """A mutation was sent, but its committed result is not known locally."""
+
+
+class CalendarProviderUnavailable(CalendarProviderError):
+    """A non-mutating provider prerequisite/read was unavailable."""
 
 
 def build_recurrence_rule(
@@ -165,8 +196,6 @@ class CalendarService:
         if reminder_minutes is not None and not 0 <= int(reminder_minutes) <= 1440:
             raise ValueError("calendar reminder must be between 0 and 1440 minutes")
 
-        token = await self.tokens.get_access_token(participant_id)
-        headers = {"Authorization": f"Bearer {token}"}
         payload: dict[str, Any] = {
             "summary": title,
             "description": str(description)[:5000],
@@ -190,22 +219,22 @@ class CalendarService:
             ).encode("utf-8")
         ).hexdigest()
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            primary_response = await client.post(
-                "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
-                headers=headers,
-                params={"user_id_type": "open_id"},
+            headers, calendar_id = await self._mutation_preflight(
+                participant_id, client
             )
-            calendar_id = self._calendar_id(self._checked(primary_response))
-            response = await client.post(
-                "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
-                + quote(calendar_id, safe="")
-                + "/events",
-                headers=headers,
-                params={"idempotency_key": idempotency_key},
-                json=payload,
+            data = await self._dispatch_mutation(
+                "create_event",
+                lambda: client.post(
+                    "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
+                    + quote(calendar_id, safe="")
+                    + "/events",
+                    headers=headers,
+                    params={"idempotency_key": idempotency_key},
+                    json=payload,
+                ),
             )
-        data = self._checked(response).get("data") or {}
-        event = data.get("event") or data
+        payload_data = data.get("data") or {}
+        event = payload_data.get("event") or payload_data
         return self._sanitize_event(event)
 
     async def get_event(
@@ -230,7 +259,9 @@ class CalendarService:
                 + quote(normalized_event_id, safe=""),
                 headers=headers,
             )
-        data = self._checked(response).get("data") or {}
+        data = self._checked(
+            response, request_kind="get_event", mutation=False
+        ).get("data") or {}
         return self._sanitize_event(data.get("event") or data)
 
     async def update_event(
@@ -286,25 +317,23 @@ class CalendarService:
         if not payload:
             raise ValueError("calendar event update has no changes")
 
-        token = await self.tokens.get_access_token(participant_id)
-        headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            primary_response = await client.post(
-                "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
-                headers=headers,
-                params={"user_id_type": "open_id"},
+            headers, calendar_id = await self._mutation_preflight(
+                participant_id, client
             )
-            calendar_id = self._calendar_id(self._checked(primary_response))
-            response = await client.patch(
-                "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
-                + quote(calendar_id, safe="")
-                + "/events/"
-                + quote(normalized_event_id, safe=""),
-                headers=headers,
-                json=payload,
+            data = await self._dispatch_mutation(
+                "update_event",
+                lambda: client.patch(
+                    "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
+                    + quote(calendar_id, safe="")
+                    + "/events/"
+                    + quote(normalized_event_id, safe=""),
+                    headers=headers,
+                    json=payload,
+                ),
             )
-        data = self._checked(response).get("data") or {}
-        return self._sanitize_event(data.get("event") or data)
+        payload_data = data.get("data") or {}
+        return self._sanitize_event(payload_data.get("event") or payload_data)
 
     async def delete_event(
         self, participant_id: uuid.UUID, event_id: str
@@ -312,30 +341,100 @@ class CalendarService:
         normalized_event_id = str(event_id).strip()
         if not normalized_event_id or len(normalized_event_id) > 256:
             raise ValueError("calendar event id is invalid")
-        token = await self.tokens.get_access_token(participant_id)
-        headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            headers, calendar_id = await self._mutation_preflight(
+                participant_id, client
+            )
+            await self._dispatch_mutation(
+                "delete_event",
+                lambda: client.delete(
+                    "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
+                    + quote(calendar_id, safe="")
+                    + "/events/"
+                    + quote(normalized_event_id, safe=""),
+                    headers=headers,
+                ),
+            )
+        return {"id": normalized_event_id, "deleted": True}
+
+    async def _mutation_preflight(
+        self, participant_id: uuid.UUID, client: httpx.AsyncClient
+    ) -> tuple[dict[str, str], str]:
+        """Resolve auth and primary Calendar before crossing the write boundary."""
+
+        try:
+            token = await self.tokens.get_access_token(participant_id)
+            headers = {"Authorization": f"Bearer {token}"}
             primary_response = await client.post(
                 "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
                 headers=headers,
                 params={"user_id_type": "open_id"},
             )
-            calendar_id = self._calendar_id(self._checked(primary_response))
-            response = await client.delete(
-                "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
-                + quote(calendar_id, safe="")
-                + "/events/"
-                + quote(normalized_event_id, safe=""),
-                headers=headers,
+            payload = self._checked(
+                primary_response,
+                request_kind="primary_calendar_lookup",
+                mutation=False,
             )
-        self._checked(response)
-        return {"id": normalized_event_id, "deleted": True}
+            return headers, self._calendar_id(payload)
+        except PermissionError:
+            raise
+        except CalendarProviderError as exc:
+            raise CalendarMutationNotSent(
+                "Calendar mutation preflight failed before dispatch",
+                status_code=exc.status_code,
+                provider_code=exc.provider_code,
+                request_kind=exc.request_kind,
+            ) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise CalendarMutationNotSent(
+                "Calendar mutation preflight failed before dispatch",
+                request_kind="primary_calendar_lookup",
+            ) from exc
+
+    async def _dispatch_mutation(
+        self,
+        request_kind: str,
+        send: Callable[[], Awaitable[httpx.Response]],
+    ) -> dict[str, Any]:
+        """Dispatch one write; transport failures beyond this boundary are unknown."""
+
+        try:
+            response = await send()
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise CalendarMutationOutcomeUnknown(
+                "Feishu calendar mutation outcome is unknown",
+                request_kind=request_kind,
+            ) from exc
+        return self._checked(response, request_kind=request_kind, mutation=True)
 
     @staticmethod
-    def _checked(response: httpx.Response) -> dict[str, Any]:
-        data = response.json()
+    def _checked(
+        response: httpx.Response,
+        *,
+        request_kind: str = "calendar_read",
+        mutation: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
         if response.status_code >= 400 or data.get("code") not in (None, 0):
-            raise RuntimeError("Feishu calendar request failed")
+            values = {
+                "status_code": response.status_code,
+                "provider_code": data.get("code"),
+                "request_kind": request_kind,
+            }
+            if mutation and response.status_code >= 500:
+                raise CalendarMutationOutcomeUnknown(
+                    "Feishu calendar mutation outcome is unknown", **values
+                )
+            if response.status_code >= 500:
+                raise CalendarProviderUnavailable(
+                    "Feishu calendar provider is unavailable", **values
+                )
+            raise CalendarMutationRejected(
+                "Feishu calendar request was rejected", **values
+            )
         return data
 
     @staticmethod

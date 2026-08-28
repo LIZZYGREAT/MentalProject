@@ -10,7 +10,12 @@ from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
 from app.integrations.feishu.cards import daily_review_card
-from app.models import ForecastSnapshot, Participant, RetrospectiveCurveSnapshot
+from app.models import (
+    ForecastCurrentnessEvent,
+    ForecastSnapshot,
+    Participant,
+    RetrospectiveCurveSnapshot,
+)
 from app.repositories import (
     ForecastSnapshotRepository,
     ObservationRepository,
@@ -113,8 +118,31 @@ def _set_forecast_timeline(
         row = session.get(ForecastSnapshot, uuid.UUID(forecast_id))
         assert row is not None
         row.generated_at = generated_at
+        events = session.execute(select(ForecastCurrentnessEvent).where(
+            ForecastCurrentnessEvent.forecast_id == row.id,
+        )).scalars().all()
+        transition_times = {event.occurred_at for event in events}
+        transition_events = session.execute(select(ForecastCurrentnessEvent).where(
+            ForecastCurrentnessEvent.participant_id == row.participant_id,
+            ForecastCurrentnessEvent.local_date == row.local_date,
+            ForecastCurrentnessEvent.occurred_at.in_(transition_times),
+        )).scalars().all()
+        for event in transition_events:
+            event.occurred_at = generated_at
         if valid is not None:
             row.valid = valid
+
+
+def _set_latest_currentness_event(
+    database, forecast_id: str, occurred_at: datetime
+) -> None:
+    with database.session() as session:
+        event = session.execute(
+            select(ForecastCurrentnessEvent).where(
+                ForecastCurrentnessEvent.forecast_id == uuid.UUID(forecast_id)
+            ).order_by(ForecastCurrentnessEvent.id.desc()).limit(1)
+        ).scalar_one()
+        event.occurred_at = occurred_at
 
 
 def _set_retrospective_generated_at(
@@ -315,6 +343,7 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
 
     _, correct_analysis, _ = service.reconstructor.reconstruct(
         _curve(), response,
+        source_terminal_state={"stress_0_10": 4, "vitality_0_10": 5},
         end_anchor_minute=22 * 60,
         end_anchor_source="scheduled_review_time",
         review_local_date="2030-01-15",
@@ -322,6 +351,7 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
     )
     _, midnight_analysis, _ = service.reconstructor.reconstruct(
         _curve(), response,
+        source_terminal_state={"stress_0_10": 4, "vitality_0_10": 5},
         end_anchor_minute=5,
         end_anchor_source="scheduled_review_time",
         review_local_date="2030-01-15",
@@ -533,26 +563,27 @@ def test_submission_before_scheduled_time_has_no_model_side_effects():
     assert RetrospectiveCurveRepository(database).latest(person.id, target) is None
 
 
-def test_direct_callback_without_forecast_does_not_persist_orphan_response():
+def test_direct_callback_without_forecast_persists_explicit_unresolved_source():
     database = memory_database()
     person = participant(database, "DR-NO-SOURCE-FORECAST")
     target = date(2030, 1, 15)
     scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
 
-    with pytest.raises(ValueError, match="source forecast unavailable"):
-        _service(database).submit(
-            person.id,
-            callback_event_id="callback-no-source-forecast",
-            action=_daily_review_action(
-                database, person.id, target, scheduled_at
-            ),
-            values=_values(),
-            submitted_at=scheduled_at + timedelta(minutes=5),
-        )
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-no-source-forecast",
+        action=_daily_review_action(
+            database, person.id, target, scheduled_at
+        ),
+        values=_values(),
+        submitted_at=scheduled_at + timedelta(minutes=5),
+    )
 
-    assert DailyReviewResponseRepository(database).latest(
-        person.id, target
-    ) is None
+    response = DailyReviewResponseRepository(database).latest(person.id, target)
+    assert result["created"] is True
+    assert result["retrospective"] is None
+    assert response["causal_source_forecast_id"] is None
+    assert response["causal_source_forecast_version"] is None
     assert RetrospectiveCurveRepository(database).latest(
         person.id, target
     ) is None
@@ -671,6 +702,9 @@ def test_reactivated_forecast_is_persisted_as_daily_review_causal_source():
     reactivated_v1 = _seed_forecast(
         database, person.id, target, version="forecast-reactivated-v1"
     )
+    _set_latest_currentness_event(
+        database, forecast_v1["id"], t1 + timedelta(minutes=1)
+    )
 
     forecasts = ForecastSnapshotRepository(database)
     assert reactivated_v1["id"] == forecast_v1["id"]
@@ -700,6 +734,78 @@ def test_reactivated_forecast_is_persisted_as_daily_review_causal_source():
         result["retrospective"]["source_forecast_version"]
         == "forecast-reactivated-v1"
     )
+
+
+def test_submission_excludes_forecast_generated_after_submitted_at():
+    database = memory_database()
+    person = participant(database, "DR-FUTURE-SOURCE-RACE")
+    target = date(2030, 1, 15)
+    before = datetime(2030, 1, 15, 14, 10, tzinfo=timezone.utc)
+    submitted_at = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    after = datetime(2030, 1, 15, 14, 31, tzinfo=timezone.utc)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-before-submission"
+    )
+    _set_forecast_timeline(database, forecast_v1["id"], before)
+    forecast_v2 = _seed_forecast(
+        database, person.id, target, version="forecast-after-submission"
+    )
+    _set_forecast_timeline(database, forecast_v2["id"], after)
+
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-future-source-race",
+        action=_daily_review_action(
+            database,
+            person.id,
+            target,
+            datetime(2030, 1, 15, 14, tzinfo=timezone.utc),
+        ),
+        values=_values(),
+        submitted_at=submitted_at,
+    )
+
+    assert result["response"]["causal_source_forecast_id"] == forecast_v1["id"]
+    assert result["retrospective"]["source_forecast_id"] == forecast_v1["id"]
+    assert result["retrospective"]["source_forecast_id"] != forecast_v2["id"]
+
+
+def test_reanalysis_uses_latest_facts_without_replacing_causal_artifact():
+    database = memory_database()
+    person = participant(database, "DR-LATEST-FACTS-REANALYSIS")
+    target = date(2030, 1, 15)
+    forecast_v1 = _seed_forecast(
+        database, person.id, target, version="forecast-causal"
+    )
+    submitted_at = datetime(2030, 1, 15, 14, 30, tzinfo=timezone.utc)
+    service = _service(database)
+    submitted = service.submit(
+        person.id,
+        callback_event_id="callback-reanalysis",
+        action=_daily_review_action(
+            database,
+            person.id,
+            target,
+            datetime(2030, 1, 15, 14, tzinfo=timezone.utc),
+        ),
+        values=_values(),
+        submitted_at=submitted_at,
+    )
+    causal = submitted["retrospective"]
+    forecast_v2 = _seed_forecast(
+        database, person.id, target, version="forecast-latest-facts"
+    )
+
+    latest_facts = service.reanalysis(person.id, target)
+    persisted = RetrospectiveCurveRepository(database).latest(person.id, target)
+
+    assert latest_facts["id"] is None
+    assert latest_facts["analysis_kind"] == "reanalysis"
+    assert latest_facts["diagnostics"]["analysis_kind"] == "reanalysis"
+    assert latest_facts["source_forecast_id"] == forecast_v2["id"]
+    assert persisted["id"] == causal["id"]
+    assert persisted["source_forecast_id"] == forecast_v1["id"]
+    assert _retrospective_count(database, person.id) == 1
 
 
 def test_reactivated_forecast_crash_recovery_uses_persisted_exact_source():

@@ -135,7 +135,7 @@ class PredictionResult:
 
 
 class AssessmentModel:
-    MODEL_VERSION = "mindflow-ctssm-runtime-v6"
+    MODEL_VERSION = "mindflow-ctssm-runtime-v7"
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
@@ -264,6 +264,15 @@ class AssessmentModel:
                     3,
                 ),
                 "state": str(point.get("state") or ""),
+                "delta_stress_0_10": round(
+                    float(point.get("delta_S") or 0.0) / 10.0, 4
+                ),
+                "delta_vitality_0_10": round(
+                    float(point.get("delta_V") or 0.0) / 10.0, 4
+                ),
+                "continuous_load_hours": round(
+                    max(0.0, float(point.get("continuous_hours") or 0.0)), 4
+                ),
                 "stress_equilibrium_0_10": round(
                     float(point.get("stress_equilibrium") or 0.0) / 10.0, 3
                 ),

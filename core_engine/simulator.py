@@ -288,6 +288,7 @@ class Simulator:
         wake_s = latent.stress
         wake_recorded = False
         boundary_hits = 0
+        previous_point_latent = None
 
         while current_time <= end_of_day:
             cur_str = current_time.strftime("%H:%M")
@@ -363,7 +364,6 @@ class Simulator:
                     active_event_names=dynamic_inputs.active_event_names,
                 )
 
-            previous = latent
             observation_applied = False
             for observation in observations_by_time.get(
                 current_observation_key, []
@@ -413,40 +413,12 @@ class Simulator:
                     f"[{cur_str}] 清晨潜在压力参考={wake_s:.1f}"
                 )
 
-            dt_hours = self.time_step / 60.0
-            if dynamic_inputs.task_demand > 0.05:
-                continuous_load_hours += (
-                    dynamic_inputs.task_demand * dt_hours
-                )
+            if previous_point_latent is None:
+                delta_s = 0.0
+                delta_v = 0.0
             else:
-                continuous_load_hours = max(
-                    0.0,
-                    continuous_load_hours
-                    - (0.35 + dynamic_inputs.recovery) * dt_hours,
-                )
-
-            active_ids = list(dynamic_inputs.active_event_ids)
-            for event_id in active_ids:
-                assessment = assessments[event_id]
-                profile = profiles[event_id]
-                profile["total_S"] += (
-                    assessment.stress_intensity
-                    * float(ctssm_cfg.get("event_stress_gain", 30.0))
-                    * dt_hours
-                )
-                profile["total_E"] -= (
-                    assessment.task_demand
-                    * float(
-                        ctssm_cfg.get(
-                            "demand_vitality_drain_per_hour",
-                            13.0,
-                        )
-                    )
-                    * dt_hours
-                )
-
-            delta_s = point_latent.stress - previous.stress
-            delta_v = point_latent.vitality - previous.vitality
+                delta_s = point_latent.stress - previous_point_latent.stress
+                delta_v = point_latent.vitality - previous_point_latent.vitality
             stress_interval = prediction_interval(
                 point_latent.stress,
                 point_uncertainty.stress_variance,
@@ -539,6 +511,42 @@ class Simulator:
                     "observation_assimilated": observation_applied,
                 }
             )
+
+            # These quantities integrate the interval [t, t + dt).  Update
+            # them only after recording the point at t so a trajectory row
+            # never contains work that has not happened yet.
+            dt_hours = self.time_step / 60.0
+            if dynamic_inputs.task_demand > 0.05:
+                continuous_load_hours += (
+                    dynamic_inputs.task_demand * dt_hours
+                )
+            else:
+                continuous_load_hours = max(
+                    0.0,
+                    continuous_load_hours
+                    - (0.35 + dynamic_inputs.recovery) * dt_hours,
+                )
+
+            for event_id in dynamic_inputs.active_event_ids:
+                assessment = assessments[event_id]
+                profile = profiles[event_id]
+                profile["total_S"] += (
+                    assessment.stress_intensity
+                    * float(ctssm_cfg.get("event_stress_gain", 30.0))
+                    * dt_hours
+                )
+                profile["total_E"] -= (
+                    assessment.task_demand
+                    * float(
+                        ctssm_cfg.get(
+                            "demand_vitality_drain_per_hour",
+                            13.0,
+                        )
+                    )
+                    * dt_hours
+                )
+
+            previous_point_latent = point_latent
             current_time += timedelta(minutes=self.time_step)
 
         alerts, confidence_series = AlertMonitor(self.user.params).analyze(
@@ -547,7 +555,7 @@ class Simulator:
         hit_rate = boundary_hits / max(1, len(results))
         trace_logs.append(
             (
-                f"[23:59] {model_info['canonical']} 结束：S={latent.stress:.1f}, "
+                f"[24:00] {model_info['canonical']} 结束：S={latent.stress:.1f}, "
                 f"V={latent.vitality:.1f}, P={latent.perseverative_cognition:.2f}, "
                 f"F={latent.recovery_debt:.2f}, 边界命中率={hit_rate:.2%}, "
                 f"关怀提示={len(alerts)}"

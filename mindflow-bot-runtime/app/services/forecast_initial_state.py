@@ -6,7 +6,64 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 import hashlib
 import json
+import logging
 from typing import Any
+
+
+POINT_AT_T_MODEL_VERSION = 7
+logger = logging.getLogger(__name__)
+
+
+def _uses_point_at_t_curve(forecast: dict[str, Any]) -> bool:
+    """Return whether ``curve[-1]`` is the 23:55 point, not the 24:00 terminal."""
+
+    version = str(forecast.get("algorithm_version") or "")
+    prefix = "mindflow-ctssm-runtime-v"
+    if not version.startswith(prefix):
+        return False
+    try:
+        return int(version[len(prefix):]) >= POINT_AT_T_MODEL_VERSION
+    except ValueError:
+        # A future/non-numeric version under the canonical runtime namespace
+        # must fail closed instead of silently treating 23:55 as midnight.
+        return True
+
+
+def forecast_terminal_state(
+    forecast: dict[str, Any] | None,
+) -> tuple[float, float] | None:
+    """Resolve a forecast's 24:00 terminal without misusing a 23:55 point.
+
+    Legacy snapshots predate the point-at-t contract and may use the final
+    curve row as their terminal approximation.  Current runtime snapshots must
+    carry the explicit output contract.
+    """
+
+    if forecast is None:
+        return None
+    output = dict(forecast.get("output") or {})
+    stress = output.get("stress_0_10")
+    vitality = output.get("vitality_0_10")
+    if (stress is None or vitality is None) and not _uses_point_at_t_curve(forecast):
+        curve = list(forecast.get("curve") or [])
+        terminal = dict(curve[-1]) if curve else {}
+        stress = terminal.get("stress_0_10")
+        vitality = terminal.get("vitality_0_10")
+    try:
+        return (
+            max(0.0, min(float(stress), 10.0)),
+            max(0.0, min(float(vitality), 10.0)),
+        )
+    except (TypeError, ValueError):
+        if _uses_point_at_t_curve(forecast):
+            logger.error(
+                "forecast_terminal_contract_incomplete forecast_id=%s "
+                "forecast_version=%s algorithm_version=%s",
+                forecast.get("id"),
+                forecast.get("forecast_version"),
+                forecast.get("algorithm_version"),
+            )
+        return None
 
 
 def _revision(payload: dict[str, Any]) -> str:
@@ -67,23 +124,7 @@ class ForecastInitialStateResolver:
     def _previous_terminal(
         self, previous_day_forecast: dict[str, Any] | None
     ) -> tuple[float, float] | None:
-        if previous_day_forecast is None:
-            return None
-        output = dict(previous_day_forecast.get("output") or {})
-        stress = output.get("stress_0_10")
-        vitality = output.get("vitality_0_10")
-        if stress is None or vitality is None:
-            curve = list(previous_day_forecast.get("curve") or [])
-            terminal = dict(curve[-1]) if curve else {}
-            stress = terminal.get("stress_0_10")
-            vitality = terminal.get("vitality_0_10")
-        try:
-            return (
-                max(0.0, min(float(stress), 10.0)),
-                max(0.0, min(float(vitality), 10.0)),
-            )
-        except (TypeError, ValueError):
-            return None
+        return forecast_terminal_state(previous_day_forecast)
 
     def resolve(
         self,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from app.agent.context import AgentContext
 from app.agent.sdk_adapter import (
     ClaudeSDKInvocationError,
@@ -43,7 +45,8 @@ class ClaudeAgentRuntime:
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
     ) -> RuntimeResponse:
-        self.conversations.add(
+        await asyncio.to_thread(
+            self.conversations.add,
             ctx.participant_id,
             "user",
             text,
@@ -51,7 +54,7 @@ class ClaudeAgentRuntime:
         )
         fixed = self.safety.precheck(text, chat_type=chat_type)
         if fixed is not None:
-            self._save_answer(ctx, fixed)
+            await self._save_answer(ctx, fixed)
             return RuntimeResponse(
                 text=fixed,
                 safety_locked=True,
@@ -62,13 +65,13 @@ class ClaudeAgentRuntime:
                 ctx, text, on_activity=on_activity
             )
         except ClaudeSDKTurnInterrupted as exc:
-            self._save_answer(ctx, FALLBACK_INTERRUPTED)
+            await self._save_answer(ctx, FALLBACK_INTERRUPTED)
             raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED) from exc
         except ClaudeSDKInvocationError:
-            self._save_answer(ctx, FALLBACK_TEMPORARY)
+            await self._save_answer(ctx, FALLBACK_TEMPORARY)
             raise
         answer = self.safety.postcheck(result.text)
-        self._save_answer(ctx, answer)
+        await self._save_answer(ctx, answer)
         return RuntimeResponse(
             text=answer,
             safety_locked=False,
@@ -81,8 +84,9 @@ class ClaudeAgentRuntime:
     async def close(self) -> None:
         await self.sessions.close()
 
-    def _save_answer(self, ctx: AgentContext, text: str) -> None:
-        self.conversations.add(
+    async def _save_answer(self, ctx: AgentContext, text: str) -> None:
+        await asyncio.to_thread(
+            self.conversations.add,
             ctx.participant_id,
             "assistant",
             text,

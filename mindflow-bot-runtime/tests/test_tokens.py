@@ -83,6 +83,61 @@ def test_concurrent_refresh_performs_one_rotation():
     assert repo.status(p1.id)["token_version"] == 2
 
 
+def test_separate_refresh_service_instances_share_one_authoritative_lease():
+    database = memory_database()
+    person = participant(database, "TOKEN-CROSS-SERVICE")
+    encryption = TokenEncryptionService(TokenEncryptionService.generate_key())
+    repo = TokenRepository(database, encryption, oauth_app_id="calendar-app")
+    repo.save(person.id, token_set("expired", "refresh-old", expired=True))
+    refresh_count = 0
+    network_started = asyncio.Event()
+
+    async def refresh(value):
+        nonlocal refresh_count
+        assert value == "refresh-old"
+        refresh_count += 1
+        network_started.set()
+        await asyncio.sleep(0.05)
+        return token_set("access-new", "refresh-new")
+
+    first = TokenRefreshService(
+        database,
+        encryption,
+        refresh,
+        expected_oauth_app_id="calendar-app",
+        refresh_poll_seconds=0.01,
+    )
+    second = TokenRefreshService(
+        database,
+        encryption,
+        refresh,
+        expected_oauth_app_id="calendar-app",
+        refresh_poll_seconds=0.01,
+    )
+
+    async def scenario():
+        requests = [
+            asyncio.create_task(first.get_access_token(person.id)),
+            asyncio.create_task(second.get_access_token(person.id)),
+        ]
+        await asyncio.wait_for(network_started.wait(), timeout=1)
+        # The authoritative network owner has already committed its short DB
+        # lease, so an unrelated token status read remains available.
+        status = await asyncio.wait_for(
+            asyncio.to_thread(repo.status, person.id), timeout=0.5
+        )
+        assert status["connected"] is True
+        return await asyncio.gather(*requests)
+
+    assert asyncio.run(scenario()) == ["access-new", "access-new"]
+    assert refresh_count == 1
+    assert repo.status(person.id)["token_version"] == 2
+    with database.session() as session:
+        row = session.get(FeishuOAuthToken, person.id)
+        assert row.refresh_lease_token is None
+        assert row.refresh_lease_until is None
+
+
 def test_calendar_resolves_the_requested_participant_token(monkeypatch):
     database = memory_database()
     p1 = participant(database, "P001")

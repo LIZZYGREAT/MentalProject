@@ -30,7 +30,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 |---|---|
 | 代码与自动测试 | `READY`（以 `python -m pytest -q tests` 当前结果为准） |
 | 业务 Tool | `15`（由文档漂移测试校验） |
-| Alembic head | `0017_care_delivery_authorization` |
+| Alembic head | `0020_oauth_refresh_lease` |
 | Daily Review | `IMPLEMENTED`（生产启用仍依赖 HTTPS 卡片回调） |
 | Admin | `IMPLEMENTED`（生产访问仍需账号与安全入口配置） |
 | 真实环境配置 | `TODO` |
@@ -45,7 +45,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 |---|---|---|---|---|---|---|
 | ENV-01 | P0 | 补齐 `mindflow-bot-runtime/.env` | TODO | 数据库、加密 Key、`CLAUDE_ANTHROPIC_BASE_URL`、主模型以及 Opus/Sonnet/Haiku/Subagent 的 DeepSeek 映射均已配置；真实值未进入 Git | — | Opus/Sonnet 使用 v4-pro，Haiku/Subagent 使用 v4-flash；不在本文件记录真实 ID 或 Secret |
 | SEC-01 | P0 | 轮换曾在旧环境或聊天记录中出现过的飞书与 DeepSeek Secret | TODO | 新 Secret 生效，旧 Secret 已失效，仓库敏感信息扫描无命中 | — | 只记录轮换完成，不记录 Secret |
-| DEP-01 | P0 | 首次构建并启动生产容器 | TODO | `docker compose up --build -d` 成功；`bot`、`admin`、`postgres` 健康；Alembic head `0017_care_delivery_authorization` 与 Agent SDK import 成功 | — | 保存脱敏后的 `docker compose ps`、`alembic current` 和启动日志 |
+| DEP-01 | P0 | 首次构建并启动生产容器 | TODO | `docker compose up --build -d` 成功；`bot`、`admin`、`postgres` 健康；Alembic head `0020_oauth_refresh_lease` 与 Agent SDK import 成功 | — | 保存脱敏后的 `docker compose ps`、`alembic current` 和启动日志 |
 | SDK-01 | P0 | 云端 Claude Agent SDK -> DeepSeek smoke | TODO | 容器内 `ClaudeSDKClient` 使用 DeepSeek Anthropic endpoint 返回结果；没有 Anthropic 官方模型 fallback | — | 保存模型名、状态和脱敏延迟，不保存 Prompt/Key |
 | SDK-02 | P0 | 验证 session queue、`/stop` 与 progress | TODO | busy 时新消息顺序排队；`/stop` 中断当前 turn；progress 模板限频且 final 始终由 Backend 发送 | — | 使用脱敏 message/session ID |
 | FS-01 | P0 | 核对飞书应用配置 | TODO | 机器人长连接已开启；订阅 `im.message.receive_v1`；日历和 `offline_access` 权限已审批 | — | 截图或审批记录路径 |
@@ -74,7 +74,7 @@ archive_rule: 所有必须项完成并形成证据后，将 document_status 改�
 | BASE-04 | DONE | 十五个 participant-bound SDK MCP Tool、封闭 schema 与身份隔离 | 自动测试（历史完成基线：2026-08-25） |
 | BASE-05 | DONE | OAuth Token AES-256-GCM 加密与参与者隔离 | 自动测试 |
 | BASE-06 | DONE | 完整预测输入快照、轨迹和告警留存 | 自动测试 |
-| BASE-07 | DONE | Agent SDK Docker、Claude state volume、Alembic `0017` head 和生产配置模板 | 自动迁移、静态验证与可选真实 PostgreSQL 0016→0017 集成测试 |
+| BASE-07 | DONE | Agent SDK Docker、Claude state volume、Alembic `0020` head 和生产配置模板 | 自动迁移、静态验证与可选真实 PostgreSQL 0016→0020 集成测试 |
 | BASE-08 | DOING | FeishuChannel 独立 receiver process、稳定 IPC DTO、字段映射、dedupe 与 queue-full 恢复 | 本地自动测试通过；待 ECS WebSocket smoke、restart_count=0 与旧 event-loop warning 消失后验收 |
 | BASE-09 | DONE | Backend progress policy、可靠 final delivery 与 `/stop` 控制路径 | 自动测试 |
 | BASE-10 | DONE | 独立 Admin 服务、角色权限、Forecast/回顾查询与显式运维操作 | 自动测试（历史完成基线：2026-08-25） |

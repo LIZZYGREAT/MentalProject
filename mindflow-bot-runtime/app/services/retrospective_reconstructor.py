@@ -33,7 +33,7 @@ def _gaussian(delta: float, sigma: float) -> float:
 
 
 class RetrospectiveReconstructor:
-    ALGORITHM_VERSION = "anchor-residual-kernel-v2"
+    ALGORITHM_VERSION = "anchor-residual-kernel-v3"
 
     def __init__(
         self, *, morning_sigma: float = 90, end_sigma: float = 60,
@@ -52,6 +52,7 @@ class RetrospectiveReconstructor:
         curve: list[dict],
         review: dict[str, Any],
         *,
+        source_terminal_state: dict[str, float] | None,
         end_anchor_minute: int,
         end_anchor_source: str,
         review_local_date: str,
@@ -117,31 +118,41 @@ class RetrospectiveReconstructor:
             point["vitality_0_10"] = round(float(point["vitality_0_10"]), 3)
 
         end_index = _nearest(base, end_minute)
-        remaining_minutes = max(0, 1435 - end_minute)
+        remaining_minutes = max(0, 1440 - end_minute)
         persistence = math.exp(-remaining_minutes / 720)
-        terminal_base = base[-1]
-        forward_terminal = {
-            "stress_0_10": round(min(10.0, max(0.0,
-                float(terminal_base.get("stress_0_10", 0))
-                + self.end_state_gain * persistence * (
-                    float(review["end_stress"]) - float(base[end_index].get("stress_0_10", 0))
-                ))), 3),
-            "vitality_0_10": round(min(10.0, max(0.0,
-                float(terminal_base.get("vitality_0_10", 0))
-                + self.end_state_gain * persistence * (
-                    float(review["end_energy"]) - float(base[end_index].get("vitality_0_10", 0))
-                ))), 3),
-            "source": "daily_review_end_state",
-            "gain": self.end_state_gain,
-        }
+        forward_terminal = None
+        if source_terminal_state is not None:
+            terminal_base = dict(source_terminal_state)
+            forward_terminal = {
+                "stress_0_10": round(min(10.0, max(0.0,
+                    float(terminal_base["stress_0_10"])
+                    + self.end_state_gain * persistence * (
+                        float(review["end_stress"]) - float(base[end_index].get("stress_0_10", 0))
+                    ))), 3),
+                "vitality_0_10": round(min(10.0, max(0.0,
+                    float(terminal_base["vitality_0_10"])
+                    + self.end_state_gain * persistence * (
+                        float(review["end_energy"]) - float(base[end_index].get("vitality_0_10", 0))
+                    ))), 3),
+                "source": "daily_review_end_state",
+                "gain": self.end_state_gain,
+            }
         peak_point = max(result, key=lambda point: float(point.get("stress_0_10", 0)))
         analysis = {
             "peak_stress": float(peak_point["stress_0_10"]),
             "peak_time": peak_point["time"],
-            "terminal_state": {
+            "curve_last_point_state": {
                 "stress_0_10": result[-1]["stress_0_10"],
                 "vitality_0_10": result[-1]["vitality_0_10"],
             },
+            "terminal_state": (
+                {
+                    "stress_0_10": forward_terminal["stress_0_10"],
+                    "vitality_0_10": forward_terminal["vitality_0_10"],
+                }
+                if forward_terminal is not None
+                else None
+            ),
             "forward_terminal_state": forward_terminal,
             "labels": {
                 "forecast": "预测", "instant": "即时反馈",
@@ -166,6 +177,7 @@ class RetrospectiveReconstructor:
             "energy_consumption_diagnostic": float(review["energy_consumption"]),
             "energy_consumption_used_as_hard_anchor": False,
             "peak_used_as_current_state": False,
+            "source_terminal_complete": source_terminal_state is not None,
         }
         return result, analysis, diagnostics
 

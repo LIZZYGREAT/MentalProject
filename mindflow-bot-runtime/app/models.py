@@ -87,6 +87,13 @@ class FeishuOAuthToken(Base):
     refresh_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     granted_scopes: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    refresh_lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refresh_lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    refresh_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
@@ -348,7 +355,7 @@ class CalendarMutationReconciliation(Base):
     mutation_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     work_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
     status: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="pending"
+        String(32), nullable=False, default="prepared"
     )
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(
@@ -415,6 +422,42 @@ class ForecastSnapshot(Base):
     output_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
     valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ForecastCurrentnessEvent(Base):
+    """Append-only history of which forecast was current at a point in time."""
+
+    __tablename__ = "forecast_currentness_events"
+    __table_args__ = (
+        Index(
+            "ix_forecast_currentness_at",
+            "participant_id",
+            "local_date",
+            "occurred_at",
+            "id",
+        ),
+        Index("ix_forecast_currentness_forecast", "forecast_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    forecast_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("forecast_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class WarningSchedule(Base):

@@ -2,6 +2,7 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from app.models import StateObservation
 from app.repositories import ObservationRepository, ParticipantRepository
 from algorithm.time_utils import normalize_observation_to_model_step
 from helpers import memory_database
@@ -101,20 +102,25 @@ def test_repository_filters_by_business_local_date_and_as_of():
     local_day = date(2026, 8, 21)
     before_midnight_utc = datetime(2026, 8, 20, 15, 30, tzinfo=timezone.utc)
     after_midnight_utc = datetime(2026, 8, 20, 16, 30, tzinfo=timezone.utc)
-    observations.add(
+    previous_id = observations.add(
         participant.id,
         "checkin",
         {"stress_0_10": 4},
         observed_at=before_midnight_utc,
         source_message_id="previous-local-day",
     )
-    observations.add(
+    target_id = observations.add(
         participant.id,
         "checkin",
         {"stress_0_10": 7},
         observed_at=after_midnight_utc,
         source_message_id="target-local-day",
     )
+    # These rows model observations ingested at their event times.  Keep the
+    # knowledge-time axis explicit now that as_of applies both timestamps.
+    with database.session() as session:
+        session.get(StateObservation, previous_id).created_at = before_midnight_utc
+        session.get(StateObservation, target_id).created_at = after_midnight_utc
 
     before = observations.for_local_date(
         participant.id,

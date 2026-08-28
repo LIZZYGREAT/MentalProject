@@ -41,6 +41,36 @@ def _settings():
     )
 
 
+def test_admin_slow_health_repository_does_not_block_event_loop(monkeypatch):
+    repository = AdminRepository(memory_database())
+    started = threading.Event()
+    loop_thread = threading.get_ident()
+    repository_thread = None
+
+    def slow_health():
+        nonlocal repository_thread
+        repository_thread = threading.get_ident()
+        started.set()
+        time.sleep(0.30)
+        return {"status": "ok", "database": "ok"}
+
+    monkeypatch.setattr(repository, "health", slow_health)
+    api = AdminAPI(repository, _settings(), None)
+    request = Request({"type": "http", "method": "GET", "path": "/health"})
+
+    async def scenario():
+        task = asyncio.create_task(api.health(request))
+        assert await asyncio.to_thread(started.wait, 1.0)
+        heartbeat_started = time.monotonic()
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - heartbeat_started < 0.2
+        response = await task
+        assert response.status_code == 200
+
+    asyncio.run(scenario())
+    assert repository_thread != loop_thread
+
+
 def _save_forecast(repository, participant_id, target, version):
     return repository.save(
         participant_id,
@@ -155,17 +185,16 @@ def test_admin_rebuild_offloads_slow_reconstruction_from_event_loop(monkeypatch)
         None,
         daily_reviews=daily_reviews,
     )
-    monkeypatch.setattr(
-        api,
-        "_authorized",
-        lambda *_args, **_kwargs: AdminSession(
+    async def authorized(*_args, **_kwargs):
+        return AdminSession(
             username="admin",
             expires_at=datetime.now(ZoneInfo("UTC")) + timedelta(hours=1),
             csrf_token="csrf",
             user_id=str(uuid.uuid4()),
             role="admin",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(api, "_authorized", authorized)
     target = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     request = Request(
         {

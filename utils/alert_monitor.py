@@ -78,7 +78,9 @@ class AlertMonitor:
         for row in results:
             minute = time_to_minutes(row.get("time", "00:00"))
             if previous_minute is None:
-                dt_minutes = self.default_step
+                # The first point is a state at its timestamp; no duration
+                # has elapsed before it within this trajectory.
+                dt_minutes = 0.0
             else:
                 dt_minutes = float((minute - previous_minute) % 1440)
                 if dt_minutes <= 0.0:

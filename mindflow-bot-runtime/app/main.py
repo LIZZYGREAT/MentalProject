@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -118,6 +119,7 @@ async def _run_gateway_until_shutdown(gateway: Any, on_ready: Any = None) -> Non
 
 
 async def run() -> None:
+    process_started_at = datetime.now(timezone.utc)
     # Heavy application/algorithm imports are intentionally inside run().
     # Spawned Feishu receiver children importing app.main stay lightweight.
     from sqlalchemy import text
@@ -166,6 +168,7 @@ async def run() -> None:
     business = build_business_services(database, settings, runs)
     business.dependency_refresh.start()
     business.mutation_refresh.start()
+    await business.mutation_refresh.recover_startup_fences(process_started_at)
     business.observation_refresh.start()
     _log_startup_phase("business_ready")
 

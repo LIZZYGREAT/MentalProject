@@ -76,3 +76,19 @@ def test_authoritative_alembic_head_matches_migration_graph():
         "ALEMBIC_HEAD",
     )
     assert _migration_heads() == {declared}
+
+
+def test_authoritative_architecture_describes_critical_0018_behaviors():
+    text = (REPOSITORY_ROOT / "docs" / "CURRENT_ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+    assert "point-at-t" in text
+    assert "submitted_at` 之前" in text
+    assert "重建（因果）" in text
+    assert "analysis_kind=reanalysis" in text
+    assert "delivery_kind=same_day_late_care" in text
+    assert "durable pre-intent saga" in text
+    assert "PostgreSQL JSONB" in text
+    assert "forecast_currentness_events" in text
+    assert "remote_outcome_unknown" in text
+    assert "refresh lease" in text

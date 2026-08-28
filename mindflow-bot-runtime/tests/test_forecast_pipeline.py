@@ -384,6 +384,10 @@ def test_external_enrichment_is_single_flight_durable_and_identity_free():
                 "appraisal_score_1_10": 5.0,
                 "confidence": 0.8, "evidence_tags": ["汇报"],
                 "reasoning_summary": "正式汇报具有客观评价属性",
+                "event_classification": {
+                    "event_type": "task", "task_type": "general", "confidence": 0.8,
+                },
+                "course_match": {"matched": False},
             }
 
     client = Client()
@@ -476,6 +480,10 @@ def test_stale_semantic_miss_does_not_repeat_api_call():
                 "confidence": 0.8,
                 "evidence_tags": [],
                 "reasoning_summary": "ok",
+                "event_classification": {
+                    "event_type": "task", "task_type": "general", "confidence": 0.8,
+                },
+                "course_match": {"matched": False},
             }
 
     client = BlockingClient()
@@ -631,6 +639,10 @@ def test_completion_watcher_absorbs_new_fingerprint_without_duplicate_callback()
                 "confidence": 0.8,
                 "evidence_tags": [],
                 "reasoning_summary": "ok",
+                "event_classification": {
+                    "event_type": "task", "task_type": "general", "confidence": 0.8,
+                },
+                "course_match": {"matched": False},
             }
 
     event_a = event(summary="A", event_id="event-a")
@@ -700,6 +712,10 @@ def test_dynamic_calendar_addition_is_enriched_and_latest_forecast_uses_it():
                 "confidence": 0.9,
                 "evidence_tags": [],
                 "reasoning_summary": "material enrichment",
+                "event_classification": {
+                    "event_type": "task", "task_type": "general", "confidence": 0.9,
+                },
+                "course_match": {"matched": False},
             }
 
     event_a = event(summary="A", event_id="event-a")

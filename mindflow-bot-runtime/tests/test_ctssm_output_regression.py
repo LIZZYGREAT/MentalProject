@@ -84,20 +84,20 @@ def test_production_ctssm_fixture_is_stable_after_legacy_removal():
         for item in coordinator._warning_windows(selected, date(2030, 1, 15))
     ]
 
-    assert result.model_version == "mindflow-ctssm-runtime-v6"
+    assert result.model_version == "mindflow-ctssm-runtime-v7"
     assert result.model_family == "stress-ctssm.m0"
     assert result.point_count == 288
     assert _sha(result.trajectory) == (
-        "fe0ee74f0bf5fe47619477d1543ca5141bce5229fb4da7dbff561a70daf17d0b"
+        "c6f17e9b5bad3e674807ae1cc0a905746a940382a0cb55602222d78ac7805c6d"
     )
     assert _sha(result.alerts) == (
-        "b4fa656a60fe503af0394d4c75bb0ca7cd9258f8c81b01018c85564d525c628a"
+        "3b674b9753941b253047a42fc305efea884dd011e68e0a6239bb8315ea821a8c"
     )
     assert _sha(warning_windows) == (
-        "f18fd1eb56c581d0d215c2c815506834c52d297fb65171b6c957384a66076cd4"
+        "d32b572cee8e70c37e5571265ff2b4c22b0cf34c9d4e9da8a86d25be15ad8bce"
     )
     assert _sha(result.confidence_series) == (
-        "9540d25537c7c84ebb2ed08cc6124f8ab2936d66e8bdb3861e526ab55be14f14"
+        "64a0bab1313af875ecef28e137f128dc98f27b254b159d03aa87ce1897e22c95"
     )
     assert (result.stress_0_10, result.vitality_0_10) == (4.98, 7.2)
     assert result.active_states == ("S",)

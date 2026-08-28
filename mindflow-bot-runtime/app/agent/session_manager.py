@@ -149,7 +149,8 @@ class ParticipantSessionManager:
                         client.run_turn(request.text),
                         timeout=self.turn_timeout_seconds,
                     )
-                    self.repository.save(
+                    await asyncio.to_thread(
+                        self.repository.save,
                         session.participant_id,
                         result.session_id,
                         last_message_id=request.ctx.message_id,
@@ -158,7 +159,9 @@ class ParticipantSessionManager:
                         request.future.set_result(result)
                 except asyncio.TimeoutError as exc:
                     await self._interrupt_and_drop(session)
-                    self.repository.mark_stale(session.participant_id)
+                    await asyncio.to_thread(
+                        self.repository.mark_stale, session.participant_id
+                    )
                     if not request.future.done():
                         request.future.set_exception(
                             ClaudeSDKInvocationError("Claude turn timed out")
@@ -228,7 +231,9 @@ class ParticipantSessionManager:
             await asyncio.sleep(0.05)
         if victim_client is not None:
             await victim_client.disconnect()
-        saved = self.repository.get(session.participant_id)
+        saved = await asyncio.to_thread(
+            self.repository.get, session.participant_id
+        )
         resume_id = saved.session_id if saved and saved.status == "active" else None
         client = self.factory.create(session.binding, resume_session_id=resume_id)
         try:
@@ -238,7 +243,9 @@ class ParticipantSessionManager:
                 self._connecting.discard(session.participant_id)
                 session.state = "closed"
             if resume_id:
-                self.repository.mark_stale(session.participant_id)
+                await asyncio.to_thread(
+                    self.repository.mark_stale, session.participant_id
+                )
             raise
         async with self._lock:
             self._connecting.discard(session.participant_id)

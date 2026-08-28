@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import pressure_curve_card
 from app.contracts.warning import WarningDeliveryPolicyConfig
-from app.models import ForecastSnapshot, StateObservation, WarningSchedule
+from app.models import (
+    ForecastCurrentnessEvent,
+    ForecastSnapshot,
+    StateObservation,
+    WarningSchedule,
+)
 from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
@@ -1264,11 +1269,24 @@ def test_longitudinal_calibration_requires_seven_days_and_versions_learned_layer
 
 def _set_forecast_generated_at(database, forecast_id, value):
     with database.session() as session:
-        session.get(ForecastSnapshot, uuid.UUID(forecast_id)).generated_at = (
+        generated_at = (
             value.replace(tzinfo=timezone.utc)
             if value.tzinfo is None
             else value.astimezone(timezone.utc)
         )
+        row = session.get(ForecastSnapshot, uuid.UUID(forecast_id))
+        row.generated_at = generated_at
+        own_events = session.query(ForecastCurrentnessEvent).filter(
+            ForecastCurrentnessEvent.forecast_id == row.id
+        ).all()
+        transition_times = {event.occurred_at for event in own_events}
+        paired_events = session.query(ForecastCurrentnessEvent).filter(
+            ForecastCurrentnessEvent.participant_id == row.participant_id,
+            ForecastCurrentnessEvent.local_date == row.local_date,
+            ForecastCurrentnessEvent.occurred_at.in_(transition_times),
+        ).all()
+        for event in paired_events:
+            event.occurred_at = generated_at
 
 
 def _add_observation_at(observations, database, participant_id, *, observed_at, actual, key):
@@ -1409,6 +1427,12 @@ def test_warning_policy_full_pipeline_closes_candidate_interval_and_daily_cap():
     if len(selected) == 2:
         claimed = repository.claim_if_current(second_id, now=second_target)
         assert claimed is not None
+        assert repository.validate_claim_current(
+            second_id,
+            claim_token=claimed["claim_token"],
+            expected_forecast_version=claimed["forecast_version"],
+            now=second_target,
+        )
         assert repository.finish_claim(
             second_id, claim_token=claimed["claim_token"],
             expected_forecast_version=claimed["forecast_version"], sent=True,

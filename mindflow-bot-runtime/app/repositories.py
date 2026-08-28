@@ -11,7 +11,9 @@ import uuid
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import desc, or_, select
+from sqlalchemy import case, desc, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
 
@@ -36,6 +38,7 @@ def _integrity_matches(
 
 from app.db import Database
 from app.contracts.warning import WarningDeliveryPolicyConfig
+from app.services.same_day_late_care_policy import SameDayLateCarePolicy
 from app.models import (
     AgentRun,
     AgentToolCall,
@@ -50,6 +53,7 @@ from app.models import (
     ParticipantCarePreference,
     ParticipantProfile,
     LearnedModelProfile,
+    ForecastCurrentnessEvent,
     ForecastSnapshot,
     RuntimeIncident,
     StateObservation,
@@ -500,6 +504,7 @@ class ObservationRepository:
                 else as_of.astimezone(timezone.utc)
             )
             conditions.append(StateObservation.observed_at <= cutoff)
+            conditions.append(StateObservation.created_at <= cutoff)
         with self.database.session() as session:
             rows = session.execute(
                 select(StateObservation)
@@ -779,15 +784,38 @@ class EventSemanticCacheRepository:
         schema_version: str,
         prompt_version: str,
         model: str,
+        assessment: dict[str, Any] | None = None,
     ) -> None:
         rejection: dict[str, Any] = {"reason": str(reason)[:128]}
         if confidence is not None:
             rejection["confidence"] = float(confidence)
+        payload = dict(assessment or {})
+        payload["rejection"] = rejection
         self._put(
             participant_id,
             fingerprint,
-            {"rejection": rejection},
+            payload,
             status="rejected",
+            schema_version=schema_version,
+            prompt_version=prompt_version,
+            model=model,
+        )
+
+    def put_partial(
+        self,
+        participant_id: uuid.UUID,
+        fingerprint: str,
+        assessment: dict[str, Any],
+        *,
+        schema_version: str,
+        prompt_version: str,
+        model: str,
+    ) -> None:
+        self._put(
+            participant_id,
+            fingerprint,
+            assessment,
+            status="partial",
             schema_version=schema_version,
             prompt_version=prompt_version,
             model=model,
@@ -804,8 +832,54 @@ class EventSemanticCacheRepository:
         prompt_version: str,
         model: str,
     ) -> None:
-        if status not in {"complete", "rejected"}:
+        if status not in {"complete", "partial", "rejected"}:
             raise ValueError("unsupported semantic cache status")
+        now = utc_now()
+        values = {
+            "id": uuid.uuid4(),
+            "participant_id": participant_id,
+            "fingerprint": fingerprint,
+            "schema_version": schema_version,
+            "prompt_version": prompt_version,
+            "model": model,
+            "assessment_json": dict(assessment),
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+        }
+        dialect = self.database.engine.dialect.name
+        if dialect in {"postgresql", "sqlite"}:
+            insert = postgresql_insert if dialect == "postgresql" else sqlite_insert
+            statement = insert(EventSemanticCache).values(**values)
+            conflict_columns = [
+                EventSemanticCache.participant_id,
+                EventSemanticCache.fingerprint,
+                EventSemanticCache.schema_version,
+                EventSemanticCache.prompt_version,
+                EventSemanticCache.model,
+            ]
+            incoming_rank = case(
+                (statement.excluded.status == "complete", 3),
+                (statement.excluded.status == "partial", 2),
+                else_=1,
+            )
+            stored_rank = case(
+                (EventSemanticCache.status == "complete", 3),
+                (EventSemanticCache.status == "partial", 2),
+                else_=1,
+            )
+            statement = statement.on_conflict_do_update(
+                index_elements=conflict_columns,
+                set_={
+                    "assessment_json": statement.excluded.assessment_json,
+                    "status": statement.excluded.status,
+                    "updated_at": statement.excluded.updated_at,
+                },
+                where=incoming_rank >= stored_rank,
+            )
+            with self.database.session() as session:
+                session.execute(statement)
+            return
         with self.database.session() as session:
             row = session.execute(
                 select(EventSemanticCache).where(
@@ -823,9 +897,11 @@ class EventSemanticCacheRepository:
                     model=model, assessment_json=dict(assessment), status=status,
                 ))
             else:
-                row.assessment_json = dict(assessment)
-                row.status = status
-                row.updated_at = utc_now()
+                quality = {"rejected": 1, "partial": 2, "complete": 3}
+                if quality[status] >= quality.get(str(row.status), 0):
+                    row.assessment_json = dict(assessment)
+                    row.status = status
+                    row.updated_at = utc_now()
 
 
 class ForecastSnapshotRepository:
@@ -924,8 +1000,8 @@ class ForecastSnapshotRepository:
     ) -> Optional[dict[str, Any]]:
         """Return the newest snapshot generated before a causal cutoff.
 
-        Invalidated snapshots are intentionally included: a later forecast may
-        invalidate the exact pre-observation version that calibration needs.
+        This is an artifact-generation query only.  Consumers that need the
+        forecast which was current at the cutoff must use :meth:`current_at`.
         """
 
         with self.database.session() as session:
@@ -935,6 +1011,80 @@ class ForecastSnapshotRepository:
                 ForecastSnapshot.generated_at < timestamp,
             ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
             return self._view(row) if row is not None else None
+
+    def current_at(
+        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
+    ) -> Optional[dict[str, Any]]:
+        """Return the forecast that was actually current at ``timestamp``."""
+
+        cutoff = (
+            timestamp.replace(tzinfo=timezone.utc)
+            if timestamp.tzinfo is None
+            else timestamp.astimezone(timezone.utc)
+        )
+        with self.database.session() as session:
+            event = session.execute(
+                select(ForecastCurrentnessEvent).where(
+                    ForecastCurrentnessEvent.participant_id == participant_id,
+                    ForecastCurrentnessEvent.local_date == local_date,
+                    ForecastCurrentnessEvent.occurred_at <= cutoff,
+                ).order_by(
+                    desc(ForecastCurrentnessEvent.occurred_at),
+                    desc(ForecastCurrentnessEvent.id),
+                ).limit(1)
+            ).scalar_one_or_none()
+            if event is None or event.event_type != "activated":
+                return None
+            row = session.get(ForecastSnapshot, event.forecast_id)
+            return self._view(row) if row is not None else None
+
+    @staticmethod
+    def _append_currentness_event(
+        session: Any,
+        row: ForecastSnapshot,
+        *,
+        event_type: str,
+        reason: str,
+        occurred_at: datetime,
+    ) -> None:
+        if event_type not in {"activated", "invalidated"}:
+            raise ValueError("forecast currentness event type is invalid")
+        session.add(ForecastCurrentnessEvent(
+            participant_id=row.participant_id,
+            local_date=row.local_date,
+            forecast_id=row.id,
+            forecast_version=row.forecast_version,
+            event_type=event_type,
+            reason=reason[:128],
+            occurred_at=occurred_at,
+        ))
+
+    @staticmethod
+    def _transition_time_in_session(
+        session: Any,
+        participant_id: uuid.UUID,
+        local_date: date,
+        requested: datetime,
+    ) -> datetime:
+        """Keep transition timestamps strictly ordered under participant lock."""
+
+        latest = session.execute(
+            select(ForecastCurrentnessEvent.occurred_at).where(
+                ForecastCurrentnessEvent.participant_id == participant_id,
+                ForecastCurrentnessEvent.local_date == local_date,
+            ).order_by(
+                desc(ForecastCurrentnessEvent.occurred_at),
+                desc(ForecastCurrentnessEvent.id),
+            ).limit(1)
+        ).scalar_one_or_none()
+        if latest is None:
+            return requested
+        latest_aware = (
+            latest.replace(tzinfo=timezone.utc)
+            if latest.tzinfo is None
+            else latest.astimezone(timezone.utc)
+        )
+        return max(requested, latest_aware + timedelta(microseconds=1))
 
     def invalidate_current_for_date(
         self,
@@ -949,9 +1099,11 @@ class ForecastSnapshotRepository:
 
         if warning_repository.database is not self.database:
             raise ValueError("forecast and warning repositories must share a database")
-        changed_at = now or utc_now()
         with self.database.session() as session:
             session.get(Participant, participant_id, with_for_update=True)
+            changed_at = self._transition_time_in_session(
+                session, participant_id, local_date, now or utc_now()
+            )
             rows = session.execute(
                 select(ForecastSnapshot).where(
                     ForecastSnapshot.participant_id == participant_id,
@@ -962,6 +1114,10 @@ class ForecastSnapshotRepository:
             forecast_ids = [row.id for row in rows]
             for row in rows:
                 row.valid = False
+                self._append_currentness_event(
+                    session, row, event_type="invalidated", reason=reason,
+                    occurred_at=changed_at,
+                )
             cancelled = warning_repository._cancel_for_forecasts_in_session(
                 session,
                 forecast_ids,
@@ -1059,6 +1215,13 @@ class ForecastSnapshotRepository:
             forecast_ids = [row.id for row in rows]
             for row in rows:
                 row.valid = False
+                event_time = self._transition_time_in_session(
+                    session, participant_id, row.local_date, changed_at
+                )
+                self._append_currentness_event(
+                    session, row, event_type="invalidated", reason=reason,
+                    occurred_at=event_time,
+                )
             cancelled = warning_repository._cancel_for_forecasts_in_session(
                 session,
                 forecast_ids,
@@ -1208,6 +1371,9 @@ class ForecastSnapshotRepository:
         verify_current_inputs: bool = False,
     ) -> dict[str, Any]:
         session.get(Participant, participant_id, with_for_update=True)
+        changed_at = self._transition_time_in_session(
+            session, participant_id, local_date, utc_now()
+        )
 
         calendar = session.execute(
             select(CalendarSnapshot).where(
@@ -1269,8 +1435,18 @@ class ForecastSnapshotRepository:
         for row in stale:
             if existing is None or row.id != existing.id:
                 row.valid = False
+                self._append_currentness_event(
+                    session, row, event_type="invalidated",
+                    reason="superseded_by_forecast", occurred_at=changed_at,
+                )
         if existing is not None:
+            was_valid = existing.valid
             existing.valid = True
+            if not was_valid:
+                self._append_currentness_event(
+                    session, existing, event_type="activated",
+                    reason="forecast_reactivated", occurred_at=changed_at,
+                )
             session.flush()
             return self._view(existing)
         row = ForecastSnapshot(
@@ -1283,6 +1459,11 @@ class ForecastSnapshotRepository:
             warning_windows_json=list(warning_windows), output_json=dict(output), valid=True,
         )
         session.add(row)
+        session.flush()
+        self._append_currentness_event(
+            session, row, event_type="activated", reason="forecast_published",
+            occurred_at=changed_at,
+        )
         session.flush()
         return self._view(row)
 
@@ -1301,6 +1482,7 @@ class WarningScheduleRepository:
         self.database = database
         self.delivery_policy = delivery_policy
         self.timezone = ZoneInfo(timezone_name)
+        self.same_day_late_care_policy = SameDayLateCarePolicy()
 
     @staticmethod
     def _aware(value: datetime) -> datetime:
@@ -1790,7 +1972,7 @@ class WarningScheduleRepository:
         sources = session.execute(
             select(WarningSchedule).where(
                 WarningSchedule.local_date == local_today,
-                WarningSchedule.status.in_(("expired", "failed")),
+                WarningSchedule.status.in_(("expired", "failed", "suppressed")),
                 WarningSchedule.sent_at.is_(None),
                 WarningSchedule.risk_time <= now,
             ).with_for_update()
@@ -1801,6 +1983,12 @@ class WarningScheduleRepository:
             if (
                 source_payload.get("delivery_kind") == "same_day_late_care"
                 or source_payload.get("user_requested_followup")
+            ):
+                continue
+            if (
+                source.status == "suppressed"
+                and source_payload.get("suppression_reason")
+                != "minimum_interval"
             ):
                 continue
             forecast = session.get(ForecastSnapshot, source.forecast_id)
@@ -1838,6 +2026,15 @@ class WarningScheduleRepository:
             )
             if successful_count >= effective_cap:
                 continue
+            current_context = self._same_day_late_care_context(
+                session,
+                source,
+                forecast,
+                source_payload,
+                now,
+            )
+            if current_context is None:
+                continue
             identity = hashlib.sha256(
                 f"{source.warning_identity}\0same_day_late_care".encode("utf-8")
             ).hexdigest()
@@ -1851,16 +2048,18 @@ class WarningScheduleRepository:
             if existing is not None:
                 continue
             row_id = uuid.uuid4()
-            late_message = (
-                "刚才这一时段的安排比较密集。如果你现在仍在连续处理任务，"
-                "可以先留几分钟缓冲，喝口水或短暂离开屏幕。"
+            late_plan = self.same_day_late_care_policy.plan(
+                source_warning_level=source.warning_level,
+                source_care_plan=source_payload.get("care_plan"),
+                current_context=current_context,
             )
+            late_message = late_plan.message
             plan = dict(source_payload.get("care_plan") or {})
             plan.update(
                 {
-                    "intervention_type": "brief_check_in",
-                    "template_id": "same-day-late-care-v1",
-                    "reason_code": "missed_proactive_same_day_care",
+                    "intervention_type": late_plan.intervention_type,
+                    "template_id": late_plan.template_id,
+                    "reason_code": late_plan.reason_code,
                 }
             )
             provenance = dict(source_payload.get("care_provenance") or {})
@@ -1876,6 +2075,7 @@ class WarningScheduleRepository:
                 "fallback_message": late_message,
                 "delivery_kind": "same_day_late_care",
                 "source_opportunity_id": str(source.id),
+                "late_care_context": current_context,
                 "care_plan": plan,
                 "care_provenance": provenance,
             }
@@ -1909,6 +2109,128 @@ class WarningScheduleRepository:
             self._mirror_care(session, late_care)
             created += 1
         return created
+
+    def _same_day_late_care_context(
+        self,
+        session: Any,
+        source: WarningSchedule,
+        forecast: ForecastSnapshot,
+        source_payload: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Re-evaluate current facts instead of replaying the old warning."""
+
+        local_now = now.astimezone(self.timezone)
+        reasons: list[str] = []
+        context: dict[str, Any] = {
+            "evaluated_at": now.isoformat(),
+            "forecast_id": str(forecast.id),
+            "forecast_version": forecast.forecast_version,
+        }
+
+        observation = session.execute(
+            select(StateObservation).where(
+                StateObservation.participant_id == source.participant_id,
+                StateObservation.observed_at <= now,
+                StateObservation.observed_at >= now - timedelta(hours=6),
+            ).order_by(desc(StateObservation.observed_at)).limit(1)
+        ).scalar_one_or_none()
+        if observation is not None:
+            payload = dict(observation.payload_json or {})
+            stress = payload.get("stress_0_10")
+            energy = payload.get("energy_0_10")
+            try:
+                stress_value = float(stress) if stress is not None else None
+                energy_value = float(energy) if energy is not None else None
+            except (TypeError, ValueError):
+                stress_value = energy_value = None
+            context["observation_id"] = str(observation.id)
+            context["observation_stress_0_10"] = stress_value
+            context["observation_energy_0_10"] = energy_value
+            observation_age = now - self._aware(observation.observed_at)
+            if (
+                observation_age <= timedelta(minutes=90)
+                and stress_value is not None
+                and energy_value is not None
+                and stress_value <= 3.5
+                and energy_value >= 6.0
+            ):
+                # A fresh, explicitly good check-in is stronger evidence than
+                # the older proactive forecast and suppresses late care.
+                return None
+            if (
+                (stress_value is not None and stress_value >= 5.5)
+                or (energy_value is not None and energy_value <= 4.0)
+            ):
+                reasons.append("recent_observation_relevant")
+
+        calendar = session.execute(
+            select(CalendarSnapshot).where(
+                CalendarSnapshot.participant_id == source.participant_id,
+                CalendarSnapshot.local_date == source.local_date,
+                CalendarSnapshot.calendar_revision == forecast.calendar_revision,
+                CalendarSnapshot.snapshot_state == "current",
+            ).limit(1)
+        ).scalar_one_or_none()
+        relevant_event_ids: list[str] = []
+        if calendar is not None and not calendar.degraded:
+            for event in list(calendar.events_json or []):
+                try:
+                    start = datetime.fromisoformat(
+                        str(event.get("start_time") or "").replace("Z", "+00:00")
+                    ).astimezone(self.timezone)
+                    end = datetime.fromisoformat(
+                        str(event.get("end_time") or "").replace("Z", "+00:00")
+                    ).astimezone(self.timezone)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if (
+                    start - timedelta(minutes=60)
+                    <= local_now
+                    <= end + timedelta(minutes=60)
+                ):
+                    relevant_event_ids.append(
+                        str(event.get("id") or event.get("event_id") or "")
+                    )
+            if relevant_event_ids:
+                reasons.append("current_calendar_relevant")
+        context["calendar_event_ids"] = relevant_event_ids
+
+        curve = list(forecast.curve_json or [])
+        minute = local_now.hour * 60 + local_now.minute
+        current_point: dict[str, Any] | None = None
+        for point in curve:
+            try:
+                hour, minute_value = (
+                    int(value) for value in str(point.get("time") or "").split(":")[:2]
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if hour * 60 + minute_value <= minute:
+                current_point = point
+            else:
+                break
+        if current_point is not None:
+            try:
+                current_stress = float(
+                    current_point.get("stress_0_10")
+                    if current_point.get("stress_0_10") is not None
+                    else float(current_point.get("S") or 0.0) / 10.0
+                )
+                source_stress = float(source_payload.get("S") or 7.0) / (
+                    10.0 if float(source_payload.get("S") or 7.0) > 10.0 else 1.0
+                )
+            except (TypeError, ValueError):
+                current_stress = 0.0
+                source_stress = 7.0
+            context["current_predicted_stress_0_10"] = round(current_stress, 3)
+            if current_stress >= max(5.5, source_stress - 2.0):
+                reasons.append("current_forecast_relevant")
+
+        if not reasons:
+            return None
+        context["relevance_reasons"] = sorted(set(reasons))
+        return context
 
     def count_successful_deliveries(
         self, participant_id: uuid.UUID, local_date: date
@@ -2245,6 +2567,19 @@ class WarningScheduleRepository:
                 or row.forecast_version != expected_forecast_version
             ):
                 return False
+            if sent:
+                forecast = session.get(ForecastSnapshot, row.forecast_id)
+                if (
+                    row.authorized_at is None
+                    or now < self._aware(row.authorized_at)
+                    or row.claimed_at is None
+                    or row.lease_until is None
+                    or self._aware(row.lease_until) < now
+                    or forecast is None
+                    or not forecast.valid
+                    or forecast.forecast_version != expected_forecast_version
+                ):
+                    return False
             row.attempt_count += 1
             row.last_attempt_at = now
             row.last_error_code = error_code

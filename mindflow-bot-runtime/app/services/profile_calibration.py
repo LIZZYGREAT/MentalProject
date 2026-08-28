@@ -80,7 +80,7 @@ class ProfileCalibrationService:
             # Both constraints matter for backfilled observations: the source
             # forecast must precede the represented state and its DB ingest.
             causal_cutoff = min(observed_utc, created_utc)
-            forecast = self.forecasts.latest_before(
+            forecast = self.forecasts.current_at(
                 participant_id, local_day, causal_cutoff
             )
             if forecast is None:

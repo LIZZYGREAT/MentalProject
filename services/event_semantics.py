@@ -27,6 +27,7 @@ from services.event_semantic_prompt import (
 SEMANTIC_SCHEMA_VERSION = "event_semantics.v3"
 RULE_VERSION = "zh_event_rules.2026-08-01.v2"
 FUSION_POLICY_VERSION = "rule_anchored_api_fusion.v2"
+COURSE_MATCH_MIN_CONFIDENCE = 0.55
 
 DIMENSIONS = (
     "difficulty",
@@ -519,7 +520,9 @@ def validate_course_match(
             unmatched["rejected"] = "candidate_out_of_bounds"
         return unmatched
     confidence = _validated_confidence(
-        match.get("confidence"), "course_match.confidence", minimum=0.0
+        match.get("confidence"),
+        "course_match.confidence",
+        minimum=COURSE_MATCH_MIN_CONFIDENCE,
     )
     canonical_name = str(match.get("canonical_name") or "").strip()
     code = str(match.get("code") or "").strip()

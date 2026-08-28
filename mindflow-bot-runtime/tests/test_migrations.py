@@ -65,6 +65,16 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0018_calendar_mutation_reconciliation"
     )
     assert migration_0018.down_revision == "0017_care_delivery_authorization"
+    migration_0019 = next(
+        migration for migration in migrations
+        if migration.revision == "0019_forecast_currentness_history"
+    )
+    assert migration_0019.down_revision == "0018_calendar_mutation_reconciliation"
+    migration_0020 = next(
+        migration for migration in migrations
+        if migration.revision == "0020_oauth_refresh_lease"
+    )
+    assert migration_0020.down_revision == "0019_forecast_currentness_history"
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

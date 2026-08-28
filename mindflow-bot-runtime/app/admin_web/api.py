@@ -86,7 +86,7 @@ class AdminAPI:
             return None, _json_error("invalid_query_parameter", 400)
         return value, None
 
-    def _session(self, request: Request) -> AdminSession | None:
+    def _session_sync(self, request: Request) -> AdminSession | None:
         session = self.signer.from_request(request)
         if session is None:
             return None
@@ -105,8 +105,10 @@ class AdminAPI:
         )
         return session
 
-    def _authorized(self, request: Request, *, csrf: bool = False) -> AdminSession | None:
-        session = self._session(request)
+    async def _authorized(
+        self, request: Request, *, csrf: bool = False
+    ) -> AdminSession | None:
+        session = await asyncio.to_thread(self._session_sync, request)
         if session is None:
             return None
         if csrf and not hmac.compare_digest(
@@ -117,7 +119,7 @@ class AdminAPI:
 
     async def health(self, _request: Request) -> Response:
         try:
-            return JSONResponse(self.repository.health())
+            return JSONResponse(await asyncio.to_thread(self.repository.health))
         except Exception:
             return _json_error("database_unavailable", 503)
 
@@ -128,7 +130,7 @@ class AdminAPI:
             return _json_error("invalid_json", 400)
         username = str(value.get("username") or "").strip().casefold()
         password = str(value.get("password") or "")
-        row = self.admin_users.get_by_username(username)
+        row = await asyncio.to_thread(self.admin_users.get_by_username, username)
         if row is None or row.status != "active" or not verify_password(
             password, row.password_hash
         ):
@@ -136,7 +138,7 @@ class AdminAPI:
         token, session = self.signer.issue(
             row.username, user_id=str(row.id), role=row.role
         )
-        self.admin_users.touch_login(row.id)
+        await asyncio.to_thread(self.admin_users.touch_login, row.id)
         response = JSONResponse(
             {
                 "authenticated": True,
@@ -158,7 +160,7 @@ class AdminAPI:
         return response
 
     async def session(self, request: Request) -> Response:
-        session = self._authorized(request)
+        session = await self._authorized(request)
         if session is None:
             return _json_error("unauthorized", 401)
         return JSONResponse(
@@ -173,19 +175,19 @@ class AdminAPI:
         )
 
     async def logout(self, request: Request) -> Response:
-        if self._authorized(request, csrf=True) is None:
+        if await self._authorized(request, csrf=True) is None:
             return _json_error("unauthorized_or_csrf", 401)
         response = JSONResponse({"authenticated": False})
         response.delete_cookie(COOKIE_NAME, path="/admin")
         return response
 
     async def dashboard(self, request: Request) -> Response:
-        if self._authorized(request) is None:
+        if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
-        return JSONResponse(self.repository.dashboard())
+        return JSONResponse(await asyncio.to_thread(self.repository.dashboard))
 
     async def participants(self, request: Request) -> Response:
-        if self._authorized(request) is None:
+        if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
         query = request.query_params
         page, error = self._query_int(request, "page", 1, maximum=1_000_000)
@@ -195,7 +197,8 @@ class AdminAPI:
         if error:
             return error
         return JSONResponse(
-            self.repository.participants(
+            await asyncio.to_thread(
+                self.repository.participants,
                 search=query.get("search", ""),
                 status=query.get("status", ""),
                 page=page,
@@ -203,23 +206,29 @@ class AdminAPI:
             )
         )
 
-    def _participant(self, request: Request) -> tuple[Any, Response | None]:
-        if self._authorized(request) is None:
+    async def _participant(
+        self, request: Request
+    ) -> tuple[Any, Response | None]:
+        if await self._authorized(request) is None:
             return None, _json_error("unauthorized", 401)
         code = request.path_params["participant_code"]
-        participant_id = self.repository.participant_id(code)
+        participant_id = await asyncio.to_thread(
+            self.repository.participant_id, code
+        )
         if participant_id is None:
             return None, _json_error("participant_not_found", 404)
         return participant_id, None
 
     async def participant(self, request: Request) -> Response:
-        if self._authorized(request) is None:
+        if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
-        value = self.repository.participant(request.path_params["participant_code"])
+        value = await asyncio.to_thread(
+            self.repository.participant, request.path_params["participant_code"]
+        )
         return JSONResponse(value) if value else _json_error("participant_not_found", 404)
 
     async def messages(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         query = request.query_params
@@ -228,7 +237,8 @@ class AdminAPI:
         )
         if query_error:
             return query_error
-        items = self.repository.messages(
+        items = await asyncio.to_thread(
+            self.repository.messages,
             participant_id,
             status=query.get("status", ""),
             error_only=query.get("error_only", "").lower() in {"1", "true", "yes"},
@@ -237,48 +247,65 @@ class AdminAPI:
         return JSONResponse({"items": items})
 
     async def message(self, request: Request) -> Response:
-        if self._authorized(request) is None:
+        if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
-        value = self.repository.message(request.path_params["event_id"])
+        value = await asyncio.to_thread(
+            self.repository.message, request.path_params["event_id"]
+        )
         return JSONResponse(value) if value else _json_error("message_not_found", 404)
 
     async def observations(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
-        return JSONResponse({"items": self.repository.observations(participant_id)})
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.repository.observations, participant_id
+            )
+        })
 
     async def calendars(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
-        return JSONResponse({"items": self.repository.calendars(participant_id)})
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.repository.calendars, participant_id
+            )
+        })
 
     async def forecasts(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
-        return JSONResponse({"items": self.repository.forecasts(participant_id)})
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.repository.forecasts, participant_id
+            )
+        })
 
     async def forecast(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         try:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
             return _json_error("invalid_local_date", 400)
-        value = self.repository.forecast(participant_id, target)
+        value = await asyncio.to_thread(
+            self.repository.forecast, participant_id, target
+        )
         return JSONResponse(value) if value else _json_error("forecast_not_found", 404)
 
     async def refresh_forecast(self, request: Request) -> Response:
-        session = self._authorized(request, csrf=True)
+        session = await self._authorized(request, csrf=True)
         if session is None:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role not in {"admin", "superadmin"}:
             return _json_error("forbidden", 403)
-        participant_id = self.repository.participant_id(
-            request.path_params["participant_code"]
+        participant_id = await asyncio.to_thread(
+            self.repository.participant_id,
+            request.path_params["participant_code"],
         )
         if participant_id is None:
             return _json_error("participant_not_found", 404)
@@ -310,7 +337,7 @@ class AdminAPI:
         )
 
     async def curve_json(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         try:
@@ -318,7 +345,9 @@ class AdminAPI:
         except ValueError:
             return _json_error("invalid_local_date", 400)
         if self.pressure_curves is None:
-            forecast = self.repository.forecast(participant_id, target)
+            forecast = await asyncio.to_thread(
+                self.repository.forecast, participant_id, target
+            )
             return JSONResponse(forecast) if forecast else _json_error("forecast_not_found", 404)
         try:
             view = await self.pressure_curves.build(
@@ -331,7 +360,9 @@ class AdminAPI:
         except HistoricalForecastNotFoundError:
             return _json_error("forecast_not_found", 404)
         output = dict(view.forecast.get("output") or {})
-        retrospective = self.retrospectives.latest(participant_id, target)
+        retrospective = await asyncio.to_thread(
+            self.retrospectives.latest, participant_id, target
+        )
         current_forecast_version = view.forecast.get("forecast_version")
         retrospective_source = None
         retrospective_matches_current = None
@@ -340,7 +371,8 @@ class AdminAPI:
                 retrospective.get("source_forecast_version")
                 == current_forecast_version
             )
-            retrospective_source = self.forecasts_repository.get(
+            retrospective_source = await asyncio.to_thread(
+                self.forecasts_repository.get,
                 participant_id,
                 retrospective["source_forecast_id"],
                 local_date=target,
@@ -351,10 +383,15 @@ class AdminAPI:
                 != retrospective.get("source_forecast_version")
             ):
                 retrospective_source = None
-        reviews = self.review_responses.list(participant_id, target)
-        observations = self.observations_repository.for_local_date(
-            participant_id, target, timezone_name=self.settings.timezone_name,
-            limit=500,
+        reviews, observations = await asyncio.gather(
+            asyncio.to_thread(self.review_responses.list, participant_id, target),
+            asyncio.to_thread(
+                self.observations_repository.for_local_date,
+                participant_id,
+                target,
+                timezone_name=self.settings.timezone_name,
+                limit=500,
+            ),
         )
         return JSONResponse(
             {
@@ -398,40 +435,51 @@ class AdminAPI:
         )
 
     async def daily_reviews_list(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
-        return JSONResponse({"items": self.review_responses.list(participant_id)})
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.review_responses.list, participant_id
+            )
+        })
 
     async def daily_reviews_date(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         try:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
             return _json_error("invalid_local_date", 400)
-        items = self.review_responses.list(participant_id, target)
+        items = await asyncio.to_thread(
+            self.review_responses.list, participant_id, target
+        )
         return JSONResponse({"items": items, "latest": items[0] if items else None})
 
     async def retrospective_curve(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         try:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
             return _json_error("invalid_local_date", 400)
-        value = self.retrospectives.latest(participant_id, target)
+        value = await asyncio.to_thread(
+            self.retrospectives.latest, participant_id, target
+        )
         return JSONResponse(value) if value else _json_error("retrospective_curve_not_found", 404)
 
     async def rebuild_retrospective_curve(self, request: Request) -> Response:
-        session = self._authorized(request, csrf=True)
+        session = await self._authorized(request, csrf=True)
         if session is None:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role not in {"admin", "superadmin"}:
             return _json_error("forbidden", 403)
-        participant_id = self.repository.participant_id(request.path_params["participant_code"])
+        participant_id = await asyncio.to_thread(
+            self.repository.participant_id,
+            request.path_params["participant_code"],
+        )
         if participant_id is None:
             return _json_error("participant_not_found", 404)
         if self.daily_reviews is None:
@@ -445,8 +493,31 @@ class AdminAPI:
             return _json_error(str(exc), 409)
         return JSONResponse(value)
 
+    async def reanalyse_retrospective_curve(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=True)
+        if session is None:
+            return _json_error("unauthorized_or_csrf", 401)
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        participant_id = await asyncio.to_thread(
+            self.repository.participant_id,
+            request.path_params["participant_code"],
+        )
+        if participant_id is None:
+            return _json_error("participant_not_found", 404)
+        if self.daily_reviews is None:
+            return _json_error("daily_review_service_unavailable", 503)
+        try:
+            target = date.fromisoformat(request.path_params["local_date"])
+            value = await asyncio.to_thread(
+                self.daily_reviews.reanalysis, participant_id, target
+            )
+        except ValueError as exc:
+            return _json_error(str(exc), 409)
+        return JSONResponse(value)
+
     async def curve_png(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         if self.pressure_curves is None:
@@ -472,13 +543,17 @@ class AdminAPI:
         )
 
     async def warnings(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
-        return JSONResponse({"items": self.repository.warnings(participant_id)})
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.repository.warnings, participant_id
+            )
+        })
 
     async def care_timeline(self, request: Request) -> Response:
-        participant_id, error = self._participant(request)
+        participant_id, error = await self._participant(request)
         if error:
             return error
         limit, query_error = self._query_int(
@@ -487,29 +562,34 @@ class AdminAPI:
         if query_error:
             return query_error
         return JSONResponse(
-            self.repository.care_timeline(participant_id, limit=limit)
+            await asyncio.to_thread(
+                self.repository.care_timeline, participant_id, limit=limit
+            )
         )
 
     async def incidents(self, request: Request) -> Response:
-        if self._authorized(request) is None:
+        if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
         limit, error = self._query_int(request, "limit", 100, maximum=500)
         if error:
             return error
         return JSONResponse(
-            {"items": self.repository.incidents(limit)}
+            {"items": await asyncio.to_thread(self.repository.incidents, limit)}
         )
 
     async def admin_users_list(self, request: Request) -> Response:
-        session = self._authorized(request)
+        session = await self._authorized(request)
         if session is None:
             return _json_error("unauthorized", 401)
         if session.role != "superadmin":
             return _json_error("forbidden", 403)
-        return JSONResponse({"items": self.admin_users.list(), "roles": ["viewer", "admin", "superadmin"]})
+        return JSONResponse({
+            "items": await asyncio.to_thread(self.admin_users.list),
+            "roles": ["viewer", "admin", "superadmin"],
+        })
 
     async def admin_users_create(self, request: Request) -> Response:
-        session = self._authorized(request, csrf=True)
+        session = await self._authorized(request, csrf=True)
         if session is None:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role != "superadmin":
@@ -519,7 +599,8 @@ class AdminAPI:
             password = str(value.get("password") or "")
             if len(password) < 10:
                 raise ValueError("password must be at least 10 characters")
-            item = self.admin_users.create(
+            item = await asyncio.to_thread(
+                self.admin_users.create,
                 str(value.get("username") or ""),
                 hash_password(password),
                 str(value.get("role") or "viewer"),
@@ -530,7 +611,7 @@ class AdminAPI:
         return JSONResponse(item, status_code=201)
 
     async def admin_users_update(self, request: Request) -> Response:
-        session = self._authorized(request, csrf=True)
+        session = await self._authorized(request, csrf=True)
         if session is None:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role != "superadmin":
@@ -540,7 +621,8 @@ class AdminAPI:
             password = value.get("password")
             if password is not None and len(str(password)) < 10:
                 raise ValueError("password must be at least 10 characters")
-            item = self.admin_users.update(
+            item = await asyncio.to_thread(
+                self.admin_users.update,
                 request.path_params["admin_id"],
                 role=value.get("role"),
                 status=value.get("status"),
@@ -576,6 +658,7 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/daily-reviews/{{local_date}}", self.daily_reviews_date, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}", self.retrospective_curve, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/rebuild", self.rebuild_retrospective_curve, methods=["POST"]),
+            Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/reanalysis", self.reanalyse_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/incidents", self.incidents, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_list, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_create, methods=["POST"]),
