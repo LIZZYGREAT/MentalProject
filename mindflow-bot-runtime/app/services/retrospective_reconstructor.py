@@ -33,7 +33,7 @@ def _gaussian(delta: float, sigma: float) -> float:
 
 
 class RetrospectiveReconstructor:
-    ALGORITHM_VERSION = "anchor-residual-kernel-v3"
+    ALGORITHM_VERSION = "anchor-residual-kernel-v4"
 
     def __init__(
         self, *, morning_sigma: float = 90, end_sigma: float = 60,
@@ -73,14 +73,24 @@ class RetrospectiveReconstructor:
         peak_minute, peak_reason = self._peak_minute(
             base, review["peak_period"], end_anchor_minute=end_minute
         )
+        peak_consistency = float(review["peak_stress"]) >= max(
+            float(review["start_stress"]),
+            float(review["end_stress"]),
+        )
 
         anchors = [
             ("start_stress", wake_minute, float(review["start_stress"]), "stress_0_10", self.morning_sigma, "gaussian"),
-            ("peak_stress", peak_minute, float(review["peak_stress"]), "stress_0_10", 0.0, "peak"),
             ("end_stress", end_minute, float(review["end_stress"]), "stress_0_10", self.end_sigma, "gaussian"),
             ("start_energy", wake_minute, float(review["start_energy"]), "vitality_0_10", self.morning_sigma, "gaussian"),
             ("end_energy", end_minute, float(review["end_energy"]), "vitality_0_10", self.end_sigma, "gaussian"),
         ]
+        if peak_consistency:
+            anchors.insert(1, (
+                "peak_stress", peak_minute, float(review["peak_stress"]),
+                "stress_0_10", 0.0, "peak",
+            ))
+        else:
+            peak_reason = "inconsistent_reported_peak_not_used"
         corrections = {"stress_0_10": [0.0] * len(result), "vitality_0_10": [0.0] * len(result)}
         # A small prior denominator keeps anchors soft while still bringing
         # the posterior close to a reported value at the anchor itself.
@@ -165,6 +175,9 @@ class RetrospectiveReconstructor:
         diagnostics = {
             "algorithm_version": self.ALGORITHM_VERSION,
             "anchors": anchor_diagnostics,
+            "peak_consistency": peak_consistency,
+            "peak_anchor_used": peak_consistency,
+            "reported_peak_stress": float(review["peak_stress"]),
             "peak_anchor_reason": peak_reason,
             "peak_anchor_time": result[_nearest(result, peak_minute)]["time"],
             "wake_anchor_time": result[_nearest(result, wake_minute)]["time"],
@@ -174,7 +187,11 @@ class RetrospectiveReconstructor:
             "submitted_local_date": submitted_local_date,
             "review_local_date": review_local_date,
             "slope_limit_applied_count": limited,
-            "energy_consumption_diagnostic": float(review["energy_consumption"]),
+            "energy_consumption_diagnostic": (
+                float(review["energy_consumption"])
+                if review.get("energy_consumption") is not None
+                else None
+            ),
             "energy_consumption_used_as_hard_anchor": False,
             "peak_used_as_current_state": False,
             "source_terminal_complete": source_terminal_state is not None,

@@ -37,6 +37,12 @@ def _score(value: Any, field: str) -> float:
     return result
 
 
+def _optional_score(value: Any, field: str) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return _score(value, field)
+
+
 def _text(value: Any, field: str, maximum: int) -> str | None:
     result = str(value or "").strip()
     if len(result) > maximum:
@@ -168,7 +174,7 @@ class DailyReviewService:
             "peak_period": peak_period,
             "end_stress": _score(values.get("end_stress"), "end_stress"),
             "end_energy": _score(values.get("end_energy"), "end_energy"),
-            "energy_consumption": _score(
+            "energy_consumption": _optional_score(
                 values.get("energy_consumption"), "energy_consumption"
             ),
             "main_stressor": _text(values.get("main_stressor"), "main_stressor", 300),

@@ -108,14 +108,22 @@ conda activate MentalProject
 python -c "from app.services.token_service import TokenEncryptionService; print(TokenEncryptionService.generate_key())"
 ```
 
-## 容器启动
+## 容器部署
 
-```powershell
+生产部署必须从干净工作区执行项目脚本。脚本会把当前 Git HEAD 注入 migrate、Bot 和
+Admin 镜像，等待 PostgreSQL ready，执行 Alembic upgrade，初始化 Claude state volume，
+重建 Bot/Admin，并验证两个运行服务的 revision 与 HEAD 一致：
+
+```bash
+git pull
 cd mindflow-bot-runtime
-docker compose up --build -d
+sh ./scripts/deploy_runtime.sh
 docker compose ps
 docker compose logs -f bot
 ```
+
+不要用未设置 `BUILD_REVISION` 的 `docker compose up --build` 代替该脚本，否则镜像会标记为
+`development`，无法通过正式验收。脚本默认拒绝 dirty working tree；提交和推送不由脚本代办。
 
 生产验收期间用标准 smoke override 启动 Bot（`restart=no`、Rules-only、单 forecast
 并发）：
@@ -129,7 +137,7 @@ docker compose -f compose.yaml -f compose.smoke.yaml up -d --no-deps bot
 可在 ECS 容器内单独验证 WebSocket receiver 的连接、存活和关闭（不会打印 Secret）：
 
 ```powershell
-docker compose run --rm bot python -m app.smoke.feishu_gateway --seconds 30
+docker compose run --rm bot python3 -m app.smoke.feishu_gateway --seconds 30
 ```
 
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
@@ -139,8 +147,8 @@ container recreate 后 transcript 仍可用于 `resume=session_id`。
 容器内检查：
 
 ```powershell
-docker compose exec bot python -c "import claude_agent_sdk; print('sdk ok')"
-docker compose exec bot python -c "from app.config import Settings; s=Settings.from_env(); print(s.claude_model, s.claude_workdir)"
+docker compose exec bot python3 -c "import claude_agent_sdk; print('sdk ok')"
+docker compose exec bot python3 -c "from app.config import Settings; s=Settings.from_env(); print(s.claude_model, s.claude_workdir)"
 ```
 
 ## 创建参与者
@@ -201,10 +209,10 @@ Calendar create/update/delete 在调用飞书前写入 durable `prepared` reconc
 event mutation 已发送后的未知结果保持 recoverable。`remote_committed` 立即 due，并由数据库 claim
 避免请求与恢复双重处理；进程重启会在 scheduler 前完成旧 intent fencing。Forecast currentness 使用 append-only history，
 OAuth refresh 使用不跨 HTTP 持锁的 expiring lease。当前唯一 Alembic head 为
-`0020_oauth_refresh_lease`，JSON 业务列在 PostgreSQL 使用 JSONB。
+`0021_daily_review_energy_optional`，JSON 业务列在 PostgreSQL 使用 JSONB。
 
-部署前执行迁移；`compose.yaml` 已提供一次性的 `migrate` 服务，Bot 和 Admin 都会
-等待迁移成功。生产环境还需把飞书卡片回调配置为真实可访问的 HTTPS 地址；本地
+部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
+飞书卡片回调配置为真实可访问的 HTTPS 地址；本地
 代码和测试无法替代域名、证书、反向代理及飞书后台的外部配置。
 
 ## Response Presentation 性能策略
@@ -225,6 +233,18 @@ conda activate MentalProject
 cd mindflow-bot-runtime
 python -m pytest -q tests
 ```
+
+正式 ECS acceptance 必须预先创建独立、可清空的 PostgreSQL 数据库，并显式传入专用 URL：
+
+```bash
+export MINDFLOW_TEST_POSTGRES_URL='postgresql+psycopg://<test-user>:<test-password>@postgres:5432/mindflow_acceptance_test'
+sh ./scripts/run_acceptance_tests.sh
+```
+
+数据库名只允许 `mindflow_acceptance_test` 或 `mindflow_test_*`。runner 不读取、派生或 fallback
+到生产 `DATABASE_URL`；它会校验 clean tree、运行中的 Bot/Admin 与测试镜像 revision，随后在
+一次性 root 容器中临时安装固定版本的 pytest 并执行全量测试。该安装不会修改生产镜像或正在
+运行的服务。`ALLOW_DIRTY_ACCEPTANCE=1` 只供明确的本地临时诊断，正式验收不得设置。
 
 本地测试使用 SQLite、Fake SDK client 和 Fake 外部服务，不需要安装系统级 Claude
 Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以下证据：

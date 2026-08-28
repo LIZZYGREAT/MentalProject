@@ -732,7 +732,7 @@ class DailyReviewResponse(Base):
     peak_period: Mapped[str] = mapped_column(String(32), nullable=False)
     end_stress: Mapped[float] = mapped_column(Float, nullable=False)
     end_energy: Mapped[float] = mapped_column(Float, nullable=False)
-    energy_consumption: Mapped[float] = mapped_column(Float, nullable=False)
+    energy_consumption: Mapped[float | None] = mapped_column(Float, nullable=True)
     main_stressor: Mapped[str | None] = mapped_column(Text, nullable=True)
     recovery_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     free_text: Mapped[str | None] = mapped_column(Text, nullable=True)

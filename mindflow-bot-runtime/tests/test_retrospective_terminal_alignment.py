@@ -19,7 +19,7 @@ def _curve():
 def _review():
     return {
         "start_stress": 3,
-        "peak_stress": 5,
+        "peak_stress": 7,
         "end_stress": 6,
         "start_energy": 6,
         "end_energy": 4,
@@ -27,6 +27,103 @@ def _review():
         "peak_period": "evening",
         "raw": {},
     }
+
+
+def _reconstruct(review):
+    return RetrospectiveReconstructor().reconstruct(
+        _curve(),
+        review,
+        source_terminal_state={"stress_0_10": 4.0, "vitality_0_10": 5.0},
+        end_anchor_minute=22 * 60,
+        end_anchor_source="scheduled_review_time",
+        review_local_date="2030-01-15",
+        submitted_local_date="2030-01-15",
+    )
+
+
+def _series(curve, field):
+    return [point[field] for point in curve]
+
+
+def test_daily_review_numerical_anchor_model_semantics():
+    baseline_curve, baseline_analysis, baseline_diagnostics = _reconstruct(_review())
+
+    cases = (
+        ("start_stress", 4, "stress_0_10", False),
+        ("start_energy", 2, "vitality_0_10", False),
+        ("peak_stress", 9, "stress_0_10", False),
+        ("end_stress", 2, "stress_0_10", True),
+        ("end_energy", 9, "vitality_0_10", True),
+    )
+    for field, value, curve_field, changes_terminal in cases:
+        review = _review()
+        review[field] = value
+        curve, analysis, _diagnostics = _reconstruct(review)
+        assert _series(curve, curve_field) != _series(baseline_curve, curve_field)
+        terminal_field = curve_field
+        if changes_terminal:
+            assert (
+                analysis["forward_terminal_state"][terminal_field]
+                != baseline_analysis["forward_terminal_state"][terminal_field]
+            )
+        else:
+            assert (
+                analysis["forward_terminal_state"]
+                == baseline_analysis["forward_terminal_state"]
+            )
+
+    period_review = _review()
+    period_review["peak_period"] = "morning"
+    period_curve, _period_analysis, period_diagnostics = _reconstruct(period_review)
+    assert (
+        period_diagnostics["peak_anchor_time"]
+        != baseline_diagnostics["peak_anchor_time"]
+    )
+    assert _series(period_curve, "stress_0_10") != _series(
+        baseline_curve, "stress_0_10"
+    )
+
+
+def test_daily_review_diagnostics_and_text_do_not_change_model_output():
+    baseline_curve, baseline_analysis, _diagnostics = _reconstruct(_review())
+
+    for field, value in (
+        ("energy_consumption", 10),
+        ("energy_consumption", None),
+        ("main_stressor", "连续会议"),
+        ("recovery_note", "散步"),
+        ("free_text", "今天睡眠不足"),
+    ):
+        review = _review()
+        review[field] = value
+        curve, analysis, _changed_diagnostics = _reconstruct(review)
+        assert curve == baseline_curve
+        assert analysis["forward_terminal_state"] == baseline_analysis[
+            "forward_terminal_state"
+        ]
+
+
+def test_inconsistent_peak_is_retained_as_diagnostic_but_not_curve_anchor():
+    first_review = _review()
+    first_review["peak_stress"] = 2
+    first_curve, first_analysis, first_diagnostics = _reconstruct(first_review)
+
+    second_review = _review()
+    second_review["peak_stress"] = 1
+    second_curve, second_analysis, second_diagnostics = _reconstruct(second_review)
+
+    assert first_diagnostics["peak_consistency"] is False
+    assert first_diagnostics["peak_anchor_used"] is False
+    assert first_diagnostics["reported_peak_stress"] == 2
+    assert first_diagnostics["peak_anchor_reason"] == (
+        "inconsistent_reported_peak_not_used"
+    )
+    assert "peak_stress" not in {
+        anchor["name"] for anchor in first_diagnostics["anchors"]
+    }
+    assert second_diagnostics["reported_peak_stress"] == 1
+    assert first_curve == second_curve
+    assert first_analysis == second_analysis
 
 
 def test_forward_terminal_uses_explicit_2400_output_not_2355_curve_point():
@@ -46,7 +143,7 @@ def test_forward_terminal_uses_explicit_2400_output_not_2355_curve_point():
     assert analysis["curve_last_point_state"]["stress_0_10"] == curve[-1]["stress_0_10"]
     assert analysis["forward_terminal_state"]["stress_0_10"] == expected_stress
     assert analysis["terminal_state"]["stress_0_10"] == expected_stress
-    assert diagnostics["algorithm_version"] == "anchor-residual-kernel-v3"
+    assert diagnostics["algorithm_version"] == "anchor-residual-kernel-v4"
 
 
 def test_current_point_at_t_forecast_missing_output_falls_back_to_profile_not_2355():

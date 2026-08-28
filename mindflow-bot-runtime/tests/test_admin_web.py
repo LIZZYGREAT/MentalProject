@@ -147,6 +147,21 @@ def test_admin_curve_marks_and_draws_mismatched_retrospective_source():
     assert "回顾基准 Forecast" in source
 
 
+def test_admin_daily_review_formats_optional_energy_and_peak_conflict():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "admin_web"
+        / "static"
+        / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "r.energy_consumption == null ? '未填写'" in source
+    assert "r.peak_consistency===false" in source
+    assert "本次回顾峰值回答与起始/收尾值存在冲突" in source
+    assert "峰值锚点未用于曲线重建" in source
+
+
 def test_disabled_admin_app_fails_closed():
     value = replace(settings(), admin_enabled=False)
 

@@ -648,6 +648,9 @@ class DailyReviewResponseRepository:
             "peak_stress": row.peak_stress, "peak_period": row.peak_period,
             "end_stress": row.end_stress, "end_energy": row.end_energy,
             "energy_consumption": row.energy_consumption,
+            "peak_consistency": row.peak_stress >= max(
+                row.start_stress, row.end_stress
+            ),
             "main_stressor": row.main_stressor, "recovery_note": row.recovery_note,
             "free_text": row.free_text, "raw": dict(row.raw_json),
         }

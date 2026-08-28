@@ -144,20 +144,61 @@ def daily_review_card(
         ("夜间 22:00 以后", "late_night"),
         ("不确定", "unknown"),
     ]
-    fields = [
-        ("start_stress", "早晨起始压力"), ("start_energy", "早晨起始精力"),
-        ("peak_stress", "全天最高压力"), ("end_stress", "当天收尾压力"),
-        ("end_energy", "当天收尾精力"), ("energy_consumption", "全天精力消耗"),
-    ]
     elements: list[dict[str, Any]] = []
-    for name, label in fields:
+    field_labels = {
+        "start_stress": "早晨起始压力",
+        "start_energy": "早晨起始精力",
+        "peak_stress": "全天最高压力",
+        "end_stress": "当天收尾压力",
+        "end_energy": "当天收尾精力",
+        "energy_consumption": "全天精力消耗（选填）",
+    }
+
+    def add_scale(
+        name: str, *, prompt: str, guidance: str = "", required: bool = True
+    ) -> None:
+        description = f"**{prompt}**"
+        if guidance:
+            description += f"\n{guidance}"
         elements.append({
-            "tag": "select_static", "name": name, "required": True,
-            "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
-            "label": {"tag": "plain_text", "content": label},
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": description},
+        })
+        elements.append({
+            "tag": "select_static", "name": name, "required": required,
+            "placeholder": {
+                "tag": "plain_text",
+                "content": "选择 0–10" if required else "选填 0–10",
+            },
+            "label": {"tag": "plain_text", "content": field_labels[name]},
             "options": scale_options,
         })
-    elements.insert(3, {
+
+    add_scale(
+        "start_stress",
+        prompt=f"① 回顾 {local_date}：当天早晨刚开始一天时，你的压力有多高？",
+        guidance="0 = 完全没有压力　·　5 = 中等压力　·　10 = 已经非常难承受",
+    )
+    add_scale(
+        "start_energy",
+        prompt=f"② 回顾 {local_date}：当天早晨的精力怎么样？",
+        guidance="0 = 几乎没有精力　·　5 = 一般　·　10 = 精力非常充足",
+    )
+    add_scale(
+        "peak_stress",
+        prompt=f"③ 回顾 {local_date}：当天最高压力大约有多高？",
+        guidance="0 = 没有明显压力　·　10 = 当天最难承受的程度",
+    )
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": (
+                f"**④ 回顾 {local_date}：当天最高压力大约出现在什么时候？**"
+            ),
+        },
+    })
+    elements.append({
         "tag": "select_static", "name": "peak_period", "required": True,
         "placeholder": {"tag": "plain_text", "content": "选择大致时段"},
         "label": {"tag": "plain_text", "content": "最高压力出现时段"},
@@ -166,16 +207,70 @@ def daily_review_card(
             for label, value in period_options
         ],
     })
-    for name, label, maximum in (
-        ("main_stressor", "主要压力来源（选填）", 300),
-        ("recovery_note", "有效恢复方式（选填）", 300),
-        ("free_text", "其他补充（选填）", 1000),
+    add_scale(
+        "end_stress",
+        prompt=f"⑤ 回顾 {local_date}：当天结束时（约晚间/睡前），你的压力有多高？",
+        guidance="0 = 完全没有压力　·　10 = 已经非常难承受",
+    )
+    add_scale(
+        "end_energy",
+        prompt=f"⑥ 回顾 {local_date}：当天结束时，你还剩多少精力？",
+        guidance="0 = 基本耗尽　·　10 = 仍然非常充足",
+    )
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": "💡 第 ⑤、⑥ 项会用于帮助估计下一天的起始状态。",
+        },
+    })
+    add_scale(
+        "energy_consumption",
+        prompt=f"⑦ 回顾 {local_date}：当天整体让你感觉被消耗了多少？（选填）",
+        guidance=(
+            "0 = 几乎没被消耗　·　10 = 非常消耗\n"
+            "当前主要用于研究分析，不会直接改变压力或精力曲线。"
+        ),
+        required=False,
+    )
+    for name, prompt, placeholder, maximum in (
+        (
+            "main_stressor",
+            f"回顾 {local_date}：当天最主要的压力来自什么？（选填）",
+            "例如：考试、连续会议、项目截止、睡眠不足",
+            300,
+        ),
+        (
+            "recovery_note",
+            f"回顾 {local_date}：当天什么事情让你稍微恢复了一些？（选填）",
+            "例如：午休、散步、运动、和朋友聊天",
+            300,
+        ),
+        (
+            "free_text",
+            "还有什么会帮助我们理解回顾当天的状态？（选填）",
+            "可留空",
+            1000,
+        ),
     ):
         elements.append({
-            "tag": "input", "name": name, "required": False, "max_length": maximum,
-            "placeholder": {"tag": "plain_text", "content": "可留空"},
-            "label": {"tag": "plain_text", "content": label},
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"**{prompt}**"},
         })
+        elements.append({
+            "tag": "input", "name": name, "required": False, "max_length": maximum,
+            "placeholder": {"tag": "plain_text", "content": placeholder},
+            "label": {"tag": "plain_text", "content": prompt},
+        })
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": (
+                "以上文字主要用于回顾和研究分析，目前不会直接改变压力曲线数值。"
+            ),
+        },
+    })
     elements.append({
         "tag": "button", "name": "daily_review_submit",
         "action_type": "form_submit", "type": "primary",
@@ -190,9 +285,18 @@ def daily_review_card(
         "config": {"wide_screen_mode": True, "update_multi": False, "enable_forward": False},
         "header": {"template": "purple", "title": {"tag": "plain_text", "content": "MindFlow 每日回顾"}},
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"回顾 **{local_date}**。这是回顾反馈，不会改写当天原始预测。"}},
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"回顾 **{local_date}**。这是回顾反馈，不会改写当天原始预测。\n"
+                        "如果这是次日补填，请回忆上方标注日期当天的状态，不要填写此刻状态。"
+                    ),
+                },
+            },
             {"tag": "form", "name": "mindflow_daily_review", "elements": elements},
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": "0 表示最低，10 表示最高；用于日常建模，不是医学诊断。"}]},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "用于日常回顾与建模，不是医学诊断。"}]},
         ],
     }
 

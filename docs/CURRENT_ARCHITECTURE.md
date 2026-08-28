@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0020_oauth_refresh_lease -->
+<!-- ALEMBIC_HEAD: 0021_daily_review_energy_optional -->
 
 ## 运行边界
 
@@ -108,7 +108,7 @@ posterior/current latent state。`00:00` 是初始/后验状态，`23:55` 是最
 独立 terminal 表示 `24:00`。`delta_S`/`delta_V` 是相邻已记录点之差；累计负荷只统计 t
 之前已发生的区间，所以 09:00 开始的事件在 09:00 累计量不增加、09:05 才增加。
 AlertMonitor 首点 elapsed 为 0，40 分钟确认阈值最早只能在实际经过 40 分钟后触发。
-Daily Review v3 的 `curve_last_point_state` 明确表示 23:55，`terminal_state` 与
+Daily Review v4 的 `curve_last_point_state` 明确表示 23:55，`terminal_state` 与
 `forward_terminal_state` 从 Forecast `output` 的 24:00 terminal 计算。当前 v7 Forecast 缺少
 显式 output terminal 时不会把 `curve[-1]` 当作午夜；只有旧 loop 版本保留 legacy fallback。
 
@@ -124,6 +124,10 @@ Forecast，且不改写原 Forecast。新的 retrospective terminal 会立即 fa
 下一日 Forecast，并进入托管后台重算；旧历史日期的 Admin rebuild 不触发无意义传播。
 Bot 与独立 Admin 进程都管理 dependency refresh 生命周期；Admin reconstruction 在线程中
 执行，不阻塞 HTTP event loop。
+
+Daily Review 卡片的所有问题显式绑定回顾 `local_date`，次日补填仍要求回答前一日状态。
+`peak_stress` 小于起始或收尾压力时保留原始回答并标记 `peak_consistency=false`，但不把该冲突值
+作为峰值锚点；Admin 会显示冲突提示。`energy_consumption` 是可选研究诊断，不进入曲线锚点。
 
 Forecast currentness 的 activate/invalidate/reactivate 在同事务写入 append-only history；
 Daily Review 与 calibration 通过 `current_at(submitted_at)` 选择当时真正 current 的 Forecast，
@@ -176,7 +180,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0020_oauth_refresh_lease`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0021_daily_review_energy_optional`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -192,8 +196,9 @@ OAuth token 增加 expiring refresh lease。claim 与 finalize 都是短事务�
 且数据库事务已关闭；竞争进程等待 lease，过期 lease 可在崩溃后恢复。Device Flow 的同步
 SQLAlchemy 读写全部在线程执行，不阻塞 asyncio loop。
 
-生产启动依赖显式 Alembic upgrade，不在应用启动时 `create_all`。可选的真实 PostgreSQL
-集成测试从 0016 插入 current/degraded 数据后升级到 0017，再升级到 0020，并验证列、JSONB、
+生产启动依赖显式 Alembic upgrade，不在应用启动时 `create_all`。0021 将 Daily Review 中
+仅作研究诊断的全天精力消耗改为可空字段。可选的真实 PostgreSQL 集成测试从 0016 插入
+current/degraded 数据后升级到 0017，再升级到 0021，并验证列、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 

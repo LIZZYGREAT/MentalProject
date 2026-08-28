@@ -1,4 +1,4 @@
-"""Opt-in proof that the real 0016 -> 0020 PostgreSQL migrations are executable."""
+"""Opt-in proof that the real 0016 -> 0021 PostgreSQL migrations are executable."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from postgres_test_guard import optional_test_postgres_url
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
+def test_real_postgres_upgrade_0016_to_0021_preserves_and_backfills():
     try:
         raw_url = optional_test_postgres_url()
     except ValueError as exc:
@@ -35,6 +35,8 @@ def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
     source_warning_id = uuid.uuid4()
     child_warning_id = uuid.uuid4()
     invalid_warning_id = uuid.uuid4()
+    existing_review_id = uuid.uuid4()
+    optional_review_id = uuid.uuid4()
     now = datetime(2030, 1, 15, 2, 0, tzinfo=timezone.utc)
     engine = build_engine(raw_url)
     config = Config(str(RUNTIME_ROOT / "alembic.ini"))
@@ -71,6 +73,30 @@ def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
                     "participant_id": participant_id,
                     "local_date": date(2030, 1, 15),
                     "events": json.dumps([{"id": "event-1"}]),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO daily_review_responses (
+                        id, participant_id, local_date, revision,
+                        card_version, callback_event_id, submitted_at,
+                        start_stress, start_energy, peak_stress, peak_period,
+                        end_stress, end_energy, energy_consumption,
+                        raw_json, created_at
+                    ) VALUES (
+                        :id, :participant_id, :local_date, 1,
+                        'daily-review-v1', 'migration-existing-review',
+                        :submitted_at, 3, 8, 9, 'evening', 5, 4, 7,
+                        '{}'::jsonb, :submitted_at
+                    )
+                    """
+                ),
+                {
+                    "id": existing_review_id,
+                    "participant_id": participant_id,
+                    "local_date": date(2030, 1, 15),
+                    "submitted_at": now,
                 },
             )
             connection.execute(
@@ -363,10 +389,10 @@ def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0020_oauth_refresh_lease")
+            command.upgrade(config, "0021_daily_review_energy_optional")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0020_oauth_refresh_lease"
+            ) == "0021_daily_review_energy_optional"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
             currentness_columns = {
@@ -389,6 +415,74 @@ def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
             assert {
                 "refresh_lease_token", "refresh_lease_until", "refresh_started_at"
             } <= token_columns
+            review_columns = {
+                column["name"]: column
+                for column in inspector.get_columns("daily_review_responses")
+            }
+            assert review_columns["energy_consumption"]["nullable"] is True
+            assert connection.scalar(
+                text(
+                    "SELECT energy_consumption FROM daily_review_responses "
+                    "WHERE id = :id"
+                ),
+                {"id": existing_review_id},
+            ) == 7
+
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO daily_review_responses (
+                        id, participant_id, local_date, revision,
+                        card_version, callback_event_id, submitted_at,
+                        start_stress, start_energy, peak_stress, peak_period,
+                        end_stress, end_energy, energy_consumption,
+                        raw_json, created_at
+                    ) VALUES (
+                        :id, :participant_id, :local_date, 2,
+                        'daily-review-v1', 'migration-optional-review',
+                        :submitted_at, 3, 8, 9, 'evening', 5, 4, NULL,
+                        '{}'::jsonb, :submitted_at
+                    )
+                    """
+                ),
+                {
+                    "id": optional_review_id,
+                    "participant_id": participant_id,
+                    "local_date": date(2030, 1, 15),
+                    "submitted_at": now + timedelta(minutes=5),
+                },
+            )
+            assert connection.scalar(
+                text(
+                    "SELECT energy_consumption IS NULL "
+                    "FROM daily_review_responses WHERE id = :id"
+                ),
+                {"id": optional_review_id},
+            ) is True
+
+            command.downgrade(config, "0020_oauth_refresh_lease")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0020_oauth_refresh_lease"
+            downgraded_columns = {
+                column["name"]: column
+                for column in inspect(connection).get_columns(
+                    "daily_review_responses"
+                )
+            }
+            assert downgraded_columns["energy_consumption"]["nullable"] is False
+            assert connection.scalar(
+                text(
+                    "SELECT energy_consumption FROM daily_review_responses "
+                    "WHERE id = :id"
+                ),
+                {"id": optional_review_id},
+            ) == 0
+
+            command.upgrade(config, "0021_daily_review_energy_optional")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0021_daily_review_energy_optional"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

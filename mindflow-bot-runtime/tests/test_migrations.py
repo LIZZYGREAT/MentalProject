@@ -75,6 +75,38 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0020_oauth_refresh_lease"
     )
     assert migration_0020.down_revision == "0019_forecast_currentness_history"
+    migration_0021 = next(
+        migration for migration in migrations
+        if migration.revision == "0021_daily_review_energy_optional"
+    )
+    assert migration_0021.down_revision == "0020_oauth_refresh_lease"
+
+
+def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
+    monkeypatch,
+):
+    migration = _migration(
+        VERSIONS / "0021_daily_review_energy_optional.py"
+    )
+    alterations = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda *args, **kwargs: alterations.append((args, kwargs)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+    assert alterations[-1][0] == (
+        "daily_review_responses",
+        "energy_consumption",
+    )
+    assert alterations[-1][1]["nullable"] is True
+
+    migration.downgrade()
+    assert "WHERE energy_consumption IS NULL" in statements[-1]
+    assert alterations[-1][1]["nullable"] is False
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

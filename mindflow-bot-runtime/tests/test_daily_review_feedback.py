@@ -265,15 +265,96 @@ def test_unknown_peak_period_never_uses_submission_time_as_a_fake_peak_anchor():
 
 def test_daily_review_validation_and_card_contract():
     card = daily_review_card(schedule_id=str(uuid.uuid4()), local_date="2030-01-15")
+    form = next(element for element in card["elements"] if element["tag"] == "form")
+    form_elements = form["elements"]
+    fields = {element.get("name"): element for element in form_elements}
+    prompts = {
+        "start_stress": "① 回顾 2030-01-15：当天早晨刚开始一天时，你的压力有多高？",
+        "start_energy": "② 回顾 2030-01-15：当天早晨的精力怎么样？",
+        "peak_stress": "③ 回顾 2030-01-15：当天最高压力大约有多高？",
+        "peak_period": "④ 回顾 2030-01-15：当天最高压力大约出现在什么时候？",
+        "end_stress": "⑤ 回顾 2030-01-15：当天结束时（约晚间/睡前），你的压力有多高？",
+        "end_energy": "⑥ 回顾 2030-01-15：当天结束时，你还剩多少精力？",
+        "energy_consumption": "⑦ 回顾 2030-01-15：当天整体让你感觉被消耗了多少？（选填）",
+    }
+
+    for name, prompt in prompts.items():
+        field_index = form_elements.index(fields[name])
+        visible_description = form_elements[field_index - 1]
+        assert visible_description["tag"] == "div"
+        assert visible_description["text"]["tag"] == "lark_md"
+        assert prompt in visible_description["text"]["content"]
+
+    assert fields["energy_consumption"]["required"] is False
+    assert fields["daily_review_submit"]["action_type"] == "form_submit"
     serialized = str(card)
-    for field in (
-        "start_stress", "start_energy", "peak_stress", "peak_period",
-        "end_stress", "end_energy", "energy_consumption", "daily_review_submit",
-    ):
-        assert field in serialized
-    assert "当天收尾压力" in serialized
-    assert "当天收尾精力" in serialized
-    assert "当前/收尾" not in serialized
+    assert "0 = 完全没有压力" in serialized
+    assert "10 = 已经非常难承受" in serialized
+    assert "0 = 几乎没有精力" in serialized
+    assert "10 = 精力非常充足" in serialized
+    assert "第 ⑤、⑥ 项会用于帮助估计下一天的起始状态" in serialized
+    assert "当前主要用于研究分析，不会直接改变压力或精力曲线" in serialized
+    assert "以上文字主要用于回顾和研究分析，目前不会直接改变压力曲线数值" in serialized
+    assert "如果这是次日补填" in serialized
+    assert "不要填写此刻状态" in serialized
+    assert "现在/今天结束时" not in serialized
+
+
+def test_daily_review_energy_consumption_is_optional_diagnostic():
+    database = memory_database()
+    person = participant(database, "DR-OPTIONAL-ENERGY")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+    values = _values()
+    values.pop("energy_consumption")
+
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-optional-energy",
+        action=_daily_review_action(database, person.id, target, scheduled_at),
+        values=values,
+        submitted_at=scheduled_at + timedelta(minutes=30),
+    )
+
+    assert result["response"]["energy_consumption"] is None
+    assert (
+        result["retrospective"]["diagnostics"]["energy_consumption_diagnostic"]
+        is None
+    )
+    assert (
+        result["retrospective"]["diagnostics"][
+            "energy_consumption_used_as_hard_anchor"
+        ]
+        is False
+    )
+
+
+def test_inconsistent_reported_peak_is_accepted_but_not_used_as_peak_anchor():
+    database = memory_database()
+    person = participant(database, "DR-INCONSISTENT-PEAK")
+    target = date(2030, 1, 15)
+    _seed_forecast(database, person.id, target)
+    scheduled_at = datetime(2030, 1, 15, 14, tzinfo=timezone.utc)
+
+    result = _service(database).submit(
+        person.id,
+        callback_event_id="callback-inconsistent-peak",
+        action=_daily_review_action(database, person.id, target, scheduled_at),
+        values=_values(start_stress="7", peak_stress="4", end_stress="8"),
+        submitted_at=scheduled_at + timedelta(minutes=30),
+    )
+
+    assert result["response"]["peak_consistency"] is False
+    diagnostics = result["retrospective"]["diagnostics"]
+    assert diagnostics["peak_consistency"] is False
+    assert diagnostics["peak_anchor_used"] is False
+    assert diagnostics["peak_anchor_reason"] == (
+        "inconsistent_reported_peak_not_used"
+    )
+    assert "peak_stress" not in {
+        anchor["name"] for anchor in diagnostics["anchors"]
+    }
 
 
 def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_time():
@@ -424,7 +505,13 @@ def test_next_morning_recovered_card_still_uses_previous_day_closing_anchor():
     )
     recovered_at = datetime(2030, 1, 16, 2, 0, tzinfo=timezone.utc)
     assert asyncio.run(scheduler.run_once(recovered_at))["sent"] == 1
-    action = sent[0][1]["elements"][1]["elements"][-1]["value"]
+    recovered_card = sent[0][1]
+    recovered_copy = str(recovered_card)
+    assert "回顾 2030-01-15" in recovered_copy
+    assert "如果这是次日补填" in recovered_copy
+    assert "不要填写此刻状态" in recovered_copy
+    assert "现在/今天结束时" not in recovered_copy
+    action = recovered_card["elements"][1]["elements"][-1]["value"]
     result = _service(database).submit(
         person.id,
         callback_event_id="callback-late-recovery",
