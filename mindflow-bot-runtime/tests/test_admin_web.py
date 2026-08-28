@@ -130,18 +130,21 @@ def test_admin_date_helpers_do_not_round_trip_calendar_dates_through_utc():
 
 
 def test_admin_curve_marks_and_draws_mismatched_retrospective_source():
-    source = (
+    static_dir = (
         Path(__file__).resolve().parents[1]
         / "app"
         / "admin_web"
         / "static"
-        / "app.js"
-    ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        (static_dir / name).read_text(encoding="utf-8")
+        for name in ("app.js", "forecast_chart.js")
+    )
 
     assert "retrospective_matches_current_forecast===false" in source
     assert "retrospective_source_curve" in source
     assert "回顾估计基于 Forecast" in source
-    assert "回顾基准预测" in source
+    assert "回顾基准 Forecast" in source
 
 
 def test_disabled_admin_app_fails_closed():

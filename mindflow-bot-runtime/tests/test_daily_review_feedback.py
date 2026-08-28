@@ -1172,7 +1172,7 @@ def test_admin_curve_uses_exact_retrospective_source_for_stale_overlay():
     )
 
     class PressureCurves:
-        async def build(self, participant_id, local_date, **_kwargs):
+        async def read_persisted(self, participant_id, local_date, **_kwargs):
             forecast = ForecastSnapshotRepository(database).latest(
                 participant_id, local_date
             )

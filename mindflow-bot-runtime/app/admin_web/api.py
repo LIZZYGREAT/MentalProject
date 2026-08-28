@@ -350,11 +350,9 @@ class AdminAPI:
             )
             return JSONResponse(forecast) if forecast else _json_error("forecast_not_found", 404)
         try:
-            view = await self.pressure_curves.build(
+            view = await self.pressure_curves.read_persisted(
                 participant_id,
                 target,
-                reason="admin_curve_view",
-                refresh_calendar=False,
                 stress_only=False,
             )
         except HistoricalForecastNotFoundError:
@@ -398,10 +396,16 @@ class AdminAPI:
                 "local_date": str(view.forecast.get("local_date") or target),
                 "forecast_version": current_forecast_version,
                 "current_forecast_version": current_forecast_version,
+                "forecast_id": str(view.forecast.get("id") or ""),
+                "generated_at": view.forecast.get("generated_at"),
+                "calendar_revision": view.forecast.get("calendar_revision"),
+                "observation_revision": view.forecast.get("observation_revision"),
+                "point_count": view.analysis.point_count,
+                "is_current": True,
                 "curve": list(view.forecast.get("curve") or []),
                 "analysis": view.analysis.to_dict(),
                 "events": list(view.forecast.get("calendar_events") or []),
-                "warnings": list(view.forecast.get("warning_windows") or []),
+                "warnings": list(view.analysis.warning_windows),
                 "initial_state": dict(output.get("initial_state") or {}),
                 "initial_state_revision": output.get("initial_state_revision"),
                 "calendar_degraded": bool(view.forecast.get("calendar_degraded")),
@@ -527,11 +531,9 @@ class AdminAPI:
         except ValueError:
             return _json_error("invalid_local_date", 400)
         try:
-            view = await self.pressure_curves.build(
+            view = await self.pressure_curves.read_persisted(
                 participant_id,
                 target,
-                reason="admin_curve_png",
-                refresh_calendar=False,
                 stress_only=False,
             )
         except HistoricalForecastNotFoundError:

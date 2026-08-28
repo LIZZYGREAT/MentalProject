@@ -12,23 +12,21 @@ from alembic import command
 from alembic.config import Config
 import pytest
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import make_url
 
 from app.db import build_engine
+from postgres_test_guard import configured_test_postgres_url
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
-    raw_url = os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip()
-    if not raw_url:
+    if not os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip():
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
-    parsed = make_url(raw_url)
-    if not parsed.drivername.startswith("postgresql"):
-        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not PostgreSQL")
-    if "test" not in str(parsed.database or "").casefold():
-        pytest.fail("refusing migration test outside a test database")
+    try:
+        raw_url = configured_test_postgres_url()
+    except ValueError as exc:
+        pytest.fail(str(exc))
 
     schema = f"mindflow_migration_{uuid.uuid4().hex}"
     participant_id = uuid.uuid4()

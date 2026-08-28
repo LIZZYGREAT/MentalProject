@@ -1,7 +1,8 @@
 """Opt-in PostgreSQL tests for row locks and uniqueness constraints.
 
-Set MINDFLOW_TEST_POSTGRES_URL to a disposable database whose database name
-contains ``test``. Each test run uses and drops its own random schema.
+Set MINDFLOW_TEST_POSTGRES_URL to a disposable database named exactly
+``mindflow_acceptance_test`` or prefixed with ``mindflow_test_``. Each test run
+uses and drops its own random schema.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.db import Base, Database, build_engine
@@ -49,18 +49,17 @@ from app.services.token_service import (
     TokenRefreshService,
     TokenRepository,
 )
+from postgres_test_guard import configured_test_postgres_url
 
 
 @pytest.fixture
 def postgres_database():
-    raw_url = os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip()
-    if not raw_url:
+    if not os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip():
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
-    parsed = make_url(raw_url)
-    if not parsed.drivername.startswith("postgresql"):
-        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not PostgreSQL")
-    if "test" not in str(parsed.database or "").casefold():
-        pytest.fail("refusing PostgreSQL concurrency test outside a test database")
+    try:
+        raw_url = configured_test_postgres_url()
+    except ValueError as exc:
+        pytest.fail(str(exc))
 
     schema = f"mindflow_test_{uuid.uuid4().hex}"
     root_engine = build_engine(raw_url)

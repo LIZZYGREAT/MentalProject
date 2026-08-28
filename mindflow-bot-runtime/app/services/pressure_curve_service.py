@@ -48,39 +48,11 @@ class PressureCurveService:
     ) -> PressureCurveView:
         target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
         if target < datetime.now(self.timezone).date():
-            forecast = await asyncio.to_thread(
-                self.coordinator.forecasts.latest, participant_id, target
+            return await self.read_persisted(
+                participant_id,
+                target,
+                stress_only=stress_only,
             )
-            if forecast is None:
-                raise HistoricalForecastNotFoundError(target.isoformat())
-            calendar_snapshot = await asyncio.to_thread(
-                self.coordinator.calendar_snapshots.get, participant_id, target
-            )
-            matching_calendar = bool(
-                calendar_snapshot
-                and calendar_snapshot.get("calendar_revision")
-                == forecast.get("calendar_revision")
-            )
-            forecast = {
-                **forecast,
-                "calendar_events": list(
-                    (forecast.get("output") or {}).get(
-                        "classified_calendar_events"
-                    )
-                    or (calendar_snapshot or {}).get("events")
-                    or []
-                ),
-                "calendar_degraded": bool(
-                    (forecast.get("output") or {}).get("calendar_degraded")
-                ),
-            }
-            if (
-                not (forecast.get("output") or {}).get(
-                    "classified_calendar_events"
-                )
-                and not matching_calendar
-            ):
-                forecast["calendar_events"] = []
         else:
             forecast = await self.coordinator.ensure_forecast(
                 participant_id,
@@ -101,6 +73,56 @@ class PressureCurveService:
             curve,
             analysis,
             dict(forecast.get("output") or {}),
+            stress_only=stress_only,
+        )
+        return PressureCurveView(forecast, analysis, png_bytes)
+
+    async def read_persisted(
+        self,
+        participant_id: uuid.UUID,
+        local_date: date | str,
+        *,
+        stress_only: bool = False,
+    ) -> PressureCurveView:
+        """Render the current persisted Forecast without recomputing anything."""
+
+        target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+        forecast = await asyncio.to_thread(
+            self.coordinator.forecasts.latest, participant_id, target
+        )
+        if forecast is None:
+            raise HistoricalForecastNotFoundError(target.isoformat())
+        calendar_snapshot = await asyncio.to_thread(
+            self.coordinator.calendar_snapshots.get, participant_id, target
+        )
+        output = dict(forecast.get("output") or {})
+        classified_events = list(output.get("classified_calendar_events") or [])
+        matching_calendar = bool(
+            calendar_snapshot
+            and calendar_snapshot.get("calendar_revision")
+            == forecast.get("calendar_revision")
+        )
+        calendar_events = classified_events
+        if not calendar_events and matching_calendar:
+            calendar_events = list((calendar_snapshot or {}).get("events") or [])
+        forecast = {
+            **forecast,
+            "calendar_events": calendar_events,
+            "calendar_degraded": bool(output.get("calendar_degraded")),
+        }
+        curve = list(forecast.get("curve") or [])
+        analysis = analyze_curve(
+            curve,
+            warning_windows=list(forecast.get("warning_windows") or []),
+            calendar_events=calendar_events,
+            now=datetime.now(self.timezone),
+            timezone_value=self.timezone,
+        )
+        png_bytes = await asyncio.to_thread(
+            self.renderer.render,
+            curve,
+            analysis,
+            output,
             stress_only=stress_only,
         )
         return PressureCurveView(forecast, analysis, png_bytes)
