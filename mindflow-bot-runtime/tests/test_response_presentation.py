@@ -131,6 +131,22 @@ def test_progress_presenter_uses_task_stage_and_avoids_generic_after_activity():
     assert "正在处理，请稍候" not in first + second
 
 
+def test_generic_progress_copy_uses_a_bounded_deterministic_template_pool():
+    presenter = ProgressPresenter()
+    prompts = [f"task-{index}" for index in range(16)]
+    first_pass = [
+        presenter.delayed(prompt, state=ProgressState()) for prompt in prompts
+    ]
+    second_pass = [
+        presenter.delayed(prompt, state=ProgressState()) for prompt in prompts
+    ]
+
+    assert first_pass == second_pass
+    assert 1 < len(set(first_pass)) <= 4
+    assert all(message and len(message) <= 20 for message in first_pass)
+    assert all("已完成" not in message for message in first_pass)
+
+
 class GoodPresentationAgent:
     def __init__(self):
         self.calls = 0
@@ -209,7 +225,7 @@ def test_pressure_curve_card_companion_is_formal_and_contains_no_extra_analysis(
     )
 
     assert plan.kind == "rich"
-    assert plan.full_text == "今日压力曲线已生成，请查看卡片。"
+    assert plan.full_text == "压力曲线已生成，请查看卡片。"
     assert len(plan.segments) == 1
     assert "绘图参数" not in plan.full_text
     assert "模型版本" not in plan.full_text

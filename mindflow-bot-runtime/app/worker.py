@@ -72,6 +72,10 @@ class ProgressState:
     first_tool_started_at: float | None = None
     tool_started_at: dict[str, float] = field(default_factory=dict)
     tool_durations_ms: list[float] = field(default_factory=list)
+    grace_elapsed: bool = False
+    final_ready: bool = False
+    pending_text: str | None = None
+    pending_key: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -145,7 +149,10 @@ class BotWorker:
         self.max_retries = max_retries
         self.progress_delay_seconds = progress_delay_seconds
         self.progress_cooldown_seconds = progress_cooldown_seconds
-        self.progress_max_messages = progress_max_messages
+        # A bot event owns at most one user-visible processing message. Keep
+        # accepting the legacy setting so existing deployments do not fail at
+        # startup, but never allow it to weaken the ordering invariant.
+        self.progress_max_messages = min(1, max(0, int(progress_max_messages)))
         self.incidents = incidents
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -365,63 +372,83 @@ class BotWorker:
             )
         }
 
-        async def emit(text: str, *, key: str) -> None:
-            async with progress.lock:
-                now = time.monotonic()
-                if progress.sent >= self.progress_max_messages:
-                    return
-                if key in progress.sent_keys:
-                    return
-                if (
-                    progress.sent
-                    and now - progress.last_sent_at < self.progress_cooldown_seconds
-                ):
-                    return
-                try:
-                    await self._send(
-                        event.chat_id,
-                        text,
-                        message_uuid=self._stable_message_uuid(
-                            f"mindflow:progress:{event.event_id}:{key}"
-                        ),
-                    )
-                except FeishuSendError:
-                    return
-                progress.sent += 1
-                progress.last_sent_at = now
-                progress.sent_keys.add(key)
+        async def emit_locked(text: str, *, key: str) -> None:
+            """Send while holding progress.lock so final cannot overtake it."""
+
+            now = time.monotonic()
+            if progress.final_ready:
+                return
+            if progress.sent >= self.progress_max_messages:
+                return
+            if key in progress.sent_keys:
+                return
+            if (
+                progress.sent
+                and now - progress.last_sent_at < self.progress_cooldown_seconds
+            ):
+                return
+            try:
+                await self._send(
+                    event.chat_id,
+                    text,
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:progress:{event.event_id}"
+                    ),
+                )
+            except FeishuSendError:
+                return
+            progress.sent += 1
+            progress.last_sent_at = now
+            progress.sent_keys.add(key)
 
         async def delayed_progress() -> None:
             await asyncio.sleep(self.progress_delay_seconds)
-            suggestion = self.progress_presenter.delayed(
-                event.text, state=progress
-            )
-            if suggestion:
-                await emit(suggestion, key="delayed")
+            async with progress.lock:
+                progress.grace_elapsed = True
+                suggestion = progress.pending_text
+                key = progress.pending_key
+                if suggestion is None:
+                    suggestion = self.progress_presenter.delayed(
+                        event.text, state=progress
+                    )
+                    key = "delayed"
+                if suggestion and key:
+                    await emit_locked(suggestion, key=key)
 
         async def on_activity(activity: AgentActivityEvent) -> None:
-            now = time.monotonic()
-            if progress.first_activity_at is None:
-                progress.first_activity_at = now
-            tool_name = str(activity.tool_name or "")
-            if tool_name:
-                progress.used_tools.add(tool_name)
-            if activity.kind == "tool_started" and tool_name:
-                if progress.first_tool_started_at is None:
-                    progress.first_tool_started_at = now
-                progress.tool_started_at[tool_name] = now
-            elif activity.kind in {"tool_succeeded", "tool_failed"} and tool_name:
-                tool_started = progress.tool_started_at.pop(tool_name, None)
-                if tool_started is not None:
-                    progress.tool_durations_ms.append(
-                        round((now - tool_started) * 1000, 1)
-                    )
-            suggestion = self.progress_presenter.present(activity, state=progress)
-            if suggestion:
-                await emit(
-                    suggestion,
-                    key=self.progress_presenter.key_for(activity, state=progress),
-                )
+            async with progress.lock:
+                now = time.monotonic()
+                if progress.first_activity_at is None:
+                    progress.first_activity_at = now
+                tool_name = str(activity.tool_name or "")
+                if tool_name:
+                    progress.used_tools.add(tool_name)
+                if activity.kind == "tool_started" and tool_name:
+                    if progress.first_tool_started_at is None:
+                        progress.first_tool_started_at = now
+                    progress.tool_started_at[tool_name] = now
+                elif activity.kind in {"tool_succeeded", "tool_failed"} and tool_name:
+                    tool_started = progress.tool_started_at.pop(tool_name, None)
+                    if tool_started is not None:
+                        progress.tool_durations_ms.append(
+                            round((now - tool_started) * 1000, 1)
+                        )
+                suggestion = self.progress_presenter.present(activity, state=progress)
+                if suggestion:
+                    key = self.progress_presenter.key_for(activity, state=progress)
+                    progress.pending_text = suggestion
+                    progress.pending_key = key
+                    if progress.grace_elapsed:
+                        await emit_locked(suggestion, key=key)
+
+        async def close_progress_before_final() -> None:
+            # If a processing send already owns the lock, wait until the
+            # provider call has completed. Otherwise mark final ready first so
+            # a threshold-edge timer can no longer start a processing send.
+            async with progress.lock:
+                progress.final_ready = True
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
 
         timer = asyncio.create_task(delayed_progress())
         try:
@@ -435,6 +462,7 @@ class BotWorker:
             metrics["agent_result_ms"] = round(
                 (time.monotonic() - agent_started) * 1000, 1
             )
+            await close_progress_before_final()
             if ctx.participant_id in self._cancelled_participants:
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
             cards = (
@@ -519,12 +547,14 @@ class BotWorker:
             )
             status = "completed" if delivered else "reply_pending"
         except ClaudeRuntimeInterrupted:
+            await close_progress_before_final()
             if self.presentations is not None:
                 self.presentations.discard(run_id)
             await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
             delivered = await self._deliver(event, FALLBACK_INTERRUPTED)
             status = "interrupted" if delivered else "reply_pending"
         except Exception:
+            await close_progress_before_final()
             if self.presentations is not None:
                 self.presentations.discard(run_id)
             logger.exception(

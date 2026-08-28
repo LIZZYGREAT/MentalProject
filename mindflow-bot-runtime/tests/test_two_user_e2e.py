@@ -305,7 +305,7 @@ def test_stop_bypasses_running_turn_and_interrupts_runtime():
     assert "当前处理已停止。" in texts
 
 
-def test_progress_is_backend_controlled_and_final_reply_remains_separate():
+def test_fast_tool_reply_finishes_inside_grace_without_processing_message():
     database = memory_database()
     p1 = participant(database, "P001")
     identity = IdentityService(database, BindingRepository(database))
@@ -352,7 +352,5 @@ def test_progress_is_backend_controlled_and_final_reply_remains_separate():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert sender.sent[-2:] == [
-        ("oc_1", "我正在结合今天的信息进行评估。"),
-        ("oc_1", "final assessment"),
-    ]
+    assert sender.sent[-1:] == [("oc_1", "final assessment")]
+    assert all("评估" not in text for _chat, text in sender.sent[:-1])

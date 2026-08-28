@@ -1,7 +1,10 @@
 import asyncio
 from datetime import datetime, timedelta
+from pathlib import Path
+import uuid
 from zoneinfo import ZoneInfo
 
+from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.repositories import (
     CalendarSnapshotRepository,
@@ -18,6 +21,7 @@ from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
     PressureCurveService,
 )
+from app.services.presentation_service import PresentationOutbox
 from app.tools.care import CareTools
 from helpers import memory_database, warning_repository
 
@@ -420,3 +424,53 @@ def test_pressure_curve_tool_has_optional_date_schema():
     spec = next(item for item in registry.specs if item.name == "care_get_pressure_curve")
     assert spec.parameters["properties"]["local_date"]["format"] == "date"
     assert "local_date" not in spec.parameters.get("required", [])
+    assert "future" in spec.description
+    assert "past date is read-only" in spec.description
+    assert "Preserve the user's requested" in (
+        spec.parameters["properties"]["local_date"]["description"]
+    )
+
+
+def test_future_date_pressure_curve_runs_through_real_tool_service_and_forecast_pipeline():
+    _, participant, prediction, coordinator = pipeline()
+    target = datetime.now(ZoneInfo("Asia/Shanghai")).date() + timedelta(days=5)
+    outbox = PresentationOutbox()
+    tools = CareTools(
+        None,
+        None,
+        None,
+        None,
+        "Asia/Shanghai",
+        coordinator,
+        presentations=outbox,
+    )
+    context = AgentContext(
+        participant.id, "DATE-FORECAST", "ou", "oc", "message", uuid.uuid4()
+    )
+
+    result = asyncio.run(
+        tools.get_pressure_curve(context, {"local_date": target.isoformat()})
+    )
+
+    assert result["ok"] is True
+    assert result["local_date"] == target.isoformat()
+    assert prediction.calls[-1]["local_date"] == target.isoformat()
+    card = outbox.take_cards(context.agent_run_id)[0].materialize("img-key")
+    assert card["header"]["title"]["content"] == f"{target.isoformat()} 压力趋势"
+    assert "今日压力趋势" not in str(card)
+
+
+def test_care_skill_routes_explicit_future_date_without_substituting_today():
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / "claude-runtime"
+        / "plugins"
+        / "mindflow-care"
+        / "skills"
+        / "mental-health-care"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert '"生成 2026-09-02 的压力曲线"' in skill
+    assert 'care_get_pressure_curve(local_date="2026-09-02")' in skill
+    assert "never rebuild a past forecast from current inputs" in skill

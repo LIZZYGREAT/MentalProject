@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Protocol
 
 from app.presentation.contracts import AgentActivityEvent
@@ -20,6 +21,13 @@ TOOL_STAGE = {
     "calendar_update_event": "calendar_mutation",
     "calendar_delete_event": "calendar_mutation",
 }
+
+_GENERIC_PROGRESS_MESSAGES = (
+    "我正在整理这次结果，稍等一下。",
+    "我在核对相关信息，马上整理好。",
+    "我正在处理这项任务，结果很快发你。",
+    "我在把相关内容汇总起来，请稍等。",
+)
 
 
 class ProgressPresentationState(Protocol):
@@ -65,15 +73,15 @@ class ProgressPresenter:
         return None
 
     def delayed(
-        self, _user_text: str = "", *, state: ProgressPresentationState
+        self, user_text: str = "", *, state: ProgressPresentationState
     ) -> str | None:
         if state.sent or state.last_stage is not None:
             return None
-        return "我在整理这条消息，马上给你结果。"
+        digest = hashlib.sha256(str(user_text).encode("utf-8")).digest()
+        return _GENERIC_PROGRESS_MESSAGES[digest[0] % len(_GENERIC_PROGRESS_MESSAGES)]
 
     def key_for(
         self, event: AgentActivityEvent, *, state: ProgressPresentationState
     ) -> str:
         stage = TOOL_STAGE.get(str(event.tool_name or ""), "generic")
         return f"{event.kind}:{stage}"
-

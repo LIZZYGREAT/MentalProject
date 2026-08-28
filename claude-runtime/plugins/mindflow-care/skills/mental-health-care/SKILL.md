@@ -30,7 +30,7 @@ Use only these tools:
 - `care_record_checkin` after all required 0-10 check-in fields are known.
 - `care_get_recent_state` when the participant asks about recorded check-ins.
 - `care_run_today_assessment` only when the participant asks or confirms.
-- `care_get_pressure_curve` when the participant asks to see or receive the pressure curve; it queues a reviewed Feishu chart card.
+- `care_get_pressure_curve` when the participant asks to see or receive the pressure curve; it queues a reviewed Feishu chart card. Preserve an explicitly requested `local_date`: today and future dates are supported. A past date is read-only and can return only an already persisted original forecast; never rebuild a past forecast from current inputs.
 - `care_get_checkin_card` when the participant asks for a questionnaire, form,
   buttons, or an easier way to record the five daily check-in fields. This is a
   non-clinical daily-state form, not a baseline diagnostic questionnaire.
@@ -106,6 +106,9 @@ fill it in. A card callback never needs a second Agent turn.
 - "给我个表填状态" → call `care_get_checkin_card`; do not ask the five fields in
   text as well.
 - "看看今天的压力曲线" → call `care_get_pressure_curve`.
+- "看看明天的压力曲线" → call `care_get_pressure_curve` with tomorrow's explicit local date.
+- "生成 2026-09-02 的压力曲线" → call `care_get_pressure_curve(local_date="2026-09-02")`.
+- A pressure curve request for a past date → call `care_get_pressure_curve` with that date and report `historical_forecast_not_found` if no original forecast was persisted; do not substitute today or rebuild history.
 - "明天有什么安排" → call `calendar_list_events` for tomorrow's explicit local
   range and summarize only returned events.
 - "明天下午三点加一个组会" → ask for the missing end time or duration before

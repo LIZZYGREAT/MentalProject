@@ -95,7 +95,7 @@ class Settings:
     claude_max_turns: int = 8
     progress_delay_seconds: int = 3
     progress_cooldown_seconds: int = 3
-    progress_max_messages: int = 2
+    progress_max_messages: int = 1
     response_segmentation_enabled: bool = True
     response_segment_min_total_chars: int = 320
     response_segment_target_chars: int = 260
@@ -284,7 +284,7 @@ class Settings:
             progress_cooldown_seconds=_int(
                 values, "PROGRESS_COOLDOWN_SECONDS", 3
             ),
-            progress_max_messages=_int(values, "PROGRESS_MAX_MESSAGES", 2),
+            progress_max_messages=_int(values, "PROGRESS_MAX_MESSAGES", 1),
             response_segmentation_enabled=_bool(
                 values, "RESPONSE_SEGMENTATION_ENABLED", True
             ),

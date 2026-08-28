@@ -1,8 +1,13 @@
 from pathlib import Path
 
 import pytest
+import yaml
+from starlette.testclient import TestClient
 
+from app.admin_web.auth import hash_password
+from app.admin_web.main import create_app
 from app.config import Settings
+from helpers import memory_database
 
 
 def valid_environment() -> dict[str, str]:
@@ -78,7 +83,7 @@ def test_response_ux_defaults_and_presentation_model_fallback():
 
     assert settings.progress_delay_seconds == 3
     assert settings.progress_cooldown_seconds == 3
-    assert settings.progress_max_messages == 2
+    assert settings.progress_max_messages == 1
     assert settings.response_segmentation_enabled is True
     assert settings.response_segment_min_total_chars == 320
     assert settings.response_segment_target_chars == 260
@@ -300,3 +305,71 @@ def test_compose_keeps_container_admin_port_stable():
     assert 'ADMIN_PORT: 8081' in compose
     assert '127.0.0.1:${ADMIN_HOST_PORT:-8081}:8081' in compose
     assert '127.0.0.1:${ADMIN_PORT:-8081}:8081' not in compose
+
+
+def _normalized_volume(value):
+    if isinstance(value, dict):
+        return {
+            "source": value.get("source"),
+            "target": value.get("target"),
+            "read_only": bool(value.get("read_only")),
+        }
+    source, target, *options = str(value).split(":")
+    return {
+        "source": source,
+        "target": target,
+        "read_only": "ro" in options,
+    }
+
+
+def test_admin_compose_mounts_real_claude_runtime_read_only_without_changing_postgres():
+    compose_path = Path(__file__).resolve().parents[1] / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+
+    admin_volumes = [
+        _normalized_volume(value)
+        for value in compose["services"]["admin"].get("volumes", [])
+    ]
+    assert {
+        "source": "../claude-runtime",
+        "target": "/srv/claude-runtime",
+        "read_only": True,
+    } in admin_volumes
+
+    postgres_volumes = [
+        _normalized_volume(value)
+        for value in compose["services"]["postgres"].get("volumes", [])
+    ]
+    assert any(
+        volume["source"] == "postgres_data"
+        and volume["target"] == "/var/lib/postgresql/data"
+        for volume in postgres_volumes
+    )
+
+
+def test_admin_production_like_startup_uses_mounted_runtime_and_missing_mount_fails_closed(
+    tmp_path,
+):
+    runtime_dir = Path(__file__).resolve().parents[2] / "claude-runtime"
+    environment = valid_environment()
+    environment.update(
+        {
+            "CLAUDE_WORKDIR": str(runtime_dir),
+            "ADMIN_ENABLED": "true",
+            "ADMIN_USERNAME": "admin",
+            "ADMIN_PASSWORD_HASH": hash_password("correct-password"),
+            "ADMIN_SESSION_SECRET": "a-long-test-session-secret",
+        }
+    )
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    with TestClient(create_app(memory_database(), settings)) as client:
+        assert client.get("/", follow_redirects=False).status_code in {302, 307}
+
+    environment["CLAUDE_WORKDIR"] = str(tmp_path / "missing-claude-runtime")
+    with pytest.raises(ValueError, match="CLAUDE_WORKDIR does not exist"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )

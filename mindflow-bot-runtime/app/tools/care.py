@@ -327,14 +327,14 @@ class CareTools:
         )
         registry.register(
             "care_get_pressure_curve",
-            "Generate a participant-bound pressure forecast for a requested local date and queue its pressure-only curve card.",
+            "Generate a participant-bound pressure forecast for today or a requested future local date and queue its pressure-only curve card. A past date is read-only and succeeds only when its original forecast was persisted.",
             {
                 "type": "object",
                 "properties": {
                     "local_date": {
                         "type": "string",
                         "format": "date",
-                        "description": "Requested local calendar date in YYYY-MM-DD. Omit for today.",
+                        "description": "Preserve the user's requested local calendar date in YYYY-MM-DD. Omit only when the user requests today; future dates are supported, while past dates only read a persisted original forecast.",
                     }
                 },
                 "additionalProperties": False,

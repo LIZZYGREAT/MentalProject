@@ -306,7 +306,7 @@ class ResponseOrchestrator:
         if used_tools & _CHECKIN_TOOLS:
             return "可以直接在卡片里记录。"
         if "care_get_pressure_curve" in used_tools:
-            return "今日压力曲线已生成，请查看卡片。"
+            return "压力曲线已生成，请查看卡片。"
         if len(text) > 180 or text.count("\n") > 3:
             return "结果已经整理在卡片里。"
         return text
