@@ -16,6 +16,7 @@ from app.admin_web.api import AdminAPI
 from app.admin_web.admin_users import AdminUserRepository
 from app.admin_web.repositories import AdminRepository
 from app.bootstrap import build_business_services
+from app.build_info import announce_build
 from app.config import Settings
 from app.db import Database, build_engine
 from app.repositories import AgentRunRepository
@@ -78,6 +79,7 @@ def create_app(
 def main() -> None:
     import uvicorn
 
+    announce_build("admin")
     settings = Settings.from_env()
     database = Database(build_engine(settings.database_url))
     services = build_business_services(

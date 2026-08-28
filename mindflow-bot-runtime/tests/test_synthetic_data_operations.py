@@ -5,8 +5,21 @@ import uuid
 import pytest
 from sqlalchemy import delete, func, select
 
-from app.models import CareInterventionEvent, ForecastSnapshot, WarningSchedule
-from app.synthetic_data import CleanupPlanError, audit_synthetic_data, cleanup_from_plan
+from app.models import (
+    CareInterventionEvent,
+    CareInterventionFeedback,
+    DailyReviewResponse,
+    ForecastCurrentnessEvent,
+    ForecastSnapshot,
+    RetrospectiveCurveSnapshot,
+    WarningSchedule,
+)
+from app.synthetic_data import (
+    CleanupPlanError,
+    approve_cleanup_candidates,
+    audit_synthetic_data,
+    cleanup_from_plan,
+)
 from helpers import memory_database, participant
 
 
@@ -184,3 +197,214 @@ def test_audit_reports_forecast_and_warning_invariant_violations():
     report = audit_synthetic_data(database.engine, today=local_date)
     assert len(report["invariants"]["duplicate_valid_forecasts"]) == 1
     assert len(report["invariants"]["sent_warnings_without_authorization_or_sent_time"]) == 1
+
+
+def _warning(database, participant_id, forecast_id, local_date, *, status, forecast_version):
+    timestamp = datetime.combine(local_date, datetime.min.time(), tzinfo=timezone.utc)
+    row = WarningSchedule(
+        participant_id=participant_id,
+        local_date=local_date,
+        forecast_id=forecast_id,
+        forecast_version=forecast_version,
+        warning_identity=f"warning-{uuid.uuid4().hex}",
+        episode_identity=f"episode-{uuid.uuid4().hex}",
+        target_time=timestamp + timedelta(hours=8),
+        risk_time=timestamp + timedelta(hours=9),
+        valid_until=timestamp + timedelta(hours=10),
+        warning_level="medium",
+        status=status,
+        payload_json={},
+    )
+    with database.session() as session:
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+def test_audit_uses_production_warning_status_and_complete_invariants():
+    database = memory_database()
+    user = participant(database, "P-REAL-INVARIANTS")
+    local_date = date(2026, 8, 28)
+    stale_id = _forecast(database, user.id, local_date, marker="production-stale", valid=False)
+    stale_warning = _warning(
+        database, user.id, stale_id, local_date,
+        status="delivery_unavailable", forecast_version="production-stale",
+    )
+    valid_id = _forecast(database, user.id, local_date + timedelta(days=1), marker="production-current")
+    mismatch_warning = _warning(
+        database, user.id, valid_id, local_date + timedelta(days=1),
+        status="pending", forecast_version="wrong-version",
+    )
+    sent_warning = _warning(
+        database, user.id, valid_id, local_date + timedelta(days=1),
+        status="sent", forecast_version="production-current",
+    )
+    with database.session() as session:
+        row = session.get(WarningSchedule, sent_warning)
+        row.authorized_at = datetime(2026, 8, 28, 10, tzinfo=timezone.utc)
+        row.sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    stale = {row["warning_id"] for row in report["invariants"]["active_warnings_on_stale_forecasts"]}
+    invalid_sent = {row["id"] for row in report["invariants"]["sent_warnings_without_authorization_or_sent_time"]}
+
+    assert {str(stale_warning), str(mismatch_warning)} <= stale
+    assert str(sent_warning) in invalid_sent
+
+
+def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
+    database = memory_database()
+    user = participant(database, "TEST-DEPENDENCIES")
+    local_date = date(2035, 3, 4)
+    forecast_id = _forecast(database, user.id, local_date, marker="synthetic-dependency")
+    warning_id, care_id = _warning_and_care(
+        database, user.id, forecast_id, local_date, marker="synthetic-dependency"
+    )
+    with database.session() as session:
+        currentness = ForecastCurrentnessEvent(
+            participant_id=user.id,
+            local_date=local_date,
+            forecast_id=forecast_id,
+            forecast_version="synthetic-dependency",
+            event_type="activated",
+            reason="synthetic fixture",
+            occurred_at=datetime(2035, 3, 4, tzinfo=timezone.utc),
+        )
+        feedback = CareInterventionFeedback(
+            intervention_id=care_id,
+            participant_id=user.id,
+            action_selected="helpful",
+            callback_event_id=f"callback-{uuid.uuid4().hex}",
+        )
+        session.add_all([currentness, feedback])
+        session.flush()
+        currentness_id, feedback_id = currentness.id, feedback.id
+
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    impacts = report["dependent_impacts"]["cascade_delete"]
+    planned = {(row["table"], row["id"]) for row in report["cleanup_plan"]["rows"]}
+    assert ("forecast_currentness_events", str(currentness_id)) in planned
+    assert ("care_intervention_feedback", str(feedback_id)) in planned
+    assert {impact["planned_action"] for impact in impacts} == {"explicit_delete"}
+
+    cleanup_from_plan(
+        database.engine, report["cleanup_plan"], execute=True, backup_confirmed=True
+    )
+    with database.session() as session:
+        assert session.get(ForecastCurrentnessEvent, currentness_id) is None
+        assert session.get(CareInterventionFeedback, feedback_id) is None
+        assert session.get(WarningSchedule, warning_id) is None
+
+
+def test_audit_blocks_set_null_and_restrict_side_effects_before_cleanup():
+    database = memory_database()
+    user = participant(database, "P-REAL-DEPENDENCY")
+    local_date = date(2036, 4, 5)
+    forecast_id = _forecast(database, user.id, local_date, marker="synthetic-restrict")
+    care_date = date(2026, 8, 28)
+    care_forecast_id = _forecast(
+        database, user.id, care_date, marker="production-care-forecast"
+    )
+    source_warning = _warning(
+        database, user.id, care_forecast_id, care_date,
+        status="cancelled", forecast_version="production-care-forecast",
+    )
+    with database.session() as session:
+        care = CareInterventionEvent(
+            participant_id=user.id,
+            source_warning_id=source_warning,
+            source_forecast_id=care_forecast_id,
+            forecast_version="production",
+            intervention_type="warning",
+            template_id="synthetic-care-only",
+            template_version="1",
+            reason_code="synthetic-care-only",
+            scheduled_at=datetime(2026, 8, 28, 8, tzinfo=timezone.utc),
+            status="pending",
+            delivery_status="pending",
+            message_text="fixture",
+            context_json={},
+            actions_json=[],
+        )
+        session.add(care)
+        session.flush()
+        snoozed_warning = WarningSchedule(
+            participant_id=user.id,
+            local_date=care_date,
+            forecast_id=care_forecast_id,
+            forecast_version="production-care-forecast",
+            snoozed_from_intervention_id=care.id,
+            warning_identity=f"ordinary-{uuid.uuid4().hex}",
+            episode_identity=f"ordinary-{uuid.uuid4().hex}",
+            target_time=datetime(2026, 8, 28, 8, tzinfo=timezone.utc),
+            risk_time=datetime(2026, 8, 28, 9, tzinfo=timezone.utc),
+            valid_until=datetime(2026, 8, 28, 10, tzinfo=timezone.utc),
+            warning_level="medium",
+            status="cancelled",
+            payload_json={},
+        )
+        response = DailyReviewResponse(
+            participant_id=user.id,
+            local_date=local_date,
+            revision=1,
+            card_version="v1",
+            causal_source_forecast_id=forecast_id,
+            causal_source_forecast_version="synthetic-restrict",
+            callback_event_id=f"review-{uuid.uuid4().hex}",
+            submitted_at=datetime(2036, 4, 5, 14, tzinfo=timezone.utc),
+            start_stress=3, start_energy=7, peak_stress=6,
+            peak_period="afternoon", end_stress=4, end_energy=5,
+            energy_consumption=2, raw_json={},
+        )
+        session.add_all([snoozed_warning, response])
+        session.flush()
+        retrospective = RetrospectiveCurveSnapshot(
+            participant_id=user.id,
+            local_date=local_date,
+            source_forecast_id=forecast_id,
+            source_forecast_version="synthetic-restrict",
+            daily_review_response_id=response.id,
+            daily_review_revision=1,
+            observation_revision="observation-v1",
+            algorithm_version="retrospective.v1",
+            reconstruction_version=f"reconstruction-{uuid.uuid4().hex}",
+            curve_json=[],
+            analysis_json={},
+            diagnostics_json={},
+        )
+        session.add(retrospective)
+        session.flush()
+        care_id, response_id, retrospective_id = care.id, response.id, retrospective.id
+
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    impacts = report["dependent_impacts"]
+    assert any(row["id"] == str(snoozed_warning.id) for row in impacts["set_null"])
+    assert any(row["id"] == str(response_id) for row in impacts["restrict_blockers"])
+    assert any(row["id"] == str(retrospective_id) for row in impacts["restrict_blockers"])
+    candidate_by_id = {row["id"]: row for row in report["candidates"]}
+    assert candidate_by_id[str(forecast_id)]["cleanup_blocked"] is True
+    assert candidate_by_id[str(care_id)]["cleanup_blocked"] is True
+    with pytest.raises(CleanupPlanError, match="SET NULL|RESTRICT"):
+        cleanup_from_plan(database.engine, report["cleanup_plan"])
+
+
+def test_operator_approval_promotes_only_audited_candidate_and_reaudits_dependencies():
+    database = memory_database()
+    user = participant(database, "P-REAL-LEGACY")
+    future_date = date(2163, 1, 1)
+    forecast_id = _forecast(database, user.id, future_date, marker="production-legacy")
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    candidate = next(row for row in report["candidates"] if row["id"] == str(forecast_id))
+    assert candidate["eligible_for_cleanup"] is False
+
+    plan = approve_cleanup_candidates(database.engine, report, [str(forecast_id)])
+    approved = next(row for row in plan["rows"] if row["id"] == str(forecast_id))
+    assert "far_future_date" in approved["reasons"]
+    assert "operator_approved_after_audit" in approved["reasons"]
+    cleanup_from_plan(database.engine, plan, execute=True, backup_confirmed=True)
+    assert _counts(database)["forecast_snapshots"] == 0
+
+    tampered = deepcopy(report)
+    tampered["candidates"][0]["reasons"] = []
+    with pytest.raises(CleanupPlanError, match="audit report digest"):
+        approve_cleanup_candidates(database.engine, tampered, [str(forecast_id)])

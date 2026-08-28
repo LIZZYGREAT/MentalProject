@@ -19,6 +19,7 @@ from app.synthetic_data import audit_synthetic_data
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url-env", default="DATABASE_URL")
+    parser.add_argument("--report-out", type=Path, help="optional path for the signed full audit report")
     parser.add_argument("--plan-out", type=Path, help="optional path for the signed cleanup plan")
     args = parser.parse_args()
     raw_url = os.environ.get(args.database_url_env, "").strip()
@@ -33,6 +34,10 @@ def main() -> None:
         args.plan_out.write_text(
             json.dumps(report["cleanup_plan"], ensure_ascii=False, indent=2),
             encoding="utf-8",
+        )
+    if args.report_out:
+        args.report_out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

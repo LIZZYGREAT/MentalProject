@@ -29,3 +29,17 @@ def configured_test_postgres_url() -> str:
     """Read only the dedicated variable; DATABASE_URL is intentionally ignored."""
 
     return validate_test_postgres_url(os.environ.get("MINDFLOW_TEST_POSTGRES_URL", ""))
+
+
+def optional_test_postgres_url() -> str | None:
+    """Return None for local opt-out, but fail acceptance when PostgreSQL is required."""
+
+    raw_url = os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip()
+    if not raw_url:
+        if os.environ.get("MINDFLOW_REQUIRE_POSTGRES_TESTS", "").strip() == "1":
+            raise ValueError(
+                "MINDFLOW_TEST_POSTGRES_URL is required because "
+                "MINDFLOW_REQUIRE_POSTGRES_TESTS=1"
+            )
+        return None
+    return validate_test_postgres_url(raw_url)

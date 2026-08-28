@@ -146,6 +146,7 @@ async def run() -> None:
     from app.presentation.semantic_segmenter import SemanticSegmenter
     from app.worker import BotWorker
     from app.logging_security import install_credential_redaction
+    from app.build_info import announce_build
 
     settings = Settings.from_env()
     isolate_process_environment()
@@ -154,6 +155,7 @@ async def run() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     install_credential_redaction()
+    announce_build("bot")
     _log_startup_phase("settings_ready")
     database = Database(build_engine(settings.database_url))
     with database.session() as session:

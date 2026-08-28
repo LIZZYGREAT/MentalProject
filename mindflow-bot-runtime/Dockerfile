@@ -1,10 +1,12 @@
 FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
+ARG BUILD_REVISION=development
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/srv/runtime:/srv/project \
     MPLCONFIGDIR=/tmp/matplotlib \
     HOME=/home/mindflow \
-    CLAUDE_WORKDIR=/srv/claude-workspace
+    CLAUDE_WORKDIR=/srv/claude-workspace \
+    BUILD_REVISION=${BUILD_REVISION}
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt

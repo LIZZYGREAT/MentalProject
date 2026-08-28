@@ -8,7 +8,6 @@ uses and drops its own random schema.
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from datetime import datetime, timedelta, timezone
-import os
 import threading
 import uuid
 from zoneinfo import ZoneInfo
@@ -49,17 +48,17 @@ from app.services.token_service import (
     TokenRefreshService,
     TokenRepository,
 )
-from postgres_test_guard import configured_test_postgres_url
+from postgres_test_guard import optional_test_postgres_url
 
 
 @pytest.fixture
 def postgres_database():
-    if not os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip():
-        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
     try:
-        raw_url = configured_test_postgres_url()
+        raw_url = optional_test_postgres_url()
     except ValueError as exc:
         pytest.fail(str(exc))
+    if raw_url is None:
+        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
 
     schema = f"mindflow_test_{uuid.uuid4().hex}"
     root_engine = build_engine(raw_url)

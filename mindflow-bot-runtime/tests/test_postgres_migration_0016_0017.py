@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 import json
-import os
 from pathlib import Path
 import uuid
 
@@ -14,19 +13,19 @@ import pytest
 from sqlalchemy import inspect, text
 
 from app.db import build_engine
-from postgres_test_guard import configured_test_postgres_url
+from postgres_test_guard import optional_test_postgres_url
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_real_postgres_upgrade_0016_to_0020_preserves_and_backfills():
-    if not os.environ.get("MINDFLOW_TEST_POSTGRES_URL", "").strip():
-        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
     try:
-        raw_url = configured_test_postgres_url()
+        raw_url = optional_test_postgres_url()
     except ValueError as exc:
         pytest.fail(str(exc))
+    if raw_url is None:
+        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
 
     schema = f"mindflow_migration_{uuid.uuid4().hex}"
     participant_id = uuid.uuid4()

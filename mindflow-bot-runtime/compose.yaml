@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: mindflow-bot-runtime/Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     env_file:
       - .env
     depends_on:
@@ -26,6 +28,8 @@ services:
     build:
       context: ..
       dockerfile: mindflow-bot-runtime/Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     env_file:
       - .env
     depends_on:
@@ -54,6 +58,8 @@ services:
     build:
       context: ..
       dockerfile: mindflow-bot-runtime/Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
     env_file:
       - .env
     depends_on:
