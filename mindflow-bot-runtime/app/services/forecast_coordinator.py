@@ -48,7 +48,12 @@ from services.event_lifecycle import EVENT_SCHEMA_VERSION, prepare_event_instanc
 from services.event_semantic_prompt import PROMPT_VERSION
 from services.event_semantics import SEMANTIC_SCHEMA_VERSION
 from services.semantic_model_inputs import semantic_model_inputs
-from services.workload import WORKLOAD_MODEL_VERSION, WORKLOAD_SCHEMA_VERSION
+from services.workload import (
+    WORKLOAD_MODEL_VERSION,
+    WORKLOAD_SCHEMA_VERSION,
+    workload_revision,
+    workload_semantic_inputs,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -601,6 +606,7 @@ class ForecastCoordinator:
         latest = await asyncio.to_thread(self.forecasts.latest, participant_id, target)
         algorithm_version = str(self.prediction.model.MODEL_VERSION)
         warning_revision, warning_policy_config = self._warning_revision()
+        current_workload_revision = workload_revision(effective_profile)
         expected_version = _sha({
             "calendar_revision": calendar_snapshot["calendar_revision"],
             "semantic_revision": semantic_revision,
@@ -610,6 +616,7 @@ class ForecastCoordinator:
             "algorithm_version": algorithm_version,
             "warning_revision": warning_revision,
             "initial_state_revision": initial_state.revision,
+            "workload_revision": current_workload_revision,
         })
         if latest and latest["forecast_version"] == expected_version:
             cached = await self._reconcile_cached_warning_state(
@@ -634,6 +641,8 @@ class ForecastCoordinator:
             and (latest.get("output") or {}).get("warning_revision") == warning_revision
             and (latest.get("output") or {}).get("initial_state_revision")
             == initial_state.revision
+            and (latest.get("output") or {}).get("workload_revision")
+            == current_workload_revision
             and (
                 not classification_facts_available
                 or (latest.get("output") or {}).get("classified_event_revision")
@@ -676,6 +685,7 @@ class ForecastCoordinator:
             output["semantic_schema_version"] = SEMANTIC_SCHEMA_VERSION
             output["workload_schema_version"] = WORKLOAD_SCHEMA_VERSION
             output["workload_model_version"] = WORKLOAD_MODEL_VERSION
+            output["workload_revision"] = current_workload_revision
             output["semantic_prompt_version"] = PROMPT_VERSION
             output["course_resolver_version"] = COURSE_RESOLVER_VERSION
             output["course_catalog_revision"] = COURSE_CATALOG_REVISION
@@ -915,14 +925,18 @@ class ForecastCoordinator:
     @staticmethod
     def _semantic_delta(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> float:
         left = {
-            str(item.get("id")): semantic_model_inputs(
-                (item.get("metadata") or {}).get("semantic")
-            ) for item in before
+            str(item.get("id")): {
+                **semantic_model_inputs((item.get("metadata") or {}).get("semantic")),
+                **workload_semantic_inputs((item.get("metadata") or {}).get("semantic")),
+            }
+            for item in before
         }
         right = {
-            str(item.get("id")): semantic_model_inputs(
-                (item.get("metadata") or {}).get("semantic")
-            ) for item in after
+            str(item.get("id")): {
+                **semantic_model_inputs((item.get("metadata") or {}).get("semantic")),
+                **workload_semantic_inputs((item.get("metadata") or {}).get("semantic")),
+            }
+            for item in after
         }
         delta = 0.0
         for event_id in set(left) | set(right):

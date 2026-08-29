@@ -596,6 +596,100 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
             ) == "0026_dataset_participant_membership"
+            appraisal_values = {
+                "id": uuid.uuid4(),
+                "participant_id": participant_id,
+                "event_id": "migration-event",
+                "submitted_at": now,
+                "created_at": now,
+                "mental_demand": 8,
+                "physical_demand": 2,
+                "temporal_demand": 7,
+                "effort": 8,
+                "frustration": 6,
+                "perceived_control": 4,
+                "actual_stress": 7,
+                "perceived_performance": 6,
+            }
+            connection.execute(
+                text(
+                    "INSERT INTO event_appraisal_feedback ("
+                    "id, participant_id, event_id, mental_demand, "
+                    "physical_demand, temporal_demand, effort, frustration, "
+                    "perceived_control, actual_stress, perceived_performance, "
+                    "submitted_at, created_at) VALUES ("
+                    ":id, :participant_id, :event_id, :mental_demand, "
+                    ":physical_demand, :temporal_demand, :effort, :frustration, "
+                    ":perceived_control, :actual_stress, :perceived_performance, "
+                    ":submitted_at, :created_at)"
+                ),
+                appraisal_values,
+            )
+            command.upgrade(config, "0027_workload_calibration")
+            command.upgrade(config, "0028_workload_causal_provenance")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0028_workload_causal_provenance"
+
+            appraisal_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "event_appraisal_feedback"
+                )
+            }
+            assert {
+                "event_type", "course_name", "workload_feature_vector",
+                "workload_prior", "observed_workload", "workload_residual",
+                "workload_model_version", "event_local_date", "event_start_at",
+                "source_forecast_id", "source_forecast_version",
+                "source_semantic_revision", "workload_schema_version",
+            } <= appraisal_columns
+            appraisal_checks = {
+                item["name"]
+                for item in inspect(connection).get_check_constraints(
+                    "event_appraisal_feedback"
+                )
+            }
+            assert {
+                "ck_event_appraisal_workload_prior",
+                "ck_event_appraisal_observed_workload",
+            } <= appraisal_checks
+            appraisal_indexes = {
+                item["name"]
+                for item in inspect(connection).get_indexes(
+                    "event_appraisal_feedback"
+                )
+            }
+            assert {
+                "ix_event_appraisal_event_type",
+                "ix_event_appraisal_course",
+                "ix_event_appraisal_participant_event_date",
+                "ix_event_appraisal_source_forecast",
+            } <= appraisal_indexes
+            appraisal_foreign_keys = {
+                item["name"]: item
+                for item in inspect(connection).get_foreign_keys(
+                    "event_appraisal_feedback"
+                )
+            }
+            assert appraisal_foreign_keys[
+                "fk_event_appraisal_source_forecast"
+            ]["referred_table"] == "forecast_snapshots"
+            preserved_appraisal = connection.execute(
+                text(
+                    "SELECT mental_demand, physical_demand, temporal_demand, "
+                    "effort, frustration, perceived_control, actual_stress, "
+                    "perceived_performance, submitted_at, created_at, "
+                    "source_forecast_id, source_forecast_version, "
+                    "source_semantic_revision, workload_schema_version "
+                    "FROM event_appraisal_feedback WHERE id = :id"
+                ),
+                {"id": appraisal_values["id"]},
+            ).one()
+            assert preserved_appraisal[:8] == (8, 2, 7, 8, 6, 4, 7, 6)
+            assert preserved_appraisal[8] == now
+            assert preserved_appraisal[9] == now
+            assert preserved_appraisal[10:] == (None, None, None, None)
             assert connection.execute(
                 text(
                     "SELECT schema_version, manifest_json "
@@ -843,7 +937,6 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 )
                 """
             )
-            connection.execute(appraisal_insert, appraisal_values)
             with pytest.raises(IntegrityError):
                 with connection.begin_nested():
                     connection.execute(
@@ -1061,10 +1154,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0026_dataset_participant_membership")
+            command.upgrade(config, "0028_workload_causal_provenance")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0026_dataset_participant_membership"
+            ) == "0028_workload_causal_provenance"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

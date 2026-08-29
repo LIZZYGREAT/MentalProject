@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0027_workload_calibration -->
+<!-- ALEMBIC_HEAD: 0028_workload_causal_provenance -->
 
 ## 运行边界
 
@@ -189,7 +189,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0027_workload_calibration`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0028_workload_causal_provenance`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -236,8 +236,11 @@ Schema v3 并冻结 participant membership；零观测参与者仍保留在 coho
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 
 0027 为 Event Appraisal 增加事件类型、课程、workload feature/prior、Raw-TLX observed workload、
-residual 与 estimator version；新反馈写入时同步保存可复现 residual。Admin Workload 页面按
-0/5/10/15/30/60 分钟 lag 比较 W(t) 与 EMA Stress，并显示 workload bin 误差和按 event type、
+residual 与 estimator version；0028 进一步冻结事件日期、开始时间及 source Forecast/semantic/schema
+provenance。反馈只从 `min(event_start_at, submitted_at, created_at)` 时实际 current 的 Forecast 读取
+prior，不存在因果 Forecast 或对应事件时只保存 observed workload。Admin Workload 的当前曲线明确为
+`latest_descriptive`；EMA 与 0/5/10/15/30/60 分钟 lag 则固定使用 observation 因果时点的同一 Forecast，
+并显示 workload bin 误差和按 event type、
 course、participant 分层的 appraisal residual。
 
 ## 自动漂移保护

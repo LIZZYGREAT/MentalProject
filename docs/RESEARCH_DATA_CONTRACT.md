@@ -16,10 +16,12 @@
 | Learned Model Parameters | 纵向数据学习出的可审计参数 | `learned_model_profiles` | `window_start`–`window_end` | `created_at` |
 | Event Appraisal | 用户对真实日程事件的事后评价 | `event_appraisal_feedback` | 由 `event_id` 指向事件；提交时刻为 `submitted_at` | `created_at` |
 
-Event Appraisal 同时冻结 `workload_feature_vector`、`workload_prior`、Raw-TLX 风格
-`observed_workload`、`workload_residual` 与 estimator version；残差定义为
+Event Appraisal 同时冻结 `event_local_date`、`event_start_at`、因果时点的
+`source_forecast_id/version`、`source_semantic_revision`、`workload_feature_vector`、
+`workload_prior`、Raw-TLX 风格 `observed_workload`、`workload_residual` 与 schema/estimator version；残差定义为
 `observed_workload - workload_prior`，取值尺度为 0–1。Performance 仅来自事后反馈，
-不进入事前 semantic workload prior。
+不进入事前 semantic workload prior。因果截止点是 event start、submitted、created 三者最早值；
+只允许使用该时点实际 current 的 Forecast，不得回退到后来生成的版本。
 
 实时模型只能按状态时间读取。任何 point-in-time、因果或回顾分析必须同时满足“状态时间不晚于 cutoff”与“知识时间不晚于 cutoff”，禁止让之后补录的数据泄漏到过去。
 

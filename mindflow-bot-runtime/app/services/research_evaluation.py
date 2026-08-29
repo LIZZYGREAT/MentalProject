@@ -159,13 +159,11 @@ class ResearchEvaluationService:
                 .order_by(EventAppraisalFeedback.submitted_at)
             ).scalars().all()
 
-        curve_index: dict[tuple[uuid.UUID, date], list[tuple[datetime, dict[str, Any]]]] = {}
         forecast_series: list[dict[str, Any]] = []
         events: list[dict[str, Any]] = []
         recovery_windows: list[dict[str, Any]] = []
         forecast_pairs: list[tuple[float, float]] = []
         for row in forecasts:
-            points: list[tuple[datetime, dict[str, Any]]] = []
             for point in list(row.curve_json or []):
                 timestamp = self._point_time(row.local_date, point.get("time"), self.timezone)
                 if timestamp is None:
@@ -177,7 +175,6 @@ class ResearchEvaluationService:
                     continue
                 if not (0.0 <= workload <= 1.0 and 0.0 <= stress <= 10.0):
                     continue
-                points.append((timestamp, point))
                 forecast_pairs.append((workload, stress))
                 if len(forecast_series) < 10000:
                     forecast_series.append({
@@ -189,7 +186,6 @@ class ResearchEvaluationService:
                         "forecast_stress": stress,
                         "continuous_work_hours": point.get("continuous_work_hours"),
                     })
-            curve_index[(row.participant_id, row.local_date)] = points
             for event in list((row.output_json or {}).get("classified_calendar_events") or []):
                 item = {
                     "participant_id": str(row.participant_id),
@@ -208,23 +204,20 @@ class ResearchEvaluationService:
                     recovery_windows.append(item)
 
         def nearest_workload(
-            participant: uuid.UUID, timestamp: datetime
+            forecast: dict[str, Any], timestamp: datetime
         ) -> tuple[float, float, str] | None:
-            local_day = _aware(timestamp).astimezone(self.timezone).date()
-            candidates = curve_index.get((participant, local_day), [])
-            if not candidates:
+            match = self._nearest_point(forecast, _aware(timestamp))
+            if match is None:
                 return None
-            distance, point_time, point = min(
-                (
-                    abs((point_time - _aware(timestamp)).total_seconds()),
-                    point_time,
-                    point,
-                )
-                for point_time, point in candidates
-            )
-            if distance > MATCH_TOLERANCE_SECONDS:
+            point, point_time = match
+            try:
+                workload = float(point["workload"])
+                stress = float(point["stress_0_10"])
+            except (KeyError, TypeError, ValueError):
                 return None
-            return float(point["workload"]), float(point["stress_0_10"]), point_time.isoformat()
+            if not (0.0 <= workload <= 1.0 and 0.0 <= stress <= 10.0):
+                return None
+            return workload, stress, point_time.isoformat()
 
         actual_series: list[dict[str, Any]] = []
         lag_pairs: dict[int, list[tuple[float, float]]] = {
@@ -235,7 +228,17 @@ class ResearchEvaluationService:
             actual = _score(dict(observation.payload_json or {}), "stress_0_10")
             if actual is None:
                 continue
-            current = nearest_workload(observation.participant_id, observation.observed_at)
+            observed_at = _aware(observation.observed_at)
+            created_at = _aware(observation.created_at)
+            local_day = observed_at.astimezone(self.timezone).date()
+            causal_forecast = self.forecasts.current_at(
+                observation.participant_id,
+                local_day,
+                min(observed_at, created_at),
+            )
+            if causal_forecast is None:
+                continue
+            current = nearest_workload(causal_forecast, observed_at)
             if current is not None:
                 workload, predicted, point_time = current
                 actual_series.append({
@@ -248,33 +251,40 @@ class ResearchEvaluationService:
                     "forecast_stress": predicted,
                     "actual_stress": actual,
                     "residual": actual - predicted,
+                    "source_forecast_id": causal_forecast["id"],
+                    "source_forecast_version": causal_forecast["forecast_version"],
+                    "source_semantic_revision": causal_forecast["semantic_revision"],
                 })
                 start = min(int(workload * 5), 4) * 0.2
                 label = f"{start:.1f}–{start + 0.2:.1f}"
                 residual_bins[label].append(actual - predicted)
             for lag in lag_pairs:
                 lagged = nearest_workload(
-                    observation.participant_id,
-                    _aware(observation.observed_at) - timedelta(minutes=lag),
+                    causal_forecast,
+                    observed_at - timedelta(minutes=lag),
                 )
                 if lagged is not None:
                     lag_pairs[lag].append((lagged[0], actual))
 
         appraisal_rows = []
-        grouped: dict[str, dict[str, list[float]]] = {
+        grouped: dict[str, dict[tuple[str, str], list[float]]] = {
             "event_type": defaultdict(list),
             "course": defaultdict(list),
             "participant": defaultdict(list),
         }
-        feature_rows, observed_rows = [], []
+        calibration_rows: dict[str, tuple[list[dict[str, Any]], list[float]]] = {}
         for row in appraisals:
+            model_version = row.workload_model_version or "unknown"
             if row.workload_residual is not None:
-                grouped["event_type"][row.event_type or "unknown"].append(row.workload_residual)
-                grouped["course"][row.course_name or "unknown"].append(row.workload_residual)
-                grouped["participant"][str(row.participant_id)].append(row.workload_residual)
+                grouped["event_type"][(model_version, row.event_type or "unknown")].append(row.workload_residual)
+                grouped["course"][(model_version, row.course_name or "unknown")].append(row.workload_residual)
+                grouped["participant"][(model_version, str(row.participant_id))].append(row.workload_residual)
             if row.workload_feature_vector and row.observed_workload is not None:
-                feature_rows.append(dict(row.workload_feature_vector))
-                observed_rows.append(float(row.observed_workload))
+                features, observed_values = calibration_rows.setdefault(
+                    model_version, ([], [])
+                )
+                features.append(dict(row.workload_feature_vector))
+                observed_values.append(float(row.observed_workload))
             appraisal_rows.append({
                 "event_id": row.event_id,
                 "participant_id": str(row.participant_id),
@@ -284,12 +294,37 @@ class ResearchEvaluationService:
                 "observed_workload": row.observed_workload,
                 "workload_residual": row.workload_residual,
                 "actual_stress": row.actual_stress,
+                "workload_model_version": row.workload_model_version,
+                "source_forecast_id": (
+                    str(row.source_forecast_id) if row.source_forecast_id else None
+                ),
             })
 
-        calibration = None
-        if feature_rows:
+        calibration_by_version = []
+        for model_version, (feature_rows, observed_rows) in sorted(calibration_rows.items()):
+            if len(feature_rows) < 10:
+                calibration_by_version.append({
+                    "workload_model_version": model_version,
+                    "status": "insufficient_sample",
+                    "sample_count": len(feature_rows),
+                })
+                continue
             _, fit = WorkloadEstimator.fit_ridge(feature_rows, observed_rows, alpha=1.0)
-            calibration = fit.to_dict()
+            calibration_by_version.append({
+                "workload_model_version": model_version,
+                "status": "exploratory",
+                **fit.to_dict(),
+            })
+        calibration = (
+            {"status": "insufficient_sample", "sample_count": 0}
+            if not calibration_by_version
+            else calibration_by_version[0]
+            if len(calibration_by_version) == 1
+            else {
+                "status": "separated_by_workload_model_version",
+                "model_version_count": len(calibration_by_version),
+            }
+        )
         actual_pairs = lag_pairs[0]
         if len(actual_pairs) >= 2:
             xs, ys = [x for x, _ in actual_pairs], [y for _, y in actual_pairs]
@@ -311,6 +346,7 @@ class ResearchEvaluationService:
             "date_start": date_start.isoformat(),
             "date_end": date_end.isoformat(),
             "participant_id": str(participant_id) if participant_id else None,
+            "series_mode": "latest_descriptive",
             "series": forecast_series,
             "actual_ema": actual_series,
             "calendar_events": events,
@@ -340,9 +376,15 @@ class ResearchEvaluationService:
             "event_appraisal": {
                 "items": appraisal_rows,
                 "ridge_fit": calibration,
+                "ridge_fit_by_model_version": calibration_by_version,
                 "residual_by": {
                     dimension: [
-                        {"group": key, "mean_residual": mean(values), "sample_count": len(values)}
+                        {
+                            "workload_model_version": key[0],
+                            "group": key[1],
+                            "mean_residual": mean(values),
+                            "sample_count": len(values),
+                        }
                         for key, values in sorted(groups.items())
                     ]
                     for dimension, groups in grouped.items()

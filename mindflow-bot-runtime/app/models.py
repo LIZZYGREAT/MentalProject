@@ -193,6 +193,14 @@ class EventAppraisalFeedback(Base):
     __tablename__ = "event_appraisal_feedback"
     __table_args__ = (
         Index("ix_event_appraisal_participant_time", "participant_id", "submitted_at"),
+        Index("ix_event_appraisal_event_type", "event_type", "submitted_at"),
+        Index("ix_event_appraisal_course", "course_name", "submitted_at"),
+        Index(
+            "ix_event_appraisal_participant_event_date",
+            "participant_id",
+            "event_local_date",
+        ),
+        Index("ix_event_appraisal_source_forecast", "source_forecast_id"),
         CheckConstraint("mental_demand >= 0 AND mental_demand <= 10", name="ck_event_appraisal_mental"),
         CheckConstraint("physical_demand >= 0 AND physical_demand <= 10", name="ck_event_appraisal_physical"),
         CheckConstraint("temporal_demand >= 0 AND temporal_demand <= 10", name="ck_event_appraisal_temporal"),
@@ -230,6 +238,18 @@ class EventAppraisalFeedback(Base):
     workload_prior: Mapped[float | None] = mapped_column(Float, nullable=True)
     observed_workload: Mapped[float | None] = mapped_column(Float, nullable=True)
     workload_residual: Mapped[float | None] = mapped_column(Float, nullable=True)
+    event_local_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    event_start_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_forecast_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("forecast_snapshots.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_forecast_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_semantic_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    workload_schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     workload_model_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

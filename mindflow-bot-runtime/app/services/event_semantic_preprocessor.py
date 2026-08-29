@@ -34,7 +34,7 @@ from services.event_semantics import (
 from services.event_classifier import classify_event, finalize_event_classification
 from utils.description_score import score_description
 from services.semantic_model_inputs import semantic_model_inputs
-from services.workload import WorkloadEstimator
+from services.workload import WorkloadEstimator, workload_semantic_inputs
 
 
 logger = logging.getLogger(__name__)
@@ -478,6 +478,9 @@ class EventSemanticPreprocessor:
             {
                 "id": item.get("id"),
                 "model_inputs": semantic_model_inputs(
+                    (item.get("metadata") or {}).get("semantic")
+                ),
+                "workload_inputs": workload_semantic_inputs(
                     (item.get("metadata") or {}).get("semantic")
                 ),
                 "classification": {

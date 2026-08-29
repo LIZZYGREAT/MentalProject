@@ -271,6 +271,9 @@ def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
     database = memory_database()
     person = participant(database, "synthetic-stage2")
     with database.session() as session:
+        session.get(Participant, person.id).created_at = datetime(
+            2026, 8, 14, tzinfo=timezone.utc
+        )
         session.add_all(
             [
                 LearnedModelProfile(

@@ -611,6 +611,7 @@ class ParticipantSlowStateRepository:
 class EventAppraisalFeedbackRepository:
     def __init__(self, database: Database):
         self.database = database
+        self.forecasts = ForecastSnapshotRepository(database)
 
     @staticmethod
     def _view(row: EventAppraisalFeedback) -> dict[str, Any]:
@@ -624,6 +625,18 @@ class EventAppraisalFeedbackRepository:
             "workload_prior": row.workload_prior,
             "observed_workload": row.observed_workload,
             "workload_residual": row.workload_residual,
+            "event_local_date": (
+                row.event_local_date.isoformat() if row.event_local_date else None
+            ),
+            "event_start_at": (
+                row.event_start_at.isoformat() if row.event_start_at else None
+            ),
+            "source_forecast_id": (
+                str(row.source_forecast_id) if row.source_forecast_id else None
+            ),
+            "source_forecast_version": row.source_forecast_version,
+            "source_semantic_revision": row.source_semantic_revision,
+            "workload_schema_version": row.workload_schema_version,
             "workload_model_version": row.workload_model_version,
             "submitted_at": row.submitted_at.isoformat(),
             "created_at": row.created_at.isoformat(),
@@ -635,11 +648,9 @@ class EventAppraisalFeedbackRepository:
         *,
         event_id: str,
         submitted_at: datetime,
-        event_type: str | None = None,
-        course_name: str | None = None,
-        workload_feature_vector: Mapping[str, Any] | None = None,
-        workload_prior: float | None = None,
-        workload_model_version: str | None = None,
+        event_local_date: date | None = None,
+        event_start_at: datetime | None = None,
+        created_at: datetime | None = None,
         **scores: Any,
     ) -> dict[str, Any]:
         event = str(event_id or "").strip()
@@ -658,69 +669,57 @@ class EventAppraisalFeedbackRepository:
         }
         from services.workload import (
             WORKLOAD_FEATURE_NAMES,
-            WORKLOAD_MODEL_VERSION,
-            WorkloadEstimator,
             observed_workload,
         )
 
-        # Normal feedback callers only know the provider event id.  Resolve
-        # the frozen semantic workload context from the latest current
-        # Forecast so residual persistence does not depend on a client echoing
-        # model-owned features back to us.
-        if workload_feature_vector is None or workload_prior is None:
-            with self.database.session() as lookup_session:
-                forecasts = lookup_session.execute(
-                    select(ForecastSnapshot)
-                    .where(
-                        ForecastSnapshot.participant_id == participant_id,
-                        ForecastSnapshot.valid.is_(True),
-                    )
-                    .order_by(desc(ForecastSnapshot.generated_at))
-                    .limit(100)
-                ).scalars().all()
-                for forecast in forecasts:
-                    classified = list(
-                        (forecast.output_json or {}).get("classified_calendar_events")
-                        or []
-                    )
-                    presentation = next(
-                        (
-                            item for item in classified
-                            if str(item.get("id") or item.get("event_id") or "") == event
-                        ),
-                        None,
-                    )
-                    semantic_item = next(
-                        (
-                            item for item in list(forecast.semantic_input_json or [])
-                            if str(item.get("event_id") or "") == event
-                        ),
-                        None,
-                    )
-                    semantic_context = (
-                        dict(semantic_item.get("semantic") or {})
-                        if isinstance(semantic_item, Mapping)
-                        else {}
-                    )
-                    if workload_feature_vector is None:
-                        workload_feature_vector = semantic_context.get(
-                            "workload_feature_vector"
+        submitted_utc = aware_utc(submitted_at, "submitted_at")
+        created_utc = (
+            aware_utc(created_at, "created_at") if created_at is not None else utc_now()
+        )
+        start_utc = (
+            aware_utc(event_start_at, "event_start_at")
+            if event_start_at is not None
+            else None
+        )
+        if (event_local_date is None) != (start_utc is None):
+            raise ValueError("event_local_date and event_start_at must be supplied together")
+
+        # Workload features are model-owned.  Resolve them only from the
+        # forecast that was actually current at the earliest causal instant;
+        # never scan newer snapshots or accept a client echo as provenance.
+        causal_forecast = None
+        semantic_context: dict[str, Any] = {}
+        presentation: Mapping[str, Any] | None = None
+        if event_local_date is not None and start_utc is not None:
+            causal_forecast = self.forecasts.current_at(
+                participant_id,
+                event_local_date,
+                min(start_utc, submitted_utc, created_utc),
+            )
+            if causal_forecast is not None:
+                semantic_item = next(
+                    (
+                        item
+                        for item in list(causal_forecast.get("semantic_input") or [])
+                        if str(item.get("event_id") or "") == event
+                    ),
+                    None,
+                )
+                presentation = next(
+                    (
+                        item
+                        for item in list(
+                            (causal_forecast.get("output") or {}).get(
+                                "classified_calendar_events"
+                            )
+                            or []
                         )
-                    if workload_prior is None:
-                        workload_prior = semantic_context.get("workload_prior")
-                    if presentation:
-                        event_type = event_type or presentation.get("event_type")
-                        course_name = course_name or (
-                            presentation.get("related_course_name")
-                            or presentation.get("course_name")
-                        )
-                        workload_prior = (
-                            workload_prior
-                            if workload_prior is not None
-                            else presentation.get("workload_prior")
-                        )
-                    if workload_feature_vector is not None and workload_prior is not None:
-                        break
+                        if str(item.get("id") or item.get("event_id") or "") == event
+                    ),
+                    None,
+                )
+                if isinstance(semantic_item, Mapping):
+                    semantic_context = dict(semantic_item.get("semantic") or {})
 
         def workload_unit(value: Any, name: str) -> float:
             if isinstance(value, bool):
@@ -733,8 +732,10 @@ class EventAppraisalFeedbackRepository:
                 raise ValueError(f"{name} must be between 0 and 1")
             return number
 
+        workload_feature_vector = semantic_context.get("workload_feature_vector")
+        workload_prior = semantic_context.get("workload_prior")
         feature_vector = None
-        if workload_feature_vector is not None:
+        if isinstance(workload_feature_vector, Mapping):
             feature_vector = {
                 name: workload_unit(workload_feature_vector.get(name), name)
                 for name in WORKLOAD_FEATURE_NAMES
@@ -742,8 +743,13 @@ class EventAppraisalFeedbackRepository:
         prior = None
         if workload_prior is not None:
             prior = workload_unit(workload_prior, "workload_prior")
-        elif feature_vector is not None:
-            prior = WorkloadEstimator().predict(feature_vector)
+        context_complete = feature_vector is not None and prior is not None
+        if not context_complete:
+            causal_forecast = None
+            semantic_context = {}
+            presentation = None
+            feature_vector = None
+            prior = None
         observed = observed_workload(normalized)
         with self.database.session() as session:
             if session.get(Participant, participant_id) is None:
@@ -751,16 +757,61 @@ class EventAppraisalFeedbackRepository:
             row = EventAppraisalFeedback(
                 participant_id=participant_id,
                 event_id=event[:256],
-                submitted_at=aware_utc(submitted_at, "submitted_at"),
-                event_type=str(event_type or "").strip()[:32] or None,
-                course_name=str(course_name or "").strip()[:200] or None,
+                submitted_at=submitted_utc,
+                created_at=created_utc,
+                event_local_date=event_local_date,
+                event_start_at=start_utc,
+                event_type=(
+                    str((presentation or {}).get("event_type") or "").strip()[:32]
+                    or None
+                ),
+                course_name=(
+                    str(
+                        (presentation or {}).get("related_course_name")
+                        or (presentation or {}).get("course_name")
+                        or ""
+                    ).strip()[:200]
+                    or None
+                ),
                 workload_feature_vector=feature_vector,
                 workload_prior=prior,
                 observed_workload=observed,
                 workload_residual=(observed - prior) if prior is not None else None,
+                source_forecast_id=(
+                    uuid.UUID(str(causal_forecast["id"])) if causal_forecast else None
+                ),
+                source_forecast_version=(
+                    str(causal_forecast.get("forecast_version") or "")[:64] or None
+                    if causal_forecast
+                    else None
+                ),
+                source_semantic_revision=(
+                    str(causal_forecast.get("semantic_revision") or "")[:64] or None
+                    if causal_forecast
+                    else None
+                ),
+                workload_schema_version=(
+                    str(
+                        semantic_context.get("workload_schema_version")
+                        or (causal_forecast.get("output") or {}).get(
+                            "workload_schema_version"
+                        )
+                        or ""
+                    )[:64]
+                    or None
+                    if causal_forecast
+                    else None
+                ),
                 workload_model_version=(
-                    str(workload_model_version or WORKLOAD_MODEL_VERSION)[:64]
-                    if prior is not None
+                    str(
+                        semantic_context.get("workload_model_version")
+                        or (causal_forecast.get("output") or {}).get(
+                            "workload_model_version"
+                        )
+                        or ""
+                    )[:64]
+                    or None
+                    if causal_forecast
                     else None
                 ),
                 **normalized,

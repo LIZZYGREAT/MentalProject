@@ -186,6 +186,26 @@ def test_calendar_revision_is_canonical_and_detects_time_or_text_change():
     assert normalized_calendar_revision([first])[0] != normalized_calendar_revision([event(description="修改描述")])[0]
 
 
+def test_workload_revision_change_bypasses_exact_and_materiality_cache(monkeypatch):
+    _, participant, _, _, prediction, _, coordinator = build_pipeline([event()])
+    first = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "workload-revision-v1"
+    ))
+    monkeypatch.setattr(
+        "app.services.forecast_coordinator.workload_revision",
+        lambda _config: "workload-revision-test-v2",
+    )
+
+    second = asyncio.run(coordinator.ensure_forecast(
+        participant.id, TEST_LOCAL_DATE, "workload-revision-v2"
+    ))
+
+    assert second["cache_hit"] is False
+    assert second["forecast_version"] != first["forecast_version"]
+    assert second["output"]["workload_revision"] == "workload-revision-test-v2"
+    assert prediction.calls == 2
+
+
 def test_calendar_mutation_timeout_fails_closed_until_readback_succeeds():
     database, participant, calendar, _semantics, _prediction, warnings, coordinator = (
         build_pipeline([event()])

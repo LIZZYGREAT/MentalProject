@@ -110,6 +110,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0027_workload_calibration"
     )
     assert migration_0027.down_revision == "0026_dataset_participant_membership"
+    migration_0028 = next(
+        migration for migration in migrations
+        if migration.revision == "0028_workload_causal_provenance"
+    )
+    assert migration_0028.down_revision == "0027_workload_calibration"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -430,6 +435,51 @@ def test_0027_adds_workload_calibration_fields_and_constraints(monkeypatch):
     assert {name for name, _, _ in indexes} == {
         "ix_event_appraisal_event_type",
         "ix_event_appraisal_course",
+    }
+
+
+def test_0028_adds_nullable_causal_provenance_fk_and_indexes(monkeypatch):
+    migration = _migration(VERSIONS / "0028_workload_causal_provenance.py")
+    columns = []
+    foreign_keys = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op, "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(
+        migration.op, "create_foreign_key",
+        lambda *args, **kwargs: foreign_keys.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op, "create_index",
+        lambda name, table, fields: indexes.append((name, table, tuple(fields))),
+    )
+
+    migration.upgrade()
+
+    assert [column.name for _, column in columns] == [
+        "event_local_date",
+        "event_start_at",
+        "source_forecast_id",
+        "source_forecast_version",
+        "source_semantic_revision",
+        "workload_schema_version",
+    ]
+    assert all(column.nullable for _, column in columns)
+    assert foreign_keys == [(
+        (
+            "fk_event_appraisal_source_forecast",
+            "event_appraisal_feedback",
+            "forecast_snapshots",
+            ["source_forecast_id"],
+            ["id"],
+        ),
+        {"ondelete": "SET NULL"},
+    )]
+    assert {name for name, _, _ in indexes} == {
+        "ix_event_appraisal_participant_event_date",
+        "ix_event_appraisal_source_forecast",
     }
 
 

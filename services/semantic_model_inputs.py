@@ -8,7 +8,6 @@ from typing import Any, Mapping
 OBJECTIVE_DIMENSIONS = (
     "difficulty",
     "cognitive_demand",
-    "physical_demand",
     "stakes",
     "time_pressure",
     "social_evaluation",

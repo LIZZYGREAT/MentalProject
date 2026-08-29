@@ -8,6 +8,8 @@ combined with a saturating union without changing scale.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -16,6 +18,14 @@ import numpy as np
 
 WORKLOAD_SCHEMA_VERSION = "event_workload.v1"
 WORKLOAD_MODEL_VERSION = "workload-rules-logistic.v1"
+WORKLOAD_FEATURE_MAPPING_VERSION = "mindflow-to-raw-tlx.v1"
+WORKLOAD_KERNEL_VERSION = "event-exp-pre90-post120.v1"
+WORKLOAD_CONCURRENCY_VERSION = "saturating-union.v1"
+WORKLOAD_CONTINUOUS_LOAD_VERSION = "linear-saturating.v1"
+DEFAULT_PRE_TAU_MINUTES = 90.0
+DEFAULT_POST_TAU_MINUTES = 120.0
+DEFAULT_CONTINUOUS_SATURATION_HOURS = 3.0
+DEFAULT_CONTINUOUS_BETA = 0.18
 WORKLOAD_FEATURE_NAMES = (
     "mental_demand",
     "physical_demand",
@@ -116,8 +126,9 @@ class WorkloadFit:
     ridge_alpha: float
     intercept: float
     coefficients: dict[str, float]
-    mae: float
-    rmse: float
+    mae_in_sample: float
+    rmse_in_sample: float
+    fit_scope: str = "exploratory_in_sample"
     link: str = "identity_clip"
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,8 +213,8 @@ class WorkloadEstimator:
             ridge_alpha=max(0.0, float(alpha)),
             intercept=estimator.intercept,
             coefficients=dict(estimator.coefficients),
-            mae=float(np.mean(np.abs(residual))),
-            rmse=float(np.sqrt(np.mean(residual**2))),
+            mae_in_sample=float(np.mean(np.abs(residual))),
+            rmse_in_sample=float(np.sqrt(np.mean(residual**2))),
         )
         return estimator, fit
 
@@ -232,8 +243,8 @@ def event_workload_contribution(
     minutes_before_start: float,
     minutes_after_end: float,
     active: bool,
-    pre_tau_minutes: float = 90.0,
-    post_tau_minutes: float = 120.0,
+    pre_tau_minutes: float = DEFAULT_PRE_TAU_MINUTES,
+    post_tau_minutes: float = DEFAULT_POST_TAU_MINUTES,
 ) -> tuple[float, str]:
     """Return ``W_e g_e(t)`` and its active/anticipation/aftermath phase."""
 
@@ -251,11 +262,73 @@ def apply_continuous_load(
     workload: float,
     continuous_hours: float,
     *,
-    saturation_hours: float = 3.0,
-    beta: float = 0.18,
+    saturation_hours: float = DEFAULT_CONTINUOUS_SATURATION_HOURS,
+    beta: float = DEFAULT_CONTINUOUS_BETA,
 ) -> tuple[float, float]:
     """Apply ``clip(W + beta * min(1, h_c/h_sat), 0, 1)``."""
 
     continuous = min(1.0, max(0.0, float(continuous_hours)) / max(0.01, float(saturation_hours)))
     adjusted = max(0.0, min(1.0, _unit(workload) + float(beta) * continuous))
     return adjusted, continuous
+
+
+def workload_semantic_inputs(semantic: Mapping[str, Any] | None) -> dict[str, float]:
+    """Canonical Stage-3-only semantic projection used for materiality."""
+
+    payload = semantic if isinstance(semantic, Mapping) else {}
+    vector = payload.get("workload_feature_vector")
+    if not isinstance(vector, Mapping):
+        values = payload.get("values")
+        vector = workload_feature_vector(values if isinstance(values, Mapping) else {})
+    result = {
+        f"workload_{name}": _unit(vector.get(name))
+        for name in WORKLOAD_FEATURE_NAMES
+    }
+    if payload.get("workload_prior") is not None:
+        result["workload_prior"] = _unit(payload.get("workload_prior"))
+    return result
+
+
+def workload_revision(config: Mapping[str, Any] | None = None) -> str:
+    """Hash every versioned/configurable input capable of changing W(t)."""
+
+    root = config if isinstance(config, Mapping) else {}
+    parameters = root.get("model_params") or root.get("params") or root
+    parameters = parameters if isinstance(parameters, Mapping) else {}
+    ctssm = parameters.get("ctssm_params") or {}
+    ctssm = ctssm if isinstance(ctssm, Mapping) else {}
+
+    def number(name: str, default: float) -> float:
+        try:
+            value = float(ctssm.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return value if math.isfinite(value) else default
+
+    identity = {
+        "schema_version": WORKLOAD_SCHEMA_VERSION,
+        "model_version": WORKLOAD_MODEL_VERSION,
+        "feature_mapping_version": WORKLOAD_FEATURE_MAPPING_VERSION,
+        "kernel_version": WORKLOAD_KERNEL_VERSION,
+        "kernel": {
+            "pre_tau_minutes": DEFAULT_PRE_TAU_MINUTES,
+            "post_tau_minutes": DEFAULT_POST_TAU_MINUTES,
+        },
+        "concurrency_version": WORKLOAD_CONCURRENCY_VERSION,
+        "concurrency_policy": "1-product(1-W_e_g_e)",
+        "continuous_load_version": WORKLOAD_CONTINUOUS_LOAD_VERSION,
+        "continuous_beta": number(
+            "workload_continuous_beta", DEFAULT_CONTINUOUS_BETA
+        ),
+        "continuous_saturation_hours": number(
+            "workload_continuous_saturation_hours",
+            DEFAULT_CONTINUOUS_SATURATION_HOURS,
+        ),
+        "estimator": {
+            "link": "logistic",
+            "intercept": DEFAULT_INTERCEPT,
+            "coefficients": DEFAULT_COEFFICIENTS,
+        },
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

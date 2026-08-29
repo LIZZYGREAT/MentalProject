@@ -213,10 +213,11 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0027_workload_calibration`。新快照使用包含 Participant Membership 的 Dataset
+`0028_workload_causal_provenance`。新快照使用包含 Participant Membership 的 Dataset
 Schema v3；0025 创建的 v2 快照不回填 membership，并继续按原不可变合同评估。JSON 业务列在
 PostgreSQL 使用 JSONB。Stage 3 增加独立派生的事件 workload、随时间 W(t)、Event Appraisal
-Ridge 校准数据与 Admin workload–stress 诊断；workload 目前不作为新潜在状态，也不修改
+Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Appraisal/EMA 均按历史 current
+Forecast 冻结因果来源，workload revision 参与 Forecast cache identity。workload 目前不作为新潜在状态，也不修改
 CTSSM 主方程。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把

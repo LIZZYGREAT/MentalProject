@@ -213,7 +213,7 @@ def assess_event(event: Any) -> EventAssessment:
     semantic_values = {
         key: model_semantics[key]
         for key in (
-            "difficulty", "cognitive_demand", "physical_demand", "stakes", "time_pressure",
+            "difficulty", "cognitive_demand", "stakes", "time_pressure",
             "social_evaluation", "uncontrollability", "novelty",
             "expected_effort", "uncertainty", "unfinished",
         )
@@ -331,9 +331,6 @@ def assess_event(event: Any) -> EventAssessment:
             if isinstance(fused_values, Mapping)
             else {}
         )
-    if isinstance(semantic_payload_values, Mapping) and "physical_demand" in semantic_payload_values:
-        defaults["physical_demand"] = semantic_values["physical_demand"]
-
     objective = {
         key: _unit(_nested(metadata, "objective", key), value)
         for key, value in defaults.items()
@@ -439,7 +436,14 @@ def assess_event(event: Any) -> EventAssessment:
     workload_semantics = {
         **semantic_values,
         "cognitive_demand": objective["cognitive_demand"],
-        "physical_demand": objective["physical_demand"],
+        # Stage 3 physical demand belongs only to W(t).  CTSSM continues to
+        # use its Stage-2 objective defaults/explicit objective metadata.
+        "physical_demand": _unit(
+            semantic_payload_values.get("physical_demand")
+            if isinstance(semantic_payload_values, Mapping)
+            else None,
+            objective["physical_demand"],
+        ),
         "time_pressure": objective["deadline"],
         "expected_effort": appraisal["expected_effort"],
         "uncontrollability": objective["uncontrollability"],
