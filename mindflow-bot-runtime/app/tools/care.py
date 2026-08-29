@@ -459,7 +459,7 @@ class CareTools:
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
         profile = self.profiles.current(ctx.participant_id)
         learned_profile = (
-            self.learned_profiles.current(ctx.participant_id)
+            self.learned_profiles.runtime_active(ctx.participant_id)
             if self.learned_profiles is not None else None
         )
         recent = self.observations.recent_before(

@@ -210,8 +210,9 @@ event mutation 已发送后的未知结果保持 recoverable。`remote_committed
 避免请求与恢复双重处理；进程重启会在 scheduler 前完成旧 intent fencing。Forecast currentness 使用 append-only history，
 OAuth refresh 使用不跨 HTTP 持锁的 expiring lease。研究画像分为 Explicit、Psychometrics、
 Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加保存，学习参数保留不确定性、
-模型版本与验证状态。当前唯一 Alembic head 为 `0022_research_profile_v2`，JSON 业务列在
-PostgreSQL 使用 JSONB；Stage 1 不修改 CTSSM 主方程。
+模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
+与 rejected 只保留作研究历史。当前唯一 Alembic head 为 `0023_stage1_gate_constraints`，JSON
+业务列在 PostgreSQL 使用 JSONB；Stage 1 不修改 CTSSM 主方程。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

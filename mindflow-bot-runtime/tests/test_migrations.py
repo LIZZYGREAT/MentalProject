@@ -85,6 +85,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0022_research_profile_v2"
     )
     assert migration_0022.down_revision == "0021_daily_review_energy_optional"
+    migration_0023 = next(
+        migration for migration in migrations
+        if migration.revision == "0023_stage1_gate_constraints"
+    )
+    assert migration_0023.down_revision == "0022_research_profile_v2"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -162,6 +167,40 @@ def test_0022_adds_stage1_research_tables_and_learned_parameter_audit(monkeypatc
         "validation_status",
     ]
     assert len(indexes) == 3
+
+
+def test_0023_adds_learned_and_slow_state_checks_without_relabeling_legacy(
+    monkeypatch,
+):
+    migration = _migration(VERSIONS / "0023_stage1_gate_constraints.py")
+    created = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: created.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert len(created) == 11
+    assert {
+        "ck_learned_profile_validation_status",
+        "ck_learned_profile_sample_count",
+        "ck_learned_profile_day_count",
+        "ck_learned_profile_confidence",
+        "ck_learned_profile_window",
+    } <= {name for name, table, _ in created if table == "learned_model_profiles"}
+    assert {
+        "ck_slow_state_cadence",
+        "ck_slow_state_stress",
+        "ck_slow_state_workload",
+        "ck_slow_state_energy",
+        "ck_slow_state_recovery",
+        "ck_slow_state_sleep_debt",
+    } <= {name for name, table, _ in created if table == "participant_slow_states"}
+    assert statements == []
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

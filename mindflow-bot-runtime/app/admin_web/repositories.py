@@ -252,6 +252,20 @@ class AdminRepository:
             .order_by(desc(StateObservation.observed_at))
             .limit(1)
         ).scalar_one_or_none()
+        profile_payload = dict(profile.profile_json) if profile else {}
+        explicit_payload = profile_payload.get("explicit")
+        explicit_data = (
+            dict(explicit_payload)
+            if isinstance(explicit_payload, dict)
+            else {}
+        )
+        legacy_compatibility = {
+            key: profile_payload[key]
+            for key in ("model_params", "params")
+            if key in profile_payload
+        }
+        if profile and profile_payload.get("schema_version") != "2.0":
+            legacy_compatibility["legacy_profile"] = profile_payload
         result.update(
             {
                 "external_llm_consent": bool(row.external_llm_consent_at),
@@ -273,11 +287,13 @@ class AdminRepository:
                     "explicit": (
                         {
                             "version": profile.version,
-                            "data": _redact(dict(profile.profile_json)),
+                            "data": _redact(explicit_data),
                             "created_at": _iso(profile.created_at),
                         }
                         if profile else None
                     ),
+                    "schema_version": profile_payload.get("schema_version"),
+                    "legacy_compatibility": _redact(legacy_compatibility),
                     "psychometrics": [
                         {
                             "id": str(item.id),

@@ -7,6 +7,9 @@ from typing import Any, Mapping
 
 
 PROFILE_SCHEMA_VERSION = "2.0"
+PROFILE_V2_TOP_LEVEL_FIELDS = frozenset(
+    {"schema_version", "explicit", "model_params"}
+)
 SUPPORTED_PSYCHOMETRIC_INSTRUMENTS = frozenset({"PSS", "BRS"})
 EXPLICIT_PROFILE_FIELDS = frozenset(
     {
@@ -102,6 +105,12 @@ def validate_profile_v2(profile: Mapping[str, Any]) -> dict[str, Any]:
         return value
     if str(version) != PROFILE_SCHEMA_VERSION:
         raise ValueError(f"unsupported profile schema_version: {version}")
+    unknown_top_level = set(value) - PROFILE_V2_TOP_LEVEL_FIELDS
+    if unknown_top_level:
+        raise ValueError(
+            "unsupported Profile Schema v2 top-level fields: "
+            f"{sorted(unknown_top_level)}"
+        )
     explicit = value.get("explicit")
     if not isinstance(explicit, Mapping):
         raise ValueError("Profile Schema v2 requires an explicit object")
@@ -131,6 +140,10 @@ def validate_profile_v2(profile: Mapping[str, Any]) -> dict[str, Any]:
         }
     value["schema_version"] = PROFILE_SCHEMA_VERSION
     value["explicit"] = normalized
+    model_params = value.get("model_params", {})
+    if not isinstance(model_params, Mapping):
+        raise ValueError("Profile Schema v2 model_params must be an object")
+    value["model_params"] = dict(model_params)
     return value
 
 
@@ -140,4 +153,3 @@ def normalize_instrument_name(value: Any) -> str:
         supported = ", ".join(sorted(SUPPORTED_PSYCHOMETRIC_INSTRUMENTS))
         raise ValueError(f"instrument_name must be one of: {supported}")
     return name
-

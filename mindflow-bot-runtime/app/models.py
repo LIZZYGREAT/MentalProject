@@ -143,6 +143,32 @@ class ParticipantSlowState(Base):
     __tablename__ = "participant_slow_states"
     __table_args__ = (
         Index("ix_slow_state_participant_time", "participant_id", "effective_at"),
+        CheckConstraint("cadence IN ('daily', 'weekly')", name="ck_slow_state_cadence"),
+        CheckConstraint(
+            "rolling_7d_stress IS NULL OR "
+            "(rolling_7d_stress >= 0 AND rolling_7d_stress <= 10)",
+            name="ck_slow_state_stress",
+        ),
+        CheckConstraint(
+            "rolling_7d_workload IS NULL OR "
+            "(rolling_7d_workload >= 0 AND rolling_7d_workload <= 10)",
+            name="ck_slow_state_workload",
+        ),
+        CheckConstraint(
+            "rolling_7d_energy IS NULL OR "
+            "(rolling_7d_energy >= 0 AND rolling_7d_energy <= 10)",
+            name="ck_slow_state_energy",
+        ),
+        CheckConstraint(
+            "recent_recovery_quality IS NULL OR "
+            "(recent_recovery_quality >= 0 AND recent_recovery_quality <= 10)",
+            name="ck_slow_state_recovery",
+        ),
+        CheckConstraint(
+            "recent_sleep_debt IS NULL OR "
+            "(recent_sleep_debt >= 0 AND recent_sleep_debt <= 24)",
+            name="ck_slow_state_sleep_debt",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -269,6 +295,20 @@ class LearnedModelProfile(Base):
     __table_args__ = (
         UniqueConstraint("participant_id", "version", name="uq_learned_profile_version"),
         Index("ix_learned_profile_participant_version", "participant_id", "version"),
+        CheckConstraint(
+            "validation_status IN ('candidate', 'validated', 'rejected')",
+            name="ck_learned_profile_validation_status",
+        ),
+        CheckConstraint("sample_count >= 0", name="ck_learned_profile_sample_count"),
+        CheckConstraint("day_count >= 0", name="ck_learned_profile_day_count"),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_learned_profile_confidence",
+        ),
+        CheckConstraint(
+            "window_start <= window_end",
+            name="ck_learned_profile_window",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

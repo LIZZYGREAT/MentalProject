@@ -108,7 +108,9 @@
 | `model_version` | 产生参数的模型版本 | 版本字符串 | 校准服务 | `created_at` | No | Gate | Yes | Audit | No |
 | `validation_status` | 参数是否可进入正式模型 | `candidate` / `validated` / `rejected` | OOT 评估 | `created_at` | No | Only `validated` | Yes | Audit | No |
 
-Stage 1 不改变当前参数生效优先级，不把 `candidate` 自动提升为生产输入。
+Stage 1 明确区分 latest 与 runtime-active：`validated` 可以进入生产；迁移前已经生效且
+`model_version=legacy` 的行保持兼容，但不被错误标记为 validated；新的 `candidate` 与所有
+`rejected` 行只保留作研究历史，不进入 Forecast。
 
 ### 2.7 Event Appraisal Feedback
 
@@ -160,4 +162,3 @@ Stage 1 不改变当前参数生效优先级，不把 `candidate` 自动提升�
 - Profile Schema v2 的显式字段带 `value/source/updated_at`。
 - Admin Participant 画像页分层显示 Explicit、Psychometrics、Slow State、Learned Parameters，并展示量表与参数历史。
 - 学习参数记录包含 uncertainty、model version 和 validation status；当前 CTSSM 主方程保持不变。
-

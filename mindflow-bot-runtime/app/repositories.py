@@ -7,8 +7,9 @@ from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 import uuid
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import case, desc, or_, select
@@ -302,12 +303,78 @@ class LearnedProfileRepository:
             "created_at": row.created_at.isoformat(),
         }
 
-    def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
+    def latest(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
         with self.database.session() as session:
             row = session.execute(select(LearnedModelProfile).where(
                 LearnedModelProfile.participant_id == participant_id
             ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
             return self._view(row) if row is not None else None
+
+    def runtime_active(
+        self, participant_id: uuid.UUID
+    ) -> Optional[dict[str, Any]]:
+        """Return only parameters allowed to affect production runtime.
+
+        Rows migrated from the pre-validation schema carry model_version=legacy
+        and candidate status. They remain active for behavior compatibility,
+        without falsely claiming that they completed formal validation.
+        """
+
+        with self.database.session() as session:
+            row = session.execute(
+                select(LearnedModelProfile)
+                .where(
+                    LearnedModelProfile.participant_id == participant_id,
+                    or_(
+                        LearnedModelProfile.validation_status == "validated",
+                        (
+                            (LearnedModelProfile.validation_status == "candidate")
+                            & (LearnedModelProfile.model_version == "legacy")
+                        ),
+                    ),
+                )
+                .order_by(desc(LearnedModelProfile.version))
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
+    def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
+        """Compatibility alias for research callers; prefer latest()."""
+
+        return self.latest(participant_id)
+
+    @staticmethod
+    def _valid_uncertainty(
+        parameters: Mapping[str, Any], uncertainty: Mapping[str, Any]
+    ) -> bool:
+        if not parameters or not uncertainty:
+            return False
+        if set(parameters) - set(uncertainty):
+            return False
+
+        def has_finite_number(value: Any) -> bool:
+            if isinstance(value, bool):
+                return False
+            if isinstance(value, (int, float)):
+                return float(value) >= 0 and math.isfinite(float(value))
+            if isinstance(value, Mapping):
+                std_error = value.get("std_error")
+                if std_error is not None:
+                    if isinstance(std_error, bool):
+                        return False
+                    try:
+                        if float(std_error) < 0 or not math.isfinite(float(std_error)):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                return bool(value) and any(
+                    has_finite_number(child) for child in value.values()
+                )
+            if isinstance(value, (list, tuple)):
+                return bool(value) and any(has_finite_number(child) for child in value)
+            return False
+
+        return all(has_finite_number(uncertainty[name]) for name in parameters)
 
     def save(
         self, participant_id: uuid.UUID, *, parameters: dict[str, Any],
@@ -319,20 +386,73 @@ class LearnedProfileRepository:
     ) -> dict[str, Any]:
         if validation_status not in {"candidate", "validated", "rejected"}:
             raise ValueError("invalid validation_status")
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count < 0
+        ):
+            raise ValueError("sample_count must be a non-negative integer")
+        if (
+            isinstance(day_count, bool)
+            or not isinstance(day_count, int)
+            or day_count < 0
+        ):
+            raise ValueError("day_count must be a non-negative integer")
+        if (
+            not isinstance(window_start, date)
+            or isinstance(window_start, datetime)
+            or not isinstance(window_end, date)
+            or isinstance(window_end, datetime)
+        ):
+            raise ValueError("window_start and window_end must be dates")
+        if window_start > window_end:
+            raise ValueError("window_start must be on or before window_end")
+        normalized_source = str(source or "").strip()
+        normalized_model_version = str(model_version or "").strip()
+        if not normalized_source:
+            raise ValueError("source is required")
+        if not normalized_model_version:
+            raise ValueError("model_version is required")
+        if isinstance(confidence, bool):
+            raise ValueError("confidence must be between 0 and 1")
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be between 0 and 1") from exc
+        if (
+            not math.isfinite(normalized_confidence)
+            or not 0.0 <= normalized_confidence <= 1.0
+        ):
+            raise ValueError("confidence must be between 0 and 1")
+        if not isinstance(parameters, Mapping):
+            raise ValueError("parameters must be an object")
+        if uncertainty is not None and not isinstance(uncertainty, Mapping):
+            raise ValueError("uncertainty must be an object")
+        normalized_uncertainty = dict(uncertainty or {})
+        if validation_status == "validated" and not self._valid_uncertainty(
+            parameters, normalized_uncertainty
+        ):
+            raise ValueError(
+                "validated parameters require uncertainty for every parameter"
+            )
         with self.database.session() as session:
-            session.get(Participant, participant_id, with_for_update=True)
+            if (
+                session.get(Participant, participant_id, with_for_update=True)
+                is None
+            ):
+                raise ValueError("participant not found")
             latest = session.execute(select(LearnedModelProfile.version).where(
                 LearnedModelProfile.participant_id == participant_id
             ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
             row = LearnedModelProfile(
                 participant_id=participant_id, version=int(latest or 0) + 1,
                 parameters_json=dict(parameters),
-                uncertainty_json=dict(uncertainty or {}),
-                source=source,
-                model_version=str(model_version)[:64],
+                uncertainty_json=normalized_uncertainty,
+                source=normalized_source[:64],
+                model_version=normalized_model_version[:64],
                 validation_status=validation_status,
                 sample_count=sample_count, day_count=day_count,
-                confidence=max(0.0, min(1.0, float(confidence))),
+                confidence=normalized_confidence,
                 window_start=window_start, window_end=window_end,
             )
             session.add(row)

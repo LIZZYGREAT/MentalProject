@@ -91,6 +91,9 @@ def test_admin_profile_ui_has_the_four_research_layers():
     assert "LAYER C · SLOW STATE" in script
     assert "LAYER D · LEARNED PARAMETERS" in script
     assert "标准量表与历史变化" in script
+    assert "SCHEMA / COMPATIBILITY" in script
+    assert "这里只展示用户明确填写的 explicit 内容" in script
+    assert "layers.explicit?.data??p.profile" not in script
 
 
 def test_admin_login_rejects_wrong_password_and_session_cookie_is_httponly():

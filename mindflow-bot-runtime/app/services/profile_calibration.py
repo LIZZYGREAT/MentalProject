@@ -120,7 +120,7 @@ class ProfileCalibrationService:
                 "minimum_sample_count": self.MIN_MATCHED_SAMPLES,
                 "minimum_day_count": self.MIN_DAYS,
             }
-        current = self.learned_profiles.current(participant_id)
+        current = self.learned_profiles.latest(participant_id)
         if (
             current is not None
             and current["window_end"] == days[-1].isoformat()

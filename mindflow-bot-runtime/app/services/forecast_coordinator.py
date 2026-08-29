@@ -506,7 +506,9 @@ class ForecastCoordinator:
     ) -> dict[str, Any]:
         profile_row = await asyncio.to_thread(self.profiles.current, participant_id)
         learned_row = (
-            await asyncio.to_thread(self.learned_profiles.current, participant_id)
+            await asyncio.to_thread(
+                self.learned_profiles.runtime_active, participant_id
+            )
             if self.learned_profiles is not None else None
         )
         effective_profile, profile_layers = layered_profile(profile_row, learned_row)
