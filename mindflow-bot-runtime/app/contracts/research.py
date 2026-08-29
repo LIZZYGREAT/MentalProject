@@ -75,6 +75,10 @@ OBSERVATION_TAXONOMY = {
     },
 }
 
+MOMENTARY_OBSERVATION_TYPES = frozenset(
+    OBSERVATION_TAXONOMY["momentary_state"]["types"]
+)
+
 
 def aware_utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime):

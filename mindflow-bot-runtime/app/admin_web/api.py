@@ -754,7 +754,7 @@ class AdminAPI:
             snapshot_id = uuid.UUID(request.path_params["snapshot_id"])
             item_type = str(request.query_params.get("item_type") or "").strip()
             if item_type and item_type not in {
-                "observation", "forecast", "forecast_currentness",
+                "participant", "observation", "forecast", "forecast_currentness",
                 "calendar", "match_source",
             }:
                 raise ValueError("unsupported item_type")

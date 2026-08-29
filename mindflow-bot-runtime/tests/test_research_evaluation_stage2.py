@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 from app.admin_web.main import create_app
 from app.models import (
     CalendarSnapshot,
+    DatasetSnapshotItem,
     EventSemanticCache,
     ForecastCurrentnessEvent,
     ForecastObservationMatch,
@@ -81,7 +82,7 @@ def _seed_causal_forecast_and_observations(database, participant_id):
             [
                 StateObservation(
                     participant_id=participant_id,
-                    observation_type="instant_checkin",
+                    observation_type="checkin",
                     source_message_id="stage2-observation-1",
                     payload_json={
                         "stress_0_10": 7.0,
@@ -92,7 +93,7 @@ def _seed_causal_forecast_and_observations(database, participant_id):
                 ),
                 StateObservation(
                     participant_id=participant_id,
-                    observation_type="instant_checkin",
+                    observation_type="checkin",
                     source_message_id="stage2-observation-2",
                     payload_json={
                         "stress_0_10": 9.0,
@@ -184,7 +185,11 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
     assert len(snapshot["manifest"]["manifest_hash"]) == 64
     frozen = service.snapshot_items(uuid.UUID(snapshot["id"]))
     assert {item["item_type"] for item in frozen} == {
-        "observation", "forecast", "forecast_currentness", "calendar",
+        "participant",
+        "observation",
+        "forecast",
+        "forecast_currentness",
+        "calendar",
         "match_source",
     }
     assert run["dataset_snapshot_id"] == snapshot["id"]
@@ -238,7 +243,7 @@ def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
                 ),
                 StateObservation(
                     participant_id=person.id,
-                    observation_type="instant_checkin",
+                    observation_type="checkin",
                     source_message_id="late-backfill",
                     payload_json={"stress_0_10": 6.0},
                     observed_at=datetime(2026, 8, 28, 1, tzinfo=timezone.utc),
@@ -246,7 +251,7 @@ def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
                 ),
                 StateObservation(
                     participant_id=person.id,
-                    observation_type="instant_checkin",
+                    observation_type="checkin",
                     source_message_id="time-anomaly",
                     payload_json={"stress_0_10": 5.0},
                     observed_at=datetime(2026, 8, 28, 10, tzinfo=timezone.utc),
@@ -384,7 +389,7 @@ def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes()
         session.add(
             StateObservation(
                 participant_id=person.id,
-                observation_type="instant_checkin",
+                observation_type="checkin",
                 source_message_id="after-snapshot",
                 payload_json={"stress_0_10": 10.0},
                 observed_at=datetime(2026, 8, 28, 1, 10, tzinfo=timezone.utc),
@@ -479,6 +484,134 @@ def test_peak_proxy_is_participant_isolated_and_requires_two_samples():
     assert "peak_magnitude_error" not in metrics
 
 
+def test_non_momentary_observation_is_isolated_from_all_stage2_metrics():
+    database = memory_database()
+    person = participant(database, "STAGE2-TYPE-ISOLATION")
+    _seed_causal_forecast_and_observations(database, person.id)
+    with database.session() as session:
+        session.get(Participant, person.id).created_at = datetime(
+            2026, 8, 27, 0, tzinfo=timezone.utc
+        )
+        debug = StateObservation(
+            participant_id=person.id,
+            observation_type="research_debug",
+            source_message_id="stage2-non-momentary",
+            payload_json={"stress_0_10": 10.0},
+            observed_at=datetime(2026, 8, 28, 1, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 8, 28, 1, 0, tzinfo=timezone.utc),
+        )
+        session.add(debug)
+        session.flush()
+        debug_id = debug.id
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+
+    rebuilt = service.rebuild_matches(date_start=LOCAL_DATE, date_end=LOCAL_DATE)
+    evaluation = service.evaluation(LOCAL_DATE, LOCAL_DATE, person.id)
+    dashboard = service.cohort_dashboard(LOCAL_DATE, LOCAL_DATE)
+    longitudinal = service.participant_longitudinal(person.id, LOCAL_DATE, 14)
+    snapshot = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+    )
+    observation_items = service.snapshot_items(
+        uuid.UUID(snapshot["id"]), "observation"
+    )
+
+    assert rebuilt["examined"] == 2
+    assert rebuilt["created"] == 2
+    with database.session() as session:
+        assert session.execute(
+            select(ForecastObservationMatch).where(
+                ForecastObservationMatch.observation_id == debug_id
+            )
+        ).scalar_one_or_none() is None
+    observation_ids = {item["source_id"] for item in observation_items}
+    assert str(debug_id) not in observation_ids
+    completeness = dashboard["data_completeness"]
+    assert completeness["ema_count"] == 2
+    assert completeness["ema_observed_day_rate"] == 1.0
+    assert longitudinal["stress_trend_14d"] == [
+        {"date": LOCAL_DATE.isoformat(), "mean_stress": 8.0, "ema_count": 2}
+    ]
+    assert evaluation["metrics"]["sample_count"] == 2
+    assert evaluation["metrics"]["mae"] == 1.5
+    assert evaluation["metrics"]["rmse"] == round(math.sqrt(2.5), 4)
+
+
+def test_snapshot_membership_includes_zero_sample_participant_and_changes_hash():
+    database = memory_database()
+    first = participant(database, "STAGE2-COHORT-P001")
+    _seed_causal_forecast_and_observations(database, first.id)
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    observation_cutoff = datetime(2026, 8, 28, 3, tzinfo=timezone.utc)
+
+    first_only = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        observation_cutoff=observation_cutoff,
+        calendar_cutoff=observation_cutoff,
+    )
+    second = participant(database, "STAGE2-COHORT-P002")
+    with database.session() as session:
+        session.get(Participant, second.id).created_at = datetime(
+            2026, 8, 28, 2, 30, tzinfo=timezone.utc
+        )
+    both = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        observation_cutoff=observation_cutoff,
+        calendar_cutoff=observation_cutoff,
+    )
+
+    membership = service.snapshot_items(uuid.UUID(both["id"]), "participant")
+    assert both["manifest"]["participant_count"] == 2
+    assert len(membership) == 2
+    assert {item["participant_id"] for item in membership} == {
+        str(first.id), str(second.id)
+    }
+    second_membership = next(
+        item for item in membership if item["participant_id"] == str(second.id)
+    )
+    assert second_membership["source_version"] == "participant-membership.v1"
+    assert second_membership["metadata"]["participant_code"] == second.participant_code
+    assert second_membership["metadata"]["status_at_snapshot"] == "active"
+    assert first_only["manifest"]["participant_count"] == 1
+    assert both["manifest"]["manifest_hash"] != first_only["manifest"][
+        "manifest_hash"
+    ]
+    match_sources = service.snapshot_items(uuid.UUID(both["id"]), "match_source")
+    assert all(
+        item["participant_id"] != str(second.id)
+        for item in match_sources
+    )
+
+    zero_sample = service.create_evaluation_run(
+        uuid.UUID(both["id"]), "forecast.v4", participant_id=second.id
+    )
+    assert zero_sample["status"] == "completed"
+    assert zero_sample["metrics"]["metrics"]["sample_count"] == 0
+    assert zero_sample["metrics"]["matched_observation_count"] == 0
+
+    with database.session() as session:
+        item = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == uuid.UUID(both["id"]),
+                DatasetSnapshotItem.item_type == "participant",
+                DatasetSnapshotItem.participant_id == second.id,
+            )
+        ).scalar_one()
+        metadata = dict(item.metadata_json)
+        metadata["participant_code"] = "TAMPERED"
+        item.metadata_json = metadata
+    with pytest.raises(ValueError, match="dataset snapshot manifest mismatch"):
+        service.create_evaluation_run(
+            uuid.UUID(both["id"]), "forecast.v4", participant_id=second.id
+        )
+
+
 def test_snapshot_filter_fails_closed_and_calendar_cutoff_is_effective():
     database = memory_database()
     person = participant(database, "STAGE2-FILTER")
@@ -502,7 +635,9 @@ def test_snapshot_filter_fails_closed_and_calendar_cutoff_is_effective():
         calendar_cutoff=datetime(2026, 8, 27, 22, tzinfo=timezone.utc),
     )
     items = service.snapshot_items(uuid.UUID(snapshot["id"]))
-    assert {item["item_type"] for item in items} == {"observation"}
+    assert {item["item_type"] for item in items} == {
+        "participant", "observation"
+    }
     assert snapshot["manifest"]["forecast_count"] == 0
     assert snapshot["manifest"]["calendar_count"] == 0
 
@@ -554,7 +689,7 @@ def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
     )
     assert items.status_code == 200
     assert {item["item_type"] for item in items.json()["items"]} >= {
-        "observation", "forecast", "match_source"
+        "participant", "observation", "forecast", "match_source"
     }
     offline = browser.post(
         "/admin/api/research/evaluation-runs",

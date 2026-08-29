@@ -411,10 +411,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0025_dataset_snapshot_items")
+            command.upgrade(config, "0026_dataset_participant_membership")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0025_dataset_snapshot_items"
+            ) == "0026_dataset_participant_membership"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
             assert {
@@ -468,13 +468,14 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             ) == "CASCADE"
             dataset_snapshot_id = uuid.uuid4()
             dataset_item_id = uuid.uuid4()
+            membership_item_id = uuid.uuid4()
             manifest = {
                 "schema_version": "mindflow-research-dataset-v2",
                 "participant_count": 1,
                 "observation_count": 1,
                 "forecast_count": 0,
                 "calendar_count": 0,
-                "item_count": 1,
+                "item_count": 2,
                 "manifest_hash": "a" * 64,
             }
             connection.execute(
@@ -530,6 +531,36 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 ),
                 item_values,
             )
+            membership_values = {
+                **item_values,
+                "id": membership_item_id,
+                "metadata": json.dumps(
+                    {
+                        "participant_id": str(participant_id),
+                        "participant_code": "MIGRATION-TEST",
+                        "joined_at": now.isoformat(),
+                        "status_at_snapshot": "active",
+                    }
+                ),
+            }
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO dataset_snapshot_items (
+                        id, dataset_snapshot_id, item_type, source_id,
+                        source_version, participant_id, local_date,
+                        source_hash, metadata_json, created_at
+                    ) VALUES (
+                        :id, :dataset_snapshot_id, 'participant',
+                        CAST(:participant_id AS text),
+                        'participant-membership.v1', :participant_id, :local_date,
+                        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                        CAST(:metadata AS jsonb), :created_at
+                    )
+                    """
+                ),
+                membership_values,
+            )
             assert connection.scalar(
                 text(
                     "SELECT count(*) FROM dataset_snapshot_items "
@@ -556,6 +587,28 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                         """
                     ),
                     duplicate,
+                )
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                duplicate_membership = dict(membership_values)
+                duplicate_membership["id"] = uuid.uuid4()
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO dataset_snapshot_items (
+                            id, dataset_snapshot_id, item_type, source_id,
+                            source_version, participant_id, local_date,
+                            source_hash, metadata_json, created_at
+                        ) VALUES (
+                            :id, :dataset_snapshot_id, 'participant',
+                            CAST(:participant_id AS text),
+                            'participant-membership.v1', :participant_id,
+                            :local_date,
+                            'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                            CAST(:metadata AS jsonb), :created_at
+                        )
+                        """
+                    ),
+                    duplicate_membership,
                 )
             with pytest.raises(IntegrityError), connection.begin_nested():
                 connection.execute(
@@ -897,10 +950,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0025_dataset_snapshot_items")
+            command.upgrade(config, "0026_dataset_participant_membership")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0025_dataset_snapshot_items"
+            ) == "0026_dataset_participant_membership"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

@@ -5,7 +5,11 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.admin_web.repositories import AdminRepository
-from app.contracts.research import OBSERVATION_TAXONOMY, validate_profile_v2
+from app.contracts.research import (
+    MOMENTARY_OBSERVATION_TYPES,
+    OBSERVATION_TAXONOMY,
+    validate_profile_v2,
+)
 from app.models import LearnedModelProfile, ParticipantSlowState
 from app.repositories import (
     CalendarSnapshotRepository,
@@ -480,6 +484,7 @@ def test_sqlite_schema_enforces_learned_and_slow_state_constraints():
 
 def test_observation_taxonomy_never_classifies_daily_review_as_momentary():
     assert OBSERVATION_TAXONOMY["momentary_state"]["types"] == ("checkin",)
+    assert MOMENTARY_OBSERVATION_TYPES == frozenset({"checkin"})
     assert OBSERVATION_TAXONOMY["retrospective_state"]["types"] == (
         "daily_review",
     )

@@ -100,6 +100,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0025_dataset_snapshot_items"
     )
     assert migration_0025.down_revision == "0024_research_evaluation"
+    migration_0026 = next(
+        migration for migration in migrations
+        if migration.revision == "0026_dataset_participant_membership"
+    )
+    assert migration_0026.down_revision == "0025_dataset_snapshot_items"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -341,6 +346,47 @@ def test_0025_freezes_snapshot_items_and_evaluation_modes(monkeypatch):
         "ck_model_evaluation_status",
         "ck_model_evaluation_mode",
     }
+
+
+def test_0026_allows_frozen_participant_membership(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0026_dataset_participant_membership.py"
+    )
+    dropped = []
+    checks = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "drop_constraint",
+        lambda name, table, **kwargs: dropped.append((name, table, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert dropped == [
+        (
+            "ck_dataset_snapshot_item_type",
+            "dataset_snapshot_items",
+            {"type_": "check"},
+        )
+    ]
+    assert len(checks) == 1
+    assert "'participant'" in checks[0][2]
+    assert statements == []
+
+    dropped.clear()
+    checks.clear()
+    migration.downgrade()
+    assert statements == [
+        "DELETE FROM dataset_snapshot_items WHERE item_type = 'participant'"
+    ]
+    assert "'participant'" not in checks[0][2]
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

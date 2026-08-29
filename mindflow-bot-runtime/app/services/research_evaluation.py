@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 
+from app.contracts.research import MOMENTARY_OBSERVATION_TYPES
 from app.db import Database
 from app.models import (
     CalendarSnapshot,
@@ -183,6 +184,8 @@ class ResearchEvaluationService:
     def _match_values(
         self, observation: StateObservation, forecast: dict[str, Any]
     ) -> dict[str, Any] | None:
+        if observation.observation_type not in MOMENTARY_OBSERVATION_TYPES:
+            return None
         payload = dict(observation.payload_json or {})
         actual = _score(payload, "stress_0_10")
         observed_at = _aware(observation.observed_at)
@@ -243,6 +246,7 @@ class ResearchEvaluationService:
             StateObservation.observed_at >= lower,
             StateObservation.observed_at < upper,
             StateObservation.created_at <= cutoff,
+            StateObservation.observation_type.in_(MOMENTARY_OBSERVATION_TYPES),
         ]
         if participant_id is not None:
             conditions.append(StateObservation.participant_id == participant_id)
@@ -341,17 +345,17 @@ class ResearchEvaluationService:
             ForecastObservationMatch.local_date >= date_start,
             ForecastObservationMatch.local_date <= date_end,
             ForecastObservationMatch.match_schema_version == MATCH_SCHEMA_VERSION,
+            StateObservation.observation_type.in_(MOMENTARY_OBSERVATION_TYPES),
         ]
         if participant_id is not None:
             conditions.append(
                 ForecastObservationMatch.participant_id == participant_id
             )
-        statement = select(ForecastObservationMatch)
+        statement = select(ForecastObservationMatch).join(
+            StateObservation,
+            StateObservation.id == ForecastObservationMatch.observation_id,
+        )
         if observation_cutoff is not None:
-            statement = statement.join(
-                StateObservation,
-                StateObservation.id == ForecastObservationMatch.observation_id,
-            )
             conditions.append(
                 StateObservation.created_at <= _aware(observation_cutoff)
             )
@@ -640,6 +644,8 @@ class ResearchEvaluationService:
             unknown = sorted(set(codes) - {row.participant_code for row in participants})
             if unknown:
                 raise ValueError(f"unknown participant_codes: {', '.join(unknown)}")
+            if not participants:
+                raise ValueError("dataset snapshot requires at least one participant")
             participant_ids = [row.id for row in participants]
             observations = session.execute(
                 select(StateObservation)
@@ -648,6 +654,9 @@ class ResearchEvaluationService:
                     StateObservation.observed_at >= lower,
                     StateObservation.observed_at < upper,
                     StateObservation.created_at <= observation_cutoff,
+                    StateObservation.observation_type.in_(
+                        MOMENTARY_OBSERVATION_TYPES
+                    ),
                 )
                 .order_by(
                     StateObservation.participant_id,
@@ -662,6 +671,24 @@ class ResearchEvaluationService:
             if key in item_map and item_map[key]["source_hash"] != item["source_hash"]:
                 raise ValueError(f"conflicting immutable source: {key}")
             item_map[key] = item
+
+        for participant in participants:
+            membership_metadata = {
+                "participant_id": str(participant.id),
+                "participant_code": participant.participant_code,
+                "joined_at": _aware(participant.created_at).isoformat(),
+                "status_at_snapshot": participant.status,
+            }
+            freeze(
+                self._item(
+                    "participant",
+                    str(participant.id),
+                    "participant-membership.v1",
+                    participant.id,
+                    date_start,
+                    membership_metadata,
+                )
+            )
 
         for observation in observations:
             observed_at = _aware(observation.observed_at)
@@ -793,7 +820,7 @@ class ResearchEvaluationService:
         type_count = lambda kind: sum(item["item_type"] == kind for item in items)
         manifest = {
             "schema_version": DATASET_SCHEMA_VERSION,
-            "participant_count": len(participant_ids),
+            "participant_count": type_count("participant"),
             "observation_count": type_count("observation"),
             "forecast_count": type_count("forecast"),
             "calendar_count": type_count("calendar"),
@@ -927,6 +954,9 @@ class ResearchEvaluationService:
         manifest = snapshot_view["manifest"]
         expected_counts = {
             "item_count": len(items),
+            "participant_count": sum(
+                item["item_type"] == "participant" for item in items
+            ),
             "observation_count": sum(
                 item["item_type"] == "observation" for item in items
             ),
@@ -939,6 +969,8 @@ class ResearchEvaluationService:
         }
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
+        if expected_counts["participant_count"] <= 0:
+            raise ValueError("dataset snapshot has no frozen participant membership")
         contract = {
             "schema_version": snapshot_view["schema_version"],
             "date_start": snapshot_view["date_start"],
@@ -950,7 +982,10 @@ class ResearchEvaluationService:
         manifest_hash = self._manifest_hash(contract, items)
         if manifest_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")
-        participant_ids = {item["participant_id"] for item in items}
+        participant_items = [
+            item for item in items if item["item_type"] == "participant"
+        ]
+        participant_ids = {item["participant_id"] for item in participant_items}
         if participant_id is not None and participant_id not in participant_ids:
             raise ValueError("participant is outside dataset snapshot")
         match_items = [
@@ -1051,6 +1086,9 @@ class ResearchEvaluationService:
                     StateObservation.participant_id.in_(ids),
                     StateObservation.observed_at >= lower,
                     StateObservation.observed_at < upper,
+                    StateObservation.observation_type.in_(
+                        MOMENTARY_OBSERVATION_TYPES
+                    ),
                 )
             ).all()
             review_pairs = session.execute(
@@ -1205,6 +1243,9 @@ class ResearchEvaluationService:
                     StateObservation.participant_id == participant_id,
                     StateObservation.observed_at >= lower,
                     StateObservation.observed_at < upper,
+                    StateObservation.observation_type.in_(
+                        MOMENTARY_OBSERVATION_TYPES
+                    ),
                 )
                 .order_by(StateObservation.observed_at)
             ).scalars().all()
@@ -1371,6 +1412,9 @@ class ResearchEvaluationService:
                     StateObservation.participant_id.in_(ids),
                     StateObservation.observed_at >= lower,
                     StateObservation.observed_at < upper,
+                    StateObservation.observation_type.in_(
+                        MOMENTARY_OBSERVATION_TYPES
+                    ),
                 )
             ).scalars().all()
             reviews = session.execute(

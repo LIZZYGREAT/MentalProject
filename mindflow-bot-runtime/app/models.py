@@ -721,7 +721,7 @@ class DatasetSnapshotItem(Base):
             "local_date",
         ),
         CheckConstraint(
-            "item_type IN ('observation', 'forecast', "
+            "item_type IN ('participant', 'observation', 'forecast', "
             "'forecast_currentness', 'calendar', 'match_source')",
             name="ck_dataset_snapshot_item_type",
         ),
