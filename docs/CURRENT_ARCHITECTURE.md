@@ -237,8 +237,10 @@ Schema v3 并冻结 participant membership；零观测参与者仍保留在 coho
 
 0027 为 Event Appraisal 增加事件类型、课程、workload feature/prior、Raw-TLX observed workload、
 residual 与 estimator version；0028 进一步冻结事件日期、开始时间及 source Forecast/semantic/schema
-provenance。反馈只从 `min(event_start_at, submitted_at, created_at)` 时实际 current 的 Forecast 读取
-prior，不存在因果 Forecast 或对应事件时只保存 observed workload。Admin Workload 的当前曲线明确为
+provenance。`created_at` 是 repository 单次生成且不接受业务调用者输入的系统知识时间；反馈只从
+`min(event_start_at, submitted_at, created_at)` 时实际 current 的 Forecast 读取 prior。不存在因果
+Forecast、对应事件或完整有效的 workload context 时只保存 observed workload，不保存部分 provenance。
+Admin Workload 的当前曲线明确为
 `latest_descriptive`；EMA 与 0/5/10/15/30/60 分钟 lag 则固定使用 observation 因果时点的同一 Forecast，
 并显示 workload bin 误差和按 event type、
 course、participant 分层的 appraisal residual。

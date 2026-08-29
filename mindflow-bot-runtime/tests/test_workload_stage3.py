@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+import inspect
 
 import pytest
 
@@ -113,10 +114,12 @@ def test_semantic_enrichment_and_forecast_expose_workload_without_new_state():
     assert "W" not in result.active_states
 
 
-def test_event_appraisal_persists_observed_workload_and_residual():
+def test_event_appraisal_persists_observed_workload_and_residual(monkeypatch):
     database = memory_database()
     person = participant(database, "P001")
     repository = EventAppraisalFeedbackRepository(database)
+    fixed_time = datetime(2030, 1, 15, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.repositories.utc_now", lambda: fixed_time)
     features = {
         "mental_demand": 0.8,
         "physical_demand": 0.2,
@@ -174,7 +177,6 @@ def test_event_appraisal_persists_observed_workload_and_residual():
         submitted_at=datetime(2030, 1, 15, 12, tzinfo=timezone.utc),
         event_local_date=date(2030, 1, 15),
         event_start_at=datetime(2030, 1, 15, 1, tzinfo=timezone.utc),
-        created_at=datetime(2030, 1, 15, 12, tzinfo=timezone.utc),
         mental_demand=8,
         physical_demand=2,
         temporal_demand=7,
@@ -188,6 +190,7 @@ def test_event_appraisal_persists_observed_workload_and_residual():
     assert item["workload_residual"] == pytest.approx(-0.08)
     assert item["event_type"] == "exam"
     assert item["source_forecast_version"] == "f-context"
+    assert item["created_at"] == fixed_time.isoformat()
 
 
 def test_admin_workload_diagnostics_reports_lags_bins_and_appraisal_calibration():
@@ -242,9 +245,13 @@ def test_admin_workload_diagnostics_reports_lags_bins_and_appraisal_calibration(
     assert result["series_mode"] == "latest_descriptive"
 
 
-def test_event_appraisal_freezes_exact_causal_forecast_and_never_uses_later_revision():
+def test_event_appraisal_freezes_exact_causal_forecast_and_never_uses_later_revision(
+    monkeypatch,
+):
     database = memory_database()
     person = participant(database, "P001")
+    fixed_time = datetime(2030, 1, 16, 11, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.repositories.utc_now", lambda: fixed_time)
     forecasts = []
     with database.session() as session:
         for version, prior, activated_at, valid in (
@@ -306,7 +313,6 @@ def test_event_appraisal_freezes_exact_causal_forecast_and_never_uses_later_revi
         event_local_date=date(2030, 1, 15),
         event_start_at=datetime(2030, 1, 15, 9, tzinfo=timezone.utc),
         submitted_at=datetime(2030, 1, 15, 11, tzinfo=timezone.utc),
-        created_at=datetime(2030, 1, 15, 11, tzinfo=timezone.utc),
         **scores,
     )
     assert item["source_forecast_id"] == str(forecasts[0])
@@ -315,6 +321,7 @@ def test_event_appraisal_freezes_exact_causal_forecast_and_never_uses_later_revi
     assert item["event_type"] == "forecast-a"
     assert item["workload_prior"] == 0.2
     assert item["workload_residual"] == pytest.approx(0.42)
+    assert item["created_at"] == fixed_time.isoformat()
 
     no_causal = EventAppraisalFeedbackRepository(database).record(
         person.id,
@@ -322,13 +329,169 @@ def test_event_appraisal_freezes_exact_causal_forecast_and_never_uses_later_revi
         event_local_date=date(2030, 1, 16),
         event_start_at=datetime(2030, 1, 16, 1, tzinfo=timezone.utc),
         submitted_at=datetime(2030, 1, 16, 11, tzinfo=timezone.utc),
-        created_at=datetime(2030, 1, 16, 11, tzinfo=timezone.utc),
         **scores,
     )
     assert no_causal["observed_workload"] == pytest.approx(0.62)
     assert no_causal["workload_prior"] is None
     assert no_causal["workload_residual"] is None
     assert no_causal["source_forecast_id"] is None
+
+
+def test_event_appraisal_system_clock_controls_created_at_and_causal_cutoff(
+    monkeypatch,
+):
+    database = memory_database()
+    person = participant(database, "P001")
+    fixed_time = datetime(2030, 1, 15, 9, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.repositories.utc_now", lambda: fixed_time)
+    with database.session() as session:
+        for version, prior, activated_at, valid in (
+            ("forecast-a", 0.2, datetime(2030, 1, 15, 8, tzinfo=timezone.utc), False),
+            ("forecast-b", 0.9, datetime(2030, 1, 15, 10, tzinfo=timezone.utc), True),
+        ):
+            row = ForecastSnapshot(
+                participant_id=person.id,
+                local_date=date(2030, 1, 15),
+                calendar_revision="c",
+                semantic_revision=f"s-{version}",
+                observation_revision="o",
+                algorithm_version="v",
+                forecast_version=version,
+                semantic_status="rules_only",
+                semantic_input_json=[{
+                    "event_id": "event-1",
+                    "semantic": {
+                        "workload_feature_vector": {
+                            name: prior for name in (
+                                "mental_demand", "physical_demand",
+                                "temporal_demand", "effort", "frustration",
+                            )
+                        },
+                        "workload_prior": prior,
+                    },
+                }],
+                curve_json=[], peaks_json=[], warning_windows_json=[],
+                output_json={"classified_calendar_events": [{
+                    "id": "event-1", "event_type": "exam",
+                }]},
+                valid=valid, generated_at=activated_at,
+            )
+            session.add(row)
+            session.flush()
+            session.add(ForecastCurrentnessEvent(
+                participant_id=person.id,
+                local_date=date(2030, 1, 15),
+                forecast_id=row.id,
+                forecast_version=version,
+                event_type="activated",
+                reason="test",
+                occurred_at=activated_at,
+            ))
+    scores = dict(
+        mental_demand=8, physical_demand=2, temporal_demand=7, effort=8,
+        frustration=6, perceived_control=4, actual_stress=7,
+        perceived_performance=6,
+    )
+    repository = EventAppraisalFeedbackRepository(database)
+    item = repository.record(
+        person.id, event_id="event-1",
+        event_local_date=date(2030, 1, 15),
+        event_start_at=datetime(2030, 1, 15, 12, tzinfo=timezone.utc),
+        submitted_at=datetime(2030, 1, 15, 13, tzinfo=timezone.utc),
+        **scores,
+    )
+    assert item["created_at"] == fixed_time.isoformat()
+    assert item["source_forecast_version"] == "forecast-a"
+    assert item["workload_prior"] == 0.2
+    assert "created_at" not in inspect.signature(repository.record).parameters
+    with pytest.raises(ValueError, match="created_at"):
+        repository.record(
+            person.id, event_id="event-1",
+            event_local_date=date(2030, 1, 15),
+            event_start_at=datetime(2030, 1, 15, 12, tzinfo=timezone.utc),
+            submitted_at=datetime(2030, 1, 15, 13, tzinfo=timezone.utc),
+            created_at=datetime(2029, 1, 1, tzinfo=timezone.utc),
+            **scores,
+        )
+
+
+@pytest.mark.parametrize(
+    "feature_vector",
+    [
+        {
+            "mental_demand": 0.8, "physical_demand": 0.2,
+            "temporal_demand": 0.7, "effort": 0.8,
+        },
+        {
+            "mental_demand": "invalid", "physical_demand": 0.2,
+            "temporal_demand": 0.7, "effort": 0.8, "frustration": 0.6,
+        },
+        {
+            "mental_demand": 0.8, "physical_demand": 1.2,
+            "temporal_demand": 0.7, "effort": 0.8, "frustration": 0.6,
+        },
+    ],
+)
+def test_event_appraisal_malformed_workload_context_fails_soft(
+    monkeypatch, feature_vector,
+):
+    database = memory_database()
+    person = participant(database, "P001")
+    fixed_time = datetime(2030, 1, 15, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.repositories.utc_now", lambda: fixed_time)
+    with database.session() as session:
+        forecast = ForecastSnapshot(
+            participant_id=person.id,
+            local_date=date(2030, 1, 15),
+            calendar_revision="c", semantic_revision="s-malformed",
+            observation_revision="o", algorithm_version="v",
+            forecast_version="f-malformed", semantic_status="rules_only",
+            semantic_input_json=[{
+                "event_id": "event-1",
+                "semantic": {
+                    "workload_feature_vector": feature_vector,
+                    "workload_prior": 0.7,
+                    "workload_schema_version": "event_workload.v1",
+                    "workload_model_version": "workload-rules-logistic.v1",
+                },
+            }],
+            curve_json=[], peaks_json=[], warning_windows_json=[],
+            output_json={"classified_calendar_events": [{
+                "id": "event-1", "event_type": "exam",
+            }]},
+            valid=True,
+            generated_at=datetime(2030, 1, 15, 8, tzinfo=timezone.utc),
+        )
+        session.add(forecast)
+        session.flush()
+        session.add(ForecastCurrentnessEvent(
+            participant_id=person.id,
+            local_date=date(2030, 1, 15),
+            forecast_id=forecast.id,
+            forecast_version=forecast.forecast_version,
+            event_type="activated", reason="test",
+            occurred_at=datetime(2030, 1, 15, 8, tzinfo=timezone.utc),
+        ))
+
+    item = EventAppraisalFeedbackRepository(database).record(
+        person.id, event_id="event-1",
+        event_local_date=date(2030, 1, 15),
+        event_start_at=datetime(2030, 1, 15, 9, tzinfo=timezone.utc),
+        submitted_at=datetime(2030, 1, 15, 11, tzinfo=timezone.utc),
+        mental_demand=8, physical_demand=2, temporal_demand=7, effort=8,
+        frustration=6, perceived_control=4, actual_stress=7,
+        perceived_performance=6,
+    )
+    assert item["mental_demand"] == 8
+    assert item["observed_workload"] == pytest.approx(0.62)
+    assert item["workload_feature_vector"] is None
+    assert item["workload_prior"] is None
+    assert item["workload_residual"] is None
+    assert item["source_forecast_id"] is None
+    assert item["source_forecast_version"] is None
+    assert item["source_semantic_revision"] is None
+    assert item["workload_schema_version"] is None
+    assert item["workload_model_version"] is None
 
 
 def test_ema_workload_statistics_use_historical_currentness_not_latest_valid():

@@ -650,9 +650,9 @@ class EventAppraisalFeedbackRepository:
         submitted_at: datetime,
         event_local_date: date | None = None,
         event_start_at: datetime | None = None,
-        created_at: datetime | None = None,
         **scores: Any,
     ) -> dict[str, Any]:
+        knowledge_time = utc_now()
         event = str(event_id or "").strip()
         if not event:
             raise ValueError("event_id is required")
@@ -673,9 +673,6 @@ class EventAppraisalFeedbackRepository:
         )
 
         submitted_utc = aware_utc(submitted_at, "submitted_at")
-        created_utc = (
-            aware_utc(created_at, "created_at") if created_at is not None else utc_now()
-        )
         start_utc = (
             aware_utc(event_start_at, "event_start_at")
             if event_start_at is not None
@@ -694,7 +691,7 @@ class EventAppraisalFeedbackRepository:
             causal_forecast = self.forecasts.current_at(
                 participant_id,
                 event_local_date,
-                min(start_utc, submitted_utc, created_utc),
+                min(start_utc, submitted_utc, knowledge_time),
             )
             if causal_forecast is not None:
                 semantic_item = next(
@@ -718,8 +715,10 @@ class EventAppraisalFeedbackRepository:
                     ),
                     None,
                 )
-                if isinstance(semantic_item, Mapping):
-                    semantic_context = dict(semantic_item.get("semantic") or {})
+                if isinstance(semantic_item, Mapping) and isinstance(
+                    semantic_item.get("semantic"), Mapping
+                ):
+                    semantic_context = dict(semantic_item["semantic"])
 
         def workload_unit(value: Any, name: str) -> float:
             if isinstance(value, bool):
@@ -732,19 +731,27 @@ class EventAppraisalFeedbackRepository:
                 raise ValueError(f"{name} must be between 0 and 1")
             return number
 
-        workload_feature_vector = semantic_context.get("workload_feature_vector")
-        workload_prior = semantic_context.get("workload_prior")
         feature_vector = None
-        if isinstance(workload_feature_vector, Mapping):
+        prior = None
+        try:
+            workload_feature_vector = semantic_context.get(
+                "workload_feature_vector"
+            )
+            if not isinstance(workload_feature_vector, Mapping) or not all(
+                name in workload_feature_vector for name in WORKLOAD_FEATURE_NAMES
+            ):
+                raise ValueError("workload feature vector is incomplete")
             feature_vector = {
-                name: workload_unit(workload_feature_vector.get(name), name)
+                name: workload_unit(workload_feature_vector[name], name)
                 for name in WORKLOAD_FEATURE_NAMES
             }
-        prior = None
-        if workload_prior is not None:
-            prior = workload_unit(workload_prior, "workload_prior")
-        context_complete = feature_vector is not None and prior is not None
-        if not context_complete:
+            prior = workload_unit(
+                semantic_context.get("workload_prior"), "workload_prior"
+            )
+        except (KeyError, TypeError, ValueError):
+            # Appraisal feedback is primary evidence.  A malformed model-owned
+            # context must never prevent its persistence or create partial
+            # provenance that could later be mistaken for a reproducible prior.
             causal_forecast = None
             semantic_context = {}
             presentation = None
@@ -758,7 +765,7 @@ class EventAppraisalFeedbackRepository:
                 participant_id=participant_id,
                 event_id=event[:256],
                 submitted_at=submitted_utc,
-                created_at=created_utc,
+                created_at=knowledge_time,
                 event_local_date=event_local_date,
                 event_start_at=start_utc,
                 event_type=(

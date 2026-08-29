@@ -21,7 +21,9 @@ Event Appraisal 同时冻结 `event_local_date`、`event_start_at`、因果时�
 `workload_prior`、Raw-TLX 风格 `observed_workload`、`workload_residual` 与 schema/estimator version；残差定义为
 `observed_workload - workload_prior`，取值尺度为 0–1。Performance 仅来自事后反馈，
 不进入事前 semantic workload prior。因果截止点是 event start、submitted、created 三者最早值；
-只允许使用该时点实际 current 的 Forecast，不得回退到后来生成的版本。
+其中 `created_at` 仅由 repository 的系统时钟生成，业务调用者不得提供或回填。只允许使用该时点
+实际 current 的 Forecast，不得回退到后来生成的版本；workload context 缺失、不完整或非法时，
+observed workload 与八项反馈照常保存，但 prior、residual 及 workload provenance 必须全部为空。
 
 实时模型只能按状态时间读取。任何 point-in-time、因果或回顾分析必须同时满足“状态时间不晚于 cutoff”与“知识时间不晚于 cutoff”，禁止让之后补录的数据泄漏到过去。
 
@@ -134,7 +136,8 @@ Stage 1 明确区分 latest 与 runtime-active：`validated` 可以进入生产�
 | `actual_stress` | 事件实际带来的主观压力 | Event Appraisal | 同上 | No | No | Yes | Yes | Yes |
 | `perceived_performance` | 用户自评表现 | Event Appraisal | 同上 | No | No | Yes | Yes | Yes |
 
-`event_id` 是事件关联键；`submitted_at` 是用户完成评价的时刻；`created_at` 是系统入库时刻。
+`event_id` 是事件关联键；`submitted_at` 是用户完成评价的时刻；`created_at` 是系统内部生成的
+知识/入库时刻，不能由业务请求传入。
 
 ## 3. Workload、Resilience 与参数边界
 
