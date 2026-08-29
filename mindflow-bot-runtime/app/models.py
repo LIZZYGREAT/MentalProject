@@ -594,8 +594,8 @@ class ForecastObservationMatch(Base):
     __table_args__ = (
         UniqueConstraint(
             "observation_id",
-            "forecast_id",
-            name="uq_forecast_observation_match",
+            "match_schema_version",
+            name="uq_forecast_observation_match_schema",
         ),
         Index(
             "ix_forecast_observation_match_participant_day",
@@ -643,6 +643,9 @@ class ForecastObservationMatch(Base):
         nullable=False,
     )
     forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_schema_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
     forecast_timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -695,6 +698,59 @@ class DatasetSnapshot(Base):
     manifest_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
 
 
+class DatasetSnapshotItem(Base):
+    """Immutable source identity and representation frozen into a dataset."""
+
+    __tablename__ = "dataset_snapshot_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_snapshot_id",
+            "item_type",
+            "source_id",
+            "source_version",
+            name="uq_dataset_snapshot_item_source",
+        ),
+        Index(
+            "ix_dataset_snapshot_item_snapshot_type",
+            "dataset_snapshot_id",
+            "item_type",
+        ),
+        Index(
+            "ix_dataset_snapshot_item_participant_day",
+            "participant_id",
+            "local_date",
+        ),
+        CheckConstraint(
+            "item_type IN ('observation', 'forecast', "
+            "'forecast_currentness', 'calendar', 'match_source')",
+            name="ck_dataset_snapshot_item_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    dataset_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("dataset_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class ModelEvaluationRun(Base):
     """Versioned evaluation result tied to one immutable dataset snapshot."""
 
@@ -711,8 +767,13 @@ class ModelEvaluationRun(Base):
             "created_at",
         ),
         CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'failed')",
+            "status IN ('pending', 'running', 'completed', 'failed', "
+            "'not_implemented')",
             name="ck_model_evaluation_status",
+        ),
+        CheckConstraint(
+            "evaluation_mode IN ('historical_online', 'offline_replay')",
+            name="ck_model_evaluation_mode",
         ),
     )
 
@@ -725,6 +786,10 @@ class ModelEvaluationRun(Base):
         nullable=False,
     )
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluation_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    evaluation_code_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
     participant_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("participants.id", ondelete="SET NULL"),

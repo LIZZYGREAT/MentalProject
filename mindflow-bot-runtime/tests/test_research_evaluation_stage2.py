@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import math
 import uuid
 
+import pytest
 from sqlalchemy import select
 from starlette.testclient import TestClient
 
@@ -15,6 +16,7 @@ from app.models import (
     ForecastObservationMatch,
     ForecastSnapshot,
     LearnedModelProfile,
+    Participant,
     ParticipantSlowState,
     StateObservation,
 )
@@ -116,7 +118,10 @@ def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     )
     evaluation = service.evaluation(LOCAL_DATE, LOCAL_DATE, person.id)
 
-    assert rebuilt == {"created": 2, "updated": 0, "unmatched": 0, "examined": 2}
+    assert rebuilt["created"] == 2
+    assert rebuilt["updated"] == rebuilt["unmatched"] == 0
+    assert rebuilt["examined"] == 2
+    assert rebuilt["match_schema_version"] == "forecast-observation-grid.v1"
     assert len(evaluation["matches"]) == 2
     first = evaluation["matches"][0]
     assert first["forecast_version"] == "forecast-stage2-v1"
@@ -133,8 +138,10 @@ def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     assert metrics["interval_nominal_coverage"] == 0.9
     assert metrics["interval_90_coverage"] == 0.5
     assert metrics["mean_interval_width"] == 2.0
-    assert metrics["peak_magnitude_error"] == 1.0
-    assert metrics["peak_timing_error_minutes"] == 1.0
+    assert metrics["observed_peak_proxy_magnitude_error"] == 1.0
+    assert metrics["observed_peak_proxy_timing_error_minutes"] == 1.0
+    assert metrics["peak_proxy_day_count"] == 1
+    assert metrics["peak_proxy_mean_samples_per_day"] == 2.0
     diagnostics = evaluation["residual_diagnostics"]
     assert diagnostics["event_type"][0]["group"] == "class"
     assert diagnostics["course"][0]["group"] == "高等数学"
@@ -169,13 +176,25 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
         "forecast.v4",
     )
 
-    assert snapshot["schema_version"] == "mindflow-research-dataset-v1"
+    assert snapshot["schema_version"] == "mindflow-research-dataset-v2"
     assert snapshot["manifest"]["participant_count"] == 1
     assert snapshot["manifest"]["observation_count"] == 2
+    assert snapshot["manifest"]["forecast_count"] == 1
+    assert snapshot["manifest"]["calendar_count"] == 1
+    assert len(snapshot["manifest"]["manifest_hash"]) == 64
+    frozen = service.snapshot_items(uuid.UUID(snapshot["id"]))
+    assert {item["item_type"] for item in frozen} == {
+        "observation", "forecast", "forecast_currentness", "calendar",
+        "match_source",
+    }
     assert run["dataset_snapshot_id"] == snapshot["id"]
     assert run["model_version"] == "forecast.v4"
+    assert run["evaluation_mode"] == "historical_online"
     assert run["status"] == "completed"
     assert run["metrics"]["matched_observation_count"] == 2
+    assert run["metrics"]["config"]["manifest_hash"] == snapshot["manifest"][
+        "manifest_hash"
+    ]
     assert service.list_snapshots()[0]["id"] == snapshot["id"]
     assert service.list_runs()[0]["id"] == run["id"]
 
@@ -280,7 +299,6 @@ def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
     }
     assert longitudinal["workload_trend_7d"][0]["rolling_7d_workload"] == 7.0
     assert {
-        "missing_ema",
         "late_ema",
         "backfilled_observation",
         "daily_review_missing",
@@ -291,6 +309,202 @@ def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
         "synthetic_row",
         "time_anomaly",
     } <= set(quality["counts"])
+    assert "missing_ema" not in quality["counts"]
+
+
+def test_user_initiated_checkins_use_observed_day_rate_and_join_date_exposure():
+    database = memory_database()
+    first = participant(database, "EXPOSURE-A")
+    second = participant(database, "EXPOSURE-B")
+    with database.session() as session:
+        session.get(Participant, first.id).created_at = datetime(
+            2026, 7, 31, 16, tzinfo=timezone.utc
+        )
+        session.get(Participant, second.id).created_at = datetime(
+            2026, 8, 19, 16, tzinfo=timezone.utc
+        )
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+
+    dashboard = service.cohort_dashboard(
+        date(2026, 8, 1), date(2026, 8, 28)
+    )
+    quality = service.data_quality(date(2026, 8, 1), date(2026, 8, 28))
+
+    completeness = dashboard["data_completeness"]
+    assert completeness["eligible_participant_days"] == 28 + 9
+    assert completeness["ema_observed_day_rate"] == 0.0
+    assert "ema_adherence" not in completeness
+    assert "missing_ema" not in quality["counts"]
+    second_dates = {
+        item["local_date"]
+        for item in quality["items"]
+        if item["participant_id"] == str(second.id)
+    }
+    assert min(second_dates) == "2026-08-20"
+
+    longitudinal = service.participant_longitudinal(
+        second.id, date(2026, 8, 28), 14
+    )
+    assert longitudinal["eligible_day_count_14d"] == 9
+    assert longitudinal["ema_observed_day_rate_14d"] == 0.0
+    assert "ema_adherence_14d" not in longitudinal
+
+
+def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes():
+    database = memory_database()
+    person = participant(database, "STAGE2-IMMUTABLE")
+    _seed_causal_forecast_and_observations(database, person.id)
+    with database.session() as session:
+        session.add(
+            CalendarSnapshot(
+                participant_id=person.id,
+                local_date=LOCAL_DATE,
+                calendar_revision="calendar-stage2",
+                events_json=[{"id": "original", "summary": "原始日程"}],
+                snapshot_state="current",
+                degraded=False,
+                updated_at=datetime(2026, 8, 28, 0, tzinfo=timezone.utc),
+            )
+        )
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+    )
+    snapshot_id = uuid.UUID(snapshot["id"])
+    before_items = service.snapshot_items(snapshot_id)
+    first_run = service.create_evaluation_run(
+        snapshot_id, "forecast.v4", evaluation_mode="historical_online"
+    )
+
+    with database.session() as session:
+        session.add(
+            StateObservation(
+                participant_id=person.id,
+                observation_type="instant_checkin",
+                source_message_id="after-snapshot",
+                payload_json={"stress_0_10": 10.0},
+                observed_at=datetime(2026, 8, 28, 1, 10, tzinfo=timezone.utc),
+                created_at=datetime(2026, 8, 28, 4, tzinfo=timezone.utc),
+            )
+        )
+        calendar = session.execute(
+            select(CalendarSnapshot).where(
+                CalendarSnapshot.participant_id == person.id,
+                CalendarSnapshot.local_date == LOCAL_DATE,
+            )
+        ).scalar_one()
+        calendar.calendar_revision = "calendar-live-mutated"
+        calendar.events_json = [{"id": "later", "summary": "后续日程"}]
+        calendar.updated_at = datetime(2026, 8, 28, 5, tzinfo=timezone.utc)
+    ForecastSnapshotRepository(database).save(
+        person.id,
+        LOCAL_DATE,
+        calendar_revision="calendar-live-mutated",
+        semantic_revision="semantic-later",
+        observation_revision="observation-later",
+        algorithm_version="forecast.v5",
+        forecast_version="forecast-stage2-v2",
+        semantic_status="complete",
+        semantic_input=[],
+        curve=[{"time": "09:00", "stress_0_10": 10.0}],
+        peaks=[{"time": "09:00", "stress_0_10": 10.0}],
+        warning_windows=[],
+        output={"classified_calendar_events": []},
+    )
+
+    second_run = service.create_evaluation_run(
+        snapshot_id, "forecast.v4", evaluation_mode="historical_online"
+    )
+    after_items = service.snapshot_items(snapshot_id)
+    persisted_snapshot = service.list_snapshots()[0]
+
+    item_identity = lambda rows: [
+        (row["item_type"], row["source_id"], row["source_version"], row["source_hash"])
+        for row in rows
+    ]
+    assert item_identity(after_items) == item_identity(before_items)
+    assert persisted_snapshot["manifest"]["manifest_hash"] == snapshot["manifest"][
+        "manifest_hash"
+    ]
+    assert first_run["metrics"] == second_run["metrics"]
+    assert first_run["metrics"]["config"]["source_set"] == second_run[
+        "metrics"
+    ]["config"]["source_set"]
+
+    offline = service.create_evaluation_run(
+        snapshot_id, "candidate.v1", evaluation_mode="offline_replay"
+    )
+    assert offline["evaluation_mode"] == "offline_replay"
+    assert offline["status"] == "not_implemented"
+    assert offline["metrics"]["config"]["dataset_schema_version"] == (
+        "mindflow-research-dataset-v2"
+    )
+
+
+def test_peak_proxy_is_participant_isolated_and_requires_two_samples():
+    def match(participant_id, actual, observed, predicted_peak, predicted_time):
+        return {
+            "participant_id": participant_id,
+            "local_date": "2026-08-28",
+            "forecast_version": "shared-version",
+            "actual_stress": actual,
+            "residual": 1.0,
+            "prediction_lower": None,
+            "prediction_upper": None,
+            "context": {
+                "time_of_day": observed,
+                "forecast_peak_stress": predicted_peak,
+                "forecast_peak_time": predicted_time,
+            },
+        }
+
+    matches = [
+        match("A", 4.0, "09:00", 6.0, "09:10"),
+        match("A", 5.0, "09:05", 6.0, "09:10"),
+        match("B", 8.0, "09:00", 7.0, "09:15"),
+        match("B", 9.0, "09:05", 7.0, "09:15"),
+        match("C", 10.0, "09:00", 1.0, "12:00"),
+    ]
+
+    metrics = ResearchEvaluationService.metrics(matches)
+
+    assert metrics["peak_proxy_day_count"] == 2
+    assert metrics["peak_proxy_mean_samples_per_day"] == 2.0
+    assert metrics["observed_peak_proxy_magnitude_error"] == 1.5
+    assert metrics["observed_peak_proxy_timing_error_minutes"] == 7.5
+    assert "peak_magnitude_error" not in metrics
+
+
+def test_snapshot_filter_fails_closed_and_calendar_cutoff_is_effective():
+    database = memory_database()
+    person = participant(database, "STAGE2-FILTER")
+    _seed_causal_forecast_and_observations(database, person.id)
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+
+    with pytest.raises(ValueError, match="unknown participant_codes: UNKNOWN"):
+        service.create_dataset_snapshot(
+            date_start=LOCAL_DATE,
+            date_end=LOCAL_DATE,
+            participant_filter={
+                "participant_codes": [person.participant_code, "UNKNOWN"]
+            },
+        )
+
+    snapshot = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2026, 8, 27, 22, tzinfo=timezone.utc),
+    )
+    items = service.snapshot_items(uuid.UUID(snapshot["id"]))
+    assert {item["item_type"] for item in items} == {"observation"}
+    assert snapshot["manifest"]["forecast_count"] == 0
+    assert snapshot["manifest"]["calendar_count"] == 0
 
 
 def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
@@ -320,6 +534,39 @@ def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
     )
     assert rebuilt.status_code == 200
     assert rebuilt.json()["created"] == 2
+    snapshot = browser.post(
+        "/admin/api/research/dataset-snapshots",
+        headers={"X-CSRF-Token": auth["csrf_token"]},
+        json={
+            "date_start": LOCAL_DATE.isoformat(),
+            "date_end": LOCAL_DATE.isoformat(),
+            "participant_filter": {
+                "participant_codes": [person.participant_code]
+            },
+            "observation_cutoff": "2026-08-28T03:00:00Z",
+            "calendar_cutoff": "2026-08-28T03:00:00Z",
+        },
+    )
+    assert snapshot.status_code == 201
+    snapshot_id = snapshot.json()["id"]
+    items = browser.get(
+        f"/admin/api/research/dataset-snapshots/{snapshot_id}/items"
+    )
+    assert items.status_code == 200
+    assert {item["item_type"] for item in items.json()["items"]} >= {
+        "observation", "forecast", "match_source"
+    }
+    offline = browser.post(
+        "/admin/api/research/evaluation-runs",
+        headers={"X-CSRF-Token": auth["csrf_token"]},
+        json={
+            "dataset_snapshot_id": snapshot_id,
+            "model_version": "candidate.v1",
+            "evaluation_mode": "offline_replay",
+        },
+    )
+    assert offline.status_code == 201
+    assert offline.json()["status"] == "not_implemented"
     script = browser.get("/admin/static/app.js").text
     for marker in (
         "研究评估",
@@ -328,5 +575,7 @@ def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
         "参数历史",
         "/research/dataset-snapshots",
         "/research/evaluation-runs",
+        "historical_online",
+        "EMA 观测日率",
     ):
         assert marker in script

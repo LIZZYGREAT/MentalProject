@@ -95,6 +95,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0024_research_evaluation"
     )
     assert migration_0024.down_revision == "0023_stage1_gate_constraints"
+    migration_0025 = next(
+        migration for migration in migrations
+        if migration.revision == "0025_dataset_snapshot_items"
+    )
+    assert migration_0025.down_revision == "0024_research_evaluation"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -259,6 +264,83 @@ def test_0024_adds_reproducible_research_evaluation_tables(monkeypatch):
         "status",
     } <= table_map["model_evaluation_runs"]
     assert len(indexes) == 4
+
+
+def test_0025_freezes_snapshot_items_and_evaluation_modes(monkeypatch):
+    migration = _migration(VERSIONS / "0025_dataset_snapshot_items.py")
+    columns = []
+    tables = []
+    indexes = []
+    unique_constraints = []
+    checks = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(migration.op, "alter_column", lambda *a, **k: None)
+    monkeypatch.setattr(migration.op, "drop_constraint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_unique_constraint",
+        lambda name, table, fields: unique_constraints.append(
+            (name, table, tuple(fields))
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *items, **kwargs: tables.append(
+            (name, {item.name for item in items if hasattr(item, "name")})
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+
+    migration.upgrade()
+
+    assert [column.name for table, column in columns] == [
+        "match_schema_version",
+        "evaluation_mode",
+        "evaluation_code_version",
+    ]
+    assert "PARTITION BY observation_id" in statements[1]
+    assert unique_constraints == [
+        (
+            "uq_forecast_observation_match_schema",
+            "forecast_observation_matches",
+            ("observation_id", "match_schema_version"),
+        )
+    ]
+    table_map = dict(tables)
+    assert set(table_map) == {"dataset_snapshot_items"}
+    assert {
+        "dataset_snapshot_id",
+        "item_type",
+        "source_id",
+        "source_version",
+        "participant_id",
+        "local_date",
+        "source_hash",
+        "metadata_json",
+    } <= table_map["dataset_snapshot_items"]
+    assert len(indexes) == 2
+    assert {name for name, _, _ in checks} == {
+        "ck_model_evaluation_status",
+        "ck_model_evaluation_mode",
+    }
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

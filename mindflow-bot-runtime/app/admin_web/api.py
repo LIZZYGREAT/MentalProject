@@ -726,15 +726,46 @@ class AdminAPI:
             participant_filter = value.get("participant_filter") or {}
             if not isinstance(participant_filter, dict):
                 raise ValueError("participant_filter must be an object")
+            cutoffs = {}
+            for field in ("observation_cutoff", "calendar_cutoff"):
+                raw = value.get(field)
+                if raw:
+                    parsed = datetime.fromisoformat(
+                        str(raw).replace("Z", "+00:00")
+                    )
+                    if parsed.tzinfo is None:
+                        raise ValueError(f"{field} must include timezone")
+                    cutoffs[field] = parsed.astimezone(timezone.utc)
             item = await asyncio.to_thread(
                 self.research.create_dataset_snapshot,
                 date_start=date_start,
                 date_end=date_end,
                 participant_filter=participant_filter,
+                **cutoffs,
             )
         except (TypeError, ValueError) as exc:
             return _json_error(str(exc) or "invalid_request", 400)
         return JSONResponse(item, status_code=201)
+
+    async def dataset_snapshot_items(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        try:
+            snapshot_id = uuid.UUID(request.path_params["snapshot_id"])
+            item_type = str(request.query_params.get("item_type") or "").strip()
+            if item_type and item_type not in {
+                "observation", "forecast", "forecast_currentness",
+                "calendar", "match_source",
+            }:
+                raise ValueError("unsupported item_type")
+            items = await asyncio.to_thread(
+                self.research.snapshot_items,
+                snapshot_id,
+                item_type or None,
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse({"items": items})
 
     async def evaluation_runs(self, request: Request) -> Response:
         session = await self._authorized(request, csrf=request.method == "POST")
@@ -758,6 +789,9 @@ class AdminAPI:
             value = await request.json()
             snapshot_id = uuid.UUID(str(value.get("dataset_snapshot_id") or ""))
             model_version = str(value.get("model_version") or "").strip()
+            evaluation_mode = str(
+                value.get("evaluation_mode") or "historical_online"
+            ).strip()
             if not model_version:
                 raise ValueError("model_version is required")
             participant_id = None
@@ -773,6 +807,7 @@ class AdminAPI:
                 snapshot_id,
                 model_version,
                 participant_id,
+                evaluation_mode,
             )
         except (TypeError, ValueError) as exc:
             return _json_error(str(exc) or "invalid_request", 400)
@@ -874,6 +909,7 @@ class AdminAPI:
             Route(f"{prefix}/data-quality", self.data_quality, methods=["GET"]),
             Route(f"{prefix}/research/matches/rebuild", self.rebuild_research_matches, methods=["POST"]),
             Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),
+            Route(f"{prefix}/research/dataset-snapshots/{{snapshot_id}}/items", self.dataset_snapshot_items, methods=["GET"]),
             Route(f"{prefix}/research/evaluation-runs", self.evaluation_runs, methods=["GET", "POST"]),
             Route(f"{prefix}/participants/{{participant_code}}/longitudinal", self.participant_longitudinal, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/evaluation", self.participant_evaluation, methods=["GET"]),

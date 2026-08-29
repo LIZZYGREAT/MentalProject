@@ -213,7 +213,7 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0024_research_evaluation`，JSON 业务列在 PostgreSQL 使用 JSONB；Stage 1/2 均不修改
+`0025_dataset_snapshot_items`，JSON 业务列在 PostgreSQL 使用 JSONB；Stage 1/2 均不修改
 CTSSM 主方程。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把

@@ -1,4 +1,4 @@
-"""Opt-in proof that the real 0016 -> 0023 PostgreSQL migrations are executable."""
+"""Opt-in proof that the real 0016 -> current PostgreSQL migrations execute."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from postgres_test_guard import optional_test_postgres_url
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_postgres_upgrade_0016_to_0023_preserves_and_backfills():
+def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
     try:
         raw_url = optional_test_postgres_url()
     except ValueError as exc:
@@ -411,17 +411,157 @@ def test_real_postgres_upgrade_0016_to_0023_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0024_research_evaluation")
+            command.upgrade(config, "0025_dataset_snapshot_items")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0024_research_evaluation"
+            ) == "0025_dataset_snapshot_items"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
             assert {
                 "forecast_observation_matches",
                 "dataset_snapshots",
+                "dataset_snapshot_items",
                 "model_evaluation_runs",
             } <= set(inspector.get_table_names())
+            match_columns = {
+                column["name"]
+                for column in inspector.get_columns(
+                    "forecast_observation_matches"
+                )
+            }
+            assert "match_schema_version" in match_columns
+            item_columns = {
+                column["name"]
+                for column in inspector.get_columns("dataset_snapshot_items")
+            }
+            assert {
+                "dataset_snapshot_id", "item_type", "source_id",
+                "source_version", "participant_id", "local_date",
+                "source_hash", "metadata_json",
+            } <= item_columns
+            evaluation_columns = {
+                column["name"]
+                for column in inspector.get_columns("model_evaluation_runs")
+            }
+            assert {
+                "evaluation_mode", "evaluation_code_version"
+            } <= evaluation_columns
+            item_unique = {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "dataset_snapshot_items"
+                )
+            }
+            assert (
+                "dataset_snapshot_id", "item_type", "source_id",
+                "source_version",
+            ) in item_unique
+            item_foreign_keys = {
+                tuple(item["constrained_columns"]): item
+                for item in inspector.get_foreign_keys("dataset_snapshot_items")
+            }
+            assert item_foreign_keys[("participant_id",)]["options"].get(
+                "ondelete"
+            ) == "RESTRICT"
+            assert item_foreign_keys[("dataset_snapshot_id",)]["options"].get(
+                "ondelete"
+            ) == "CASCADE"
+            dataset_snapshot_id = uuid.uuid4()
+            dataset_item_id = uuid.uuid4()
+            manifest = {
+                "schema_version": "mindflow-research-dataset-v2",
+                "participant_count": 1,
+                "observation_count": 1,
+                "forecast_count": 0,
+                "calendar_count": 0,
+                "item_count": 1,
+                "manifest_hash": "a" * 64,
+            }
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO dataset_snapshots (
+                        id, created_at, date_start, date_end,
+                        participant_filter, observation_cutoff,
+                        calendar_cutoff, schema_version, manifest_json
+                    ) VALUES (
+                        :id, :created_at, :date_start, :date_end,
+                        CAST(:participant_filter AS jsonb),
+                        :observation_cutoff, :calendar_cutoff,
+                        'mindflow-research-dataset-v2', CAST(:manifest AS jsonb)
+                    )
+                    """
+                ),
+                {
+                    "id": dataset_snapshot_id,
+                    "created_at": now,
+                    "date_start": date(2030, 1, 15),
+                    "date_end": date(2030, 1, 15),
+                    "participant_filter": json.dumps(
+                        {"participant_codes": ["P001"]}
+                    ),
+                    "observation_cutoff": now,
+                    "calendar_cutoff": now,
+                    "manifest": json.dumps(manifest),
+                },
+            )
+            item_values = {
+                "id": dataset_item_id,
+                "dataset_snapshot_id": dataset_snapshot_id,
+                "participant_id": participant_id,
+                "local_date": date(2030, 1, 15),
+                "metadata": json.dumps({"observation_id": "source-1"}),
+                "created_at": now,
+            }
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO dataset_snapshot_items (
+                        id, dataset_snapshot_id, item_type, source_id,
+                        source_version, participant_id, local_date,
+                        source_hash, metadata_json, created_at
+                    ) VALUES (
+                        :id, :dataset_snapshot_id, 'observation', 'source-1',
+                        'observation.v1', :participant_id, :local_date,
+                        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                        CAST(:metadata AS jsonb), :created_at
+                    )
+                    """
+                ),
+                item_values,
+            )
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM dataset_snapshot_items "
+                    "WHERE dataset_snapshot_id = :id"
+                ),
+                {"id": dataset_snapshot_id},
+            ) == manifest["item_count"]
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                duplicate = dict(item_values)
+                duplicate["id"] = uuid.uuid4()
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO dataset_snapshot_items (
+                            id, dataset_snapshot_id, item_type, source_id,
+                            source_version, participant_id, local_date,
+                            source_hash, metadata_json, created_at
+                        ) VALUES (
+                            :id, :dataset_snapshot_id, 'observation', 'source-1',
+                            'observation.v1', :participant_id, :local_date,
+                            'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                            CAST(:metadata AS jsonb), :created_at
+                        )
+                        """
+                    ),
+                    duplicate,
+                )
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                connection.execute(
+                    text("DELETE FROM participants WHERE id = :id"),
+                    {"id": participant_id},
+                )
             currentness_columns = {
                 column["name"]
                 for column in inspector.get_columns("forecast_currentness_events")
@@ -757,10 +897,10 @@ def test_real_postgres_upgrade_0016_to_0023_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0024_research_evaluation")
+            command.upgrade(config, "0025_dataset_snapshot_items")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0024_research_evaluation"
+            ) == "0025_dataset_snapshot_items"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

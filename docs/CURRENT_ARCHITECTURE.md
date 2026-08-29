@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0024_research_evaluation -->
+<!-- ALEMBIC_HEAD: 0025_dataset_snapshot_items -->
 
 ## 运行边界
 
@@ -183,7 +183,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0024_research_evaluation`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0025_dataset_snapshot_items`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -208,9 +208,15 @@ Psychometrics、Slow State 与 Learned Parameters，Schema/兼容字段与 Expli
 CTSSM 主方程。0024 新增 `forecast_observation_matches`、`dataset_snapshots` 与
 `model_evaluation_runs`；匹配记录使用观测时点当时生效的 Forecast，在最近五分钟 grid point
 的 ±2.5 分钟内落库，并保留预测区间和分层诊断上下文。模型训练和比较通过 observation/calendar
-cutoff、schema version 与 manifest 固定数据边界。Stage 2 同样不修改 CTSSM 主方程。
+cutoff、schema version 与 manifest 固定数据边界。0025 增加不可变 `dataset_snapshot_items`，
+逐条冻结 Observation、causal Forecast、Currentness event、Calendar 表示及 Match Source，
+manifest hash 由规范化合同与条目共同生成；Evaluation Run 只读取冻结条目，不重新选择 live 数据。
+评估模式明确区分 `historical_online` 与尚未执行候选模型的 `offline_replay`。Instant Check-in
+是用户主动观测，因此只报告 observed-day rate，不推断 `missing_ema`；participant-day 分母从
+参与者创建日开始计算。Peak 指标明确标记为至少两个匹配样本形成的 observed peak proxy，
+并按 participant/date/forecast version 隔离。Stage 2 同样不修改 CTSSM 主方程。
 可选的真实 PostgreSQL 集成测试从 0016 插入 current/degraded 数据后升级到 0017，
-再升级到 0024，并验证列、JSONB、
+再升级到 0025，并验证列、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 
