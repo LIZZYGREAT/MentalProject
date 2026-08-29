@@ -140,22 +140,30 @@ def test_admin_curve_missing_date_is_read_only_and_does_not_create_a_forecast():
     assert repository.latest(user.id, local_date) is not None
 
 
-def test_forecast_chart_source_uses_time_coordinates_and_declares_all_overlays():
-    static_dir = Path(__file__).resolve().parents[1] / "app" / "admin_web" / "static"
-    chart = (static_dir / "forecast_chart.js").read_text(encoding="utf-8")
+def test_admin_forecast_uses_server_rendered_python_image():
+    static_dir = (
+        Path(__file__).resolve().parents[1] / "app" / "admin_web" / "static"
+    )
     app = (static_dir / "app.js").read_text(encoding="utf-8")
 
-    assert "LAST_CURVE_MINUTE = 23 * 60 + 55" in chart
-    assert "point.time" in chart
-    assert "23:55" in chart
-    assert "24:00" not in chart
-    assert "PredictionRun" not in chart + app
-    for required in (
-        "Calendar Event",
-        "Warning / Risk Window",
-        "即时 Observation",
-        "Daily Review 回顾估计",
-        "significantChanges",
-    ):
-        assert required in chart
-    assert "read_persisted" not in app, "the browser must use the API rather than know repository internals"
+    assert "pressureCurveImage" in app
+    assert "pressure-curve/${localDate}.png" in app
+    assert 'class="forecast-chart-image"' in app
+    assert "renderForecastChart" not in app
+    assert "forecast_chart.js" not in app
+    assert "read_persisted" not in app, (
+        "the browser must use the API rather than know repository internals"
+    )
+
+
+def test_admin_curve_png_returns_renderer_output():
+    browser, _database, _repository, _user, local_date, _saved = _seeded_client()
+
+    response = browser.get(
+        f"/admin/api/participants/P-VISUAL-001/pressure-curve/{local_date}.png"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.content == b"real-render-boundary"

@@ -83,8 +83,9 @@ class PressureCurveService:
         local_date: date | str,
         *,
         stress_only: bool = False,
+        render_png: bool = True,
     ) -> PressureCurveView:
-        """Render the current persisted Forecast without recomputing anything."""
+        """Read the persisted Forecast and optionally render its PNG."""
 
         target = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
         forecast = await asyncio.to_thread(
@@ -118,11 +119,13 @@ class PressureCurveService:
             now=datetime.now(self.timezone),
             timezone_value=self.timezone,
         )
-        png_bytes = await asyncio.to_thread(
-            self.renderer.render,
-            curve,
-            analysis,
-            output,
-            stress_only=stress_only,
-        )
+        png_bytes = b""
+        if render_png:
+            png_bytes = await asyncio.to_thread(
+                self.renderer.render,
+                curve,
+                analysis,
+                output,
+                stress_only=stress_only,
+            )
         return PressureCurveView(forecast, analysis, png_bytes)

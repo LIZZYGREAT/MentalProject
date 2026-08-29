@@ -354,6 +354,7 @@ class AdminAPI:
                 participant_id,
                 target,
                 stress_only=False,
+                render_png=False,
             )
         except HistoricalForecastNotFoundError:
             return _json_error("forecast_not_found", 404)
