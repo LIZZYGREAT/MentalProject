@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 from app.admin_web.main import create_app
 from app.models import (
     CalendarSnapshot,
+    DatasetSnapshot,
     DatasetSnapshotItem,
     EventSemanticCache,
     ForecastCurrentnessEvent,
@@ -22,7 +23,12 @@ from app.models import (
     StateObservation,
 )
 from app.repositories import ForecastSnapshotRepository
-from app.services.research_evaluation import ResearchEvaluationService
+from app.services.research_evaluation import (
+    DATASET_SCHEMA_V2,
+    DATASET_SCHEMA_V3,
+    EVALUATION_CODE_VERSION,
+    ResearchEvaluationService,
+)
 from helpers import memory_database, participant
 from test_admin_web import login, settings
 
@@ -107,6 +113,59 @@ def _seed_causal_forecast_and_observations(database, participant_id):
     return saved
 
 
+def _convert_snapshot_to_legacy_v2(database, service, snapshot_id):
+    with database.session() as session:
+        snapshot = session.get(DatasetSnapshot, snapshot_id)
+        participant_items = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id,
+                DatasetSnapshotItem.item_type == "participant",
+            )
+        ).scalars().all()
+        for item in participant_items:
+            session.delete(item)
+        session.flush()
+        rows = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id
+            )
+        ).scalars().all()
+        items = [
+            {
+                "item_type": row.item_type,
+                "source_id": row.source_id,
+                "source_version": row.source_version,
+                "participant_id": row.participant_id,
+                "local_date": row.local_date,
+                "source_hash": row.source_hash,
+                "metadata": dict(row.metadata_json),
+            }
+            for row in rows
+        ]
+        snapshot.schema_version = DATASET_SCHEMA_V2
+        snapshot_view = service._snapshot_view(snapshot)
+        contract = {
+            "schema_version": DATASET_SCHEMA_V2,
+            "date_start": snapshot_view["date_start"],
+            "date_end": snapshot_view["date_end"],
+            "participant_filter": snapshot_view["participant_filter"],
+            "observation_cutoff": snapshot_view["observation_cutoff"],
+            "calendar_cutoff": snapshot_view["calendar_cutoff"],
+        }
+        type_count = lambda kind: sum(
+            item["item_type"] == kind for item in items
+        )
+        snapshot.manifest_json = {
+            "schema_version": DATASET_SCHEMA_V2,
+            "participant_count": 1,
+            "observation_count": type_count("observation"),
+            "forecast_count": type_count("forecast"),
+            "calendar_count": type_count("calendar"),
+            "item_count": len(items),
+            "manifest_hash": service._manifest_hash(contract, items),
+        }
+
+
 def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     database = memory_database()
     person = participant(database, "STAGE2-MATCH")
@@ -177,7 +236,7 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
         "forecast.v4",
     )
 
-    assert snapshot["schema_version"] == "mindflow-research-dataset-v2"
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V3
     assert snapshot["manifest"]["participant_count"] == 1
     assert snapshot["manifest"]["observation_count"] == 2
     assert snapshot["manifest"]["forecast_count"] == 1
@@ -197,6 +256,10 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
     assert run["evaluation_mode"] == "historical_online"
     assert run["status"] == "completed"
     assert run["metrics"]["matched_observation_count"] == 2
+    assert run["evaluation_code_version"] == EVALUATION_CODE_VERSION
+    assert run["metrics"]["config"]["evaluation_code_version"] == (
+        "stage2-evaluation.v3"
+    )
     assert run["metrics"]["config"]["manifest_hash"] == snapshot["manifest"][
         "manifest_hash"
     ]
@@ -446,7 +509,7 @@ def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes()
     assert offline["evaluation_mode"] == "offline_replay"
     assert offline["status"] == "not_implemented"
     assert offline["metrics"]["config"]["dataset_schema_version"] == (
-        "mindflow-research-dataset-v2"
+        DATASET_SCHEMA_V3
     )
 
 
@@ -610,6 +673,74 @@ def test_snapshot_membership_includes_zero_sample_participant_and_changes_hash()
         service.create_evaluation_run(
             uuid.UUID(both["id"]), "forecast.v4", participant_id=second.id
         )
+
+    first_only_id = uuid.UUID(first_only["id"])
+    with database.session() as session:
+        membership_item = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == first_only_id,
+                DatasetSnapshotItem.item_type == "participant",
+            )
+        ).scalar_one()
+        session.delete(membership_item)
+    with pytest.raises(
+        ValueError, match="dataset snapshot manifest/items count mismatch"
+    ):
+        service.create_evaluation_run(first_only_id, "forecast.v4")
+
+
+def test_legacy_v2_snapshot_remains_evaluable_without_membership_items():
+    database = memory_database()
+    person = participant(database, "STAGE2-LEGACY-V2")
+    _seed_causal_forecast_and_observations(database, person.id)
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+    )
+    snapshot_id = uuid.UUID(snapshot["id"])
+    _convert_snapshot_to_legacy_v2(database, service, snapshot_id)
+
+    legacy_items = service.snapshot_items(snapshot_id)
+    assert {item["item_type"] for item in legacy_items} == {
+        "observation",
+        "forecast",
+        "forecast_currentness",
+        "calendar",
+        "match_source",
+    }
+    cohort_run = service.create_evaluation_run(snapshot_id, "forecast.v4")
+    participant_run = service.create_evaluation_run(
+        snapshot_id, "forecast.v4", participant_id=person.id
+    )
+    assert cohort_run["status"] == "completed"
+    assert cohort_run["metrics"]["metrics"]["sample_count"] == 2
+    assert cohort_run["metrics"]["config"]["dataset_schema_version"] == (
+        DATASET_SCHEMA_V2
+    )
+    assert participant_run["metrics"]["matched_observation_count"] == 2
+
+    unknown = participant(database, "STAGE2-LEGACY-UNKNOWN")
+    with pytest.raises(ValueError, match="legacy_v2_snapshot_membership_unknown"):
+        service.create_evaluation_run(
+            snapshot_id, "forecast.v4", participant_id=unknown.id
+        )
+
+    with database.session() as session:
+        item = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id,
+                DatasetSnapshotItem.item_type == "observation",
+            )
+        ).scalars().first()
+        metadata = dict(item.metadata_json)
+        metadata["payload"] = {"stress_0_10": 10.0}
+        item.metadata_json = metadata
+    with pytest.raises(ValueError, match="dataset snapshot manifest mismatch"):
+        service.create_evaluation_run(snapshot_id, "forecast.v4")
 
 
 def test_snapshot_filter_fails_closed_and_calendar_cutoff_is_effective():

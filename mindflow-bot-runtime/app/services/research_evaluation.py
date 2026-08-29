@@ -36,9 +36,11 @@ from app.models import (
 from app.repositories import ForecastSnapshotRepository
 
 
-DATASET_SCHEMA_VERSION = "mindflow-research-dataset-v2"
+DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
+DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
+DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V3
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v1"
-EVALUATION_CODE_VERSION = "stage2-evaluation.v2"
+EVALUATION_CODE_VERSION = "stage2-evaluation.v3"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
 
@@ -952,11 +954,13 @@ class ResearchEvaluationService:
         if not items:
             raise ValueError("dataset snapshot has no immutable items")
         manifest = snapshot_view["manifest"]
+        schema_version = snapshot_view["schema_version"]
+        if schema_version not in {DATASET_SCHEMA_V2, DATASET_SCHEMA_V3}:
+            raise ValueError("unsupported dataset schema version")
+        if manifest.get("schema_version") != schema_version:
+            raise ValueError("dataset snapshot schema/manifest mismatch")
         expected_counts = {
             "item_count": len(items),
-            "participant_count": sum(
-                item["item_type"] == "participant" for item in items
-            ),
             "observation_count": sum(
                 item["item_type"] == "observation" for item in items
             ),
@@ -967,9 +971,16 @@ class ResearchEvaluationService:
                 item["item_type"] == "calendar" for item in items
             ),
         }
+        participant_item_count = sum(
+            item["item_type"] == "participant" for item in items
+        )
+        if schema_version == DATASET_SCHEMA_V3:
+            expected_counts["participant_count"] = participant_item_count
+        elif participant_item_count:
+            raise ValueError("legacy v2 dataset contains v3 participant membership")
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
-        if expected_counts["participant_count"] <= 0:
+        if schema_version == DATASET_SCHEMA_V3 and participant_item_count <= 0:
             raise ValueError("dataset snapshot has no frozen participant membership")
         contract = {
             "schema_version": snapshot_view["schema_version"],
@@ -982,12 +993,26 @@ class ResearchEvaluationService:
         manifest_hash = self._manifest_hash(contract, items)
         if manifest_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")
-        participant_items = [
-            item for item in items if item["item_type"] == "participant"
-        ]
-        participant_ids = {item["participant_id"] for item in participant_items}
-        if participant_id is not None and participant_id not in participant_ids:
-            raise ValueError("participant is outside dataset snapshot")
+        if schema_version == DATASET_SCHEMA_V3:
+            participant_ids = {
+                item["participant_id"]
+                for item in items
+                if item["item_type"] == "participant"
+            }
+            if participant_id is not None and participant_id not in participant_ids:
+                raise ValueError("participant is outside dataset snapshot")
+        else:
+            legacy_membership_evidence = {
+                item["participant_id"]
+                for item in items
+                if item["item_type"]
+                in {"observation", "forecast", "calendar", "match_source"}
+            }
+            if (
+                participant_id is not None
+                and participant_id not in legacy_membership_evidence
+            ):
+                raise ValueError("legacy_v2_snapshot_membership_unknown")
         match_items = [
             item
             for item in items

@@ -211,8 +211,12 @@ CTSSM 主方程。0024 新增 `forecast_observation_matches`、`dataset_snapshot
 cutoff、schema version 与 manifest 固定数据边界。0025 增加不可变 `dataset_snapshot_items`，
 逐条冻结 Observation、causal Forecast、Currentness event、Calendar 表示及 Match Source，
 manifest hash 由规范化合同与条目共同生成；Evaluation Run 只读取冻结条目，不重新选择 live 数据。
-0026 进一步冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
+0025 创建的 legacy Dataset Schema v2 冻结 Observation、Forecast、Currentness、Calendar 与
+Match Source，不伪造历史 membership；当前 evaluator 仍按原 v2 manifest 合同读取这些快照，
+participant-specific 查询仅在不可变条目能证明参与者出现时允许。0026 后新快照使用 Dataset
+Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
+新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变。
 评估模式明确区分 `historical_online` 与尚未执行候选模型的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
@@ -220,7 +224,8 @@ manifest hash 由规范化合同与条目共同生成；Evaluation Run 只读取
 参与者创建日开始计算。Peak 指标明确标记为至少两个匹配样本形成的 observed peak proxy，
 并按 participant/date/forecast version 隔离。Stage 2 同样不修改 CTSSM 主方程。
 可选的真实 PostgreSQL 集成测试从 0016 插入 current/degraded 数据后升级到 0017，
-再升级到 0026，并验证列、JSONB、participant membership、
+先升级到 0025 创建真实 v2 快照，再升级到 0026，验证 v2 快照原样保留且仍可评估，并验证
+新 v3 快照的 participant membership、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 

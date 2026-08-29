@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -12,12 +13,43 @@ from alembic.config import Config
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.db import build_engine
+from app.services.research_evaluation import (
+    DATASET_SCHEMA_V2,
+    DATASET_SCHEMA_V3,
+    ResearchEvaluationService,
+)
 from postgres_test_guard import optional_test_postgres_url
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _ConnectionDatabase:
+    """Run service sessions inside the migration test's isolated schema."""
+
+    def __init__(self, connection):
+        self.engine = connection.engine
+        self.connection = connection
+
+    @contextmanager
+    def session(self):
+        session = Session(
+            bind=self.connection,
+            expire_on_commit=False,
+            autoflush=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
 
 def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
@@ -411,10 +443,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0026_dataset_participant_membership")
+            command.upgrade(config, "0025_dataset_snapshot_items")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0026_dataset_participant_membership"
+            ) == "0025_dataset_snapshot_items"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
             assert {
@@ -468,15 +500,35 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             ) == "CASCADE"
             dataset_snapshot_id = uuid.uuid4()
             dataset_item_id = uuid.uuid4()
-            membership_item_id = uuid.uuid4()
+            legacy_metadata = {"observation_id": "source-1"}
+            legacy_item = ResearchEvaluationService._item(
+                "observation",
+                "source-1",
+                "observation.v1",
+                participant_id,
+                date(2030, 1, 15),
+                legacy_metadata,
+            )
+            legacy_contract = {
+                "schema_version": DATASET_SCHEMA_V2,
+                "date_start": "2030-01-15",
+                "date_end": "2030-01-15",
+                "participant_filter": {
+                    "participant_codes": ["MIGRATION-TEST"]
+                },
+                "observation_cutoff": now.isoformat(),
+                "calendar_cutoff": now.isoformat(),
+            }
             manifest = {
-                "schema_version": "mindflow-research-dataset-v2",
+                "schema_version": DATASET_SCHEMA_V2,
                 "participant_count": 1,
                 "observation_count": 1,
                 "forecast_count": 0,
                 "calendar_count": 0,
-                "item_count": 2,
-                "manifest_hash": "a" * 64,
+                "item_count": 1,
+                "manifest_hash": ResearchEvaluationService._manifest_hash(
+                    legacy_contract, [legacy_item]
+                ),
             }
             connection.execute(
                 text(
@@ -489,7 +541,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                         :id, :created_at, :date_start, :date_end,
                         CAST(:participant_filter AS jsonb),
                         :observation_cutoff, :calendar_cutoff,
-                        'mindflow-research-dataset-v2', CAST(:manifest AS jsonb)
+                        :schema_version, CAST(:manifest AS jsonb)
                     )
                     """
                 ),
@@ -499,10 +551,11 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                     "date_start": date(2030, 1, 15),
                     "date_end": date(2030, 1, 15),
                     "participant_filter": json.dumps(
-                        {"participant_codes": ["P001"]}
+                        {"participant_codes": ["MIGRATION-TEST"]}
                     ),
                     "observation_cutoff": now,
                     "calendar_cutoff": now,
+                    "schema_version": DATASET_SCHEMA_V2,
                     "manifest": json.dumps(manifest),
                 },
             )
@@ -511,7 +564,8 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 "dataset_snapshot_id": dataset_snapshot_id,
                 "participant_id": participant_id,
                 "local_date": date(2030, 1, 15),
-                "metadata": json.dumps({"observation_id": "source-1"}),
+                "source_hash": legacy_item["source_hash"],
+                "metadata": json.dumps(legacy_metadata),
                 "created_at": now,
             }
             connection.execute(
@@ -524,42 +578,12 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                     ) VALUES (
                         :id, :dataset_snapshot_id, 'observation', 'source-1',
                         'observation.v1', :participant_id, :local_date,
-                        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                        :source_hash,
                         CAST(:metadata AS jsonb), :created_at
                     )
                     """
                 ),
                 item_values,
-            )
-            membership_values = {
-                **item_values,
-                "id": membership_item_id,
-                "metadata": json.dumps(
-                    {
-                        "participant_id": str(participant_id),
-                        "participant_code": "MIGRATION-TEST",
-                        "joined_at": now.isoformat(),
-                        "status_at_snapshot": "active",
-                    }
-                ),
-            }
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO dataset_snapshot_items (
-                        id, dataset_snapshot_id, item_type, source_id,
-                        source_version, participant_id, local_date,
-                        source_hash, metadata_json, created_at
-                    ) VALUES (
-                        :id, :dataset_snapshot_id, 'participant',
-                        CAST(:participant_id AS text),
-                        'participant-membership.v1', :participant_id, :local_date,
-                        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-                        CAST(:metadata AS jsonb), :created_at
-                    )
-                    """
-                ),
-                membership_values,
             )
             assert connection.scalar(
                 text(
@@ -568,6 +592,84 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 ),
                 {"id": dataset_snapshot_id},
             ) == manifest["item_count"]
+            command.upgrade(config, "0026_dataset_participant_membership")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0026_dataset_participant_membership"
+            assert connection.execute(
+                text(
+                    "SELECT schema_version, manifest_json "
+                    "FROM dataset_snapshots WHERE id = :id"
+                ),
+                {"id": dataset_snapshot_id},
+            ).one() == (DATASET_SCHEMA_V2, manifest)
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM dataset_snapshot_items "
+                    "WHERE dataset_snapshot_id = :id"
+                ),
+                {"id": dataset_snapshot_id},
+            ) == 1
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM dataset_snapshot_items "
+                    "WHERE dataset_snapshot_id = :id "
+                    "AND item_type = 'participant'"
+                ),
+                {"id": dataset_snapshot_id},
+            ) == 0
+            inspector = inspect(connection)
+            item_checks = inspector.get_check_constraints(
+                "dataset_snapshot_items"
+            )
+            assert any(
+                "participant" in str(check.get("sqltext") or "")
+                for check in item_checks
+                if check.get("name") == "ck_dataset_snapshot_item_type"
+            )
+
+            service = ResearchEvaluationService(
+                _ConnectionDatabase(connection), "Asia/Shanghai"
+            )
+            legacy_run = service.create_evaluation_run(
+                dataset_snapshot_id, "algorithm-v1"
+            )
+            legacy_participant_run = service.create_evaluation_run(
+                dataset_snapshot_id,
+                "algorithm-v1",
+                participant_id=participant_id,
+            )
+            assert legacy_run["status"] == "completed"
+            assert legacy_run["metrics"]["metrics"]["sample_count"] == 0
+            assert legacy_run["metrics"]["config"][
+                "dataset_schema_version"
+            ] == DATASET_SCHEMA_V2
+            assert legacy_participant_run["status"] == "completed"
+
+            v3_snapshot = service.create_dataset_snapshot(
+                date_start=date(2030, 1, 15),
+                date_end=date(2030, 1, 15),
+                participant_filter={
+                    "participant_codes": ["MIGRATION-TEST"]
+                },
+                observation_cutoff=now,
+                calendar_cutoff=now,
+            )
+            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V3
+            assert v3_snapshot["manifest"]["participant_count"] == 1
+            v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
+            memberships = service.snapshot_items(v3_snapshot_id, "participant")
+            assert len(memberships) == 1
+            membership = memberships[0]
+            assert membership["participant_id"] == str(participant_id)
+            v3_run = service.create_evaluation_run(
+                v3_snapshot_id,
+                "algorithm-v1",
+                participant_id=participant_id,
+            )
+            assert v3_run["status"] == "completed"
+            assert v3_run["metrics"]["metrics"]["sample_count"] == 0
+
             with pytest.raises(IntegrityError), connection.begin_nested():
                 duplicate = dict(item_values)
                 duplicate["id"] = uuid.uuid4()
@@ -588,6 +690,15 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                     ),
                     duplicate,
                 )
+            membership_values = {
+                "id": uuid.UUID(membership["id"]),
+                "dataset_snapshot_id": v3_snapshot_id,
+                "participant_id": participant_id,
+                "local_date": date.fromisoformat(membership["local_date"]),
+                "source_hash": membership["source_hash"],
+                "metadata": json.dumps(membership["metadata"]),
+                "created_at": now,
+            }
             with pytest.raises(IntegrityError), connection.begin_nested():
                 duplicate_membership = dict(membership_values)
                 duplicate_membership["id"] = uuid.uuid4()
@@ -603,7 +714,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                             CAST(:participant_id AS text),
                             'participant-membership.v1', :participant_id,
                             :local_date,
-                            'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                            :source_hash,
                             CAST(:metadata AS jsonb), :created_at
                         )
                         """
