@@ -411,12 +411,17 @@ def test_real_postgres_upgrade_0016_to_0023_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0023_stage1_gate_constraints")
+            command.upgrade(config, "0024_research_evaluation")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0023_stage1_gate_constraints"
+            ) == "0024_research_evaluation"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
+            assert {
+                "forecast_observation_matches",
+                "dataset_snapshots",
+                "model_evaluation_runs",
+            } <= set(inspector.get_table_names())
             currentness_columns = {
                 column["name"]
                 for column in inspector.get_columns("forecast_currentness_events")
@@ -752,10 +757,10 @@ def test_real_postgres_upgrade_0016_to_0023_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0023_stage1_gate_constraints")
+            command.upgrade(config, "0024_research_evaluation")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0023_stage1_gate_constraints"
+            ) == "0024_research_evaluation"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

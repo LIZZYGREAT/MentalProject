@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0023_stage1_gate_constraints -->
+<!-- ALEMBIC_HEAD: 0024_research_evaluation -->
 
 ## 运行边界
 
@@ -175,12 +175,15 @@ authoritative full text，`reply_segments_json` 保存当前分段；只有历�
 清理后的权威正文逐字一致，且不会切断 URL、链接或未闭合结构。
 
 Admin 是独立 HTTP 服务，提供参与者、Forecast、Warning、Calendar、Daily Review、Care
-Timeline 和运行事件查询。Calendar 视图显示 snapshot state 与最近刷新结果，便于识别
+Timeline 和运行事件查询。研究评估页按日期窗口展示 cohort 数据完整性、Forecast 误差、
+Prediction Interval 校准与 Warning/Care 指标；参与者研究诊断展示 7/14 日趋势、参数历史、
+分层残差及因果匹配明细。数据质量页可按参与者和日期过滤缺失、迟到、回填、降级、语义状态、
+重复、合成与时间异常。Calendar 视图显示 snapshot state 与最近刷新结果，便于识别
 mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0023_stage1_gate_constraints`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0024_research_evaluation`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -202,8 +205,12 @@ SQLAlchemy 读写全部在线程执行，不阻塞 asyncio loop。
 CHECK；Forecast 只读取 validated 参数，或保留迁移前已生效且 `model_version=legacy` 的兼容行。
 更新的 candidate 与 rejected 参数不会进入正式 Forecast。四层画像在 Admin 中分别显示 Explicit、
 Psychometrics、Slow State 与 Learned Parameters，Schema/兼容字段与 Explicit 分开；Stage 1 不修改
-CTSSM 主方程。可选的真实 PostgreSQL 集成测试从 0016 插入 current/degraded 数据后升级到 0017，
-再升级到 0023，并验证列、JSONB、
+CTSSM 主方程。0024 新增 `forecast_observation_matches`、`dataset_snapshots` 与
+`model_evaluation_runs`；匹配记录使用观测时点当时生效的 Forecast，在最近五分钟 grid point
+的 ±2.5 分钟内落库，并保留预测区间和分层诊断上下文。模型训练和比较通过 observation/calendar
+cutoff、schema version 与 manifest 固定数据边界。Stage 2 同样不修改 CTSSM 主方程。
+可选的真实 PostgreSQL 集成测试从 0016 插入 current/degraded 数据后升级到 0017，
+再升级到 0024，并验证列、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 

@@ -587,6 +587,158 @@ class ForecastCurrentnessEvent(Base):
     )
 
 
+class ForecastObservationMatch(Base):
+    """Causal alignment between an EMA and a five-minute forecast point."""
+
+    __tablename__ = "forecast_observation_matches"
+    __table_args__ = (
+        UniqueConstraint(
+            "observation_id",
+            "forecast_id",
+            name="uq_forecast_observation_match",
+        ),
+        Index(
+            "ix_forecast_observation_match_participant_day",
+            "participant_id",
+            "local_date",
+            "observed_at",
+        ),
+        CheckConstraint(
+            "actual_stress >= 0 AND actual_stress <= 10",
+            name="ck_forecast_match_actual_stress",
+        ),
+        CheckConstraint(
+            "predicted_stress >= 0 AND predicted_stress <= 10",
+            name="ck_forecast_match_predicted_stress",
+        ),
+        CheckConstraint(
+            "prediction_lower IS NULL OR "
+            "(prediction_lower >= 0 AND prediction_lower <= 10)",
+            name="ck_forecast_match_prediction_lower",
+        ),
+        CheckConstraint(
+            "prediction_upper IS NULL OR "
+            "(prediction_upper >= 0 AND prediction_upper <= 10)",
+            name="ck_forecast_match_prediction_upper",
+        ),
+        CheckConstraint(
+            "prediction_lower IS NULL OR prediction_upper IS NULL OR "
+            "prediction_lower <= prediction_upper",
+            name="ck_forecast_match_interval_order",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    forecast_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("forecast_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    forecast_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    forecast_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    observation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("state_observations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    predicted_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    actual_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    residual: Mapped[float] = mapped_column(Float, nullable=False)
+    prediction_lower: Mapped[float | None] = mapped_column(Float, nullable=True)
+    prediction_upper: Mapped[float | None] = mapped_column(Float, nullable=True)
+    context_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class DatasetSnapshot(Base):
+    """Immutable manifest binding future training and evaluation to data cutoffs."""
+
+    __tablename__ = "dataset_snapshots"
+    __table_args__ = (
+        Index("ix_dataset_snapshot_created", "created_at"),
+        CheckConstraint("date_start <= date_end", name="ck_dataset_snapshot_dates"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    date_start: Mapped[date] = mapped_column(Date, nullable=False)
+    date_end: Mapped[date] = mapped_column(Date, nullable=False)
+    participant_filter: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    observation_cutoff: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    calendar_cutoff: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+
+
+class ModelEvaluationRun(Base):
+    """Versioned evaluation result tied to one immutable dataset snapshot."""
+
+    __tablename__ = "model_evaluation_runs"
+    __table_args__ = (
+        Index(
+            "ix_model_evaluation_snapshot_created",
+            "dataset_snapshot_id",
+            "created_at",
+        ),
+        Index(
+            "ix_model_evaluation_model_created",
+            "model_version",
+            "created_at",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed')",
+            name="ck_model_evaluation_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    dataset_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    participant_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    metrics_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+
+
 class WarningSchedule(Base):
     __tablename__ = "warning_schedules"
     __table_args__ = (

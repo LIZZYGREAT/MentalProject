@@ -90,6 +90,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0023_stage1_gate_constraints"
     )
     assert migration_0023.down_revision == "0022_research_profile_v2"
+    migration_0024 = next(
+        migration for migration in migrations
+        if migration.revision == "0024_research_evaluation"
+    )
+    assert migration_0024.down_revision == "0023_stage1_gate_constraints"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -201,6 +206,59 @@ def test_0023_adds_learned_and_slow_state_checks_without_relabeling_legacy(
         "ck_slow_state_sleep_debt",
     } <= {name for name, table, _ in created if table == "participant_slow_states"}
     assert statements == []
+
+
+def test_0024_adds_reproducible_research_evaluation_tables(monkeypatch):
+    migration = _migration(VERSIONS / "0024_research_evaluation.py")
+    tables = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *items, **kwargs: tables.append(
+            (name, {item.name for item in items if hasattr(item, "name")})
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+
+    migration.upgrade()
+
+    table_map = dict(tables)
+    assert set(table_map) == {
+        "forecast_observation_matches",
+        "dataset_snapshots",
+        "model_evaluation_runs",
+    }
+    assert {
+        "forecast_version",
+        "forecast_timestamp",
+        "observation_id",
+        "predicted_stress",
+        "actual_stress",
+        "residual",
+        "context_json",
+    } <= table_map["forecast_observation_matches"]
+    assert {
+        "participant_filter",
+        "observation_cutoff",
+        "calendar_cutoff",
+        "schema_version",
+        "manifest_json",
+    } <= table_map["dataset_snapshots"]
+    assert {
+        "dataset_snapshot_id",
+        "model_version",
+        "participant_id",
+        "metrics_json",
+        "status",
+    } <= table_map["model_evaluation_runs"]
+    assert len(indexes) == 4
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

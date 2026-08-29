@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import hmac
 import uuid
 from typing import Any, Awaitable, Callable
@@ -27,6 +27,7 @@ from app.repositories_daily_review import (
     DailyReviewResponseRepository, RetrospectiveCurveRepository,
 )
 from app.services.daily_review_service import DailyReviewService
+from app.services.research_evaluation import ResearchEvaluationService
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
@@ -55,6 +56,9 @@ class AdminAPI:
             repository.database
         )
         self.observations_repository = ObservationRepository(repository.database)
+        self.research = ResearchEvaluationService(
+            repository.database, settings.timezone_name
+        )
         self.signer = SessionSigner(
             settings.admin_session_secret or "test-admin-session-secret",
             settings.admin_session_ttl_seconds,
@@ -67,6 +71,20 @@ class AdminAPI:
                 ZoneInfo(self.settings.timezone_name)
             ).date().isoformat(),
         }
+
+    def _research_dates(self, request: Request, default_days: int = 14):
+        today = datetime.now(ZoneInfo(self.settings.timezone_name)).date()
+        try:
+            end = date.fromisoformat(request.query_params.get("date_end") or today.isoformat())
+            start = date.fromisoformat(
+                request.query_params.get("date_start")
+                or (end - timedelta(days=default_days - 1)).isoformat()
+            )
+            if start > end or (end - start).days > 365:
+                raise ValueError
+            return start, end, None
+        except ValueError:
+            return None, None, _json_error("invalid_date_range", 400)
 
     @staticmethod
     def _query_int(
@@ -570,6 +588,196 @@ class AdminAPI:
             )
         )
 
+    async def research_dashboard(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        date_start, date_end, error = self._research_dates(request)
+        if error:
+            return error
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.cohort_dashboard, date_start, date_end
+            )
+        )
+
+    async def data_quality(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        date_start, date_end, error = self._research_dates(request)
+        if error:
+            return error
+        participant_id = None
+        participant_code = str(
+            request.query_params.get("participant_code") or ""
+        ).strip()
+        if participant_code:
+            participant_id = await asyncio.to_thread(
+                self.repository.participant_id, participant_code
+            )
+            if participant_id is None:
+                return _json_error("participant_not_found", 404)
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.data_quality,
+                date_start,
+                date_end,
+                participant_id,
+            )
+        )
+
+    async def participant_longitudinal(self, request: Request) -> Response:
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        try:
+            through = date.fromisoformat(
+                request.query_params.get("through")
+                or datetime.now(ZoneInfo(self.settings.timezone_name))
+                .date()
+                .isoformat()
+            )
+            days = int(request.query_params.get("days") or 14)
+            if days not in {7, 14}:
+                raise ValueError
+        except (TypeError, ValueError):
+            return _json_error("invalid_query_parameter", 400)
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.participant_longitudinal,
+                participant_id,
+                through,
+                days,
+            )
+        )
+
+    async def participant_evaluation(self, request: Request) -> Response:
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        date_start, date_end, error = self._research_dates(request)
+        if error:
+            return error
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.evaluation,
+                date_start,
+                date_end,
+                participant_id,
+            )
+        )
+
+    async def rebuild_research_matches(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=True)
+        if session is None:
+            return _json_error("unauthorized_or_csrf", 401)
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        date_start, date_end, error = self._research_dates(request)
+        if error:
+            return error
+        participant_id = None
+        participant_code = str(
+            request.query_params.get("participant_code") or ""
+        ).strip()
+        if participant_code:
+            participant_id = await asyncio.to_thread(
+                self.repository.participant_id, participant_code
+            )
+            if participant_id is None:
+                return _json_error("participant_not_found", 404)
+        result = await asyncio.to_thread(
+            self.research.rebuild_matches,
+            date_start=date_start,
+            date_end=date_end,
+            participant_id=participant_id,
+        )
+        return JSONResponse(result)
+
+    async def dataset_snapshots(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=request.method == "POST")
+        if session is None:
+            return _json_error(
+                "unauthorized_or_csrf" if request.method == "POST" else "unauthorized",
+                401,
+            )
+        if request.method == "GET":
+            limit, error = self._query_int(
+                request, "limit", 50, maximum=200
+            )
+            if error:
+                return error
+            return JSONResponse(
+                {"items": await asyncio.to_thread(self.research.list_snapshots, limit)}
+            )
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        try:
+            value = await request.json()
+            today = datetime.now(ZoneInfo(self.settings.timezone_name)).date()
+            date_end = date.fromisoformat(
+                str(value.get("date_end") or today.isoformat())
+            )
+            date_start = date.fromisoformat(
+                str(
+                    value.get("date_start")
+                    or (date_end - timedelta(days=13)).isoformat()
+                )
+            )
+            participant_filter = value.get("participant_filter") or {}
+            if not isinstance(participant_filter, dict):
+                raise ValueError("participant_filter must be an object")
+            item = await asyncio.to_thread(
+                self.research.create_dataset_snapshot,
+                date_start=date_start,
+                date_end=date_end,
+                participant_filter=participant_filter,
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse(item, status_code=201)
+
+    async def evaluation_runs(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=request.method == "POST")
+        if session is None:
+            return _json_error(
+                "unauthorized_or_csrf" if request.method == "POST" else "unauthorized",
+                401,
+            )
+        if request.method == "GET":
+            limit, error = self._query_int(
+                request, "limit", 100, maximum=500
+            )
+            if error:
+                return error
+            return JSONResponse(
+                {"items": await asyncio.to_thread(self.research.list_runs, limit)}
+            )
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        try:
+            value = await request.json()
+            snapshot_id = uuid.UUID(str(value.get("dataset_snapshot_id") or ""))
+            model_version = str(value.get("model_version") or "").strip()
+            if not model_version:
+                raise ValueError("model_version is required")
+            participant_id = None
+            participant_code = str(value.get("participant_code") or "").strip()
+            if participant_code:
+                participant_id = await asyncio.to_thread(
+                    self.repository.participant_id, participant_code
+                )
+                if participant_id is None:
+                    return _json_error("participant_not_found", 404)
+            item = await asyncio.to_thread(
+                self.research.create_evaluation_run,
+                snapshot_id,
+                model_version,
+                participant_id,
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse(item, status_code=201)
+
     async def incidents(self, request: Request) -> Response:
         if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
@@ -662,6 +870,13 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}", self.retrospective_curve, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/rebuild", self.rebuild_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/reanalysis", self.reanalyse_retrospective_curve, methods=["POST"]),
+            Route(f"{prefix}/research/dashboard", self.research_dashboard, methods=["GET"]),
+            Route(f"{prefix}/data-quality", self.data_quality, methods=["GET"]),
+            Route(f"{prefix}/research/matches/rebuild", self.rebuild_research_matches, methods=["POST"]),
+            Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),
+            Route(f"{prefix}/research/evaluation-runs", self.evaluation_runs, methods=["GET", "POST"]),
+            Route(f"{prefix}/participants/{{participant_code}}/longitudinal", self.participant_longitudinal, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/evaluation", self.participant_evaluation, methods=["GET"]),
             Route(f"{prefix}/incidents", self.incidents, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_list, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_create, methods=["POST"]),
