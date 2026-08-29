@@ -46,6 +46,30 @@ def _profile_v2() -> dict:
     }
 
 
+def _insert_migrated_legacy_profile(
+    database, participant_id, *, version: int, stress: float
+) -> None:
+    """Simulate an existing row backfilled by migration 0022."""
+
+    with database.session() as session:
+        session.add(
+            LearnedModelProfile(
+                participant_id=participant_id,
+                version=version,
+                parameters_json={"S_star_init": stress},
+                uncertainty_json={},
+                source="pilot-calibration-v1",
+                model_version="legacy",
+                validation_status="candidate",
+                sample_count=14,
+                day_count=7,
+                confidence=0.6,
+                window_start=date(2029, 12, 1),
+                window_end=date(2029, 12, 7),
+            )
+        )
+
+
 def test_profile_schema_v2_requires_field_provenance_and_keeps_legacy_compatible():
     assert validate_profile_v2({"preferred_name": "legacy"}) == {
         "preferred_name": "legacy"
@@ -270,6 +294,14 @@ def test_forecast_only_receives_runtime_active_learned_parameters(
     person = ParticipantRepository(database).create("P-RUNTIME-ACTIVE")
     learned = LearnedProfileRepository(database)
     for status, model_version, stress in rows:
+        if model_version == "legacy":
+            _insert_migrated_legacy_profile(
+                database,
+                person.id,
+                version=1,
+                stress=stress,
+            )
+            continue
         learned.save(
             person.id,
             parameters={"S_star_init": stress},
@@ -352,16 +384,11 @@ def test_learned_repository_latest_and_runtime_active_are_distinct():
     database = memory_database()
     person = participant(database, "P001")
     learned = LearnedProfileRepository(database)
-    legacy = learned.save(
+    _insert_migrated_legacy_profile(
+        database,
         person.id,
-        parameters={"S_star_init": 41.0},
-        sample_count=10,
-        day_count=5,
-        confidence=0.5,
-        window_start=date(2029, 1, 1),
-        window_end=date(2029, 1, 5),
-        model_version="legacy",
-        validation_status="candidate",
+        version=1,
+        stress=41.0,
     )
     candidate = learned.save(
         person.id,
@@ -376,7 +403,7 @@ def test_learned_repository_latest_and_runtime_active_are_distinct():
     )
 
     assert learned.latest(person.id)["version"] == candidate["version"]
-    assert learned.runtime_active(person.id)["version"] == legacy["version"]
+    assert learned.runtime_active(person.id)["version"] == 1
 
 
 @pytest.mark.parametrize(
@@ -388,6 +415,7 @@ def test_learned_repository_latest_and_runtime_active_are_distinct():
         ({"window_start": date(2030, 2, 1)}, "window_start"),
         ({"source": ""}, "source"),
         ({"model_version": ""}, "model_version"),
+        ({"model_version": "legacy"}, "reserved"),
         ({"validation_status": "active"}, "validation_status"),
         (
             {"validation_status": "validated", "uncertainty": {}},

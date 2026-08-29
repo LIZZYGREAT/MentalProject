@@ -413,6 +413,11 @@ class LearnedProfileRepository:
             raise ValueError("source is required")
         if not normalized_model_version:
             raise ValueError("model_version is required")
+        if normalized_model_version == "legacy":
+            raise ValueError(
+                "model_version='legacy' is reserved for migrated "
+                "pre-validation profiles"
+            )
         if isinstance(confidence, bool):
             raise ValueError("confidence must be between 0 and 1")
         try:
