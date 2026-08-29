@@ -1,4 +1,4 @@
-"""Opt-in proof that the real 0016 -> 0021 PostgreSQL migrations are executable."""
+"""Opt-in proof that the real 0016 -> 0022 PostgreSQL migrations are executable."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from postgres_test_guard import optional_test_postgres_url
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_postgres_upgrade_0016_to_0021_preserves_and_backfills():
+def test_real_postgres_upgrade_0016_to_0022_preserves_and_backfills():
     try:
         raw_url = optional_test_postgres_url()
     except ValueError as exc:
@@ -389,10 +389,10 @@ def test_real_postgres_upgrade_0016_to_0021_preserves_and_backfills():
                 {"id": reconciliation_id},
             ).one() == ("remote_committed", 1)
 
-            command.upgrade(config, "0021_daily_review_energy_optional")
+            command.upgrade(config, "0022_research_profile_v2")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0021_daily_review_energy_optional"
+            ) == "0022_research_profile_v2"
             inspector = inspect(connection)
             assert "forecast_currentness_events" in inspector.get_table_names()
             currentness_columns = {
@@ -420,6 +420,20 @@ def test_real_postgres_upgrade_0016_to_0021_preserves_and_backfills():
                 for column in inspector.get_columns("daily_review_responses")
             }
             assert review_columns["energy_consumption"]["nullable"] is True
+            assert {
+                "psychometric_assessments",
+                "participant_slow_states",
+                "event_appraisal_feedback",
+            } <= set(inspector.get_table_names())
+            learned_columns = {
+                column["name"]
+                for column in inspector.get_columns("learned_model_profiles")
+            }
+            assert {
+                "uncertainty_json",
+                "model_version",
+                "validation_status",
+            } <= learned_columns
             assert connection.scalar(
                 text(
                     "SELECT energy_consumption FROM daily_review_responses "
@@ -479,10 +493,10 @@ def test_real_postgres_upgrade_0016_to_0021_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0021_daily_review_energy_optional")
+            command.upgrade(config, "0022_research_profile_v2")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0021_daily_review_energy_optional"
+            ) == "0022_research_profile_v2"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

@@ -80,6 +80,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0021_daily_review_energy_optional"
     )
     assert migration_0021.down_revision == "0020_oauth_refresh_lease"
+    migration_0022 = next(
+        migration for migration in migrations
+        if migration.revision == "0022_research_profile_v2"
+    )
+    assert migration_0022.down_revision == "0021_daily_review_energy_optional"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -107,6 +112,56 @@ def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
     migration.downgrade()
     assert "WHERE energy_consumption IS NULL" in statements[-1]
     assert alterations[-1][1]["nullable"] is False
+
+
+def test_0022_adds_stage1_research_tables_and_learned_parameter_audit(monkeypatch):
+    migration = _migration(VERSIONS / "0022_research_profile_v2.py")
+    tables = []
+    columns = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *items, **kwargs: tables.append(
+            (name, {item.name for item in items if hasattr(item, "name")})
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+
+    migration.upgrade()
+
+    table_map = dict(tables)
+    assert set(table_map) == {
+        "psychometric_assessments",
+        "participant_slow_states",
+        "event_appraisal_feedback",
+    }
+    assert {"instrument_name", "raw_items_json", "scores_json"} <= table_map[
+        "psychometric_assessments"
+    ]
+    assert {"rolling_7d_workload", "recent_sleep_debt"} <= table_map[
+        "participant_slow_states"
+    ]
+    assert {"mental_demand", "actual_stress", "perceived_control"} <= table_map[
+        "event_appraisal_feedback"
+    ]
+    assert [column.name for table, column in columns if table == "learned_model_profiles"] == [
+        "uncertainty_json",
+        "model_version",
+        "validation_status",
+    ]
+    assert len(indexes) == 3
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

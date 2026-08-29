@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0021_daily_review_energy_optional -->
+<!-- ALEMBIC_HEAD: 0022_research_profile_v2 -->
 
 ## 运行边界
 
@@ -180,7 +180,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0021_daily_review_energy_optional`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0022_research_profile_v2`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -197,8 +197,10 @@ OAuth token 增加 expiring refresh lease。claim 与 finalize 都是短事务�
 SQLAlchemy 读写全部在线程执行，不阻塞 asyncio loop。
 
 生产启动依赖显式 Alembic upgrade，不在应用启动时 `create_all`。0021 将 Daily Review 中
-仅作研究诊断的全天精力消耗改为可空字段。可选的真实 PostgreSQL 集成测试从 0016 插入
-current/degraded 数据后升级到 0017，再升级到 0021，并验证列、JSONB、
+仅作研究诊断的全天精力消耗改为可空字段。0022 增加追加式量表、事件评价与慢状态表，
+并为学习参数补充不确定性、模型版本和验证状态。四层画像在 Admin 中分别显示 Explicit、
+Psychometrics、Slow State 与 Learned Parameters；Stage 1 不修改 CTSSM 主方程。可选的真实
+PostgreSQL 集成测试从 0016 插入 current/degraded 数据后升级到 0017，再升级到 0022，并验证列、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
 

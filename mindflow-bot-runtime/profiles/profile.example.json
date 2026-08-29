@@ -1,6 +1,36 @@
 {
-  "preferred_name": "",
-  "research_group": "",
-  "notes": "",
+  "schema_version": "2.0",
+  "explicit": {
+    "preferred_name": {
+      "value": "",
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    },
+    "typical_sleep_window": {
+      "value": null,
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    },
+    "chronotype": {
+      "value": null,
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    },
+    "typical_study_load": {
+      "value": null,
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    },
+    "exercise_frequency": {
+      "value": null,
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    },
+    "preferred_recovery_methods": {
+      "value": [],
+      "source": "participant",
+      "updated_at": "2026-01-01T00:00:00+00:00"
+    }
+  },
   "model_params": {}
 }

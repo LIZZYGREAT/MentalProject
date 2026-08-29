@@ -208,8 +208,10 @@ Calendar create/update/delete 在调用飞书前写入 durable `prepared` reconc
 成功、本地 Forecast/Warning 隔离和后台重算分别推进状态；preflight 未发出的失败禁止 replay，只有
 event mutation 已发送后的未知结果保持 recoverable。`remote_committed` 立即 due，并由数据库 claim
 避免请求与恢复双重处理；进程重启会在 scheduler 前完成旧 intent fencing。Forecast currentness 使用 append-only history，
-OAuth refresh 使用不跨 HTTP 持锁的 expiring lease。当前唯一 Alembic head 为
-`0021_daily_review_energy_optional`，JSON 业务列在 PostgreSQL 使用 JSONB。
+OAuth refresh 使用不跨 HTTP 持锁的 expiring lease。研究画像分为 Explicit、Psychometrics、
+Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加保存，学习参数保留不确定性、
+模型版本与验证状态。当前唯一 Alembic head 为 `0022_research_profile_v2`，JSON 业务列在
+PostgreSQL 使用 JSONB；Stage 1 不修改 CTSSM 主方程。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

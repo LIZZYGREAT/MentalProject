@@ -210,6 +210,12 @@ class CareTools:
                     "activity": {"type": "string", "minLength": 1, "maxLength": 120},
                     "stress_event_since_last": {"type": "boolean"},
                     "event_ongoing": {"type": "boolean"},
+                    "current_workload": {
+                        "type": "number", "minimum": 0, "maximum": 10
+                    },
+                    "perceived_control": {
+                        "type": "number", "minimum": 0, "maximum": 10
+                    },
                 },
                 "required": [
                     "stress",
@@ -502,6 +508,10 @@ class CareTools:
             "stress_event_since_last": bool(args["stress_event_since_last"]),
             "event_ongoing": bool(args["event_ongoing"]),
         }
+        if args.get("current_workload") is not None:
+            payload["current_workload_0_10"] = float(args["current_workload"])
+        if args.get("perceived_control") is not None:
+            payload["perceived_control_0_10"] = float(args["perceived_control"])
         write = self.observations.add_with_status(
             ctx.participant_id,
             "checkin",

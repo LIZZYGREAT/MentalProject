@@ -7,6 +7,7 @@ import uuid
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -110,6 +111,89 @@ class ParticipantProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class PsychometricAssessment(Base):
+    """Append-only administration history for validated psychometric instruments."""
+
+    __tablename__ = "psychometric_assessments"
+    __table_args__ = (
+        Index(
+            "ix_psychometric_participant_time",
+            "participant_id",
+            "administered_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    instrument_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    instrument_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    language: Mapped[str] = mapped_column(String(16), nullable=False)
+    raw_items_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    scores_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    administered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reference_period: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantSlowState(Base):
+    """Append-only, derived state whose expected cadence is daily or weekly."""
+
+    __tablename__ = "participant_slow_states"
+    __table_args__ = (
+        Index("ix_slow_state_participant_time", "participant_id", "effective_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cadence: Mapped[str] = mapped_column(String(16), nullable=False)
+    rolling_7d_stress: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rolling_7d_workload: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rolling_7d_energy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recent_recovery_quality: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recent_sleep_debt: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exam_period_flag: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class EventAppraisalFeedback(Base):
+    """Participant feedback used to calibrate event semantics and workload."""
+
+    __tablename__ = "event_appraisal_feedback"
+    __table_args__ = (
+        Index("ix_event_appraisal_participant_time", "participant_id", "submitted_at"),
+        CheckConstraint("mental_demand >= 0 AND mental_demand <= 10", name="ck_event_appraisal_mental"),
+        CheckConstraint("physical_demand >= 0 AND physical_demand <= 10", name="ck_event_appraisal_physical"),
+        CheckConstraint("temporal_demand >= 0 AND temporal_demand <= 10", name="ck_event_appraisal_temporal"),
+        CheckConstraint("effort >= 0 AND effort <= 10", name="ck_event_appraisal_effort"),
+        CheckConstraint("frustration >= 0 AND frustration <= 10", name="ck_event_appraisal_frustration"),
+        CheckConstraint("perceived_control >= 0 AND perceived_control <= 10", name="ck_event_appraisal_control"),
+        CheckConstraint("actual_stress >= 0 AND actual_stress <= 10", name="ck_event_appraisal_stress"),
+        CheckConstraint("perceived_performance >= 0 AND perceived_performance <= 10", name="ck_event_appraisal_performance"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    mental_demand: Mapped[float] = mapped_column(Float, nullable=False)
+    physical_demand: Mapped[float] = mapped_column(Float, nullable=False)
+    temporal_demand: Mapped[float] = mapped_column(Float, nullable=False)
+    effort: Mapped[float] = mapped_column(Float, nullable=False)
+    frustration: Mapped[float] = mapped_column(Float, nullable=False)
+    perceived_control: Mapped[float] = mapped_column(Float, nullable=False)
+    actual_stress: Mapped[float] = mapped_column(Float, nullable=False)
+    perceived_performance: Mapped[float] = mapped_column(Float, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class StateObservation(Base):
     __tablename__ = "state_observations"
     __table_args__ = (
@@ -193,7 +277,10 @@ class LearnedModelProfile(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     parameters_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    uncertainty_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
     source: Mapped[str] = mapped_column(String(64), nullable=False, default="calibration.v1")
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False, default="legacy")
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
     sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
     day_count: Mapped[int] = mapped_column(Integer, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)

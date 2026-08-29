@@ -23,6 +23,8 @@ from app.models import (
     Participant,
     ParticipantCarePreference,
     ParticipantProfile,
+    ParticipantSlowState,
+    PsychometricAssessment,
     RuntimeIncident,
     StateObservation,
     WarningSchedule,
@@ -226,6 +228,24 @@ class AdminRepository:
             .order_by(desc(LearnedModelProfile.version))
             .limit(1)
         ).scalar_one_or_none()
+        psychometrics = session.execute(
+            select(PsychometricAssessment)
+            .where(PsychometricAssessment.participant_id == row.id)
+            .order_by(desc(PsychometricAssessment.administered_at))
+            .limit(100)
+        ).scalars().all()
+        slow_states = session.execute(
+            select(ParticipantSlowState)
+            .where(ParticipantSlowState.participant_id == row.id)
+            .order_by(desc(ParticipantSlowState.effective_at))
+            .limit(100)
+        ).scalars().all()
+        learned_history = session.execute(
+            select(LearnedModelProfile)
+            .where(LearnedModelProfile.participant_id == row.id)
+            .order_by(desc(LearnedModelProfile.version))
+            .limit(100)
+        ).scalars().all()
         observation = session.execute(
             select(StateObservation)
             .where(StateObservation.participant_id == row.id)
@@ -240,12 +260,69 @@ class AdminRepository:
                     {
                         "version": learned.version,
                         "parameters": _redact(dict(learned.parameters_json)),
+                        "uncertainty": _redact(dict(learned.uncertainty_json or {})),
+                        "model_version": learned.model_version,
+                        "validation_status": learned.validation_status,
                         "confidence": learned.confidence,
                         "sample_count": learned.sample_count,
                         "day_count": learned.day_count,
                     }
                     if learned else None
                 ),
+                "profile_layers": {
+                    "explicit": (
+                        {
+                            "version": profile.version,
+                            "data": _redact(dict(profile.profile_json)),
+                            "created_at": _iso(profile.created_at),
+                        }
+                        if profile else None
+                    ),
+                    "psychometrics": [
+                        {
+                            "id": str(item.id),
+                            "instrument_name": item.instrument_name,
+                            "instrument_version": item.instrument_version,
+                            "language": item.language,
+                            "scores": _redact(dict(item.scores_json)),
+                            "administered_at": _iso(item.administered_at),
+                            "reference_period": item.reference_period,
+                            "created_at": _iso(item.created_at),
+                        }
+                        for item in psychometrics
+                    ],
+                    "slow_state": [
+                        {
+                            "id": str(item.id),
+                            "effective_at": _iso(item.effective_at),
+                            "cadence": item.cadence,
+                            "rolling_7d_stress": item.rolling_7d_stress,
+                            "rolling_7d_workload": item.rolling_7d_workload,
+                            "rolling_7d_energy": item.rolling_7d_energy,
+                            "recent_recovery_quality": item.recent_recovery_quality,
+                            "recent_sleep_debt": item.recent_sleep_debt,
+                            "exam_period_flag": item.exam_period_flag,
+                            "source": item.source,
+                            "created_at": _iso(item.created_at),
+                        }
+                        for item in slow_states
+                    ],
+                    "learned_parameters": [
+                        {
+                            "version": item.version,
+                            "parameters": _redact(dict(item.parameters_json)),
+                            "uncertainty": _redact(dict(item.uncertainty_json or {})),
+                            "sample_count": item.sample_count,
+                            "window_start": _iso(item.window_start),
+                            "window_end": _iso(item.window_end),
+                            "model_version": item.model_version,
+                            "validation_status": item.validation_status,
+                            "source": item.source,
+                            "created_at": _iso(item.created_at),
+                        }
+                        for item in learned_history
+                    ],
+                },
                 "latest_observation": self._observation_view(observation) if observation else None,
             }
         )

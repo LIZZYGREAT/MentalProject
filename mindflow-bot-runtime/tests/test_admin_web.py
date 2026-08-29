@@ -82,6 +82,17 @@ def test_admin_exposes_participant_bound_care_timeline_and_ui_tab():
     assert "/care-timeline" in script
 
 
+def test_admin_profile_ui_has_the_four_research_layers():
+    browser = client()
+    script = browser.get("/admin/static/app.js").text
+
+    assert "LAYER A · EXPLICIT" in script
+    assert "LAYER B · PSYCHOMETRICS" in script
+    assert "LAYER C · SLOW STATE" in script
+    assert "LAYER D · LEARNED PARAMETERS" in script
+    assert "标准量表与历史变化" in script
+
+
 def test_admin_login_rejects_wrong_password_and_session_cookie_is_httponly():
     browser = client()
     bad = browser.post(

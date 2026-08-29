@@ -38,6 +38,14 @@ def _integrity_matches(
 
 from app.db import Database
 from app.contracts.warning import WarningDeliveryPolicyConfig
+from app.contracts.research import (
+    EVENT_APPRAISAL_SCORE_FIELDS,
+    SLOW_STATE_FIELDS,
+    aware_utc,
+    normalize_instrument_name,
+    score_0_10,
+    validate_profile_v2,
+)
 from app.services.same_day_late_care_policy import SameDayLateCarePolicy
 from app.models import (
     AgentRun,
@@ -46,12 +54,15 @@ from app.models import (
     CalendarSnapshot,
     ClaudeSession,
     ConversationMessage,
+    EventAppraisalFeedback,
     EventSemanticCache,
     FeishuBinding,
     FeishuOAuthToken,
     Participant,
     ParticipantCarePreference,
     ParticipantProfile,
+    ParticipantSlowState,
+    PsychometricAssessment,
     LearnedModelProfile,
     ForecastCurrentnessEvent,
     ForecastSnapshot,
@@ -249,6 +260,7 @@ class ProfileRepository:
             }
 
     def save(self, participant_id: uuid.UUID, profile: dict[str, Any]) -> int:
+        validated = validate_profile_v2(profile)
         with self.database.session() as session:
             latest = session.execute(
                 select(ParticipantProfile.version)
@@ -262,7 +274,7 @@ class ProfileRepository:
                 ParticipantProfile(
                     participant_id=participant_id,
                     version=version,
-                    profile_json=dict(profile),
+                    profile_json=validated,
                 )
             )
             return version
@@ -274,10 +286,14 @@ class LearnedProfileRepository:
 
     @staticmethod
     def _view(row: LearnedModelProfile) -> dict[str, Any]:
+        uncertainty = dict(row.uncertainty_json or {})
         return {
             "version": row.version,
             "parameters": dict(row.parameters_json),
+            "uncertainty": uncertainty,
             "source": row.source,
+            "model_version": row.model_version,
+            "validation_status": row.validation_status,
             "sample_count": row.sample_count,
             "day_count": row.day_count,
             "confidence": row.confidence,
@@ -297,7 +313,12 @@ class LearnedProfileRepository:
         self, participant_id: uuid.UUID, *, parameters: dict[str, Any],
         sample_count: int, day_count: int, confidence: float,
         window_start: date, window_end: date, source: str = "calibration.v1",
+        uncertainty: dict[str, Any] | None = None,
+        model_version: str = "mindflow-ctssm-runtime-v7",
+        validation_status: str = "candidate",
     ) -> dict[str, Any]:
+        if validation_status not in {"candidate", "validated", "rejected"}:
+            raise ValueError("invalid validation_status")
         with self.database.session() as session:
             session.get(Participant, participant_id, with_for_update=True)
             latest = session.execute(select(LearnedModelProfile.version).where(
@@ -305,7 +326,11 @@ class LearnedProfileRepository:
             ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
             row = LearnedModelProfile(
                 participant_id=participant_id, version=int(latest or 0) + 1,
-                parameters_json=dict(parameters), source=source,
+                parameters_json=dict(parameters),
+                uncertainty_json=dict(uncertainty or {}),
+                source=source,
+                model_version=str(model_version)[:64],
+                validation_status=validation_status,
                 sample_count=sample_count, day_count=day_count,
                 confidence=max(0.0, min(1.0, float(confidence))),
                 window_start=window_start, window_end=window_end,
@@ -313,6 +338,209 @@ class LearnedProfileRepository:
             session.add(row)
             session.flush()
             return self._view(row)
+
+
+class PsychometricAssessmentRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: PsychometricAssessment) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "instrument_name": row.instrument_name,
+            "instrument_version": row.instrument_version,
+            "language": row.language,
+            "raw_items": dict(row.raw_items_json),
+            "scores": dict(row.scores_json),
+            "administered_at": row.administered_at.isoformat(),
+            "reference_period": row.reference_period,
+            "created_at": row.created_at.isoformat(),
+        }
+
+    def record(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        instrument_name: str,
+        instrument_version: str,
+        language: str,
+        raw_items: dict[str, Any],
+        scores: dict[str, Any],
+        administered_at: datetime,
+        reference_period: str | None = None,
+    ) -> dict[str, Any]:
+        name = normalize_instrument_name(instrument_name)
+        version = str(instrument_version or "").strip()
+        locale = str(language or "").strip()
+        if not version or not locale:
+            raise ValueError("instrument_version and language are required")
+        if not isinstance(raw_items, dict) or not isinstance(scores, dict):
+            raise ValueError("raw_items and scores must be objects")
+        with self.database.session() as session:
+            if session.get(Participant, participant_id) is None:
+                raise ValueError("participant not found")
+            row = PsychometricAssessment(
+                participant_id=participant_id,
+                instrument_name=name,
+                instrument_version=version[:32],
+                language=locale[:16],
+                raw_items_json=dict(raw_items),
+                scores_json=dict(scores),
+                administered_at=aware_utc(administered_at, "administered_at"),
+                reference_period=(
+                    str(reference_period).strip()[:64]
+                    if reference_period is not None else None
+                ),
+            )
+            session.add(row)
+            session.flush()
+            return self._view(row)
+
+    def history(self, participant_id: uuid.UUID, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(PsychometricAssessment)
+                .where(PsychometricAssessment.participant_id == participant_id)
+                .order_by(desc(PsychometricAssessment.administered_at))
+                .limit(max(1, min(limit, 500)))
+            ).scalars().all()
+            return [self._view(row) for row in rows]
+
+
+class ParticipantSlowStateRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: ParticipantSlowState) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "effective_at": row.effective_at.isoformat(),
+            "cadence": row.cadence,
+            "source": row.source,
+            **{name: getattr(row, name) for name in SLOW_STATE_FIELDS},
+            "created_at": row.created_at.isoformat(),
+        }
+
+    def record(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        effective_at: datetime,
+        cadence: str,
+        source: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        cadence_value = str(cadence).strip().lower()
+        if cadence_value not in {"daily", "weekly"}:
+            raise ValueError("cadence must be daily or weekly")
+        unknown = set(values) - set(SLOW_STATE_FIELDS)
+        if unknown:
+            raise ValueError(f"unsupported slow-state fields: {sorted(unknown)}")
+        normalized = dict(values)
+        for name in (
+            "rolling_7d_stress",
+            "rolling_7d_workload",
+            "rolling_7d_energy",
+            "recent_recovery_quality",
+        ):
+            if normalized.get(name) is not None:
+                normalized[name] = score_0_10(normalized[name], name)
+        if normalized.get("recent_sleep_debt") is not None:
+            debt = float(normalized["recent_sleep_debt"])
+            if not 0.0 <= debt <= 24.0:
+                raise ValueError("recent_sleep_debt must be between 0 and 24 hours")
+            normalized["recent_sleep_debt"] = debt
+        if normalized.get("exam_period_flag") is not None and not isinstance(
+            normalized["exam_period_flag"], bool
+        ):
+            raise ValueError("exam_period_flag must be boolean")
+        with self.database.session() as session:
+            if session.get(Participant, participant_id) is None:
+                raise ValueError("participant not found")
+            row = ParticipantSlowState(
+                participant_id=participant_id,
+                effective_at=aware_utc(effective_at, "effective_at"),
+                cadence=cadence_value,
+                source=str(source or "").strip()[:64],
+                **normalized,
+            )
+            if not row.source:
+                raise ValueError("source is required")
+            session.add(row)
+            session.flush()
+            return self._view(row)
+
+    def history(self, participant_id: uuid.UUID, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(ParticipantSlowState)
+                .where(ParticipantSlowState.participant_id == participant_id)
+                .order_by(desc(ParticipantSlowState.effective_at))
+                .limit(max(1, min(limit, 500)))
+            ).scalars().all()
+            return [self._view(row) for row in rows]
+
+
+class EventAppraisalFeedbackRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    @staticmethod
+    def _view(row: EventAppraisalFeedback) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "event_id": row.event_id,
+            **{name: getattr(row, name) for name in EVENT_APPRAISAL_SCORE_FIELDS},
+            "submitted_at": row.submitted_at.isoformat(),
+            "created_at": row.created_at.isoformat(),
+        }
+
+    def record(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        event_id: str,
+        submitted_at: datetime,
+        **scores: Any,
+    ) -> dict[str, Any]:
+        event = str(event_id or "").strip()
+        if not event:
+            raise ValueError("event_id is required")
+        missing = set(EVENT_APPRAISAL_SCORE_FIELDS) - set(scores)
+        unknown = set(scores) - set(EVENT_APPRAISAL_SCORE_FIELDS)
+        if missing or unknown:
+            raise ValueError(
+                f"event appraisal fields mismatch; missing={sorted(missing)}, "
+                f"unknown={sorted(unknown)}"
+            )
+        normalized = {
+            name: score_0_10(scores[name], name)
+            for name in EVENT_APPRAISAL_SCORE_FIELDS
+        }
+        with self.database.session() as session:
+            if session.get(Participant, participant_id) is None:
+                raise ValueError("participant not found")
+            row = EventAppraisalFeedback(
+                participant_id=participant_id,
+                event_id=event[:256],
+                submitted_at=aware_utc(submitted_at, "submitted_at"),
+                **normalized,
+            )
+            session.add(row)
+            session.flush()
+            return self._view(row)
+
+    def history(self, participant_id: uuid.UUID, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(EventAppraisalFeedback)
+                .where(EventAppraisalFeedback.participant_id == participant_id)
+                .order_by(desc(EventAppraisalFeedback.submitted_at))
+                .limit(max(1, min(limit, 500)))
+            ).scalars().all()
+            return [self._view(row) for row in rows]
 
 
 @dataclass(frozen=True)
