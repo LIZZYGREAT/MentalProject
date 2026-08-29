@@ -26,6 +26,7 @@ from algorithm.dynamic_state_model import (
     stress_semantic_label,
     vitality_semantic_label,
 )
+from services.workload import apply_continuous_load
 from algorithm.time_utils import normalize_observation_to_model_step
 from settings.model_defaults import (
     DEFAULT_INITIAL_ENERGY,
@@ -255,6 +256,8 @@ class Simulator:
                     "post_weight": round(assessment.post_weight, 4),
                     "onset_floor": round(assessment.onset_floor, 4),
                     "semantic": assessment.semantic,
+                    "workload_feature_vector": assessment.workload_feature_vector,
+                    "workload_prior": round(assessment.workload_prior, 4),
                 },
             }
 
@@ -285,6 +288,7 @@ class Simulator:
                 )
             )
         continuous_load_hours = 0.0
+        continuous_work_hours = 0.0
         wake_s = latent.stress
         wake_recorded = False
         boundary_hits = 0
@@ -339,6 +343,7 @@ class Simulator:
                     * (1.0 - cross_day_unfinished_input),
                     active_event_ids=dynamic_inputs.active_event_ids,
                     active_event_names=dynamic_inputs.active_event_names,
+                    workload_raw=dynamic_inputs.workload_raw,
                 )
             if sleeping and dynamic_inputs.recovery < 0.85:
                 dynamic_inputs = DynamicInputs(
@@ -349,6 +354,7 @@ class Simulator:
                     post_event_input=dynamic_inputs.post_event_input,
                     active_event_ids=dynamic_inputs.active_event_ids,
                     active_event_names=dynamic_inputs.active_event_names,
+                    workload_raw=dynamic_inputs.workload_raw,
                 )
             if inertia_ds > 0.0:
                 interruption_input = max(0.0, min(1.0, inertia_ds / 10.0))
@@ -362,7 +368,17 @@ class Simulator:
                     post_event_input=dynamic_inputs.post_event_input,
                     active_event_ids=dynamic_inputs.active_event_ids,
                     active_event_names=dynamic_inputs.active_event_names,
+                    workload_raw=dynamic_inputs.workload_raw,
                 )
+
+            workload, continuous_load_factor = apply_continuous_load(
+                dynamic_inputs.workload_raw,
+                continuous_work_hours,
+                saturation_hours=float(
+                    ctssm_cfg.get("workload_continuous_saturation_hours", 3.0)
+                ),
+                beta=float(ctssm_cfg.get("workload_continuous_beta", 0.18)),
+            )
 
             observation_applied = False
             for observation in observations_by_time.get(
@@ -464,12 +480,16 @@ class Simulator:
                     "delta_E": delta_v,
                     "f_pen": point_latent.recovery_debt,
                     "continuous_hours": continuous_load_hours,
+                    "continuous_work_hours": continuous_work_hours,
+                    "continuous_load_factor": continuous_load_factor,
                     "current_events": list(
                         dynamic_inputs.active_event_names
                     ),
                     "dominant_stressors": dominant_stressors,
                     "event_stress_input": dynamic_inputs.event_stress,
                     "task_demand": dynamic_inputs.task_demand,
+                    "workload": workload,
+                    "workload_raw": dynamic_inputs.workload_raw,
                     "recovery_input": dynamic_inputs.recovery,
                     "anticipatory_input": (
                         dynamic_inputs.anticipatory_input
@@ -526,6 +546,13 @@ class Simulator:
                     continuous_load_hours
                     - (0.35 + dynamic_inputs.recovery) * dt_hours,
                 )
+            active_workload = any(
+                assessments[event_id].workload_prior > 0.05
+                for event_id in dynamic_inputs.active_event_ids
+            )
+            continuous_work_hours = (
+                continuous_work_hours + dt_hours if active_workload else 0.0
+            )
 
             for event_id in dynamic_inputs.active_event_ids:
                 assessment = assessments[event_id]

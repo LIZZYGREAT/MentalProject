@@ -105,6 +105,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0026_dataset_participant_membership"
     )
     assert migration_0026.down_revision == "0025_dataset_snapshot_items"
+    migration_0027 = next(
+        migration for migration in migrations
+        if migration.revision == "0027_workload_calibration"
+    )
+    assert migration_0027.down_revision == "0026_dataset_participant_membership"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -387,6 +392,45 @@ def test_0026_allows_frozen_participant_membership(monkeypatch):
         "DELETE FROM dataset_snapshot_items WHERE item_type = 'participant'"
     ]
     assert "'participant'" not in checks[0][2]
+
+
+def test_0027_adds_workload_calibration_fields_and_constraints(monkeypatch):
+    migration = _migration(VERSIONS / "0027_workload_calibration.py")
+    columns = []
+    checks = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op, "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op, "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(
+        migration.op, "create_index",
+        lambda name, table, fields: indexes.append((name, table, tuple(fields))),
+    )
+
+    migration.upgrade()
+
+    assert [name for _, name in columns] == [
+        "event_type",
+        "course_name",
+        "workload_feature_vector",
+        "workload_prior",
+        "observed_workload",
+        "workload_residual",
+        "workload_model_version",
+    ]
+    assert {name for name, _, _ in checks} == {
+        "ck_event_appraisal_workload_prior",
+        "ck_event_appraisal_observed_workload",
+    }
+    assert {name for name, _, _ in indexes} == {
+        "ix_event_appraisal_event_type",
+        "ix_event_appraisal_course",
+    }
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

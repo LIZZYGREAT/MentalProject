@@ -34,9 +34,11 @@ from services.event_semantics import (
 from services.event_classifier import classify_event, finalize_event_classification
 from utils.description_score import score_description
 from services.semantic_model_inputs import semantic_model_inputs
+from services.workload import WorkloadEstimator
 
 
 logger = logging.getLogger(__name__)
+_WORKLOAD_ESTIMATOR = WorkloadEstimator()
 _SECRET = re.compile(
     r"(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|secret|token)\s*[=:]\s*)[^\s,;]+"
 )
@@ -459,6 +461,15 @@ class EventSemanticPreprocessor:
                 "confidence": round(confidence, 6),
                 "source": source,
             }
+            workload = _WORKLOAD_ESTIMATOR.estimate(values)
+            semantic["workload_feature_vector"] = workload.feature_vector
+            semantic["workload_prior"] = (
+                0.0
+                if event_type in {"rest", "meal", "nap", "sleep"}
+                else workload.workload_prior
+            )
+            semantic["workload_schema_version"] = workload.schema_version
+            semantic["workload_model_version"] = workload.model_version
             metadata = dict(event.get("metadata") or {})
             metadata["semantic"] = semantic
             event["metadata"] = metadata

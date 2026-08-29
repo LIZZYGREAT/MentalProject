@@ -201,6 +201,14 @@ class EventAppraisalFeedback(Base):
         CheckConstraint("perceived_control >= 0 AND perceived_control <= 10", name="ck_event_appraisal_control"),
         CheckConstraint("actual_stress >= 0 AND actual_stress <= 10", name="ck_event_appraisal_stress"),
         CheckConstraint("perceived_performance >= 0 AND perceived_performance <= 10", name="ck_event_appraisal_performance"),
+        CheckConstraint(
+            "workload_prior IS NULL OR (workload_prior >= 0 AND workload_prior <= 1)",
+            name="ck_event_appraisal_workload_prior",
+        ),
+        CheckConstraint(
+            "observed_workload IS NULL OR (observed_workload >= 0 AND observed_workload <= 1)",
+            name="ck_event_appraisal_observed_workload",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -216,6 +224,13 @@ class EventAppraisalFeedback(Base):
     perceived_control: Mapped[float] = mapped_column(Float, nullable=False)
     actual_stress: Mapped[float] = mapped_column(Float, nullable=False)
     perceived_performance: Mapped[float] = mapped_column(Float, nullable=False)
+    event_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    course_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    workload_feature_vector: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    workload_prior: Mapped[float | None] = mapped_column(Float, nullable=True)
+    observed_workload: Mapped[float | None] = mapped_column(Float, nullable=True)
+    workload_residual: Mapped[float | None] = mapped_column(Float, nullable=True)
+    workload_model_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 
 
-PROMPT_VERSION = "event_semantics_prompt.zh.v4"
+PROMPT_VERSION = "event_semantics_prompt.zh.v5"
 
 SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。你的唯一职责是把日程事件转换为可审计的客观任务语义，供后续心理压力动态模型作为弱先验使用。
 
@@ -26,6 +26,7 @@ SEMANTIC_AGENT_SYSTEM_PROMPT = """你是“事件客观语义分析 Agent”。�
 逐维评分规范（全部为 0.0–1.0）：
 - difficulty：完成任务所需知识或技能难度。0.1 为几乎无需技能；0.5 为一般大学任务；0.9 为竞赛、重要考试或高阶专业难题。
 - cognitive_demand：持续注意、工作记忆、推理和决策负荷。区分于结果重要性。
+- physical_demand：完成事件所需的身体活动强度与持续体力投入；普通课程、会议和书面任务应保持较低，运动可较高。
 - stakes：结果失败或成功的客观后果大小；普通练习应低于考试、答辩和正式比赛。
 - time_pressure：是否有明确时限、倒计时或紧迫节奏。仅“耗时长”不等同于时间压力。
 - social_evaluation：是否被教师、评委、同伴、客户或公开排名评价。

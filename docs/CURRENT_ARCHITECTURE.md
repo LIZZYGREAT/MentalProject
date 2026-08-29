@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0026_dataset_participant_membership -->
+<!-- ALEMBIC_HEAD: 0027_workload_calibration -->
 
 ## 运行边界
 
@@ -101,6 +101,12 @@ SQLite/PostgreSQL 原生 upsert 同时消除首次 insert race，并在数据库
 `complete > partial > rejected` 的质量优先级；后到的低质量结果不能降级已有缓存，status 与
 payload 始终来自同一次获胜写入。
 
+Semantic Schema v4 正式包含 `physical_demand`，并为每个事件保存 NASA-TLX 风格的
+`workload_feature_vector` 与规则初始化 `workload_prior`。Workload v1 是独立可解释派生量：
+事件预期、进行中与事后使用指数核，重叠事件按 `1-product(1-W)` 饱和合并；连续工作时长按
+三小时饱和并施加有界增量。轨迹同时保存 raw 与 adjusted workload，但阶段 3 不新增潜在状态、
+不把 workload 直接反馈进 CTSSM 主方程。
+
 ## CTSSM 时间语义
 
 CTSSM trajectory 的每个 point-at-t 表示 t 时刻 observation assimilation 后的
@@ -183,7 +189,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0026_dataset_participant_membership`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0027_workload_calibration`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -228,6 +234,11 @@ Schema v3 并冻结 participant membership；零观测参与者仍保留在 coho
 新 v3 快照的 participant membership、JSONB、
 索引、FK、状态回填、旧数据保留与 reconciliation CRUD；只有配置 disposable
 `MINDFLOW_TEST_POSTGRES_URL` 时才执行。
+
+0027 为 Event Appraisal 增加事件类型、课程、workload feature/prior、Raw-TLX observed workload、
+residual 与 estimator version；新反馈写入时同步保存可复现 residual。Admin Workload 页面按
+0/5/10/15/30/60 分钟 lag 比较 W(t) 与 EMA Stress，并显示 workload bin 误差和按 event type、
+course、participant 分层的 appraisal residual。
 
 ## 自动漂移保护
 

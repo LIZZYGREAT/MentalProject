@@ -194,7 +194,7 @@ def test_optional_component_rejection_preserves_objective_semantics_and_cache():
     cache = EventSemanticCacheRepository(database).get_entry(
         participant.id,
         fingerprint,
-        schema_version="event_semantics.v3",
+        schema_version="event_semantics.v4",
         prompt_version=PROMPT_VERSION,
         model="semantic-test",
     )

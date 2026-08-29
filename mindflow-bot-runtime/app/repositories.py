@@ -618,6 +618,13 @@ class EventAppraisalFeedbackRepository:
             "id": str(row.id),
             "event_id": row.event_id,
             **{name: getattr(row, name) for name in EVENT_APPRAISAL_SCORE_FIELDS},
+            "event_type": row.event_type,
+            "course_name": row.course_name,
+            "workload_feature_vector": row.workload_feature_vector,
+            "workload_prior": row.workload_prior,
+            "observed_workload": row.observed_workload,
+            "workload_residual": row.workload_residual,
+            "workload_model_version": row.workload_model_version,
             "submitted_at": row.submitted_at.isoformat(),
             "created_at": row.created_at.isoformat(),
         }
@@ -628,6 +635,11 @@ class EventAppraisalFeedbackRepository:
         *,
         event_id: str,
         submitted_at: datetime,
+        event_type: str | None = None,
+        course_name: str | None = None,
+        workload_feature_vector: Mapping[str, Any] | None = None,
+        workload_prior: float | None = None,
+        workload_model_version: str | None = None,
         **scores: Any,
     ) -> dict[str, Any]:
         event = str(event_id or "").strip()
@@ -644,6 +656,95 @@ class EventAppraisalFeedbackRepository:
             name: score_0_10(scores[name], name)
             for name in EVENT_APPRAISAL_SCORE_FIELDS
         }
+        from services.workload import (
+            WORKLOAD_FEATURE_NAMES,
+            WORKLOAD_MODEL_VERSION,
+            WorkloadEstimator,
+            observed_workload,
+        )
+
+        # Normal feedback callers only know the provider event id.  Resolve
+        # the frozen semantic workload context from the latest current
+        # Forecast so residual persistence does not depend on a client echoing
+        # model-owned features back to us.
+        if workload_feature_vector is None or workload_prior is None:
+            with self.database.session() as lookup_session:
+                forecasts = lookup_session.execute(
+                    select(ForecastSnapshot)
+                    .where(
+                        ForecastSnapshot.participant_id == participant_id,
+                        ForecastSnapshot.valid.is_(True),
+                    )
+                    .order_by(desc(ForecastSnapshot.generated_at))
+                    .limit(100)
+                ).scalars().all()
+                for forecast in forecasts:
+                    classified = list(
+                        (forecast.output_json or {}).get("classified_calendar_events")
+                        or []
+                    )
+                    presentation = next(
+                        (
+                            item for item in classified
+                            if str(item.get("id") or item.get("event_id") or "") == event
+                        ),
+                        None,
+                    )
+                    semantic_item = next(
+                        (
+                            item for item in list(forecast.semantic_input_json or [])
+                            if str(item.get("event_id") or "") == event
+                        ),
+                        None,
+                    )
+                    semantic_context = (
+                        dict(semantic_item.get("semantic") or {})
+                        if isinstance(semantic_item, Mapping)
+                        else {}
+                    )
+                    if workload_feature_vector is None:
+                        workload_feature_vector = semantic_context.get(
+                            "workload_feature_vector"
+                        )
+                    if workload_prior is None:
+                        workload_prior = semantic_context.get("workload_prior")
+                    if presentation:
+                        event_type = event_type or presentation.get("event_type")
+                        course_name = course_name or (
+                            presentation.get("related_course_name")
+                            or presentation.get("course_name")
+                        )
+                        workload_prior = (
+                            workload_prior
+                            if workload_prior is not None
+                            else presentation.get("workload_prior")
+                        )
+                    if workload_feature_vector is not None and workload_prior is not None:
+                        break
+
+        def workload_unit(value: Any, name: str) -> float:
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be between 0 and 1")
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be between 0 and 1") from exc
+            if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+            return number
+
+        feature_vector = None
+        if workload_feature_vector is not None:
+            feature_vector = {
+                name: workload_unit(workload_feature_vector.get(name), name)
+                for name in WORKLOAD_FEATURE_NAMES
+            }
+        prior = None
+        if workload_prior is not None:
+            prior = workload_unit(workload_prior, "workload_prior")
+        elif feature_vector is not None:
+            prior = WorkloadEstimator().predict(feature_vector)
+        observed = observed_workload(normalized)
         with self.database.session() as session:
             if session.get(Participant, participant_id) is None:
                 raise ValueError("participant not found")
@@ -651,6 +752,17 @@ class EventAppraisalFeedbackRepository:
                 participant_id=participant_id,
                 event_id=event[:256],
                 submitted_at=aware_utc(submitted_at, "submitted_at"),
+                event_type=str(event_type or "").strip()[:32] or None,
+                course_name=str(course_name or "").strip()[:200] or None,
+                workload_feature_vector=feature_vector,
+                workload_prior=prior,
+                observed_workload=observed,
+                workload_residual=(observed - prior) if prior is not None else None,
+                workload_model_version=(
+                    str(workload_model_version or WORKLOAD_MODEL_VERSION)[:64]
+                    if prior is not None
+                    else None
+                ),
                 **normalized,
             )
             session.add(row)

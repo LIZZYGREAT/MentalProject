@@ -48,6 +48,7 @@ from services.event_lifecycle import EVENT_SCHEMA_VERSION, prepare_event_instanc
 from services.event_semantic_prompt import PROMPT_VERSION
 from services.event_semantics import SEMANTIC_SCHEMA_VERSION
 from services.semantic_model_inputs import semantic_model_inputs
+from services.workload import WORKLOAD_MODEL_VERSION, WORKLOAD_SCHEMA_VERSION
 
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,9 @@ def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, A
                 "classification_source": classification.get("source"),
                 "classification_confidence": classification.get("confidence"),
                 "semantic_source": semantic.get("source"),
+                "workload_feature_vector": semantic.get("workload_feature_vector"),
+                "workload_prior": semantic.get("workload_prior"),
+                "workload_model_version": semantic.get("workload_model_version"),
             }
         )
     return classified
@@ -670,6 +674,8 @@ class ForecastCoordinator:
             output["classified_event_revision"] = classified_event_revision
             output["event_schema_version"] = EVENT_SCHEMA_VERSION
             output["semantic_schema_version"] = SEMANTIC_SCHEMA_VERSION
+            output["workload_schema_version"] = WORKLOAD_SCHEMA_VERSION
+            output["workload_model_version"] = WORKLOAD_MODEL_VERSION
             output["semantic_prompt_version"] = PROMPT_VERSION
             output["course_resolver_version"] = COURSE_RESOLVER_VERSION
             output["course_catalog_revision"] = COURSE_CATALOG_REVISION

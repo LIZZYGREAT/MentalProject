@@ -24,14 +24,15 @@ from services.event_semantic_prompt import (
 )
 
 
-SEMANTIC_SCHEMA_VERSION = "event_semantics.v3"
-RULE_VERSION = "zh_event_rules.2026-08-01.v2"
+SEMANTIC_SCHEMA_VERSION = "event_semantics.v4"
+RULE_VERSION = "zh_event_rules.2026-08-29.v3"
 FUSION_POLICY_VERSION = "rule_anchored_api_fusion.v2"
 COURSE_MATCH_MIN_CONFIDENCE = 0.55
 
 DIMENSIONS = (
     "difficulty",
     "cognitive_demand",
+    "physical_demand",
     "stakes",
     "time_pressure",
     "social_evaluation",
@@ -137,6 +138,7 @@ BASE_PROFILES: Dict[str, Dict[str, float]] = {
     "course": {
         "difficulty": 0.58,
         "cognitive_demand": 0.66,
+        "physical_demand": 0.05,
         "stakes": 0.34,
         "time_pressure": 0.18,
         "social_evaluation": 0.34,
@@ -149,6 +151,7 @@ BASE_PROFILES: Dict[str, Dict[str, float]] = {
     "library": {
         "difficulty": 0.60,
         "cognitive_demand": 0.72,
+        "physical_demand": 0.05,
         "stakes": 0.28,
         "time_pressure": 0.24,
         "social_evaluation": 0.05,
@@ -161,6 +164,7 @@ BASE_PROFILES: Dict[str, Dict[str, float]] = {
     "task": {
         "difficulty": 0.45,
         "cognitive_demand": 0.50,
+        "physical_demand": 0.08,
         "stakes": 0.30,
         "time_pressure": 0.28,
         "social_evaluation": 0.18,
@@ -173,6 +177,7 @@ BASE_PROFILES: Dict[str, Dict[str, float]] = {
     "recovery": {
         "difficulty": 0.05,
         "cognitive_demand": 0.03,
+        "physical_demand": 0.02,
         "stakes": 0.02,
         "time_pressure": 0.02,
         "social_evaluation": 0.02,
@@ -188,6 +193,7 @@ TASK_PROFILES: Dict[str, Dict[str, float]] = {
     "exam": {
         "difficulty": 0.84,
         "cognitive_demand": 0.86,
+        "physical_demand": 0.08,
         "stakes": 0.90,
         "time_pressure": 0.88,
         "social_evaluation": 0.82,
@@ -200,6 +206,7 @@ TASK_PROFILES: Dict[str, Dict[str, float]] = {
     "ddl": {
         "difficulty": 0.76,
         "cognitive_demand": 0.75,
+        "physical_demand": 0.08,
         "stakes": 0.78,
         "time_pressure": 0.92,
         "social_evaluation": 0.45,
@@ -212,6 +219,7 @@ TASK_PROFILES: Dict[str, Dict[str, float]] = {
     "meeting": {
         "difficulty": 0.45,
         "cognitive_demand": 0.54,
+        "physical_demand": 0.06,
         "stakes": 0.48,
         "time_pressure": 0.35,
         "social_evaluation": 0.64,
@@ -224,6 +232,7 @@ TASK_PROFILES: Dict[str, Dict[str, float]] = {
     "homework": {
         "difficulty": 0.61,
         "cognitive_demand": 0.68,
+        "physical_demand": 0.06,
         "stakes": 0.40,
         "time_pressure": 0.52,
         "social_evaluation": 0.15,
@@ -355,6 +364,8 @@ def infer_rule_semantics(
         base = dict(BASE_PROFILES.get(normalized_type, BASE_PROFILES["task"]))
     if normalized_type == "task" and normalized_task in TASK_PROFILES:
         base.update(TASK_PROFILES[normalized_task])
+    if normalized_type == "gym":
+        base["physical_demand"] = 0.78
 
     text = f"{name or ''} {description or ''}".strip().lower()
     matched: list[str] = []
@@ -410,7 +421,13 @@ def validate_external_semantics(
     candidate = raw.get("values", raw)
     if not isinstance(candidate, Mapping):
         raise SemanticResponseMalformedError("semantic API values must be an object")
-    missing = [key for key in DIMENSIONS if key not in candidate]
+    # ``physical_demand`` was added in v4.  Accepting an older provider payload
+    # here keeps staged deployments safe; the rule prior still supplies the
+    # dimension and all newly generated prompts request it explicitly.
+    missing = [
+        key for key in DIMENSIONS
+        if key not in candidate and key != "physical_demand"
+    ]
     if missing:
         raise SemanticResponseMalformedError(
             f"semantic API response missing: {','.join(missing)}"
@@ -418,7 +435,7 @@ def validate_external_semantics(
     values: Dict[str, float] = {}
     for key in DIMENSIONS:
         try:
-            value = float(candidate[key])
+            value = float(candidate.get(key, 0.0))
         except (TypeError, ValueError) as exc:
             raise SemanticResponseMalformedError(
                 f"semantic API {key} must be numeric"

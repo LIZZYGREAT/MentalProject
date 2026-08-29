@@ -27,9 +27,15 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from algorithm.time_utils import interval_minutes, parse_datetime_on_date
 from utils.description_score import convert_score_to_Flike, score_description
 from services.semantic_model_inputs import fused_appraisal_score, semantic_model_inputs
+from services.workload import (
+    WorkloadEstimator,
+    event_workload_contribution,
+    saturating_union,
+)
 
 
 RECOVERY_TYPES = {"rest", "meal", "nap", "sleep"}
+_WORKLOAD_ESTIMATOR = WorkloadEstimator()
 
 MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
     "m0": {
@@ -153,6 +159,8 @@ class EventAssessment:
     objective: Dict[str, float]
     appraisal: Dict[str, float]
     semantic: Dict[str, Any]
+    workload_prior: float = 0.0
+    workload_feature_vector: Dict[str, float] | None = None
     appraisal_observed: bool = False
     cancelled: bool = False
     cancelled_at: Optional[str] = None
@@ -166,6 +174,7 @@ class DynamicInputs:
     recovery: float = 0.0
     anticipatory_input: float = 0.0
     post_event_input: float = 0.0
+    workload_raw: float = 0.0
     active_event_ids: tuple[str, ...] = ()
     active_event_names: tuple[str, ...] = ()
 
@@ -189,6 +198,7 @@ def assess_event(event: Any) -> EventAssessment:
             "values": {
                 "difficulty": 0.45,
                 "cognitive_demand": 0.50,
+                "physical_demand": 0.08,
                 "stakes": 0.30,
                 "time_pressure": 0.28,
                 "social_evaluation": 0.18,
@@ -203,7 +213,7 @@ def assess_event(event: Any) -> EventAssessment:
     semantic_values = {
         key: model_semantics[key]
         for key in (
-            "difficulty", "cognitive_demand", "stakes", "time_pressure",
+            "difficulty", "cognitive_demand", "physical_demand", "stakes", "time_pressure",
             "social_evaluation", "uncontrollability", "novelty",
             "expected_effort", "uncertainty", "unfinished",
         )
@@ -313,6 +323,16 @@ def assess_event(event: Any) -> EventAssessment:
             "unfinished": semantic_values["unfinished"],
         }
     )
+    semantic_payload_values = semantic.get("values")
+    if not isinstance(semantic_payload_values, Mapping):
+        fused_values = semantic.get("fused")
+        semantic_payload_values = (
+            fused_values.get("objective_semantics")
+            if isinstance(fused_values, Mapping)
+            else {}
+        )
+    if isinstance(semantic_payload_values, Mapping) and "physical_demand" in semantic_payload_values:
+        defaults["physical_demand"] = semantic_values["physical_demand"]
 
     objective = {
         key: _unit(_nested(metadata, "objective", key), value)
@@ -415,6 +435,20 @@ def assess_event(event: Any) -> EventAssessment:
         key: _unit(_nested(metadata, "appraisal", key), value)
         for key, value in appraisal_defaults.items()
     }
+
+    workload_semantics = {
+        **semantic_values,
+        "cognitive_demand": objective["cognitive_demand"],
+        "physical_demand": objective["physical_demand"],
+        "time_pressure": objective["deadline"],
+        "expected_effort": appraisal["expected_effort"],
+        "uncontrollability": objective["uncontrollability"],
+        "uncertainty": appraisal["uncertainty"],
+    }
+    workload_estimate = _WORKLOAD_ESTIMATOR.estimate(workload_semantics)
+    workload_prior = (
+        0.0 if event_type in RECOVERY_TYPES else workload_estimate.workload_prior
+    )
 
     if event_type in RECOVERY_TYPES:
         stress_intensity = 0.0
@@ -540,6 +574,8 @@ def assess_event(event: Any) -> EventAssessment:
         objective=objective,
         appraisal=appraisal,
         semantic=semantic,
+        workload_prior=workload_prior,
+        workload_feature_vector=workload_estimate.feature_vector,
         appraisal_observed=appraisal_observed,
         cancelled=cancelled,
         cancelled_at=str(cancelled_at) if cancelled_at else None,
@@ -565,6 +601,7 @@ def calculate_dynamic_inputs(
     recoveries = []
     anticipatory = []
     post_event = []
+    workload_inputs = []
     active_ids = []
     active_names = []
 
@@ -619,6 +656,15 @@ def calculate_dynamic_inputs(
                 )
             continue
 
+        workload_value, _ = event_workload_contribution(
+            assessment.workload_prior,
+            minutes_before_start=before_min,
+            minutes_after_end=after_min,
+            active=is_active,
+        )
+        if workload_value > 0.0:
+            workload_inputs.append(workload_value)
+
         if 0.0 < before_min <= 240.0 and assessment.pre_weight > 0.0:
             anticipatory.append(
                 assessment.pre_weight
@@ -666,6 +712,7 @@ def calculate_dynamic_inputs(
         recovery=_combine(recoveries),
         anticipatory_input=_combine(anticipatory),
         post_event_input=_combine(post_event),
+        workload_raw=saturating_union(workload_inputs),
         active_event_ids=tuple(active_ids),
         active_event_names=tuple(active_names),
     )

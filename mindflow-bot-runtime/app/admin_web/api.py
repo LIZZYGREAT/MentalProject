@@ -625,6 +625,31 @@ class AdminAPI:
             )
         )
 
+    async def workload_dashboard(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        date_start, date_end, error = self._research_dates(request)
+        if error:
+            return error
+        participant_id = None
+        participant_code = str(
+            request.query_params.get("participant_code") or ""
+        ).strip()
+        if participant_code:
+            participant_id = await asyncio.to_thread(
+                self.repository.participant_id, participant_code
+            )
+            if participant_id is None:
+                return _json_error("participant_not_found", 404)
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.workload_diagnostics,
+                date_start,
+                date_end,
+                participant_id,
+            )
+        )
+
     async def participant_longitudinal(self, request: Request) -> Response:
         participant_id, error = await self._participant(request)
         if error:
@@ -906,6 +931,7 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/rebuild", self.rebuild_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/reanalysis", self.reanalyse_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/research/dashboard", self.research_dashboard, methods=["GET"]),
+            Route(f"{prefix}/research/workload", self.workload_dashboard, methods=["GET"]),
             Route(f"{prefix}/data-quality", self.data_quality, methods=["GET"]),
             Route(f"{prefix}/research/matches/rebuild", self.rebuild_research_matches, methods=["POST"]),
             Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),

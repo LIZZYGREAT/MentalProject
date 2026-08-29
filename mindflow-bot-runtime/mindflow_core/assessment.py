@@ -273,6 +273,22 @@ class AssessmentModel:
                 "continuous_load_hours": round(
                     max(0.0, float(point.get("continuous_hours") or 0.0)), 4
                 ),
+                "workload": round(
+                    max(0.0, min(1.0, float(point.get("workload") or 0.0))),
+                    4,
+                ),
+                "workload_raw": round(
+                    max(0.0, min(1.0, float(point.get("workload_raw") or 0.0))),
+                    4,
+                ),
+                "continuous_work_hours": round(
+                    max(0.0, float(point.get("continuous_work_hours") or 0.0)),
+                    4,
+                ),
+                "continuous_load_factor": round(
+                    max(0.0, min(1.0, float(point.get("continuous_load_factor") or 0.0))),
+                    4,
+                ),
                 "stress_equilibrium_0_10": round(
                     float(point.get("stress_equilibrium") or 0.0) / 10.0, 3
                 ),

@@ -305,6 +305,9 @@ GLOBAL_DEFAULT_CONFIG = {
         "vitality_baseline": 72.0,
         "vitality_regulation_per_hour": 0.58,
         "demand_vitality_drain_per_hour": 13.0,
+        # Stage-3 diagnostic W(t); these do not feed the CTSSM state equation.
+        "workload_continuous_saturation_hours": 3.0,
+        "workload_continuous_beta": 0.18,
         "recovery_vitality_gain_per_hour": 10.0,
         "fatigue_vitality_gain": 27.0,
         "sleep_debt_vitality_per_hour": 1.8,

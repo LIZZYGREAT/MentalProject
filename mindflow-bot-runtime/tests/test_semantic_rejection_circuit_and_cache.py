@@ -261,7 +261,7 @@ def test_low_confidence_is_negative_cached_without_blocking_next_event():
         rejected = cache.get_entry(
             participant.id,
             low_misses[0]["fingerprint"],
-            schema_version="event_semantics.v3",
+            schema_version="event_semantics.v4",
             prompt_version=PROMPT_VERSION,
             model="semantic-test",
         )

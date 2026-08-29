@@ -88,7 +88,7 @@ def test_production_ctssm_fixture_is_stable_after_legacy_removal():
     assert result.model_family == "stress-ctssm.m0"
     assert result.point_count == 288
     assert _sha(result.trajectory) == (
-        "c6f17e9b5bad3e674807ae1cc0a905746a940382a0cb55602222d78ac7805c6d"
+        "f55991f9c14c5125bce0fa6bef4c916d1654f41dea9ebdffa87026a96b9e1210"
     )
     assert _sha(result.alerts) == (
         "3b674b9753941b253047a42fc305efea884dd011e68e0a6239bb8315ea821a8c"

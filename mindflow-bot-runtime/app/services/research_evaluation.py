@@ -24,8 +24,10 @@ from app.models import (
     DatasetSnapshot,
     DatasetSnapshotItem,
     EventSemanticCache,
+    EventAppraisalFeedback,
     ForecastCurrentnessEvent,
     ForecastObservationMatch,
+    ForecastSnapshot,
     LearnedModelProfile,
     ModelEvaluationRun,
     Participant,
@@ -34,6 +36,7 @@ from app.models import (
     WarningSchedule,
 )
 from app.repositories import ForecastSnapshotRepository
+from services.workload import WorkloadEstimator
 
 
 DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
@@ -97,6 +100,255 @@ class ResearchEvaluationService:
             end + timedelta(days=1), time.min, self.timezone
         ).astimezone(timezone.utc)
         return lower, upper
+
+    @staticmethod
+    def _correlation(pairs: list[tuple[float, float]]) -> float | None:
+        if len(pairs) < 2:
+            return None
+        xs = [item[0] for item in pairs]
+        ys = [item[1] for item in pairs]
+        x_mean, y_mean = mean(xs), mean(ys)
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in pairs)
+        denominator = math.sqrt(
+            sum((x - x_mean) ** 2 for x in xs)
+            * sum((y - y_mean) ** 2 for y in ys)
+        )
+        return numerator / denominator if denominator > 1e-12 else None
+
+    def workload_diagnostics(
+        self,
+        date_start: date,
+        date_end: date,
+        participant_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        """Compare persisted W(t) with Forecast stress and actual EMA stress."""
+
+        lower, upper = self._bounds(date_start, date_end)
+        forecast_conditions = [
+            ForecastSnapshot.local_date >= date_start,
+            ForecastSnapshot.local_date <= date_end,
+            ForecastSnapshot.valid.is_(True),
+        ]
+        observation_conditions = [
+            StateObservation.observed_at >= lower,
+            StateObservation.observed_at < upper,
+            StateObservation.observation_type.in_(MOMENTARY_OBSERVATION_TYPES),
+        ]
+        appraisal_conditions = [
+            EventAppraisalFeedback.submitted_at >= lower,
+            EventAppraisalFeedback.submitted_at < upper,
+        ]
+        if participant_id is not None:
+            forecast_conditions.append(ForecastSnapshot.participant_id == participant_id)
+            observation_conditions.append(StateObservation.participant_id == participant_id)
+            appraisal_conditions.append(EventAppraisalFeedback.participant_id == participant_id)
+        with self.database.session() as session:
+            forecasts = session.execute(
+                select(ForecastSnapshot)
+                .where(*forecast_conditions)
+                .order_by(ForecastSnapshot.local_date, ForecastSnapshot.participant_id)
+            ).scalars().all()
+            observations = session.execute(
+                select(StateObservation)
+                .where(*observation_conditions)
+                .order_by(StateObservation.observed_at)
+            ).scalars().all()
+            appraisals = session.execute(
+                select(EventAppraisalFeedback)
+                .where(*appraisal_conditions)
+                .order_by(EventAppraisalFeedback.submitted_at)
+            ).scalars().all()
+
+        curve_index: dict[tuple[uuid.UUID, date], list[tuple[datetime, dict[str, Any]]]] = {}
+        forecast_series: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        recovery_windows: list[dict[str, Any]] = []
+        forecast_pairs: list[tuple[float, float]] = []
+        for row in forecasts:
+            points: list[tuple[datetime, dict[str, Any]]] = []
+            for point in list(row.curve_json or []):
+                timestamp = self._point_time(row.local_date, point.get("time"), self.timezone)
+                if timestamp is None:
+                    continue
+                try:
+                    workload = float(point["workload"])
+                    stress = float(point["stress_0_10"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (0.0 <= workload <= 1.0 and 0.0 <= stress <= 10.0):
+                    continue
+                points.append((timestamp, point))
+                forecast_pairs.append((workload, stress))
+                if len(forecast_series) < 10000:
+                    forecast_series.append({
+                        "participant_id": str(row.participant_id),
+                        "local_date": row.local_date.isoformat(),
+                        "time": point.get("time"),
+                        "workload": workload,
+                        "workload_raw": point.get("workload_raw"),
+                        "forecast_stress": stress,
+                        "continuous_work_hours": point.get("continuous_work_hours"),
+                    })
+            curve_index[(row.participant_id, row.local_date)] = points
+            for event in list((row.output_json or {}).get("classified_calendar_events") or []):
+                item = {
+                    "participant_id": str(row.participant_id),
+                    "local_date": row.local_date.isoformat(),
+                    "event_id": event.get("id"),
+                    "summary": event.get("summary"),
+                    "event_type": event.get("event_type"),
+                    "workload_prior": event.get("workload_prior"),
+                    "start_time": event.get("start_time"),
+                    "end_time": event.get("end_time"),
+                }
+                events.append(item)
+                if str(event.get("event_type") or "").lower() in {
+                    "rest", "meal", "nap", "sleep"
+                }:
+                    recovery_windows.append(item)
+
+        def nearest_workload(
+            participant: uuid.UUID, timestamp: datetime
+        ) -> tuple[float, float, str] | None:
+            local_day = _aware(timestamp).astimezone(self.timezone).date()
+            candidates = curve_index.get((participant, local_day), [])
+            if not candidates:
+                return None
+            distance, point_time, point = min(
+                (
+                    abs((point_time - _aware(timestamp)).total_seconds()),
+                    point_time,
+                    point,
+                )
+                for point_time, point in candidates
+            )
+            if distance > MATCH_TOLERANCE_SECONDS:
+                return None
+            return float(point["workload"]), float(point["stress_0_10"]), point_time.isoformat()
+
+        actual_series: list[dict[str, Any]] = []
+        lag_pairs: dict[int, list[tuple[float, float]]] = {
+            lag: [] for lag in (0, 5, 10, 15, 30, 60)
+        }
+        residual_bins: dict[str, list[float]] = defaultdict(list)
+        for observation in observations:
+            actual = _score(dict(observation.payload_json or {}), "stress_0_10")
+            if actual is None:
+                continue
+            current = nearest_workload(observation.participant_id, observation.observed_at)
+            if current is not None:
+                workload, predicted, point_time = current
+                actual_series.append({
+                    "participant_id": str(observation.participant_id),
+                    "observed_at": _aware(observation.observed_at).isoformat(),
+                    "forecast_point_time": point_time,
+                    "local_date": _aware(observation.observed_at).astimezone(self.timezone).date().isoformat(),
+                    "time": datetime.fromisoformat(point_time).astimezone(self.timezone).strftime("%H:%M"),
+                    "workload": workload,
+                    "forecast_stress": predicted,
+                    "actual_stress": actual,
+                    "residual": actual - predicted,
+                })
+                start = min(int(workload * 5), 4) * 0.2
+                label = f"{start:.1f}–{start + 0.2:.1f}"
+                residual_bins[label].append(actual - predicted)
+            for lag in lag_pairs:
+                lagged = nearest_workload(
+                    observation.participant_id,
+                    _aware(observation.observed_at) - timedelta(minutes=lag),
+                )
+                if lagged is not None:
+                    lag_pairs[lag].append((lagged[0], actual))
+
+        appraisal_rows = []
+        grouped: dict[str, dict[str, list[float]]] = {
+            "event_type": defaultdict(list),
+            "course": defaultdict(list),
+            "participant": defaultdict(list),
+        }
+        feature_rows, observed_rows = [], []
+        for row in appraisals:
+            if row.workload_residual is not None:
+                grouped["event_type"][row.event_type or "unknown"].append(row.workload_residual)
+                grouped["course"][row.course_name or "unknown"].append(row.workload_residual)
+                grouped["participant"][str(row.participant_id)].append(row.workload_residual)
+            if row.workload_feature_vector and row.observed_workload is not None:
+                feature_rows.append(dict(row.workload_feature_vector))
+                observed_rows.append(float(row.observed_workload))
+            appraisal_rows.append({
+                "event_id": row.event_id,
+                "participant_id": str(row.participant_id),
+                "event_type": row.event_type,
+                "course_name": row.course_name,
+                "workload_prior": row.workload_prior,
+                "observed_workload": row.observed_workload,
+                "workload_residual": row.workload_residual,
+                "actual_stress": row.actual_stress,
+            })
+
+        calibration = None
+        if feature_rows:
+            _, fit = WorkloadEstimator.fit_ridge(feature_rows, observed_rows, alpha=1.0)
+            calibration = fit.to_dict()
+        actual_pairs = lag_pairs[0]
+        if len(actual_pairs) >= 2:
+            xs, ys = [x for x, _ in actual_pairs], [y for _, y in actual_pairs]
+            x_mean, y_mean = mean(xs), mean(ys)
+            variance = sum((x - x_mean) ** 2 for x in xs)
+            beta = (
+                sum((x - x_mean) * (y - y_mean) for x, y in actual_pairs) / variance
+                if variance > 1e-12 else None
+            )
+            exploratory = {
+                "intercept": (y_mean - beta * x_mean) if beta is not None else None,
+                "beta_workload": beta,
+                "sample_count": len(actual_pairs),
+            }
+        else:
+            exploratory = {"intercept": None, "beta_workload": None, "sample_count": len(actual_pairs)}
+
+        return {
+            "date_start": date_start.isoformat(),
+            "date_end": date_end.isoformat(),
+            "participant_id": str(participant_id) if participant_id else None,
+            "series": forecast_series,
+            "actual_ema": actual_series,
+            "calendar_events": events,
+            "recovery_windows": recovery_windows,
+            "statistics": {
+                "corr_workload_forecast_stress": self._correlation(forecast_pairs),
+                "corr_workload_actual_stress": self._correlation(actual_pairs),
+                "lagged_corr": [
+                    {
+                        "lag_minutes": lag,
+                        "correlation": self._correlation(pairs),
+                        "sample_count": len(pairs),
+                    }
+                    for lag, pairs in lag_pairs.items()
+                ],
+                "mae_by_workload_bin": [
+                    {
+                        "bin": label,
+                        "mae": mean(abs(value) for value in values),
+                        "mean_residual": mean(values),
+                        "sample_count": len(values),
+                    }
+                    for label, values in sorted(residual_bins.items())
+                ],
+                "exploratory_model": exploratory,
+            },
+            "event_appraisal": {
+                "items": appraisal_rows,
+                "ridge_fit": calibration,
+                "residual_by": {
+                    dimension: [
+                        {"group": key, "mean_residual": mean(values), "sample_count": len(values)}
+                        for key, values in sorted(groups.items())
+                    ]
+                    for dimension, groups in grouped.items()
+                },
+            },
+        }
 
     def eligible_participant_days(
         self,
