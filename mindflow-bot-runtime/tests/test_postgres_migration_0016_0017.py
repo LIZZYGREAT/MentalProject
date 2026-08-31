@@ -722,10 +722,13 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 for check in item_checks
                 if check.get("name") == "ck_dataset_snapshot_item_type"
             )
-            command.upgrade(config, "0029_ctssm_vnext_recovery_snapshot")
+            command.upgrade(config, "0030_model_promotion_decisions")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0029_ctssm_vnext_recovery_snapshot"
+            ) == "0030_model_promotion_decisions"
+            assert "model_promotion_decisions" in inspect(
+                connection
+            ).get_table_names()
 
             service = ResearchEvaluationService(
                 _ConnectionDatabase(connection), "Asia/Shanghai"
@@ -1159,10 +1162,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0029_ctssm_vnext_recovery_snapshot")
+            command.upgrade(config, "0030_model_promotion_decisions")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0029_ctssm_vnext_recovery_snapshot"
+            ) == "0030_model_promotion_decisions"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

@@ -51,22 +51,22 @@ def trait_resilience_prior(scores: Mapping[str, Any] | None) -> float | None:
 
     if not isinstance(scores, Mapping):
         return None
-    raw = next(
+    mean_value = next(
         (
-            scores.get(key)
-            for key in ("mean", "total_mean", "score", "brs_mean", "total")
+            _number(scores.get(key))
+            for key in ("mean", "total_mean", "score", "brs_mean")
             if scores.get(key) is not None
         ),
         None,
     )
-    value = _number(raw)
-    if value is None:
+    if mean_value is None and scores.get("total") is not None:
+        total = _number(scores.get("total"))
+        if total is None or not 6.0 <= total <= 30.0:
+            return None
+        mean_value = total / 6.0
+    if mean_value is None or not 1.0 <= mean_value <= 5.0:
         return None
-    if "total" in scores and raw == scores.get("total") and value > 6.0:
-        value /= 6.0
-    if not 1.0 <= value <= 5.0:
-        return None
-    return round((value - 1.0) / 4.0, 6)
+    return round((mean_value - 1.0) / 4.0, 6)
 
 
 def rolling_origin_splits(
@@ -331,6 +331,9 @@ def comparison_metrics(
         "median_absolute_error": None,
         "peak_magnitude_error": None,
         "peak_timing_error_minutes": None,
+        "observed_peak_proxy_magnitude_error": None,
+        "observed_peak_proxy_timing_error_minutes": None,
+        "peak_metric_source": None,
         "interval_90_coverage": None,
         "mean_interval_width": None,
         "high_stress_precision": None,
@@ -356,16 +359,44 @@ def comparison_metrics(
         item = row[0]
         groups[(str(item.get("participant_id") or ""), str(item.get("local_date") or ""))].append(row)
     magnitude, timing = [], []
+    observed_proxy_magnitude, observed_proxy_timing = [], []
     for group in groups.values():
         if len(group) < 2:
             continue
         actual_peak = max(group, key=lambda row: row[1])
         predicted_peak = max(group, key=lambda row: row[2])
-        magnitude.append(abs(actual_peak[1] - predicted_peak[2]))
+        observed_proxy_magnitude.append(abs(actual_peak[1] - predicted_peak[2]))
+        proxy_timing_value = None
         try:
             actual_time = datetime.fromisoformat(str(actual_peak[0]["observed_at"]).replace("Z", "+00:00"))
             predicted_time = datetime.fromisoformat(str(predicted_peak[0]["observed_at"]).replace("Z", "+00:00"))
-            timing.append(abs((actual_time - predicted_time).total_seconds()) / 60.0)
+            proxy_timing_value = abs(
+                (actual_time - predicted_time).total_seconds()
+            ) / 60.0
+            observed_proxy_timing.append(proxy_timing_value)
+        except (KeyError, TypeError, ValueError):
+            pass
+        trajectory_peak = _number(group[0][0].get("trajectory_peak_stress"))
+        trajectory_peak_time = str(
+            group[0][0].get("trajectory_peak_time") or ""
+        )[:5]
+        if trajectory_peak is None or not trajectory_peak_time:
+            magnitude.append(abs(actual_peak[1] - predicted_peak[2]))
+            if proxy_timing_value is not None:
+                timing.append(proxy_timing_value)
+            continue
+        magnitude.append(abs(actual_peak[1] - trajectory_peak))
+        try:
+            actual_time = datetime.fromisoformat(
+                str(actual_peak[0]["observed_at"]).replace("Z", "+00:00")
+            )
+            hour, minute = (int(part) for part in trajectory_peak_time.split(":"))
+            trajectory_time = actual_time.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            timing.append(
+                abs((actual_time - trajectory_time).total_seconds()) / 60.0
+            )
         except (KeyError, TypeError, ValueError):
             pass
     pr_auc = _pr_auc(actual_high, [predicted for _, _, predicted in rows])
@@ -376,6 +407,13 @@ def comparison_metrics(
             "median_absolute_error": round(median(abs(value) for value in errors), 4),
             "peak_magnitude_error": round(mean(magnitude), 4) if magnitude else None,
             "peak_timing_error_minutes": round(mean(timing), 2) if timing else None,
+            "observed_peak_proxy_magnitude_error": round(mean(observed_proxy_magnitude), 4) if observed_proxy_magnitude else None,
+            "observed_peak_proxy_timing_error_minutes": round(mean(observed_proxy_timing), 2) if observed_proxy_timing else None,
+            "peak_metric_source": (
+                "observed_ema_peak_vs_full_trajectory_peak"
+                if any(row[0].get("trajectory_peak_time") for row in rows)
+                else "observed_ema_peak_proxy"
+            ),
             "interval_90_coverage": round(mean(lower <= actual <= upper for lower, upper, actual in intervals), 4) if intervals else None,
             "mean_interval_width": round(mean(upper - lower for lower, upper, _ in intervals), 4) if intervals else None,
             "high_stress_precision": round(tp / (tp + fp), 4) if tp + fp else None,

@@ -21,7 +21,9 @@ from app.repositories import (
     LearnedProfileRepository,
     WarningScheduleRepository,
     ForecastInputChangedError,
+    promotion_parameters_hash,
 )
+from algorithm.dynamic_state_model import normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.care_message_service import (
     CARE_MESSAGE_SCHEMA_VERSION,
@@ -69,6 +71,49 @@ def _canonical(value: Any) -> str:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def enforce_promoted_model_selection(
+    effective_profile: dict[str, Any],
+    learned_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fail closed when the final layered profile is not the promoted model."""
+
+    effective_parameters = dict(
+        effective_profile.get("model_params")
+        or effective_profile.get("params")
+        or {}
+    )
+    effective_selection = dict(
+        effective_parameters.get("model_selection") or {}
+    )
+    if normalize_model_variant(
+        effective_selection.get("active_variant") or "m0"
+    ) == "m0":
+        return effective_profile
+    learned_selection = dict(
+        (
+            ((learned_row or {}).get("parameters") or {}).get(
+                "model_selection"
+            )
+            or {}
+        )
+    )
+    selection_is_proven = bool(
+        learned_row is not None
+        and effective_selection == learned_selection
+        and learned_selection.get("status")
+        == "retained_from_empirical_evidence"
+        and learned_selection.get("parameters_hash")
+        == promotion_parameters_hash(effective_parameters)
+    )
+    if selection_is_proven:
+        return effective_profile
+    effective_parameters["model_selection"] = {
+        "active_variant": "m0",
+        "status": "promotion_provenance_missing",
+    }
+    return {**effective_profile, "model_params": effective_parameters}
 
 
 def normalized_calendar_revision(events: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -521,6 +566,9 @@ class ForecastCoordinator:
             if self.learned_profiles is not None else None
         )
         effective_profile, profile_layers = layered_profile(profile_row, learned_row)
+        effective_profile = enforce_promoted_model_selection(
+            effective_profile, learned_row
+        )
         initial_state = await self._resolve_initial_state(
             participant_id,
             target,

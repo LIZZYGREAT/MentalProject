@@ -213,13 +213,15 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0029_ctssm_vnext_recovery_snapshot`。新快照使用包含 Participant Membership、BRS 与 recovery
+`0030_model_promotion_decisions`。新快照使用包含 Participant Membership、BRS 与 recovery
 证据的 Dataset Schema v4；0025 创建的 v2 和既有 v3 快照继续按原不可变合同评估。JSON 业务列在
 PostgreSQL 使用 JSONB。Stage 3 增加独立派生的事件 workload、随时间 W(t)、Event Appraisal
 Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Appraisal/EMA 均按历史 current
 Forecast 冻结因果来源，workload revision 参与 Forecast cache identity。Stage 4 保留 Current M0
 作为生产对照，新增 Workload-aware M0 与 M1/M2/M3 的统一 rolling-origin offline replay、完整
-预测/峰值/区间/high-stress 指标和 promotion gate；候选通过门槛前不进入生产。
+预测/峰值/区间/high-stress 指标和 promotion gate。Replay 直接使用真实 CTSSM Simulator，候选
+区间来自 latent uncertainty，完整轨迹用于 peak 指标；0030 durable promotion provenance 校验失败时
+生产 Forecast 强制回退 Current M0。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

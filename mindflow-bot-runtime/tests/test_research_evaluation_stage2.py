@@ -167,6 +167,92 @@ def _convert_snapshot_to_legacy_v2(database, service, snapshot_id):
         }
 
 
+def _convert_snapshot_to_historical_v3(database, service, snapshot_id):
+    with database.session() as session:
+        snapshot = session.get(DatasetSnapshot, snapshot_id)
+        rows = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id
+            )
+        ).scalars().all()
+        items = [
+            {
+                "item_type": row.item_type,
+                "source_id": row.source_id,
+                "source_version": row.source_version,
+                "participant_id": row.participant_id,
+                "local_date": row.local_date,
+                "source_hash": row.source_hash,
+                "metadata": dict(row.metadata_json),
+            }
+            for row in rows
+        ]
+        assert not {
+            "psychometric", "daily_review", "slow_state"
+        } & {item["item_type"] for item in items}
+        snapshot.schema_version = DATASET_SCHEMA_V3
+        view = service._snapshot_view(snapshot)
+        contract = {
+            "schema_version": DATASET_SCHEMA_V3,
+            "date_start": view["date_start"],
+            "date_end": view["date_end"],
+            "participant_filter": view["participant_filter"],
+            "observation_cutoff": view["observation_cutoff"],
+            "calendar_cutoff": view["calendar_cutoff"],
+        }
+        count = lambda kind: sum(item["item_type"] == kind for item in items)
+        snapshot.manifest_json = {
+            "schema_version": DATASET_SCHEMA_V3,
+            "participant_count": count("participant"),
+            "observation_count": count("observation"),
+            "forecast_count": count("forecast"),
+            "calendar_count": count("calendar"),
+            "item_count": len(items),
+            "manifest_hash": service._manifest_hash(contract, items),
+        }
+
+
+def test_historical_v3_snapshot_remains_immutable_and_evaluable_after_stage4():
+    database = memory_database()
+    person = participant(database, "HISTORICAL-V3")
+    _seed_causal_forecast_and_observations(database, person.id)
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = service.create_dataset_snapshot(
+        date_start=LOCAL_DATE,
+        date_end=LOCAL_DATE,
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2026, 8, 28, 3, tzinfo=timezone.utc),
+    )
+    snapshot_id = uuid.UUID(snapshot["id"])
+    _convert_snapshot_to_historical_v3(database, service, snapshot_id)
+    before = service.snapshot_items(snapshot_id)
+
+    cohort = service.create_evaluation_run(snapshot_id, "forecast.v4")
+    individual = service.create_evaluation_run(
+        snapshot_id, "forecast.v4", participant_id=person.id
+    )
+
+    assert cohort["status"] == individual["status"] == "completed"
+    assert service.list_snapshots()[0]["schema_version"] == DATASET_SCHEMA_V3
+    assert service.snapshot_items(snapshot_id) == before
+    manifest = service.list_snapshots()[0]["manifest"]
+    assert "psychometric_count" not in manifest
+    assert "daily_review_count" not in manifest
+    assert "slow_state_count" not in manifest
+
+    with database.session() as session:
+        item = session.execute(
+            select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id,
+                DatasetSnapshotItem.item_type == "observation",
+            )
+        ).scalars().first()
+        item.source_hash = "0" * 64
+    with pytest.raises(ValueError, match="dataset snapshot manifest mismatch"):
+        service.create_evaluation_run(snapshot_id, "forecast.v4")
+
+
 def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     database = memory_database()
     person = participant(database, "STAGE2-MATCH")

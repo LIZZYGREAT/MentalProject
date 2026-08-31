@@ -1,0 +1,578 @@
+"""Frozen rolling-origin replay through the real CTSSM implementation."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+
+from algorithm.dynamic_state_model import normalize_model_variant
+from app.services.model_comparison import (
+    MODEL_FAMILIES,
+    MODEL_VARIANT_BY_FAMILY,
+    ROLLING_ORIGIN_VERSION,
+    comparison_metrics,
+    estimate_reactivity_and_recovery,
+    estimate_response_rates,
+    observed_recovery_efficiency,
+    promotion_gate,
+    rolling_origin_splits,
+    trait_resilience_prior,
+)
+from entry.config import GLOBAL_DEFAULT_CONFIG
+from mindflow_core.assessment import AssessmentModel
+
+
+OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v1"
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _aware(value: Any) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return (
+        parsed.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None
+        else parsed.astimezone(timezone.utc)
+    )
+
+
+def _trajectory_peak(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    point = max(
+        trajectory,
+        key=lambda item: float(item.get("stress_0_10") or 0.0),
+        default=None,
+    )
+    return {
+        "trajectory_peak_stress": (
+            float(point.get("stress_0_10") or 0.0) if point else None
+        ),
+        "trajectory_peak_time": str(point.get("time") or "")[:5] if point else None,
+    }
+
+
+class Stage4CandidateReplayService:
+    """Compare frozen candidates without maintaining a second model formula."""
+
+    def __init__(self, timezone_name: str):
+        self.model = AssessmentModel(timezone_name)
+
+    @staticmethod
+    def _calendar_events(calendar: Mapping[str, Any]) -> list[dict[str, Any]]:
+        events = []
+        for raw in calendar.get("calendar_representation") or []:
+            event = dict(raw)
+            metadata = dict(event.get("metadata") or {})
+            if event.get("workload_prior") is not None:
+                semantic = dict(metadata.get("semantic") or {})
+                semantic["workload_prior"] = event.get("workload_prior")
+                semantic["workload_feature_vector"] = event.get(
+                    "workload_feature_vector"
+                )
+                semantic["workload_model_version"] = event.get(
+                    "workload_model_version"
+                )
+                metadata["semantic"] = semantic
+            if event.get("event_type") in {"rest", "nap"}:
+                metadata["protected_break"] = True
+            event["metadata"] = metadata
+            events.append(event)
+        return events
+
+    @staticmethod
+    def _calendar_recovery(
+        calendar: Mapping[str, Any], observed_at: datetime
+    ) -> float:
+        demanding: list[tuple[datetime, datetime]] = []
+        active = 0.0
+        for event in calendar.get("calendar_representation") or []:
+            try:
+                start = _aware(event.get("start_time"))
+                end = _aware(event.get("end_time"))
+            except (TypeError, ValueError):
+                continue
+            event_type = str(event.get("event_type") or "").lower()
+            metadata = dict(event.get("metadata") or {})
+            name = str(event.get("summary") or event.get("name") or "").lower()
+            protected = bool(
+                metadata.get("protected_break")
+                or event_type in {"rest", "nap"}
+                or "protected break" in name
+                or "保护性休息" in name
+            )
+            if start <= observed_at < end:
+                if event_type == "sleep":
+                    active = 1.0
+                elif protected:
+                    active = max(active, 0.65)
+            if event_type not in {"rest", "nap", "sleep", "meal"}:
+                demanding.append((start, end))
+        if active:
+            return active
+        previous = [end for _, end in demanding if end <= observed_at]
+        following = [start for start, _ in demanding if start > observed_at]
+        if not previous or not following:
+            return 0.0
+        gap = (min(following) - max(previous)).total_seconds() / 60.0
+        return 0.35 * min(1.0, max(0.0, gap) / 60.0) if gap >= 10 else 0.0
+
+    def _extract(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        participant_id: Any | None,
+    ) -> dict[str, Any]:
+        forecasts = {
+            str(item["source_id"]): dict(item["metadata"])
+            for item in items
+            if item["item_type"] == "forecast"
+        }
+        calendars = {
+            str(item["source_id"]): dict(item["metadata"])
+            for item in items
+            if item["item_type"] == "calendar"
+        }
+        observations = {
+            str(item["source_id"]): dict(item["metadata"])
+            for item in items
+            if item["item_type"] == "observation"
+        }
+        observation_history: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in items:
+            if item["item_type"] != "observation":
+                continue
+            metadata = dict(item["metadata"])
+            metadata["participant_id"] = str(item["participant_id"])
+            observation_history[str(item["participant_id"])].append(metadata)
+
+        slow_history: dict[str, list[tuple[datetime, float, float]]] = defaultdict(list)
+        brs_history: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+        for item in items:
+            metadata = dict(item["metadata"])
+            participant = str(item["participant_id"])
+            if item["item_type"] == "slow_state":
+                recovery = _number(metadata.get("recent_recovery_quality"))
+                sleep_debt = _number(metadata.get("recent_sleep_debt")) or 0.0
+                try:
+                    available = max(
+                        _aware(metadata.get("effective_at")),
+                        _aware(metadata.get("created_at")),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                slow_history[participant].append(
+                    (available, max(0.0, min(1.0, (recovery or 0.0) / 10.0)), sleep_debt)
+                )
+            elif item["item_type"] == "psychometric" and str(
+                metadata.get("instrument_name") or ""
+            ).upper() == "BRS":
+                prior = trait_resilience_prior(metadata.get("scores"))
+                if prior is None:
+                    continue
+                try:
+                    available = max(
+                        _aware(metadata.get("administered_at")),
+                        _aware(metadata.get("created_at")),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                brs_history[participant].append((available, prior))
+
+        samples = []
+        for item in items:
+            if item["item_type"] != "match_source":
+                continue
+            if participant_id is not None and item["participant_id"] != participant_id:
+                continue
+            match = dict(item["metadata"])
+            forecast_id = str(match.get("forecast_id") or "")
+            forecast = forecasts.get(forecast_id) or {}
+            calendar = calendars.get(forecast_id) or {}
+            context = dict(match.get("context") or {})
+            point_time = str(context.get("forecast_point_time") or "")[:5]
+            point = next(
+                (
+                    dict(value)
+                    for value in forecast.get("curve") or []
+                    if str(value.get("time") or "")[:5] == point_time
+                ),
+                {},
+            )
+            observation = observations.get(str(match.get("observation_id"))) or {}
+            payload = dict(observation.get("payload") or {})
+            actual = _number(match.get("actual_stress"))
+            current_prediction = _number(match.get("predicted_stress"))
+            if actual is None or current_prediction is None:
+                continue
+            try:
+                observed_at = _aware(match.get("observed_at"))
+            except (TypeError, ValueError):
+                continue
+            workload = _number(point.get("workload"))
+            workload_observed = workload is not None
+            if workload is None:
+                raw = _number(context.get("workload_0_10"))
+                workload_observed = raw is not None
+                workload = (raw or 0.0) / 10.0
+            recovery = _number(point.get("recovery_resource")) or 0.0
+            recovery_observed = point.get("recovery_resource") is not None
+            reported = next(
+                (
+                    _number(payload.get(key))
+                    for key in ("recovery_0_10", "recovery_quality_0_10")
+                    if payload.get(key) is not None
+                ),
+                None,
+            )
+            if reported is not None:
+                recovery = max(recovery, reported / 10.0)
+                recovery_observed = True
+            eligible_slow = [
+                value
+                for value in slow_history.get(str(item["participant_id"]), [])
+                if value[0] <= observed_at
+            ]
+            slow = max(eligible_slow, key=lambda value: value[0]) if eligible_slow else None
+            calendar_recovery = self._calendar_recovery(calendar, observed_at)
+            recovery = max(recovery, slow[1] if slow else 0.0, calendar_recovery)
+            recovery_observed = bool(
+                recovery_observed or slow is not None or calendar_recovery > 0.0
+            )
+            current_peak = _trajectory_peak(forecast.get("curve") or [])
+            samples.append(
+                {
+                    **match,
+                    **current_peak,
+                    "participant_id": str(item["participant_id"]),
+                    "local_date": item["local_date"].isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "forecast_id": forecast_id,
+                    "actual_stress": actual,
+                    "current_prediction": current_prediction,
+                    "workload": max(0.0, min(1.0, workload)),
+                    "workload_observed": workload_observed,
+                    "recovery": max(0.0, min(1.0, recovery)),
+                    "recovery_observed": recovery_observed,
+                    "observed_vitality": next(
+                        (
+                            _number(payload.get(key))
+                            for key in ("energy_0_10", "vitality_0_10")
+                            if payload.get(key) is not None
+                        ),
+                        None,
+                    ),
+                    "post_event_input": _number(point.get("post_event_input")) or 0.0,
+                    "continuous_load": _number(point.get("continuous_load_factor")) or 0.0,
+                    "sleep_debt": slow[2] if slow else 0.0,
+                }
+            )
+        samples.sort(key=lambda row: (row["local_date"], row["observed_at"], row["participant_id"]))
+        return {
+            "samples": samples,
+            "forecasts": forecasts,
+            "calendars": calendars,
+            "observation_history": observation_history,
+            "brs_history": brs_history,
+        }
+
+    @staticmethod
+    def _candidate_parameters(
+        fitted: Mapping[str, Any], rates: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        ctssm = {
+            "workload_stress_gain": float(fitted["workload_reactivity_beta"]) * 10.0,
+            "recovery_stress_gain": float(fitted["recovery_beta"]) * 10.0,
+        }
+        for key in ("stress_reactivity_per_hour", "stress_recovery_per_hour"):
+            if rates.get(key) is not None:
+                ctssm[key] = float(rates[key])
+        return {
+            "S_star_init": float(fitted["stress_baseline_0_10"]) * 10.0,
+            "ctssm_params": ctssm,
+        }
+
+    @staticmethod
+    def _initial_state(training: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+        latest = max(training, key=lambda row: str(row.get("observed_at") or ""), default=None)
+        return {
+            "stress_0_10": float((latest or {}).get("actual_stress") or 4.0),
+            "vitality_0_10": float((latest or {}).get("observed_vitality") or 7.0),
+        }
+
+    @staticmethod
+    def _known_observations(
+        history: Sequence[Mapping[str, Any]], target: datetime
+    ) -> list[dict[str, Any]]:
+        known = []
+        for observation in history:
+            try:
+                observed = _aware(observation.get("observed_at"))
+                created = _aware(observation.get("created_at"))
+            except (TypeError, ValueError):
+                continue
+            if max(observed, created) >= target:
+                continue
+            known.append(
+                {
+                    "type": observation.get("observation_type"),
+                    "observed_at": observation.get("observed_at"),
+                    "payload": dict(observation.get("payload") or {}),
+                }
+            )
+        return known
+
+    @staticmethod
+    def _support(samples: Sequence[Mapping[str, Any]], family: str) -> dict[str, Any]:
+        participants = {str(row["participant_id"]) for row in samples}
+        days = {str(row["local_date"]) for row in samples}
+        ordered: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+        for row in samples:
+            ordered[
+                (str(row["participant_id"]), str(row["local_date"]))
+            ].append(row)
+        persistence = recovery_transitions = sustained_episodes = 0
+        for rows in ordered.values():
+            rows = sorted(rows, key=lambda row: str(row["observed_at"]))
+            in_sustained = False
+            for row in rows:
+                sustained = float(row.get("continuous_load") or 0.0) > 0.0
+                if sustained and not in_sustained:
+                    sustained_episodes += 1
+                in_sustained = sustained
+            for previous, current in zip(rows, rows[1:]):
+                if float(current.get("post_event_input") or 0.0) > 0.0 and (
+                    float(current["actual_stress"]) >= float(previous["actual_stress"]) - 0.5
+                ):
+                    persistence += 1
+                if (
+                    (float(previous.get("workload") or 0.0) >= 0.7 or float(previous.get("continuous_load") or 0.0) > 0.0)
+                    and float(current.get("recovery") or 0.0) > 0.0
+                    and float(current.get("workload") or 0.0) < float(previous.get("workload") or 0.0)
+                    and float(current["actual_stress"]) < float(previous["actual_stress"])
+                ):
+                    recovery_transitions += 1
+        counts = {
+            "stress_ema_count": len(samples),
+            "workload_observation_count": sum(bool(row.get("workload_observed")) for row in samples),
+            "workload_level_count": len({round(float(row.get("workload") or 0.0), 6) for row in samples if row.get("workload_observed")}),
+            "recovery_observation_count": sum(bool(row.get("recovery_observed")) for row in samples),
+            "recovery_level_count": len({round(float(row.get("recovery") or 0.0), 6) for row in samples if row.get("recovery_observed")}),
+            "vitality_observation_count": sum(row.get("observed_vitality") is not None for row in samples),
+            "post_event_exposure_count": sum(float(row.get("post_event_input") or 0.0) > 0.0 for row in samples),
+            "post_event_ema_count": sum(float(row.get("post_event_input") or 0.0) > 0.0 and row.get("actual_stress") is not None for row in samples),
+            "stress_persistence_transition_count": persistence,
+            "sustained_workload_episode_count": sustained_episodes,
+            "continuous_load_level_count": len({round(float(row.get("continuous_load") or 0.0), 6) for row in samples}),
+            "post_load_recovery_transition_count": recovery_transitions,
+            "participant_count": len(participants),
+            "day_count": len(days),
+        }
+        checks = {
+            "stress_ema": counts["stress_ema_count"] > 0,
+        }
+        if family != "current_m0":
+            checks.update(
+                {
+                    "workload": counts["workload_observation_count"] > 0 and counts["workload_level_count"] >= 2,
+                    "recovery": counts["recovery_observation_count"] > 0 and counts["recovery_level_count"] >= 2,
+                }
+            )
+        if family in {"m1", "m2", "m3"}:
+            checks["vitality"] = counts["vitality_observation_count"] > 0
+        if family == "m2":
+            checks.update(
+                {
+                    key: counts[key] >= threshold
+                    for key, threshold in OBSERVABLE_SUPPORT_CONFIG["m2"].items()
+                }
+            )
+        if family == "m3":
+            checks.update(
+                {
+                    key: counts[key] >= threshold
+                    for key, threshold in OBSERVABLE_SUPPORT_CONFIG["m3"].items()
+                }
+            )
+        return {
+            "version": OBSERVABLE_SUPPORT_CONFIG["version"],
+            "supported": all(checks.values()),
+            "counts": counts,
+            "checks": checks,
+            "thresholds": OBSERVABLE_SUPPORT_CONFIG.get(family, {}),
+        }
+
+    def compare(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        participant_id: Any | None,
+        requested_family: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        frozen = self._extract(items, participant_id)
+        samples = frozen["samples"]
+        splits = rolling_origin_splits(samples, minimum_training_days=2)
+        if not splits:
+            return {
+                "config": config,
+                "status": "insufficient_rolling_origin_days",
+                "rolling_origin": {"version": ROLLING_ORIGIN_VERSION, "split_count": 0, "sample_count": len(samples)},
+                "comparison": {},
+                "promotion": {},
+            }
+        prediction_sets = {family: [] for family in MODEL_FAMILIES}
+        parameter_history = []
+        replay_audit = []
+        final_parameters: dict[str, dict[str, Any]] = {}
+        for split in splits:
+            training = [samples[index] for index in split["train_indices"]]
+            testing = [samples[index] for index in split["test_indices"]]
+            by_participant: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for sample in testing:
+                by_participant[str(sample["participant_id"])].append(sample)
+            for participant, participant_testing in by_participant.items():
+                participant_training = [row for row in training if row["participant_id"] == participant]
+                fit_samples = participant_training or training
+                training_cutoff = max(_aware(row["observed_at"]) for row in fit_samples)
+                priors = [value for value in frozen["brs_history"].get(participant, []) if value[0] <= training_cutoff]
+                prior = max(priors, key=lambda value: value[0])[1] if priors else None
+                fitted = estimate_reactivity_and_recovery(fit_samples, trait_resilience=prior)
+                rates = estimate_response_rates(fit_samples, fitted)
+                candidate_params = self._candidate_parameters(fitted, rates)
+                parameter_history.append(
+                    {
+                        "split_index": split["split_index"],
+                        "participant_id": participant,
+                        "training_cutoff": training_cutoff.isoformat(),
+                        **fitted,
+                        **rates,
+                        **observed_recovery_efficiency(fit_samples),
+                    }
+                )
+                initial_state = self._initial_state(participant_training)
+                full_peak_cache: dict[tuple[str, str], dict[str, Any]] = {}
+                for sample in participant_testing:
+                    target = _aware(sample["observed_at"])
+                    calendar = frozen["calendars"].get(sample["forecast_id"]) or {}
+                    events = self._calendar_events(calendar)
+                    known = self._known_observations(
+                        frozen["observation_history"].get(participant, []), target
+                    )
+                    current_row = {
+                        **sample,
+                        "predicted_stress": sample["current_prediction"],
+                        "prediction_lower": sample.get("prediction_lower"),
+                        "prediction_upper": sample.get("prediction_upper"),
+                        "split_index": split["split_index"],
+                    }
+                    prediction_sets["current_m0"].append(current_row)
+                    for family in MODEL_FAMILIES[1:]:
+                        variant = MODEL_VARIANT_BY_FAMILY[family]
+                        result = self.model.predict_candidate(
+                            model_variant=variant,
+                            candidate_params=candidate_params,
+                            observations=known,
+                            calendar_events=events,
+                            local_date=sample["local_date"],
+                            initial_state=initial_state,
+                            sleep_debt_hours=float(sample.get("sleep_debt") or 0.0),
+                        )
+                        point_time = str((sample.get("context") or {}).get("forecast_point_time") or "")[:5]
+                        point = next(
+                            (row for row in result.trajectory if str(row.get("time") or "")[:5] == point_time),
+                            None,
+                        )
+                        if point is None:
+                            continue
+                        cache_key = (family, sample["local_date"])
+                        if cache_key not in full_peak_cache:
+                            origin = self.model.predict_candidate(
+                                model_variant=variant,
+                                candidate_params=candidate_params,
+                                observations=[],
+                                calendar_events=events,
+                                local_date=sample["local_date"],
+                                initial_state=initial_state,
+                                sleep_debt_hours=float(sample.get("sleep_debt") or 0.0),
+                            )
+                            full_peak_cache[cache_key] = _trajectory_peak(origin.trajectory)
+                        interval = dict(point.get("stress_interval_90_0_10") or {})
+                        prediction_sets[family].append(
+                            {
+                                **sample,
+                                **full_peak_cache[cache_key],
+                                "predicted_stress": point["stress_0_10"],
+                                "prediction_lower": interval.get("lower"),
+                                "prediction_upper": interval.get("upper"),
+                                "split_index": split["split_index"],
+                                "replay_engine": REPLAY_ENGINE_VERSION,
+                            }
+                        )
+                        replay_audit.append(
+                            {
+                                "split_index": split["split_index"],
+                                "participant_id": participant,
+                                "family": family,
+                                "target": target.isoformat(),
+                                "assimilated_observation_count": len(known),
+                                "target_observation_assimilated": False,
+                                "trajectory_point_count": result.point_count,
+                                "interval_source": "LatentUncertainty/prediction_interval",
+                            }
+                        )
+                final_parameters[participant] = candidate_params
+
+        comparison: dict[str, dict[str, Any]] = {}
+        baseline_by_participant = {}
+        for participant in sorted({row["participant_id"] for row in samples}):
+            metric = comparison_metrics([row for row in prediction_sets["current_m0"] if row["participant_id"] == participant])
+            if metric["mae"] is not None:
+                baseline_by_participant[participant] = metric["mae"]
+        for family in MODEL_FAMILIES:
+            metrics = comparison_metrics(prediction_sets[family])
+            metrics["model_variant"] = MODEL_VARIANT_BY_FAMILY[family]
+            metrics["replay_engine"] = "frozen_current_m0" if family == "current_m0" else REPLAY_ENGINE_VERSION
+            metrics["observable_support"] = self._support(samples, family)
+            metrics["participant_effect"] = []
+            for participant, baseline_mae in baseline_by_participant.items():
+                participant_metrics = comparison_metrics([row for row in prediction_sets[family] if row["participant_id"] == participant])
+                if participant_metrics["mae"] is not None:
+                    metrics["participant_effect"].append(
+                        {
+                            "participant_id": participant,
+                            "mae_delta_vs_current_m0": round(participant_metrics["mae"] - baseline_mae, 4),
+                            "sample_count": participant_metrics["sample_count"],
+                        }
+                    )
+            comparison[family] = metrics
+        promotion = {
+            family: promotion_gate(comparison["current_m0"], comparison[family])
+            for family in MODEL_FAMILIES
+            if family != "current_m0"
+        }
+        evaluation_config = {
+            **config,
+            "replay_engine_version": REPLAY_ENGINE_VERSION,
+            "observable_support_config_version": OBSERVABLE_SUPPORT_CONFIG["version"],
+        }
+        return {
+            "config": evaluation_config,
+            "status": "completed",
+            "replay_engine": REPLAY_ENGINE_VERSION,
+            "rolling_origin": {"version": ROLLING_ORIGIN_VERSION, "split_count": len(splits), "splits": splits},
+            "comparison": comparison,
+            "promotion": promotion,
+            "requested_family": requested_family,
+            "metrics": comparison.get(requested_family) if requested_family != "all" else None,
+            "parameter_history": parameter_history,
+            "candidate_parameters": final_parameters,
+            "replay_audit": replay_audit,
+        }

@@ -30,10 +30,7 @@ class User:
         status = str(selection.get("status") or "")
         active_variant = (
             normalize_model_variant(selection.get("active_variant", "m0"))
-            if status in {
-                "retained_from_empirical_evidence",
-                "research_candidate_run",
-            }
+            if status == "retained_from_empirical_evidence"
             else "m0"
         )
         self.params["model_family"] = MODEL_VARIANTS[active_variant]["canonical"]

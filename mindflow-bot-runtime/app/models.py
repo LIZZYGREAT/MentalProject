@@ -840,6 +840,55 @@ class ModelEvaluationRun(Base):
     )
 
 
+class ModelPromotionDecision(Base):
+    """Durable proof that one candidate passed the production gate."""
+
+    __tablename__ = "model_promotion_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "model_evaluation_run_id",
+            "participant_id",
+            "model_family",
+            name="uq_model_promotion_run_participant_family",
+        ),
+        Index(
+            "ix_model_promotion_participant_promoted",
+            "participant_id",
+            "promoted_at",
+        ),
+        CheckConstraint(
+            "status = 'retained_from_empirical_evidence'",
+            name="ck_model_promotion_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    model_evaluation_run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("model_evaluation_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    dataset_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    participant_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    model_family: Mapped[str] = mapped_column(String(32), nullable=False)
+    promotion_gate_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluation_code_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False)
+    passed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class WarningSchedule(Base):
     __tablename__ = "warning_schedules"
     __table_args__ = (

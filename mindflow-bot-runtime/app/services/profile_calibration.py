@@ -216,8 +216,21 @@ class ProfileCalibrationService:
             "S_star_init": round(max(25.0, min(75.0, baseline + baseline_step)), 3),
         }
 
+        cutoff = (
+            datetime.combine(
+                through + timedelta(days=1),
+                datetime.min.time(),
+                self.timezone,
+            )
+            - timedelta(microseconds=1)
+        ).astimezone(timezone.utc)
         brs = (
-            self.psychometrics.latest_by_instrument(participant_id, "BRS")
+            self.psychometrics.latest_by_instrument_as_of(
+                participant_id,
+                "BRS",
+                state_cutoff=cutoff,
+                knowledge_cutoff=cutoff,
+            )
             if self.psychometrics is not None
             else None
         )

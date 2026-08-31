@@ -14,6 +14,7 @@ from core_engine.state_machine import PhysiologyStateMachine
 from algorithm.dynamic_state_model import (
     DynamicInputs,
     LatentState,
+    RECOVERY_DEBT_DYNAMICS_VERSION,
     assimilate_observation_with_uncertainty,
     build_event_assessments,
     calculate_dynamic_inputs,
@@ -552,6 +553,15 @@ class Simulator:
                         point_latent.vitality
                     ),
                     "observation_assimilated": observation_applied,
+                    **(
+                        {
+                            "recovery_debt_dynamics_version": (
+                                RECOVERY_DEBT_DYNAMICS_VERSION
+                            )
+                        }
+                        if model_variant == "m3"
+                        else {}
+                    ),
                 }
             )
 

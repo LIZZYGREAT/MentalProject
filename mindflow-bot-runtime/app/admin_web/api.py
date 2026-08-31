@@ -28,6 +28,7 @@ from app.repositories_daily_review import (
 )
 from app.services.daily_review_service import DailyReviewService
 from app.services.research_evaluation import ResearchEvaluationService
+from app.services.model_promotion import ModelPromotionService
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
@@ -57,6 +58,9 @@ class AdminAPI:
         )
         self.observations_repository = ObservationRepository(repository.database)
         self.research = ResearchEvaluationService(
+            repository.database, settings.timezone_name
+        )
+        self.promotions = ModelPromotionService(
             repository.database, settings.timezone_name
         )
         self.signer = SessionSigner(
@@ -859,6 +863,33 @@ class AdminAPI:
             return _json_error(str(exc) or "invalid_request", 400)
         return JSONResponse(item, status_code=201)
 
+    async def promote_evaluation_run(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=True)
+        if session is None:
+            return _json_error("unauthorized_or_csrf", 401)
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        try:
+            run_id = uuid.UUID(request.path_params["run_id"])
+            value = await request.json()
+            participant_id = None
+            participant_code = str(value.get("participant_code") or "").strip()
+            if participant_code:
+                participant_id = await asyncio.to_thread(
+                    self.repository.participant_id, participant_code
+                )
+                if participant_id is None:
+                    return _json_error("participant_not_found", 404)
+            result = await asyncio.to_thread(
+                self.promotions.promote_candidate,
+                run_id,
+                participant_id=participant_id,
+                model_family=str(value.get("model_family") or "").strip() or None,
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse(result, status_code=201)
+
     async def incidents(self, request: Request) -> Response:
         if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
@@ -958,6 +989,7 @@ class AdminAPI:
             Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),
             Route(f"{prefix}/research/dataset-snapshots/{{snapshot_id}}/items", self.dataset_snapshot_items, methods=["GET"]),
             Route(f"{prefix}/research/evaluation-runs", self.evaluation_runs, methods=["GET", "POST"]),
+            Route(f"{prefix}/research/evaluation-runs/{{run_id}}/promote", self.promote_evaluation_run, methods=["POST"]),
             Route(f"{prefix}/research/model-comparison", self.model_comparison, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/longitudinal", self.participant_longitudinal, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/evaluation", self.participant_evaluation, methods=["GET"]),

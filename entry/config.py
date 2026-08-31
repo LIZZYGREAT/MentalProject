@@ -46,6 +46,27 @@ GLOBAL_DEFAULT_CONFIG = {
         "maximum_peak_timing_regression_minutes": 0.0,
         "minimum_high_stress_recall_delta": 0.0,
     },
+    # Stage-4 observable-support gates are versioned independently from the
+    # prediction model so evaluation records remain reproducible after a
+    # threshold revision.
+    "observable_support": {
+        "version": "ctssm-observable-support.v2",
+        "m2": {
+            "post_event_exposure_count": 3,
+            "post_event_ema_count": 3,
+            "stress_persistence_transition_count": 2,
+            "participant_count": 1,
+            "day_count": 2,
+        },
+        "m3": {
+            "sustained_workload_episode_count": 2,
+            "continuous_load_level_count": 2,
+            "post_load_recovery_transition_count": 2,
+            "vitality_observation_count": 3,
+            "participant_count": 1,
+            "day_count": 2,
+        },
+    },
     # Phase 0 baseline: keep the model deterministic and identifiable.
     # Disabled mechanisms stay available for later ablation experiments, but
     # cannot influence the production baseline unless explicitly enabled.

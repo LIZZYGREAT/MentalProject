@@ -25,7 +25,11 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(project_root))
     from entity.user import User
 from services.event_lifecycle import prepare_event_instances
-from algorithm.dynamic_state_model import model_variant_metadata
+from algorithm.dynamic_state_model import (
+    MODEL_VARIANTS,
+    model_variant_metadata,
+    normalize_model_variant,
+)
 from algorithm.time_utils import normalize_observation_to_model_step
 from settings.model_defaults import (
     DEFAULT_EVENT_END,
@@ -166,6 +170,8 @@ class AssessmentModel:
         local_date: str | None = None,
         calendar_degraded: bool = False,
         initial_state: dict[str, Any] | None = None,
+        _candidate_variant: str | None = None,
+        _sleep_debt_hours: float = 0.0,
     ) -> PredictionResult:
         target_date = local_date or datetime.now(self.timezone).date().isoformat()
         parameters = dict(profile.get("model_params") or profile.get("params") or {})
@@ -179,6 +185,22 @@ class AssessmentModel:
                 **dict(parameters["ctssm_params"]),
             }
         user = User(user_id="runtime", params=dict(parameters))
+        if _candidate_variant is not None:
+            # This explicit research-only path bypasses production selection;
+            # callers cannot activate a candidate through persisted Profile
+            # status.  The same Simulator and step_latent_state implementation
+            # remain the sole mathematical implementation.
+            candidate_variant = normalize_model_variant(_candidate_variant)
+            user.params["model_family"] = MODEL_VARIANTS[candidate_variant][
+                "canonical"
+            ]
+            user.params["model_selection"] = {
+                "active_variant": candidate_variant,
+                "status": "offline_replay_only",
+            }
+        sleep_debt_hours = max(0.0, float(_sleep_debt_hours))
+        if sleep_debt_hours:
+            user.set_sleep_debt(sleep_debt_hours)
         time_step = int(
             user.get_param("time_step", DEFAULT_TIME_STEP_MINUTES)
             or DEFAULT_TIME_STEP_MINUTES
@@ -356,6 +378,15 @@ class AssessmentModel:
                             ),
                             4,
                         ),
+                        **(
+                            {
+                                "recovery_debt_dynamics_version": str(
+                                    point["recovery_debt_dynamics_version"]
+                                )
+                            }
+                            if point.get("recovery_debt_dynamics_version")
+                            else {}
+                        ),
                     }
                     if model_info["workload_aware"]
                     else {}
@@ -400,6 +431,33 @@ class AssessmentModel:
                 round(max(0.0, min(1.0, float(value))), 4)
                 for value in (confidence_series or [])
             ),
+        )
+
+    def predict_candidate(
+        self,
+        *,
+        model_variant: str,
+        candidate_params: dict[str, Any],
+        observations: list[dict[str, Any]],
+        calendar_events: list[dict[str, Any]],
+        local_date: str,
+        initial_state: dict[str, Any] | None = None,
+        sleep_debt_hours: float = 0.0,
+    ) -> PredictionResult:
+        """Replay a research candidate through the production CTSSM engine."""
+
+        variant = normalize_model_variant(model_variant)
+        if variant == "m0":
+            raise ValueError("predict_candidate requires a non-production candidate")
+        return self.predict(
+            profile={"model_params": dict(candidate_params)},
+            observations=list(observations),
+            calendar_events=list(calendar_events),
+            local_date=local_date,
+            calendar_degraded=False,
+            initial_state=initial_state,
+            _candidate_variant=variant,
+            _sleep_debt_hours=sleep_debt_hours,
         )
 
 

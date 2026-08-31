@@ -36,6 +36,7 @@ from services.workload import (
 
 RECOVERY_TYPES = {"rest", "meal", "nap", "sleep"}
 _WORKLOAD_ESTIMATOR = WorkloadEstimator()
+RECOVERY_DEBT_DYNAMICS_VERSION = "recovery-debt-dynamics.v1"
 
 MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
     "m0": {
@@ -1079,6 +1080,9 @@ def step_latent_state(
         "cognition_drive": cognition_drive,
         "fatigue_accumulation": accumulation,
         "fatigue_restoration": restoration,
+        "recovery_debt_dynamics_version": (
+            RECOVERY_DEBT_DYNAMICS_VERSION if use_fatigue else None
+        ),
         "stress_rate": stress_rate,
         "vitality_rate": vitality_rate,
     }

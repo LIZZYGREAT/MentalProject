@@ -120,6 +120,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0029_ctssm_vnext_recovery_snapshot"
     )
     assert migration_0029.down_revision == "0028_workload_causal_provenance"
+    migration_0030 = next(
+        migration for migration in migrations
+        if migration.revision == "0030_model_promotion_decisions"
+    )
+    assert migration_0030.down_revision == "0029_ctssm_vnext_recovery_snapshot"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

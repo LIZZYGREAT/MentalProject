@@ -17,6 +17,8 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
+from algorithm.dynamic_state_model import normalize_model_variant
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,7 @@ from app.models import (
     ParticipantSlowState,
     PsychometricAssessment,
     LearnedModelProfile,
+    ModelPromotionDecision,
     ForecastCurrentnessEvent,
     ForecastSnapshot,
     RuntimeIncident,
@@ -85,6 +88,17 @@ def _canonical_json(value: Any) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+def promotion_parameters_hash(parameters: Mapping[str, Any]) -> str:
+    """Bind promotion evidence to the exact non-selection model parameters."""
+
+    payload = {
+        key: value
+        for key, value in dict(parameters).items()
+        if key != "model_selection"
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 class ForecastInputChangedError(RuntimeError):
@@ -321,7 +335,7 @@ class LearnedProfileRepository:
         """
 
         with self.database.session() as session:
-            row = session.execute(
+            rows = session.execute(
                 select(LearnedModelProfile)
                 .where(
                     LearnedModelProfile.participant_id == participant_id,
@@ -334,9 +348,44 @@ class LearnedProfileRepository:
                     ),
                 )
                 .order_by(desc(LearnedModelProfile.version))
-                .limit(1)
-            ).scalar_one_or_none()
-            return self._view(row) if row is not None else None
+            ).scalars().all()
+            for row in rows:
+                view = self._view(row)
+                parameters = dict(view["parameters"])
+                selection = dict(parameters.get("model_selection") or {})
+                active_variant = normalize_model_variant(
+                    selection.get("active_variant") or "m0"
+                )
+                if active_variant == "m0":
+                    return view
+                try:
+                    decision_id = uuid.UUID(
+                        str(selection.get("promotion_decision_id") or "")
+                    )
+                except ValueError:
+                    decision_id = None
+                decision = (
+                    session.get(ModelPromotionDecision, decision_id)
+                    if decision_id is not None
+                    else None
+                )
+                valid = bool(
+                    decision is not None
+                    and decision.participant_id == participant_id
+                    and decision.status == "retained_from_empirical_evidence"
+                    and decision.model_family
+                    == {
+                        "wm0": "workload_aware_m0",
+                        "m1": "m1",
+                        "m2": "m2",
+                        "m3": "m3",
+                    }.get(active_variant)
+                    and decision.parameters_hash
+                    == promotion_parameters_hash(parameters)
+                )
+                if valid:
+                    return view
+            return None
 
     def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
         """Compatibility alias for research callers; prefer latest()."""
@@ -542,6 +591,36 @@ class PsychometricAssessmentRepository:
                 .where(
                     PsychometricAssessment.participant_id == participant_id,
                     PsychometricAssessment.instrument_name == name,
+                )
+                .order_by(
+                    desc(PsychometricAssessment.administered_at),
+                    desc(PsychometricAssessment.created_at),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
+    def latest_by_instrument_as_of(
+        self,
+        participant_id: uuid.UUID,
+        instrument_name: str,
+        *,
+        state_cutoff: datetime,
+        knowledge_cutoff: datetime,
+    ) -> Optional[dict[str, Any]]:
+        """Return the latest assessment both measured and known by cutoffs."""
+
+        name = normalize_instrument_name(instrument_name)
+        state = aware_utc(state_cutoff, "state_cutoff")
+        knowledge = aware_utc(knowledge_cutoff, "knowledge_cutoff")
+        with self.database.session() as session:
+            row = session.execute(
+                select(PsychometricAssessment)
+                .where(
+                    PsychometricAssessment.participant_id == participant_id,
+                    PsychometricAssessment.instrument_name == name,
+                    PsychometricAssessment.administered_at <= state,
+                    PsychometricAssessment.created_at <= knowledge,
                 )
                 .order_by(
                     desc(PsychometricAssessment.administered_at),

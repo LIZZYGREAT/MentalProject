@@ -1,10 +1,16 @@
 from datetime import date, datetime, timezone
 import uuid
 
+from app.models import ModelEvaluationRun
 from app.repositories import (
+    ForecastSnapshotRepository,
+    LearnedProfileRepository,
+    ObservationRepository,
     ParticipantSlowStateRepository,
     PsychometricAssessmentRepository,
 )
+from app.repositories import promotion_parameters_hash
+from app.services.forecast_coordinator import enforce_promoted_model_selection
 from app.services.model_comparison import (
     MODEL_FAMILIES,
     comparison_metrics,
@@ -19,6 +25,12 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V4,
     ResearchEvaluationService,
 )
+from app.services.profile_calibration import ProfileCalibrationService
+from app.services.model_comparison import PROMOTION_GATE_VERSION
+from app.services.model_promotion import ModelPromotionService
+from app.services.research_evaluation import EVALUATION_CODE_VERSION
+from app.services.stage4_candidate_replay import Stage4CandidateReplayService
+from entity.user import User
 from mindflow_core.assessment import AssessmentModel
 from tests.helpers import memory_database, participant
 
@@ -59,13 +71,22 @@ def _calendar() -> list[dict]:
 def test_current_m0_is_stable_comparator_and_candidates_share_interface():
     model = AssessmentModel("Asia/Shanghai")
     results = {
-        variant: model.predict(
-            profile=_profile(variant),
+        "m0": model.predict(
+            profile=_profile("m0"),
             observations=[],
             calendar_events=_calendar(),
             local_date="2030-01-15",
-        )
-        for variant in ("m0", "wm0", "m1", "m2", "m3")
+        ),
+        **{
+            variant: model.predict_candidate(
+                model_variant=variant,
+                candidate_params={},
+                observations=[],
+                calendar_events=_calendar(),
+                local_date="2030-01-15",
+            )
+            for variant in ("wm0", "m1", "m2", "m3")
+        },
     }
 
     assert results["m0"].model_family == "stress-ctssm.m0"
@@ -93,7 +114,9 @@ def test_resilience_prior_parameter_estimation_and_observed_recovery_are_auditab
     assert trait_resilience_prior({"mean": 1.0}) == 0.0
     assert trait_resilience_prior({"mean": 5.0}) == 1.0
     assert trait_resilience_prior({"total_mean": 3.5}) == 0.625
-    assert trait_resilience_prior({"total": 24.0}) == 0.75
+    assert trait_resilience_prior({"total": 6.0}) == 0.0
+    assert trait_resilience_prior({"total": 18.0}) == 0.5
+    assert trait_resilience_prior({"total": 30.0}) == 1.0
     assert trait_resilience_prior({"mean": 8.0}) is None
     samples = [
         {
@@ -174,6 +197,111 @@ def test_resilience_prior_parameter_estimation_and_observed_recovery_are_auditab
     assert rates["stress_recovery_per_hour"] == 0.6931
     assert rates["response_transition_count"] == 1
     assert rates["recovery_transition_count"] == 1
+
+
+def test_historical_calibration_uses_only_brs_known_by_through_date():
+    database = memory_database()
+    person = participant(database, "BRS-AS-OF")
+    psychometrics = PsychometricAssessmentRepository(database)
+    psychometrics.record(
+        person.id,
+        instrument_name="BRS",
+        instrument_version="1",
+        language="zh-CN",
+        raw_items={},
+        scores={"total": 18},
+        administered_at=datetime(2030, 1, 5, tzinfo=timezone.utc),
+    )
+    psychometrics.record(
+        person.id,
+        instrument_name="BRS",
+        instrument_version="1",
+        language="zh-CN",
+        raw_items={},
+        scores={"total": 30},
+        administered_at=datetime(2030, 1, 15, tzinfo=timezone.utc),
+    )
+    forecasts = ForecastSnapshotRepository(database)
+    forecasts.save(
+        person.id,
+        date(2030, 1, 10),
+        calendar_revision="c",
+        semantic_revision="s",
+        observation_revision="o",
+        algorithm_version="a",
+        forecast_version="v",
+        semantic_status="complete",
+        semantic_input=[],
+        curve=[
+            {
+                "time": "09:00",
+                "stress_0_10": 5.0,
+                "workload": 0.5,
+                "recovery_resource": 0.2,
+            }
+        ],
+        peaks=[],
+        warning_windows=[],
+        output={},
+    )
+    observations = ObservationRepository(database)
+    observations.add(
+        person.id,
+        "checkin",
+        {"stress_0_10": 6.0},
+        observed_at=datetime(2030, 1, 10, 9, tzinfo=timezone.utc),
+        source_message_id="brs-as-of",
+    )
+    service = ProfileCalibrationService(
+        observations,
+        forecasts,
+        LearnedProfileRepository(database),
+        "Asia/Shanghai",
+        psychometrics=psychometrics,
+    )
+    service.MIN_DAYS = 1
+    service.MIN_MATCHED_SAMPLES = 1
+    result = service.maybe_calibrate(person.id, through=date(2030, 1, 10))
+
+    assert result["status"] == "calibrated"
+    assert result["learned_profile"]["parameters"]["ctssm_params"][
+        "trait_resilience_prior"
+    ] == 0.5
+
+
+def test_candidate_replay_never_assimilates_target_future_or_late_known_ema():
+    target = datetime(2030, 1, 10, 10, tzinfo=timezone.utc)
+    history = [
+        {
+            "observation_type": "checkin",
+            "observed_at": "2030-01-10T09:00:00+00:00",
+            "created_at": "2030-01-10T09:01:00+00:00",
+            "payload": {"stress_0_10": 5.0},
+        },
+        {
+            "observation_type": "checkin",
+            "observed_at": target.isoformat(),
+            "created_at": target.isoformat(),
+            "payload": {"stress_0_10": 9.0},
+        },
+        {
+            "observation_type": "checkin",
+            "observed_at": "2030-01-10T09:30:00+00:00",
+            "created_at": "2030-01-10T10:30:00+00:00",
+            "payload": {"stress_0_10": 8.0},
+        },
+        {
+            "observation_type": "checkin",
+            "observed_at": "2030-01-10T11:00:00+00:00",
+            "created_at": "2030-01-10T11:00:00+00:00",
+            "payload": {"stress_0_10": 7.0},
+        },
+    ]
+
+    known = Stage4CandidateReplayService._known_observations(history, target)
+
+    assert len(known) == 1
+    assert known[0]["payload"]["stress_0_10"] == 5.0
 
 
 def test_rolling_origin_metrics_and_promotion_gate_cover_all_stage4_checks():
@@ -372,6 +500,155 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert result["comparison"]["m1"]["observable_support"]["supported"] is True
     assert result["comparison"]["m2"]["observable_support"]["supported"] is False
+    assert {
+        "post_event_exposure_count",
+        "post_event_ema_count",
+        "stress_persistence_transition_count",
+        "participant_count",
+        "day_count",
+    } <= set(result["comparison"]["m2"]["observable_support"]["counts"])
+    assert {
+        "sustained_workload_episode_count",
+        "continuous_load_level_count",
+        "post_load_recovery_transition_count",
+        "vitality_observation_count",
+        "participant_count",
+        "day_count",
+    } <= set(result["comparison"]["m3"]["observable_support"]["counts"])
     assert result["promotion"]["m2"]["checks"]["observable_support"] is False
     assert result["parameter_history"][0]["trait_resilience_prior"] is None
-    assert result["parameter_history"][1]["trait_resilience_prior"] == 1.0
+    assert result["parameter_history"][1]["trait_resilience_prior"] is None
+    assert all(
+        row["target_observation_assimilated"] is False
+        and row["interval_source"] == "LatentUncertainty/prediction_interval"
+        and row["trajectory_point_count"] == 288
+        for row in result["replay_audit"]
+    )
+    assert all(
+        result["comparison"][family]["replay_engine"]
+        == "stage4-real-ctssm-replay.v1"
+        for family in ("workload_aware_m0", "m1", "m2", "m3")
+    )
+
+
+def test_production_candidate_requires_durable_promotion_provenance():
+    assert User(
+        params={
+            "model_selection": {
+                "active_variant": "m1",
+                "status": "research_candidate_run",
+            }
+        }
+    ).params["model_selection"]["active_variant"] == "m0"
+
+    database = memory_database()
+    person = participant(database, "PROMOTION-PROVENANCE")
+    learned = LearnedProfileRepository(database)
+    unproven = {
+        "S_star_init": 50.0,
+        "ctssm_params": {"workload_stress_gain": 25.0},
+        "model_selection": {
+            "active_variant": "m1",
+            "status": "retained_from_empirical_evidence",
+        },
+    }
+    learned.save(
+        person.id,
+        parameters=unproven,
+        uncertainty={key: {"std_error": 0.0} for key in unproven},
+        sample_count=10,
+        day_count=3,
+        confidence=1.0,
+        window_start=date(2030, 1, 1),
+        window_end=date(2030, 1, 3),
+        model_version="candidate-without-proof",
+        validation_status="validated",
+    )
+    assert learned.runtime_active(person.id) is None
+
+    research = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = research.create_dataset_snapshot(
+        date_start=date(2030, 1, 1),
+        date_end=date(2030, 1, 3),
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2030, 1, 4, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2030, 1, 4, tzinfo=timezone.utc),
+    )
+    candidate_params = {
+        "S_star_init": 48.0,
+        "ctssm_params": {
+            "workload_stress_gain": 24.0,
+            "recovery_stress_gain": 16.0,
+        },
+    }
+    with database.session() as session:
+        run = ModelEvaluationRun(
+            dataset_snapshot_id=uuid.UUID(snapshot["id"]),
+            model_version="m1",
+            evaluation_mode="offline_replay",
+            evaluation_code_version=EVALUATION_CODE_VERSION,
+            participant_id=person.id,
+            metrics_json={
+                "config": {
+                    "manifest_hash": snapshot["manifest"]["manifest_hash"],
+                },
+                "comparison": {"m1": {"mae": 0.9, "sample_count": 12}},
+                "promotion": {
+                    "m1": {
+                        "passed": True,
+                        "gate_version": PROMOTION_GATE_VERSION,
+                    }
+                },
+                "candidate_parameters": {
+                    str(person.id): candidate_params,
+                },
+            },
+            status="completed",
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.id
+
+    decision = ModelPromotionService(
+        database, "Asia/Shanghai"
+    ).promote_candidate(run_id, participant_id=person.id, model_family="m1")
+    active = learned.runtime_active(person.id)
+
+    assert decision["status"] == "retained_from_empirical_evidence"
+    assert active["parameters"]["model_selection"]["active_variant"] == "m1"
+    assert active["parameters"]["model_selection"][
+        "promotion_decision_id"
+    ] == decision["id"]
+
+
+def test_explicit_profile_override_cannot_mutate_promoted_candidate():
+    candidate = {
+        "S_star_init": 50.0,
+        "ctssm_params": {"workload_stress_gain": 25.0},
+    }
+    selection = {
+        "active_variant": "m1",
+        "status": "retained_from_empirical_evidence",
+        "promotion_decision_id": str(uuid.uuid4()),
+        "parameters_hash": promotion_parameters_hash(candidate),
+    }
+    learned = {"parameters": {**candidate, "model_selection": selection}}
+    valid = enforce_promoted_model_selection(
+        {"model_params": {**candidate, "model_selection": selection}}, learned
+    )
+    overridden = enforce_promoted_model_selection(
+        {
+            "model_params": {
+                **candidate,
+                "ctssm_params": {"workload_stress_gain": 99.0},
+                "model_selection": selection,
+            }
+        },
+        learned,
+    )
+
+    assert valid["model_params"]["model_selection"]["active_variant"] == "m1"
+    assert overridden["model_params"]["model_selection"] == {
+        "active_variant": "m0",
+        "status": "promotion_provenance_missing",
+    }
