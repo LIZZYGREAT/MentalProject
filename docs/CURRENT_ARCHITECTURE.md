@@ -225,7 +225,7 @@ participant-specific 查询仅在不可变条目能证明参与者出现时允�
 Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
 Stage 2 新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变；Stage 4
-新增运行记录 `stage4-evaluation.v3`。评估模式明确区分 `historical_online` 与执行候选模型族
+新增运行记录 `stage4-evaluation.v4`。评估模式明确区分 `historical_online` 与执行候选模型族
 Rolling-Origin 比较的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
@@ -257,7 +257,7 @@ M2、M3 使用同一不可变快照与 expanding rolling-origin split，统一�
 纵向 EMA episode 继续估计 workload reactivity、recovery coefficient、上升/恢复响应速率 κ 与
 observed recovery efficiency。Admin 提供模型族比较表及参与者当前模型、候选模型和验证结果。
 
-Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v2` 直接调用真实
+Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v3` 直接调用真实
 `AssessmentModel.predict_candidate → Simulator → step_latent_state`；目标时点 EMA 及未来 EMA
 不会提前 assimilate，候选区间来自 `LatentUncertainty/prediction_interval`，峰值指标使用完整 288 点
 trajectory。0030 新增 `model_promotion_decisions`：非 M0 只有在 completed offline replay、有效
@@ -278,6 +278,19 @@ rate 不进入晋级参数。晋级 confidence 使用样本、天数、transitio
 ForecastObservationMatch context 与 Dataset v4 中冻结 `model_family`、`model_variant`、
 `model_spec_version`、`promotion_decision_id` 和 `promotion_parameters_hash`。Participant Admin
 页面的 current model 读取 `runtime_active()`；cohort evaluation 单独标记，不作为个体验证结果。
+
+Current M0 不再复用 Dataset 中可能已经属于 M1/M2/M3 的历史生产预测，而是与 WM0/M1/M2/M3
+共同通过 `AssessmentModel → Simulator → step_latent_state` 真实回放；五个模型共享冻结 initial
+state、daily causal origin、Calendar 与 known observations。原预测保留为独立
+`historical_production` 指标，不参与 promotion gate。参数估计采用
+`ridge-posterior-covariance.v1`：$\Sigma_\beta=\hat\sigma^2(X^TX+\lambda I)^{-1}$，分别报告三个
+系数的标准误、设计条件数、可识别状态及 boundary clipping。`not_identified` 的 workload/recovery
+参数不能晋级生产。
+
+Participant promotion 在同一个数据库事务中写入 `ModelPromotionDecision` 与
+`LearnedModelProfile`，任一写入失败会同时回滚。`historical_online` 支持完整
+`model_identity_filter`，尤其可按 `promotion_decision_id` 与 `promotion_parameters_hash` 精确过滤；
+evaluation config 冻结 resolved filter 及实际匹配的 decision/hash 集合。
 
 M3 使用 `recovery-debt-dynamics.v1`：
 $dF/dt=\alpha_FW(t)(1-F)-\lambda_FR(t)F$，并约束 $F\in[0,1]$。这一 bounded dynamics

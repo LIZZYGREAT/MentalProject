@@ -49,9 +49,17 @@ DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
 DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V4
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
-EVALUATION_CODE_VERSION = "stage4-evaluation.v3"
+EVALUATION_CODE_VERSION = "stage4-evaluation.v4"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
+MODEL_IDENTITY_FILTER_FIELDS = {
+    "engine_version",
+    "model_family",
+    "model_variant",
+    "model_spec_version",
+    "promotion_decision_id",
+    "promotion_parameters_hash",
+}
 
 
 def _aware(value: datetime) -> datetime:
@@ -515,6 +523,9 @@ class ResearchEvaluationService:
             "weekday": observed_at.astimezone(self.timezone).strftime("%A"),
             "workload_0_10": _score(payload, "current_workload_0_10"),
             "algorithm_version": forecast.get("algorithm_version"),
+            "engine_version": (forecast.get("output") or {}).get(
+                "engine_version", forecast.get("algorithm_version")
+            ),
             "model_family": (forecast.get("output") or {}).get("model_family"),
             "model_variant": (forecast.get("output") or {}).get("model_variant"),
             "model_spec_version": (forecast.get("output") or {}).get(
@@ -1153,6 +1164,9 @@ class ResearchEvaluationService:
                 "forecast_id": str(forecast_id),
                 "forecast_version": forecast["forecast_version"],
                 "algorithm_version": forecast["algorithm_version"],
+                "engine_version": (forecast.get("output") or {}).get(
+                    "engine_version", forecast["algorithm_version"]
+                ),
                 "generated_at": forecast["generated_at"],
                 "calendar_revision": forecast["calendar_revision"],
                 "semantic_revision": forecast["semantic_revision"],
@@ -1361,6 +1375,7 @@ class ResearchEvaluationService:
         model_version: str,
         participant_id: uuid.UUID | None = None,
         evaluation_mode: str = "historical_online",
+        model_identity_filter: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model_version = str(model_version).strip()
         if not model_version or len(model_version) > 64:
@@ -1368,6 +1383,27 @@ class ResearchEvaluationService:
         evaluation_mode = str(evaluation_mode).strip()
         if evaluation_mode not in EVALUATION_MODES:
             raise ValueError("unsupported evaluation_mode")
+        if model_identity_filter is not None and evaluation_mode != "historical_online":
+            raise ValueError(
+                "model_identity_filter is only supported for historical_online"
+            )
+        if model_identity_filter is not None:
+            if not isinstance(model_identity_filter, dict):
+                raise ValueError("model_identity_filter must be an object")
+            unknown_identity_fields = (
+                set(model_identity_filter) - MODEL_IDENTITY_FILTER_FIELDS
+            )
+            if unknown_identity_fields:
+                raise ValueError("model_identity_filter contains unsupported fields")
+            resolved_identity_filter = {
+                key: str(value).strip()
+                for key, value in model_identity_filter.items()
+                if value is not None and str(value).strip()
+            }
+            if not resolved_identity_filter:
+                raise ValueError("model_identity_filter must not be empty")
+        else:
+            resolved_identity_filter = None
         with self.database.session() as session:
             snapshot = session.get(DatasetSnapshot, snapshot_id)
             if snapshot is None:
@@ -1499,6 +1535,11 @@ class ResearchEvaluationService:
             "model_version": model_version,
             "evaluation_code_version": EVALUATION_CODE_VERSION,
             "source_set": source_set,
+            "model_identity_filter": (
+                dict(resolved_identity_filter)
+                if resolved_identity_filter is not None
+                else {"legacy_model_version": model_version}
+            ),
         }
         if evaluation_mode == "offline_replay":
             requested_family = self._model_family(model_version)
@@ -1510,21 +1551,41 @@ class ResearchEvaluationService:
             )
             status = "completed"
         else:
-            matches = [
-                dict(item["metadata"])
-                for item in match_items
-                if model_version
-                in {
-                    item["metadata"].get("context", {}).get(
-                        "algorithm_version"
-                    ),
-                    item["metadata"].get("context", {}).get(
-                        "model_spec_version"
-                    ),
-                    item["metadata"].get("context", {}).get("model_family"),
-                    item["metadata"].get("context", {}).get("model_variant"),
+            matches = []
+            for item in match_items:
+                metadata = dict(item["metadata"])
+                context = dict(metadata.get("context") or {})
+                if resolved_identity_filter is not None:
+                    matched = all(
+                        str(context.get(key) or "") == expected
+                        for key, expected in resolved_identity_filter.items()
+                    )
+                else:
+                    matched = model_version in {
+                        context.get("algorithm_version"),
+                        context.get("engine_version"),
+                        context.get("model_spec_version"),
+                        context.get("model_family"),
+                        context.get("model_variant"),
+                    }
+                if matched:
+                    matches.append(metadata)
+            config["matched_promotion_decision_ids"] = sorted(
+                {
+                    str((item.get("context") or {}).get("promotion_decision_id"))
+                    for item in matches
+                    if (item.get("context") or {}).get("promotion_decision_id")
                 }
-            ]
+            )
+            config["matched_parameters_hashes"] = sorted(
+                {
+                    str((item.get("context") or {}).get("promotion_parameters_hash"))
+                    for item in matches
+                    if (item.get("context") or {}).get(
+                        "promotion_parameters_hash"
+                    )
+                }
+            )
             metrics_json = {
                 "config": config,
                 "metrics": self.metrics(matches),

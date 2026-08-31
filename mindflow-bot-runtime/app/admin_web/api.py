@@ -842,6 +842,7 @@ class AdminAPI:
             evaluation_mode = str(
                 value.get("evaluation_mode") or "historical_online"
             ).strip()
+            model_identity_filter = value.get("model_identity_filter")
             if not model_version:
                 raise ValueError("model_version is required")
             participant_id = None
@@ -858,6 +859,7 @@ class AdminAPI:
                 model_version,
                 participant_id,
                 evaluation_mode,
+                model_identity_filter=model_identity_filter,
             )
         except (TypeError, ValueError) as exc:
             return _json_error(str(exc) or "invalid_request", 400)

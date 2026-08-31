@@ -470,6 +470,32 @@ class AssessmentModel:
             _sleep_debt_hours=sleep_debt_hours,
         )
 
+    def predict_baseline_m0(
+        self,
+        *,
+        baseline_params: dict[str, Any],
+        observations: list[dict[str, Any]],
+        calendar_events: list[dict[str, Any]],
+        local_date: str,
+        initial_state: dict[str, Any] | None = None,
+        sleep_debt_hours: float = 0.0,
+    ) -> PredictionResult:
+        """Replay the research baseline through the real production M0 engine."""
+
+        parameters = dict(baseline_params)
+        parameters.pop("model_selection", None)
+        parameters.pop("model_family", None)
+        return self.predict(
+            profile={"model_params": parameters},
+            observations=list(observations),
+            calendar_events=list(calendar_events),
+            local_date=local_date,
+            calendar_degraded=False,
+            initial_state=initial_state,
+            _candidate_variant="m0",
+            _sleep_debt_hours=sleep_debt_hours,
+        )
+
 
 def _has_explicit_date(value: Any) -> bool:
     if isinstance(value, datetime):

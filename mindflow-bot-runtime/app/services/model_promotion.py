@@ -75,6 +75,31 @@ class ModelPromotionService:
         }
         return round(confidence, 6), definition
 
+    @staticmethod
+    def _has_required_parameter_uncertainty(
+        uncertainty: dict[str, Any]
+    ) -> bool:
+        values = [
+            (uncertainty.get("S_star_init") or {}).get("std_error"),
+            (
+                (uncertainty.get("ctssm_params") or {}).get(
+                    "workload_stress_gain"
+                )
+                or {}
+            ).get("std_error"),
+            (
+                (uncertainty.get("ctssm_params") or {}).get(
+                    "recovery_stress_gain"
+                )
+                or {}
+            ).get("std_error"),
+        ]
+        try:
+            normalized = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return False
+        return all(math.isfinite(value) and value >= 0 for value in normalized)
+
     def _validate_manifest(
         self, snapshot: DatasetSnapshot, rows: list[DatasetSnapshotItem]
     ) -> str:
@@ -221,8 +246,19 @@ class ModelPromotionService:
                 if target_participant is not None
                 else {}
             )
-            if target_participant is not None and not self.learned_profiles._valid_uncertainty(
-                participant_parameters, participant_uncertainty
+            if target_participant is not None and participant_evidence.get(
+                "identifiability_status"
+            ) not in {"identified", "weak"}:
+                raise ValueError(
+                    "promotion parameters are not identifiable"
+                )
+            if target_participant is not None and (
+                not self._has_required_parameter_uncertainty(
+                    participant_uncertainty
+                )
+                or not self.learned_profiles._valid_uncertainty(
+                    participant_parameters, participant_uncertainty
+                )
             ):
                 raise ValueError(
                     "promotion requires real candidate parameter uncertainty"
@@ -251,41 +287,41 @@ class ModelPromotionService:
             snapshot_end = snapshot.date_end
             sample_count = int(participant_evidence.get("sample_count") or 0)
             day_count = int(participant_evidence.get("day_count") or 0)
-
-        learned_profile = None
-        if target_participant is not None:
-            variant = MODEL_VARIANT_BY_FAMILY[family]
-            promoted_parameters = {
-                **participant_parameters,
-                "model_selection": {
-                    "active_variant": variant,
-                    "status": "retained_from_empirical_evidence",
-                    "promotion_decision_id": str(decision_id),
-                    "model_evaluation_run_id": str(evaluation_run_id),
-                    "dataset_snapshot_id": str(snapshot.id),
-                    "promotion_gate_version": PROMOTION_GATE_VERSION,
-                    "evaluation_code_version": EVALUATION_CODE_VERSION,
-                    "passed_at": run.created_at.isoformat(),
-                    "promoted_at": now.isoformat(),
-                    "manifest_hash": manifest_hash,
-                    "parameters_hash": parameters_hash,
-                    "calibration_confidence": confidence,
-                    "calibration_confidence_definition": confidence_definition,
-                },
-            }
-            learned_profile = self.learned_profiles.save(
-                target_participant,
-                parameters=promoted_parameters,
-                uncertainty=participant_uncertainty,
-                sample_count=sample_count,
-                day_count=day_count,
-                confidence=confidence,
-                window_start=snapshot_start,
-                window_end=snapshot_end,
-                source="stage4-promotion.v1",
-                model_version="mindflow-ctssm-runtime-v8",
-                validation_status="validated",
-            )
+            learned_profile = None
+            if target_participant is not None:
+                variant = MODEL_VARIANT_BY_FAMILY[family]
+                promoted_parameters = {
+                    **participant_parameters,
+                    "model_selection": {
+                        "active_variant": variant,
+                        "status": "retained_from_empirical_evidence",
+                        "promotion_decision_id": str(decision_id),
+                        "model_evaluation_run_id": str(evaluation_run_id),
+                        "dataset_snapshot_id": str(snapshot.id),
+                        "promotion_gate_version": PROMOTION_GATE_VERSION,
+                        "evaluation_code_version": EVALUATION_CODE_VERSION,
+                        "passed_at": run.created_at.isoformat(),
+                        "promoted_at": now.isoformat(),
+                        "manifest_hash": manifest_hash,
+                        "parameters_hash": parameters_hash,
+                        "calibration_confidence": confidence,
+                        "calibration_confidence_definition": confidence_definition,
+                    },
+                }
+                learned_profile = self.learned_profiles.save_in_session(
+                    session,
+                    target_participant,
+                    parameters=promoted_parameters,
+                    uncertainty=participant_uncertainty,
+                    sample_count=sample_count,
+                    day_count=day_count,
+                    confidence=confidence,
+                    window_start=snapshot_start,
+                    window_end=snapshot_end,
+                    source="stage4-promotion.v1",
+                    model_version="mindflow-ctssm-runtime-v8",
+                    validation_status="validated",
+                )
         return {
             "id": str(decision_id),
             "model_evaluation_run_id": str(evaluation_run_id),

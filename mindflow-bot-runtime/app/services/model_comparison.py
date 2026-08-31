@@ -120,6 +120,33 @@ def _solve_three_by_three(matrix: list[list[float]], vector: list[float]) -> lis
     return [augmented[index][3] for index in range(3)]
 
 
+def _invert_three_by_three(matrix: list[list[float]]) -> list[list[float]]:
+    augmented = [
+        row[:] + [1.0 if row_index == column else 0.0 for column in range(3)]
+        for row_index, row in enumerate(matrix)
+    ]
+    for column in range(3):
+        pivot = max(range(column, 3), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-12:
+            raise ValueError("parameter design matrix is singular")
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        divisor = augmented[column][column]
+        augmented[column] = [value / divisor for value in augmented[column]]
+        for row in range(3):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            augmented[row] = [
+                left - factor * right
+                for left, right in zip(augmented[row], augmented[column])
+            ]
+    return [row[3:] for row in augmented]
+
+
+def _infinity_norm(matrix: Sequence[Sequence[float]]) -> float:
+    return max((sum(abs(value) for value in row) for row in matrix), default=0.0)
+
+
 def estimate_reactivity_and_recovery(
     samples: Sequence[Mapping[str, Any]],
     *,
@@ -147,6 +174,7 @@ def estimate_reactivity_and_recovery(
             vector[i] += row[i] * stress
             for j in range(3):
                 matrix[i][j] += row[i] * row[j]
+    design_matrix = [row[:] for row in matrix]
     population = [5.0, 2.8, 1.4]
     resilience = (
         None
@@ -163,9 +191,20 @@ def estimate_reactivity_and_recovery(
     baseline = max(0.0, min(10.0, coefficients[0]))
     beta_workload = max(0.0, min(6.0, coefficients[1]))
     beta_recovery = max(0.0, min(6.0, coefficients[2]))
+    boundary_clipped = any(
+        raw != clipped
+        for raw, clipped in zip(
+            coefficients, (baseline, beta_workload, beta_recovery)
+        )
+    )
 
     residuals = [
-        stress - (baseline + beta_workload * workload - beta_recovery * recovery)
+        stress
+        - (
+            coefficients[0]
+            + coefficients[1] * workload
+            - coefficients[2] * recovery
+        )
         for stress, workload, recovery in usable
     ]
     residual_sd = (
@@ -173,9 +212,62 @@ def estimate_reactivity_and_recovery(
         if residuals
         else None
     )
-    standard_error = (
-        residual_sd / math.sqrt(max(1, len(usable))) if residual_sd is not None else None
-    )
+    inverse_ridge = _invert_three_by_three(matrix)
+    coefficient_standard_errors = [
+        (
+            math.sqrt(max(0.0, residual_sd * residual_sd * inverse_ridge[index][index]))
+            if residual_sd is not None
+            else None
+        )
+        for index in range(3)
+    ]
+    try:
+        inverse_design = _invert_three_by_three(design_matrix)
+        condition_number = _infinity_norm(design_matrix) * _infinity_norm(
+            inverse_design
+        )
+    except ValueError:
+        condition_number = 1e12
+
+    workloads = [value[1] for value in usable]
+    recoveries = [value[2] for value in usable]
+
+    def variance(values: Sequence[float]) -> float:
+        if not values:
+            return 0.0
+        center = sum(values) / len(values)
+        return sum((value - center) ** 2 for value in values) / len(values)
+
+    workload_variance = variance(workloads)
+    recovery_variance = variance(recoveries)
+    if workload_variance > 0 and recovery_variance > 0:
+        workload_mean = sum(workloads) / len(workloads)
+        recovery_mean = sum(recoveries) / len(recoveries)
+        correlation = sum(
+            (workload - workload_mean) * (recovery - recovery_mean)
+            for workload, recovery in zip(workloads, recoveries)
+        ) / (
+            len(usable) * math.sqrt(workload_variance * recovery_variance)
+        )
+    else:
+        correlation = None
+    absolute_correlation = abs(correlation) if correlation is not None else 1.0
+    if (
+        len(usable) < 3
+        or workload_variance < 1e-4
+        or recovery_variance < 1e-4
+        or absolute_correlation >= 0.98
+        or condition_number >= 1e6
+    ):
+        identifiability_status = "not_identified"
+    elif (
+        len(usable) < 8
+        or absolute_correlation >= 0.90
+        or condition_number >= 1e3
+    ):
+        identifiability_status = "weak"
+    else:
+        identifiability_status = "identified"
     return {
         "stress_baseline_0_10": round(baseline, 4),
         "workload_reactivity_beta": round(beta_workload, 4),
@@ -183,10 +275,24 @@ def estimate_reactivity_and_recovery(
         "trait_resilience_prior": resilience,
         "sample_count": len(usable),
         "residual_sd": round(residual_sd, 4) if residual_sd is not None else None,
+        "uncertainty_method": "ridge-posterior-covariance.v1",
+        "ridge_lambda": ridge,
+        "design_condition_number": round(min(condition_number, 1e12), 4),
+        "workload_variance": round(workload_variance, 8),
+        "recovery_variance": round(recovery_variance, 8),
+        "workload_recovery_correlation": (
+            round(correlation, 6) if correlation is not None else None
+        ),
+        "identifiability_status": identifiability_status,
+        "boundary_clipped": boundary_clipped,
         "uncertainty": {
-            "stress_baseline_0_10": {"std_error": standard_error},
-            "workload_reactivity_beta": {"std_error": standard_error},
-            "recovery_beta": {"std_error": standard_error},
+            "stress_baseline_0_10": {
+                "std_error": coefficient_standard_errors[0]
+            },
+            "workload_reactivity_beta": {
+                "std_error": coefficient_standard_errors[1]
+            },
+            "recovery_beta": {"std_error": coefficient_standard_errors[2]},
         },
     }
 

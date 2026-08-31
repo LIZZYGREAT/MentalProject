@@ -223,7 +223,10 @@ Forecast 冻结因果来源，workload revision 参与 Forecast cache identity�
 区间来自 latent uncertainty，`rolling-origin-knowledge-causal.v2` 同时约束事件时间与知识时间，
 完整轨迹 peak 使用同一 causal origin 和冻结 initial state；0030 durable promotion provenance 校验失败时
 生产 Forecast 强制回退 Current M0。生产 Forecast/Match/Dataset 显式冻结 runtime v7 M0 或 runtime
-v8 WM0/M1/M2/M3 的 model spec、promotion decision 与 parameters hash。
+v8 WM0/M1/M2/M3 的 model spec、promotion decision 与 parameters hash。Current M0 与候选族均由真实
+Simulator 回放；historical production 仅单独报告。Ridge coefficient uncertainty 使用 posterior
+covariance 并执行 identifiability gate；participant promotion decision/profile 在同一事务提交，历史评估
+可按 promotion decision 或 parameters hash 精确筛选。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

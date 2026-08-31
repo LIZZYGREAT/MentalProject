@@ -3,7 +3,11 @@ import uuid
 
 import pytest
 
-from app.models import ModelEvaluationRun
+from app.models import (
+    LearnedModelProfile,
+    ModelEvaluationRun,
+    ModelPromotionDecision,
+)
 from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
@@ -207,6 +211,89 @@ def test_resilience_prior_parameter_estimation_and_observed_recovery_are_auditab
     assert rates["stress_recovery_per_hour"] == 0.6931
     assert rates["response_transition_count"] == 1
     assert rates["recovery_transition_count"] == 1
+
+
+def test_ridge_covariance_uncertainty_and_identifiability_are_auditable():
+    identified_samples = [
+        {
+            "actual_stress": 4.0 + workload * 3.0 - recovery * 2.0,
+            "workload": workload,
+            "recovery": recovery,
+        }
+        for workload, recovery in (
+            (0.1, 0.2),
+            (0.2, 0.8),
+            (0.4, 0.1),
+            (0.5, 0.6),
+            (0.7, 0.3),
+            (0.8, 0.9),
+            (0.9, 0.4),
+            (0.3, 0.7),
+        )
+    ]
+    identified = estimate_reactivity_and_recovery(identified_samples)
+    standard_errors = [
+        identified["uncertainty"][name]["std_error"]
+        for name in (
+            "stress_baseline_0_10",
+            "workload_reactivity_beta",
+            "recovery_beta",
+        )
+    ]
+    assert identified["uncertainty_method"] == "ridge-posterior-covariance.v1"
+    assert identified["ridge_lambda"] == 0.35
+    assert identified["identifiability_status"] == "identified"
+    assert len({round(value, 8) for value in standard_errors}) == 3
+
+    low_variance = estimate_reactivity_and_recovery(
+        [
+            {
+                "actual_stress": 5.0 + (index % 3) * 0.1,
+                "workload": 0.5 + (index % 2) * 0.0001,
+                "recovery": 0.4 + (index % 3) * 0.0001,
+            }
+            for index in range(12)
+        ]
+    )
+    assert low_variance["identifiability_status"] == "not_identified"
+    assert low_variance["uncertainty"]["workload_reactivity_beta"][
+        "std_error"
+    ] > identified["uncertainty"]["workload_reactivity_beta"]["std_error"]
+
+    collinear = estimate_reactivity_and_recovery(
+        [
+            {
+                "actual_stress": 4.0 + value,
+                "workload": value,
+                "recovery": value,
+            }
+            for value in (0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9)
+        ]
+    )
+    assert collinear["identifiability_status"] == "not_identified"
+    assert collinear["design_condition_number"] >= 1e6
+
+    clipped = estimate_reactivity_and_recovery(
+        [
+            {
+                "actual_stress": 8.0 - 5.0 * workload + 2.0 * recovery,
+                "workload": workload,
+                "recovery": recovery,
+            }
+            for workload, recovery in (
+                (0.1, 0.2),
+                (0.2, 0.8),
+                (0.4, 0.1),
+                (0.5, 0.6),
+                (0.7, 0.3),
+                (0.8, 0.9),
+                (0.9, 0.4),
+                (0.3, 0.7),
+            )
+        ]
+    )
+    assert clipped["boundary_clipped"] is True
+    assert clipped["workload_reactivity_beta"] == 0.0
 
 
 def test_historical_calibration_uses_only_brs_known_by_through_date():
@@ -559,6 +646,7 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
                     "local_date": local_day,
                     "source_hash": f"f{day}",
                     "metadata": {
+                        "model_variant": "m1",
                         "initial_state": {
                             "stress_0_10": 4.0,
                             "vitality_0_10": 7.0,
@@ -607,12 +695,15 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
                         "forecast_version": f"v{day}",
                         "observation_id": observation_id,
                         "observed_at": f"2030-01-0{day}T09:00:00+08:00",
-                        "predicted_stress": 4.0 + day * 0.5,
+                        "predicted_stress": 9.0,
                         "actual_stress": 4.2 + day * 0.6,
                         "residual": 0.2 + day * 0.1,
                         "prediction_lower": 3.0,
                         "prediction_upper": 8.0,
-                        "context": {"forecast_point_time": "09:00"},
+                        "context": {
+                            "forecast_point_time": "09:00",
+                            "model_variant": "m1",
+                        },
                     },
                 },
             ]
@@ -675,7 +766,7 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert all(
         result["comparison"][family]["replay_engine"]
-        == "stage4-real-ctssm-replay.v2"
+        == "stage4-real-ctssm-replay.v3"
         for family in ("workload_aware_m0", "m1", "m2", "m3")
     )
     participant_key = str(person_id)
@@ -701,6 +792,17 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     assert result["config"]["candidate_latent_initialization"]["version"] == (
         "candidate-latent-initialization.v1"
     )
+    assert result["historical_production"]["mae"] == 2.7
+    assert result["comparison"]["current_m0"]["mae"] != 2.7
+    m0_audit = [
+        row for row in result["replay_audit"] if row["family"] == "current_m0"
+    ]
+    assert m0_audit
+    assert all(row["replayed_model_variant"] == "m0" for row in m0_audit)
+    for target in {row["target"] for row in m0_audit}:
+        same_target = [row for row in result["replay_audit"] if row["target"] == target]
+        assert len({row["initial_state_revision"] for row in same_target}) == 1
+        assert len({row["daily_peak_origin"] for row in same_target}) == 1
 
 
 def test_production_candidate_requires_durable_promotion_provenance():
@@ -764,6 +866,7 @@ def test_production_candidate_requires_durable_promotion_provenance():
         "sample_count": 12,
         "day_count": 3,
         "transition_count": 4,
+        "identifiability_status": "weak",
     }
     with database.session() as session:
         run = ModelEvaluationRun(
@@ -891,6 +994,97 @@ def test_production_model_identity_distinguishes_m0_m1_and_m3():
         "m3",
     }
     assert len({identity["model_spec_version"] for identity in (m0, m1, m3)}) == 3
+
+
+def test_participant_promotion_rolls_back_decision_and_profile_atomically(
+    monkeypatch,
+):
+    database = memory_database()
+    person = participant(database, "PROMOTION-ATOMIC")
+    research = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = research.create_dataset_snapshot(
+        date_start=date(2030, 2, 1),
+        date_end=date(2030, 2, 3),
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2030, 2, 4, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2030, 2, 4, tzinfo=timezone.utc),
+    )
+    candidate_params = {
+        "S_star_init": 50.0,
+        "ctssm_params": {
+            "workload_stress_gain": 28.0,
+            "recovery_stress_gain": 14.0,
+        },
+    }
+    with database.session() as session:
+        run = ModelEvaluationRun(
+            dataset_snapshot_id=uuid.UUID(snapshot["id"]),
+            model_version="m1",
+            evaluation_mode="offline_replay",
+            evaluation_code_version=EVALUATION_CODE_VERSION,
+            participant_id=person.id,
+            metrics_json={
+                "config": {
+                    "manifest_hash": snapshot["manifest"]["manifest_hash"],
+                    "initial_state_provenance_complete": True,
+                },
+                "comparison": {"m1": {"mae": 0.8}},
+                "promotion": {
+                    "m1": {
+                        "passed": True,
+                        "gate_version": PROMOTION_GATE_VERSION,
+                    }
+                },
+                "candidate_parameters": {str(person.id): candidate_params},
+                "candidate_parameter_uncertainty": {
+                    str(person.id): {
+                        "S_star_init": {"std_error": 1.0},
+                        "ctssm_params": {
+                            "workload_stress_gain": {"std_error": 2.0},
+                            "recovery_stress_gain": {"std_error": 1.5},
+                        },
+                    }
+                },
+                "candidate_parameter_evidence": {
+                    str(person.id): {
+                        "sample_count": 12,
+                        "day_count": 3,
+                        "transition_count": 4,
+                        "identifiability_status": "identified",
+                    }
+                },
+            },
+            status="completed",
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.id
+
+    service = ModelPromotionService(database, "Asia/Shanghai")
+    real_save = service.learned_profiles.save_in_session
+
+    def fail_profile_insert(*_args, **_kwargs):
+        raise RuntimeError("simulated profile insert failure")
+
+    monkeypatch.setattr(
+        service.learned_profiles, "save_in_session", fail_profile_insert
+    )
+    with pytest.raises(RuntimeError, match="simulated profile insert failure"):
+        service.promote_candidate(
+            run_id, participant_id=person.id, model_family="m1"
+        )
+    with database.session() as session:
+        assert session.query(ModelPromotionDecision).count() == 0
+        assert session.query(LearnedModelProfile).count() == 0
+
+    monkeypatch.setattr(service.learned_profiles, "save_in_session", real_save)
+    result = service.promote_candidate(
+        run_id, participant_id=person.id, model_family="m1"
+    )
+    with database.session() as session:
+        assert session.query(ModelPromotionDecision).count() == 1
+        assert session.query(LearnedModelProfile).count() == 1
+    assert result["learned_profile"] is not None
 
 
 def test_explicit_profile_override_cannot_mutate_promoted_candidate():

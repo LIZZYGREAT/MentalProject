@@ -374,6 +374,135 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
     assert service.list_runs()[0]["id"] == run["id"]
 
 
+def test_historical_online_filters_exact_promotion_identity_without_mixing_revisions():
+    database = memory_database()
+    person = participant(database, "IDENTITY-FILTER")
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot_id = uuid.uuid4()
+    cutoff = datetime(2030, 3, 2, tzinfo=timezone.utc)
+    local_day = date(2030, 3, 1)
+    identities = [
+        ("decision-1", "hash-1", 5.0, 6.0),
+        ("decision-1", "hash-1", 6.0, 7.0),
+        ("decision-2", "hash-2", 8.0, 7.0),
+    ]
+    items = [
+        service._item(
+            "match_source",
+            f"identity-observation-{index}",
+            "forecast-observation-grid.v2",
+            person.id,
+            local_day,
+            {
+                "participant_id": str(person.id),
+                "local_date": local_day.isoformat(),
+                "forecast_id": f"identity-forecast-{index}",
+                "forecast_version": f"identity-v{index}",
+                "observation_id": f"identity-observation-{index}",
+                "observed_at": (
+                    f"2030-03-01T{index + 8:02d}:00:00+00:00"
+                ),
+                "predicted_stress": predicted,
+                "actual_stress": actual,
+                "residual": actual - predicted,
+                "prediction_lower": 0.0,
+                "prediction_upper": 10.0,
+                "context": {
+                    "algorithm_version": "mindflow-ctssm-runtime-v8",
+                    "engine_version": "mindflow-ctssm-runtime-v8",
+                    "model_family": "stress-ctssm.m1",
+                    "model_variant": "m1",
+                    "model_spec_version": "stress-ctssm-model-spec.v1:m1",
+                    "promotion_decision_id": decision,
+                    "promotion_parameters_hash": parameters_hash,
+                },
+            },
+        )
+        for index, (decision, parameters_hash, predicted, actual) in enumerate(
+            identities
+        )
+    ]
+    contract = {
+        "schema_version": DATASET_SCHEMA_V2,
+        "date_start": local_day.isoformat(),
+        "date_end": local_day.isoformat(),
+        "participant_filter": {},
+        "observation_cutoff": cutoff.isoformat(),
+        "calendar_cutoff": cutoff.isoformat(),
+    }
+    manifest = {
+        "schema_version": DATASET_SCHEMA_V2,
+        "item_count": len(items),
+        "observation_count": 0,
+        "forecast_count": 0,
+        "calendar_count": 0,
+        "manifest_hash": service._manifest_hash(contract, items),
+    }
+    with database.session() as session:
+        session.add(
+            DatasetSnapshot(
+                id=snapshot_id,
+                date_start=local_day,
+                date_end=local_day,
+                participant_filter={},
+                observation_cutoff=cutoff,
+                calendar_cutoff=cutoff,
+                schema_version=DATASET_SCHEMA_V2,
+                manifest_json=manifest,
+            )
+        )
+        session.add_all(
+            [
+                DatasetSnapshotItem(
+                    dataset_snapshot_id=snapshot_id,
+                    item_type=item["item_type"],
+                    source_id=item["source_id"],
+                    source_version=item["source_version"],
+                    participant_id=item["participant_id"],
+                    local_date=item["local_date"],
+                    source_hash=item["source_hash"],
+                    metadata_json=item["metadata"],
+                )
+                for item in items
+            ]
+        )
+
+    decision_run = service.create_evaluation_run(
+        snapshot_id,
+        "m1-decision-1",
+        evaluation_mode="historical_online",
+        model_identity_filter={"promotion_decision_id": "decision-1"},
+    )
+    hash_run = service.create_evaluation_run(
+        snapshot_id,
+        "m1-hash-2",
+        evaluation_mode="historical_online",
+        model_identity_filter={"promotion_parameters_hash": "hash-2"},
+    )
+    mismatched_pair = service.create_evaluation_run(
+        snapshot_id,
+        "m1-mismatched-revision",
+        evaluation_mode="historical_online",
+        model_identity_filter={
+            "promotion_decision_id": "decision-1",
+            "promotion_parameters_hash": "hash-2",
+        },
+    )
+
+    assert decision_run["metrics"]["matched_observation_count"] == 2
+    assert decision_run["metrics"]["config"][
+        "matched_promotion_decision_ids"
+    ] == ["decision-1"]
+    assert decision_run["metrics"]["config"]["matched_parameters_hashes"] == [
+        "hash-1"
+    ]
+    assert hash_run["metrics"]["matched_observation_count"] == 1
+    assert hash_run["metrics"]["config"]["model_identity_filter"] == {
+        "promotion_parameters_hash": "hash-2"
+    }
+    assert mismatched_pair["metrics"]["matched_observation_count"] == 0
+
+
 def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
     database = memory_database()
     person = participant(database, "synthetic-stage2")

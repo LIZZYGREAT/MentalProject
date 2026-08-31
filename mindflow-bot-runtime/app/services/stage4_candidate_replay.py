@@ -24,7 +24,7 @@ from mindflow_core.assessment import AssessmentModel
 
 
 OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
-REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v2"
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v3"
 CANDIDATE_LATENT_INITIALIZATION_VERSION = "candidate-latent-initialization.v1"
 
 
@@ -272,6 +272,7 @@ class Stage4CandidateReplayService:
                     "forecast_id": forecast_id,
                     "actual_stress": actual,
                     "current_prediction": current_prediction,
+                    "historical_production_prediction": current_prediction,
                     "workload": max(0.0, min(1.0, workload)),
                     "workload_observed": workload_observed,
                     "recovery": max(0.0, min(1.0, recovery)),
@@ -331,6 +332,18 @@ class Stage4CandidateReplayService:
             "ctssm_params": {
                 "workload_stress_gain": scaled("workload_reactivity_beta"),
                 "recovery_stress_gain": scaled("recovery_beta"),
+            },
+            "estimation": {
+                "uncertainty_method": fitted.get("uncertainty_method"),
+                "ridge_lambda": fitted.get("ridge_lambda"),
+                "sample_count": fitted.get("sample_count"),
+                "design_condition_number": fitted.get(
+                    "design_condition_number"
+                ),
+                "identifiability_status": fitted.get(
+                    "identifiability_status"
+                ),
+                "boundary_clipped": bool(fitted.get("boundary_clipped")),
             },
         }
 
@@ -469,7 +482,10 @@ class Stage4CandidateReplayService:
                 "comparison": {},
                 "promotion": {},
             }
-        prediction_sets = {family: [] for family in MODEL_FAMILIES}
+        prediction_sets = {
+            **{family: [] for family in MODEL_FAMILIES},
+            "historical_production": [],
+        }
         parameter_history = []
         replay_audit = []
         final_parameters: dict[str, dict[str, Any]] = {}
@@ -604,26 +620,39 @@ class Stage4CandidateReplayService:
                             "trajectory_peak_time"
                         ),
                     }
-                    current_row = {
+                    historical_row = {
                         **sample,
                         **daily_current_peak,
-                        "predicted_stress": sample["current_prediction"],
+                        "predicted_stress": sample[
+                            "historical_production_prediction"
+                        ],
                         "prediction_lower": sample.get("prediction_lower"),
                         "prediction_upper": sample.get("prediction_upper"),
                         "split_index": split["split_index"],
                     }
-                    prediction_sets["current_m0"].append(current_row)
-                    for family in MODEL_FAMILIES[1:]:
+                    prediction_sets["historical_production"].append(
+                        historical_row
+                    )
+                    for family in MODEL_FAMILIES:
                         variant = MODEL_VARIANT_BY_FAMILY[family]
-                        result = self.model.predict_candidate(
-                            model_variant=variant,
-                            candidate_params=candidate_params,
-                            observations=known,
-                            calendar_events=events,
-                            local_date=sample["local_date"],
-                            initial_state=initial_state,
-                            sleep_debt_hours=sleep_debt,
+                        replay = (
+                            self.model.predict_baseline_m0
+                            if family == "current_m0"
+                            else self.model.predict_candidate
                         )
+                        replay_arguments = {
+                            "observations": known,
+                            "calendar_events": events,
+                            "local_date": sample["local_date"],
+                            "initial_state": initial_state,
+                            "sleep_debt_hours": sleep_debt,
+                        }
+                        if family == "current_m0":
+                            replay_arguments["baseline_params"] = candidate_params
+                        else:
+                            replay_arguments["model_variant"] = variant
+                            replay_arguments["candidate_params"] = candidate_params
+                        result = replay(**replay_arguments)
                         point_time = str((sample.get("context") or {}).get("forecast_point_time") or "")[:5]
                         point = next(
                             (row for row in result.trajectory if str(row.get("time") or "")[:5] == point_time),
@@ -640,15 +669,23 @@ class Stage4CandidateReplayService:
                                 frozen["observation_history"].get(participant, []),
                                 daily_peak_cutoff,
                             )
-                            origin = self.model.predict_candidate(
-                                model_variant=variant,
-                                candidate_params=candidate_params,
-                                observations=origin_known,
-                                calendar_events=self._calendar_events(origin_calendar),
-                                local_date=sample["local_date"],
-                                initial_state=self._frozen_initial_state(daily_origin),
-                                sleep_debt_hours=sleep_debt,
-                            )
+                            origin_arguments = {
+                                "observations": origin_known,
+                                "calendar_events": self._calendar_events(
+                                    origin_calendar
+                                ),
+                                "local_date": sample["local_date"],
+                                "initial_state": self._frozen_initial_state(
+                                    daily_origin
+                                ),
+                                "sleep_debt_hours": sleep_debt,
+                            }
+                            if family == "current_m0":
+                                origin_arguments["baseline_params"] = candidate_params
+                            else:
+                                origin_arguments["model_variant"] = variant
+                                origin_arguments["candidate_params"] = candidate_params
+                            origin = replay(**origin_arguments)
                             full_peak_cache[cache_key] = _trajectory_peak(origin.trajectory)
                         interval = dict(point.get("stress_interval_90_0_10") or {})
                         prediction_sets[family].append(
@@ -667,6 +704,7 @@ class Stage4CandidateReplayService:
                                 "split_index": split["split_index"],
                                 "participant_id": participant,
                                 "family": family,
+                                "replayed_model_variant": result.model_variant,
                                 "target": target.isoformat(),
                                 "origin_cutoff": origin_cutoff.isoformat(),
                                 "daily_peak_origin": daily_peak_cutoff.isoformat(),
@@ -687,6 +725,13 @@ class Stage4CandidateReplayService:
                         {str(value["local_date"]) for value in fit_samples}
                     ),
                     "transition_count": transition_count,
+                    "identifiability_status": fitted.get(
+                        "identifiability_status"
+                    ),
+                    "boundary_clipped": bool(fitted.get("boundary_clipped")),
+                    "design_condition_number": fitted.get(
+                        "design_condition_number"
+                    ),
                 }
 
         comparison: dict[str, dict[str, Any]] = {}
@@ -698,7 +743,7 @@ class Stage4CandidateReplayService:
         for family in MODEL_FAMILIES:
             metrics = comparison_metrics(prediction_sets[family])
             metrics["model_variant"] = MODEL_VARIANT_BY_FAMILY[family]
-            metrics["replay_engine"] = "frozen_current_m0" if family == "current_m0" else REPLAY_ENGINE_VERSION
+            metrics["replay_engine"] = REPLAY_ENGINE_VERSION
             metrics["observable_support"] = self._support(samples, family)
             metrics["participant_effect"] = []
             for participant, baseline_mae in baseline_by_participant.items():
@@ -712,6 +757,15 @@ class Stage4CandidateReplayService:
                         }
                     )
             comparison[family] = metrics
+        historical_production = comparison_metrics(
+            prediction_sets["historical_production"]
+        )
+        historical_production.update(
+            {
+                "model_variant": "frozen_historical_production",
+                "replay_engine": "frozen_historical_production",
+            }
+        )
         promotion = {
             family: promotion_gate(comparison["current_m0"], comparison[family])
             for family in MODEL_FAMILIES
@@ -737,6 +791,7 @@ class Stage4CandidateReplayService:
             "replay_engine": REPLAY_ENGINE_VERSION,
             "rolling_origin": {"version": ROLLING_ORIGIN_VERSION, "split_count": len(splits), "splits": splits},
             "comparison": comparison,
+            "historical_production": historical_production,
             "promotion": promotion,
             "requested_family": requested_family,
             "metrics": comparison.get(requested_family) if requested_family != "all" else None,

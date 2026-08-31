@@ -433,8 +433,8 @@ class LearnedProfileRepository:
             for name in statistical_parameters
         )
 
-    def save(
-        self, participant_id: uuid.UUID, *, parameters: dict[str, Any],
+    def save_in_session(
+        self, session: Any, participant_id: uuid.UUID, *, parameters: dict[str, Any],
         sample_count: int, day_count: int, confidence: float,
         window_start: date, window_end: date, source: str = "calibration.v1",
         uncertainty: dict[str, Any] | None = None,
@@ -497,29 +497,52 @@ class LearnedProfileRepository:
             raise ValueError(
                 "validated parameters require uncertainty for every parameter"
             )
+        if (
+            session.get(Participant, participant_id, with_for_update=True)
+            is None
+        ):
+            raise ValueError("participant not found")
+        latest = session.execute(select(LearnedModelProfile.version).where(
+            LearnedModelProfile.participant_id == participant_id
+        ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
+        row = LearnedModelProfile(
+            participant_id=participant_id, version=int(latest or 0) + 1,
+            parameters_json=dict(parameters),
+            uncertainty_json=normalized_uncertainty,
+            source=normalized_source[:64],
+            model_version=normalized_model_version[:64],
+            validation_status=validation_status,
+            sample_count=sample_count, day_count=day_count,
+            confidence=normalized_confidence,
+            window_start=window_start, window_end=window_end,
+        )
+        session.add(row)
+        session.flush()
+        return self._view(row)
+
+    def save(
+        self, participant_id: uuid.UUID, *, parameters: dict[str, Any],
+        sample_count: int, day_count: int, confidence: float,
+        window_start: date, window_end: date, source: str = "calibration.v1",
+        uncertainty: dict[str, Any] | None = None,
+        model_version: str = "mindflow-ctssm-runtime-v7",
+        validation_status: str = "candidate",
+    ) -> dict[str, Any]:
         with self.database.session() as session:
-            if (
-                session.get(Participant, participant_id, with_for_update=True)
-                is None
-            ):
-                raise ValueError("participant not found")
-            latest = session.execute(select(LearnedModelProfile.version).where(
-                LearnedModelProfile.participant_id == participant_id
-            ).order_by(desc(LearnedModelProfile.version)).limit(1)).scalar_one_or_none()
-            row = LearnedModelProfile(
-                participant_id=participant_id, version=int(latest or 0) + 1,
-                parameters_json=dict(parameters),
-                uncertainty_json=normalized_uncertainty,
-                source=normalized_source[:64],
-                model_version=normalized_model_version[:64],
+            return self.save_in_session(
+                session,
+                participant_id,
+                parameters=parameters,
+                uncertainty=uncertainty,
+                sample_count=sample_count,
+                day_count=day_count,
+                confidence=confidence,
+                window_start=window_start,
+                window_end=window_end,
+                source=source,
+                model_version=model_version,
                 validation_status=validation_status,
-                sample_count=sample_count, day_count=day_count,
-                confidence=normalized_confidence,
-                window_start=window_start, window_end=window_end,
             )
-            session.add(row)
-            session.flush()
-            return self._view(row)
 
 
 class PsychometricAssessmentRepository:
