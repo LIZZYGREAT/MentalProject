@@ -398,7 +398,12 @@ class LearnedProfileRepository:
     ) -> bool:
         if not parameters or not uncertainty:
             return False
-        if set(parameters) - set(uncertainty):
+        statistical_parameters = {
+            name: value
+            for name, value in parameters.items()
+            if name != "model_selection"
+        }
+        if not statistical_parameters or set(statistical_parameters) - set(uncertainty):
             return False
 
         def has_finite_number(value: Any) -> bool:
@@ -423,7 +428,10 @@ class LearnedProfileRepository:
                 return bool(value) and any(has_finite_number(child) for child in value)
             return False
 
-        return all(has_finite_number(uncertainty[name]) for name in parameters)
+        return all(
+            has_finite_number(uncertainty[name])
+            for name in statistical_parameters
+        )
 
     def save(
         self, participant_id: uuid.UUID, *, parameters: dict[str, Any],

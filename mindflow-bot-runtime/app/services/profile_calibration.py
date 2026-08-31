@@ -116,6 +116,14 @@ class ProfileCalibrationService:
         """Build auditable samples from forecasts that predate each target."""
 
         matched: list[dict[str, Any]] = []
+        through_cutoff = (
+            datetime.combine(
+                through + timedelta(days=1),
+                datetime.min.time(),
+                self.timezone,
+            )
+            - timedelta(microseconds=1)
+        ).astimezone(timezone.utc)
         for observation in self.observations.recent(participant_id, limit=100):
             payload = observation.get("payload") or {}
             try:
@@ -132,6 +140,8 @@ class ProfileCalibrationService:
                 created.replace(tzinfo=timezone.utc)
                 if created.tzinfo is None else created.astimezone(timezone.utc)
             )
+            if observed_utc > through_cutoff or created_utc > through_cutoff:
+                continue
             observed_local = observed_utc.astimezone(self.timezone)
             local_day = observed_local.date()
             if local_day > through or local_day < through - timedelta(days=self.WINDOW_DAYS - 1):

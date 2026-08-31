@@ -789,6 +789,12 @@ def test_on_demand_forecast_is_immediate_rules_baseline_and_fast_path():
         assert second["cache_hit"]
         assert first["semantic_status"] == "rules_only"
         assert first["curve"]
+        assert first["algorithm_version"] == prediction.model.MODEL_VERSION
+        assert first["output"]["model_family"] == "stress-ctssm.m0"
+        assert first["output"]["model_variant"] == "m0"
+        assert first["output"]["model_spec_version"].endswith(":m0")
+        assert first["output"]["promotion_decision_id"] is None
+        assert first["output"]["promotion_parameters_hash"] is None
         assert prediction.calls == 1
         assert calendar.calls == 2  # bounded freshness check on every user request
 

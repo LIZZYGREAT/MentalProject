@@ -23,7 +23,7 @@ from app.repositories import (
     ForecastInputChangedError,
     promotion_parameters_hash,
 )
-from algorithm.dynamic_state_model import normalize_model_variant
+from algorithm.dynamic_state_model import model_variant_metadata, normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.care_message_service import (
     CARE_MESSAGE_SCHEMA_VERSION,
@@ -114,6 +114,41 @@ def enforce_promoted_model_selection(
         "status": "promotion_provenance_missing",
     }
     return {**effective_profile, "model_params": effective_parameters}
+
+
+def production_model_identity(
+    effective_profile: dict[str, Any], model: Any
+) -> dict[str, Any]:
+    """Return the explicit, immutable identity of the effective CTSSM."""
+
+    parameters = dict(
+        effective_profile.get("model_params")
+        or effective_profile.get("params")
+        or {}
+    )
+    selection = dict(parameters.get("model_selection") or {})
+    variant = normalize_model_variant(selection.get("active_variant") or "m0")
+    metadata = model_variant_metadata(variant)
+    promoted = variant != "m0"
+    base_engine = str(getattr(model, "MODEL_VERSION", "mindflow-ctssm-runtime-v7"))
+    promoted_engine = str(
+        getattr(model, "PROMOTED_MODEL_VERSION", "mindflow-ctssm-runtime-v8")
+    )
+    spec_version = str(
+        getattr(model, "MODEL_SPEC_VERSION", "stress-ctssm-model-spec.v1")
+    )
+    return {
+        "engine_version": promoted_engine if promoted else base_engine,
+        "model_family": str(metadata["canonical"]),
+        "model_variant": variant,
+        "model_spec_version": f"{spec_version}:{variant}",
+        "promotion_decision_id": (
+            str(selection.get("promotion_decision_id") or "") or None
+        ),
+        "promotion_parameters_hash": (
+            str(selection.get("parameters_hash") or "") or None
+        ),
+    }
 
 
 def normalized_calendar_revision(events: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -652,7 +687,10 @@ class ForecastCoordinator:
             "learned": learned_row,
         })
         latest = await asyncio.to_thread(self.forecasts.latest, participant_id, target)
-        algorithm_version = str(self.prediction.model.MODEL_VERSION)
+        model_identity = production_model_identity(
+            effective_profile, self.prediction.model
+        )
+        algorithm_version = str(model_identity["engine_version"])
         warning_revision, warning_policy_config = self._warning_revision()
         current_workload_revision = workload_revision(effective_profile)
         expected_version = _sha({
@@ -662,6 +700,7 @@ class ForecastCoordinator:
             "observation_revision": observation_revision,
             "profile_revision": profile_revision,
             "algorithm_version": algorithm_version,
+            "model_identity": model_identity,
             "warning_revision": warning_revision,
             "initial_state_revision": initial_state.revision,
             "workload_revision": current_workload_revision,
@@ -685,6 +724,11 @@ class ForecastCoordinator:
             and latest["calendar_revision"] == calendar_snapshot["calendar_revision"]
             and latest.get("observation_revision", "") == observation_revision
             and latest["algorithm_version"] == algorithm_version
+            and {
+                key: (latest.get("output") or {}).get(key)
+                for key in model_identity
+            }
+            == model_identity
             and (latest.get("output") or {}).get("profile_revision") == profile_revision
             and (latest.get("output") or {}).get("warning_revision") == warning_revision
             and (latest.get("output") or {}).get("initial_state_revision")
@@ -723,6 +767,8 @@ class ForecastCoordinator:
             )
             output["profile_layers"] = profile_layers
             output["profile_revision"] = profile_revision
+            output["algorithm_version"] = algorithm_version
+            output.update(model_identity)
             output["warning_revision"] = warning_revision
             output["warning_policy_config"] = warning_policy_config
             output["initial_state"] = initial_state.to_dict()

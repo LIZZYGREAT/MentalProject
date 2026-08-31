@@ -118,6 +118,7 @@ class PredictionResult:
     model_version: str
     model_family: str
     model_variant: str
+    model_spec_version: str
     active_states: tuple[str, ...]
     local_date: str
     stress_baseline_0_10: float
@@ -142,6 +143,8 @@ class AssessmentModel:
     # Current M0 remains the production comparator until the Stage-4 gate
     # passes. Candidate family versions are recorded by offline evaluation.
     MODEL_VERSION = "mindflow-ctssm-runtime-v7"
+    PROMOTED_MODEL_VERSION = "mindflow-ctssm-runtime-v8"
+    MODEL_SPEC_VERSION = "stress-ctssm-model-spec.v1"
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
@@ -406,9 +409,16 @@ class AssessmentModel:
         )
         safe_alerts = tuple(sanitize_forecast_alert(alert) for alert in (alerts or []))
         return PredictionResult(
-            model_version=self.MODEL_VERSION,
+            model_version=(
+                self.MODEL_VERSION
+                if model_info["key"] == "m0"
+                else self.PROMOTED_MODEL_VERSION
+            ),
             model_family=model_family,
             model_variant=str(model_info["key"]),
+            model_spec_version=(
+                f"{self.MODEL_SPEC_VERSION}:{model_info['key']}"
+            ),
             active_states=active_states,
             local_date=target_date,
             stress_baseline_0_10=round(user.get_current_S_star() / 10.0, 3),

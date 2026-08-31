@@ -220,8 +220,10 @@ Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Apprais
 Forecast 冻结因果来源，workload revision 参与 Forecast cache identity。Stage 4 保留 Current M0
 作为生产对照，新增 Workload-aware M0 与 M1/M2/M3 的统一 rolling-origin offline replay、完整
 预测/峰值/区间/high-stress 指标和 promotion gate。Replay 直接使用真实 CTSSM Simulator，候选
-区间来自 latent uncertainty，完整轨迹用于 peak 指标；0030 durable promotion provenance 校验失败时
-生产 Forecast 强制回退 Current M0。
+区间来自 latent uncertainty，`rolling-origin-knowledge-causal.v2` 同时约束事件时间与知识时间，
+完整轨迹 peak 使用同一 causal origin 和冻结 initial state；0030 durable promotion provenance 校验失败时
+生产 Forecast 强制回退 Current M0。生产 Forecast/Match/Dataset 显式冻结 runtime v7 M0 或 runtime
+v8 WM0/M1/M2/M3 的 model spec、promotion decision 与 parameters hash。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

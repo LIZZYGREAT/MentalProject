@@ -64,6 +64,16 @@ def _seed_causal_forecast_and_observations(database, participant_id):
         peaks=[{"time": "09:05", "stress_0_10": 8.0}],
         warning_windows=[],
         output={
+            "model_family": "stress-ctssm.m1",
+            "model_variant": "m1",
+            "model_spec_version": "stress-ctssm-model-spec.v1:m1",
+            "promotion_decision_id": "promotion-stage2",
+            "promotion_parameters_hash": "parameters-stage2",
+            "initial_state": {
+                "stress_0_10": 4.0,
+                "vitality_0_10": 7.0,
+            },
+            "initial_state_revision": "initial-state-stage2",
             "classified_calendar_events": [
                 {
                     "id": "class-1",
@@ -268,7 +278,7 @@ def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     assert rebuilt["created"] == 2
     assert rebuilt["updated"] == rebuilt["unmatched"] == 0
     assert rebuilt["examined"] == 2
-    assert rebuilt["match_schema_version"] == "forecast-observation-grid.v1"
+    assert rebuilt["match_schema_version"] == "forecast-observation-grid.v2"
     assert len(evaluation["matches"]) == 2
     first = evaluation["matches"][0]
     assert first["forecast_version"] == "forecast-stage2-v1"
@@ -277,6 +287,9 @@ def test_stage2_materializes_causal_grid_matches_and_exact_metrics():
     assert first["residual"] == 2.0
     assert first["context"]["event_types"] == ["class"]
     assert first["context"]["courses"] == ["高等数学"]
+    assert first["context"]["model_variant"] == "m1"
+    assert first["context"]["promotion_decision_id"] == "promotion-stage2"
+    assert first["context"]["promotion_parameters_hash"] == "parameters-stage2"
     metrics = evaluation["metrics"]
     assert metrics["sample_count"] == 2
     assert metrics["mae"] == 1.5
@@ -338,6 +351,13 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
         "calendar",
         "match_source",
     }
+    frozen_forecast = next(
+        item for item in frozen if item["item_type"] == "forecast"
+    )
+    assert frozen_forecast["metadata"]["model_variant"] == "m1"
+    assert frozen_forecast["metadata"]["initial_state_revision"] == (
+        "initial-state-stage2"
+    )
     assert run["dataset_snapshot_id"] == snapshot["id"]
     assert run["model_version"] == "forecast.v4"
     assert run["evaluation_mode"] == "historical_online"

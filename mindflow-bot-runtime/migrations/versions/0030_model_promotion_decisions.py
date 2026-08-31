@@ -55,9 +55,21 @@ def upgrade() -> None:
         ["participant_id", "promoted_at"],
         unique=False,
     )
+    op.create_index(
+        "uq_model_promotion_cohort_run_family",
+        "model_promotion_decisions",
+        ["model_evaluation_run_id", "model_family"],
+        unique=True,
+        postgresql_where=sa.text("participant_id IS NULL"),
+        sqlite_where=sa.text("participant_id IS NULL"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(
+        "uq_model_promotion_cohort_run_family",
+        table_name="model_promotion_decisions",
+    )
     op.drop_index(
         "ix_model_promotion_participant_promoted",
         table_name="model_promotion_decisions",

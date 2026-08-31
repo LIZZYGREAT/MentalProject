@@ -748,6 +748,112 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             ] == DATASET_SCHEMA_V2
             assert legacy_participant_run["status"] == "completed"
 
+            promotion_inspector = inspect(connection)
+            promotion_fks = {
+                item["referred_table"]: item
+                for item in promotion_inspector.get_foreign_keys(
+                    "model_promotion_decisions"
+                )
+            }
+            assert {
+                "model_evaluation_runs",
+                "dataset_snapshots",
+                "participants",
+            } <= set(promotion_fks)
+            assert all(
+                str((promotion_fks[table].get("options") or {}).get("ondelete")).upper()
+                == "RESTRICT"
+                for table in (
+                    "model_evaluation_runs",
+                    "dataset_snapshots",
+                    "participants",
+                )
+            )
+            assert any(
+                item.get("name") == "ck_model_promotion_status"
+                and "retained_from_empirical_evidence"
+                in str(item.get("sqltext") or "")
+                for item in promotion_inspector.get_check_constraints(
+                    "model_promotion_decisions"
+                )
+            )
+            promotion_indexes = {
+                item["name"]
+                for item in promotion_inspector.get_indexes(
+                    "model_promotion_decisions"
+                )
+            }
+            assert {
+                "ix_model_promotion_participant_promoted",
+                "uq_model_promotion_cohort_run_family",
+            } <= promotion_indexes
+
+            def insert_promotion(
+                decision_id, run_id, promoted_participant, family="m1",
+                status="retained_from_empirical_evidence",
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO model_promotion_decisions ("
+                        "id, model_evaluation_run_id, dataset_snapshot_id, "
+                        "participant_id, model_family, promotion_gate_version, "
+                        "evaluation_code_version, parameters_hash, status, "
+                        "passed_at, promoted_at) VALUES ("
+                        ":id, :run_id, :snapshot_id, :participant_id, :family, "
+                        "'gate.v1', 'evaluation.v1', :parameters_hash, :status, "
+                        ":passed_at, :promoted_at)"
+                    ),
+                    {
+                        "id": decision_id,
+                        "run_id": uuid.UUID(run_id),
+                        "snapshot_id": dataset_snapshot_id,
+                        "participant_id": promoted_participant,
+                        "family": family,
+                        "parameters_hash": uuid.uuid4().hex,
+                        "status": status,
+                        "passed_at": now,
+                        "promoted_at": now,
+                    },
+                )
+
+            participant_decision_id = uuid.uuid4()
+            insert_promotion(
+                participant_decision_id,
+                legacy_participant_run["id"],
+                participant_id,
+            )
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                insert_promotion(
+                    uuid.uuid4(),
+                    legacy_participant_run["id"],
+                    participant_id,
+                )
+            insert_promotion(
+                uuid.uuid4(), legacy_run["id"], None, family="m2"
+            )
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                insert_promotion(
+                    uuid.uuid4(), legacy_run["id"], None, family="m2"
+                )
+            with pytest.raises(IntegrityError), connection.begin_nested():
+                insert_promotion(
+                    uuid.uuid4(),
+                    legacy_participant_run["id"],
+                    participant_id,
+                    family="m3",
+                    status="invalid",
+                )
+            for table, identifier in (
+                ("model_evaluation_runs", uuid.UUID(legacy_participant_run["id"])),
+                ("dataset_snapshots", dataset_snapshot_id),
+                ("participants", participant_id),
+            ):
+                with pytest.raises(IntegrityError), connection.begin_nested():
+                    connection.execute(
+                        text(f"DELETE FROM {table} WHERE id = :id"),
+                        {"id": identifier},
+                    )
+
             v3_snapshot = service.create_dataset_snapshot(
                 date_start=date(2030, 1, 15),
                 date_end=date(2030, 1, 15),

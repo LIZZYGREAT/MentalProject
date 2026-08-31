@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+import math
 import uuid
 
 from sqlalchemy import select
@@ -21,10 +22,58 @@ from app.services.research_evaluation import EVALUATION_CODE_VERSION, ResearchEv
 
 
 class ModelPromotionService:
+    CONFIDENCE_VERSION = "stage4-calibration-confidence.v1"
+
     def __init__(self, database: Database, timezone_name: str):
         self.database = database
         self.timezone_name = timezone_name
         self.learned_profiles = LearnedProfileRepository(database)
+
+    @classmethod
+    def _calibration_confidence(
+        cls, evidence: dict[str, Any], uncertainty: dict[str, Any]
+    ) -> tuple[float, dict[str, Any]]:
+        standard_errors: list[float] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                if "std_error" in value:
+                    try:
+                        number = float(value["std_error"])
+                    except (TypeError, ValueError):
+                        return
+                    if math.isfinite(number) and number >= 0:
+                        standard_errors.append(number)
+                for child in value.values():
+                    collect(child)
+
+        collect(uncertainty)
+        sample_component = min(1.0, int(evidence.get("sample_count") or 0) / 42.0)
+        day_component = min(1.0, int(evidence.get("day_count") or 0) / 14.0)
+        transition_component = min(
+            1.0, int(evidence.get("transition_count") or 0) / 12.0
+        )
+        uncertainty_component = (
+            1.0 / (1.0 + sum(standard_errors) / len(standard_errors))
+            if standard_errors
+            else 0.0
+        )
+        confidence = min(
+            0.95,
+            0.35 * sample_component
+            + 0.25 * day_component
+            + 0.20 * transition_component
+            + 0.20 * uncertainty_component,
+        )
+        definition = {
+            "version": cls.CONFIDENCE_VERSION,
+            "sample_component": round(sample_component, 6),
+            "day_component": round(day_component, 6),
+            "transition_component": round(transition_component, 6),
+            "uncertainty_component": round(uncertainty_component, 6),
+            "maximum": 0.95,
+        }
+        return round(confidence, 6), definition
 
     def _validate_manifest(
         self, snapshot: DatasetSnapshot, rows: list[DatasetSnapshotItem]
@@ -100,11 +149,10 @@ class ModelPromotionService:
                 raise ValueError("promotion requires a completed offline_replay")
             if run.evaluation_code_version != EVALUATION_CODE_VERSION:
                 raise ValueError("unsupported evaluation code version")
-            if run.participant_id is not None and participant_id not in {
-                None,
-                run.participant_id,
-            }:
-                raise ValueError("participant does not match evaluation run")
+            if participant_id is not None and run.participant_id != participant_id:
+                raise ValueError(
+                    "participant promotion requires participant-specific evaluation run"
+                )
             target_participant = participant_id or run.participant_id
             snapshot = session.get(DatasetSnapshot, run.dataset_snapshot_id)
             if snapshot is None:
@@ -121,6 +169,10 @@ class ModelPromotionService:
             run_config = dict(metrics.get("config") or {})
             if run_config.get("manifest_hash") != manifest_hash:
                 raise ValueError("evaluation manifest provenance mismatch")
+            if run_config.get("initial_state_provenance_complete") is not True:
+                raise ValueError(
+                    "promotion requires frozen initial-state provenance"
+                )
             comparison = dict(metrics.get("comparison") or {})
             promotion = dict(metrics.get("promotion") or {})
             candidates = [
@@ -146,6 +198,12 @@ class ModelPromotionService:
             if gate.get("gate_version") != PROMOTION_GATE_VERSION:
                 raise ValueError("unsupported promotion gate version")
             candidate_parameters = dict(metrics.get("candidate_parameters") or {})
+            candidate_uncertainty = dict(
+                metrics.get("candidate_parameter_uncertainty") or {}
+            )
+            candidate_evidence = dict(
+                metrics.get("candidate_parameter_evidence") or {}
+            )
             participant_parameters = (
                 dict(candidate_parameters.get(str(target_participant)) or {})
                 if target_participant is not None
@@ -153,6 +211,25 @@ class ModelPromotionService:
             )
             if target_participant is not None and not participant_parameters:
                 raise ValueError("evaluation has no candidate parameters for participant")
+            participant_uncertainty = (
+                dict(candidate_uncertainty.get(str(target_participant)) or {})
+                if target_participant is not None
+                else {}
+            )
+            participant_evidence = (
+                dict(candidate_evidence.get(str(target_participant)) or {})
+                if target_participant is not None
+                else {}
+            )
+            if target_participant is not None and not self.learned_profiles._valid_uncertainty(
+                participant_parameters, participant_uncertainty
+            ):
+                raise ValueError(
+                    "promotion requires real candidate parameter uncertainty"
+                )
+            confidence, confidence_definition = self._calibration_confidence(
+                participant_evidence, participant_uncertainty
+            )
             now = datetime.now(timezone.utc)
             parameters_hash = promotion_parameters_hash(participant_parameters)
             decision = ModelPromotionDecision(
@@ -172,8 +249,8 @@ class ModelPromotionService:
             decision_id = decision.id
             snapshot_start = snapshot.date_start
             snapshot_end = snapshot.date_end
-            sample_count = int((comparison.get(family) or {}).get("sample_count") or 0)
-            day_count = max(0, (snapshot_end - snapshot_start).days + 1)
+            sample_count = int(participant_evidence.get("sample_count") or 0)
+            day_count = int(participant_evidence.get("day_count") or 0)
 
         learned_profile = None
         if target_participant is not None:
@@ -192,19 +269,17 @@ class ModelPromotionService:
                     "promoted_at": now.isoformat(),
                     "manifest_hash": manifest_hash,
                     "parameters_hash": parameters_hash,
+                    "calibration_confidence": confidence,
+                    "calibration_confidence_definition": confidence_definition,
                 },
-            }
-            uncertainty = {
-                key: {"std_error": 0.0}
-                for key in promoted_parameters
             }
             learned_profile = self.learned_profiles.save(
                 target_participant,
                 parameters=promoted_parameters,
-                uncertainty=uncertainty,
+                uncertainty=participant_uncertainty,
                 sample_count=sample_count,
                 day_count=day_count,
-                confidence=1.0,
+                confidence=confidence,
                 window_start=snapshot_start,
                 window_end=snapshot_end,
                 source="stage4-promotion.v1",

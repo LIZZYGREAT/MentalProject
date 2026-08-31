@@ -28,7 +28,7 @@ MODEL_VARIANT_BY_FAMILY = {
     "m2": "m2",
     "m3": "m3",
 }
-ROLLING_ORIGIN_VERSION = "rolling-origin.v1"
+ROLLING_ORIGIN_VERSION = "rolling-origin-knowledge-causal.v2"
 PROMOTION_GATE_VERSION = "ctssm-promotion-gate.v1"
 
 

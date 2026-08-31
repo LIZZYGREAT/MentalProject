@@ -225,7 +225,7 @@ participant-specific 查询仅在不可变条目能证明参与者出现时允�
 Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
 Stage 2 新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变；Stage 4
-新增运行记录 `stage4-evaluation.v2`。评估模式明确区分 `historical_online` 与执行候选模型族
+新增运行记录 `stage4-evaluation.v3`。评估模式明确区分 `historical_online` 与执行候选模型族
 Rolling-Origin 比较的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
@@ -257,13 +257,27 @@ M2、M3 使用同一不可变快照与 expanding rolling-origin split，统一�
 纵向 EMA episode 继续估计 workload reactivity、recovery coefficient、上升/恢复响应速率 κ 与
 observed recovery efficiency。Admin 提供模型族比较表及参与者当前模型、候选模型和验证结果。
 
-Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v1` 直接调用真实
+Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v2` 直接调用真实
 `AssessmentModel.predict_candidate → Simulator → step_latent_state`；目标时点 EMA 及未来 EMA
 不会提前 assimilate，候选区间来自 `LatentUncertainty/prediction_interval`，峰值指标使用完整 288 点
 trajectory。0030 新增 `model_promotion_decisions`：非 M0 只有在 completed offline replay、有效
 Dataset manifest、兼容 evaluation/gate version 且 gate 通过后，才能写入
 `retained_from_empirical_evidence`。Forecast 读取不到匹配的 durable provenance 或参数 hash 时一律
 fail closed 到 Current M0。
+
+`rolling-origin-knowledge-causal.v2` 以测试日当地 00:00 作为 split origin；训练 EMA 的
+`created_at`、BRS 的 `max(administered_at, created_at)` 与 Slow State 的
+`max(effective_at, created_at)` 均必须早于该 origin。测试日峰值以第一条 eligible EMA 的 causal
+cutoff 为统一信息集，并复用 Dataset v4 冻结的 `initial_state` / `initial_state_revision`。
+候选参数不确定性由回放 estimator 的标准误按 0–10→0–100 尺度转换；尚无可靠标准误的个体响应
+rate 不进入晋级参数。晋级 confidence 使用样本、天数、transition 与参数不确定性的
+`stage4-calibration-confidence.v1` 保守定义，最高为 0.95。
+
+生产模型身份不再只依赖单一 algorithm label：Current M0 使用
+`mindflow-ctssm-runtime-v7:m0`，已晋级 WM0/M1/M2/M3 使用 runtime v8，并在 Forecast output、
+ForecastObservationMatch context 与 Dataset v4 中冻结 `model_family`、`model_variant`、
+`model_spec_version`、`promotion_decision_id` 和 `promotion_parameters_hash`。Participant Admin
+页面的 current model 读取 `runtime_active()`；cohort evaluation 单独标记，不作为个体验证结果。
 
 M3 使用 `recovery-debt-dynamics.v1`：
 $dF/dt=\alpha_FW(t)(1-F)-\lambda_FR(t)F$，并约束 $F\in[0,1]$。这一 bounded dynamics

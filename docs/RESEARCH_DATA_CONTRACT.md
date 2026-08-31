@@ -150,7 +150,9 @@ Stage 1 明确区分 latest 与 runtime-active：`validated` 可以进入生产�
 
 Stage 4 离线比较固定使用 `mindflow-research-dataset-v4` Dataset Snapshot。BRS、Daily Review recovery、Slow State recovery/sleep、Forecast、Calendar、EMA 与 match source 必须一并冻结；Current M0、Workload-aware M0、M1、M2、M3 使用同一 Rolling-Origin split。M1/M2/M3 缺少 vitality、perseverative cognition 或 recovery debt 对应观测证据时可以保留研究指标，但 promotion gate 必须失败。
 
-候选模型必须通过 `stage4-real-ctssm-replay.v1` 调用真实 CTSSM；任何独立近似公式产生的结果不得进入 promotion。M2 support 使用 post-event exposure/EMA、stress persistence transition、参与者数和天数；M3 support 使用 sustained-workload episode、continuous-load variation、post-load recovery transition、vitality EMA、参与者数和天数，阈值版本为 `ctssm-observable-support.v2`。M3 Recovery Debt 采用 `recovery-debt-dynamics.v1`：$F\in[0,1]$ 且 $dF/dt=\alpha_FW(1-F)-\lambda_FRF$，以饱和累积和非负恢复保证状态有界。
+候选模型必须通过 `stage4-real-ctssm-replay.v2` 调用真实 CTSSM；任何独立近似公式产生的结果不得进入 promotion。rolling-origin 使用 `rolling-origin-knowledge-causal.v2`，训练 EMA、BRS 与 Slow State 同时受 state-time 和 split origin knowledge-time 约束。M2 support 使用 post-event exposure/EMA、stress persistence transition、参与者数和天数；M3 support 使用 sustained-workload episode、continuous-load variation、post-load recovery transition、vitality EMA、参与者数和天数，阈值版本为 `ctssm-observable-support.v2`。M3 Recovery Debt 采用 `recovery-debt-dynamics.v1`：$F\in[0,1]$ 且 $dF/dt=\alpha_FW(1-F)-\lambda_FRF$，以饱和累积和非负恢复保证状态有界。
+
+Dataset v4 的 Forecast item 必须冻结 day-boundary `initial_state`、`initial_state_revision` 以及完整生产模型身份。ForecastObservationMatch context 必须冻结相同的 model/promotion provenance。个体 production promotion 只能来自同一 participant 的 evaluation run；cohort run 只能产生 cohort research decision。promotion profile 的 uncertainty 不包含 `model_selection`，且不得用零标准误或固定 1.0 confidence 伪造统计证据。
 
 ## 4. Sampling Protocol
 

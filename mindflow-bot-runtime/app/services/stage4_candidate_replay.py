@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from algorithm.dynamic_state_model import normalize_model_variant
@@ -24,7 +24,8 @@ from mindflow_core.assessment import AssessmentModel
 
 
 OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
-REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v1"
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v2"
+CANDIDATE_LATENT_INITIALIZATION_VERSION = "candidate-latent-initialization.v1"
 
 
 def _number(value: Any) -> float | None:
@@ -65,6 +66,7 @@ class Stage4CandidateReplayService:
 
     def __init__(self, timezone_name: str):
         self.model = AssessmentModel(timezone_name)
+        self.timezone = self.model.timezone
 
     @staticmethod
     def _calendar_events(calendar: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -153,7 +155,9 @@ class Stage4CandidateReplayService:
             metadata["participant_id"] = str(item["participant_id"])
             observation_history[str(item["participant_id"])].append(metadata)
 
-        slow_history: dict[str, list[tuple[datetime, float, float]]] = defaultdict(list)
+        slow_history: dict[
+            str, list[tuple[datetime, float, float, datetime]]
+        ] = defaultdict(list)
         brs_history: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
         for item in items:
             metadata = dict(item["metadata"])
@@ -169,7 +173,12 @@ class Stage4CandidateReplayService:
                 except (TypeError, ValueError):
                     continue
                 slow_history[participant].append(
-                    (available, max(0.0, min(1.0, (recovery or 0.0) / 10.0)), sleep_debt)
+                    (
+                        available,
+                        max(0.0, min(1.0, (recovery or 0.0) / 10.0)),
+                        sleep_debt,
+                        _aware(metadata.get("effective_at")),
+                    )
                 )
             elif item["item_type"] == "psychometric" and str(
                 metadata.get("instrument_name") or ""
@@ -214,6 +223,7 @@ class Stage4CandidateReplayService:
                 continue
             try:
                 observed_at = _aware(match.get("observed_at"))
+                observation_created_at = _aware(observation.get("created_at"))
             except (TypeError, ValueError):
                 continue
             workload = _number(point.get("workload"))
@@ -242,7 +252,11 @@ class Stage4CandidateReplayService:
             ]
             slow = max(eligible_slow, key=lambda value: value[0]) if eligible_slow else None
             calendar_recovery = self._calendar_recovery(calendar, observed_at)
-            recovery = max(recovery, slow[1] if slow else 0.0, calendar_recovery)
+            recovery_without_slow = max(recovery, calendar_recovery)
+            recovery_observed_without_slow = bool(
+                recovery_observed or calendar_recovery > 0.0
+            )
+            recovery = max(recovery_without_slow, slow[1] if slow else 0.0)
             recovery_observed = bool(
                 recovery_observed or slow is not None or calendar_recovery > 0.0
             )
@@ -254,12 +268,17 @@ class Stage4CandidateReplayService:
                     "participant_id": str(item["participant_id"]),
                     "local_date": item["local_date"].isoformat(),
                     "observed_at": observed_at.isoformat(),
+                    "observation_created_at": observation_created_at.isoformat(),
                     "forecast_id": forecast_id,
                     "actual_stress": actual,
                     "current_prediction": current_prediction,
                     "workload": max(0.0, min(1.0, workload)),
                     "workload_observed": workload_observed,
                     "recovery": max(0.0, min(1.0, recovery)),
+                    "recovery_without_slow": max(
+                        0.0, min(1.0, recovery_without_slow)
+                    ),
+                    "recovery_observed_without_slow": recovery_observed_without_slow,
                     "recovery_observed": recovery_observed,
                     "observed_vitality": next(
                         (
@@ -272,6 +291,10 @@ class Stage4CandidateReplayService:
                     "post_event_input": _number(point.get("post_event_input")) or 0.0,
                     "continuous_load": _number(point.get("continuous_load_factor")) or 0.0,
                     "sleep_debt": slow[2] if slow else 0.0,
+                    "initial_state": dict(forecast.get("initial_state") or {}),
+                    "initial_state_revision": forecast.get(
+                        "initial_state_revision"
+                    ),
                 }
             )
         samples.sort(key=lambda row: (row["local_date"], row["observed_at"], row["participant_id"]))
@@ -281,31 +304,49 @@ class Stage4CandidateReplayService:
             "calendars": calendars,
             "observation_history": observation_history,
             "brs_history": brs_history,
+            "slow_history": slow_history,
         }
 
     @staticmethod
-    def _candidate_parameters(
-        fitted: Mapping[str, Any], rates: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _candidate_parameters(fitted: Mapping[str, Any]) -> dict[str, Any]:
         ctssm = {
             "workload_stress_gain": float(fitted["workload_reactivity_beta"]) * 10.0,
             "recovery_stress_gain": float(fitted["recovery_beta"]) * 10.0,
         }
-        for key in ("stress_reactivity_per_hour", "stress_recovery_per_hour"):
-            if rates.get(key) is not None:
-                ctssm[key] = float(rates[key])
         return {
             "S_star_init": float(fitted["stress_baseline_0_10"]) * 10.0,
             "ctssm_params": ctssm,
         }
 
     @staticmethod
-    def _initial_state(training: Sequence[Mapping[str, Any]]) -> dict[str, float]:
-        latest = max(training, key=lambda row: str(row.get("observed_at") or ""), default=None)
+    def _candidate_uncertainty(fitted: Mapping[str, Any]) -> dict[str, Any]:
+        source = dict(fitted.get("uncertainty") or {})
+
+        def scaled(name: str) -> dict[str, float | None]:
+            value = _number((source.get(name) or {}).get("std_error"))
+            return {"std_error": round(value * 10.0, 6) if value is not None else None}
+
         return {
-            "stress_0_10": float((latest or {}).get("actual_stress") or 4.0),
-            "vitality_0_10": float((latest or {}).get("observed_vitality") or 7.0),
+            "S_star_init": scaled("stress_baseline_0_10"),
+            "ctssm_params": {
+                "workload_stress_gain": scaled("workload_reactivity_beta"),
+                "recovery_stress_gain": scaled("recovery_beta"),
+            },
         }
+
+    @staticmethod
+    def _frozen_initial_state(sample: Mapping[str, Any]) -> dict[str, float]:
+        frozen = dict(sample.get("initial_state") or {})
+        try:
+            return {
+                "stress_0_10": max(0.0, min(10.0, float(frozen["stress_0_10"]))),
+                "vitality_0_10": max(0.0, min(10.0, float(frozen["vitality_0_10"]))),
+            }
+        except (KeyError, TypeError, ValueError):
+            # Dataset rows created before initial-state provenance was added
+            # remain replayable, but the fallback is explicit in evaluation
+            # metadata and cannot qualify as complete provenance.
+            return {"stress_0_10": 4.0, "vitality_0_10": 7.0}
 
     @staticmethod
     def _known_observations(
@@ -432,42 +473,140 @@ class Stage4CandidateReplayService:
         parameter_history = []
         replay_audit = []
         final_parameters: dict[str, dict[str, Any]] = {}
+        final_uncertainty: dict[str, dict[str, Any]] = {}
+        final_evidence: dict[str, dict[str, Any]] = {}
+        initial_state_provenance_complete = True
         for split in splits:
-            training = [samples[index] for index in split["train_indices"]]
+            origin_cutoff = datetime.combine(
+                datetime.fromisoformat(split["test_days"][0]).date(),
+                time.min,
+                self.timezone,
+            ).astimezone(timezone.utc)
+            split["origin_cutoff"] = origin_cutoff.isoformat()
+            training = [
+                samples[index]
+                for index in split["train_indices"]
+                if _aware(samples[index]["observation_created_at"])
+                < origin_cutoff
+            ]
             testing = [samples[index] for index in split["test_indices"]]
+
+            def with_origin_slow(
+                rows: Sequence[Mapping[str, Any]],
+            ) -> list[dict[str, Any]]:
+                adjusted = []
+                for value in rows:
+                    participant_slow = [
+                        state
+                        for state in frozen["slow_history"].get(
+                            str(value["participant_id"]), []
+                        )
+                        if state[0] < origin_cutoff
+                        and state[3] <= _aware(value["observed_at"])
+                    ]
+                    slow = (
+                        max(participant_slow, key=lambda state: state[0])
+                        if participant_slow
+                        else None
+                    )
+                    adjusted.append(
+                        {
+                            **value,
+                            "recovery": max(
+                                float(value.get("recovery_without_slow") or 0.0),
+                                slow[1] if slow else 0.0,
+                            ),
+                            "recovery_observed": bool(
+                                value.get("recovery_observed_without_slow")
+                                or slow is not None
+                            ),
+                            "sleep_debt": slow[2] if slow else 0.0,
+                        }
+                    )
+                return adjusted
+
+            training = with_origin_slow(training)
             by_participant: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for sample in testing:
                 by_participant[str(sample["participant_id"])].append(sample)
             for participant, participant_testing in by_participant.items():
                 participant_training = [row for row in training if row["participant_id"] == participant]
                 fit_samples = participant_training or training
-                training_cutoff = max(_aware(row["observed_at"]) for row in fit_samples)
-                priors = [value for value in frozen["brs_history"].get(participant, []) if value[0] <= training_cutoff]
+                priors = [
+                    value
+                    for value in frozen["brs_history"].get(participant, [])
+                    if value[0] < origin_cutoff
+                ]
                 prior = max(priors, key=lambda value: value[0])[1] if priors else None
                 fitted = estimate_reactivity_and_recovery(fit_samples, trait_resilience=prior)
                 rates = estimate_response_rates(fit_samples, fitted)
-                candidate_params = self._candidate_parameters(fitted, rates)
+                candidate_params = self._candidate_parameters(fitted)
+                candidate_uncertainty = self._candidate_uncertainty(fitted)
+                transition_count = int(rates["response_transition_count"]) + int(
+                    rates["recovery_transition_count"]
+                )
                 parameter_history.append(
                     {
                         "split_index": split["split_index"],
                         "participant_id": participant,
-                        "training_cutoff": training_cutoff.isoformat(),
+                        "origin_cutoff": origin_cutoff.isoformat(),
+                        "training_sample_count": len(fit_samples),
                         **fitted,
                         **rates,
                         **observed_recovery_efficiency(fit_samples),
                     }
                 )
-                initial_state = self._initial_state(participant_training)
+                participant_slow = [
+                    value
+                    for value in frozen["slow_history"].get(participant, [])
+                    if value[0] < origin_cutoff
+                ]
+                origin_slow = (
+                    max(participant_slow, key=lambda value: value[0])
+                    if participant_slow
+                    else None
+                )
+                sleep_debt = origin_slow[2] if origin_slow else 0.0
                 full_peak_cache: dict[tuple[str, str], dict[str, Any]] = {}
+                daily_origins = {
+                    local_day: min(
+                        (
+                            value
+                            for value in participant_testing
+                            if value["local_date"] == local_day
+                        ),
+                        key=lambda value: str(value["observed_at"]),
+                    )
+                    for local_day in {
+                        value["local_date"] for value in participant_testing
+                    }
+                }
                 for sample in participant_testing:
                     target = _aware(sample["observed_at"])
                     calendar = frozen["calendars"].get(sample["forecast_id"]) or {}
                     events = self._calendar_events(calendar)
+                    initial_state = self._frozen_initial_state(sample)
+                    if not sample.get("initial_state_revision"):
+                        initial_state_provenance_complete = False
                     known = self._known_observations(
                         frozen["observation_history"].get(participant, []), target
                     )
+                    daily_origin = daily_origins[sample["local_date"]]
+                    daily_peak_cutoff = min(
+                        _aware(daily_origin["observed_at"]),
+                        _aware(daily_origin["observation_created_at"]),
+                    )
+                    daily_current_peak = {
+                        "trajectory_peak_stress": daily_origin.get(
+                            "trajectory_peak_stress"
+                        ),
+                        "trajectory_peak_time": daily_origin.get(
+                            "trajectory_peak_time"
+                        ),
+                    }
                     current_row = {
                         **sample,
+                        **daily_current_peak,
                         "predicted_stress": sample["current_prediction"],
                         "prediction_lower": sample.get("prediction_lower"),
                         "prediction_upper": sample.get("prediction_upper"),
@@ -483,7 +622,7 @@ class Stage4CandidateReplayService:
                             calendar_events=events,
                             local_date=sample["local_date"],
                             initial_state=initial_state,
-                            sleep_debt_hours=float(sample.get("sleep_debt") or 0.0),
+                            sleep_debt_hours=sleep_debt,
                         )
                         point_time = str((sample.get("context") or {}).get("forecast_point_time") or "")[:5]
                         point = next(
@@ -494,14 +633,21 @@ class Stage4CandidateReplayService:
                             continue
                         cache_key = (family, sample["local_date"])
                         if cache_key not in full_peak_cache:
+                            origin_calendar = frozen["calendars"].get(
+                                daily_origin["forecast_id"]
+                            ) or {}
+                            origin_known = self._known_observations(
+                                frozen["observation_history"].get(participant, []),
+                                daily_peak_cutoff,
+                            )
                             origin = self.model.predict_candidate(
                                 model_variant=variant,
                                 candidate_params=candidate_params,
-                                observations=[],
-                                calendar_events=events,
+                                observations=origin_known,
+                                calendar_events=self._calendar_events(origin_calendar),
                                 local_date=sample["local_date"],
-                                initial_state=initial_state,
-                                sleep_debt_hours=float(sample.get("sleep_debt") or 0.0),
+                                initial_state=self._frozen_initial_state(daily_origin),
+                                sleep_debt_hours=sleep_debt,
                             )
                             full_peak_cache[cache_key] = _trajectory_peak(origin.trajectory)
                         interval = dict(point.get("stress_interval_90_0_10") or {})
@@ -522,6 +668,11 @@ class Stage4CandidateReplayService:
                                 "participant_id": participant,
                                 "family": family,
                                 "target": target.isoformat(),
+                                "origin_cutoff": origin_cutoff.isoformat(),
+                                "daily_peak_origin": daily_peak_cutoff.isoformat(),
+                                "initial_state_revision": sample.get(
+                                    "initial_state_revision"
+                                ),
                                 "assimilated_observation_count": len(known),
                                 "target_observation_assimilated": False,
                                 "trajectory_point_count": result.point_count,
@@ -529,6 +680,14 @@ class Stage4CandidateReplayService:
                             }
                         )
                 final_parameters[participant] = candidate_params
+                final_uncertainty[participant] = candidate_uncertainty
+                final_evidence[participant] = {
+                    "sample_count": len(fit_samples),
+                    "day_count": len(
+                        {str(value["local_date"]) for value in fit_samples}
+                    ),
+                    "transition_count": transition_count,
+                }
 
         comparison: dict[str, dict[str, Any]] = {}
         baseline_by_participant = {}
@@ -562,6 +721,15 @@ class Stage4CandidateReplayService:
             **config,
             "replay_engine_version": REPLAY_ENGINE_VERSION,
             "observable_support_config_version": OBSERVABLE_SUPPORT_CONFIG["version"],
+            "candidate_latent_initialization": {
+                "version": CANDIDATE_LATENT_INITIALIZATION_VERSION,
+                "perseverative_cognition": "0.0 at frozen day boundary",
+                "recovery_debt": (
+                    "clip((vitality_baseline-initial_vitality)/80 + "
+                    "min(0.25,sleep_debt_hours*0.04), 0, 0.75)"
+                ),
+            },
+            "initial_state_provenance_complete": initial_state_provenance_complete,
         }
         return {
             "config": evaluation_config,
@@ -574,5 +742,7 @@ class Stage4CandidateReplayService:
             "metrics": comparison.get(requested_family) if requested_family != "all" else None,
             "parameter_history": parameter_history,
             "candidate_parameters": final_parameters,
+            "candidate_parameter_uncertainty": final_uncertainty,
+            "candidate_parameter_evidence": final_evidence,
             "replay_audit": replay_audit,
         }

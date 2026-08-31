@@ -36,7 +36,7 @@ from app.models import (
     StateObservation,
     WarningSchedule,
 )
-from app.repositories import ForecastSnapshotRepository
+from app.repositories import ForecastSnapshotRepository, LearnedProfileRepository
 from app.services.model_comparison import (
     MODEL_FAMILIES,
 )
@@ -48,8 +48,8 @@ DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
 DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
 DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V4
-MATCH_SCHEMA_VERSION = "forecast-observation-grid.v1"
-EVALUATION_CODE_VERSION = "stage4-evaluation.v2"
+MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
+EVALUATION_CODE_VERSION = "stage4-evaluation.v3"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
 
@@ -95,6 +95,7 @@ class ResearchEvaluationService:
         self.database = database
         self.timezone = ZoneInfo(timezone_name)
         self.forecasts = ForecastSnapshotRepository(database)
+        self.learned_profiles = LearnedProfileRepository(database)
 
     def _bounds(self, start: date, end: date) -> tuple[datetime, datetime]:
         if start > end or (end - start).days > 365:
@@ -514,6 +515,17 @@ class ResearchEvaluationService:
             "weekday": observed_at.astimezone(self.timezone).strftime("%A"),
             "workload_0_10": _score(payload, "current_workload_0_10"),
             "algorithm_version": forecast.get("algorithm_version"),
+            "model_family": (forecast.get("output") or {}).get("model_family"),
+            "model_variant": (forecast.get("output") or {}).get("model_variant"),
+            "model_spec_version": (forecast.get("output") or {}).get(
+                "model_spec_version"
+            ),
+            "promotion_decision_id": (forecast.get("output") or {}).get(
+                "promotion_decision_id"
+            ),
+            "promotion_parameters_hash": (forecast.get("output") or {}).get(
+                "promotion_parameters_hash"
+            ),
             "forecast_peak_stress": _score(peak, "stress_0_10"),
             "forecast_peak_time": peak.get("time"),
         }
@@ -1145,6 +1157,27 @@ class ResearchEvaluationService:
                 "calendar_revision": forecast["calendar_revision"],
                 "semantic_revision": forecast["semantic_revision"],
                 "observation_revision": forecast["observation_revision"],
+                "model_family": (forecast.get("output") or {}).get(
+                    "model_family"
+                ),
+                "model_variant": (forecast.get("output") or {}).get(
+                    "model_variant"
+                ),
+                "model_spec_version": (forecast.get("output") or {}).get(
+                    "model_spec_version"
+                ),
+                "promotion_decision_id": (forecast.get("output") or {}).get(
+                    "promotion_decision_id"
+                ),
+                "promotion_parameters_hash": (forecast.get("output") or {}).get(
+                    "promotion_parameters_hash"
+                ),
+                "initial_state": dict(
+                    (forecast.get("output") or {}).get("initial_state") or {}
+                ),
+                "initial_state_revision": (forecast.get("output") or {}).get(
+                    "initial_state_revision"
+                ),
                 "curve": list(forecast.get("curve") or []),
                 "peaks": list(forecast.get("peaks") or []),
             }
@@ -1480,8 +1513,17 @@ class ResearchEvaluationService:
             matches = [
                 dict(item["metadata"])
                 for item in match_items
-                if item["metadata"].get("context", {}).get("algorithm_version")
-                == model_version
+                if model_version
+                in {
+                    item["metadata"].get("context", {}).get(
+                        "algorithm_version"
+                    ),
+                    item["metadata"].get("context", {}).get(
+                        "model_spec_version"
+                    ),
+                    item["metadata"].get("context", {}).get("model_family"),
+                    item["metadata"].get("context", {}).get("model_variant"),
+                }
             ]
             metrics_json = {
                 "config": config,
@@ -1638,17 +1680,17 @@ class ResearchEvaluationService:
                 .order_by(desc(ModelEvaluationRun.created_at))
                 .limit(50)
             ).scalars().all()
-            learned = (
-                session.execute(
-                    select(LearnedModelProfile)
-                    .where(LearnedModelProfile.participant_id == participant_id)
-                    .order_by(desc(LearnedModelProfile.version))
-                    .limit(1)
-                ).scalar_one_or_none()
-                if participant_id is not None
-                else None
-            )
-        latest = self._run_view(runs[0]) if runs else None
+        participant_runs = [
+            row for row in runs if row.participant_id == participant_id
+        ] if participant_id is not None else []
+        cohort_runs = [row for row in runs if row.participant_id is None]
+        selected_runs = participant_runs if participant_id is not None else cohort_runs
+        latest = self._run_view(selected_runs[0]) if selected_runs else None
+        if latest is not None:
+            latest["scope"] = "participant" if participant_id is not None else "cohort"
+        cohort_latest = self._run_view(cohort_runs[0]) if cohort_runs else None
+        if cohort_latest is not None:
+            cohort_latest["scope"] = "cohort"
         payload = dict((latest or {}).get("metrics") or {})
         comparison = dict(payload.get("comparison") or {})
         promotion = dict(payload.get("promotion") or {})
@@ -1671,8 +1713,13 @@ class ResearchEvaluationService:
                 }
             )
         current_model = "current_m0"
+        learned = (
+            self.learned_profiles.runtime_active(participant_id)
+            if participant_id is not None
+            else None
+        )
         if learned is not None:
-            parameters = dict(learned.parameters_json or {})
+            parameters = dict(learned.get("parameters") or {})
             selection = dict(parameters.get("model_selection") or {})
             current_model = str(
                 selection.get("active_variant")
@@ -1697,7 +1744,9 @@ class ResearchEvaluationService:
             ),
             "rows": rows,
             "latest_run": latest,
-            "run_count": len(runs),
+            "cohort_latest_run": cohort_latest if participant_id is not None else None,
+            "run_count": len(selected_runs),
+            "cohort_run_count": len(cohort_runs) if participant_id is not None else len(selected_runs),
         }
 
     def cohort_dashboard(

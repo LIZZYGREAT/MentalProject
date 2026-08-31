@@ -1,6 +1,8 @@
 from datetime import date, datetime, timezone
 import uuid
 
+import pytest
+
 from app.models import ModelEvaluationRun
 from app.repositories import (
     ForecastSnapshotRepository,
@@ -10,7 +12,10 @@ from app.repositories import (
     PsychometricAssessmentRepository,
 )
 from app.repositories import promotion_parameters_hash
-from app.services.forecast_coordinator import enforce_promoted_model_selection
+from app.services.forecast_coordinator import (
+    enforce_promoted_model_selection,
+    production_model_identity,
+)
 from app.services.model_comparison import (
     MODEL_FAMILIES,
     comparison_metrics,
@@ -98,6 +103,11 @@ def test_current_m0_is_stable_comparator_and_candidates_share_interface():
     assert {
         result.model_variant for result in results.values()
     } == {"m0", "wm0", "m1", "m2", "m3"}
+    assert results["m0"].model_version == "mindflow-ctssm-runtime-v7"
+    assert {
+        results[variant].model_version for variant in ("wm0", "m1", "m2", "m3")
+    } == {"mindflow-ctssm-runtime-v8"}
+    assert len({result.model_spec_version for result in results.values()}) == 5
 
     workload_point = next(
         point for point in results["wm0"].trajectory if point["time"] == "10:00"
@@ -269,6 +279,42 @@ def test_historical_calibration_uses_only_brs_known_by_through_date():
     ] == 0.5
 
 
+def test_historical_calibration_excludes_observation_created_after_through():
+    class Observations:
+        def recent(self, *_args, **_kwargs):
+            return [
+                {
+                    "id": "late",
+                    "observed_at": "2030-01-10T09:00:00+08:00",
+                    "created_at": "2030-01-15T09:00:00+08:00",
+                    "payload": {"stress_0_10": 9.0},
+                },
+                {
+                    "id": "causal",
+                    "observed_at": "2030-01-10T10:00:00+08:00",
+                    "created_at": "2030-01-10T10:01:00+08:00",
+                    "payload": {"stress_0_10": 6.0},
+                },
+            ]
+
+    class Forecasts:
+        def current_at(self, *_args, **_kwargs):
+            return {
+                "id": "forecast",
+                "forecast_version": "v1",
+                "generated_at": "2030-01-09T00:00:00+00:00",
+                "curve": [{"time": "10:00", "stress_0_10": 5.0}],
+                "output": {},
+            }
+
+    service = ProfileCalibrationService(
+        Observations(), Forecasts(), object(), "Asia/Shanghai"
+    )
+    samples = service.causal_samples("participant", through=date(2030, 1, 10))
+
+    assert [sample["observation_id"] for sample in samples] == ["causal"]
+
+
 def test_candidate_replay_never_assimilates_target_future_or_late_known_ema():
     target = datetime(2030, 1, 10, 10, tzinfo=timezone.utc)
     history = [
@@ -302,6 +348,101 @@ def test_candidate_replay_never_assimilates_target_future_or_late_known_ema():
 
     assert len(known) == 1
     assert known[0]["payload"]["stress_0_10"] == 5.0
+
+
+def test_rolling_origin_excludes_late_backfilled_training_ema_by_knowledge_time():
+    participant_id = uuid.uuid4()
+
+    def replay(day_one_created_at: str):
+        items = []
+        for day in range(1, 4):
+            local_day = date(2030, 1, day)
+            observation_id = f"knowledge-observation-{day}"
+            forecast_id = f"knowledge-forecast-{day}"
+            observed_at = f"2030-01-0{day}T09:00:00+08:00"
+            created_at = (
+                day_one_created_at
+                if day == 1
+                else f"2030-01-0{day}T09:01:00+08:00"
+            )
+            items.extend(
+                [
+                    {
+                        "item_type": "forecast",
+                        "source_id": forecast_id,
+                        "source_version": "v1",
+                        "participant_id": participant_id,
+                        "local_date": local_day,
+                        "source_hash": f"forecast-{day}",
+                        "metadata": {
+                            "initial_state": {
+                                "stress_0_10": 4.0,
+                                "vitality_0_10": 7.0,
+                            },
+                            "initial_state_revision": f"initial-{day}",
+                            "curve": [
+                                {
+                                    "time": "09:00",
+                                    "stress_0_10": 4.0 + day,
+                                    "vitality_0_10": 7.0,
+                                    "workload": day / 4.0,
+                                    "recovery_resource": (4 - day) / 4.0,
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "item_type": "observation",
+                        "source_id": observation_id,
+                        "source_version": "observation.v1",
+                        "participant_id": participant_id,
+                        "local_date": local_day,
+                        "source_hash": f"observation-{day}",
+                        "metadata": {
+                            "observation_type": "checkin",
+                            "observed_at": observed_at,
+                            "created_at": created_at,
+                            "payload": {
+                                "stress_0_10": 4.5 + day,
+                                "energy_0_10": 7.0,
+                            },
+                        },
+                    },
+                    {
+                        "item_type": "match_source",
+                        "source_id": observation_id,
+                        "source_version": "match.v2",
+                        "participant_id": participant_id,
+                        "local_date": local_day,
+                        "source_hash": f"match-{day}",
+                        "metadata": {
+                            "forecast_id": forecast_id,
+                            "observation_id": observation_id,
+                            "observed_at": observed_at,
+                            "predicted_stress": 4.0 + day,
+                            "actual_stress": 4.5 + day,
+                            "prediction_lower": 3.0,
+                            "prediction_upper": 9.0,
+                            "context": {"forecast_point_time": "09:00"},
+                        },
+                    },
+                ]
+            )
+        return Stage4CandidateReplayService("Asia/Shanghai").compare(
+            items,
+            participant_id=None,
+            requested_family="all",
+            config={},
+        )
+
+    late = replay("2030-01-04T09:00:00+08:00")
+    causal = replay("2030-01-01T09:01:00+08:00")
+
+    assert late["parameter_history"][0]["training_sample_count"] == 1
+    assert causal["parameter_history"][0]["training_sample_count"] == 2
+    assert late["rolling_origin"]["splits"][0]["origin_cutoff"] == (
+        "2030-01-02T16:00:00+00:00"
+    )
 
 
 def test_rolling_origin_metrics_and_promotion_gate_cover_all_stage4_checks():
@@ -418,6 +559,11 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
                     "local_date": local_day,
                     "source_hash": f"f{day}",
                     "metadata": {
+                        "initial_state": {
+                            "stress_0_10": 4.0,
+                            "vitality_0_10": 7.0,
+                        },
+                        "initial_state_revision": f"initial-{day}",
                         "curve": [
                             {
                                 "time": "09:00",
@@ -438,6 +584,9 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
                     "local_date": local_day,
                     "source_hash": f"o{day}",
                     "metadata": {
+                        "observed_at": f"2030-01-0{day}T09:00:00+08:00",
+                        "created_at": f"2030-01-0{day}T09:01:00+08:00",
+                        "observation_type": "checkin",
                         "payload": {
                             "stress_0_10": 4.2 + day * 0.6,
                             "energy_0_10": 7.0,
@@ -526,8 +675,31 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert all(
         result["comparison"][family]["replay_engine"]
-        == "stage4-real-ctssm-replay.v1"
+        == "stage4-real-ctssm-replay.v2"
         for family in ("workload_aware_m0", "m1", "m2", "m3")
+    )
+    participant_key = str(person_id)
+    final_fit = [
+        row
+        for row in result["parameter_history"]
+        if row["participant_id"] == participant_key
+    ][-1]
+    uncertainty = result["candidate_parameter_uncertainty"][participant_key]
+    assert uncertainty["S_star_init"]["std_error"] == pytest.approx(
+        final_fit["uncertainty"]["stress_baseline_0_10"]["std_error"] * 10.0
+    )
+    assert uncertainty["ctssm_params"]["workload_stress_gain"][
+        "std_error"
+    ] == pytest.approx(
+        final_fit["uncertainty"]["workload_reactivity_beta"]["std_error"]
+        * 10.0
+    )
+    assert "stress_reactivity_per_hour" not in result["candidate_parameters"][
+        participant_key
+    ]["ctssm_params"]
+    assert result["config"]["initial_state_provenance_complete"] is True
+    assert result["config"]["candidate_latent_initialization"]["version"] == (
+        "candidate-latent-initialization.v1"
     )
 
 
@@ -581,6 +753,18 @@ def test_production_candidate_requires_durable_promotion_provenance():
             "recovery_stress_gain": 16.0,
         },
     }
+    candidate_uncertainty = {
+        "S_star_init": {"std_error": 1.2},
+        "ctssm_params": {
+            "workload_stress_gain": {"std_error": 2.1},
+            "recovery_stress_gain": {"std_error": 1.7},
+        },
+    }
+    candidate_evidence = {
+        "sample_count": 12,
+        "day_count": 3,
+        "transition_count": 4,
+    }
     with database.session() as session:
         run = ModelEvaluationRun(
             dataset_snapshot_id=uuid.UUID(snapshot["id"]),
@@ -591,6 +775,7 @@ def test_production_candidate_requires_durable_promotion_provenance():
             metrics_json={
                 "config": {
                     "manifest_hash": snapshot["manifest"]["manifest_hash"],
+                    "initial_state_provenance_complete": True,
                 },
                 "comparison": {"m1": {"mae": 0.9, "sample_count": 12}},
                 "promotion": {
@@ -599,19 +784,54 @@ def test_production_candidate_requires_durable_promotion_provenance():
                         "gate_version": PROMOTION_GATE_VERSION,
                     }
                 },
-                "candidate_parameters": {
-                    str(person.id): candidate_params,
-                },
+                    "candidate_parameters": {
+                        str(person.id): candidate_params,
+                    },
+                    "candidate_parameter_uncertainty": {
+                        str(person.id): candidate_uncertainty,
+                    },
+                    "candidate_parameter_evidence": {
+                        str(person.id): candidate_evidence,
+                    },
             },
             status="completed",
         )
         session.add(run)
         session.flush()
         run_id = run.id
+        cohort_run = ModelEvaluationRun(
+            dataset_snapshot_id=uuid.UUID(snapshot["id"]),
+            model_version="m1",
+            evaluation_mode="offline_replay",
+            evaluation_code_version=EVALUATION_CODE_VERSION,
+            participant_id=None,
+            metrics_json=dict(run.metrics_json),
+            status="completed",
+        )
+        session.add(cohort_run)
+        session.flush()
+        cohort_run_id = cohort_run.id
 
-    decision = ModelPromotionService(
-        database, "Asia/Shanghai"
-    ).promote_candidate(run_id, participant_id=person.id, model_family="m1")
+    other = participant(database, "PROMOTION-OTHER")
+    promotion_service = ModelPromotionService(database, "Asia/Shanghai")
+    with pytest.raises(
+        ValueError,
+        match="participant promotion requires participant-specific evaluation run",
+    ):
+        promotion_service.promote_candidate(
+            cohort_run_id, participant_id=person.id, model_family="m1"
+        )
+    with pytest.raises(
+        ValueError,
+        match="participant promotion requires participant-specific evaluation run",
+    ):
+        promotion_service.promote_candidate(
+            run_id, participant_id=other.id, model_family="m1"
+        )
+
+    decision = promotion_service.promote_candidate(
+        run_id, participant_id=person.id, model_family="m1"
+    )
     active = learned.runtime_active(person.id)
 
     assert decision["status"] == "retained_from_empirical_evidence"
@@ -619,6 +839,58 @@ def test_production_candidate_requires_durable_promotion_provenance():
     assert active["parameters"]["model_selection"][
         "promotion_decision_id"
     ] == decision["id"]
+    assert active["confidence"] < 1.0
+    assert "model_selection" not in active["uncertainty"]
+    assert "stress_reactivity_per_hour" not in active["parameters"]["ctssm_params"]
+    learned.save(
+        person.id,
+        parameters={"S_star_init": 99.0},
+        uncertainty={},
+        sample_count=1,
+        day_count=1,
+        confidence=0.1,
+        window_start=date(2030, 1, 3),
+        window_end=date(2030, 1, 3),
+        model_version="newer-research-candidate",
+        validation_status="candidate",
+    )
+    dashboard = research.model_comparison_dashboard(person.id)
+    assert dashboard["current_model"] == "m1"
+    assert dashboard["latest_run"]["scope"] == "participant"
+    assert dashboard["latest_run"]["id"] == str(run_id)
+    assert dashboard["cohort_latest_run"]["scope"] == "cohort"
+
+
+def test_production_model_identity_distinguishes_m0_m1_and_m3():
+    model = AssessmentModel("Asia/Shanghai")
+    m0 = production_model_identity({"model_params": {}}, model)
+
+    def promoted(variant: str) -> dict:
+        return production_model_identity(
+            {
+                "model_params": {
+                    "model_selection": {
+                        "active_variant": variant,
+                        "status": "retained_from_empirical_evidence",
+                        "promotion_decision_id": f"decision-{variant}",
+                        "parameters_hash": f"hash-{variant}",
+                    }
+                }
+            },
+            model,
+        )
+
+    m1, m3 = promoted("m1"), promoted("m3")
+    assert m0["engine_version"] == "mindflow-ctssm-runtime-v7"
+    assert m1["engine_version"] == m3["engine_version"] == (
+        "mindflow-ctssm-runtime-v8"
+    )
+    assert {identity["model_variant"] for identity in (m0, m1, m3)} == {
+        "m0",
+        "m1",
+        "m3",
+    }
+    assert len({identity["model_spec_version"] for identity in (m0, m1, m3)}) == 3
 
 
 def test_explicit_profile_override_cannot_mutate_promoted_candidate():

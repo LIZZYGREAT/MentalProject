@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     Time,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -855,6 +856,14 @@ class ModelPromotionDecision(Base):
             "ix_model_promotion_participant_promoted",
             "participant_id",
             "promoted_at",
+        ),
+        Index(
+            "uq_model_promotion_cohort_run_family",
+            "model_evaluation_run_id",
+            "model_family",
+            unique=True,
+            postgresql_where=text("participant_id IS NULL"),
+            sqlite_where=text("participant_id IS NULL"),
         ),
         CheckConstraint(
             "status = 'retained_from_empirical_evidence'",
