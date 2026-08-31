@@ -718,6 +718,26 @@ class AdminAPI:
         )
         return JSONResponse(result)
 
+    async def model_comparison(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        return JSONResponse(
+            await asyncio.to_thread(self.research.model_comparison_dashboard)
+        )
+
+    async def participant_model_comparison(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.research.model_comparison_dashboard,
+                participant_id,
+            )
+        )
+
     async def dataset_snapshots(self, request: Request) -> Response:
         session = await self._authorized(request, csrf=request.method == "POST")
         if session is None:
@@ -780,7 +800,8 @@ class AdminAPI:
             item_type = str(request.query_params.get("item_type") or "").strip()
             if item_type and item_type not in {
                 "participant", "observation", "forecast", "forecast_currentness",
-                "calendar", "match_source",
+                "calendar", "match_source", "psychometric", "daily_review",
+                "slow_state",
             }:
                 raise ValueError("unsupported item_type")
             items = await asyncio.to_thread(
@@ -937,8 +958,10 @@ class AdminAPI:
             Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),
             Route(f"{prefix}/research/dataset-snapshots/{{snapshot_id}}/items", self.dataset_snapshot_items, methods=["GET"]),
             Route(f"{prefix}/research/evaluation-runs", self.evaluation_runs, methods=["GET", "POST"]),
+            Route(f"{prefix}/research/model-comparison", self.model_comparison, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/longitudinal", self.participant_longitudinal, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/evaluation", self.participant_evaluation, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/model-comparison", self.participant_model_comparison, methods=["GET"]),
             Route(f"{prefix}/incidents", self.incidents, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_list, methods=["GET"]),
             Route(f"{prefix}/admin-users", self.admin_users_create, methods=["POST"]),

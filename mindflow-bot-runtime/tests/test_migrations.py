@@ -115,6 +115,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0028_workload_causal_provenance"
     )
     assert migration_0028.down_revision == "0027_workload_calibration"
+    migration_0029 = next(
+        migration for migration in migrations
+        if migration.revision == "0029_ctssm_vnext_recovery_snapshot"
+    )
+    assert migration_0029.down_revision == "0028_workload_causal_provenance"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
@@ -481,6 +486,40 @@ def test_0028_adds_nullable_causal_provenance_fk_and_indexes(monkeypatch):
         "ix_event_appraisal_participant_event_date",
         "ix_event_appraisal_source_forecast",
     }
+
+
+def test_0029_expands_snapshot_evidence_types_and_has_safe_downgrade(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0029_ctssm_vnext_recovery_snapshot.py"
+    )
+    dropped = []
+    checks = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "drop_constraint",
+        lambda *args, **kwargs: dropped.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+    assert all(
+        item_type in checks[-1][2]
+        for item_type in ("'psychometric'", "'daily_review'", "'slow_state'")
+    )
+
+    migration.downgrade()
+    assert statements == [
+        "DELETE FROM dataset_snapshot_items "
+        "WHERE item_type IN ('psychometric', 'daily_review', 'slow_state')"
+    ]
+    assert "'psychometric'" not in checks[-1][2]
+    assert len(dropped) == 2
 
 
 def test_0015_backfills_causal_source_without_guessing_orphan_responses(

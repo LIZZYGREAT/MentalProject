@@ -19,6 +19,7 @@ from app.db import build_engine
 from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
+    DATASET_SCHEMA_V4,
     ResearchEvaluationService,
 )
 from postgres_test_guard import optional_test_postgres_url
@@ -721,6 +722,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 for check in item_checks
                 if check.get("name") == "ck_dataset_snapshot_item_type"
             )
+            command.upgrade(config, "0029_ctssm_vnext_recovery_snapshot")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0029_ctssm_vnext_recovery_snapshot"
 
             service = ResearchEvaluationService(
                 _ConnectionDatabase(connection), "Asia/Shanghai"
@@ -749,7 +754,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 observation_cutoff=now,
                 calendar_cutoff=now,
             )
-            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V3
+            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V4
             assert v3_snapshot["manifest"]["participant_count"] == 1
             v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
             memberships = service.snapshot_items(v3_snapshot_id, "participant")
@@ -1154,10 +1159,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 {"id": optional_review_id},
             ) == 0
 
-            command.upgrade(config, "0028_workload_causal_provenance")
+            command.upgrade(config, "0029_ctssm_vnext_recovery_snapshot")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0028_workload_causal_provenance"
+            ) == "0029_ctssm_vnext_recovery_snapshot"
     finally:
         config.attributes.pop("connection", None)
         with engine.begin() as connection:

@@ -20,6 +20,7 @@ from app.repositories import (
     ParticipantRepository,
     ProfileRepository,
     LearnedProfileRepository,
+    PsychometricAssessmentRepository,
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
@@ -148,8 +149,13 @@ def build_business_services(
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
+    psychometrics = PsychometricAssessmentRepository(database)
     profile_calibration = ProfileCalibrationService(
-        observations, forecast_snapshots, learned_profiles, settings.timezone_name
+        observations,
+        forecast_snapshots,
+        learned_profiles,
+        settings.timezone_name,
+        psychometrics=psychometrics,
     )
     forecast_coordinator = ForecastCoordinator(
         participants=ParticipantRepository(database), profiles=profiles,

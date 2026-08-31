@@ -141,11 +141,14 @@ Stage 1 明确区分 latest 与 runtime-active：`validated` 可以进入生产�
 
 ## 3. Workload、Resilience 与参数边界
 
-| 概念 | 当前定义 | Stage 1 用途 |
+| 概念 | 当前定义 | Stage 4 用途 |
 |---|---|---|
-| Workload / `W(t)` | Calendar/Event Semantic demand 与主观 workload 的待校准综合量，目标尺度 0–10 | 只做观测、诊断与候选输入；Stage 3 前不新增动态状态 |
-| Resilience | 面对 demand 后维持功能并恢复的能力/过程；与单次低压力不同 | BRS 可作稳定特征证据，recovery quality 可作慢状态证据；Stage 4 前不改主方程 |
-| Learned Parameters | 只能由 longitudinal data 学习，必须带证据窗口、样本量、模型版本、不确定性和验证状态 | `candidate` 不等于生产生效；外部 LLM 不接触内部参数 |
+| Workload / `W(t)` | Calendar/Event Semantic demand 与主观 workload 的待校准综合量，运行时归一化到 0–1 | Workload-aware M0 及 M1–M3 的可观测输入；结合真实 EMA Stress 估计个体 stress reactivity |
+| Recovery / `R(t)` | calendar gap、protected break、sleep window、user-reported recovery 的保守聚合，运行时为 0–1 | 以 `-β_R R(t)` 进入候选模型，并用于纵向 recovery efficiency 与恢复速率估计 |
+| Resilience | 面对 demand 后维持功能并恢复的能力/过程；与单次低压力不同 | BRS 只作为 `β_R` 的慢 trait prior；真实纵向恢复数据继续更新恢复参数 |
+| Learned Parameters | 只能由 longitudinal data 学习，必须带证据窗口、样本量、模型版本、不确定性和验证状态 | 学习 `β_W`、`β_R` 与上升/恢复响应速率 `κ`；`candidate` 不等于生产生效，外部 LLM 不接触内部参数 |
+
+Stage 4 离线比较固定使用 `mindflow-research-dataset-v4` Dataset Snapshot。BRS、Daily Review recovery、Slow State recovery/sleep、Forecast、Calendar、EMA 与 match source 必须一并冻结；Current M0、Workload-aware M0、M1、M2、M3 使用同一 Rolling-Origin split。M1/M2/M3 缺少 vitality、perseverative cognition 或 recovery debt 对应观测证据时可以保留研究指标，但 promotion gate 必须失败。
 
 ## 4. Sampling Protocol
 

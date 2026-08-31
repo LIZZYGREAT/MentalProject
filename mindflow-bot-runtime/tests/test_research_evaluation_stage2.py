@@ -26,6 +26,7 @@ from app.repositories import ForecastSnapshotRepository
 from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
+    DATASET_SCHEMA_V4,
     EVALUATION_CODE_VERSION,
     ResearchEvaluationService,
 )
@@ -236,7 +237,7 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
         "forecast.v4",
     )
 
-    assert snapshot["schema_version"] == DATASET_SCHEMA_V3
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V4
     assert snapshot["manifest"]["participant_count"] == 1
     assert snapshot["manifest"]["observation_count"] == 2
     assert snapshot["manifest"]["forecast_count"] == 1
@@ -258,7 +259,7 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
     assert run["metrics"]["matched_observation_count"] == 2
     assert run["evaluation_code_version"] == EVALUATION_CODE_VERSION
     assert run["metrics"]["config"]["evaluation_code_version"] == (
-        "stage2-evaluation.v3"
+        EVALUATION_CODE_VERSION
     )
     assert run["metrics"]["config"]["manifest_hash"] == snapshot["manifest"][
         "manifest_hash"
@@ -510,9 +511,9 @@ def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes()
         snapshot_id, "candidate.v1", evaluation_mode="offline_replay"
     )
     assert offline["evaluation_mode"] == "offline_replay"
-    assert offline["status"] == "not_implemented"
+    assert offline["status"] == "completed"
     assert offline["metrics"]["config"]["dataset_schema_version"] == (
-        DATASET_SCHEMA_V3
+        DATASET_SCHEMA_V4
     )
 
 
@@ -835,7 +836,7 @@ def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
         },
     )
     assert offline.status_code == 201
-    assert offline.json()["status"] == "not_implemented"
+    assert offline.json()["status"] == "completed"
     script = browser.get("/admin/static/app.js").text
     for marker in (
         "研究评估",
@@ -844,6 +845,8 @@ def test_stage2_admin_routes_and_research_ui_are_exposed_with_auth_and_csrf():
         "参数历史",
         "/research/dataset-snapshots",
         "/research/evaluation-runs",
+        "ADMIN MODEL COMPARISON",
+        "/research/model-comparison",
         "historical_online",
         "EMA 观测日率",
     ):

@@ -43,6 +43,8 @@ GLOBAL_DEFAULT_CONFIG = {
         "minimum_interval_coverage": 0.80,
         "require_care_frequency_validation": True,
         "target_interval_coverage": 0.90,
+        "maximum_peak_timing_regression_minutes": 0.0,
+        "minimum_high_stress_recall_delta": 0.0,
     },
     # Phase 0 baseline: keep the model deterministic and identifiable.
     # Disabled mechanisms stay available for later ablation experiments, but
@@ -297,6 +299,15 @@ GLOBAL_DEFAULT_CONFIG = {
         "stress_reactivity_per_hour": 1.55,
         "stress_recovery_per_hour": 0.68,
         "event_stress_gain": 30.0,
+        # Stage-4 candidates.  Current M0 ignores these until an out-of-time
+        # promotion decision selects workload-aware M0/M1/M2/M3.
+        "workload_stress_gain": 28.0,
+        "recovery_stress_gain": 14.0,
+        "anticipation_stress_gain": 5.0,
+        "aftermath_stress_gain": 8.0,
+        "continuous_load_stress_gain": 6.0,
+        "vitality_workload_sensitivity": 0.45,
+        "perseverative_cognition_accumulation_per_hour": 0.90,
         "m0_anticipation_stress_gain": 5.0,
         "m0_post_event_stress_gain": 8.0,
         "cognition_stress_gain": 15.0,

@@ -532,6 +532,25 @@ class PsychometricAssessmentRepository:
             ).scalars().all()
             return [self._view(row) for row in rows]
 
+    def latest_by_instrument(
+        self, participant_id: uuid.UUID, instrument_name: str
+    ) -> Optional[dict[str, Any]]:
+        name = normalize_instrument_name(instrument_name)
+        with self.database.session() as session:
+            row = session.execute(
+                select(PsychometricAssessment)
+                .where(
+                    PsychometricAssessment.participant_id == participant_id,
+                    PsychometricAssessment.instrument_name == name,
+                )
+                .order_by(
+                    desc(PsychometricAssessment.administered_at),
+                    desc(PsychometricAssessment.created_at),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._view(row) if row is not None else None
+
 
 class ParticipantSlowStateRepository:
     def __init__(self, database: Database):

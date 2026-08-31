@@ -11,6 +11,13 @@ from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
     ObservationRepository,
+    PsychometricAssessmentRepository,
+)
+from app.services.model_comparison import (
+    estimate_reactivity_and_recovery,
+    estimate_response_rates,
+    observed_recovery_efficiency,
+    trait_resilience_prior,
 )
 
 
@@ -35,6 +42,56 @@ def _curve_stress(point: dict[str, Any]) -> float | None:
     return value / 10.0 if value > 10.0 else value
 
 
+def _calendar_recovery_resource(
+    forecast: dict[str, Any], observed_at: datetime
+) -> float:
+    """Derive calendar gap/protected break/sleep from causal Forecast input."""
+
+    current = observed_at.astimezone(timezone.utc)
+    demanding: list[tuple[datetime, datetime]] = []
+    active = 0.0
+    for event in (
+        (forecast.get("output") or {}).get("classified_calendar_events") or []
+    ):
+        try:
+            start = datetime.fromisoformat(
+                str(event.get("start_time") or "").replace("Z", "+00:00")
+            )
+            end = datetime.fromisoformat(
+                str(event.get("end_time") or "").replace("Z", "+00:00")
+            )
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        event_type = str(event.get("event_type") or "").lower()
+        metadata = dict(event.get("metadata") or {})
+        name = str(event.get("summary") or event.get("name") or "").lower()
+        if start <= current < end:
+            if event_type == "sleep":
+                active = 1.0
+            elif (
+                metadata.get("protected_break")
+                or event_type in {"rest", "nap"}
+                or "protected break" in name
+                or "保护性休息" in name
+            ):
+                active = max(active, 0.65)
+        if event_type not in {"rest", "nap", "sleep", "meal"}:
+            demanding.append((start, end))
+    if active:
+        return active
+    previous = [end for _, end in demanding if end <= current]
+    following = [start for start, _ in demanding if start > current]
+    if not previous or not following:
+        return 0.0
+    gap_minutes = (min(following) - max(previous)).total_seconds() / 60.0
+    return 0.35 * min(1.0, gap_minutes / 60.0) if gap_minutes >= 10 else 0.0
+
+
 class ProfileCalibrationService:
     MIN_DAYS = 7
     MIN_MATCHED_SAMPLES = 14
@@ -45,11 +102,13 @@ class ProfileCalibrationService:
         forecasts: ForecastSnapshotRepository,
         learned_profiles: LearnedProfileRepository,
         timezone_name: str,
+        psychometrics: PsychometricAssessmentRepository | None = None,
     ):
         self.observations = observations
         self.forecasts = forecasts
         self.learned_profiles = learned_profiles
         self.timezone = ZoneInfo(timezone_name)
+        self.psychometrics = psychometrics
 
     def causal_samples(
         self, participant_id: Any, *, through: date
@@ -91,13 +150,31 @@ class ProfileCalibrationService:
                 point_minute = _minute(point.get("time"))
                 stress = _curve_stress(point)
                 if point_minute is not None and stress is not None:
-                    candidates.append((abs(point_minute - minute), stress))
+                    candidates.append((abs(point_minute - minute), stress, point))
             if not candidates:
                 continue
-            predicted = min(candidates, key=lambda item: item[0])[1]
+            _, predicted, point = min(candidates, key=lambda item: item[0])
+            reported_recovery = payload.get(
+                "recovery_0_10", payload.get("recovery_quality_0_10")
+            )
+            try:
+                reported_recovery_value = max(
+                    0.0, min(1.0, float(reported_recovery) / 10.0)
+                )
+            except (TypeError, ValueError):
+                reported_recovery_value = 0.0
             matched.append({
+                "participant_id": str(participant_id),
                 "actual": actual,
+                "actual_stress": actual,
                 "predicted": predicted,
+                "workload": float(point.get("workload") or 0.0),
+                "recovery": max(
+                    float(point.get("recovery_resource") or 0.0),
+                    reported_recovery_value,
+                    _calendar_recovery_resource(forecast, observed_utc),
+                ),
+                "observed_at": observed_utc.isoformat(),
                 "stress_event_since_last": bool(payload.get("stress_event_since_last")),
                 "local_date": local_day,
                 "observation_id": observation.get("id"),
@@ -139,6 +216,45 @@ class ProfileCalibrationService:
             "S_star_init": round(max(25.0, min(75.0, baseline + baseline_step)), 3),
         }
 
+        brs = (
+            self.psychometrics.latest_by_instrument(participant_id, "BRS")
+            if self.psychometrics is not None
+            else None
+        )
+        resilience = trait_resilience_prior(
+            (brs or {}).get("scores") if brs else None
+        )
+        parameter_estimate = estimate_reactivity_and_recovery(
+            matched,
+            trait_resilience=resilience,
+        )
+        response_rates = estimate_response_rates(matched, parameter_estimate)
+        recovery_efficiency = observed_recovery_efficiency(matched)
+        existing_ctssm = dict(previous.get("ctssm_params") or {})
+        identified_rates = {
+            key: value
+            for key, value in response_rates.items()
+            if key.endswith("_per_hour") and value is not None
+        }
+        parameters["ctssm_params"] = {
+            **existing_ctssm,
+            "workload_stress_gain": round(
+                parameter_estimate["workload_reactivity_beta"] * 10.0, 3
+            ),
+            "recovery_stress_gain": round(
+                parameter_estimate["recovery_beta"] * 10.0, 3
+            ),
+            "trait_resilience_prior": resilience,
+            **identified_rates,
+            "response_transition_count": response_rates[
+                "response_transition_count"
+            ],
+            "recovery_transition_count": response_rates[
+                "recovery_transition_count"
+            ],
+            **recovery_efficiency,
+        }
+
         with_event = [
             item["actual"] - item["predicted"]
             for item in matched if item["stress_event_since_last"]
@@ -152,7 +268,7 @@ class ProfileCalibrationService:
             contrast = mean(with_event) - mean(without_event)
             gain_step = max(-1.0, min(1.0, contrast * 0.5))
             parameters["ctssm_params"] = {
-                **dict(previous.get("ctssm_params") or {}),
+                **dict(parameters.get("ctssm_params") or {}),
                 "event_stress_gain": round(max(20.0, min(40.0, old_gain + gain_step)), 3),
             }
 
@@ -160,6 +276,15 @@ class ProfileCalibrationService:
             participant_id, parameters=parameters, sample_count=len(matched),
             day_count=len(days), confidence=min(1.0, len(matched) / 42.0),
             window_start=days[0], window_end=days[-1],
+            source="calibration.v2-resilience-recovery",
+            model_version="mindflow-ctssm-runtime-v8",
+            uncertainty={
+                "S_star_init": {"std_error": parameter_estimate["uncertainty"]["stress_baseline_0_10"]["std_error"]},
+                "ctssm_params": {
+                    "workload_stress_gain": parameter_estimate["uncertainty"]["workload_reactivity_beta"],
+                    "recovery_stress_gain": parameter_estimate["uncertainty"]["recovery_beta"],
+                },
+            },
         )
         return {"status": "calibrated", "learned_profile": saved}
 

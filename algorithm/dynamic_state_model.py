@@ -40,23 +40,33 @@ _WORKLOAD_ESTIMATOR = WorkloadEstimator()
 MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
     "m0": {
         "canonical": "stress-ctssm.m0",
-        "label": "M0 压力时变平衡",
+        "label": "Current M0 压力时变平衡",
         "states": ("S",),
+        "workload_aware": False,
+    },
+    "wm0": {
+        "canonical": "workload-aware-stress-ctssm.m0",
+        "label": "Workload-aware M0",
+        "states": ("S",),
+        "workload_aware": True,
     },
     "m1": {
         "canonical": "stress-vitality-ctssm.m1",
         "label": "M1 压力与主观活力",
         "states": ("S", "V"),
+        "workload_aware": True,
     },
     "m2": {
         "canonical": "stress-vitality-pc-ctssm.m2",
         "label": "M2 加入持续性认知代理",
         "states": ("S", "V", "P"),
+        "workload_aware": True,
     },
     "m3": {
         "canonical": "stress-vitality-pc-fatigue-ctssm.m3",
         "label": "M3 加入恢复债代理",
         "states": ("S", "V", "P", "F"),
+        "workload_aware": True,
     },
 }
 
@@ -69,6 +79,10 @@ def normalize_model_variant(value: Any) -> str:
     """
 
     text = str(value or "m0").strip().lower().replace("_", "-")
+    if text in {"wm0", "workload-m0", "workload-aware-m0"} or (
+        "workload" in text and "m0" in text
+    ):
+        return "wm0"
     for key in ("m3", "m2", "m1", "m0"):
         if text == key or f".{key}" in text or text.endswith(f"-{key}"):
             return key
@@ -83,6 +97,7 @@ def model_variant_metadata(value: Any) -> Dict[str, Any]:
         "canonical": item["canonical"],
         "label": item["label"],
         "active_states": list(item["states"]),
+        "workload_aware": bool(item["workload_aware"]),
         "candidate_status": "requires_out_of_time_validation",
     }
 
@@ -175,6 +190,12 @@ class DynamicInputs:
     anticipatory_input: float = 0.0
     post_event_input: float = 0.0
     workload_raw: float = 0.0
+    workload: float = 0.0
+    continuous_load: float = 0.0
+    recovery_calendar_gap: float = 0.0
+    recovery_protected_break: float = 0.0
+    recovery_sleep_window: float = 0.0
+    recovery_user_reported: float = 0.0
     active_event_ids: tuple[str, ...] = ()
     active_event_names: tuple[str, ...] = ()
 
@@ -602,12 +623,14 @@ def calculate_dynamic_inputs(
 
     stress_inputs = []
     demands = []
-    recoveries = []
     anticipatory = []
     post_event = []
     workload_inputs = []
     active_ids = []
     active_names = []
+    demanding_intervals: list[tuple[datetime, datetime]] = []
+    protected_breaks = []
+    user_reported_recoveries = []
 
     for event in events:
         assessment = assessments[str(event.event_id)]
@@ -648,6 +671,9 @@ def calculate_dynamic_inputs(
             and current_time >= cancellation_time
         )
         is_active = start <= current_time < end and not is_cancelled_now
+
+        if assessment.workload_prior > 0.05 and not assessment.cancelled:
+            demanding_intervals.append((start, end))
 
         if is_cancelled_now and cancellation_time is not None:
             since_cancel = max(
@@ -696,7 +722,32 @@ def calculate_dynamic_inputs(
                 assessment.stress_intensity * appraisal_multiplier * onset
             )
             demands.append(assessment.task_demand)
-            recoveries.append(assessment.recovery_quality)
+            metadata = (
+                event.metadata
+                if isinstance(getattr(event, "metadata", None), Mapping)
+                else {}
+            )
+            recovery_metadata = metadata.get("recovery")
+            recovery_metadata = (
+                recovery_metadata
+                if isinstance(recovery_metadata, Mapping)
+                else {}
+            )
+            event_name = str(getattr(event, "name", "") or "").lower()
+            is_protected_break = bool(
+                metadata.get("protected_break")
+                or recovery_metadata.get("protected_break")
+                or assessment.event_type in {"rest", "nap"}
+                or "protected break" in event_name
+                or "保护性休息" in event_name
+            )
+            if is_protected_break:
+                protected_breaks.append(assessment.recovery_quality)
+            reported = recovery_metadata.get(
+                "user_reported", metadata.get("user_reported_recovery")
+            )
+            if reported is not None:
+                user_reported_recoveries.append(_unit(reported, 0.0))
 
         if 0.0 <= after_min <= 360.0 and assessment.post_weight > 0.0:
             post_event.append(
@@ -710,13 +761,31 @@ def calculate_dynamic_inputs(
                 )
             )
 
+    calendar_gap = 0.0
+    if not active_ids and demanding_intervals:
+        previous_ends = [end for _, end in demanding_intervals if end <= current_time]
+        next_starts = [start for start, _ in demanding_intervals if start > current_time]
+        if previous_ends and next_starts:
+            gap_start, gap_end = max(previous_ends), min(next_starts)
+            gap_minutes = max(0.0, (gap_end - gap_start).total_seconds() / 60.0)
+            if gap_minutes >= 10.0:
+                # A calendar gap is an observable opportunity, not proof of
+                # actual recovery, so its contribution is conservative.
+                calendar_gap = 0.35 * _clamp(gap_minutes / 60.0)
+    protected_break = _combine(protected_breaks)
+    user_reported = _combine(user_reported_recoveries)
+    recovery_resource = _combine((calendar_gap, protected_break, user_reported))
+
     return DynamicInputs(
         event_stress=_combine(stress_inputs),
         task_demand=_combine(demands),
-        recovery=_combine(recoveries),
+        recovery=recovery_resource,
         anticipatory_input=_combine(anticipatory),
         post_event_input=_combine(post_event),
         workload_raw=saturating_union(workload_inputs),
+        recovery_calendar_gap=calendar_gap,
+        recovery_protected_break=protected_break,
+        recovery_user_reported=user_reported,
         active_event_ids=tuple(active_ids),
         active_event_names=tuple(active_names),
     )
@@ -815,7 +884,8 @@ def step_latent_state(
     dt_hours = max(1e-6, float(dt_minutes) / 60.0)
     cfg = dict(config)
     variant = normalize_model_variant(model_variant)
-    rank = int(variant[-1])
+    rank = 0 if variant in {"m0", "wm0"} else int(variant[-1])
+    workload_aware = bool(MODEL_VARIANTS[variant]["workload_aware"])
     use_vitality = rank >= 1
     use_cognition = rank >= 2
     use_fatigue = rank >= 3
@@ -825,12 +895,12 @@ def step_latent_state(
         float(cfg.get("cognition_decay_per_hour", 1.05)),
     )
     if use_cognition:
-        cognition_drive = (
-            float(cfg.get("anticipation_gain_per_hour", 0.90))
-            * inputs.anticipatory_input
-            + float(cfg.get("aftermath_gain_per_hour", 1.00))
-            * inputs.post_event_input
+        stressful_indicator = _combine(
+            (inputs.workload, inputs.anticipatory_input, inputs.post_event_input)
         )
+        cognition_drive = float(
+            cfg.get("perseverative_cognition_accumulation_per_hour", 0.90)
+        ) * stressful_indicator
         cognition_eq = cognition_drive / cognition_decay
         cognition = cognition_eq + (
             state.perseverative_cognition - cognition_eq
@@ -843,7 +913,7 @@ def step_latent_state(
     if use_fatigue:
         accumulation = (
             max(0.0, float(cfg.get("fatigue_accumulation_per_hour", 0.42)))
-            * inputs.task_demand
+            * inputs.workload
         )
         restoration = (
             max(0.0, float(cfg.get("fatigue_recovery_per_hour", 0.95)))
@@ -881,13 +951,34 @@ def step_latent_state(
         float(stress_baseline)
         + stress_tod
         + debt_term
-        + float(cfg.get("event_stress_gain", 30.0)) * inputs.event_stress
     )
+    workload_gain = 0.0
+    if workload_aware:
+        workload_gain = float(cfg.get("workload_stress_gain", 28.0))
+        if use_vitality:
+            workload_gain *= 1.0 + float(
+                cfg.get("vitality_workload_sensitivity", 0.45)
+            ) * (1.0 - _clamp(state.vitality / 100.0))
+        stress_equilibrium += (
+            workload_gain * inputs.workload
+            + float(cfg.get("anticipation_stress_gain", 5.0))
+            * inputs.anticipatory_input
+            + float(cfg.get("aftermath_stress_gain", 8.0))
+            * inputs.post_event_input
+            + float(cfg.get("continuous_load_stress_gain", 6.0))
+            * inputs.continuous_load
+            - float(cfg.get("recovery_stress_gain", 14.0))
+            * inputs.recovery
+        )
+    else:
+        stress_equilibrium += (
+            float(cfg.get("event_stress_gain", 30.0)) * inputs.event_stress
+        )
     # M0 has no latent perseverative-cognition state, but the paper's
     # time-varying equilibrium may still contain observable event covariates.
     # Retaining small, explicit pre/post kernels prevents a new demanding event
     # from pretending that the previous event's load vanished instantly.
-    if not use_cognition:
+    if not use_cognition and not workload_aware:
         stress_equilibrium += (
             float(cfg.get("m0_anticipation_stress_gain", 5.0))
             * inputs.anticipatory_input
@@ -981,6 +1072,9 @@ def step_latent_state(
         "vitality_time_of_day": vitality_tod,
         "sleep_debt_effect": debt_term,
         "model_variant": variant,
+        "workload_aware": workload_aware,
+        "effective_workload_gain": workload_gain,
+        "recovery_resource": inputs.recovery,
         "active_states": list(MODEL_VARIANTS[variant]["states"]),
         "cognition_drive": cognition_drive,
         "fatigue_accumulation": accumulation,
@@ -1004,7 +1098,7 @@ def initialize_latent_state(
 
     cfg = dict(config or {})
     variant = normalize_model_variant(model_variant)
-    rank = int(variant[-1])
+    rank = 0 if variant in {"m0", "wm0"} else int(variant[-1])
     sleep_delta = max(-1.0, min(1.0, float(sleep_quality_deviation)))
     if previous is None:
         return LatentState(
@@ -1065,7 +1159,8 @@ def initialize_uncertainty(
     model_variant: Any = "m0",
 ) -> LatentUncertainty:
     cfg = dict(config or {})
-    rank = int(normalize_model_variant(model_variant)[-1])
+    normalized_variant = normalize_model_variant(model_variant)
+    rank = 0 if normalized_variant in {"m0", "wm0"} else int(normalized_variant[-1])
     return LatentUncertainty(
         stress_variance=float(cfg.get("initial_stress_variance", 100.0)),
         vitality_variance=(
@@ -1092,7 +1187,8 @@ def step_uncertainty(
 
     cfg = dict(config)
     dt_hours = max(1e-6, float(dt_minutes) / 60.0)
-    rank = int(normalize_model_variant(model_variant)[-1])
+    normalized_variant = normalize_model_variant(model_variant)
+    rank = 0 if normalized_variant in {"m0", "wm0"} else int(normalized_variant[-1])
 
     def advance(variance: float, rate: float, process_sd: float) -> float:
         rate = max(1e-6, float(rate))
@@ -1171,7 +1267,8 @@ def assimilate_observation_with_uncertainty(
     """
 
     cfg = dict(config)
-    rank = int(normalize_model_variant(model_variant)[-1])
+    normalized_variant = normalize_model_variant(model_variant)
+    rank = 0 if normalized_variant in {"m0", "wm0"} else int(normalized_variant[-1])
     retrospective = bool(observation.get("retrospective", False))
     delay_minutes = max(
         0.0,

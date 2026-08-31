@@ -1,4 +1,5 @@
 # core_engine/simulator.py
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import math
@@ -212,6 +213,11 @@ class Simulator:
                 normalized_observation["perseverative_cognition"] = (
                     normalized_observation.get("perseverative_cognition_0_10")
                 )
+            if "recovery" not in normalized_observation:
+                normalized_observation["recovery"] = normalized_observation.get(
+                    "recovery_0_10",
+                    normalized_observation.get("recovery_quality_0_10"),
+                )
             observations_by_time.setdefault(key, []).append(
                 normalized_observation
             )
@@ -333,42 +339,26 @@ class Simulator:
                 config=ctssm_cfg,
             )
             if cross_day_unfinished_input > 0.0:
-                dynamic_inputs = DynamicInputs(
-                    event_stress=dynamic_inputs.event_stress,
-                    task_demand=dynamic_inputs.task_demand,
-                    recovery=dynamic_inputs.recovery,
+                dynamic_inputs = replace(
+                    dynamic_inputs,
                     anticipatory_input=dynamic_inputs.anticipatory_input,
                     post_event_input=1.0
                     - (1.0 - dynamic_inputs.post_event_input)
                     * (1.0 - cross_day_unfinished_input),
-                    active_event_ids=dynamic_inputs.active_event_ids,
-                    active_event_names=dynamic_inputs.active_event_names,
-                    workload_raw=dynamic_inputs.workload_raw,
                 )
             if sleeping and dynamic_inputs.recovery < 0.85:
-                dynamic_inputs = DynamicInputs(
-                    event_stress=dynamic_inputs.event_stress,
-                    task_demand=dynamic_inputs.task_demand,
+                dynamic_inputs = replace(
+                    dynamic_inputs,
                     recovery=0.85,
-                    anticipatory_input=dynamic_inputs.anticipatory_input,
-                    post_event_input=dynamic_inputs.post_event_input,
-                    active_event_ids=dynamic_inputs.active_event_ids,
-                    active_event_names=dynamic_inputs.active_event_names,
-                    workload_raw=dynamic_inputs.workload_raw,
+                    recovery_sleep_window=1.0,
                 )
             if inertia_ds > 0.0:
                 interruption_input = max(0.0, min(1.0, inertia_ds / 10.0))
-                dynamic_inputs = DynamicInputs(
+                dynamic_inputs = replace(
+                    dynamic_inputs,
                     event_stress=1.0
                     - (1.0 - dynamic_inputs.event_stress)
                     * (1.0 - interruption_input),
-                    task_demand=dynamic_inputs.task_demand,
-                    recovery=dynamic_inputs.recovery,
-                    anticipatory_input=dynamic_inputs.anticipatory_input,
-                    post_event_input=dynamic_inputs.post_event_input,
-                    active_event_ids=dynamic_inputs.active_event_ids,
-                    active_event_names=dynamic_inputs.active_event_names,
-                    workload_raw=dynamic_inputs.workload_raw,
                 )
 
             workload, continuous_load_factor = apply_continuous_load(
@@ -380,10 +370,37 @@ class Simulator:
                 beta=float(ctssm_cfg.get("workload_continuous_beta", 0.18)),
             )
 
-            observation_applied = False
-            for observation in observations_by_time.get(
+            current_observations = observations_by_time.get(
                 current_observation_key, []
-            ):
+            )
+            reported_recovery = 0.0
+            for observation in current_observations:
+                try:
+                    value = float(observation.get("recovery"))
+                except (TypeError, ValueError):
+                    continue
+                if value > 1.0:
+                    value /= 10.0
+                reported_recovery = max(
+                    reported_recovery, max(0.0, min(1.0, value))
+                )
+            combined_recovery = 1.0 - (
+                (1.0 - max(0.0, min(1.0, dynamic_inputs.recovery)))
+                * (1.0 - reported_recovery)
+            )
+            dynamic_inputs = replace(
+                dynamic_inputs,
+                workload=workload,
+                continuous_load=continuous_load_factor,
+                recovery=combined_recovery,
+                recovery_user_reported=max(
+                    dynamic_inputs.recovery_user_reported,
+                    reported_recovery,
+                ),
+            )
+
+            observation_applied = False
+            for observation in current_observations:
                 try:
                     latent, uncertainty = assimilate_observation_with_uncertainty(
                         latent,
@@ -491,6 +508,12 @@ class Simulator:
                     "workload": workload,
                     "workload_raw": dynamic_inputs.workload_raw,
                     "recovery_input": dynamic_inputs.recovery,
+                    "recovery_components": {
+                        "calendar_gap": dynamic_inputs.recovery_calendar_gap,
+                        "protected_break": dynamic_inputs.recovery_protected_break,
+                        "sleep_window": dynamic_inputs.recovery_sleep_window,
+                        "user_reported": dynamic_inputs.recovery_user_reported,
+                    },
                     "anticipatory_input": (
                         dynamic_inputs.anticipatory_input
                     ),

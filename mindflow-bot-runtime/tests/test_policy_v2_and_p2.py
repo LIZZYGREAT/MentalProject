@@ -1257,6 +1257,10 @@ def test_longitudinal_calibration_requires_seven_days_and_versions_learned_layer
     assert result["learned_profile"]["version"] == 1
     assert result["learned_profile"]["day_count"] == 7
     assert result["learned_profile"]["parameters"]["S_star_init"] == 52.0
+    ctssm_params = result["learned_profile"]["parameters"]["ctssm_params"]
+    assert "stress_reactivity_per_hour" not in ctssm_params
+    assert "stress_recovery_per_hour" not in ctssm_params
+    assert ctssm_params["response_transition_count"] == 0
     repeated = service.maybe_calibrate(participant.id, through=DAY)
     assert repeated["status"] == "unchanged"
     effective, layers = layered_profile(

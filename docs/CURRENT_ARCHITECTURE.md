@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0028_workload_causal_provenance -->
+<!-- ALEMBIC_HEAD: 0029_ctssm_vnext_recovery_snapshot -->
 
 ## 运行边界
 
@@ -104,8 +104,10 @@ payload 始终来自同一次获胜写入。
 Semantic Schema v4 正式包含 `physical_demand`，并为每个事件保存 NASA-TLX 风格的
 `workload_feature_vector` 与规则初始化 `workload_prior`。Workload v1 是独立可解释派生量：
 事件预期、进行中与事后使用指数核，重叠事件按 `1-product(1-W)` 饱和合并；连续工作时长按
-三小时饱和并施加有界增量。轨迹同时保存 raw 与 adjusted workload，但阶段 3 不新增潜在状态、
-不把 workload 直接反馈进 CTSSM 主方程。
+三小时饱和并施加有界增量。Current M0 保持阶段 3 行为作为稳定对照；Workload-aware M0 与
+M1/M2/M3 候选把 W(t)、anticipation、aftermath、continuous load 和 recovery resource 接入
+CTSSM。首版 recovery resource 只承认可审计的 calendar gap、protected break、sleep window 与
+用户报告。候选在 rolling-origin 比较与 promotion gate 通过前不会替换生产 Current M0。
 
 ## CTSSM 时间语义
 
@@ -189,7 +191,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0028_workload_causal_provenance`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0029_ctssm_vnext_recovery_snapshot`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -222,8 +224,9 @@ Match Source，不伪造历史 membership；当前 evaluator 仍按原 v2 manife
 participant-specific 查询仅在不可变条目能证明参与者出现时允许。0026 后新快照使用 Dataset
 Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
-新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变。
-评估模式明确区分 `historical_online` 与尚未执行候选模型的 `offline_replay`。Instant Check-in
+Stage 2 新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变；Stage 4
+新增运行记录 `stage4-evaluation.v1`。评估模式明确区分 `historical_online` 与执行候选模型族
+Rolling-Origin 比较的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
 不推断 `missing_ema`；participant-day 分母从
@@ -244,6 +247,15 @@ Admin Workload 的当前曲线明确为
 `latest_descriptive`；EMA 与 0/5/10/15/30/60 分钟 lag 则固定使用 observation 因果时点的同一 Forecast，
 并显示 workload bin 误差和按 event type、
 course、participant 分层的 appraisal residual。
+
+0029 扩展 Dataset Snapshot item contract，冻结 BRS psychometric、Daily Review recovery 和
+Slow State recovery/sleep 证据。Stage 4 offline replay 对 Current M0、Workload-aware M0、M1、
+M2、M3 使用同一不可变快照与 expanding rolling-origin split，统一输出 MAE、RMSE、Median AE、
+峰值幅度/时序误差、90% coverage、interval width、high-stress precision/recall 与 PR-AUC。
+晋级门槛要求 MAE 相对改善至少 3%，且 coverage、peak timing、high-stress recall 均不退化；
+结果保留样本量和 participant-level effect。BRS 只进入 recovery coefficient 的 slow trait prior，
+纵向 EMA episode 继续估计 workload reactivity、recovery coefficient、上升/恢复响应速率 κ 与
+observed recovery efficiency。Admin 提供模型族比较表及参与者当前模型、候选模型和验证结果。
 
 ## 自动漂移保护
 

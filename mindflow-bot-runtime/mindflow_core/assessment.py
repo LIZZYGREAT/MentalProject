@@ -135,6 +135,8 @@ class PredictionResult:
 
 
 class AssessmentModel:
+    # Current M0 remains the production comparator until the Stage-4 gate
+    # passes. Candidate family versions are recorded by offline evaluation.
     MODEL_VERSION = "mindflow-ctssm-runtime-v7"
 
     def __init__(self, timezone_name: str):
@@ -245,6 +247,10 @@ class AssessmentModel:
                     "target_time": target_time,
                     "stress": (item.get("payload") or {}).get("stress_0_10"),
                     "vitality": (item.get("payload") or {}).get("energy_0_10"),
+                    "recovery": (item.get("payload") or {}).get(
+                        "recovery_0_10",
+                        (item.get("payload") or {}).get("recovery_quality_0_10"),
+                    ),
                 }
             )
         result = user.solver.simulate_day(
@@ -315,6 +321,44 @@ class AssessmentModel:
                 "post_event_input": round(
                     max(0.0, min(1.0, float(point.get("post_event_input") or 0.0))),
                     4,
+                ),
+                **(
+                    {
+                        "recovery_resource": round(
+                            max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    float(point.get("recovery_input") or 0.0),
+                                ),
+                            ),
+                            4,
+                        ),
+                        "recovery_components": {
+                            str(key): round(
+                                max(0.0, min(1.0, float(value or 0.0))), 4
+                            )
+                            for key, value in dict(
+                                point.get("recovery_components") or {}
+                            ).items()
+                        },
+                        "perseverative_cognition": round(
+                            max(
+                                0.0,
+                                min(1.0, float(point.get("P") or 0.0)),
+                            ),
+                            4,
+                        ),
+                        "recovery_debt": round(
+                            max(
+                                0.0,
+                                min(1.0, float(point.get("F") or 0.0)),
+                            ),
+                            4,
+                        ),
+                    }
+                    if model_info["workload_aware"]
+                    else {}
                 ),
                 "observation_assimilated": bool(point.get("observation_assimilated")),
                 "confidence_0_1": round(

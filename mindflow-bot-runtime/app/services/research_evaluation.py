@@ -32,18 +32,32 @@ from app.models import (
     ModelEvaluationRun,
     Participant,
     ParticipantSlowState,
+    PsychometricAssessment,
     StateObservation,
     WarningSchedule,
 )
 from app.repositories import ForecastSnapshotRepository
+from app.services.model_comparison import (
+    MODEL_FAMILIES,
+    MODEL_VARIANT_BY_FAMILY,
+    ROLLING_ORIGIN_VERSION,
+    comparison_metrics,
+    estimate_reactivity_and_recovery,
+    estimate_response_rates,
+    observed_recovery_efficiency,
+    promotion_gate,
+    rolling_origin_splits,
+    trait_resilience_prior,
+)
 from services.workload import WorkloadEstimator
 
 
 DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
 DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
-DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V3
+DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
+DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V4
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v1"
-EVALUATION_CODE_VERSION = "stage2-evaluation.v3"
+EVALUATION_CODE_VERSION = "stage4-evaluation.v1"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
 
@@ -960,6 +974,45 @@ class ResearchEvaluationService:
                     StateObservation.id,
                 )
             ).scalars().all()
+            psychometrics = session.execute(
+                select(PsychometricAssessment)
+                .where(
+                    PsychometricAssessment.participant_id.in_(participant_ids),
+                    PsychometricAssessment.administered_at < upper,
+                    PsychometricAssessment.created_at <= observation_cutoff,
+                )
+                .order_by(
+                    PsychometricAssessment.participant_id,
+                    PsychometricAssessment.administered_at,
+                )
+            ).scalars().all()
+            daily_reviews = session.execute(
+                select(DailyReviewResponse)
+                .where(
+                    DailyReviewResponse.participant_id.in_(participant_ids),
+                    DailyReviewResponse.local_date >= date_start,
+                    DailyReviewResponse.local_date <= date_end,
+                    DailyReviewResponse.submitted_at <= observation_cutoff,
+                )
+                .order_by(
+                    DailyReviewResponse.participant_id,
+                    DailyReviewResponse.local_date,
+                    DailyReviewResponse.submitted_at,
+                )
+            ).scalars().all()
+            slow_states = session.execute(
+                select(ParticipantSlowState)
+                .where(
+                    ParticipantSlowState.participant_id.in_(participant_ids),
+                    ParticipantSlowState.effective_at >= lower,
+                    ParticipantSlowState.effective_at < upper,
+                    ParticipantSlowState.created_at <= observation_cutoff,
+                )
+                .order_by(
+                    ParticipantSlowState.participant_id,
+                    ParticipantSlowState.effective_at,
+                )
+            ).scalars().all()
         item_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         def freeze(item: dict[str, Any]) -> None:
@@ -983,6 +1036,70 @@ class ResearchEvaluationService:
                     participant.id,
                     date_start,
                     membership_metadata,
+                )
+            )
+
+        for assessment in psychometrics:
+            administered = _aware(assessment.administered_at)
+            freeze(
+                self._item(
+                    "psychometric",
+                    str(assessment.id),
+                    f"{assessment.instrument_name}.{assessment.instrument_version}",
+                    assessment.participant_id,
+                    administered.astimezone(self.timezone).date(),
+                    {
+                        "assessment_id": str(assessment.id),
+                        "instrument_name": assessment.instrument_name,
+                        "instrument_version": assessment.instrument_version,
+                        "language": assessment.language,
+                        "scores": dict(assessment.scores_json or {}),
+                        "administered_at": administered.isoformat(),
+                        "created_at": _aware(assessment.created_at).isoformat(),
+                    },
+                )
+            )
+
+        for review in daily_reviews:
+            freeze(
+                self._item(
+                    "daily_review",
+                    str(review.id),
+                    "daily-review-recovery.v1",
+                    review.participant_id,
+                    review.local_date,
+                    {
+                        "daily_review_id": str(review.id),
+                        "local_date": review.local_date.isoformat(),
+                        "start_stress": review.start_stress,
+                        "end_stress": review.end_stress,
+                        "start_energy": review.start_energy,
+                        "end_energy": review.end_energy,
+                        "recovery_note": review.recovery_note,
+                        "submitted_at": _aware(review.submitted_at).isoformat(),
+                    },
+                )
+            )
+
+        for slow_state in slow_states:
+            effective = _aware(slow_state.effective_at)
+            freeze(
+                self._item(
+                    "slow_state",
+                    str(slow_state.id),
+                    "slow-state-recovery.v1",
+                    slow_state.participant_id,
+                    effective.astimezone(self.timezone).date(),
+                    {
+                        "slow_state_id": str(slow_state.id),
+                        "effective_at": effective.isoformat(),
+                        "recent_recovery_quality": slow_state.recent_recovery_quality,
+                        "recent_sleep_debt": slow_state.recent_sleep_debt,
+                        "rolling_7d_stress": slow_state.rolling_7d_stress,
+                        "rolling_7d_workload": slow_state.rolling_7d_workload,
+                        "source": slow_state.source,
+                        "created_at": _aware(slow_state.created_at).isoformat(),
+                    },
                 )
             )
 
@@ -1120,6 +1237,9 @@ class ResearchEvaluationService:
             "observation_count": type_count("observation"),
             "forecast_count": type_count("forecast"),
             "calendar_count": type_count("calendar"),
+            "psychometric_count": type_count("psychometric"),
+            "daily_review_count": type_count("daily_review"),
+            "slow_state_count": type_count("slow_state"),
             "item_count": len(items),
             "manifest_hash": manifest_hash,
         }
@@ -1249,7 +1369,11 @@ class ResearchEvaluationService:
             raise ValueError("dataset snapshot has no immutable items")
         manifest = snapshot_view["manifest"]
         schema_version = snapshot_view["schema_version"]
-        if schema_version not in {DATASET_SCHEMA_V2, DATASET_SCHEMA_V3}:
+        if schema_version not in {
+            DATASET_SCHEMA_V2,
+            DATASET_SCHEMA_V3,
+            DATASET_SCHEMA_V4,
+        }:
             raise ValueError("unsupported dataset schema version")
         if manifest.get("schema_version") != schema_version:
             raise ValueError("dataset snapshot schema/manifest mismatch")
@@ -1268,13 +1392,30 @@ class ResearchEvaluationService:
         participant_item_count = sum(
             item["item_type"] == "participant" for item in items
         )
-        if schema_version == DATASET_SCHEMA_V3:
+        if schema_version in {DATASET_SCHEMA_V3, DATASET_SCHEMA_V4}:
             expected_counts["participant_count"] = participant_item_count
+        if schema_version == DATASET_SCHEMA_V4:
+            expected_counts.update(
+                {
+                    "psychometric_count": sum(
+                        item["item_type"] == "psychometric" for item in items
+                    ),
+                    "daily_review_count": sum(
+                        item["item_type"] == "daily_review" for item in items
+                    ),
+                    "slow_state_count": sum(
+                        item["item_type"] == "slow_state" for item in items
+                    ),
+                }
+            )
         elif participant_item_count:
             raise ValueError("legacy v2 dataset contains v3 participant membership")
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
-        if schema_version == DATASET_SCHEMA_V3 and participant_item_count <= 0:
+        if (
+            schema_version in {DATASET_SCHEMA_V3, DATASET_SCHEMA_V4}
+            and participant_item_count <= 0
+        ):
             raise ValueError("dataset snapshot has no frozen participant membership")
         contract = {
             "schema_version": snapshot_view["schema_version"],
@@ -1287,7 +1428,7 @@ class ResearchEvaluationService:
         manifest_hash = self._manifest_hash(contract, items)
         if manifest_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")
-        if schema_version == DATASET_SCHEMA_V3:
+        if schema_version in {DATASET_SCHEMA_V3, DATASET_SCHEMA_V4}:
             participant_ids = {
                 item["participant_id"]
                 for item in items
@@ -1331,12 +1472,14 @@ class ResearchEvaluationService:
             "source_set": source_set,
         }
         if evaluation_mode == "offline_replay":
-            metrics_json = {
-                "config": config,
-                "status": "not_implemented",
-                "reason": "offline model replay is outside the Stage 2 runtime",
-            }
-            status = "not_implemented"
+            requested_family = self._model_family(model_version)
+            metrics_json = self._offline_model_comparison(
+                items,
+                participant_id=participant_id,
+                requested_family=requested_family,
+                config=config,
+            )
+            status = "completed"
         else:
             matches = [
                 dict(item["metadata"])
@@ -1366,6 +1509,508 @@ class ResearchEvaluationService:
             return self._run_view(row)
 
     @staticmethod
+    def _model_family(value: str) -> str:
+        normalized = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "current": "current_m0",
+            "m0": "current_m0",
+            "stress_ctssm.m0": "current_m0",
+            "wm0": "workload_aware_m0",
+            "workload_m0": "workload_aware_m0",
+            "workload_aware_stress_ctssm.m0": "workload_aware_m0",
+            "all": "all",
+            "ctssm_family_comparison": "all",
+        }
+        family = aliases.get(normalized, normalized)
+        if family not in set(MODEL_FAMILIES) | {"all"}:
+            # Stage-2 clients used arbitrary candidate version labels.  Stage
+            # 4 interprets those as a request for the full frozen comparison
+            # while retaining the caller's label in evaluation provenance.
+            return "all"
+        return family
+
+    def _offline_model_comparison(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        participant_id: uuid.UUID | None,
+        requested_family: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        forecasts = {
+            item["source_id"]: item["metadata"]
+            for item in items
+            if item["item_type"] == "forecast"
+        }
+        observations = {
+            item["source_id"]: item["metadata"]
+            for item in items
+            if item["item_type"] == "observation"
+        }
+        calendars = {
+            item["source_id"]: item["metadata"]
+            for item in items
+            if item["item_type"] == "calendar"
+        }
+        slow_recovery: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+        for item in items:
+            if item["item_type"] != "slow_state":
+                continue
+            metadata = item["metadata"]
+            value = _score(metadata, "recent_recovery_quality")
+            try:
+                effective_at = _aware(
+                    datetime.fromisoformat(
+                        str(metadata.get("effective_at") or "").replace("Z", "+00:00")
+                    )
+                )
+                created_at = _aware(
+                    datetime.fromisoformat(
+                        str(metadata.get("created_at") or "").replace("Z", "+00:00")
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+            if value is not None:
+                slow_recovery[str(item["participant_id"])].append(
+                    (max(effective_at, created_at), value / 10.0)
+                )
+        brs_by_participant: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+        for item in items:
+            if item["item_type"] != "psychometric":
+                continue
+            metadata = item["metadata"]
+            if str(metadata.get("instrument_name") or "").upper() != "BRS":
+                continue
+            prior = trait_resilience_prior(metadata.get("scores"))
+            if prior is not None:
+                try:
+                    administered_at = _aware(
+                        datetime.fromisoformat(
+                            str(metadata.get("administered_at") or "").replace("Z", "+00:00")
+                        )
+                    )
+                    created_at = _aware(
+                        datetime.fromisoformat(
+                            str(metadata.get("created_at") or "").replace("Z", "+00:00")
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+                brs_by_participant[str(item["participant_id"])].append(
+                    (max(administered_at, created_at), prior)
+                )
+
+        samples = []
+        for item in items:
+            if item["item_type"] != "match_source":
+                continue
+            if participant_id is not None and item["participant_id"] != participant_id:
+                continue
+            match = dict(item["metadata"])
+            context = dict(match.get("context") or {})
+            forecast = forecasts.get(str(match.get("forecast_id")))
+            point = {}
+            if forecast is not None:
+                point_time = str(context.get("forecast_point_time") or "")[:5]
+                point = next(
+                    (
+                        value
+                        for value in forecast.get("curve") or []
+                        if str(value.get("time") or "")[:5] == point_time
+                    ),
+                    {},
+                )
+            workload = _score(point, "workload")
+            workload_observed = workload is not None
+            if workload is None:
+                raw_workload = _score(context, "workload_0_10")
+                workload_observed = raw_workload is not None
+                workload = raw_workload / 10.0 if raw_workload is not None else 0.0
+            recovery = _score(point, "recovery_resource") or 0.0
+            recovery_observed = _score(point, "recovery_resource") is not None
+            observation = observations.get(str(match.get("observation_id"))) or {}
+            payload = dict(observation.get("payload") or {})
+            reported_recovery = next(
+                (
+                    _score(payload, key)
+                    for key in ("recovery_0_10", "recovery_quality_0_10")
+                    if _score(payload, key) is not None
+                ),
+                None,
+            )
+            if reported_recovery is not None:
+                recovery = max(recovery, reported_recovery / 10.0)
+                recovery_observed = True
+            try:
+                observed_at = _aware(
+                    datetime.fromisoformat(
+                        str(match.get("observed_at") or "").replace("Z", "+00:00")
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+            eligible_slow_recovery = [
+                (available_at, value)
+                for available_at, value in slow_recovery.get(
+                    str(item["participant_id"]), []
+                )
+                if available_at <= observed_at
+            ]
+            slow_resource = (
+                max(eligible_slow_recovery, key=lambda value: value[0])[1]
+                if eligible_slow_recovery
+                else 0.0
+            )
+            calendar_resource = self._frozen_calendar_recovery(
+                calendars.get(str(match.get("forecast_id"))) or {},
+                str(match.get("observed_at") or ""),
+            )
+            recovery_observed = recovery_observed or slow_resource > 0.0 or calendar_resource > 0.0
+            recovery = max(
+                recovery,
+                slow_resource,
+                calendar_resource,
+            )
+            actual = _score(match, "actual_stress")
+            predicted = _score(match, "predicted_stress")
+            if actual is None or predicted is None:
+                continue
+            observed_vitality = next(
+                (
+                    _score(payload, key)
+                    for key in ("energy_0_10", "vitality_0_10")
+                    if _score(payload, key) is not None
+                ),
+                None,
+            )
+            anticipatory_input = _score(point, "anticipatory_input") or 0.0
+            post_event_input = _score(point, "post_event_input") or 0.0
+            continuous_load = _score(point, "continuous_load_factor") or 0.0
+            samples.append(
+                {
+                    **match,
+                    "participant_id": str(item["participant_id"]),
+                    "local_date": item["local_date"].isoformat(),
+                    "workload": max(0.0, min(1.0, workload)),
+                    "recovery": max(0.0, min(1.0, recovery)),
+                    "workload_observed": workload_observed,
+                    "recovery_observed": recovery_observed,
+                    "vitality": _score(point, "vitality_0_10"),
+                    "observed_vitality": observed_vitality,
+                    "vitality_observed": observed_vitality is not None,
+                    "anticipatory_input": anticipatory_input,
+                    "post_event_input": post_event_input,
+                    "continuous_load": continuous_load,
+                    "cognition_proxy": max(
+                        _score(point, "perseverative_cognition") or 0.0,
+                        anticipatory_input,
+                        post_event_input,
+                    ),
+                    "fatigue_proxy": max(
+                        _score(point, "recovery_debt") or 0.0,
+                        continuous_load,
+                    ),
+                }
+            )
+        samples.sort(key=lambda item: (item["local_date"], item["observed_at"]))
+        splits = rolling_origin_splits(samples, minimum_training_days=2)
+        if not splits and samples:
+            # A one-day snapshot remains auditable but cannot claim temporal
+            # model selection evidence.
+            return {
+                "config": config,
+                "status": "insufficient_rolling_origin_days",
+                "rolling_origin": {
+                    "version": ROLLING_ORIGIN_VERSION,
+                    "split_count": 0,
+                    "sample_count": len(samples),
+                },
+                "comparison": {},
+                "promotion": {},
+            }
+
+        prediction_sets: dict[str, list[dict[str, Any]]] = {
+            family: [] for family in MODEL_FAMILIES
+        }
+        parameter_history = []
+        for split in splits:
+            training = [samples[index] for index in split["train_indices"]]
+            testing = [samples[index] for index in split["test_indices"]]
+            participant_training: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for sample in training:
+                participant_training[sample["participant_id"]].append(sample)
+            candidate_latent: dict[tuple[str, str], tuple[float, datetime]] = {}
+            for sample in testing:
+                sample_time = _aware(
+                    datetime.fromisoformat(
+                        str(sample["observed_at"]).replace("Z", "+00:00")
+                    )
+                )
+                eligible_priors = [
+                    (available_at, value)
+                    for available_at, value in brs_by_participant.get(
+                        sample["participant_id"], []
+                    )
+                    if available_at <= sample_time
+                ]
+                prior = (
+                    max(eligible_priors, key=lambda value: value[0])[1]
+                    if eligible_priors
+                    else None
+                )
+                fit_samples = participant_training.get(sample["participant_id"]) or training
+                fitted = estimate_reactivity_and_recovery(
+                    fit_samples,
+                    trait_resilience=prior,
+                )
+                response_rates = estimate_response_rates(fit_samples, fitted)
+                parameter_history.append(
+                    {
+                        "split_index": split["split_index"],
+                        "participant_id": sample["participant_id"],
+                        **fitted,
+                        **response_rates,
+                        **observed_recovery_efficiency(fit_samples),
+                    }
+                )
+                baseline = fitted["stress_baseline_0_10"]
+                beta_w = fitted["workload_reactivity_beta"]
+                beta_r = fitted["recovery_beta"]
+                base_prediction = (
+                    baseline
+                    + beta_w * sample["workload"]
+                    + 0.5 * sample["anticipatory_input"]
+                    + 0.8 * sample["post_event_input"]
+                    + 0.6 * sample["continuous_load"]
+                    - beta_r * sample["recovery"]
+                )
+                participant_history = participant_training.get(
+                    sample["participant_id"], []
+                )
+                observed_vitality_history = [
+                    row
+                    for row in participant_history
+                    if row.get("observed_vitality") is not None
+                ]
+                vitality = (
+                    max(
+                        observed_vitality_history,
+                        key=lambda row: str(row.get("observed_at") or ""),
+                    )["observed_vitality"]
+                    if observed_vitality_history
+                    else sample.get("vitality")
+                )
+                vitality_modifier = 1.0 + 0.45 * (
+                    1.0 - max(0.0, min(1.0, (vitality if vitality is not None else 7.2) / 10.0))
+                )
+                predicted_by_family = {
+                    "current_m0": sample["predicted_stress"],
+                    "workload_aware_m0": base_prediction,
+                    "m1": base_prediction + beta_w * (vitality_modifier - 1.0) * sample["workload"],
+                    "m2": base_prediction + beta_w * (vitality_modifier - 1.0) * sample["workload"] + 1.5 * sample["cognition_proxy"],
+                    "m3": base_prediction + beta_w * (vitality_modifier - 1.0) * sample["workload"] + 1.5 * sample["cognition_proxy"] + 1.7 * sample["fatigue_proxy"],
+                }
+                for family in MODEL_FAMILIES:
+                    if family == "current_m0":
+                        continue
+                    state_key = (sample["participant_id"], family)
+                    previous = candidate_latent.get(state_key)
+                    if previous is None and participant_history:
+                        latest = max(
+                            participant_history,
+                            key=lambda row: str(row.get("observed_at") or ""),
+                        )
+                        previous = (
+                            float(latest["actual_stress"]),
+                            _aware(
+                                datetime.fromisoformat(
+                                    str(latest["observed_at"]).replace("Z", "+00:00")
+                                )
+                            ),
+                        )
+                    if previous is None:
+                        previous = (baseline, sample_time - timedelta(hours=1))
+                    previous_stress, previous_time = previous
+                    equilibrium = float(predicted_by_family[family])
+                    rate_key = (
+                        "stress_reactivity_per_hour"
+                        if equilibrium >= previous_stress
+                        else "stress_recovery_per_hour"
+                    )
+                    rate = response_rates.get(rate_key)
+                    if rate is None:
+                        rate = 1.55 if rate_key == "stress_reactivity_per_hour" else 0.68
+                    elapsed_hours = max(
+                        1e-6,
+                        (sample_time - previous_time).total_seconds() / 3600.0,
+                    )
+                    dynamic_prediction = equilibrium + (
+                        previous_stress - equilibrium
+                    ) * math.exp(-float(rate) * elapsed_hours)
+                    predicted_by_family[family] = dynamic_prediction
+                    candidate_latent[state_key] = (dynamic_prediction, sample_time)
+                residual_sd = fitted.get("residual_sd") or 1.25
+                for family, prediction in predicted_by_family.items():
+                    prediction = max(0.0, min(10.0, float(prediction)))
+                    row = {
+                        **sample,
+                        "predicted_stress": prediction,
+                        "prediction_lower": max(0.0, prediction - 1.6448536269514722 * residual_sd),
+                        "prediction_upper": min(10.0, prediction + 1.6448536269514722 * residual_sd),
+                        "split_index": split["split_index"],
+                    }
+                    if family == "current_m0":
+                        row["prediction_lower"] = sample.get("prediction_lower")
+                        row["prediction_upper"] = sample.get("prediction_upper")
+                    prediction_sets[family].append(row)
+
+        comparison = {}
+        baseline_by_participant: dict[str, float] = {}
+        for participant in sorted({row["participant_id"] for row in samples}):
+            values = [row for row in prediction_sets["current_m0"] if row["participant_id"] == participant]
+            metric = comparison_metrics(values)
+            if metric["mae"] is not None:
+                baseline_by_participant[participant] = metric["mae"]
+        for family in MODEL_FAMILIES:
+            metrics = comparison_metrics(prediction_sets[family])
+            support_counts = {
+                "stress_ema": len(samples),
+                "workload": sum(bool(row.get("workload_observed")) for row in samples),
+                "recovery": sum(bool(row.get("recovery_observed")) for row in samples),
+                "vitality": sum(bool(row.get("vitality_observed")) for row in samples),
+                "perseverative_cognition": sum(float(row.get("post_event_input") or 0.0) > 0.0 for row in samples),
+                "recovery_debt": sum(float(row.get("fatigue_proxy") or 0.0) > 0.0 for row in samples),
+            }
+            support_counts["workload_levels"] = len(
+                {
+                    round(float(row["workload"]), 6)
+                    for row in samples
+                    if row.get("workload_observed")
+                }
+            )
+            support_counts["recovery_levels"] = len(
+                {
+                    round(float(row["recovery"]), 6)
+                    for row in samples
+                    if row.get("recovery_observed")
+                }
+            )
+            required = {
+                "current_m0": ("stress_ema",),
+                "workload_aware_m0": ("stress_ema", "workload", "recovery"),
+                "m1": ("stress_ema", "workload", "recovery", "vitality"),
+                "m2": ("stress_ema", "workload", "recovery", "vitality", "perseverative_cognition"),
+                "m3": ("stress_ema", "workload", "recovery", "vitality", "perseverative_cognition", "recovery_debt"),
+            }[family]
+            support_checks = {
+                name: support_counts[name] > 0 for name in required
+            }
+            if "workload" in required:
+                support_checks["workload_variation"] = support_counts["workload_levels"] >= 2
+            if "recovery" in required:
+                support_checks["recovery_variation"] = support_counts["recovery_levels"] >= 2
+            metrics["observable_support"] = {
+                "supported": all(support_checks.values()),
+                "required": list(required),
+                "counts": support_counts,
+                "checks": support_checks,
+            }
+            effects = []
+            for participant, baseline_mae in baseline_by_participant.items():
+                values = [row for row in prediction_sets[family] if row["participant_id"] == participant]
+                participant_metrics = comparison_metrics(values)
+                if participant_metrics["mae"] is not None:
+                    effects.append(
+                        {
+                            "participant_id": participant,
+                            "mae_delta_vs_current_m0": round(participant_metrics["mae"] - baseline_mae, 4),
+                            "sample_count": participant_metrics["sample_count"],
+                        }
+                    )
+            metrics["participant_effect"] = effects
+            metrics["model_variant"] = MODEL_VARIANT_BY_FAMILY[family]
+            comparison[family] = metrics
+        baseline_metrics = comparison["current_m0"]
+        promotion = {
+            family: promotion_gate(baseline_metrics, comparison[family])
+            for family in MODEL_FAMILIES
+            if family != "current_m0"
+        }
+        return {
+            "config": config,
+            "status": "completed",
+            "rolling_origin": {
+                "version": ROLLING_ORIGIN_VERSION,
+                "split_count": len(splits),
+                "splits": splits,
+            },
+            "comparison": comparison,
+            "promotion": promotion,
+            "requested_family": requested_family,
+            "metrics": (
+                comparison.get(requested_family)
+                if requested_family != "all"
+                else None
+            ),
+            "parameter_history": parameter_history,
+        }
+
+    @staticmethod
+    def _frozen_calendar_recovery(
+        calendar: Mapping[str, Any], observed_at: str
+    ) -> float:
+        """Derive only observable v1 calendar recovery resources."""
+
+        try:
+            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return 0.0
+        demanding: list[tuple[datetime, datetime]] = []
+        active_recovery = 0.0
+        for event in calendar.get("calendar_representation") or []:
+            try:
+                start = datetime.fromisoformat(
+                    str(event.get("start_time") or "").replace("Z", "+00:00")
+                )
+                end = datetime.fromisoformat(
+                    str(event.get("end_time") or "").replace("Z", "+00:00")
+                )
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=observed.tzinfo)
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=observed.tzinfo)
+                start = start.astimezone(timezone.utc)
+                end = end.astimezone(timezone.utc)
+                current = observed.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            event_type = str(event.get("event_type") or "").lower()
+            metadata = dict(event.get("metadata") or {})
+            name = str(event.get("summary") or event.get("name") or "").lower()
+            is_protected = bool(
+                metadata.get("protected_break")
+                or event_type in {"rest", "nap"}
+                or "protected break" in name
+                or "保护性休息" in name
+            )
+            if start <= current < end and is_protected:
+                active_recovery = max(active_recovery, 0.65)
+            if event_type == "sleep" and start <= current < end:
+                active_recovery = 1.0
+            if event_type not in {"rest", "nap", "sleep", "meal"}:
+                demanding.append((start, end))
+        if active_recovery > 0.0:
+            return active_recovery
+        current = observed.astimezone(timezone.utc)
+        previous = [end for _, end in demanding if end <= current]
+        following = [start for start, _ in demanding if start > current]
+        if not previous or not following:
+            return 0.0
+        gap_minutes = (min(following) - max(previous)).total_seconds() / 60.0
+        return 0.35 * min(1.0, max(0.0, gap_minutes) / 60.0) if gap_minutes >= 10 else 0.0
+
+    @staticmethod
     def _run_view(row: ModelEvaluationRun) -> dict[str, Any]:
         return {
             "id": str(row.id),
@@ -1389,6 +2034,87 @@ class ResearchEvaluationService:
                 .limit(limit)
             ).scalars().all()
             return [self._run_view(row) for row in rows]
+
+    def model_comparison_dashboard(
+        self, participant_id: uuid.UUID | None = None
+    ) -> dict[str, Any]:
+        conditions = [
+            ModelEvaluationRun.evaluation_mode == "offline_replay",
+            ModelEvaluationRun.status == "completed",
+        ]
+        if participant_id is not None:
+            conditions.append(
+                (ModelEvaluationRun.participant_id == participant_id)
+                | (ModelEvaluationRun.participant_id.is_(None))
+            )
+        with self.database.session() as session:
+            runs = session.execute(
+                select(ModelEvaluationRun)
+                .where(*conditions)
+                .order_by(desc(ModelEvaluationRun.created_at))
+                .limit(50)
+            ).scalars().all()
+            learned = (
+                session.execute(
+                    select(LearnedModelProfile)
+                    .where(LearnedModelProfile.participant_id == participant_id)
+                    .order_by(desc(LearnedModelProfile.version))
+                    .limit(1)
+                ).scalar_one_or_none()
+                if participant_id is not None
+                else None
+            )
+        latest = self._run_view(runs[0]) if runs else None
+        payload = dict((latest or {}).get("metrics") or {})
+        comparison = dict(payload.get("comparison") or {})
+        promotion = dict(payload.get("promotion") or {})
+        rows = []
+        for family in MODEL_FAMILIES:
+            metrics = dict(comparison.get(family) or {})
+            if not metrics:
+                continue
+            rows.append(
+                {
+                    "model_family": family,
+                    "mae": metrics.get("mae"),
+                    "rmse": metrics.get("rmse"),
+                    "coverage": metrics.get("interval_90_coverage"),
+                    "peak_error": metrics.get("peak_magnitude_error"),
+                    "peak_timing_error_minutes": metrics.get("peak_timing_error_minutes"),
+                    "sample_count": metrics.get("sample_count"),
+                    "high_stress_recall": metrics.get("high_stress_recall"),
+                    "promotion": promotion.get(family),
+                }
+            )
+        current_model = "current_m0"
+        if learned is not None:
+            parameters = dict(learned.parameters_json or {})
+            selection = dict(parameters.get("model_selection") or {})
+            current_model = str(
+                selection.get("active_variant")
+                or parameters.get("model_family")
+                or current_model
+            )
+        passed = [
+            row for row in rows if (row.get("promotion") or {}).get("passed")
+        ]
+        candidate = min(
+            passed or [row for row in rows if row["model_family"] != "current_m0"],
+            key=lambda row: float(row["mae"] if row["mae"] is not None else math.inf),
+            default=None,
+        )
+        return {
+            "current_model": current_model,
+            "candidate_model": (
+                candidate["model_family"] if candidate is not None else None
+            ),
+            "validation_result": (
+                candidate.get("promotion") if candidate is not None else None
+            ),
+            "rows": rows,
+            "latest_run": latest,
+            "run_count": len(runs),
+        }
 
     def cohort_dashboard(
         self, date_start: date, date_end: date
