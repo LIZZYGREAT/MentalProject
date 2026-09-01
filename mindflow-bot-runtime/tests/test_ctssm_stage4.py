@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -45,6 +46,7 @@ from app.services.stage4_candidate_replay import (
     Stage4CandidateReplayService,
     Stage4DeploymentRefitService,
     aggregate_evaluation_parameter_gate_evidence,
+    aggregate_evaluation_observable_support,
     fit_current_m0_parameters_v2,
 )
 from entity.user import User
@@ -389,9 +391,123 @@ def test_current_m0_restricted_fit_uses_real_simulator_and_calendar(monkeypatch)
     assert fitted["sample_count"] == 3
     assert fitted["training_window_end"] == "2030-01-03"
     assert calls > 0
+    assert fitted["m0_fit_training_sample_count"] == 3
+    assert fitted["m0_fit_simulator_call_count"] == calls
+    assert 1 <= fitted["m0_fit_evaluated_parameter_count"] <= 92
+    assert calls == fitted["m0_fit_evaluated_parameter_count"] * 3
     assert fitted["stress_baseline_0_10"] != pytest.approx(
         training_actual_mean
     )
+
+
+def test_m0_fit_research_scale_has_bounded_calls_and_cached_preprocessing(
+    monkeypatch,
+):
+    class CountingModel:
+        def __init__(self):
+            self.calls = 0
+
+        def predict_baseline_m0(self, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                trajectory=[
+                    {
+                        "time": "10:00",
+                        "stress_0_10": kwargs["baseline_params"][
+                            "S_star_init"
+                        ]
+                        / 10.0,
+                    }
+                ]
+            )
+
+    preprocessing = {"calendar": 0, "initial": 0, "known": 0}
+    real_calendar = Stage4CandidateReplayService._calendar_events
+    real_initial = Stage4CandidateReplayService._frozen_initial_state
+    real_known = Stage4CandidateReplayService._known_observations
+
+    def counted_calendar(value):
+        preprocessing["calendar"] += 1
+        return real_calendar(value)
+
+    def counted_initial(value):
+        preprocessing["initial"] += 1
+        return real_initial(value)
+
+    def counted_known(history, target):
+        preprocessing["known"] += 1
+        return real_known(history, target)
+
+    monkeypatch.setattr(
+        Stage4CandidateReplayService,
+        "_calendar_events",
+        staticmethod(counted_calendar),
+    )
+    monkeypatch.setattr(
+        Stage4CandidateReplayService,
+        "_frozen_initial_state",
+        staticmethod(counted_initial),
+    )
+    monkeypatch.setattr(
+        Stage4CandidateReplayService,
+        "_known_observations",
+        staticmethod(counted_known),
+    )
+
+    model = CountingModel()
+    total_samples = 0
+    for participant_index in range(20):
+        participant_id = f"benchmark-{participant_index}"
+        samples = []
+        calendars = {}
+        for day in range(1, 15):
+            local_day = f"2030-02-{day:02d}"
+            forecast_id = f"{participant_id}-{day}"
+            calendars[forecast_id] = {"calendar_representation": []}
+            for hour in (9, 10):
+                samples.append(
+                    {
+                        "participant_id": participant_id,
+                        "local_date": local_day,
+                        "observed_at": f"{local_day}T{hour:02d}:00:00+08:00",
+                        "observation_created_at": (
+                            f"{local_day}T{hour:02d}:01:00+08:00"
+                        ),
+                        "forecast_id": forecast_id,
+                        "actual_stress": 4.0,
+                        "initial_state": {
+                            "stress_0_10": 4.0,
+                            "vitality_0_10": 7.0,
+                        },
+                        "initial_state_revision": f"initial-{day}",
+                        "context": {"forecast_point_time": "10:00"},
+                    }
+                )
+        result = fit_current_m0_parameters_v2(
+            samples,
+            {
+                "calendars": calendars,
+                "observation_history": {participant_id: []},
+            },
+            datetime(2030, 2, 15, tzinfo=timezone.utc),
+            model,
+        )
+        total_samples += len(samples)
+        assert result["m0_fit_training_sample_count"] == 28
+        assert result["m0_fit_evaluated_parameter_count"] <= 92
+        assert result["m0_fit_simulator_call_count"] == (
+            result["m0_fit_evaluated_parameter_count"] * 28
+        )
+        assert result["m0_fit_preprocessed_calendar_count"] == 14
+        assert result["m0_fit_preprocessed_initial_state_count"] == 14
+        assert result["m0_fit_preprocessed_known_observation_count"] == 28
+
+    assert model.calls <= 20 * 92 * 28
+    assert preprocessing == {
+        "calendar": total_samples // 2,
+        "initial": total_samples // 2,
+        "known": total_samples,
+    }
 
 
 def test_historical_calibration_uses_only_brs_known_by_through_date():
@@ -759,6 +875,131 @@ def test_promotion_gate_identifiability_uses_final_training_not_deployment():
     assert gate["passed"] is True
 
 
+def test_observable_support_gate_uses_final_training_not_test_labels():
+    service = Stage4CandidateReplayService("Asia/Shanghai")
+
+    def row(day, hour, stress, workload, recovery):
+        return {
+            "participant_id": "support-person",
+            "local_date": day,
+            "observed_at": f"{day}T{hour:02d}:00:00+08:00",
+            "actual_stress": stress,
+            "workload": workload,
+            "workload_observed": True,
+            "recovery": recovery,
+            "recovery_observed": True,
+            "observed_vitality": 6.0,
+            "post_event_input": 0.5,
+            "continuous_load": workload,
+        }
+
+    good_training = [
+        row("2030-01-01", 9, 5.0, 0.2, 0.1),
+        row("2030-01-01", 10, 5.1, 0.8, 0.2),
+        row("2030-01-01", 11, 5.0, 0.4, 0.3),
+        row("2030-01-02", 9, 5.0, 0.7, 0.4),
+    ]
+    test_high = [
+        row("2030-01-04", 9, 5.0, 0.2, 0.2),
+        row("2030-01-04", 10, 5.0, 0.8, 0.3),
+        row("2030-01-04", 11, 5.0, 0.4, 0.4),
+    ]
+    test_changed = [
+        row("2030-01-04", 9, 8.0, 0.2, 0.2),
+        row("2030-01-04", 10, 0.0, 0.8, 0.3),
+        row("2030-01-04", 11, 0.0, 0.4, 0.4),
+    ]
+
+    support = service._support(good_training, "m2")
+    evidence = {
+        "support-person": {
+            "m2": {
+                "participant_id": "support-person",
+                "family": "m2",
+                "split_index": 1,
+                "training_window_start": "2030-01-01",
+                "training_window_end": "2030-01-02",
+                "counts": support["counts"],
+                "checks": support["checks"],
+                "supported": support["supported"],
+                "support_version": support["version"],
+            }
+        }
+    }
+    aggregate = aggregate_evaluation_observable_support(evidence, "m2")
+    baseline = {
+        "mae": 1.0,
+        "interval_90_coverage": 0.8,
+        "peak_timing_error_minutes": 10.0,
+        "high_stress_recall": 0.7,
+    }
+    candidate = {
+        **baseline,
+        "mae": 0.9,
+        "peak_timing_error_minutes": 9.0,
+        "observable_support": aggregate,
+    }
+    gate_before = promotion_gate(
+        baseline,
+        candidate,
+        parameter_evidence={"identifiability_status": "identified"},
+    )
+    descriptive_high = service._support(good_training + test_high, "m2")
+    descriptive_changed = service._support(
+        good_training + test_changed,
+        "m2",
+    )
+    gate_after = promotion_gate(
+        baseline,
+        candidate,
+        parameter_evidence={"identifiability_status": "identified"},
+    )
+
+    assert aggregate["supported"] is True
+    assert gate_before == gate_after
+    assert gate_before["checks"]["observable_support"] is True
+    assert gate_before["passed"] is True
+    assert descriptive_high["counts"][
+        "stress_persistence_transition_count"
+    ] != descriptive_changed["counts"]["stress_persistence_transition_count"]
+
+    insufficient_training = good_training[:2]
+    insufficient_support = service._support(insufficient_training, "m2")
+    insufficient_evidence = {
+        "support-person": {
+            "m2": {
+                "participant_id": "support-person",
+                "family": "m2",
+                "split_index": 0,
+                "training_window_start": "2030-01-01",
+                "training_window_end": "2030-01-01",
+                "counts": insufficient_support["counts"],
+                "checks": insufficient_support["checks"],
+                "supported": insufficient_support["supported"],
+                "support_version": insufficient_support["version"],
+            }
+        }
+    }
+    insufficient_aggregate = aggregate_evaluation_observable_support(
+        insufficient_evidence,
+        "m2",
+    )
+    full_descriptive = service._support(
+        insufficient_training + test_high,
+        "m2",
+    )
+    rejected = promotion_gate(
+        baseline,
+        {**candidate, "observable_support": insufficient_aggregate},
+        parameter_evidence={"identifiability_status": "identified"},
+    )
+
+    assert full_descriptive["supported"] is True
+    assert insufficient_aggregate["supported"] is False
+    assert rejected["checks"]["observable_support"] is False
+    assert rejected["passed"] is False
+
+
 def test_dataset_v4_freezes_brs_and_slow_recovery_evidence():
     database = memory_database()
     person = participant(database, "STAGE4-SNAPSHOT")
@@ -947,7 +1188,7 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert all(
         result["comparison"][family]["replay_engine"]
-        == "stage4-real-ctssm-replay.v5"
+        == "stage4-real-ctssm-replay.v6"
         for family in ("workload_aware_m0", "m1", "m2", "m3")
     )
     participant_key = str(person_id)
@@ -978,6 +1219,20 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     assert result["evaluation_parameter_gate_aggregate"]["source"] == (
         "final_rolling_training_fit"
     )
+    support_evidence = result["evaluation_observable_support_evidence"][
+        participant_key
+    ]["m2"]
+    assert support_evidence["split_index"] == 1
+    assert support_evidence["training_window_end"] == "2030-01-03"
+    assert support_evidence["support_version"] == (
+        "ctssm-observable-support.v2"
+    )
+    assert result["evaluation_observable_support_aggregate"]["m2"] == (
+        result["comparison"]["m2"]["observable_support"]
+    )
+    assert result["comparison"]["m2"][
+        "descriptive_observable_support"
+    ]["descriptive_only"] is True
     assert result["deployment_parameters"] == {}
     assert result["deployment_uncertainty"] == {}
     assert result["deployment_evidence"] == {}

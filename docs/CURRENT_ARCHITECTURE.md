@@ -225,7 +225,7 @@ participant-specific 查询仅在不可变条目能证明参与者出现时允�
 Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
 Stage 2 新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变；Stage 4
-新增运行记录 `stage4-evaluation.v6`。评估模式明确区分 `historical_online` 与执行候选模型族
+新增运行记录 `stage4-evaluation.v7`。评估模式明确区分 `historical_online` 与执行候选模型族
 Rolling-Origin 比较的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
@@ -257,7 +257,7 @@ M2、M3 使用同一不可变快照与 expanding rolling-origin split，统一�
 纵向 EMA episode 继续估计 workload reactivity、recovery coefficient、上升/恢复响应速率 κ 与
 observed recovery efficiency。Admin 提供模型族比较表及参与者当前模型、候选模型和验证结果。
 
-Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v5` 直接调用真实
+Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v6` 直接调用真实
 `AssessmentModel.predict_candidate → Simulator → step_latent_state`；目标时点 EMA 及未来 EMA
 不会提前 assimilate，候选区间来自 `LatentUncertainty/prediction_interval`，峰值指标使用完整 288 点
 trajectory。0030 新增 `model_promotion_decisions`：非 M0 只有在 completed offline replay、有效
@@ -295,6 +295,11 @@ training-only SSE 搜索；它不是压力均值，也不会增加新的 M0 参�
 identifiability 纳入正式 blocking check；`weak` 可通过但产生 warning，`not_identified` 必须失败，
 boundary clipping 在 v2 中作为非阻断 warning 展示给 Admin。
 
+M0 Simulator fit 在进入 objective 前只解析一次 Calendar、frozen initial state 与 causal known
+observations，并缓存相同 `S_star_init` 的 loss；每次 fit 冻结
+`m0_fit_evaluated_parameter_count`、`m0_fit_simulator_call_count` 与
+`m0_fit_training_sample_count`，用于确认粗/细搜索的调用上界，但不以近似公式替代真实 Simulator。
+
 Rolling-Origin 的最后一次/最大 training-window fit 另外冻结为
 `evaluation_parameter_gate_evidence`，正式 Gate 的 identifiability 只从该证据聚合，不能读取最终
 test label 或 `deployment_*`。仅当至少一个候选 Gate PASS 后，`stage4-deployment-refit.v1` 才在
@@ -305,6 +310,13 @@ deployment 字段；LearnedModelProfile 的 window、sample/day count 与 uncert
 model-selection provenance 同时保存 snapshot、knowledge cutoff 和 refit version。
 若所有 Gate 均失败，三个 deployment 字段保持空对象；若 evaluation Gate PASS 但 full-data refit
 变为 `not_identified`，晋级执行以 `deployment_refit_not_identifiable` fail closed，原 OOS Gate 结果不变。
+
+Observable Support 与 identifiability 使用同一 training-only 边界。每个 split 在已应用 state-time、
+knowledge-time 与 Slow State cutoff 的 participant `fit_samples` 上，按 family 冻结最终最大 training
+window 的 `evaluation_observable_support_evidence`；cohort 只有所有 participating participant 均满足
+mandatory support 才得到 supported。`comparison[family].observable_support` 只引用该 aggregate 并进入
+Gate。完整 Dataset 的支持只保存在 `descriptive_observable_support`，显式标记
+`descriptive_only=true`，不得参与晋级。
 
 Participant promotion 在同一个数据库事务中写入 `ModelPromotionDecision` 与
 `LearnedModelProfile`，任一写入失败会同时回滚。`historical_online` 支持完整

@@ -226,9 +226,12 @@ Forecast 冻结因果来源，workload revision 参与 Forecast cache identity�
 v8 WM0/M1/M2/M3 的 model spec、promotion decision 与 parameters hash。Current M0 与候选族均由真实
 Simulator 回放；historical production 仅单独报告。Ridge coefficient uncertainty 使用 posterior
 covariance 并执行 identifiability gate；participant promotion decision/profile 在同一事务提交，历史评估
-可按 promotion decision 或 parameters hash 精确筛选。Replay v5 进一步以
+可按 promotion decision 或 parameters hash 精确筛选。Replay v6 进一步以
 `m0-simulator-fit.v2` 在真实 M0 Simulator 上对 `S_star_init` 做 training-only SSE 搜索，并与候选族
 `workload-recovery-ridge.v2` 分离；promotion gate v2 公开 identifiability、boundary 和 warnings。
+M0 fit 缓存 parameter-independent frozen context 与重复 objective，并审计 evaluated parameter、Simulator
+call 和 training sample 数。Observable Support 也只从 final rolling-training `fit_samples` 聚合后进入
+Gate；完整 Dataset support 仅作为 `descriptive_only` 研究输出。
 Gate 只读取 final rolling-training 的 `evaluation_parameter_gate_evidence`，至少一个候选 PASS 后才生成
 同一冻结 Dataset v4 全窗口的 `stage4-deployment-refit.v1` 参数、协方差与真实 refit window；deployment
 不可辨识时独立 fail closed，不修改 OOS Gate。评估来源

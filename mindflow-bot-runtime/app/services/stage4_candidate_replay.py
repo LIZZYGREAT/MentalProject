@@ -24,7 +24,7 @@ from mindflow_core.assessment import AssessmentModel
 
 
 OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
-REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v5"
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v6"
 CANDIDATE_LATENT_INITIALIZATION_VERSION = "candidate-latent-initialization.v1"
 DEPLOYMENT_REFIT_VERSION = "stage4-deployment-refit.v1"
 M0_SIMULATOR_FIT_VERSION = "m0-simulator-fit.v2"
@@ -112,6 +112,11 @@ def fit_current_m0_parameters_v2(
     """Fit S_star_init with bounded SSE searches through the real M0 simulator."""
 
     prepared = []
+    calendar_cache: dict[str, list[dict[str, Any]]] = {}
+    initial_state_cache: dict[tuple[str, str, str], dict[str, float]] = {}
+    known_observation_cache: dict[
+        tuple[str, str], list[dict[str, Any]]
+    ] = {}
     for sample in training_samples:
         try:
             target = _aware(sample["observed_at"])
@@ -122,9 +127,31 @@ def fit_current_m0_parameters_v2(
         if actual is None or target >= origin_cutoff or created >= origin_cutoff:
             continue
         participant = str(sample.get("participant_id") or "")
-        calendar = frozen_context.get("calendars", {}).get(
-            sample.get("forecast_id")
-        ) or {}
+        forecast_id = str(sample.get("forecast_id") or "")
+        if forecast_id not in calendar_cache:
+            calendar = frozen_context.get("calendars", {}).get(forecast_id) or {}
+            calendar_cache[forecast_id] = (
+                Stage4CandidateReplayService._calendar_events(calendar)
+            )
+        initial_key = (
+            participant,
+            str(sample.get("local_date") or ""),
+            str(sample.get("initial_state_revision") or sample.get("initial_state")),
+        )
+        if initial_key not in initial_state_cache:
+            initial_state_cache[initial_key] = (
+                Stage4CandidateReplayService._frozen_initial_state(sample)
+            )
+        known_key = (participant, target.isoformat())
+        if known_key not in known_observation_cache:
+            known_observation_cache[known_key] = (
+                Stage4CandidateReplayService._known_observations(
+                    frozen_context.get("observation_history", {}).get(
+                        participant, []
+                    ),
+                    target,
+                )
+            )
         point_time = str(
             (sample.get("context") or {}).get("forecast_point_time") or ""
         )[:5]
@@ -134,31 +161,25 @@ def fit_current_m0_parameters_v2(
             {
                 "actual": actual,
                 "point_time": point_time,
-                "observations": Stage4CandidateReplayService._known_observations(
-                    frozen_context.get("observation_history", {}).get(
-                        participant, []
-                    ),
-                    target,
-                ),
-                "calendar_events": Stage4CandidateReplayService._calendar_events(
-                    calendar
-                ),
+                "observations": known_observation_cache[known_key],
+                "calendar_events": calendar_cache[forecast_id],
                 "local_date": str(sample["local_date"]),
-                "initial_state": Stage4CandidateReplayService._frozen_initial_state(
-                    sample
-                ),
+                "initial_state": initial_state_cache[initial_key],
                 "sleep_debt_hours": float(sample.get("sleep_debt") or 0.0),
             }
         )
 
     loss_cache: dict[float, tuple[float, int]] = {}
+    simulator_call_count = 0
 
     def objective(s_star_init: float) -> tuple[float, int]:
+        nonlocal simulator_call_count
         key = round(max(0.0, min(100.0, s_star_init)), 1)
         if key in loss_cache:
             return loss_cache[key]
         squared_errors = []
         for context in prepared:
+            simulator_call_count += 1
             result = assessment_model.predict_baseline_m0(
                 baseline_params={"S_star_init": key},
                 observations=context["observations"],
@@ -212,6 +233,14 @@ def fit_current_m0_parameters_v2(
         "fit_method": "simulator-restricted-sse",
         "parameter_fit_version": M0_SIMULATOR_FIT_VERSION,
         "origin_cutoff": origin_cutoff.isoformat(),
+        "m0_fit_evaluated_parameter_count": len(loss_cache),
+        "m0_fit_simulator_call_count": simulator_call_count,
+        "m0_fit_training_sample_count": len(prepared),
+        "m0_fit_preprocessed_calendar_count": len(calendar_cache),
+        "m0_fit_preprocessed_initial_state_count": len(initial_state_cache),
+        "m0_fit_preprocessed_known_observation_count": len(
+            known_observation_cache
+        ),
         "search": {
             "bounds": [0.0, 100.0],
             "coarse_step": 2.0,
@@ -246,6 +275,66 @@ def aggregate_evaluation_parameter_gate_evidence(
     }
 
 
+def aggregate_evaluation_observable_support(
+    evidence_by_participant: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    family: str,
+) -> dict[str, Any]:
+    """Aggregate participant support fitted only on final training windows."""
+
+    participant_rows = [
+        dict(family_evidence[family])
+        for family_evidence in evidence_by_participant.values()
+        if family in family_evidence
+    ]
+    check_names = sorted(
+        {
+            str(name)
+            for row in participant_rows
+            for name in (row.get("checks") or {})
+        }
+    )
+    count_names = sorted(
+        {
+            str(name)
+            for row in participant_rows
+            for name in (row.get("counts") or {})
+        }
+    )
+    checks = {
+        name: bool(participant_rows)
+        and all(bool((row.get("checks") or {}).get(name)) for row in participant_rows)
+        for name in check_names
+    }
+    counts = {
+        name: sum(int((row.get("counts") or {}).get(name) or 0) for row in participant_rows)
+        for name in count_names
+    }
+    supported_count = sum(bool(row.get("supported")) for row in participant_rows)
+    return {
+        "version": OBSERVABLE_SUPPORT_CONFIG["version"],
+        "support_version": OBSERVABLE_SUPPORT_CONFIG["version"],
+        "family": family,
+        "supported": bool(participant_rows)
+        and supported_count == len(participant_rows),
+        "supported_participant_count": supported_count,
+        "unsupported_participant_count": len(participant_rows) - supported_count,
+        "participant_count": len(participant_rows),
+        "counts": counts,
+        "checks": checks,
+        "thresholds": OBSERVABLE_SUPPORT_CONFIG.get(family, {}),
+        "participant_effect": [
+            {
+                "participant_id": row.get("participant_id"),
+                "supported": bool(row.get("supported")),
+                "split_index": row.get("split_index"),
+                "training_window_start": row.get("training_window_start"),
+                "training_window_end": row.get("training_window_end"),
+                "checks": dict(row.get("checks") or {}),
+            }
+            for row in participant_rows
+        ],
+        "source": "final_rolling_training_support",
+    }
 class Stage4DeploymentRefitService:
     """Refit production parameters exclusively from one frozen snapshot."""
 
@@ -782,6 +871,9 @@ class Stage4CandidateReplayService:
         evaluation_parameters: dict[str, dict[str, Any]] = {}
         evaluation_uncertainty: dict[str, dict[str, Any]] = {}
         evaluation_evidence: dict[str, dict[str, Any]] = {}
+        evaluation_support_evidence: dict[
+            str, dict[str, dict[str, Any]]
+        ] = {}
         initial_state_provenance_complete = True
         for split in splits:
             origin_cutoff = datetime.combine(
@@ -1065,8 +1157,44 @@ class Stage4CandidateReplayService:
                         "parameter_fit_version"
                     ),
                 }
+                training_days = sorted(
+                    {str(value["local_date"]) for value in fit_samples}
+                )
+                participant_support = {}
+                for family in MODEL_FAMILIES:
+                    support = self._support(fit_samples, family)
+                    participant_support[family] = {
+                        "participant_id": participant,
+                        "family": family,
+                        "split_index": split["split_index"],
+                        "training_window_start": (
+                            training_days[0] if training_days else None
+                        ),
+                        "training_window_end": (
+                            training_days[-1] if training_days else None
+                        ),
+                        "counts": dict(support["counts"]),
+                        "checks": dict(support["checks"]),
+                        "supported": bool(support["supported"]),
+                        "support_version": support["version"],
+                    }
+                evaluation_support_evidence[participant] = participant_support
 
         comparison: dict[str, dict[str, Any]] = {}
+        evaluation_support_aggregate = {
+            family: aggregate_evaluation_observable_support(
+                evaluation_support_evidence,
+                family,
+            )
+            for family in MODEL_FAMILIES
+        }
+        descriptive_support = {
+            family: {
+                **self._support(samples, family),
+                "descriptive_only": True,
+            }
+            for family in MODEL_FAMILIES
+        }
         baseline_by_participant = {}
         for participant in sorted({row["participant_id"] for row in samples}):
             metric = comparison_metrics([row for row in prediction_sets["current_m0"] if row["participant_id"] == participant])
@@ -1076,7 +1204,12 @@ class Stage4CandidateReplayService:
             metrics = comparison_metrics(prediction_sets[family])
             metrics["model_variant"] = MODEL_VARIANT_BY_FAMILY[family]
             metrics["replay_engine"] = REPLAY_ENGINE_VERSION
-            metrics["observable_support"] = self._support(samples, family)
+            metrics["observable_support"] = evaluation_support_aggregate[
+                family
+            ]
+            metrics["descriptive_observable_support"] = descriptive_support[
+                family
+            ]
             metrics["participant_effect"] = []
             for participant, baseline_mae in baseline_by_participant.items():
                 participant_metrics = comparison_metrics([row for row in prediction_sets[family] if row["participant_id"] == participant])
@@ -1163,6 +1296,13 @@ class Stage4CandidateReplayService:
             "evaluation_candidate_evidence": evaluation_evidence,
             "evaluation_parameter_gate_evidence": evaluation_evidence,
             "evaluation_parameter_gate_aggregate": aggregate_parameter_evidence,
+            "evaluation_observable_support_evidence": (
+                evaluation_support_evidence
+            ),
+            "evaluation_observable_support_aggregate": (
+                evaluation_support_aggregate
+            ),
+            "descriptive_observable_support": descriptive_support,
             "deployment_parameters": deployment["parameters"],
             "deployment_uncertainty": deployment["uncertainty"],
             "deployment_evidence": deployment["evidence"],
