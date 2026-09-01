@@ -20,7 +20,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
     DATASET_SCHEMA_V4,
-    DATASET_SCHEMA_V6,
+    DATASET_SCHEMA_V7,
     ResearchEvaluationService,
 )
 from postgres_test_guard import optional_test_postgres_url
@@ -728,6 +728,8 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 text("SELECT version_num FROM alembic_version")
             ) == "0031_parameter_learning_runs"
             legacy_stage5_run = uuid.uuid4()
+            old_promoted_stage5_run = uuid.uuid4()
+            old_promoted_stage5_profile = uuid.uuid4()
             connection.execute(
                 text(
                     """
@@ -751,15 +753,83 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                     "created_at": now,
                 },
             )
-            command.upgrade(config, "0033_dataset_v6_profile_history")
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO parameter_learning_runs (
+                        id, participant_id, dataset_snapshot_id, model_family,
+                        parameters_before, parameters_candidate,
+                        training_metrics, validation_metrics, sample_count,
+                        status, created_at
+                    ) VALUES (
+                        :id, :participant_id, :snapshot_id,
+                        'hierarchical-ctssm-residual.v2', '{}'::jsonb,
+                        '{"S_star_init": 60.0}'::jsonb, '{}'::jsonb,
+                        '{"promotion_gate": {"version": "stage5-personalization-gate.v2", "passed": true}}'::jsonb,
+                        30, 'promoted', :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": old_promoted_stage5_run,
+                    "participant_id": participant_id,
+                    "snapshot_id": dataset_snapshot_id,
+                    "created_at": now,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO learned_model_profiles (
+                        id, participant_id, version, parameters_json,
+                        uncertainty_json, source, model_version,
+                        validation_status, sample_count, day_count, confidence,
+                        window_start, window_end, created_at
+                    ) VALUES (
+                        :id, :participant_id, 2,
+                        jsonb_build_object(
+                            'S_star_init', 60.0,
+                            'model_selection', jsonb_build_object(
+                                'status', 'stage5_promoted',
+                                'parameter_learning_run_id', CAST(:run_id AS TEXT),
+                                'active_variant', 'm1'
+                            )
+                        ),
+                        '{}'::jsonb, 'stage5-old-promoted',
+                        'mindflow-ctssm-runtime-v10', 'validated',
+                        30, 14, 0.8, '2030-01-01', '2030-01-14', :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": old_promoted_stage5_profile,
+                    "participant_id": participant_id,
+                    "run_id": old_promoted_stage5_run,
+                    "created_at": now,
+                },
+            )
+            command.upgrade(config, "0034_dataset_v7_active_history")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0033_dataset_v6_profile_history"
+            ) == "0034_dataset_v7_active_history"
             assert connection.scalar(
                 text(
                     "SELECT status FROM parameter_learning_runs WHERE id = :id"
                 ),
                 {"id": legacy_stage5_run},
+            ) == "rejected"
+            assert connection.scalar(
+                text(
+                    "SELECT status FROM parameter_learning_runs WHERE id = :id"
+                ),
+                {"id": old_promoted_stage5_run},
+            ) == "rejected"
+            assert connection.scalar(
+                text(
+                    "SELECT validation_status FROM learned_model_profiles "
+                    "WHERE id = :id"
+                ),
+                {"id": old_promoted_stage5_profile},
             ) == "rejected"
             stage5_columns = {
                 column["name"]
@@ -962,9 +1032,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 observation_cutoff=now,
                 calendar_cutoff=now,
             )
-            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V6
+            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V7
             assert v3_snapshot["manifest"]["participant_count"] == 1
             assert v3_snapshot["manifest"]["participant_profile_count"] == 1
+            assert v3_snapshot["manifest"]["learned_model_profile_count"] == 2
             v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
             memberships = service.snapshot_items(v3_snapshot_id, "participant")
             assert len(memberships) == 1
@@ -977,6 +1048,17 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             assert frozen_profiles[0]["metadata"]["profile_id"] == str(
                 explicit_profile_id
             )
+            frozen_learned_profiles = service.snapshot_items(
+                v3_snapshot_id, "learned_model_profile"
+            )
+            assert len(frozen_learned_profiles) == 2
+            rejected_frozen = next(
+                item
+                for item in frozen_learned_profiles
+                if item["metadata"]["profile_id"]
+                == str(old_promoted_stage5_profile)
+            )
+            assert rejected_frozen["metadata"]["runtime_valid"] is False
             v3_run = service.create_evaluation_run(
                 v3_snapshot_id,
                 "algorithm-v1",

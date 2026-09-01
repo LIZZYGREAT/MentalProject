@@ -149,6 +149,7 @@ class ModelPromotionService:
             "mindflow-research-dataset-v4",
             "mindflow-research-dataset-v5",
             "mindflow-research-dataset-v6",
+            "mindflow-research-dataset-v7",
         }:
             expected_counts["participant_count"] = sum(
                 item["item_type"] == "participant" for item in items
@@ -157,6 +158,7 @@ class ModelPromotionService:
             "mindflow-research-dataset-v4",
             "mindflow-research-dataset-v5",
             "mindflow-research-dataset-v6",
+            "mindflow-research-dataset-v7",
         }:
             for item_type in ("psychometric", "daily_review", "slow_state"):
                 expected_counts[f"{item_type}_count"] = sum(
@@ -165,14 +167,22 @@ class ModelPromotionService:
         if snapshot.schema_version in {
             "mindflow-research-dataset-v5",
             "mindflow-research-dataset-v6",
+            "mindflow-research-dataset-v7",
         }:
             for item_type in ("care_intervention_exposure", "warning_delivery"):
                 expected_counts[f"{item_type}_count"] = sum(
                     item["item_type"] == item_type for item in items
                 )
-        if snapshot.schema_version == "mindflow-research-dataset-v6":
+        if snapshot.schema_version in {
+            "mindflow-research-dataset-v6",
+            "mindflow-research-dataset-v7",
+        }:
             expected_counts["participant_profile_count"] = sum(
                 item["item_type"] == "participant_profile" for item in items
+            )
+        if snapshot.schema_version == "mindflow-research-dataset-v7":
+            expected_counts["learned_model_profile_count"] = sum(
+                item["item_type"] == "learned_model_profile" for item in items
             )
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
@@ -205,9 +215,10 @@ class ModelPromotionService:
                 "mindflow-research-dataset-v4",
                 "mindflow-research-dataset-v5",
                 "mindflow-research-dataset-v6",
+                "mindflow-research-dataset-v7",
             }:
                 raise ValueError(
-                    "Stage-4 promotion requires Dataset Schema v4, v5 or v6"
+                    "Stage-4 promotion requires Dataset Schema v4, v5, v6 or v7"
                 )
             rows = session.execute(
                 select(DatasetSnapshotItem).where(

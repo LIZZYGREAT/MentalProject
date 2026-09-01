@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0033_dataset_v6_profile_history -->
+<!-- ALEMBIC_HEAD: 0034_dataset_v7_active_history -->
 
 ## 运行边界
 
@@ -191,7 +191,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0033_dataset_v6_profile_history`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0034_dataset_v7_active_history`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -282,14 +282,15 @@ stress/vitality、recovery window 与 semantic dimensions 的 Ridge residual；�
 且当前固定为 shadow，不进入 Active runtime。`_predict_base` 只保留为不可晋级的诊断函数。
 定时校准通过现有 scheduler 接口每周至多创建一次
 56 日 Dataset Snapshot 与参数学习运行，不再在每次 EMA 后即时重拟合。晋级保留 candidate 画像，
-另写 validated Active 画像；`runtime_active()` 只有在对应 ParameterLearningRun 已 promoted 且参数
-逐项匹配时才接受该画像。晋级还会在 participant/profile 行锁内比较训练时冻结的 Active
+另写 validated Active 画像；`runtime_active()` 对 Stage 5 画像强制验证 runtime-v11、v2 模型族、
+v3 promotion gate、formal replay v2、v6/v7 因果 Dataset、promoted run 及候选参数逐项匹配。
+任一证据不满足都会 fail closed 并回退到更早的合法 Stage 4/M0 画像。晋级还会在 participant/profile 行锁内比较训练时冻结的 Active
 profile id/version/hash、模型变体、spec 与 Stage-4 decision；不一致即拒绝为
 `stale_parameter_learning_candidate`。Admin 研究页显示 Calibration Runs、Parameter History、Candidate vs
 Active、Residual Diagnostics 与 Promotion History。
 
 0032 同时引入 Dataset Schema v5，在不可变快照中冻结 Warning delivery 与 Care intervention
-exposure。Stage 5 当前只接受完整性校验通过、且包含 Explicit Profile 历史的 v6 快照，并把发送后固定 120 分钟窗口内样本排除出
+exposure。Stage 5 当前训练只接受完整性校验通过、且包含 Explicit 与 Learned Profile 历史的 v7 快照，并把发送后固定 120 分钟窗口内样本排除出
 自然动力学和 residual 核心拟合；策略版本、窗口、暴露及排除计数均写入审计。Population prior
 逐 split 使用 `available_at=max(observed_at, created_at)<origin` 的非目标参与者数据；不足两个 peer
 时回退到版本化全局默认。0032 还为 scheduled run 增加 `run_kind/schedule_key` 和 PostgreSQL/SQLite
@@ -304,6 +305,14 @@ partial unique constraint，保证同一参与者、模型族、ISO 周最多一
 与 prior version，Global、Explicit、Current、Candidate 因此共享同一个 split 信息集。
 Residual 仍只修正 OOT point prediction：MAE 可评估，但在未重算完整 trajectory 与 interval 时，
 Coverage/Peak gate 明确为 NULL、`formal_residual_promotion_eligible=false`，不得伪装为已验证。
+
+0034 引入 Dataset Schema v7，把 cutoff 前全部 `LearnedModelProfile` 身份及其 runtime-valid
+promotion evidence 冻结为 `learned_model_profile` item。Current Personalized comparator 和所有
+比较模型的 `active_variant` 都逐 split 选择 `created_at < origin` 的最新合法 Active；不存在历史
+Active 时明确回退 Current M0。快照 cutoff 之后才生成的 live Active 不进入 OOT，但训练时仍单独
+读取为 `deployment_base_active_identity_at_train_time`，继续参与 stale-promotion CAS。0034 保留
+旧记录但将 runtime-v10 的 Stage 5 promoted validated 画像及其关联 promoted run 标记 rejected，
+避免旧 v5/gate-v2/replay-v1 证据继续影响生产。
 
 `rolling-origin-knowledge-causal.v2` 以测试日当地 00:00 作为 split origin；训练 EMA 的
 `created_at`、BRS 的 `max(administered_at, created_at)` 与 Slow State 的

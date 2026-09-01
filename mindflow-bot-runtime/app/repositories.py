@@ -66,6 +66,7 @@ from app.models import (
     ParticipantProfile,
     ParticipantSlowState,
     PsychometricAssessment,
+    DatasetSnapshot,
     LearnedModelProfile,
     ModelPromotionDecision,
     ParameterLearningRun,
@@ -297,6 +298,15 @@ class ProfileRepository:
 
 
 class LearnedProfileRepository:
+    STAGE5_MODEL_FAMILY = "hierarchical-ctssm-residual.v2"
+    STAGE5_RUNTIME_VERSION = "mindflow-ctssm-runtime-v11"
+    STAGE5_PROMOTION_GATE_VERSION = "stage5-personalization-gate.v3"
+    STAGE5_FORMAL_REPLAY_ENGINE = "stage5-real-ctssm-rolling-replay.v2"
+    STAGE5_CAUSAL_DATASET_SCHEMAS = {
+        "mindflow-research-dataset-v6",
+        "mindflow-research-dataset-v7",
+    }
+
     def __init__(self, database: Database):
         self.database = database
 
@@ -367,68 +377,176 @@ class LearnedProfileRepository:
             statement = statement.with_for_update()
         rows = session.execute(statement).scalars().all()
         for row in rows:
-            view = self._view(row)
-            parameters = dict(view["parameters"])
-            selection = dict(parameters.get("model_selection") or {})
-            if selection.get("status") == "stage5_promoted":
-                try:
-                    learning_run_id = uuid.UUID(
-                        str(selection.get("parameter_learning_run_id") or "")
-                    )
-                except ValueError:
-                    learning_run_id = None
-                learning_run = (
-                    session.get(ParameterLearningRun, learning_run_id)
-                    if learning_run_id is not None
-                    else None
-                )
-                statistical_parameters = {
-                    name: value
-                    for name, value in parameters.items()
-                    if name != "model_selection"
-                }
-                if (
-                    learning_run is not None
-                    and learning_run.participant_id == participant_id
-                    and learning_run.status == "promoted"
-                    and dict(learning_run.parameters_candidate or {})
-                    == statistical_parameters
-                ):
-                    return view
-                continue
-            active_variant = normalize_model_variant(
-                selection.get("active_variant") or "m0"
-            )
-            if active_variant == "m0":
-                return view
-            try:
-                decision_id = uuid.UUID(
-                    str(selection.get("promotion_decision_id") or "")
-                )
-            except ValueError:
-                decision_id = None
-            decision = (
-                session.get(ModelPromotionDecision, decision_id)
-                if decision_id is not None
-                else None
-            )
-            valid = bool(
-                decision is not None
-                and decision.participant_id == participant_id
-                and decision.status == "retained_from_empirical_evidence"
-                and decision.model_family
-                == {
-                    "wm0": "workload_aware_m0",
-                    "m1": "m1",
-                    "m2": "m2",
-                    "m3": "m3",
-                }.get(active_variant)
-                and decision.parameters_hash
-                == promotion_parameters_hash(parameters)
-            )
+            valid, _evidence = self.runtime_validity_in_session(session, row)
             if valid:
+                view = self._view(row)
                 return view
         return None
+
+    def runtime_validity_in_session(
+        self,
+        session: Any,
+        row: LearnedModelProfile,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Validate one learned-profile row against its durable promotion proof."""
+
+        view = self._view(row)
+        parameters = dict(view["parameters"])
+        selection = dict(parameters.get("model_selection") or {})
+        active_variant = normalize_model_variant(
+            selection.get("active_variant") or "m0"
+        )
+        evidence: dict[str, Any] = {
+            "profile_id": view["id"],
+            "profile_version": view["version"],
+            "model_version": view["model_version"],
+            "validation_status": view["validation_status"],
+            "active_variant": active_variant,
+            "selection_status": selection.get("status"),
+            "proof_type": None,
+            "runtime_valid": False,
+        }
+        status_eligible = row.validation_status == "validated" or (
+            row.validation_status == "candidate" and row.model_version == "legacy"
+        )
+        if not status_eligible:
+            evidence["reason"] = "profile_validation_status_not_runtime_eligible"
+            return False, evidence
+
+        if selection.get("status") == "stage5_promoted":
+            evidence["proof_type"] = "stage5_parameter_learning_run"
+            try:
+                learning_run_id = uuid.UUID(
+                    str(selection.get("parameter_learning_run_id") or "")
+                )
+            except ValueError:
+                learning_run_id = None
+            learning_run = (
+                session.get(ParameterLearningRun, learning_run_id)
+                if learning_run_id is not None
+                else None
+            )
+            snapshot = (
+                session.get(DatasetSnapshot, learning_run.dataset_snapshot_id)
+                if learning_run is not None
+                else None
+            )
+            validation = dict(
+                (learning_run.validation_metrics if learning_run is not None else {})
+                or {}
+            )
+            gate = dict(validation.get("promotion_gate") or {})
+            formal_audit = dict(validation.get("formal_replay_audit") or {})
+            statistical_parameters = {
+                name: value
+                for name, value in parameters.items()
+                if name != "model_selection"
+            }
+            checks = {
+                "profile_runtime_v11": (
+                    row.model_version == self.STAGE5_RUNTIME_VERSION
+                ),
+                "run_exists": learning_run is not None,
+                "run_participant_matches": bool(
+                    learning_run is not None
+                    and learning_run.participant_id == row.participant_id
+                ),
+                "run_promoted": bool(
+                    learning_run is not None and learning_run.status == "promoted"
+                ),
+                "model_family_v2": bool(
+                    learning_run is not None
+                    and learning_run.model_family == self.STAGE5_MODEL_FAMILY
+                ),
+                "candidate_parameters_match": bool(
+                    learning_run is not None
+                    and dict(learning_run.parameters_candidate or {})
+                    == statistical_parameters
+                ),
+                "promotion_gate_v3": (
+                    gate.get("version") == self.STAGE5_PROMOTION_GATE_VERSION
+                ),
+                "promotion_gate_passed": gate.get("passed") is True,
+                "formal_promotion_eligible": (
+                    gate.get("formal_promotion_eligible") is True
+                ),
+                "formal_replay_v2": (
+                    formal_audit.get("engine")
+                    == self.STAGE5_FORMAL_REPLAY_ENGINE
+                ),
+                "causal_dataset_schema": bool(
+                    snapshot is not None
+                    and snapshot.schema_version
+                    in self.STAGE5_CAUSAL_DATASET_SCHEMAS
+                ),
+            }
+            valid = all(checks.values())
+            evidence.update(
+                {
+                    "parameter_learning_run_id": (
+                        str(learning_run.id) if learning_run is not None else None
+                    ),
+                    "dataset_snapshot_id": (
+                        str(snapshot.id) if snapshot is not None else None
+                    ),
+                    "dataset_schema_version": (
+                        snapshot.schema_version if snapshot is not None else None
+                    ),
+                    "checks": checks,
+                    "runtime_valid": valid,
+                    "reason": (
+                        "stage5_formal_provenance_valid"
+                        if valid
+                        else "stage5_formal_provenance_invalid"
+                    ),
+                }
+            )
+            return valid, evidence
+
+        evidence["proof_type"] = "stage4_or_m0"
+        if active_variant == "m0":
+            evidence.update(
+                {"runtime_valid": True, "reason": "m0_runtime_profile"}
+            )
+            return True, evidence
+        try:
+            decision_id = uuid.UUID(
+                str(selection.get("promotion_decision_id") or "")
+            )
+        except ValueError:
+            decision_id = None
+        decision = (
+            session.get(ModelPromotionDecision, decision_id)
+            if decision_id is not None
+            else None
+        )
+        valid = bool(
+            decision is not None
+            and decision.participant_id == row.participant_id
+            and decision.status == "retained_from_empirical_evidence"
+            and decision.model_family
+            == {
+                "wm0": "workload_aware_m0",
+                "m1": "m1",
+                "m2": "m2",
+                "m3": "m3",
+            }.get(active_variant)
+            and decision.parameters_hash == promotion_parameters_hash(parameters)
+        )
+        evidence.update(
+            {
+                "promotion_decision_id": (
+                    str(decision.id) if decision is not None else None
+                ),
+                "runtime_valid": valid,
+                "reason": (
+                    "stage4_promotion_provenance_valid"
+                    if valid
+                    else "stage4_promotion_provenance_invalid"
+                ),
+            }
+        )
+        return valid, evidence
 
     def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
         """Compatibility alias for research callers; prefer latest()."""

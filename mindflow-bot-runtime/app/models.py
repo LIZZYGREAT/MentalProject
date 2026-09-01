@@ -761,7 +761,7 @@ class DatasetSnapshotItem(Base):
             "'forecast_currentness', 'calendar', 'match_source', "
             "'psychometric', 'daily_review', 'slow_state', "
             "'care_intervention_exposure', 'warning_delivery', "
-            "'participant_profile')",
+            "'participant_profile', 'learned_model_profile')",
             name="ck_dataset_snapshot_item_type",
         ),
     )

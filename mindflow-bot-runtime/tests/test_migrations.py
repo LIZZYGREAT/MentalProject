@@ -140,6 +140,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0033_dataset_v6_profile_history"
     )
     assert migration_0033.down_revision == "0032_stage5_causal_hardening"
+    migration_0034 = next(
+        migration for migration in migrations
+        if migration.revision == "0034_dataset_v7_active_history"
+    )
+    assert migration_0034.down_revision == "0033_dataset_v6_profile_history"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
@@ -240,6 +245,43 @@ def test_0033_allows_frozen_participant_profile_history(monkeypatch):
         "WHERE item_type = 'participant_profile'"
     ]
     assert "'participant_profile'" not in checks[-1][2]
+
+
+def test_0034_freezes_active_history_and_revokes_old_promotions(monkeypatch):
+    migration = _migration(VERSIONS / "0034_dataset_v7_active_history.py")
+    checks = []
+    statements = []
+    monkeypatch.setattr(migration.op, "drop_constraint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert "'learned_model_profile'" in checks[-1][2]
+    assert any(
+        "parameter_learning_runs" in value
+        and "status = 'promoted'" in value
+        and "mindflow-ctssm-runtime-v10" in value
+        for value in statements
+    )
+    assert any(
+        "learned_model_profiles" in value
+        and "validation_status = 'rejected'" in value
+        and "mindflow-ctssm-runtime-v10" in value
+        for value in statements
+    )
+
+    statements.clear()
+    migration.downgrade()
+    assert statements == [
+        "DELETE FROM dataset_snapshot_items "
+        "WHERE item_type = 'learned_model_profile'"
+    ]
+    assert "'learned_model_profile'" not in checks[-1][2]
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

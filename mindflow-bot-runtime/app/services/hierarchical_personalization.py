@@ -34,7 +34,7 @@ from app.repositories import LearnedProfileRepository, promotion_parameters_hash
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
 from app.services.model_comparison import comparison_metrics, rolling_origin_splits
 from app.services.research_evaluation import (
-    DATASET_SCHEMA_V6,
+    DATASET_SCHEMA_V7,
     ResearchEvaluationService,
     STAGE5_INTERVENTION_EXCLUSION_MINUTES,
 )
@@ -1192,7 +1192,6 @@ class Stage5PersonalizedReplayService:
         frozen: Mapping[str, Any],
         items: Sequence[Mapping[str, Any]],
         participant_id: uuid.UUID,
-        current_parameters: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         all_samples, intervention_audit = _with_intervention_exclusions(
             frozen.get("samples", []), items
@@ -1209,8 +1208,6 @@ class Stage5PersonalizedReplayService:
         splits = rolling_origin_splits(
             target_rows, minimum_training_days=MINIMUM_TRAINING_DAYS
         )
-        selection = dict((current_parameters or {}).get("model_selection") or {})
-        variant = normalize_model_variant(selection.get("active_variant") or "m0")
         predictions: dict[str, list[dict[str, Any]]] = {
             name: []
             for name in (
@@ -1227,6 +1224,7 @@ class Stage5PersonalizedReplayService:
         latest_residual = None
         replay_call_count = 0
         split_information_sets = []
+        split_active_variants = []
         for split in splits:
             test_day = date.fromisoformat(split["test_days"][0])
             origin = datetime.combine(test_day, time.min, self.timezone).astimezone(
@@ -1251,8 +1249,23 @@ class Stage5PersonalizedReplayService:
             split_explicit, explicit_provenance = explicit_profile_as_of(
                 items, participant_id, origin
             )
+            split_current, current_provenance = active_learned_profile_as_of(
+                items, participant_id, origin
+            )
+            variant = str(current_provenance["active_variant"])
+            split_active_variants.append(
+                {
+                    "split_index": split["split_index"],
+                    "origin_cutoff": origin.isoformat(),
+                    "active_variant": variant,
+                    "profile_id": current_provenance.get("profile_id"),
+                }
+            )
             resilience_provenance["usage"] = "evaluation_trait_resilience"
             explicit_provenance["usage"] = "evaluation_explicit_profile"
+            current_provenance["usage"] = (
+                "evaluation_current_profile_as_of_origin"
+            )
             fitted = fit_partial_pooling(
                 population_training,
                 training,
@@ -1283,7 +1296,7 @@ class Stage5PersonalizedReplayService:
                     global_parameters, split_explicit
                 ),
                 "current_personalized_model": _deep_merge_parameters(
-                    _deep_merge_parameters(global_parameters, current_parameters),
+                    _deep_merge_parameters(global_parameters, split_current),
                     split_explicit,
                 ),
                 "new_candidate_model": _deep_merge_parameters(
@@ -1296,8 +1309,9 @@ class Stage5PersonalizedReplayService:
                     "origin_cutoff": origin.isoformat(),
                     "trait_resilience": resilience_provenance,
                     "explicit_profile": explicit_provenance,
+                    "current_learned_profile": current_provenance,
                     "comparator_information_set": (
-                        "same_origin_calendar_state_observations_trait_and_explicit.v1"
+                        "same_origin_calendar_state_observations_trait_explicit_and_current.v2"
                     ),
                 }
             )
@@ -1468,6 +1482,11 @@ class Stage5PersonalizedReplayService:
             "formal_residual_promotion_eligible": False,
             "reason": "trajectory_and_interval_not_recomputed",
         }
+        latest_variant = (
+            str(split_active_variants[-1]["active_variant"])
+            if split_active_variants
+            else "m0"
+        )
         return {
             "rolling_origin": {
                 "version": "stage5-expanding-local-day-origin.v2",
@@ -1503,10 +1522,25 @@ class Stage5PersonalizedReplayService:
             "formal_replay_audit": {
                 "engine": self.FORMAL_ENGINE_VERSION,
                 "production_engine": REPLAY_ENGINE_VERSION,
-                "active_variant": variant,
+                "active_variant": latest_variant,
+                "active_variant_rule": "split_origin_causal",
+                "active_variant_by_split": split_active_variants,
                 "comparator_variants": {
-                    name: variant for name in comparator_names + ("new_candidate_model",)
+                    name: latest_variant
+                    for name in comparator_names + ("new_candidate_model",)
                 },
+                "comparator_variants_by_split": [
+                    {
+                        "split_index": row["split_index"],
+                        "active_variant": row["active_variant"],
+                        "families": {
+                            name: row["active_variant"]
+                            for name in comparator_names
+                            + ("new_candidate_model",)
+                        },
+                    }
+                    for row in split_active_variants
+                ],
                 "same_calendar_state_and_knowledge_rule": True,
                 "simulator_call_count": replay_call_count,
                 "population_prior_splits": population_provenance,
@@ -1635,6 +1669,83 @@ def explicit_profile_as_of(
     return (dict(selected[3]) if selected else {}), provenance
 
 
+def active_learned_profile_as_of(
+    items: Sequence[Mapping[str, Any]],
+    participant_id: uuid.UUID,
+    knowledge_cutoff: datetime,
+    *,
+    inclusive: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve the latest frozen runtime-valid learned profile causally."""
+
+    cutoff = _aware(knowledge_cutoff)
+    candidates = []
+    for item in items:
+        if item["item_type"] != "learned_model_profile" or str(
+            item["participant_id"]
+        ) != str(participant_id):
+            continue
+        metadata = dict(item["metadata"])
+        if metadata.get("runtime_valid") is not True:
+            continue
+        try:
+            created_at = _aware(metadata.get("created_at"))
+            version = int(metadata.get("version"))
+        except (TypeError, ValueError):
+            continue
+        outside_boundary = created_at > cutoff if inclusive else created_at >= cutoff
+        if outside_boundary:
+            continue
+        parameters = dict(metadata.get("parameters") or {})
+        selection = dict(
+            metadata.get("model_selection")
+            or parameters.get("model_selection")
+            or {}
+        )
+        variant = normalize_model_variant(
+            metadata.get("active_variant")
+            or selection.get("active_variant")
+            or "m0"
+        )
+        candidates.append(
+            (
+                created_at,
+                version,
+                str(metadata.get("profile_id") or item.get("source_id") or ""),
+                parameters,
+                str(metadata.get("parameters_hash") or ""),
+                str(metadata.get("model_version") or ""),
+                str(metadata.get("validation_status") or ""),
+                str(metadata.get("source") or ""),
+                variant,
+                dict(metadata.get("runtime_validation") or {}),
+            )
+        )
+    selected = max(candidates, default=None, key=lambda value: (value[0], value[1]))
+    provenance = {
+        "profile_id": selected[2] if selected else None,
+        "version": selected[1] if selected else None,
+        "created_at": selected[0].isoformat() if selected else None,
+        "parameters_hash": selected[4] if selected else hashlib.sha256(
+            b"{}"
+        ).hexdigest(),
+        "model_version": selected[5] if selected else None,
+        "validation_status": selected[6] if selected else None,
+        "source": selected[7] if selected else "current_m0_fallback",
+        "active_variant": selected[8] if selected else "m0",
+        "runtime_validation": selected[9] if selected else {
+            "runtime_valid": True,
+            "reason": "no_historical_active_current_m0_fallback",
+        },
+        "origin_cutoff": cutoff.isoformat(),
+        "knowledge_cutoff": cutoff.isoformat(),
+        "cutoff_operator": "<=" if inclusive else "<",
+        "snapshot_item_type": "learned_model_profile",
+        "fallback": selected is None,
+    }
+    return (dict(selected[3]) if selected else {}), provenance
+
+
 def _uncertainty_payload(fitted: Mapping[str, Any], residual: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(fitted["uncertainty"])
 
@@ -1750,7 +1861,7 @@ class ParameterLearningService:
             integrity = self.snapshot_integrity.verify(
                 snapshot,
                 rows,
-                supported_schema_versions={DATASET_SCHEMA_V6},
+                supported_schema_versions={DATASET_SCHEMA_V7},
                 participant_id=participant_id,
             )
             return snapshot, list(integrity["items"]), {
@@ -1843,7 +1954,6 @@ class ParameterLearningService:
             frozen=frozen,
             items=items,
             participant_id=participant_id,
-            current_parameters=before,
         )
         residual = dict(validation.get("latest_residual_model") or {})
         candidate = runtime_candidate_parameters(fitted)
@@ -1869,6 +1979,10 @@ class ParameterLearningService:
             "dataset_snapshot_integrity": snapshot_audit,
             "intervention_exclusion": intervention_audit,
             "base_active_identity": base_active_identity,
+            "deployment_base_active_identity_at_train_time": {
+                **base_active_identity,
+                "usage": "deployment_base_active_identity_at_train_time",
+            },
         }
         validation_metrics = {
             **validation,
@@ -2060,7 +2174,7 @@ class ParameterLearningService:
                 .where(
                     DatasetSnapshot.date_start == date_start,
                     DatasetSnapshot.date_end == through,
-                    DatasetSnapshot.schema_version == DATASET_SCHEMA_V6,
+                    DatasetSnapshot.schema_version == DATASET_SCHEMA_V7,
                 )
                 .order_by(desc(DatasetSnapshot.created_at))
             ).scalars().first()

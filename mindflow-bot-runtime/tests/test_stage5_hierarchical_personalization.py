@@ -20,6 +20,7 @@ from app.services.hierarchical_personalization import (
     RESIDUAL_MAX,
     ParameterLearningService,
     Stage5PersonalizedReplayService,
+    active_learned_profile_as_of,
     _causal_previous_features,
     _with_intervention_exclusions,
     estimate_population_prior,
@@ -34,7 +35,7 @@ from app.services.hierarchical_personalization import (
     trait_resilience_as_of,
 )
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
-from app.services.research_evaluation import DATASET_SCHEMA_V6
+from app.services.research_evaluation import DATASET_SCHEMA_V6, DATASET_SCHEMA_V7
 from app.services.research_evaluation import ResearchEvaluationService
 from tests.helpers import memory_database, participant
 
@@ -343,7 +344,60 @@ def test_brs_and_explicit_profile_resolve_at_strict_knowledge_cutoff():
     assert profile_day_21["profile_id"] == "profile-v2"
 
 
-def test_dataset_v6_freezes_append_only_explicit_profile_history():
+def test_active_learned_profile_resolves_at_split_origin_and_falls_back_m0():
+    participant_id = uuid.uuid4()
+
+    def item(profile_id, version, created_at, baseline, variant):
+        parameters = {
+            "S_star_init": baseline,
+            "model_selection": {"active_variant": variant},
+        }
+        return {
+            "item_type": "learned_model_profile",
+            "source_id": profile_id,
+            "participant_id": participant_id,
+            "metadata": {
+                "profile_id": profile_id,
+                "version": version,
+                "parameters": parameters,
+                "model_selection": parameters["model_selection"],
+                "parameters_hash": f"hash-{profile_id}",
+                "model_version": "mindflow-ctssm-runtime-v11",
+                "validation_status": "validated",
+                "source": "stage5-promoted",
+                "created_at": created_at,
+                "active_variant": variant,
+                "runtime_valid": True,
+                "runtime_validation": {"runtime_valid": True},
+            },
+        }
+
+    items = [
+        item("active-v1", 1, "2030-01-10T08:00:00+00:00", 45.0, "m1"),
+        item("active-v2", 2, "2030-01-20T08:00:00+00:00", 75.0, "m3"),
+    ]
+    fallback, fallback_audit = active_learned_profile_as_of(
+        items, participant_id, datetime(2030, 1, 10, 8, tzinfo=timezone.utc)
+    )
+    day_15, day_15_audit = active_learned_profile_as_of(
+        items, participant_id, datetime(2030, 1, 15, tzinfo=timezone.utc)
+    )
+    day_21, day_21_audit = active_learned_profile_as_of(
+        items, participant_id, datetime(2030, 1, 21, tzinfo=timezone.utc)
+    )
+
+    assert fallback == {}
+    assert fallback_audit["active_variant"] == "m0"
+    assert fallback_audit["fallback"] is True
+    assert day_15["S_star_init"] == 45.0
+    assert day_15_audit["profile_id"] == "active-v1"
+    assert day_15_audit["active_variant"] == "m1"
+    assert day_21["S_star_init"] == 75.0
+    assert day_21_audit["profile_id"] == "active-v2"
+    assert day_21_audit["active_variant"] == "m3"
+
+
+def test_dataset_v7_freezes_explicit_and_learned_profile_history():
     database = memory_database()
     person = participant(database, "stage5-explicit-history")
     with database.session() as session:
@@ -361,6 +415,24 @@ def test_dataset_v6_freezes_append_only_explicit_profile_history():
                     profile_json={"model_params": {"S_star_init": 65.0}},
                     created_at=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 ),
+                LearnedModelProfile(
+                    participant_id=person.id,
+                    version=1,
+                    parameters_json={
+                        "S_star_init": 42.0,
+                        "model_selection": {"active_variant": "m0"},
+                    },
+                    uncertainty_json={},
+                    source="stage4-calibration",
+                    model_version="mindflow-ctssm-runtime-v8",
+                    validation_status="validated",
+                    sample_count=30,
+                    day_count=14,
+                    confidence=0.8,
+                    window_start=date(2029, 12, 1),
+                    window_end=date(2029, 12, 31),
+                    created_at=datetime(2030, 1, 10, tzinfo=timezone.utc),
+                ),
             ]
         )
 
@@ -377,11 +449,20 @@ def test_dataset_v6_freezes_append_only_explicit_profile_history():
         for item in service.snapshot_items(uuid.UUID(snapshot["id"]))
         if item["item_type"] == "participant_profile"
     ]
+    learned_items = [
+        item
+        for item in service.snapshot_items(uuid.UUID(snapshot["id"]))
+        if item["item_type"] == "learned_model_profile"
+    ]
 
-    assert snapshot["schema_version"] == DATASET_SCHEMA_V6
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V7
     assert snapshot["manifest"]["participant_profile_count"] == 2
+    assert snapshot["manifest"]["learned_model_profile_count"] == 1
     assert sorted(item["metadata"]["version"] for item in profile_items) == [1, 2]
     assert profile_items[0]["metadata"]["parameters_hash"]
+    assert learned_items[0]["metadata"]["runtime_valid"] is True
+    assert learned_items[0]["metadata"]["active_variant"] == "m0"
+    assert learned_items[0]["metadata"]["parameters_hash"]
 
 
 @pytest.mark.parametrize("variant", ["m0", "m1", "m2", "m3"])
@@ -460,15 +541,38 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
     extractor._calendar_events = Stage4CandidateReplayService._calendar_events
     extractor._frozen_initial_state = Stage4CandidateReplayService._frozen_initial_state
     service = Stage5PersonalizedReplayService(extractor)
+    historical_active = {
+        "item_type": "learned_model_profile",
+        "source_id": f"historical-active-{variant}",
+        "participant_id": target_id,
+        "metadata": {
+            "profile_id": f"historical-active-{variant}",
+            "version": 1,
+            "parameters": {
+                "model_selection": {"active_variant": variant}
+            },
+            "model_selection": {"active_variant": variant},
+            "parameters_hash": f"historical-active-{variant}-hash",
+            "model_version": "mindflow-ctssm-runtime-v11",
+            "validation_status": "validated",
+            "source": "test-stage5-active-history",
+            "created_at": "2029-12-31T08:00:00+00:00",
+            "active_variant": variant,
+            "runtime_valid": True,
+            "runtime_validation": {
+                "runtime_valid": True,
+                "reason": "frozen_test_provenance",
+            },
+        },
+    }
     result = service.validate(
         frozen={
             "samples": population,
             "calendars": calendars,
             "observation_history": {str(target_id): []},
         },
-        items=[],
+        items=[historical_active],
         participant_id=target_id,
-        current_parameters={"model_selection": {"active_variant": variant}},
     )
 
     assert extractor.model.calls > 0
@@ -517,6 +621,38 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
                         "created_at": "2030-01-20T08:00:00+00:00",
                     },
                 },
+                {
+                    "item_type": "learned_model_profile",
+                    "source_id": f"future-active-{explicit_baseline}",
+                    "participant_id": target_id,
+                    "metadata": {
+                        "profile_id": f"future-active-{explicit_baseline}",
+                        "version": 2,
+                        "parameters": {
+                            "S_star_init": explicit_baseline,
+                            "model_selection": {
+                                "active_variant": (
+                                    "m2" if explicit_baseline < 50 else "m3"
+                                )
+                            },
+                        },
+                        "model_selection": {
+                            "active_variant": (
+                                "m2" if explicit_baseline < 50 else "m3"
+                            )
+                        },
+                        "parameters_hash": f"future-active-{explicit_baseline}",
+                        "model_version": "mindflow-ctssm-runtime-v11",
+                        "validation_status": "validated",
+                        "source": "future-stage5-active",
+                        "created_at": "2030-01-20T08:00:00+00:00",
+                        "active_variant": (
+                            "m2" if explicit_baseline < 50 else "m3"
+                        ),
+                        "runtime_valid": True,
+                        "runtime_validation": {"runtime_valid": True},
+                    },
+                },
             ]
 
         common = {
@@ -526,13 +662,12 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
                 "observation_history": {str(target_id): []},
             },
             "participant_id": target_id,
-            "current_parameters": {"model_selection": {"active_variant": variant}},
         }
         future_low = service.validate(
-            **common, items=future_items(1.0, 20.0)
+            **common, items=[historical_active, *future_items(1.0, 20.0)]
         )
         future_high = service.validate(
-            **common, items=future_items(5.0, 90.0)
+            **common, items=[historical_active, *future_items(5.0, 90.0)]
         )
 
         assert future_low["rolling_origin"]["splits"][0] == future_high[
@@ -540,6 +675,9 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
         ]["splits"][0]
         assert future_low["comparison"] == future_high["comparison"]
         assert future_low["promotion_gate"] == future_high["promotion_gate"]
+        assert future_low["formal_replay_audit"][
+            "active_variant_by_split"
+        ] == future_high["formal_replay_audit"]["active_variant_by_split"]
         assert future_low["latest_fit"]["parameters"] == future_high[
             "latest_fit"
         ]["parameters"]
@@ -548,8 +686,14 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
         ][0]
         assert information_set["trait_resilience"]["assessment_id"] is None
         assert information_set["explicit_profile"]["profile_id"] is None
+        assert information_set["current_learned_profile"]["profile_id"] == (
+            historical_active["metadata"]["profile_id"]
+        )
+        assert information_set["current_learned_profile"][
+            "active_variant"
+        ] == "m1"
 
-        causal_items = future_items(1.0, 90.0) + [
+        causal_items = [historical_active, *future_items(1.0, 90.0),
             {
                 "item_type": "psychometric",
                 "source_id": "past-brs",
@@ -653,7 +797,7 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
                 participant_filter={"participant_codes": ["stage5-active"]},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version="test",
+                schema_version=DATASET_SCHEMA_V7,
                 manifest_json={},
             )
         )
@@ -731,6 +875,195 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
         assert len(active_profiles) == 1
 
 
+def test_runtime_active_rejects_old_stage5_and_falls_back_then_accepts_v11_v6():
+    database = memory_database()
+    person = participant(database, "stage5-runtime-provenance")
+    old_snapshot_id = uuid.uuid4()
+    old_run_id = uuid.uuid4()
+    old_candidate = {"S_star_init": 60.0}
+    with database.session() as session:
+        session.add_all(
+            [
+                DatasetSnapshot(
+                    id=old_snapshot_id,
+                    date_start=date(2030, 1, 1),
+                    date_end=date(2030, 1, 19),
+                    participant_filter={},
+                    observation_cutoff=datetime(
+                        2030, 1, 20, tzinfo=timezone.utc
+                    ),
+                    calendar_cutoff=datetime(
+                        2030, 1, 20, tzinfo=timezone.utc
+                    ),
+                    schema_version="mindflow-research-dataset-v5",
+                    manifest_json={},
+                ),
+                ParameterLearningRun(
+                    id=old_run_id,
+                    participant_id=person.id,
+                    dataset_snapshot_id=old_snapshot_id,
+                    model_family=MODEL_FAMILY,
+                    parameters_before={},
+                    parameters_candidate=old_candidate,
+                    training_metrics={},
+                    validation_metrics={
+                        "promotion_gate": {
+                            "version": "stage5-personalization-gate.v2",
+                            "passed": True,
+                            "formal_promotion_eligible": True,
+                        },
+                        "formal_replay_audit": {
+                            "engine": "stage5-real-ctssm-rolling-replay.v1"
+                        },
+                    },
+                    sample_count=57,
+                    status="promoted",
+                ),
+                LearnedModelProfile(
+                    participant_id=person.id,
+                    version=1,
+                    parameters_json={
+                        "S_star_init": 40.0,
+                        "model_selection": {"active_variant": "m0"},
+                    },
+                    uncertainty_json={},
+                    source="stage4-valid-m0",
+                    model_version="mindflow-ctssm-runtime-v8",
+                    validation_status="validated",
+                    sample_count=30,
+                    day_count=14,
+                    confidence=0.8,
+                    window_start=date(2029, 12, 1),
+                    window_end=date(2029, 12, 31),
+                ),
+                LearnedModelProfile(
+                    participant_id=person.id,
+                    version=2,
+                    parameters_json={
+                        **old_candidate,
+                        "model_selection": {
+                            "status": "stage5_promoted",
+                            "parameter_learning_run_id": str(old_run_id),
+                            "active_variant": "m1",
+                        },
+                    },
+                    uncertainty_json={},
+                    source="stage5-old-promoted",
+                    model_version="mindflow-ctssm-runtime-v10",
+                    validation_status="validated",
+                    sample_count=57,
+                    day_count=19,
+                    confidence=0.9,
+                    window_start=date(2030, 1, 1),
+                    window_end=date(2030, 1, 19),
+                ),
+            ]
+        )
+
+    repository = LearnedProfileRepository(database)
+    with database.session() as session:
+        old_profile = session.execute(
+            __import__("sqlalchemy").select(LearnedModelProfile).where(
+                LearnedModelProfile.participant_id == person.id,
+                LearnedModelProfile.version == 2,
+            )
+        ).scalar_one()
+        old_valid, old_evidence = repository.runtime_validity_in_session(
+            session, old_profile
+        )
+    assert old_valid is False
+    assert old_evidence["checks"]["profile_runtime_v11"] is False
+    assert old_evidence["checks"]["promotion_gate_v3"] is False
+    assert old_evidence["checks"]["formal_replay_v2"] is False
+    assert old_evidence["checks"]["causal_dataset_schema"] is False
+    fallback = repository.runtime_active(person.id)
+    assert fallback is not None
+    assert fallback["version"] == 1
+    assert fallback["parameters"]["model_selection"]["active_variant"] == "m0"
+
+    valid_snapshot_id = uuid.uuid4()
+    valid_run_id = uuid.uuid4()
+    valid_candidate = {"S_star_init": 55.0}
+    with database.session() as session:
+        session.add_all(
+            [
+                DatasetSnapshot(
+                    id=valid_snapshot_id,
+                    date_start=date(2030, 2, 1),
+                    date_end=date(2030, 2, 19),
+                    participant_filter={},
+                    observation_cutoff=datetime(
+                        2030, 2, 20, tzinfo=timezone.utc
+                    ),
+                    calendar_cutoff=datetime(
+                        2030, 2, 20, tzinfo=timezone.utc
+                    ),
+                    schema_version=DATASET_SCHEMA_V6,
+                    manifest_json={},
+                ),
+                ParameterLearningRun(
+                    id=valid_run_id,
+                    participant_id=person.id,
+                    dataset_snapshot_id=valid_snapshot_id,
+                    model_family=MODEL_FAMILY,
+                    parameters_before={},
+                    parameters_candidate=valid_candidate,
+                    training_metrics={},
+                    validation_metrics={
+                        "promotion_gate": {
+                            "version": PROMOTION_GATE_VERSION,
+                            "passed": True,
+                            "formal_promotion_eligible": True,
+                        },
+                        "formal_replay_audit": {
+                            "engine": "stage5-real-ctssm-rolling-replay.v2"
+                        },
+                    },
+                    sample_count=57,
+                    status="promoted",
+                ),
+                LearnedModelProfile(
+                    participant_id=person.id,
+                    version=3,
+                    parameters_json={
+                        **valid_candidate,
+                        "model_selection": {
+                            "status": "stage5_promoted",
+                            "parameter_learning_run_id": str(valid_run_id),
+                            "active_variant": "m1",
+                        },
+                    },
+                    uncertainty_json={},
+                    source="stage5-valid-promoted",
+                    model_version="mindflow-ctssm-runtime-v11",
+                    validation_status="validated",
+                    sample_count=57,
+                    day_count=19,
+                    confidence=0.9,
+                    window_start=date(2030, 2, 1),
+                    window_end=date(2030, 2, 19),
+                ),
+            ]
+        )
+
+    active = repository.runtime_active(person.id)
+    assert active is not None
+    assert active["version"] == 3
+    assert active["model_version"] == "mindflow-ctssm-runtime-v11"
+    with database.session() as session:
+        valid_profile = session.execute(
+            __import__("sqlalchemy").select(LearnedModelProfile).where(
+                LearnedModelProfile.participant_id == person.id,
+                LearnedModelProfile.version == 3,
+            )
+        ).scalar_one()
+        valid, evidence = repository.runtime_validity_in_session(
+            session, valid_profile
+        )
+    assert valid is True
+    assert all(evidence["checks"].values())
+
+
 def test_training_service_persists_run_and_candidate_profile_from_snapshot(monkeypatch):
     database = memory_database()
     person = participant(database, "stage5-training")
@@ -743,7 +1076,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
                 participant_filter={"participant_codes": ["stage5-training"]},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V6,
+                schema_version=DATASET_SCHEMA_V7,
                 manifest_json={},
             )
     item_row = DatasetSnapshotItem(
@@ -761,7 +1094,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
             )
     item_view = DatasetSnapshotIntegrityService.item_view(item_row)
     contract = {
-        "schema_version": DATASET_SCHEMA_V6,
+        "schema_version": DATASET_SCHEMA_V7,
         "date_start": "2030-01-01",
         "date_end": "2030-01-19",
         "participant_filter": {"participant_codes": ["stage5-training"]},
@@ -769,7 +1102,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
         "calendar_cutoff": cutoff.isoformat(),
     }
     snapshot_row.manifest_json = {
-        "schema_version": DATASET_SCHEMA_V6,
+        "schema_version": DATASET_SCHEMA_V7,
         "participant_count": 1,
         "observation_count": 0,
         "forecast_count": 0,
@@ -780,6 +1113,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
         "care_intervention_exposure_count": 0,
         "warning_delivery_count": 0,
         "participant_profile_count": 0,
+        "learned_model_profile_count": 0,
         "item_count": 1,
         "manifest_hash": DatasetSnapshotIntegrityService.manifest_hash(
             contract, [item_view]
@@ -788,6 +1122,27 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
     with database.session() as session:
         session.add(snapshot_row)
         session.add(item_row)
+        live_after_cutoff = LearnedModelProfile(
+            participant_id=person.id,
+            version=1,
+            parameters_json={
+                "S_star_init": 88.0,
+                "model_selection": {"active_variant": "m0"},
+            },
+            uncertainty_json={},
+            source="live-after-snapshot-cutoff",
+            model_version="mindflow-ctssm-runtime-v8",
+            validation_status="validated",
+            sample_count=30,
+            day_count=14,
+            confidence=0.8,
+            window_start=date(2030, 1, 1),
+            window_end=date(2030, 1, 19),
+            created_at=datetime(2030, 1, 25, tzinfo=timezone.utc),
+        )
+        session.add(live_after_cutoff)
+        session.flush()
+        live_after_cutoff_id = str(live_after_cutoff.id)
     service = ParameterLearningService(database, "Asia/Shanghai")
     frozen = _samples(days=19, participant_id=str(person.id))
     monkeypatch.setattr(
@@ -799,10 +1154,11 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
             "observation_history": {},
         },
     )
-    monkeypatch.setattr(
-        service.formal_replay,
-        "validate",
-        lambda **kwargs: {
+    validation_calls = []
+
+    def formal_validate(**kwargs):
+        validation_calls.append(kwargs)
+        return {
             "rolling_origin": {"split_count": 5},
             "comparison": {},
             "promotion_gate": {"passed": False},
@@ -813,7 +1169,12 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
                 "sample_count": 40,
                 "residual_sd": 0.5,
             },
-        },
+        }
+
+    monkeypatch.setattr(
+        service.formal_replay,
+        "validate",
+        formal_validate,
     )
 
     result = service.train_snapshot(snapshot_id, person.id)
@@ -822,6 +1183,16 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
     assert result["status"] in {"candidate", "rejected"}
     assert result["training_metrics"]["minimum_data_gate"]["passed"] is True
     assert result["validation_metrics"]["rolling_origin"]["split_count"] == 5
+    assert not any(
+        item["item_type"] == "learned_model_profile"
+        for item in validation_calls[0]["items"]
+    )
+    assert result["training_metrics"]["base_active_identity"][
+        "profile_id"
+    ] == live_after_cutoff_id
+    assert result["training_metrics"][
+        "deployment_base_active_identity_at_train_time"
+    ]["usage"] == "deployment_base_active_identity_at_train_time"
     latest = LearnedProfileRepository(database).latest(person.id)
     assert latest["validation_status"] == result["status"]
     assert latest["parameters"]["model_selection"][
@@ -864,7 +1235,7 @@ def test_promotion_rejects_candidate_when_base_active_profile_has_changed():
                 participant_filter={},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V6,
+                schema_version=DATASET_SCHEMA_V7,
                 manifest_json={},
             )
         )
@@ -967,7 +1338,7 @@ def test_scheduled_week_has_database_level_idempotency_constraint():
                 participant_filter={},
                 observation_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V6,
+                schema_version=DATASET_SCHEMA_V7,
                 manifest_json={},
             )
         )

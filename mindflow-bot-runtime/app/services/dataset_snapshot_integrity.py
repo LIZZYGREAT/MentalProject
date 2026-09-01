@@ -37,6 +37,16 @@ SCHEMA_ITEM_COUNTS = {
         "warning_delivery",
         "participant_profile",
     ),
+    "mindflow-research-dataset-v7": (
+        "participant",
+        "psychometric",
+        "daily_review",
+        "slow_state",
+        "care_intervention_exposure",
+        "warning_delivery",
+        "participant_profile",
+        "learned_model_profile",
+    ),
 }
 
 

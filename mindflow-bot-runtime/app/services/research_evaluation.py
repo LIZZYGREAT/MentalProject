@@ -50,7 +50,8 @@ DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
 DATASET_SCHEMA_V5 = "mindflow-research-dataset-v5"
 DATASET_SCHEMA_V6 = "mindflow-research-dataset-v6"
-DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V6
+DATASET_SCHEMA_V7 = "mindflow-research-dataset-v7"
+DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V7
 STAGE5_INTERVENTION_EXCLUSION_MINUTES = 120
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
 EVALUATION_CODE_VERSION = "stage4-evaluation.v7"
@@ -1044,6 +1045,24 @@ class ResearchEvaluationService:
                     ParticipantProfile.version,
                 )
             ).scalars().all()
+            learned_model_profiles = session.execute(
+                select(LearnedModelProfile)
+                .where(
+                    LearnedModelProfile.participant_id.in_(participant_ids),
+                    LearnedModelProfile.created_at <= observation_cutoff,
+                )
+                .order_by(
+                    LearnedModelProfile.participant_id,
+                    LearnedModelProfile.created_at,
+                    LearnedModelProfile.version,
+                )
+            ).scalars().all()
+            learned_profile_runtime_evidence = {
+                str(profile.id): self.learned_profiles.runtime_validity_in_session(
+                    session, profile
+                )[1]
+                for profile in learned_model_profiles
+            }
             exposure_lower = lower - timedelta(
                 minutes=STAGE5_INTERVENTION_EXCLUSION_MINUTES
             )
@@ -1146,8 +1165,52 @@ class ResearchEvaluationService:
                         "version": profile.version,
                         "model_params": model_parameters,
                         "created_at": created_at.isoformat(),
-                        "source": str(payload.get("source") or "participant_profiles"),
+                        "source": str(
+                            payload.get("source") or "participant_profiles"
+                        ),
                         "parameters_hash": _hash(model_parameters),
+                    },
+                )
+            )
+
+        for profile in learned_model_profiles:
+            created_at = _aware(profile.created_at)
+            parameters = dict(profile.parameters_json or {})
+            selection = dict(parameters.get("model_selection") or {})
+            runtime_evidence = dict(
+                learned_profile_runtime_evidence.get(str(profile.id)) or {}
+            )
+            freeze(
+                self._item(
+                    "learned_model_profile",
+                    str(profile.id),
+                    "learned-model-runtime-identity.v1",
+                    profile.participant_id,
+                    created_at.astimezone(self.timezone).date(),
+                    {
+                        "profile_id": str(profile.id),
+                        "participant_id": str(profile.participant_id),
+                        "version": profile.version,
+                        "parameters": parameters,
+                        "validation_status": profile.validation_status,
+                        "model_version": profile.model_version,
+                        "source": profile.source,
+                        "created_at": created_at.isoformat(),
+                        "parameters_hash": _hash(parameters),
+                        "model_selection": selection,
+                        "promotion_decision_id": selection.get(
+                            "promotion_decision_id"
+                        ),
+                        "parameter_learning_run_id": selection.get(
+                            "parameter_learning_run_id"
+                        ),
+                        "active_variant": runtime_evidence.get(
+                            "active_variant", "m0"
+                        ),
+                        "runtime_valid": runtime_evidence.get(
+                            "runtime_valid"
+                        ) is True,
+                        "runtime_validation": runtime_evidence,
                     },
                 )
             )
@@ -1406,6 +1469,7 @@ class ResearchEvaluationService:
             ),
             "warning_delivery_count": type_count("warning_delivery"),
             "participant_profile_count": type_count("participant_profile"),
+            "learned_model_profile_count": type_count("learned_model_profile"),
             "item_count": len(items),
             "manifest_hash": manifest_hash,
         }
@@ -1563,6 +1627,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V4,
             DATASET_SCHEMA_V5,
             DATASET_SCHEMA_V6,
+            DATASET_SCHEMA_V7,
         }:
             raise ValueError("unsupported dataset schema version")
         if manifest.get("schema_version") != schema_version:
@@ -1593,6 +1658,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V4,
             DATASET_SCHEMA_V5,
             DATASET_SCHEMA_V6,
+            DATASET_SCHEMA_V7,
         }:
             expected_counts["participant_count"] = participant_item_count
             expected_counts.update(
@@ -1608,7 +1674,11 @@ class ResearchEvaluationService:
                     ),
                 }
             )
-            if schema_version in {DATASET_SCHEMA_V5, DATASET_SCHEMA_V6}:
+            if schema_version in {
+                DATASET_SCHEMA_V5,
+                DATASET_SCHEMA_V6,
+                DATASET_SCHEMA_V7,
+            }:
                 expected_counts.update(
                     {
                         "care_intervention_exposure_count": sum(
@@ -1621,9 +1691,14 @@ class ResearchEvaluationService:
                         ),
                     }
                 )
-            if schema_version == DATASET_SCHEMA_V6:
+            if schema_version in {DATASET_SCHEMA_V6, DATASET_SCHEMA_V7}:
                 expected_counts["participant_profile_count"] = sum(
                     item["item_type"] == "participant_profile" for item in items
+                )
+            if schema_version == DATASET_SCHEMA_V7:
+                expected_counts["learned_model_profile_count"] = sum(
+                    item["item_type"] == "learned_model_profile"
+                    for item in items
                 )
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
@@ -1633,6 +1708,7 @@ class ResearchEvaluationService:
                 DATASET_SCHEMA_V4,
                 DATASET_SCHEMA_V5,
                 DATASET_SCHEMA_V6,
+                DATASET_SCHEMA_V7,
             }
             and participant_item_count <= 0
         ):
@@ -1653,6 +1729,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V4,
             DATASET_SCHEMA_V5,
             DATASET_SCHEMA_V6,
+            DATASET_SCHEMA_V7,
         }:
             participant_ids = {
                 item["participant_id"]
