@@ -500,7 +500,24 @@ def test_historical_online_filters_exact_promotion_identity_without_mixing_revis
     assert hash_run["metrics"]["config"]["model_identity_filter"] == {
         "promotion_parameters_hash": "hash-2"
     }
+    assert decision_run["metrics"]["config"]["snapshot_source_set"][
+        "promotion_decision_ids"
+    ] == ["decision-1", "decision-2"]
+    assert decision_run["metrics"]["config"]["evaluation_source_set"][
+        "promotion_decision_ids"
+    ] == ["decision-1"]
+    assert decision_run["metrics"]["config"]["evaluation_source_set"][
+        "promotion_parameters_hashes"
+    ] == ["hash-1"]
+    assert len(
+        decision_run["metrics"]["config"]["evaluation_source_set"][
+            "match_source_hashes"
+        ]
+    ) == 2
     assert mismatched_pair["metrics"]["matched_observation_count"] == 0
+    assert mismatched_pair["metrics"]["config"]["evaluation_source_set"][
+        "observation_ids"
+    ] == []
 
 
 def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
@@ -738,9 +755,12 @@ def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes()
         "manifest_hash"
     ]
     assert first_run["metrics"] == second_run["metrics"]
-    assert first_run["metrics"]["config"]["source_set"] == second_run[
+    assert first_run["metrics"]["config"]["snapshot_source_set"] == second_run[
         "metrics"
-    ]["config"]["source_set"]
+    ]["config"]["snapshot_source_set"]
+    assert first_run["metrics"]["config"]["evaluation_source_set"] == second_run[
+        "metrics"
+    ]["config"]["evaluation_source_set"]
 
     offline = service.create_evaluation_run(
         snapshot_id, "candidate.v1", evaluation_mode="offline_replay"

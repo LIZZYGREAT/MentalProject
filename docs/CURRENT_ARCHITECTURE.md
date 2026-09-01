@@ -225,7 +225,7 @@ participant-specific 查询仅在不可变条目能证明参与者出现时允�
 Schema v3 并冻结 participant membership；零观测参与者仍保留在 cohort 中，participant_count
 由 membership items 计算并纳入 manifest hash，participant-specific 零样本评估合法完成。
 Stage 2 新评估运行记录 `stage2-evaluation.v3`，已有运行保持原 provenance 不变；Stage 4
-新增运行记录 `stage4-evaluation.v4`。评估模式明确区分 `historical_online` 与执行候选模型族
+新增运行记录 `stage4-evaluation.v5`。评估模式明确区分 `historical_online` 与执行候选模型族
 Rolling-Origin 比较的 `offline_replay`。Instant Check-in
 只接受 research contract 定义的正式 `checkin` 类型；其他 StateObservation 即使包含压力字段也
 不会进入匹配、快照或 EMA 指标。Check-in 是用户主动观测，因此只报告 observed-day rate，
@@ -257,7 +257,7 @@ M2、M3 使用同一不可变快照与 expanding rolling-origin split，统一�
 纵向 EMA episode 继续估计 workload reactivity、recovery coefficient、上升/恢复响应速率 κ 与
 observed recovery efficiency。Admin 提供模型族比较表及参与者当前模型、候选模型和验证结果。
 
-Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v3` 直接调用真实
+Stage 4 candidate evaluation 由 `stage4-real-ctssm-replay.v4` 直接调用真实
 `AssessmentModel.predict_candidate → Simulator → step_latent_state`；目标时点 EMA 及未来 EMA
 不会提前 assimilate，候选区间来自 `LatentUncertainty/prediction_interval`，峰值指标使用完整 288 点
 trajectory。0030 新增 `model_promotion_decisions`：非 M0 只有在 completed offline replay、有效
@@ -287,10 +287,27 @@ state、daily causal origin、Calendar 与 known observations。原预测保留�
 系数的标准误、设计条件数、可识别状态及 boundary clipping。`not_identified` 的 workload/recovery
 参数不能晋级生产。
 
+Current M0 的训练参数由 restricted intercept-only
+`m0-training-fit.v1` 独立估计；WM0/M1/M2/M3 使用
+`workload-recovery-ridge.v2`。两者都只读取 split training evidence，`parameter_history`
+按 family 冻结 fit method 与 parameter fit version。`ctssm-promotion-gate.v2` 将
+identifiability 纳入正式 blocking check；`weak` 可通过但产生 warning，`not_identified` 必须失败，
+boundary clipping 在 v2 中作为非阻断 warning 展示给 Admin。
+
+Rolling-Origin 的最后一次训练参数仅保存为 `evaluation_candidate_*`，不会直接写入生产。
+`stage4-deployment-refit.v1` 在不访问 live EMA/Profile 的前提下，对同一 Dataset v4 中目标参与者
+截至 observation cutoff 的全部 eligible frozen evidence 重拟合，产出独立的
+`deployment_parameters`、`deployment_uncertainty` 与 `deployment_evidence`。生产晋级只消费这些
+deployment 字段；LearnedModelProfile 的 window、sample/day count 与 uncertainty 均来自真实 refit，
+model-selection provenance 同时保存 snapshot、knowledge cutoff 和 refit version。
+
 Participant promotion 在同一个数据库事务中写入 `ModelPromotionDecision` 与
 `LearnedModelProfile`，任一写入失败会同时回滚。`historical_online` 支持完整
 `model_identity_filter`，尤其可按 `promotion_decision_id` 与 `promotion_parameters_hash` 精确过滤；
 evaluation config 冻结 resolved filter 及实际匹配的 decision/hash 集合。
+来源审计同时保存 identity filtering 前 Dataset 全部候选来源的 `snapshot_source_set`，以及实际进入
+metrics 的 `evaluation_source_set`；后者包含 observation/forecast/match hash 与精确 promotion
+decision/parameters hash 集合。
 
 M3 使用 `recovery-debt-dynamics.v1`：
 $dF/dt=\alpha_FW(t)(1-F)-\lambda_FR(t)F$，并约束 $F\in[0,1]$。这一 bounded dynamics

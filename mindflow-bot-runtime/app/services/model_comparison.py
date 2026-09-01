@@ -29,7 +29,9 @@ MODEL_VARIANT_BY_FAMILY = {
     "m3": "m3",
 }
 ROLLING_ORIGIN_VERSION = "rolling-origin-knowledge-causal.v2"
-PROMOTION_GATE_VERSION = "ctssm-promotion-gate.v1"
+PROMOTION_GATE_VERSION = "ctssm-promotion-gate.v2"
+M0_PARAMETER_FIT_VERSION = "m0-training-fit.v1"
+WORKLOAD_PARAMETER_FIT_VERSION = "workload-recovery-ridge.v2"
 
 
 def _number(value: Any) -> float | None:
@@ -145,6 +147,48 @@ def _invert_three_by_three(matrix: list[list[float]]) -> list[list[float]]:
 
 def _infinity_norm(matrix: Sequence[Sequence[float]]) -> float:
     return max((sum(abs(value) for value in row) for row in matrix), default=0.0)
+
+
+def fit_current_m0_parameters(
+    samples: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Fit the restricted M0 intercept from training-only stress evidence.
+
+    M0 has no workload or recovery regressors.  Its least-squares intercept is
+    therefore the mean observed stress, not the intercept of the unrestricted
+    workload/recovery model.
+    """
+
+    usable = [
+        stress
+        for sample in samples
+        if (stress := _number(sample.get("actual_stress"))) is not None
+    ]
+    raw_baseline = mean(usable) if usable else 5.0
+    baseline = max(0.0, min(10.0, raw_baseline))
+    residuals = [stress - raw_baseline for stress in usable]
+    residual_sd = (
+        math.sqrt(sum(value * value for value in residuals) / (len(usable) - 1))
+        if len(usable) > 1
+        else None
+    )
+    standard_error = (
+        residual_sd / math.sqrt(len(usable))
+        if residual_sd is not None and usable
+        else None
+    )
+    return {
+        "stress_baseline_0_10": round(baseline, 4),
+        "sample_count": len(usable),
+        "residual_sd": round(residual_sd, 4) if residual_sd is not None else None,
+        "fit_method": "restricted-intercept-mean",
+        "parameter_fit_version": M0_PARAMETER_FIT_VERSION,
+        "boundary_clipped": raw_baseline != baseline,
+        "uncertainty_method": "restricted-mean-standard-error.v1",
+        "uncertainty": {
+            "stress_baseline_0_10": {"std_error": standard_error},
+        },
+    }
 
 
 def estimate_reactivity_and_recovery(
@@ -294,7 +338,22 @@ def estimate_reactivity_and_recovery(
             },
             "recovery_beta": {"std_error": coefficient_standard_errors[2]},
         },
+        "fit_method": "ridge-workload-recovery",
+        "parameter_fit_version": WORKLOAD_PARAMETER_FIT_VERSION,
     }
+
+
+def fit_workload_candidate_parameters(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    trait_resilience: float | None = None,
+) -> dict[str, Any]:
+    """Fit WM0/M1/M2/M3 parameters under their shared W/R contract."""
+
+    return estimate_reactivity_and_recovery(
+        samples,
+        trait_resilience=trait_resilience,
+    )
 
 
 def observed_recovery_efficiency(
@@ -534,9 +593,10 @@ def promotion_gate(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
     *,
+    parameter_evidence: Mapping[str, Any] | None = None,
     minimum_relative_mae_improvement: float = 0.03,
 ) -> dict[str, Any]:
-    """Apply the four mandatory non-inferiority/improvement checks."""
+    """Apply metric, support and parameter-evidence promotion checks."""
 
     baseline_mae, candidate_mae = _number(baseline.get("mae")), _number(candidate.get("mae"))
     relative = (
@@ -563,10 +623,40 @@ def promotion_gate(
     observable_support = candidate.get("observable_support")
     if isinstance(observable_support, Mapping):
         checks["observable_support"] = bool(observable_support.get("supported"))
+    evidence = dict(parameter_evidence or {})
+    identifiability = str(
+        evidence.get("identifiability_status") or "not_identified"
+    )
+    boundary_clipped = bool(evidence.get("boundary_clipped"))
+    checks["parameter_identifiability"] = identifiability in {
+        "identified",
+        "weak",
+    }
+    # Boundary clipping is visible in the formal checks but remains a
+    # non-blocking warning in gate v2.
+    checks["parameter_boundary"] = not boundary_clipped
+    warnings = []
+    if identifiability == "weak":
+        warnings.append("parameter_identifiability_weak")
+    elif identifiability not in {"identified", "weak"}:
+        warnings.append("parameter_not_identified")
+    if boundary_clipped:
+        warnings.append("parameter_boundary_clipped")
+    blocking_checks = {
+        name: passed
+        for name, passed in checks.items()
+        if name != "parameter_boundary"
+    }
     return {
         "gate_version": PROMOTION_GATE_VERSION,
-        "passed": all(checks.values()),
+        "passed": all(blocking_checks.values()),
         "checks": checks,
+        "warnings": warnings,
+        "parameter_identifiability": identifiability,
+        "parameter_boundary": {
+            "boundary_clipped": boundary_clipped,
+            "blocking": False,
+        },
         "relative_mae_improvement": round(relative, 6) if relative is not None else None,
         "sample_count": int(candidate.get("sample_count") or 0),
         "participant_effect": candidate.get("participant_effect"),

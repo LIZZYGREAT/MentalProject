@@ -485,6 +485,14 @@ class AssessmentModel:
         parameters = dict(baseline_params)
         parameters.pop("model_selection", None)
         parameters.pop("model_family", None)
+        if isinstance(parameters.get("ctssm_params"), dict):
+            restricted = dict(parameters["ctssm_params"])
+            restricted.pop("workload_stress_gain", None)
+            restricted.pop("recovery_stress_gain", None)
+            if restricted:
+                parameters["ctssm_params"] = restricted
+            else:
+                parameters.pop("ctssm_params", None)
         return self.predict(
             profile={"model_params": parameters},
             observations=list(observations),

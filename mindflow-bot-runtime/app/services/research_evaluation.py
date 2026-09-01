@@ -49,7 +49,7 @@ DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
 DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V4
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
-EVALUATION_CODE_VERSION = "stage4-evaluation.v4"
+EVALUATION_CODE_VERSION = "stage4-evaluation.v5"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
 MODEL_IDENTITY_FILTER_FIELDS = {
@@ -1513,28 +1513,65 @@ class ResearchEvaluationService:
                 and participant_id not in legacy_membership_evidence
             ):
                 raise ValueError("legacy_v2_snapshot_membership_unknown")
-        match_items = [
+        all_match_items = [
             item
             for item in items
             if item["item_type"] == "match_source"
-            and (participant_id is None or item["participant_id"] == participant_id)
         ]
-        source_set = {
-            "observation_ids": sorted(item["source_id"] for item in match_items),
-            "forecast_ids": sorted(
-                {str(item["metadata"].get("forecast_id")) for item in match_items}
-            ),
-            "match_source_hashes": sorted(
-                item["source_hash"] for item in match_items
-            ),
-        }
+        match_items = [
+            item
+            for item in all_match_items
+            if participant_id is None or item["participant_id"] == participant_id
+        ]
+
+        def source_set(source_items: list[dict[str, Any]]) -> dict[str, Any]:
+            contexts = [
+                dict((item["metadata"].get("context") or {}))
+                for item in source_items
+            ]
+            return {
+                "observation_ids": sorted(
+                    str(
+                        item["metadata"].get("observation_id")
+                        or item["source_id"]
+                    )
+                    for item in source_items
+                ),
+                "forecast_ids": sorted(
+                    {
+                        str(item["metadata"].get("forecast_id"))
+                        for item in source_items
+                        if item["metadata"].get("forecast_id")
+                    }
+                ),
+                "match_source_hashes": sorted(
+                    item["source_hash"] for item in source_items
+                ),
+                "promotion_decision_ids": sorted(
+                    {
+                        str(context.get("promotion_decision_id"))
+                        for context in contexts
+                        if context.get("promotion_decision_id")
+                    }
+                ),
+                "promotion_parameters_hashes": sorted(
+                    {
+                        str(context.get("promotion_parameters_hash"))
+                        for context in contexts
+                        if context.get("promotion_parameters_hash")
+                    }
+                ),
+            }
         config = {
             "evaluation_mode": evaluation_mode,
             "dataset_schema_version": snapshot_view["schema_version"],
             "manifest_hash": manifest_hash,
             "model_version": model_version,
             "evaluation_code_version": EVALUATION_CODE_VERSION,
-            "source_set": source_set,
+            "dataset_snapshot_id": str(snapshot_id),
+            "observation_cutoff": snapshot_view["observation_cutoff"],
+            "calendar_cutoff": snapshot_view["calendar_cutoff"],
+            "snapshot_source_set": source_set(all_match_items),
             "model_identity_filter": (
                 dict(resolved_identity_filter)
                 if resolved_identity_filter is not None
@@ -1551,7 +1588,7 @@ class ResearchEvaluationService:
             )
             status = "completed"
         else:
-            matches = []
+            matched_items = []
             for item in match_items:
                 metadata = dict(item["metadata"])
                 context = dict(metadata.get("context") or {})
@@ -1569,7 +1606,9 @@ class ResearchEvaluationService:
                         context.get("model_variant"),
                     }
                 if matched:
-                    matches.append(metadata)
+                    matched_items.append(item)
+            matches = [dict(item["metadata"]) for item in matched_items]
+            config["evaluation_source_set"] = source_set(matched_items)
             config["matched_promotion_decision_ids"] = sorted(
                 {
                     str((item.get("context") or {}).get("promotion_decision_id"))
@@ -1760,6 +1799,7 @@ class ResearchEvaluationService:
             metrics = dict(comparison.get(family) or {})
             if not metrics:
                 continue
+            gate = dict(promotion.get(family) or {})
             rows.append(
                 {
                     "model_family": family,
@@ -1770,7 +1810,12 @@ class ResearchEvaluationService:
                     "peak_timing_error_minutes": metrics.get("peak_timing_error_minutes"),
                     "sample_count": metrics.get("sample_count"),
                     "high_stress_recall": metrics.get("high_stress_recall"),
-                    "promotion": promotion.get(family),
+                    "identifiability": gate.get(
+                        "parameter_identifiability"
+                    ),
+                    "boundary": gate.get("parameter_boundary"),
+                    "promotion_warnings": list(gate.get("warnings") or []),
+                    "promotion": gate or None,
                 }
             )
         current_model = "current_m0"

@@ -25,6 +25,8 @@ from app.services.model_comparison import (
     comparison_metrics,
     estimate_reactivity_and_recovery,
     estimate_response_rates,
+    fit_current_m0_parameters,
+    fit_workload_candidate_parameters,
     observed_recovery_efficiency,
     promotion_gate,
     rolling_origin_splits,
@@ -38,7 +40,10 @@ from app.services.profile_calibration import ProfileCalibrationService
 from app.services.model_comparison import PROMOTION_GATE_VERSION
 from app.services.model_promotion import ModelPromotionService
 from app.services.research_evaluation import EVALUATION_CODE_VERSION
-from app.services.stage4_candidate_replay import Stage4CandidateReplayService
+from app.services.stage4_candidate_replay import (
+    DEPLOYMENT_REFIT_VERSION,
+    Stage4CandidateReplayService,
+)
 from entity.user import User
 from mindflow_core.assessment import AssessmentModel
 from tests.helpers import memory_database, participant
@@ -294,6 +299,31 @@ def test_ridge_covariance_uncertainty_and_identifiability_are_auditable():
     )
     assert clipped["boundary_clipped"] is True
     assert clipped["workload_reactivity_beta"] == 0.0
+
+
+def test_current_m0_uses_restricted_training_fit_not_workload_intercept():
+    samples = [
+        {
+            "actual_stress": 5.0 + 3.0 * workload,
+            "workload": workload,
+            "recovery": recovery,
+        }
+        for _ in range(100)
+        for workload, recovery in (
+            (0.0, 0.0),
+            (1.0, 0.25),
+            (0.0, 0.75),
+            (1.0, 1.0),
+        )
+    ]
+    m0 = fit_current_m0_parameters(samples)
+    full = fit_workload_candidate_parameters(samples)
+
+    assert full["stress_baseline_0_10"] == pytest.approx(5.0, abs=0.05)
+    assert m0["stress_baseline_0_10"] == pytest.approx(6.5)
+    assert m0["parameter_fit_version"] == "m0-training-fit.v1"
+    assert full["parameter_fit_version"] == "workload-recovery-ridge.v2"
+    assert "workload_reactivity_beta" not in m0
 
 
 def test_historical_calibration_uses_only_brs_known_by_through_date():
@@ -588,10 +618,29 @@ def test_rolling_origin_metrics_and_promotion_gate_cover_all_stage4_checks():
         "high_stress_recall": 0.7,
         "participant_effect": [{"participant_id": "p", "mae_delta": -0.04}],
     }
-    gate = promotion_gate(baseline, candidate)
+    gate = promotion_gate(
+        baseline,
+        candidate,
+        parameter_evidence={
+            "identifiability_status": "weak",
+            "boundary_clipped": True,
+        },
+    )
     assert gate["passed"] is True
-    assert all(gate["checks"].values())
+    assert gate["checks"]["parameter_identifiability"] is True
+    assert gate["checks"]["parameter_boundary"] is False
+    assert gate["warnings"] == [
+        "parameter_identifiability_weak",
+        "parameter_boundary_clipped",
+    ]
     assert gate["participant_effect"] == candidate["participant_effect"]
+    rejected = promotion_gate(
+        baseline,
+        candidate,
+        parameter_evidence={"identifiability_status": "not_identified"},
+    )
+    assert rejected["passed"] is False
+    assert rejected["checks"]["parameter_identifiability"] is False
 
 
 def test_dataset_v4_freezes_brs_and_slow_recovery_evidence():
@@ -728,7 +777,11 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
         items,
         participant_id=None,
         requested_family="all",
-        config={"manifest_hash": "frozen"},
+        config={
+            "manifest_hash": "frozen",
+            "dataset_snapshot_id": "frozen-snapshot",
+            "observation_cutoff": "2030-01-05T00:00:00+00:00",
+        },
     )
     assert result["status"] == "completed"
     assert result["rolling_origin"]["split_count"] == 2
@@ -756,8 +809,20 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
         "day_count",
     } <= set(result["comparison"]["m3"]["observable_support"]["counts"])
     assert result["promotion"]["m2"]["checks"]["observable_support"] is False
-    assert result["parameter_history"][0]["trait_resilience_prior"] is None
-    assert result["parameter_history"][1]["trait_resilience_prior"] is None
+    assert result["promotion"]["m1"]["checks"][
+        "parameter_identifiability"
+    ] is False
+    assert result["promotion"]["m1"]["passed"] is False
+    candidate_history = [
+        row
+        for row in result["parameter_history"]
+        if row["family"] == "m1"
+    ]
+    assert candidate_history[0]["trait_resilience_prior"] is None
+    assert candidate_history[1]["trait_resilience_prior"] is None
+    assert {
+        row["family"] for row in result["parameter_history"]
+    } == set(MODEL_FAMILIES)
     assert all(
         row["target_observation_assimilated"] is False
         and row["interval_source"] == "LatentUncertainty/prediction_interval"
@@ -766,16 +831,16 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert all(
         result["comparison"][family]["replay_engine"]
-        == "stage4-real-ctssm-replay.v3"
+        == "stage4-real-ctssm-replay.v4"
         for family in ("workload_aware_m0", "m1", "m2", "m3")
     )
     participant_key = str(person_id)
     final_fit = [
         row
         for row in result["parameter_history"]
-        if row["participant_id"] == participant_key
+        if row["participant_id"] == participant_key and row["family"] == "m1"
     ][-1]
-    uncertainty = result["candidate_parameter_uncertainty"][participant_key]
+    uncertainty = result["evaluation_candidate_uncertainty"][participant_key]
     assert uncertainty["S_star_init"]["std_error"] == pytest.approx(
         final_fit["uncertainty"]["stress_baseline_0_10"]["std_error"] * 10.0
     )
@@ -785,13 +850,31 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
         final_fit["uncertainty"]["workload_reactivity_beta"]["std_error"]
         * 10.0
     )
-    assert "stress_reactivity_per_hour" not in result["candidate_parameters"][
-        participant_key
-    ]["ctssm_params"]
+    assert "stress_reactivity_per_hour" not in result[
+        "evaluation_candidate_parameters"
+    ][participant_key]["ctssm_params"]
+    evaluation_evidence = result["evaluation_candidate_evidence"][participant_key]
+    deployment_evidence = result["deployment_evidence"][participant_key]
+    assert evaluation_evidence["sample_count"] == 3
+    assert evaluation_evidence["window_end"] == "2030-01-03"
+    assert deployment_evidence["sample_count"] == 4
+    assert deployment_evidence["window_start"] == "2030-01-01"
+    assert deployment_evidence["window_end"] == "2030-01-04"
+    assert deployment_evidence["dataset_snapshot_id"] == "frozen-snapshot"
+    assert deployment_evidence["deployment_refit_version"] == (
+        DEPLOYMENT_REFIT_VERSION
+    )
+    assert result["deployment_uncertainty"][participant_key]["estimation"][
+        "sample_count"
+    ] == 4
     assert result["config"]["initial_state_provenance_complete"] is True
     assert result["config"]["candidate_latent_initialization"]["version"] == (
         "candidate-latent-initialization.v1"
     )
+    assert result["config"]["evaluation_source_set"]["observation_ids"] == [
+        "observation-3",
+        "observation-4",
+    ]
     assert result["historical_production"]["mae"] == 2.7
     assert result["comparison"]["current_m0"]["mae"] != 2.7
     m0_audit = [
@@ -867,6 +950,12 @@ def test_production_candidate_requires_durable_promotion_provenance():
         "day_count": 3,
         "transition_count": 4,
         "identifiability_status": "weak",
+        "boundary_clipped": False,
+        "window_start": "2030-01-01",
+        "window_end": "2030-01-03",
+        "knowledge_cutoff": "2030-01-04T00:00:00+00:00",
+        "dataset_snapshot_id": snapshot["id"],
+        "deployment_refit_version": DEPLOYMENT_REFIT_VERSION,
     }
     with database.session() as session:
         run = ModelEvaluationRun(
@@ -885,15 +974,22 @@ def test_production_candidate_requires_durable_promotion_provenance():
                     "m1": {
                         "passed": True,
                         "gate_version": PROMOTION_GATE_VERSION,
+                        "checks": {"parameter_identifiability": True},
+                        "parameter_identifiability": "weak",
+                        "parameter_boundary": {
+                            "boundary_clipped": False,
+                            "blocking": False,
+                        },
+                        "warnings": ["parameter_identifiability_weak"],
                     }
                 },
-                    "candidate_parameters": {
+                    "deployment_parameters": {
                         str(person.id): candidate_params,
                     },
-                    "candidate_parameter_uncertainty": {
+                    "deployment_uncertainty": {
                         str(person.id): candidate_uncertainty,
                     },
-                    "candidate_parameter_evidence": {
+                    "deployment_evidence": {
                         str(person.id): candidate_evidence,
                     },
             },
@@ -932,6 +1028,26 @@ def test_production_candidate_requires_durable_promotion_provenance():
             run_id, participant_id=other.id, model_family="m1"
         )
 
+    with database.session() as session:
+        row = session.get(ModelEvaluationRun, run_id)
+        payload = dict(row.metrics_json)
+        deployment_evidence = dict(payload["deployment_evidence"])
+        deployment_evidence[str(person.id)] = {
+            **deployment_evidence[str(person.id)],
+            "identifiability_status": "not_identified",
+        }
+        row.metrics_json = {**payload, "deployment_evidence": deployment_evidence}
+    with pytest.raises(ValueError, match="promotion parameters are not identifiable"):
+        promotion_service.promote_candidate(
+            run_id, participant_id=person.id, model_family="m1"
+        )
+    with database.session() as session:
+        row = session.get(ModelEvaluationRun, run_id)
+        payload = dict(row.metrics_json)
+        deployment_evidence = dict(payload["deployment_evidence"])
+        deployment_evidence[str(person.id)] = candidate_evidence
+        row.metrics_json = {**payload, "deployment_evidence": deployment_evidence}
+
     decision = promotion_service.promote_candidate(
         run_id, participant_id=person.id, model_family="m1"
     )
@@ -945,6 +1061,11 @@ def test_production_candidate_requires_durable_promotion_provenance():
     assert active["confidence"] < 1.0
     assert "model_selection" not in active["uncertainty"]
     assert "stress_reactivity_per_hour" not in active["parameters"]["ctssm_params"]
+    assert active["window_start"] == "2030-01-01"
+    assert active["window_end"] == "2030-01-03"
+    assert active["parameters"]["model_selection"][
+        "deployment_refit_version"
+    ] == DEPLOYMENT_REFIT_VERSION
     learned.save(
         person.id,
         parameters={"S_star_init": 99.0},
@@ -962,6 +1083,14 @@ def test_production_candidate_requires_durable_promotion_provenance():
     assert dashboard["latest_run"]["scope"] == "participant"
     assert dashboard["latest_run"]["id"] == str(run_id)
     assert dashboard["cohort_latest_run"]["scope"] == "cohort"
+    dashboard_m1 = next(
+        row for row in dashboard["rows"] if row["model_family"] == "m1"
+    )
+    assert dashboard_m1["identifiability"] == "weak"
+    assert dashboard_m1["boundary"]["boundary_clipped"] is False
+    assert dashboard_m1["promotion_warnings"] == [
+        "parameter_identifiability_weak"
+    ]
 
 
 def test_production_model_identity_distinguishes_m0_m1_and_m3():
@@ -1033,10 +1162,11 @@ def test_participant_promotion_rolls_back_decision_and_profile_atomically(
                     "m1": {
                         "passed": True,
                         "gate_version": PROMOTION_GATE_VERSION,
+                        "checks": {"parameter_identifiability": True},
                     }
                 },
-                "candidate_parameters": {str(person.id): candidate_params},
-                "candidate_parameter_uncertainty": {
+                "deployment_parameters": {str(person.id): candidate_params},
+                "deployment_uncertainty": {
                     str(person.id): {
                         "S_star_init": {"std_error": 1.0},
                         "ctssm_params": {
@@ -1045,12 +1175,18 @@ def test_participant_promotion_rolls_back_decision_and_profile_atomically(
                         },
                     }
                 },
-                "candidate_parameter_evidence": {
+                "deployment_evidence": {
                     str(person.id): {
                         "sample_count": 12,
                         "day_count": 3,
                         "transition_count": 4,
                         "identifiability_status": "identified",
+                        "boundary_clipped": False,
+                        "window_start": "2030-02-01",
+                        "window_end": "2030-02-03",
+                        "knowledge_cutoff": "2030-02-04T00:00:00+00:00",
+                        "dataset_snapshot_id": snapshot["id"],
+                        "deployment_refit_version": DEPLOYMENT_REFIT_VERSION,
                     }
                 },
             },

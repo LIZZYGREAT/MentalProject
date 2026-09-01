@@ -12,8 +12,9 @@ from app.services.model_comparison import (
     MODEL_VARIANT_BY_FAMILY,
     ROLLING_ORIGIN_VERSION,
     comparison_metrics,
-    estimate_reactivity_and_recovery,
     estimate_response_rates,
+    fit_current_m0_parameters,
+    fit_workload_candidate_parameters,
     observed_recovery_efficiency,
     promotion_gate,
     rolling_origin_splits,
@@ -24,8 +25,9 @@ from mindflow_core.assessment import AssessmentModel
 
 
 OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
-REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v3"
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v4"
 CANDIDATE_LATENT_INITIALIZATION_VERSION = "candidate-latent-initialization.v1"
+DEPLOYMENT_REFIT_VERSION = "stage4-deployment-refit.v1"
 
 
 def _number(value: Any) -> float | None:
@@ -59,6 +61,142 @@ def _trajectory_peak(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "trajectory_peak_time": str(point.get("time") or "")[:5] if point else None,
     }
+
+
+def _candidate_parameters(fitted: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "S_star_init": float(fitted["stress_baseline_0_10"]) * 10.0,
+        "ctssm_params": {
+            "workload_stress_gain": (
+                float(fitted["workload_reactivity_beta"]) * 10.0
+            ),
+            "recovery_stress_gain": float(fitted["recovery_beta"]) * 10.0,
+        },
+    }
+
+
+def _candidate_uncertainty(fitted: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(fitted.get("uncertainty") or {})
+
+    def scaled(name: str) -> dict[str, float | None]:
+        value = _number((source.get(name) or {}).get("std_error"))
+        return {
+            "std_error": round(value * 10.0, 6) if value is not None else None
+        }
+
+    return {
+        "S_star_init": scaled("stress_baseline_0_10"),
+        "ctssm_params": {
+            "workload_stress_gain": scaled("workload_reactivity_beta"),
+            "recovery_stress_gain": scaled("recovery_beta"),
+        },
+        "estimation": {
+            "fit_method": fitted.get("fit_method"),
+            "parameter_fit_version": fitted.get("parameter_fit_version"),
+            "uncertainty_method": fitted.get("uncertainty_method"),
+            "ridge_lambda": fitted.get("ridge_lambda"),
+            "sample_count": fitted.get("sample_count"),
+            "design_condition_number": fitted.get("design_condition_number"),
+            "identifiability_status": fitted.get("identifiability_status"),
+            "boundary_clipped": bool(fitted.get("boundary_clipped")),
+        },
+    }
+
+
+class Stage4DeploymentRefitService:
+    """Refit production parameters exclusively from one frozen snapshot."""
+
+    def refit(
+        self,
+        frozen: Mapping[str, Any],
+        samples: Sequence[Mapping[str, Any]],
+        *,
+        participant_id: Any | None,
+        knowledge_cutoff: datetime,
+        dataset_snapshot_id: str | None,
+    ) -> dict[str, Any]:
+        eligible = [
+            dict(sample)
+            for sample in samples
+            if (participant_id is None or str(sample["participant_id"]) == str(participant_id))
+            and _aware(sample["observation_created_at"]) <= knowledge_cutoff
+        ]
+        by_participant: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for sample in eligible:
+            by_participant[str(sample["participant_id"])].append(sample)
+
+        parameters: dict[str, dict[str, Any]] = {}
+        uncertainty: dict[str, dict[str, Any]] = {}
+        evidence: dict[str, dict[str, Any]] = {}
+        for participant, participant_samples in by_participant.items():
+            fit_samples = []
+            for sample in participant_samples:
+                observed_at = _aware(sample["observed_at"])
+                eligible_slow = [
+                    state
+                    for state in frozen.get("slow_history", {}).get(participant, [])
+                    if state[0] <= knowledge_cutoff and state[3] <= observed_at
+                ]
+                slow = (
+                    max(eligible_slow, key=lambda state: state[0])
+                    if eligible_slow
+                    else None
+                )
+                fit_samples.append(
+                    {
+                        **sample,
+                        "recovery": max(
+                            float(sample.get("recovery_without_slow") or 0.0),
+                            slow[1] if slow else 0.0,
+                        ),
+                        "recovery_observed": bool(
+                            sample.get("recovery_observed_without_slow")
+                            or slow is not None
+                        ),
+                        "sleep_debt": slow[2] if slow else 0.0,
+                    }
+                )
+            priors = [
+                value
+                for value in frozen.get("brs_history", {}).get(participant, [])
+                if value[0] <= knowledge_cutoff
+            ]
+            prior = max(priors, key=lambda value: value[0])[1] if priors else None
+            fitted = fit_workload_candidate_parameters(
+                fit_samples,
+                trait_resilience=prior,
+            )
+            rates = estimate_response_rates(fit_samples, fitted)
+            local_dates = sorted({str(row["local_date"]) for row in fit_samples})
+            transition_count = int(rates["response_transition_count"]) + int(
+                rates["recovery_transition_count"]
+            )
+            parameters[participant] = _candidate_parameters(fitted)
+            uncertainty[participant] = _candidate_uncertainty(fitted)
+            evidence[participant] = {
+                "sample_count": len(fit_samples),
+                "day_count": len(local_dates),
+                "window_start": local_dates[0] if local_dates else None,
+                "window_end": local_dates[-1] if local_dates else None,
+                "transition_count": transition_count,
+                "identifiability_status": fitted.get("identifiability_status"),
+                "boundary_clipped": bool(fitted.get("boundary_clipped")),
+                "design_condition_number": fitted.get("design_condition_number"),
+                "knowledge_cutoff": knowledge_cutoff.isoformat(),
+                "dataset_snapshot_id": dataset_snapshot_id,
+                "deployment_refit_version": DEPLOYMENT_REFIT_VERSION,
+                "parameter_fit_version": fitted.get("parameter_fit_version"),
+                "observation_ids": sorted(
+                    str(row.get("observation_id") or "")
+                    for row in fit_samples
+                    if row.get("observation_id")
+                ),
+            }
+        return {
+            "parameters": parameters,
+            "uncertainty": uncertainty,
+            "evidence": evidence,
+        }
 
 
 class Stage4CandidateReplayService:
@@ -270,6 +408,7 @@ class Stage4CandidateReplayService:
                     "observed_at": observed_at.isoformat(),
                     "observation_created_at": observation_created_at.isoformat(),
                     "forecast_id": forecast_id,
+                    "match_source_hash": item.get("source_hash"),
                     "actual_stress": actual,
                     "current_prediction": current_prediction,
                     "historical_production_prediction": current_prediction,
@@ -306,45 +445,6 @@ class Stage4CandidateReplayService:
             "observation_history": observation_history,
             "brs_history": brs_history,
             "slow_history": slow_history,
-        }
-
-    @staticmethod
-    def _candidate_parameters(fitted: Mapping[str, Any]) -> dict[str, Any]:
-        ctssm = {
-            "workload_stress_gain": float(fitted["workload_reactivity_beta"]) * 10.0,
-            "recovery_stress_gain": float(fitted["recovery_beta"]) * 10.0,
-        }
-        return {
-            "S_star_init": float(fitted["stress_baseline_0_10"]) * 10.0,
-            "ctssm_params": ctssm,
-        }
-
-    @staticmethod
-    def _candidate_uncertainty(fitted: Mapping[str, Any]) -> dict[str, Any]:
-        source = dict(fitted.get("uncertainty") or {})
-
-        def scaled(name: str) -> dict[str, float | None]:
-            value = _number((source.get(name) or {}).get("std_error"))
-            return {"std_error": round(value * 10.0, 6) if value is not None else None}
-
-        return {
-            "S_star_init": scaled("stress_baseline_0_10"),
-            "ctssm_params": {
-                "workload_stress_gain": scaled("workload_reactivity_beta"),
-                "recovery_stress_gain": scaled("recovery_beta"),
-            },
-            "estimation": {
-                "uncertainty_method": fitted.get("uncertainty_method"),
-                "ridge_lambda": fitted.get("ridge_lambda"),
-                "sample_count": fitted.get("sample_count"),
-                "design_condition_number": fitted.get(
-                    "design_condition_number"
-                ),
-                "identifiability_status": fitted.get(
-                    "identifiability_status"
-                ),
-                "boundary_clipped": bool(fitted.get("boundary_clipped")),
-            },
         }
 
     @staticmethod
@@ -474,6 +574,54 @@ class Stage4CandidateReplayService:
         frozen = self._extract(items, participant_id)
         samples = frozen["samples"]
         splits = rolling_origin_splits(samples, minimum_training_days=2)
+        metric_indices = sorted(
+            {
+                index
+                for split in splits
+                for index in split["test_indices"]
+            }
+        )
+        metric_samples = [samples[index] for index in metric_indices]
+        evaluation_source_set = {
+            "observation_ids": sorted(
+                str(row.get("observation_id"))
+                for row in metric_samples
+                if row.get("observation_id")
+            ),
+            "forecast_ids": sorted(
+                {
+                    str(row["forecast_id"])
+                    for row in metric_samples
+                    if row.get("forecast_id")
+                }
+            ),
+            "match_source_hashes": sorted(
+                str(row["match_source_hash"])
+                for row in metric_samples
+                if row.get("match_source_hash")
+            ),
+            "promotion_decision_ids": sorted(
+                {
+                    str((row.get("context") or {}).get("promotion_decision_id"))
+                    for row in metric_samples
+                    if (row.get("context") or {}).get("promotion_decision_id")
+                }
+            ),
+            "promotion_parameters_hashes": sorted(
+                {
+                    str(
+                        (row.get("context") or {}).get(
+                            "promotion_parameters_hash"
+                        )
+                    )
+                    for row in metric_samples
+                    if (row.get("context") or {}).get(
+                        "promotion_parameters_hash"
+                    )
+                }
+            ),
+        }
+        config = {**config, "evaluation_source_set": evaluation_source_set}
         if not splits:
             return {
                 "config": config,
@@ -488,9 +636,9 @@ class Stage4CandidateReplayService:
         }
         parameter_history = []
         replay_audit = []
-        final_parameters: dict[str, dict[str, Any]] = {}
-        final_uncertainty: dict[str, dict[str, Any]] = {}
-        final_evidence: dict[str, dict[str, Any]] = {}
+        evaluation_parameters: dict[str, dict[str, Any]] = {}
+        evaluation_uncertainty: dict[str, dict[str, Any]] = {}
+        evaluation_evidence: dict[str, dict[str, Any]] = {}
         initial_state_provenance_complete = True
         for split in splits:
             origin_cutoff = datetime.combine(
@@ -554,23 +702,48 @@ class Stage4CandidateReplayService:
                     if value[0] < origin_cutoff
                 ]
                 prior = max(priors, key=lambda value: value[0])[1] if priors else None
-                fitted = estimate_reactivity_and_recovery(fit_samples, trait_resilience=prior)
+                m0_fitted = fit_current_m0_parameters(fit_samples)
+                fitted = fit_workload_candidate_parameters(
+                    fit_samples,
+                    trait_resilience=prior,
+                )
                 rates = estimate_response_rates(fit_samples, fitted)
-                candidate_params = self._candidate_parameters(fitted)
-                candidate_uncertainty = self._candidate_uncertainty(fitted)
+                m0_params = {
+                    "S_star_init": (
+                        float(m0_fitted["stress_baseline_0_10"]) * 10.0
+                    ),
+                }
+                candidate_params = _candidate_parameters(fitted)
+                candidate_uncertainty = _candidate_uncertainty(fitted)
                 transition_count = int(rates["response_transition_count"]) + int(
                     rates["recovery_transition_count"]
                 )
+                common_history = {
+                    "split_index": split["split_index"],
+                    "participant_id": participant,
+                    "origin_cutoff": origin_cutoff.isoformat(),
+                    "training_sample_count": len(fit_samples),
+                }
                 parameter_history.append(
                     {
-                        "split_index": split["split_index"],
-                        "participant_id": participant,
-                        "origin_cutoff": origin_cutoff.isoformat(),
-                        "training_sample_count": len(fit_samples),
-                        **fitted,
-                        **rates,
-                        **observed_recovery_efficiency(fit_samples),
+                        **common_history,
+                        "family": "current_m0",
+                        **m0_fitted,
                     }
+                )
+                candidate_history = {
+                    **common_history,
+                    **fitted,
+                    **rates,
+                    **observed_recovery_efficiency(fit_samples),
+                }
+                parameter_history.extend(
+                    {
+                        **candidate_history,
+                        "family": family,
+                    }
+                    for family in MODEL_FAMILIES
+                    if family != "current_m0"
                 )
                 participant_slow = [
                     value
@@ -648,7 +821,7 @@ class Stage4CandidateReplayService:
                             "sleep_debt_hours": sleep_debt,
                         }
                         if family == "current_m0":
-                            replay_arguments["baseline_params"] = candidate_params
+                            replay_arguments["baseline_params"] = m0_params
                         else:
                             replay_arguments["model_variant"] = variant
                             replay_arguments["candidate_params"] = candidate_params
@@ -681,7 +854,7 @@ class Stage4CandidateReplayService:
                                 "sleep_debt_hours": sleep_debt,
                             }
                             if family == "current_m0":
-                                origin_arguments["baseline_params"] = candidate_params
+                                origin_arguments["baseline_params"] = m0_params
                             else:
                                 origin_arguments["model_variant"] = variant
                                 origin_arguments["candidate_params"] = candidate_params
@@ -717,9 +890,9 @@ class Stage4CandidateReplayService:
                                 "interval_source": "LatentUncertainty/prediction_interval",
                             }
                         )
-                final_parameters[participant] = candidate_params
-                final_uncertainty[participant] = candidate_uncertainty
-                final_evidence[participant] = {
+                evaluation_parameters[participant] = candidate_params
+                evaluation_uncertainty[participant] = candidate_uncertainty
+                evaluation_evidence[participant] = {
                     "sample_count": len(fit_samples),
                     "day_count": len(
                         {str(value["local_date"]) for value in fit_samples}
@@ -731,6 +904,19 @@ class Stage4CandidateReplayService:
                     "boundary_clipped": bool(fitted.get("boundary_clipped")),
                     "design_condition_number": fitted.get(
                         "design_condition_number"
+                    ),
+                    "window_start": (
+                        min(str(value["local_date"]) for value in fit_samples)
+                        if fit_samples
+                        else None
+                    ),
+                    "window_end": (
+                        max(str(value["local_date"]) for value in fit_samples)
+                        if fit_samples
+                        else None
+                    ),
+                    "parameter_fit_version": fitted.get(
+                        "parameter_fit_version"
                     ),
                 }
 
@@ -766,8 +952,45 @@ class Stage4CandidateReplayService:
                 "replay_engine": "frozen_historical_production",
             }
         )
+        cutoff_value = config.get("observation_cutoff")
+        try:
+            knowledge_cutoff = _aware(cutoff_value)
+        except (TypeError, ValueError):
+            knowledge_cutoff = datetime.max.replace(tzinfo=timezone.utc)
+        deployment = Stage4DeploymentRefitService().refit(
+            frozen,
+            samples,
+            participant_id=participant_id,
+            knowledge_cutoff=knowledge_cutoff,
+            dataset_snapshot_id=(
+                str(config.get("dataset_snapshot_id"))
+                if config.get("dataset_snapshot_id")
+                else None
+            ),
+        )
+        deployment_evidence = list(deployment["evidence"].values())
+        statuses = {
+            str(value.get("identifiability_status") or "not_identified")
+            for value in deployment_evidence
+        }
+        aggregate_parameter_evidence = {
+            "identifiability_status": (
+                "not_identified"
+                if not statuses or "not_identified" in statuses
+                else "weak" if "weak" in statuses else "identified"
+            ),
+            "boundary_clipped": any(
+                bool(value.get("boundary_clipped"))
+                for value in deployment_evidence
+            ),
+            "participant_count": len(deployment_evidence),
+        }
         promotion = {
-            family: promotion_gate(comparison["current_m0"], comparison[family])
+            family: promotion_gate(
+                comparison["current_m0"],
+                comparison[family],
+                parameter_evidence=aggregate_parameter_evidence,
+            )
             for family in MODEL_FAMILIES
             if family != "current_m0"
         }
@@ -783,6 +1006,7 @@ class Stage4CandidateReplayService:
                     "min(0.25,sleep_debt_hours*0.04), 0, 0.75)"
                 ),
             },
+            "deployment_refit_version": DEPLOYMENT_REFIT_VERSION,
             "initial_state_provenance_complete": initial_state_provenance_complete,
         }
         return {
@@ -796,8 +1020,11 @@ class Stage4CandidateReplayService:
             "requested_family": requested_family,
             "metrics": comparison.get(requested_family) if requested_family != "all" else None,
             "parameter_history": parameter_history,
-            "candidate_parameters": final_parameters,
-            "candidate_parameter_uncertainty": final_uncertainty,
-            "candidate_parameter_evidence": final_evidence,
+            "evaluation_candidate_parameters": evaluation_parameters,
+            "evaluation_candidate_uncertainty": evaluation_uncertainty,
+            "evaluation_candidate_evidence": evaluation_evidence,
+            "deployment_parameters": deployment["parameters"],
+            "deployment_uncertainty": deployment["uncertainty"],
+            "deployment_evidence": deployment["evidence"],
             "replay_audit": replay_audit,
         }

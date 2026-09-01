@@ -226,7 +226,11 @@ Forecast 冻结因果来源，workload revision 参与 Forecast cache identity�
 v8 WM0/M1/M2/M3 的 model spec、promotion decision 与 parameters hash。Current M0 与候选族均由真实
 Simulator 回放；historical production 仅单独报告。Ridge coefficient uncertainty 使用 posterior
 covariance 并执行 identifiability gate；participant promotion decision/profile 在同一事务提交，历史评估
-可按 promotion decision 或 parameters hash 精确筛选。
+可按 promotion decision 或 parameters hash 精确筛选。Replay v4 进一步将 Current M0 的
+`m0-training-fit.v1` restricted baseline 与候选族 `workload-recovery-ridge.v2` 分离；promotion gate v2
+公开 identifiability、boundary 和 warnings。Rolling 参数只作 evaluation evidence，生产 Profile 仅使用
+同一冻结 Dataset v4 全窗口的 `stage4-deployment-refit.v1` 参数、协方差与真实 refit window。评估来源
+分别记录 identity filter 前的 `snapshot_source_set` 和实际进入 metrics 的 `evaluation_source_set`。
 
 部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
 飞书卡片回调配置为真实可访问的 HTTPS 地址；本地

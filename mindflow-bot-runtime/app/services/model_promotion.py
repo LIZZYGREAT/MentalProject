@@ -19,6 +19,7 @@ from app.models import (
 from app.repositories import LearnedProfileRepository, promotion_parameters_hash
 from app.services.model_comparison import MODEL_VARIANT_BY_FAMILY, PROMOTION_GATE_VERSION
 from app.services.research_evaluation import EVALUATION_CODE_VERSION, ResearchEvaluationService
+from app.services.stage4_candidate_replay import DEPLOYMENT_REFIT_VERSION
 
 
 class ModelPromotionService:
@@ -222,30 +223,64 @@ class ModelPromotionService:
             gate = dict(promotion[family])
             if gate.get("gate_version") != PROMOTION_GATE_VERSION:
                 raise ValueError("unsupported promotion gate version")
-            candidate_parameters = dict(metrics.get("candidate_parameters") or {})
-            candidate_uncertainty = dict(
-                metrics.get("candidate_parameter_uncertainty") or {}
+            if (gate.get("checks") or {}).get(
+                "parameter_identifiability"
+            ) is not True:
+                raise ValueError("candidate did not pass parameter identifiability gate")
+            deployment_parameters = dict(
+                metrics.get("deployment_parameters") or {}
             )
-            candidate_evidence = dict(
-                metrics.get("candidate_parameter_evidence") or {}
+            deployment_uncertainty = dict(
+                metrics.get("deployment_uncertainty") or {}
+            )
+            deployment_evidence = dict(
+                metrics.get("deployment_evidence") or {}
             )
             participant_parameters = (
-                dict(candidate_parameters.get(str(target_participant)) or {})
+                dict(deployment_parameters.get(str(target_participant)) or {})
                 if target_participant is not None
                 else {}
             )
             if target_participant is not None and not participant_parameters:
-                raise ValueError("evaluation has no candidate parameters for participant")
+                raise ValueError("evaluation has no deployment parameters for participant")
             participant_uncertainty = (
-                dict(candidate_uncertainty.get(str(target_participant)) or {})
+                dict(deployment_uncertainty.get(str(target_participant)) or {})
                 if target_participant is not None
                 else {}
             )
             participant_evidence = (
-                dict(candidate_evidence.get(str(target_participant)) or {})
+                dict(deployment_evidence.get(str(target_participant)) or {})
                 if target_participant is not None
                 else {}
             )
+            if target_participant is not None:
+                if participant_evidence.get(
+                    "deployment_refit_version"
+                ) != DEPLOYMENT_REFIT_VERSION:
+                    raise ValueError("unsupported deployment refit version")
+                if str(participant_evidence.get("dataset_snapshot_id") or "") != str(
+                    snapshot.id
+                ):
+                    raise ValueError("deployment refit snapshot provenance mismatch")
+                try:
+                    evidence_cutoff = datetime.fromisoformat(
+                        str(participant_evidence["knowledge_cutoff"]).replace(
+                            "Z", "+00:00"
+                        )
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "deployment refit knowledge cutoff is missing"
+                    ) from exc
+                if evidence_cutoff.tzinfo is None:
+                    evidence_cutoff = evidence_cutoff.replace(tzinfo=timezone.utc)
+                snapshot_cutoff = snapshot.observation_cutoff
+                if snapshot_cutoff.tzinfo is None:
+                    snapshot_cutoff = snapshot_cutoff.replace(tzinfo=timezone.utc)
+                if evidence_cutoff.astimezone(timezone.utc) != snapshot_cutoff.astimezone(
+                    timezone.utc
+                ):
+                    raise ValueError("deployment refit knowledge cutoff mismatch")
             if target_participant is not None and participant_evidence.get(
                 "identifiability_status"
             ) not in {"identified", "weak"}:
@@ -283,10 +318,27 @@ class ModelPromotionService:
             session.add(decision)
             session.flush()
             decision_id = decision.id
-            snapshot_start = snapshot.date_start
-            snapshot_end = snapshot.date_end
             sample_count = int(participant_evidence.get("sample_count") or 0)
             day_count = int(participant_evidence.get("day_count") or 0)
+            refit_start, refit_end = snapshot.date_start, snapshot.date_end
+            if target_participant is not None:
+                try:
+                    refit_start = datetime.fromisoformat(
+                        str(participant_evidence["window_start"])
+                    ).date()
+                    refit_end = datetime.fromisoformat(
+                        str(participant_evidence["window_end"])
+                    ).date()
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("deployment refit window is missing") from exc
+                if (
+                    sample_count <= 0
+                    or day_count <= 0
+                    or refit_start < snapshot.date_start
+                    or refit_end > snapshot.date_end
+                    or refit_start > refit_end
+                ):
+                    raise ValueError("deployment refit evidence window is invalid")
             learned_profile = None
             if target_participant is not None:
                 variant = MODEL_VARIANT_BY_FAMILY[family]
@@ -306,6 +358,16 @@ class ModelPromotionService:
                         "parameters_hash": parameters_hash,
                         "calibration_confidence": confidence,
                         "calibration_confidence_definition": confidence_definition,
+                        "knowledge_cutoff": participant_evidence.get(
+                            "knowledge_cutoff"
+                        ),
+                        "deployment_refit_version": DEPLOYMENT_REFIT_VERSION,
+                        "deployment_refit_window": {
+                            "start": refit_start.isoformat(),
+                            "end": refit_end.isoformat(),
+                            "sample_count": sample_count,
+                            "day_count": day_count,
+                        },
                     },
                 }
                 learned_profile = self.learned_profiles.save_in_session(
@@ -316,9 +378,9 @@ class ModelPromotionService:
                     sample_count=sample_count,
                     day_count=day_count,
                     confidence=confidence,
-                    window_start=snapshot_start,
-                    window_end=snapshot_end,
-                    source="stage4-promotion.v1",
+                    window_start=refit_start,
+                    window_end=refit_end,
+                    source=DEPLOYMENT_REFIT_VERSION,
                     model_version="mindflow-ctssm-runtime-v8",
                     validation_status="validated",
                 )
