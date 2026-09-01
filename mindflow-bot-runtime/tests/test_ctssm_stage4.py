@@ -25,7 +25,6 @@ from app.services.model_comparison import (
     comparison_metrics,
     estimate_reactivity_and_recovery,
     estimate_response_rates,
-    fit_current_m0_parameters,
     fit_workload_candidate_parameters,
     observed_recovery_efficiency,
     promotion_gate,
@@ -42,7 +41,11 @@ from app.services.model_promotion import ModelPromotionService
 from app.services.research_evaluation import EVALUATION_CODE_VERSION
 from app.services.stage4_candidate_replay import (
     DEPLOYMENT_REFIT_VERSION,
+    M0_SIMULATOR_FIT_VERSION,
     Stage4CandidateReplayService,
+    Stage4DeploymentRefitService,
+    aggregate_evaluation_parameter_gate_evidence,
+    fit_current_m0_parameters_v2,
 )
 from entity.user import User
 from mindflow_core.assessment import AssessmentModel
@@ -301,29 +304,94 @@ def test_ridge_covariance_uncertainty_and_identifiability_are_auditable():
     assert clipped["workload_reactivity_beta"] == 0.0
 
 
-def test_current_m0_uses_restricted_training_fit_not_workload_intercept():
-    samples = [
-        {
-            "actual_stress": 5.0 + 3.0 * workload,
-            "workload": workload,
-            "recovery": recovery,
+def test_current_m0_restricted_fit_uses_real_simulator_and_calendar(monkeypatch):
+    model = AssessmentModel("Asia/Shanghai")
+    true_s_star = 40.0
+    samples = []
+    calendars = {}
+    for day in range(1, 4):
+        local_day = f"2030-01-0{day}"
+        forecast_id = f"m0-fit-forecast-{day}"
+        event = {
+            "id": f"exam-{day}",
+            "summary": "高强度答辩",
+            "event_type": "task",
+            "task_type": "exam",
+            "start_time": f"{local_day}T09:00:00+08:00",
+            "end_time": f"{local_day}T11:00:00+08:00",
         }
-        for _ in range(100)
-        for workload, recovery in (
-            (0.0, 0.0),
-            (1.0, 0.25),
-            (0.0, 0.75),
-            (1.0, 1.0),
+        initial_state = {"stress_0_10": 2.0, "vitality_0_10": 7.0}
+        generated = model.predict_baseline_m0(
+            baseline_params={"S_star_init": true_s_star},
+            observations=[],
+            calendar_events=[event],
+            local_date=local_day,
+            initial_state=initial_state,
         )
-    ]
-    m0 = fit_current_m0_parameters(samples)
-    full = fit_workload_candidate_parameters(samples)
+        actual = next(
+            row["stress_0_10"]
+            for row in generated.trajectory
+            if row["time"] == "10:00"
+        )
+        calendars[forecast_id] = {"calendar_representation": [event]}
+        samples.append(
+            {
+                "participant_id": "m0-fit-person",
+                "local_date": local_day,
+                "observed_at": f"{local_day}T10:00:00+08:00",
+                "observation_created_at": f"{local_day}T10:01:00+08:00",
+                "forecast_id": forecast_id,
+                "actual_stress": actual,
+                "initial_state": initial_state,
+                "initial_state_revision": f"initial-{day}",
+                "sleep_debt": 0.0,
+                "context": {"forecast_point_time": "10:00"},
+            }
+        )
+    training_actual_mean = sum(
+        row["actual_stress"] for row in samples
+    ) / len(samples)
+    samples.append(
+        {
+            "participant_id": "m0-fit-person",
+            "local_date": "2030-01-04",
+            "observed_at": "2030-01-04T10:00:00+08:00",
+            "observation_created_at": "2030-01-04T10:01:00+08:00",
+            "forecast_id": "excluded-test-forecast",
+            "actual_stress": 10.0,
+            "initial_state": {"stress_0_10": 9.0, "vitality_0_10": 1.0},
+            "context": {"forecast_point_time": "10:00"},
+        }
+    )
 
-    assert full["stress_baseline_0_10"] == pytest.approx(5.0, abs=0.05)
-    assert m0["stress_baseline_0_10"] == pytest.approx(6.5)
-    assert m0["parameter_fit_version"] == "m0-training-fit.v1"
-    assert full["parameter_fit_version"] == "workload-recovery-ridge.v2"
-    assert "workload_reactivity_beta" not in m0
+    calls = 0
+    real_predict = model.predict_baseline_m0
+
+    def counted_predict(**kwargs):
+        nonlocal calls
+        calls += 1
+        return real_predict(**kwargs)
+
+    monkeypatch.setattr(model, "predict_baseline_m0", counted_predict)
+    fitted = fit_current_m0_parameters_v2(
+        samples,
+        {
+            "calendars": calendars,
+            "observation_history": {"m0-fit-person": []},
+        },
+        datetime(2030, 1, 4, tzinfo=timezone.utc),
+        model,
+    )
+
+    assert fitted["S_star_init"] == pytest.approx(true_s_star, abs=0.2)
+    assert fitted["parameter_fit_version"] == M0_SIMULATOR_FIT_VERSION
+    assert fitted["fit_method"] == "simulator-restricted-sse"
+    assert fitted["sample_count"] == 3
+    assert fitted["training_window_end"] == "2030-01-03"
+    assert calls > 0
+    assert fitted["stress_baseline_0_10"] != pytest.approx(
+        training_actual_mean
+    )
 
 
 def test_historical_calibration_uses_only_brs_known_by_through_date():
@@ -643,6 +711,54 @@ def test_rolling_origin_metrics_and_promotion_gate_cover_all_stage4_checks():
     assert rejected["checks"]["parameter_identifiability"] is False
 
 
+def test_promotion_gate_identifiability_uses_final_training_not_deployment():
+    final_training = {
+        "participant-1": {
+            "participant_id": "participant-1",
+            "split_index": 1,
+            "training_window_start": "2030-01-01",
+            "training_window_end": "2030-01-03",
+            "sample_count": 12,
+            "day_count": 3,
+            "identifiability_status": "identified",
+            "boundary_clipped": False,
+            "design_condition_number": 12.0,
+            "parameter_fit_version": "workload-recovery-ridge.v2",
+        }
+    }
+    deployment_evidence = {
+        "participant-1": {
+            "window_end": "2030-01-04",
+            "identifiability_status": "not_identified",
+        }
+    }
+    aggregate = aggregate_evaluation_parameter_gate_evidence(final_training)
+    baseline = {
+        "mae": 1.0,
+        "interval_90_coverage": 0.8,
+        "peak_timing_error_minutes": 10.0,
+        "high_stress_recall": 0.7,
+    }
+    candidate = {
+        **baseline,
+        "mae": 0.9,
+        "peak_timing_error_minutes": 9.0,
+    }
+    gate = promotion_gate(
+        baseline,
+        candidate,
+        parameter_evidence=aggregate,
+    )
+
+    assert deployment_evidence["participant-1"][
+        "identifiability_status"
+    ] == "not_identified"
+    assert aggregate["identifiability_status"] == "identified"
+    assert aggregate["source"] == "final_rolling_training_fit"
+    assert gate["checks"]["parameter_identifiability"] is True
+    assert gate["passed"] is True
+
+
 def test_dataset_v4_freezes_brs_and_slow_recovery_evidence():
     database = memory_database()
     person = participant(database, "STAGE4-SNAPSHOT")
@@ -831,7 +947,7 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
     )
     assert all(
         result["comparison"][family]["replay_engine"]
-        == "stage4-real-ctssm-replay.v4"
+        == "stage4-real-ctssm-replay.v5"
         for family in ("workload_aware_m0", "m1", "m2", "m3")
     )
     participant_key = str(person_id)
@@ -854,17 +970,31 @@ def test_offline_replay_compares_all_families_on_the_same_rolling_splits():
         "evaluation_candidate_parameters"
     ][participant_key]["ctssm_params"]
     evaluation_evidence = result["evaluation_candidate_evidence"][participant_key]
-    deployment_evidence = result["deployment_evidence"][participant_key]
     assert evaluation_evidence["sample_count"] == 3
-    assert evaluation_evidence["window_end"] == "2030-01-03"
-    assert deployment_evidence["sample_count"] == 4
-    assert deployment_evidence["window_start"] == "2030-01-01"
-    assert deployment_evidence["window_end"] == "2030-01-04"
-    assert deployment_evidence["dataset_snapshot_id"] == "frozen-snapshot"
-    assert deployment_evidence["deployment_refit_version"] == (
-        DEPLOYMENT_REFIT_VERSION
+    assert evaluation_evidence["training_window_end"] == "2030-01-03"
+    assert result["evaluation_parameter_gate_evidence"][participant_key] == (
+        evaluation_evidence
     )
-    assert result["deployment_uncertainty"][participant_key]["estimation"][
+    assert result["evaluation_parameter_gate_aggregate"]["source"] == (
+        "final_rolling_training_fit"
+    )
+    assert result["deployment_parameters"] == {}
+    assert result["deployment_uncertainty"] == {}
+    assert result["deployment_evidence"] == {}
+    replay_service = Stage4CandidateReplayService("Asia/Shanghai")
+    frozen = replay_service._extract(items, None)
+    direct_refit = Stage4DeploymentRefitService().refit(
+        frozen,
+        frozen["samples"],
+        participant_id=None,
+        knowledge_cutoff=datetime(2030, 1, 5, tzinfo=timezone.utc),
+        dataset_snapshot_id="frozen-snapshot",
+    )
+    assert direct_refit["evidence"][participant_key]["sample_count"] == 4
+    assert direct_refit["evidence"][participant_key]["window_end"] == (
+        "2030-01-04"
+    )
+    assert direct_refit["uncertainty"][participant_key]["estimation"][
         "sample_count"
     ] == 4
     assert result["config"]["initial_state_provenance_complete"] is True
@@ -1037,10 +1167,14 @@ def test_production_candidate_requires_durable_promotion_provenance():
             "identifiability_status": "not_identified",
         }
         row.metrics_json = {**payload, "deployment_evidence": deployment_evidence}
-    with pytest.raises(ValueError, match="promotion parameters are not identifiable"):
+    with pytest.raises(ValueError, match="deployment_refit_not_identifiable"):
         promotion_service.promote_candidate(
             run_id, participant_id=person.id, model_family="m1"
         )
+    with database.session() as session:
+        unchanged = dict(session.get(ModelEvaluationRun, run_id).metrics_json)
+    assert unchanged["promotion"]["m1"]["passed"] is True
+    assert unchanged["promotion"]["m1"]["parameter_identifiability"] == "weak"
     with database.session() as session:
         row = session.get(ModelEvaluationRun, run_id)
         payload = dict(row.metrics_json)

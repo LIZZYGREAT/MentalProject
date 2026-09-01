@@ -13,7 +13,6 @@ from app.services.model_comparison import (
     ROLLING_ORIGIN_VERSION,
     comparison_metrics,
     estimate_response_rates,
-    fit_current_m0_parameters,
     fit_workload_candidate_parameters,
     observed_recovery_efficiency,
     promotion_gate,
@@ -25,9 +24,10 @@ from mindflow_core.assessment import AssessmentModel
 
 
 OBSERVABLE_SUPPORT_CONFIG = dict(GLOBAL_DEFAULT_CONFIG["observable_support"])
-REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v4"
+REPLAY_ENGINE_VERSION = "stage4-real-ctssm-replay.v5"
 CANDIDATE_LATENT_INITIALIZATION_VERSION = "candidate-latent-initialization.v1"
 DEPLOYMENT_REFIT_VERSION = "stage4-deployment-refit.v1"
+M0_SIMULATOR_FIT_VERSION = "m0-simulator-fit.v2"
 
 
 def _number(value: Any) -> float | None:
@@ -100,6 +100,149 @@ def _candidate_uncertainty(fitted: Mapping[str, Any]) -> dict[str, Any]:
             "identifiability_status": fitted.get("identifiability_status"),
             "boundary_clipped": bool(fitted.get("boundary_clipped")),
         },
+    }
+
+
+def fit_current_m0_parameters_v2(
+    training_samples: Sequence[Mapping[str, Any]],
+    frozen_context: Mapping[str, Any],
+    origin_cutoff: datetime,
+    assessment_model: AssessmentModel,
+) -> dict[str, Any]:
+    """Fit S_star_init with bounded SSE searches through the real M0 simulator."""
+
+    prepared = []
+    for sample in training_samples:
+        try:
+            target = _aware(sample["observed_at"])
+            created = _aware(sample["observation_created_at"])
+            actual = _number(sample.get("actual_stress"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if actual is None or target >= origin_cutoff or created >= origin_cutoff:
+            continue
+        participant = str(sample.get("participant_id") or "")
+        calendar = frozen_context.get("calendars", {}).get(
+            sample.get("forecast_id")
+        ) or {}
+        point_time = str(
+            (sample.get("context") or {}).get("forecast_point_time") or ""
+        )[:5]
+        if not point_time:
+            continue
+        prepared.append(
+            {
+                "actual": actual,
+                "point_time": point_time,
+                "observations": Stage4CandidateReplayService._known_observations(
+                    frozen_context.get("observation_history", {}).get(
+                        participant, []
+                    ),
+                    target,
+                ),
+                "calendar_events": Stage4CandidateReplayService._calendar_events(
+                    calendar
+                ),
+                "local_date": str(sample["local_date"]),
+                "initial_state": Stage4CandidateReplayService._frozen_initial_state(
+                    sample
+                ),
+                "sleep_debt_hours": float(sample.get("sleep_debt") or 0.0),
+            }
+        )
+
+    loss_cache: dict[float, tuple[float, int]] = {}
+
+    def objective(s_star_init: float) -> tuple[float, int]:
+        key = round(max(0.0, min(100.0, s_star_init)), 1)
+        if key in loss_cache:
+            return loss_cache[key]
+        squared_errors = []
+        for context in prepared:
+            result = assessment_model.predict_baseline_m0(
+                baseline_params={"S_star_init": key},
+                observations=context["observations"],
+                calendar_events=context["calendar_events"],
+                local_date=context["local_date"],
+                initial_state=context["initial_state"],
+                sleep_debt_hours=context["sleep_debt_hours"],
+            )
+            point = next(
+                (
+                    row
+                    for row in result.trajectory
+                    if str(row.get("time") or "")[:5] == context["point_time"]
+                ),
+                None,
+            )
+            if point is None:
+                continue
+            predicted = _number(point.get("stress_0_10"))
+            if predicted is not None:
+                squared_errors.append((context["actual"] - predicted) ** 2)
+        value = (sum(squared_errors), len(squared_errors))
+        loss_cache[key] = value
+        return value
+
+    coarse_values = [float(value) for value in range(0, 101, 2)]
+    if not prepared:
+        best_value, best_loss, fitted_count = 50.0, None, 0
+    else:
+        best_coarse = min(
+            coarse_values,
+            key=lambda value: (objective(value)[0], value),
+        )
+        lower = max(0, int(round((best_coarse - 2.0) * 10)))
+        upper = min(1000, int(round((best_coarse + 2.0) * 10)))
+        fine_values = [value / 10.0 for value in range(lower, upper + 1)]
+        best_value = min(
+            fine_values,
+            key=lambda value: (objective(value)[0], value),
+        )
+        best_loss, fitted_count = objective(best_value)
+    training_days = sorted({str(context["local_date"]) for context in prepared})
+    return {
+        "S_star_init": round(best_value, 1),
+        "stress_baseline_0_10": round(best_value / 10.0, 4),
+        "training_loss": round(best_loss, 8) if best_loss is not None else None,
+        "sample_count": fitted_count,
+        "day_count": len(training_days),
+        "training_window_start": training_days[0] if training_days else None,
+        "training_window_end": training_days[-1] if training_days else None,
+        "fit_method": "simulator-restricted-sse",
+        "parameter_fit_version": M0_SIMULATOR_FIT_VERSION,
+        "origin_cutoff": origin_cutoff.isoformat(),
+        "search": {
+            "bounds": [0.0, 100.0],
+            "coarse_step": 2.0,
+            "fine_step": 0.1,
+            "evaluated_parameter_count": len(loss_cache),
+        },
+    }
+
+
+def aggregate_evaluation_parameter_gate_evidence(
+    evidence_by_participant: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate only final rolling-training fits for the formal gate."""
+
+    final_training_evidence = list(evidence_by_participant.values())
+    statuses = {
+        str(value.get("identifiability_status") or "not_identified")
+        for value in final_training_evidence
+    }
+    return {
+        "identifiability_status": (
+            "not_identified"
+            if not statuses or "not_identified" in statuses
+            else "weak" if "weak" in statuses else "identified"
+        ),
+        "boundary_clipped": any(
+            bool(value.get("boundary_clipped"))
+            for value in final_training_evidence
+        ),
+        "participant_count": len(final_training_evidence),
+        "source": "final_rolling_training_fit",
     }
 
 
@@ -695,24 +838,25 @@ class Stage4CandidateReplayService:
                 by_participant[str(sample["participant_id"])].append(sample)
             for participant, participant_testing in by_participant.items():
                 participant_training = [row for row in training if row["participant_id"] == participant]
-                fit_samples = participant_training or training
+                fit_samples = participant_training
                 priors = [
                     value
                     for value in frozen["brs_history"].get(participant, [])
                     if value[0] < origin_cutoff
                 ]
                 prior = max(priors, key=lambda value: value[0])[1] if priors else None
-                m0_fitted = fit_current_m0_parameters(fit_samples)
+                m0_fitted = fit_current_m0_parameters_v2(
+                    fit_samples,
+                    frozen,
+                    origin_cutoff,
+                    self.model,
+                )
                 fitted = fit_workload_candidate_parameters(
                     fit_samples,
                     trait_resilience=prior,
                 )
                 rates = estimate_response_rates(fit_samples, fitted)
-                m0_params = {
-                    "S_star_init": (
-                        float(m0_fitted["stress_baseline_0_10"]) * 10.0
-                    ),
-                }
+                m0_params = {"S_star_init": float(m0_fitted["S_star_init"])}
                 candidate_params = _candidate_parameters(fitted)
                 candidate_uncertainty = _candidate_uncertainty(fitted)
                 transition_count = int(rates["response_transition_count"]) + int(
@@ -893,6 +1037,8 @@ class Stage4CandidateReplayService:
                 evaluation_parameters[participant] = candidate_params
                 evaluation_uncertainty[participant] = candidate_uncertainty
                 evaluation_evidence[participant] = {
+                    "participant_id": participant,
+                    "split_index": split["split_index"],
                     "sample_count": len(fit_samples),
                     "day_count": len(
                         {str(value["local_date"]) for value in fit_samples}
@@ -905,12 +1051,12 @@ class Stage4CandidateReplayService:
                     "design_condition_number": fitted.get(
                         "design_condition_number"
                     ),
-                    "window_start": (
+                    "training_window_start": (
                         min(str(value["local_date"]) for value in fit_samples)
                         if fit_samples
                         else None
                     ),
-                    "window_end": (
+                    "training_window_end": (
                         max(str(value["local_date"]) for value in fit_samples)
                         if fit_samples
                         else None
@@ -952,39 +1098,9 @@ class Stage4CandidateReplayService:
                 "replay_engine": "frozen_historical_production",
             }
         )
-        cutoff_value = config.get("observation_cutoff")
-        try:
-            knowledge_cutoff = _aware(cutoff_value)
-        except (TypeError, ValueError):
-            knowledge_cutoff = datetime.max.replace(tzinfo=timezone.utc)
-        deployment = Stage4DeploymentRefitService().refit(
-            frozen,
-            samples,
-            participant_id=participant_id,
-            knowledge_cutoff=knowledge_cutoff,
-            dataset_snapshot_id=(
-                str(config.get("dataset_snapshot_id"))
-                if config.get("dataset_snapshot_id")
-                else None
-            ),
+        aggregate_parameter_evidence = (
+            aggregate_evaluation_parameter_gate_evidence(evaluation_evidence)
         )
-        deployment_evidence = list(deployment["evidence"].values())
-        statuses = {
-            str(value.get("identifiability_status") or "not_identified")
-            for value in deployment_evidence
-        }
-        aggregate_parameter_evidence = {
-            "identifiability_status": (
-                "not_identified"
-                if not statuses or "not_identified" in statuses
-                else "weak" if "weak" in statuses else "identified"
-            ),
-            "boundary_clipped": any(
-                bool(value.get("boundary_clipped"))
-                for value in deployment_evidence
-            ),
-            "participant_count": len(deployment_evidence),
-        }
         promotion = {
             family: promotion_gate(
                 comparison["current_m0"],
@@ -994,6 +1110,28 @@ class Stage4CandidateReplayService:
             for family in MODEL_FAMILIES
             if family != "current_m0"
         }
+        deployment = {
+            "parameters": {},
+            "uncertainty": {},
+            "evidence": {},
+        }
+        if any(bool(gate.get("passed")) for gate in promotion.values()):
+            cutoff_value = config.get("observation_cutoff")
+            try:
+                knowledge_cutoff = _aware(cutoff_value)
+            except (TypeError, ValueError):
+                knowledge_cutoff = datetime.max.replace(tzinfo=timezone.utc)
+            deployment = Stage4DeploymentRefitService().refit(
+                frozen,
+                samples,
+                participant_id=participant_id,
+                knowledge_cutoff=knowledge_cutoff,
+                dataset_snapshot_id=(
+                    str(config.get("dataset_snapshot_id"))
+                    if config.get("dataset_snapshot_id")
+                    else None
+                ),
+            )
         evaluation_config = {
             **config,
             "replay_engine_version": REPLAY_ENGINE_VERSION,
@@ -1023,6 +1161,8 @@ class Stage4CandidateReplayService:
             "evaluation_candidate_parameters": evaluation_parameters,
             "evaluation_candidate_uncertainty": evaluation_uncertainty,
             "evaluation_candidate_evidence": evaluation_evidence,
+            "evaluation_parameter_gate_evidence": evaluation_evidence,
+            "evaluation_parameter_gate_aggregate": aggregate_parameter_evidence,
             "deployment_parameters": deployment["parameters"],
             "deployment_uncertainty": deployment["uncertainty"],
             "deployment_evidence": deployment["evidence"],

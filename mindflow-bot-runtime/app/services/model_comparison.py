@@ -30,7 +30,6 @@ MODEL_VARIANT_BY_FAMILY = {
 }
 ROLLING_ORIGIN_VERSION = "rolling-origin-knowledge-causal.v2"
 PROMOTION_GATE_VERSION = "ctssm-promotion-gate.v2"
-M0_PARAMETER_FIT_VERSION = "m0-training-fit.v1"
 WORKLOAD_PARAMETER_FIT_VERSION = "workload-recovery-ridge.v2"
 
 
@@ -147,48 +146,6 @@ def _invert_three_by_three(matrix: list[list[float]]) -> list[list[float]]:
 
 def _infinity_norm(matrix: Sequence[Sequence[float]]) -> float:
     return max((sum(abs(value) for value in row) for row in matrix), default=0.0)
-
-
-def fit_current_m0_parameters(
-    samples: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Fit the restricted M0 intercept from training-only stress evidence.
-
-    M0 has no workload or recovery regressors.  Its least-squares intercept is
-    therefore the mean observed stress, not the intercept of the unrestricted
-    workload/recovery model.
-    """
-
-    usable = [
-        stress
-        for sample in samples
-        if (stress := _number(sample.get("actual_stress"))) is not None
-    ]
-    raw_baseline = mean(usable) if usable else 5.0
-    baseline = max(0.0, min(10.0, raw_baseline))
-    residuals = [stress - raw_baseline for stress in usable]
-    residual_sd = (
-        math.sqrt(sum(value * value for value in residuals) / (len(usable) - 1))
-        if len(usable) > 1
-        else None
-    )
-    standard_error = (
-        residual_sd / math.sqrt(len(usable))
-        if residual_sd is not None and usable
-        else None
-    )
-    return {
-        "stress_baseline_0_10": round(baseline, 4),
-        "sample_count": len(usable),
-        "residual_sd": round(residual_sd, 4) if residual_sd is not None else None,
-        "fit_method": "restricted-intercept-mean",
-        "parameter_fit_version": M0_PARAMETER_FIT_VERSION,
-        "boundary_clipped": raw_baseline != baseline,
-        "uncertainty_method": "restricted-mean-standard-error.v1",
-        "uncertainty": {
-            "stress_baseline_0_10": {"std_error": standard_error},
-        },
-    }
 
 
 def estimate_reactivity_and_recovery(

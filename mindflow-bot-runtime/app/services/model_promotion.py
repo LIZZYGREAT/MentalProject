@@ -284,9 +284,7 @@ class ModelPromotionService:
             if target_participant is not None and participant_evidence.get(
                 "identifiability_status"
             ) not in {"identified", "weak"}:
-                raise ValueError(
-                    "promotion parameters are not identifiable"
-                )
+                raise ValueError("deployment_refit_not_identifiable")
             if target_participant is not None and (
                 not self._has_required_parameter_uncertainty(
                     participant_uncertainty
