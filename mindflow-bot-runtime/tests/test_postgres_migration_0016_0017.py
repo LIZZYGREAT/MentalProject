@@ -20,6 +20,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
     DATASET_SCHEMA_V4,
+    DATASET_SCHEMA_V5,
     ResearchEvaluationService,
 )
 from postgres_test_guard import optional_test_postgres_url
@@ -722,10 +723,89 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 for check in item_checks
                 if check.get("name") == "ck_dataset_snapshot_item_type"
             )
-            command.upgrade(config, "0030_model_promotion_decisions")
+            command.upgrade(config, "0031_parameter_learning_runs")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0030_model_promotion_decisions"
+            ) == "0031_parameter_learning_runs"
+            legacy_stage5_run = uuid.uuid4()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO parameter_learning_runs (
+                        id, participant_id, dataset_snapshot_id, model_family,
+                        parameters_before, parameters_candidate,
+                        training_metrics, validation_metrics, sample_count,
+                        status, created_at
+                    ) VALUES (
+                        :id, :participant_id, :snapshot_id,
+                        'hierarchical-ctssm-residual.v1', '{}'::jsonb,
+                        '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 30,
+                        'candidate', :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": legacy_stage5_run,
+                    "participant_id": participant_id,
+                    "snapshot_id": dataset_snapshot_id,
+                    "created_at": now,
+                },
+            )
+            command.upgrade(config, "0032_stage5_causal_hardening")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0032_stage5_causal_hardening"
+            assert connection.scalar(
+                text(
+                    "SELECT status FROM parameter_learning_runs WHERE id = :id"
+                ),
+                {"id": legacy_stage5_run},
+            ) == "rejected"
+            stage5_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "parameter_learning_runs"
+                )
+            }
+            assert {"run_kind", "schedule_key"} <= stage5_columns
+            stage5_indexes = {
+                item["name"]: item
+                for item in inspect(connection).get_indexes(
+                    "parameter_learning_runs"
+                )
+            }
+            assert stage5_indexes[
+                "uq_parameter_learning_scheduled_week"
+            ]["unique"] is True
+            scheduled_values = {
+                "participant_id": participant_id,
+                "snapshot_id": dataset_snapshot_id,
+                "created_at": now,
+            }
+            scheduled_insert = text(
+                """
+                INSERT INTO parameter_learning_runs (
+                    id, participant_id, dataset_snapshot_id, model_family,
+                    run_kind, schedule_key, parameters_before,
+                    parameters_candidate, training_metrics,
+                    validation_metrics, sample_count, status, created_at
+                ) VALUES (
+                    :id, :participant_id, :snapshot_id,
+                    'hierarchical-ctssm-residual.v2', 'scheduled',
+                    '2030-W03', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+                    '{}'::jsonb, 30, 'rejected', :created_at
+                )
+                """
+            )
+            connection.execute(
+                scheduled_insert, {**scheduled_values, "id": uuid.uuid4()}
+            )
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        scheduled_insert,
+                        {**scheduled_values, "id": uuid.uuid4()},
+                    )
             assert "model_promotion_decisions" in inspect(
                 connection
             ).get_table_names()
@@ -863,7 +943,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 observation_cutoff=now,
                 calendar_cutoff=now,
             )
-            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V4
+            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V5
             assert v3_snapshot["manifest"]["participant_count"] == 1
             v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
             memberships = service.snapshot_items(v3_snapshot_id, "participant")

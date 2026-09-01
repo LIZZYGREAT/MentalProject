@@ -47,7 +47,9 @@ from services.workload import WorkloadEstimator
 DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
 DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
-DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V4
+DATASET_SCHEMA_V5 = "mindflow-research-dataset-v5"
+DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V5
+STAGE5_INTERVENTION_EXCLUSION_MINUTES = 120
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
 EVALUATION_CODE_VERSION = "stage4-evaluation.v7"
 MATCH_TOLERANCE_SECONDS = 150
@@ -1028,6 +1030,42 @@ class ResearchEvaluationService:
                     ParticipantSlowState.effective_at,
                 )
             ).scalars().all()
+            exposure_lower = lower - timedelta(
+                minutes=STAGE5_INTERVENTION_EXCLUSION_MINUTES
+            )
+            warning_deliveries = session.execute(
+                select(WarningSchedule)
+                .where(
+                    WarningSchedule.participant_id.in_(participant_ids),
+                    WarningSchedule.sent_at.is_not(None),
+                    WarningSchedule.sent_at >= exposure_lower,
+                    WarningSchedule.sent_at < upper,
+                    WarningSchedule.sent_at <= observation_cutoff,
+                    WarningSchedule.authorized_at.is_not(None),
+                    WarningSchedule.authorized_at <= observation_cutoff,
+                )
+                .order_by(
+                    WarningSchedule.participant_id,
+                    WarningSchedule.sent_at,
+                    WarningSchedule.id,
+                )
+            ).scalars().all()
+            care_exposures = session.execute(
+                select(CareInterventionEvent)
+                .where(
+                    CareInterventionEvent.participant_id.in_(participant_ids),
+                    CareInterventionEvent.sent_at.is_not(None),
+                    CareInterventionEvent.sent_at >= exposure_lower,
+                    CareInterventionEvent.sent_at < upper,
+                    CareInterventionEvent.sent_at <= observation_cutoff,
+                    CareInterventionEvent.created_at <= observation_cutoff,
+                )
+                .order_by(
+                    CareInterventionEvent.participant_id,
+                    CareInterventionEvent.sent_at,
+                    CareInterventionEvent.id,
+                )
+            ).scalars().all()
         item_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         def freeze(item: dict[str, Any]) -> None:
@@ -1114,6 +1152,51 @@ class ResearchEvaluationService:
                         "rolling_7d_workload": slow_state.rolling_7d_workload,
                         "source": slow_state.source,
                         "created_at": _aware(slow_state.created_at).isoformat(),
+                    },
+                )
+            )
+
+        for warning in warning_deliveries:
+            sent_at = _aware(warning.sent_at)
+            freeze(
+                self._item(
+                    "warning_delivery",
+                    str(warning.id),
+                    "warning-delivery-exposure.v1",
+                    warning.participant_id,
+                    sent_at.astimezone(self.timezone).date(),
+                    {
+                        "warning_id": str(warning.id),
+                        "forecast_id": str(warning.forecast_id),
+                        "forecast_version": warning.forecast_version,
+                        "warning_level": warning.warning_level,
+                        "authorized_at": _aware(warning.authorized_at).isoformat(),
+                        "sent_at": sent_at.isoformat(),
+                        "intervention_type": "warning",
+                    },
+                )
+            )
+
+        for intervention in care_exposures:
+            sent_at = _aware(intervention.sent_at)
+            freeze(
+                self._item(
+                    "care_intervention_exposure",
+                    str(intervention.id),
+                    "care-intervention-exposure.v1",
+                    intervention.participant_id,
+                    sent_at.astimezone(self.timezone).date(),
+                    {
+                        "intervention_id": str(intervention.id),
+                        "source_warning_id": str(intervention.source_warning_id),
+                        "source_forecast_id": str(intervention.source_forecast_id),
+                        "forecast_version": intervention.forecast_version,
+                        "intervention_type": intervention.intervention_type,
+                        "scheduled_at": _aware(
+                            intervention.scheduled_at
+                        ).isoformat(),
+                        "sent_at": sent_at.isoformat(),
+                        "created_at": _aware(intervention.created_at).isoformat(),
                     },
                 )
             )
@@ -1279,6 +1362,10 @@ class ResearchEvaluationService:
             "psychometric_count": type_count("psychometric"),
             "daily_review_count": type_count("daily_review"),
             "slow_state_count": type_count("slow_state"),
+            "care_intervention_exposure_count": type_count(
+                "care_intervention_exposure"
+            ),
+            "warning_delivery_count": type_count("warning_delivery"),
             "item_count": len(items),
             "manifest_hash": manifest_hash,
         }
@@ -1434,6 +1521,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V2,
             DATASET_SCHEMA_V3,
             DATASET_SCHEMA_V4,
+            DATASET_SCHEMA_V5,
         }:
             raise ValueError("unsupported dataset schema version")
         if manifest.get("schema_version") != schema_version:
@@ -1460,7 +1548,7 @@ class ResearchEvaluationService:
                 )
         elif schema_version == DATASET_SCHEMA_V3:
             expected_counts["participant_count"] = participant_item_count
-        elif schema_version == DATASET_SCHEMA_V4:
+        elif schema_version in {DATASET_SCHEMA_V4, DATASET_SCHEMA_V5}:
             expected_counts["participant_count"] = participant_item_count
             expected_counts.update(
                 {
@@ -1475,10 +1563,27 @@ class ResearchEvaluationService:
                     ),
                 }
             )
+            if schema_version == DATASET_SCHEMA_V5:
+                expected_counts.update(
+                    {
+                        "care_intervention_exposure_count": sum(
+                            item["item_type"] == "care_intervention_exposure"
+                            for item in items
+                        ),
+                        "warning_delivery_count": sum(
+                            item["item_type"] == "warning_delivery"
+                            for item in items
+                        ),
+                    }
+                )
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
         if (
-            schema_version in {DATASET_SCHEMA_V3, DATASET_SCHEMA_V4}
+            schema_version in {
+                DATASET_SCHEMA_V3,
+                DATASET_SCHEMA_V4,
+                DATASET_SCHEMA_V5,
+            }
             and participant_item_count <= 0
         ):
             raise ValueError("dataset snapshot has no frozen participant membership")
@@ -1493,7 +1598,11 @@ class ResearchEvaluationService:
         manifest_hash = self._manifest_hash(contract, items)
         if manifest_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")
-        if schema_version in {DATASET_SCHEMA_V3, DATASET_SCHEMA_V4}:
+        if schema_version in {
+            DATASET_SCHEMA_V3,
+            DATASET_SCHEMA_V4,
+            DATASET_SCHEMA_V5,
+        }:
             participant_ids = {
                 item["participant_id"]
                 for item in items

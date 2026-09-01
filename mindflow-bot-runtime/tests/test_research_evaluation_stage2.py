@@ -27,6 +27,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
     DATASET_SCHEMA_V4,
+    DATASET_SCHEMA_V5,
     EVALUATION_CODE_VERSION,
     ResearchEvaluationService,
 )
@@ -336,7 +337,7 @@ def test_dataset_snapshot_and_model_run_are_bound_to_cutoffs_and_model_version()
         "forecast.v4",
     )
 
-    assert snapshot["schema_version"] == DATASET_SCHEMA_V4
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V5
     assert snapshot["manifest"]["participant_count"] == 1
     assert snapshot["manifest"]["observation_count"] == 2
     assert snapshot["manifest"]["forecast_count"] == 1
@@ -768,7 +769,7 @@ def test_snapshot_and_historical_evaluation_ignore_later_live_database_changes()
     assert offline["evaluation_mode"] == "offline_replay"
     assert offline["status"] == "completed"
     assert offline["metrics"]["config"]["dataset_schema_version"] == (
-        DATASET_SCHEMA_V4
+            DATASET_SCHEMA_V5
     )
 
 

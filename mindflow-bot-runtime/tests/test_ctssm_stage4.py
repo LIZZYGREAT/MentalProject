@@ -34,6 +34,7 @@ from app.services.model_comparison import (
 )
 from app.services.research_evaluation import (
     DATASET_SCHEMA_V4,
+    DATASET_SCHEMA_V5,
     ResearchEvaluationService,
 )
 from app.services.profile_calibration import ProfileCalibrationService
@@ -1028,7 +1029,7 @@ def test_dataset_v4_freezes_brs_and_slow_recovery_evidence():
         observation_cutoff=datetime(2030, 1, 4, tzinfo=timezone.utc),
         calendar_cutoff=datetime(2030, 1, 4, tzinfo=timezone.utc),
     )
-    assert snapshot["schema_version"] == DATASET_SCHEMA_V4
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V5
     assert snapshot["manifest"]["psychometric_count"] == 1
     assert snapshot["manifest"]["slow_state_count"] == 1
 

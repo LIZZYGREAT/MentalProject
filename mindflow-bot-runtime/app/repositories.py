@@ -338,83 +338,97 @@ class LearnedProfileRepository:
         """
 
         with self.database.session() as session:
-            rows = session.execute(
-                select(LearnedModelProfile)
-                .where(
-                    LearnedModelProfile.participant_id == participant_id,
-                    or_(
-                        LearnedModelProfile.validation_status == "validated",
-                        (
-                            (LearnedModelProfile.validation_status == "candidate")
-                            & (LearnedModelProfile.model_version == "legacy")
-                        ),
+            return self.runtime_active_in_session(session, participant_id)
+
+    def runtime_active_in_session(
+        self,
+        session: Any,
+        participant_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the active profile inside the caller's transaction."""
+
+        statement = (
+            select(LearnedModelProfile)
+            .where(
+                LearnedModelProfile.participant_id == participant_id,
+                or_(
+                    LearnedModelProfile.validation_status == "validated",
+                    (
+                        (LearnedModelProfile.validation_status == "candidate")
+                        & (LearnedModelProfile.model_version == "legacy")
                     ),
-                )
-                .order_by(desc(LearnedModelProfile.version))
-            ).scalars().all()
-            for row in rows:
-                view = self._view(row)
-                parameters = dict(view["parameters"])
-                selection = dict(parameters.get("model_selection") or {})
-                if selection.get("status") == "stage5_promoted":
-                    try:
-                        learning_run_id = uuid.UUID(
-                            str(selection.get("parameter_learning_run_id") or "")
-                        )
-                    except ValueError:
-                        learning_run_id = None
-                    learning_run = (
-                        session.get(ParameterLearningRun, learning_run_id)
-                        if learning_run_id is not None
-                        else None
-                    )
-                    statistical_parameters = {
-                        name: value
-                        for name, value in parameters.items()
-                        if name != "model_selection"
-                    }
-                    if (
-                        learning_run is not None
-                        and learning_run.participant_id == participant_id
-                        and learning_run.status == "promoted"
-                        and dict(learning_run.parameters_candidate or {})
-                        == statistical_parameters
-                    ):
-                        return view
-                    continue
-                active_variant = normalize_model_variant(
-                    selection.get("active_variant") or "m0"
-                )
-                if active_variant == "m0":
-                    return view
+                ),
+            )
+            .order_by(desc(LearnedModelProfile.version))
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        rows = session.execute(statement).scalars().all()
+        for row in rows:
+            view = self._view(row)
+            parameters = dict(view["parameters"])
+            selection = dict(parameters.get("model_selection") or {})
+            if selection.get("status") == "stage5_promoted":
                 try:
-                    decision_id = uuid.UUID(
-                        str(selection.get("promotion_decision_id") or "")
+                    learning_run_id = uuid.UUID(
+                        str(selection.get("parameter_learning_run_id") or "")
                     )
                 except ValueError:
-                    decision_id = None
-                decision = (
-                    session.get(ModelPromotionDecision, decision_id)
-                    if decision_id is not None
+                    learning_run_id = None
+                learning_run = (
+                    session.get(ParameterLearningRun, learning_run_id)
+                    if learning_run_id is not None
                     else None
                 )
-                valid = bool(
-                    decision is not None
-                    and decision.participant_id == participant_id
-                    and decision.status == "retained_from_empirical_evidence"
-                    and decision.model_family
-                    == {
-                        "wm0": "workload_aware_m0",
-                        "m1": "m1",
-                        "m2": "m2",
-                        "m3": "m3",
-                    }.get(active_variant)
-                    and decision.parameters_hash
-                    == promotion_parameters_hash(parameters)
-                )
-                if valid:
+                statistical_parameters = {
+                    name: value
+                    for name, value in parameters.items()
+                    if name != "model_selection"
+                }
+                if (
+                    learning_run is not None
+                    and learning_run.participant_id == participant_id
+                    and learning_run.status == "promoted"
+                    and dict(learning_run.parameters_candidate or {})
+                    == statistical_parameters
+                ):
                     return view
-            return None
+                continue
+            active_variant = normalize_model_variant(
+                selection.get("active_variant") or "m0"
+            )
+            if active_variant == "m0":
+                return view
+            try:
+                decision_id = uuid.UUID(
+                    str(selection.get("promotion_decision_id") or "")
+                )
+            except ValueError:
+                decision_id = None
+            decision = (
+                session.get(ModelPromotionDecision, decision_id)
+                if decision_id is not None
+                else None
+            )
+            valid = bool(
+                decision is not None
+                and decision.participant_id == participant_id
+                and decision.status == "retained_from_empirical_evidence"
+                and decision.model_family
+                == {
+                    "wm0": "workload_aware_m0",
+                    "m1": "m1",
+                    "m2": "m2",
+                    "m3": "m3",
+                }.get(active_variant)
+                and decision.parameters_hash
+                == promotion_parameters_hash(parameters)
+            )
+            if valid:
+                return view
+        return None
 
     def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
         """Compatibility alias for research callers; prefer latest()."""

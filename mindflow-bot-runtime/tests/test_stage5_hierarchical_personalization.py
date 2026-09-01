@@ -1,7 +1,9 @@
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 import uuid
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     DatasetSnapshot,
@@ -15,6 +17,10 @@ from app.services.hierarchical_personalization import (
     MODEL_FAMILY,
     RESIDUAL_MAX,
     ParameterLearningService,
+    Stage5PersonalizedReplayService,
+    _causal_previous_features,
+    _with_intervention_exclusions,
+    estimate_population_prior,
     evidence_counts,
     fit_partial_pooling,
     fit_residual_ridge,
@@ -23,6 +29,8 @@ from app.services.hierarchical_personalization import (
     rolling_personalization_validation,
     runtime_candidate_parameters,
 )
+from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
+from app.services.research_evaluation import DATASET_SCHEMA_V5
 from tests.helpers import memory_database, participant
 
 
@@ -89,15 +97,23 @@ def test_partial_pooling_holds_unidentified_parameters_at_population_prior():
     fitted = fit_partial_pooling(population, sparse, trait_resilience=0.8)
 
     assert fitted["method"] == LEARNING_VERSION
-    for name in ("workload_sensitivity_i", "stress_reactivity_i", "stress_recovery_i"):
+    for name in (
+        "workload_sensitivity_i",
+        "recovery_sensitivity_i",
+        "stress_reactivity_i",
+        "stress_recovery_rate_i",
+    ):
         audit = fitted["uncertainty"][name]
         assert audit["pooling_weight"] == 0.0
         assert audit["evidence_status"] == "population_prior_insufficient_contrast"
         assert "interval_95" in audit
         assert "evidence_strength" in audit
         assert "sample_count" in audit
-    assert fitted["parameters"]["stress_recovery_i"] > fitted["population_prior"][
-        "stress_recovery_i"
+    assert fitted["parameters"]["stress_recovery_rate_i"] > fitted["population_prior"][
+        "stress_recovery_rate_i"
+    ]["mean"]
+    assert fitted["parameters"]["recovery_sensitivity_i"] > fitted["population_prior"][
+        "recovery_sensitivity_i"
     ]["mean"]
 
 
@@ -120,6 +136,233 @@ def test_residual_ridge_is_shadow_only_and_strictly_bounded():
         "previous_vitality",
         "recovery_window",
     } <= set(model["feature_names"])
+
+
+def test_recovery_equilibrium_coefficient_and_recovery_rate_map_independently():
+    runtime = runtime_candidate_parameters(
+        {
+            "parameters": {
+                "S_star_i": 4.5,
+                "workload_sensitivity_i": 2.3,
+                "recovery_sensitivity_i": 1.7,
+                "stress_reactivity_i": 0.8,
+                "stress_recovery_rate_i": 0.3,
+            },
+            "population_prior": {},
+            "trait_resilience": None,
+        }
+    )
+
+    assert runtime["ctssm_params"]["recovery_stress_gain"] == 17.0
+    assert runtime["ctssm_params"]["stress_recovery_per_hour"] == 0.3
+    assert runtime["hierarchical_parameters"]["recovery_sensitivity_i"] == 1.7
+    assert runtime["hierarchical_parameters"]["stress_recovery_rate_i"] == 0.3
+
+
+def test_population_prior_is_lopo_and_fails_back_when_peers_are_insufficient():
+    target = _samples(participant_id="target", offset=4.0)
+    peer = _samples(participant_id="peer", offset=-1.0)
+    cutoff = datetime(2030, 2, 1, tzinfo=timezone.utc)
+
+    prior = estimate_population_prior(
+        target + peer,
+        target_participant_id="target",
+        knowledge_cutoff=cutoff,
+    )
+
+    assert prior["_metadata"]["target_excluded"] is True
+    assert prior["_metadata"]["peer_participant_count"] == 1
+    assert prior["_metadata"]["source"] == (
+        "versioned_global_default_insufficient_peers"
+    )
+    assert all(prior[name]["participant_count"] == 0 for name in (
+        "S_star_i",
+        "workload_sensitivity_i",
+        "recovery_sensitivity_i",
+        "stress_reactivity_i",
+        "stress_recovery_rate_i",
+    ))
+
+
+def test_population_prior_excludes_late_backfill_at_split_cutoff():
+    target = _samples(participant_id="target")
+    peer_a = _samples(participant_id="peer-a")
+    peer_b = _samples(participant_id="peer-b")
+    peer_b[-1] = {
+        **peer_b[-1],
+        "observation_created_at": "2030-02-02T00:00:00+00:00",
+    }
+
+    prior = estimate_population_prior(
+        target + peer_a + peer_b,
+        target_participant_id="target",
+        knowledge_cutoff=datetime(2030, 2, 1, tzinfo=timezone.utc),
+    )
+
+    assert prior["_metadata"]["peer_participant_count"] == 2
+    assert prior["_metadata"]["peer_sample_count"] == len(peer_a) + len(peer_b) - 1
+    assert prior["_metadata"]["source"] == "leave_one_participant_out_peers"
+
+
+def test_future_created_observation_cannot_enter_previous_outcome_features():
+    sample = {
+        "observed_at": "2030-01-10T10:00:00+00:00",
+        "initial_state": {"stress_0_10": 2.0, "vitality_0_10": 8.0},
+        "initial_state_revision": "frozen-r1",
+    }
+    history = [
+        {
+            "observation_id": "eligible",
+            "observed_at": "2030-01-10T08:00:00+00:00",
+            "created_at": "2030-01-10T08:05:00+00:00",
+            "payload": {"stress_0_10": 4.0, "energy_0_10": 6.0},
+        },
+        {
+            "observation_id": "future-created",
+            "observed_at": "2030-01-10T09:00:00+00:00",
+            "created_at": "2030-01-10T11:00:00+00:00",
+            "payload": {"stress_0_10": 10.0, "energy_0_10": 1.0},
+        },
+    ]
+
+    features = _causal_previous_features(sample, history)
+
+    assert features["previous_stress"] == 4.0
+    assert features["previous_vitality"] == 6.0
+    assert features["previous_feature_provenance"]["stress"][
+        "observation_id"
+    ] == "eligible"
+
+
+def test_post_intervention_rows_are_versioned_and_excluded_from_core_fit():
+    participant_id = uuid.uuid4()
+    samples = [
+        {
+            **_samples(days=1, per_day=2, participant_id=str(participant_id))[0],
+            "observed_at": "2030-01-01T10:30:00+00:00",
+        },
+        {
+            **_samples(days=1, per_day=2, participant_id=str(participant_id))[1],
+            "observed_at": "2030-01-01T13:30:00+00:00",
+        },
+    ]
+    items = [
+        {
+            "item_type": "care_intervention_exposure",
+            "source_id": "care-1",
+            "participant_id": participant_id,
+            "metadata": {
+                "sent_at": "2030-01-01T10:00:00+00:00",
+                "intervention_type": "micro_break",
+            },
+        }
+    ]
+
+    marked, audit = _with_intervention_exclusions(samples, items)
+
+    assert marked[0]["exclude_from_natural_dynamics_fit"] is True
+    assert marked[1]["exclude_from_natural_dynamics_fit"] is False
+    assert audit["window_minutes"] == 120
+    assert audit["policy_version"].endswith(".v1")
+
+
+@pytest.mark.parametrize("variant", ["m0", "m1", "m2", "m3"])
+def test_formal_validator_calls_production_replay_and_preserves_family(
+    variant, monkeypatch
+):
+    import app.services.hierarchical_personalization as stage5
+
+    def forbidden_surrogate(*args, **kwargs):
+        raise AssertionError("formal validation must not call _predict_base")
+
+    monkeypatch.setattr(stage5, "_predict_base", forbidden_surrogate)
+    target_id = uuid.uuid4()
+    target = []
+    calendars = {}
+    for index, row in enumerate(_samples(days=15, participant_id=str(target_id))):
+        forecast_id = f"forecast-{index}"
+        target.append(
+            {
+                **row,
+                "forecast_id": forecast_id,
+                "observation_created_at": row["observed_at"],
+                "initial_state": {"stress_0_10": 4.0, "vitality_0_10": 7.0},
+                "initial_state_revision": "initial-r1",
+                "context": {**row["context"], "forecast_point_time": "08:00"},
+            }
+        )
+        calendars[forecast_id] = {"calendar_representation": []}
+    population = target + _samples(participant_id="peer-a") + _samples(
+        participant_id="peer-b", offset=0.5
+    )
+
+    class FakeModel:
+        MODEL_SPEC_VERSION = "fake-production-spec"
+
+        def __init__(self):
+            self.calls = 0
+
+        def _result(self, baseline, model_variant):
+            self.calls += 1
+            return SimpleNamespace(
+                model_variant=model_variant,
+                trajectory=[
+                    {
+                        "time": "08:00",
+                        "stress_0_10": baseline,
+                        "stress_interval_90_0_10": {
+                            "lower": max(0.0, baseline - 1.0),
+                            "upper": min(10.0, baseline + 1.0),
+                        },
+                    },
+                    {"time": "12:00", "stress_0_10": baseline + 0.2},
+                ],
+            )
+
+        def predict_baseline_m0(self, **kwargs):
+            baseline = float(
+                kwargs["baseline_params"].get("S_star_init", 50.0)
+            ) / 10.0
+            return self._result(baseline, "m0")
+
+        def predict_candidate(self, **kwargs):
+            baseline = float(
+                kwargs["candidate_params"].get("S_star_init", 50.0)
+            ) / 10.0
+            return self._result(baseline, kwargs["model_variant"])
+
+    extractor = SimpleNamespace(
+        model=FakeModel(),
+        timezone=timezone.utc,
+    )
+    # Bind the exact Stage-4 frozen-input helpers used in production.
+    from app.services.stage4_candidate_replay import Stage4CandidateReplayService
+
+    extractor._known_observations = Stage4CandidateReplayService._known_observations
+    extractor._calendar_events = Stage4CandidateReplayService._calendar_events
+    extractor._frozen_initial_state = Stage4CandidateReplayService._frozen_initial_state
+    service = Stage5PersonalizedReplayService(extractor)
+    result = service.validate(
+        frozen={
+            "samples": population,
+            "calendars": calendars,
+            "observation_history": {str(target_id): []},
+        },
+        items=[],
+        participant_id=target_id,
+        explicit_parameters={},
+        current_parameters={"model_selection": {"active_variant": variant}},
+        trait_resilience=None,
+    )
+
+    assert extractor.model.calls > 0
+    assert result["formal_replay_audit"]["surrogate_predict_base_used"] is False
+    assert set(result["formal_replay_audit"]["comparator_variants"].values()) == {
+        variant
+    }
+    assert result["formal_replay_audit"]["population_prior_splits"][0][
+        "target_excluded"
+    ] is True
 
 
 def test_rolling_origin_compares_all_required_models_and_residual_gate():
@@ -148,6 +391,8 @@ def test_rolling_origin_compares_all_required_models_and_residual_gate():
     } <= set(result["comparison"]["new_candidate_model"])
     assert result["residual_gate"]["checks"]["correction_bound"] == 1.0
     assert result["residual_gate"]["checks"]["mode"] == "shadow"
+    assert result["promotion_gate"]["passed"] is False
+    assert result["promotion_gate"]["formal_promotion_eligible"] is False
 
 
 def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
@@ -171,6 +416,7 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
         "parameter_learning_run_id": str(run_id),
         "dataset_snapshot_id": str(snapshot_id),
     }
+    service = ParameterLearningService(database, "Asia/Shanghai")
     with database.session() as session:
         session.add(
             DatasetSnapshot(
@@ -192,9 +438,15 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
                 model_family=MODEL_FAMILY,
                 parameters_before={},
                 parameters_candidate=candidate,
-                training_metrics={"minimum_data_gate": {"passed": True, "counts": {"observed_days": 19}}},
+                    training_metrics={
+                        "minimum_data_gate": {"passed": True, "counts": {"observed_days": 19}},
+                        "base_active_identity": service._active_identity(None),
+                    },
                 validation_metrics={
-                    "promotion_gate": {"passed": True},
+                    "promotion_gate": {
+                        "passed": True,
+                        "formal_promotion_eligible": True,
+                    },
                     "comparison": {},
                     "uncertainty": uncertainty,
                 },
@@ -222,7 +474,7 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
     repository = LearnedProfileRepository(database)
     assert repository.runtime_active(person.id) is None
 
-    result = ParameterLearningService(database, "Asia/Shanghai").promote(run_id)
+    result = service.promote(run_id)
 
     assert result["status"] == "promoted"
     active = repository.runtime_active(person.id)
@@ -236,27 +488,34 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
             )
         ).scalars().all()
         assert [row.validation_status for row in profiles] == ["candidate", "validated"]
+    with pytest.raises(ValueError, match="only a candidate"):
+        service.promote(run_id)
+    with database.session() as session:
+        active_profiles = session.execute(
+            __import__("sqlalchemy").select(LearnedModelProfile).where(
+                LearnedModelProfile.participant_id == person.id,
+                LearnedModelProfile.validation_status == "validated",
+            )
+        ).scalars().all()
+        assert len(active_profiles) == 1
 
 
 def test_training_service_persists_run_and_candidate_profile_from_snapshot(monkeypatch):
     database = memory_database()
     person = participant(database, "stage5-training")
     snapshot_id = uuid.uuid4()
-    with database.session() as session:
-        session.add(
-            DatasetSnapshot(
+    cutoff = datetime(2030, 1, 20, tzinfo=timezone.utc)
+    snapshot_row = DatasetSnapshot(
                 id=snapshot_id,
                 date_start=date(2030, 1, 1),
                 date_end=date(2030, 1, 19),
                 participant_filter={"participant_codes": ["stage5-training"]},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version="test",
+                schema_version=DATASET_SCHEMA_V5,
                 manifest_json={},
             )
-        )
-        session.add(
-            DatasetSnapshotItem(
+    item_row = DatasetSnapshotItem(
                 dataset_snapshot_id=snapshot_id,
                 item_type="participant",
                 source_id=str(person.id),
@@ -264,15 +523,65 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
                 participant_id=person.id,
                 local_date=date(2030, 1, 1),
                 source_hash="frozen-participant",
-                metadata_json={"participant_id": str(person.id)},
+                    metadata_json={
+                        "participant_id": str(person.id),
+                        "participant_code": "stage5-training",
+                    },
             )
-        )
+    item_view = DatasetSnapshotIntegrityService.item_view(item_row)
+    contract = {
+        "schema_version": DATASET_SCHEMA_V5,
+        "date_start": "2030-01-01",
+        "date_end": "2030-01-19",
+        "participant_filter": {"participant_codes": ["stage5-training"]},
+        "observation_cutoff": cutoff.isoformat(),
+        "calendar_cutoff": cutoff.isoformat(),
+    }
+    snapshot_row.manifest_json = {
+        "schema_version": DATASET_SCHEMA_V5,
+        "participant_count": 1,
+        "observation_count": 0,
+        "forecast_count": 0,
+        "calendar_count": 0,
+        "psychometric_count": 0,
+        "daily_review_count": 0,
+        "slow_state_count": 0,
+        "care_intervention_exposure_count": 0,
+        "warning_delivery_count": 0,
+        "item_count": 1,
+        "manifest_hash": DatasetSnapshotIntegrityService.manifest_hash(
+            contract, [item_view]
+        ),
+    }
+    with database.session() as session:
+        session.add(snapshot_row)
+        session.add(item_row)
     service = ParameterLearningService(database, "Asia/Shanghai")
     frozen = _samples(days=19, participant_id=str(person.id))
     monkeypatch.setattr(
         service.extractor,
         "_extract",
-        lambda items, participant_id: {"samples": frozen},
+        lambda items, participant_id: {
+            "samples": frozen,
+            "calendars": {},
+            "observation_history": {},
+        },
+    )
+    monkeypatch.setattr(
+        service.formal_replay,
+        "validate",
+        lambda **kwargs: {
+            "rolling_origin": {"split_count": 5},
+            "comparison": {},
+            "promotion_gate": {"passed": False},
+            "residual_gate": {"passed": False},
+            "formal_replay_audit": {"surrogate_predict_base_used": False},
+            "latest_residual_model": {
+                "mode": "shadow",
+                "sample_count": 40,
+                "residual_sd": 0.5,
+            },
+        },
     )
 
     result = service.train_snapshot(snapshot_id, person.id)
@@ -286,3 +595,176 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
     assert latest["parameters"]["model_selection"][
         "parameter_learning_run_id"
     ] == result["id"]
+
+    with database.session() as session:
+        frozen_item = session.execute(
+            __import__("sqlalchemy").select(DatasetSnapshotItem).where(
+                DatasetSnapshotItem.dataset_snapshot_id == snapshot_id
+            )
+        ).scalar_one()
+        frozen_item.source_hash = "tampered-after-freeze"
+    with pytest.raises(ValueError, match="manifest mismatch"):
+        service._snapshot(snapshot_id, person.id)
+
+
+def test_promotion_rejects_candidate_when_base_active_profile_has_changed():
+    database = memory_database()
+    person = participant(database, "stage5-stale")
+    service = ParameterLearningService(database, "Asia/Shanghai")
+    snapshot_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fitted = fit_partial_pooling(_samples(), _samples())
+    candidate = runtime_candidate_parameters(fitted)
+    candidate["residual_model"] = {"mode": "shadow", "residual_sd": 0.4}
+    uncertainty = {
+        "hierarchical_parameters": fitted["uncertainty"],
+        "S_star_init": {"std_error": 1.0},
+        "ctssm_params": {"std_error": 1.0},
+        "hierarchical_population_prior": {"std_error": 1.0},
+        "residual_model": {"std_error": 0.4},
+    }
+    with database.session() as session:
+        session.add(
+            DatasetSnapshot(
+                id=snapshot_id,
+                date_start=date(2030, 1, 1),
+                date_end=date(2030, 1, 19),
+                participant_filter={},
+                observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
+                calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
+                schema_version=DATASET_SCHEMA_V5,
+                manifest_json={},
+            )
+        )
+        session.add(
+            ParameterLearningRun(
+                id=run_id,
+                participant_id=person.id,
+                dataset_snapshot_id=snapshot_id,
+                model_family=MODEL_FAMILY,
+                parameters_before={},
+                parameters_candidate=candidate,
+                training_metrics={
+                    "minimum_data_gate": {
+                        "passed": True,
+                        "counts": {"observed_days": 19},
+                    },
+                    "base_active_identity": service._active_identity(None),
+                },
+                validation_metrics={
+                    "promotion_gate": {
+                        "passed": True,
+                        "formal_promotion_eligible": True,
+                    },
+                    "uncertainty": uncertainty,
+                },
+                sample_count=57,
+                status="candidate",
+            )
+        )
+        session.add(
+            LearnedModelProfile(
+                participant_id=person.id,
+                version=1,
+                parameters_json={
+                    **candidate,
+                    "model_selection": {
+                        "status": "stage5_candidate",
+                        "parameter_learning_run_id": str(run_id),
+                    },
+                },
+                uncertainty_json=uncertainty,
+                source=LEARNING_VERSION,
+                model_version="mindflow-ctssm-runtime-v10",
+                validation_status="candidate",
+                sample_count=57,
+                day_count=19,
+                confidence=0.9,
+                window_start=date(2030, 1, 1),
+                window_end=date(2030, 1, 19),
+            )
+        )
+        session.add(
+            LearnedModelProfile(
+                participant_id=person.id,
+                version=2,
+                parameters_json={
+                    "S_star_init": 55.0,
+                    "model_selection": {"active_variant": "m0"},
+                },
+                uncertainty_json={"S_star_init": {"std_error": 1.0}},
+                source="concurrent-update",
+                model_version="mindflow-ctssm-runtime-v10",
+                validation_status="validated",
+                sample_count=40,
+                day_count=15,
+                confidence=0.8,
+                window_start=date(2030, 1, 1),
+                window_end=date(2030, 1, 15),
+            )
+        )
+
+    with pytest.raises(ValueError, match="stale_parameter_learning_candidate"):
+        service.promote(run_id)
+
+    with database.session() as session:
+        run = session.get(ParameterLearningRun, run_id)
+        assert run.status == "candidate"
+        profiles = session.execute(
+            __import__("sqlalchemy").select(LearnedModelProfile).where(
+                LearnedModelProfile.participant_id == person.id
+            )
+        ).scalars().all()
+        assert len(profiles) == 2
+
+
+def test_scheduled_week_has_database_level_idempotency_constraint():
+    database = memory_database()
+    person = participant(database, "stage5-scheduled-unique")
+    snapshot_id = uuid.uuid4()
+    with database.session() as session:
+        session.add(
+            DatasetSnapshot(
+                id=snapshot_id,
+                date_start=date(2030, 1, 1),
+                date_end=date(2030, 1, 7),
+                participant_filter={},
+                observation_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
+                calendar_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
+                schema_version=DATASET_SCHEMA_V5,
+                manifest_json={},
+            )
+        )
+        session.add(
+            ParameterLearningRun(
+                participant_id=person.id,
+                dataset_snapshot_id=snapshot_id,
+                model_family=MODEL_FAMILY,
+                run_kind="scheduled",
+                schedule_key="2030-W01",
+                parameters_before={},
+                parameters_candidate={},
+                training_metrics={},
+                validation_metrics={},
+                sample_count=0,
+                status="rejected",
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        with database.session() as session:
+            session.add(
+                ParameterLearningRun(
+                    participant_id=person.id,
+                    dataset_snapshot_id=snapshot_id,
+                    model_family=MODEL_FAMILY,
+                    run_kind="scheduled",
+                    schedule_key="2030-W01",
+                    parameters_before={},
+                    parameters_candidate={},
+                    training_metrics={},
+                    validation_metrics={},
+                    sample_count=0,
+                    status="rejected",
+                )
+            )

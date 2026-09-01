@@ -759,7 +759,8 @@ class DatasetSnapshotItem(Base):
         CheckConstraint(
             "item_type IN ('participant', 'observation', 'forecast', "
             "'forecast_currentness', 'calendar', 'match_source', "
-            "'psychometric', 'daily_review', 'slow_state')",
+            "'psychometric', 'daily_review', 'slow_state', "
+            "'care_intervention_exposure', 'warning_delivery')",
             name="ck_dataset_snapshot_item_type",
         ),
     )
@@ -913,9 +914,27 @@ class ParameterLearningRun(Base):
             "dataset_snapshot_id",
             "created_at",
         ),
+        Index(
+            "uq_parameter_learning_scheduled_week",
+            "participant_id",
+            "model_family",
+            "schedule_key",
+            unique=True,
+            postgresql_where=text("run_kind = 'scheduled'"),
+            sqlite_where=text("run_kind = 'scheduled'"),
+        ),
         CheckConstraint(
             "status IN ('candidate', 'rejected', 'promoted')",
             name="ck_parameter_learning_status",
+        ),
+        CheckConstraint(
+            "run_kind IN ('manual', 'scheduled')",
+            name="ck_parameter_learning_run_kind",
+        ),
+        CheckConstraint(
+            "(run_kind = 'manual' AND schedule_key IS NULL) OR "
+            "(run_kind = 'scheduled' AND schedule_key IS NOT NULL)",
+            name="ck_parameter_learning_schedule_key",
         ),
         CheckConstraint(
             "sample_count >= 0",
@@ -937,6 +956,10 @@ class ParameterLearningRun(Base):
         nullable=False,
     )
     model_family: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="manual"
+    )
+    schedule_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
     parameters_before: Mapped[dict] = mapped_column(
         JSON_VALUE, nullable=False, default=dict
     )

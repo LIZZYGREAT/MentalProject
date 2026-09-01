@@ -130,6 +130,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0031_parameter_learning_runs"
     )
     assert migration_0031.down_revision == "0030_model_promotion_decisions"
+    migration_0032 = next(
+        migration for migration in migrations
+        if migration.revision == "0032_stage5_causal_hardening"
+    )
+    assert migration_0032.down_revision == "0031_parameter_learning_runs"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
@@ -167,6 +172,43 @@ def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
         "created_at",
     } <= tables[0][1]
     assert len(indexes) == 2
+
+
+def test_0032_separates_stage5_generation_and_adds_v5_exposures(monkeypatch):
+    migration = _migration(VERSIONS / "0032_stage5_causal_hardening.py")
+    columns = []
+    checks = []
+    indexes = []
+    statements = []
+    monkeypatch.setattr(migration.op, "drop_constraint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields), kwargs)
+        ),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert [column.name for _, column in columns] == ["run_kind", "schedule_key"]
+    assert "'care_intervention_exposure'" in checks[0][2]
+    assert "'warning_delivery'" in checks[0][2]
+    assert indexes[0][0] == "uq_parameter_learning_scheduled_week"
+    assert indexes[0][3]["postgresql_where"] is not None
+    assert any("hierarchical-ctssm-residual.v1" in value for value in statements)
+    assert any("mindflow-ctssm-runtime-v9" in value for value in statements)
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

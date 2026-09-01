@@ -147,12 +147,21 @@ class ModelPromotionService:
         if snapshot.schema_version in {
             "mindflow-research-dataset-v3",
             "mindflow-research-dataset-v4",
+            "mindflow-research-dataset-v5",
         }:
             expected_counts["participant_count"] = sum(
                 item["item_type"] == "participant" for item in items
             )
-        if snapshot.schema_version == "mindflow-research-dataset-v4":
+        if snapshot.schema_version in {
+            "mindflow-research-dataset-v4",
+            "mindflow-research-dataset-v5",
+        }:
             for item_type in ("psychometric", "daily_review", "slow_state"):
+                expected_counts[f"{item_type}_count"] = sum(
+                    item["item_type"] == item_type for item in items
+                )
+        if snapshot.schema_version == "mindflow-research-dataset-v5":
+            for item_type in ("care_intervention_exposure", "warning_delivery"):
                 expected_counts[f"{item_type}_count"] = sum(
                     item["item_type"] == item_type for item in items
                 )
@@ -183,8 +192,11 @@ class ModelPromotionService:
             snapshot = session.get(DatasetSnapshot, run.dataset_snapshot_id)
             if snapshot is None:
                 raise ValueError("dataset snapshot not found")
-            if snapshot.schema_version != "mindflow-research-dataset-v4":
-                raise ValueError("Stage-4 promotion requires Dataset Schema v4")
+            if snapshot.schema_version not in {
+                "mindflow-research-dataset-v4",
+                "mindflow-research-dataset-v5",
+            }:
+                raise ValueError("Stage-4 promotion requires Dataset Schema v4 or v5")
             rows = session.execute(
                 select(DatasetSnapshotItem).where(
                     DatasetSnapshotItem.dataset_snapshot_id == snapshot.id

@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0031_parameter_learning_runs -->
+<!-- ALEMBIC_HEAD: 0032_stage5_causal_hardening -->
 
 ## 运行边界
 
@@ -191,7 +191,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0031_parameter_learning_runs`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0032_stage5_causal_hardening`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -267,26 +267,39 @@ fail closed 到 Current M0。
 
 0031 新增 `parameter_learning_runs`，保存 participant、不可变 Dataset Snapshot、模型族、训练前参数、
 候选参数、训练/验证指标、样本量与 `candidate/rejected/promoted` 状态。Stage 5 以 population prior
-和 individual deviation 组成部分池化估计，首批参数是 `S_star_i`、workload sensitivity、stress
-reactivity 与 stress recovery；每个参数保存 estimate、标准误、95% interval、样本量、pooling
+和 individual deviation 组成部分池化估计。0032 将参数严格拆成 `S_star_i`、
+`workload_sensitivity_i`（βW）、`recovery_sensitivity_i`（βR）、
+`stress_reactivity_i`（κup）与 `stress_recovery_rate_i`（κdown）；每个参数保存 estimate、标准误、95% interval、样本量、pooling
 weight 和证据状态。缺少相应 contrast 时 pooling weight 为 0，参数保持 population prior。总体训练
 门槛为至少 14 个观测日、30 条 matched EMA、3 个 workload level 和 3 个 recovery episode。
 
-Stage 5 Rolling-Origin 从前 14 日训练、第 15 日测试开始扩展，统一比较 Global、Explicit-profile、
+Stage 5 Rolling-Origin 从前 14 日训练、第 15 日测试开始扩展，并通过真实
+`AssessmentModel → Simulator → step_latent_state` 统一比较 Global、Explicit-profile、
 Current Personalized 与 New Candidate，并输出 OOT MAE、RMSE、coverage 和 peak timing error；只有
 聚合及多数 split 稳定优于全部 comparator、coverage 不下降且 peak timing 不恶化的 candidate 才可
 人工晋级。训练时同时拟合包含 hour、weekday、W(t)、continuous load、event/course、previous
 stress/vitality、recovery window 与 semantic dimensions 的 Ridge residual；修正严格 clip 到 ±1.0，
-且当前固定为 shadow，不进入 Active runtime。定时校准通过现有 scheduler 接口每周至多创建一次
+且当前固定为 shadow，不进入 Active runtime。`_predict_base` 只保留为不可晋级的诊断函数。
+定时校准通过现有 scheduler 接口每周至多创建一次
 56 日 Dataset Snapshot 与参数学习运行，不再在每次 EMA 后即时重拟合。晋级保留 candidate 画像，
 另写 validated Active 画像；`runtime_active()` 只有在对应 ParameterLearningRun 已 promoted 且参数
-逐项匹配时才接受该画像。Admin 研究页显示 Calibration Runs、Parameter History、Candidate vs
+逐项匹配时才接受该画像。晋级还会在 participant/profile 行锁内比较训练时冻结的 Active
+profile id/version/hash、模型变体、spec 与 Stage-4 decision；不一致即拒绝为
+`stale_parameter_learning_candidate`。Admin 研究页显示 Calibration Runs、Parameter History、Candidate vs
 Active、Residual Diagnostics 与 Promotion History。
+
+0032 同时引入 Dataset Schema v5，在不可变快照中冻结 Warning delivery 与 Care intervention
+exposure。Stage 5 只接受完整性校验通过的 v5 快照，并把发送后固定 120 分钟窗口内样本排除出
+自然动力学和 residual 核心拟合；策略版本、窗口、暴露及排除计数均写入审计。Population prior
+逐 split 使用 `available_at=max(observed_at, created_at)<origin` 的非目标参与者数据；不足两个 peer
+时回退到版本化全局默认。0032 还为 scheduled run 增加 `run_kind/schedule_key` 和 PostgreSQL/SQLite
+partial unique constraint，保证同一参与者、模型族、ISO 周最多一个定时运行；旧 v1 Stage-5
+候选因 βR/κdown 无法无损拆分而 fail closed，必须使用 v2 重新训练。
 
 `rolling-origin-knowledge-causal.v2` 以测试日当地 00:00 作为 split origin；训练 EMA 的
 `created_at`、BRS 的 `max(administered_at, created_at)` 与 Slow State 的
 `max(effective_at, created_at)` 均必须早于该 origin。测试日峰值以第一条 eligible EMA 的 causal
-cutoff 为统一信息集，并复用 Dataset v4 冻结的 `initial_state` / `initial_state_revision`。
+cutoff 为统一信息集，并复用 Dataset v5 冻结的 `initial_state` / `initial_state_revision`。
 候选参数不确定性由回放 estimator 的标准误按 0–10→0–100 尺度转换；尚无可靠标准误的个体响应
 rate 不进入晋级参数。晋级 confidence 使用样本、天数、transition 与参数不确定性的
 `stage4-calibration-confidence.v1` 保守定义，最高为 0.95。
