@@ -20,7 +20,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V2,
     DATASET_SCHEMA_V3,
     DATASET_SCHEMA_V4,
-    DATASET_SCHEMA_V5,
+    DATASET_SCHEMA_V6,
     ResearchEvaluationService,
 )
 from postgres_test_guard import optional_test_postgres_url
@@ -751,10 +751,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                     "created_at": now,
                 },
             )
-            command.upgrade(config, "0032_stage5_causal_hardening")
+            command.upgrade(config, "0033_dataset_v6_profile_history")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0032_stage5_causal_hardening"
+            ) == "0033_dataset_v6_profile_history"
             assert connection.scalar(
                 text(
                     "SELECT status FROM parameter_learning_runs WHERE id = :id"
@@ -934,6 +934,25 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                         {"id": identifier},
                     )
 
+            explicit_profile_id = uuid.uuid4()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO participant_profiles (
+                        id, participant_id, version, profile_json, created_at
+                    ) VALUES (
+                        :id, :participant_id, 1,
+                        '{"model_params": {"S_star_init": 46.0}}'::jsonb,
+                        :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": explicit_profile_id,
+                    "participant_id": participant_id,
+                    "created_at": now - timedelta(days=1),
+                },
+            )
             v3_snapshot = service.create_dataset_snapshot(
                 date_start=date(2030, 1, 15),
                 date_end=date(2030, 1, 15),
@@ -943,13 +962,21 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 observation_cutoff=now,
                 calendar_cutoff=now,
             )
-            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V5
+            assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V6
             assert v3_snapshot["manifest"]["participant_count"] == 1
+            assert v3_snapshot["manifest"]["participant_profile_count"] == 1
             v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
             memberships = service.snapshot_items(v3_snapshot_id, "participant")
             assert len(memberships) == 1
             membership = memberships[0]
             assert membership["participant_id"] == str(participant_id)
+            frozen_profiles = service.snapshot_items(
+                v3_snapshot_id, "participant_profile"
+            )
+            assert len(frozen_profiles) == 1
+            assert frozen_profiles[0]["metadata"]["profile_id"] == str(
+                explicit_profile_id
+            )
             v3_run = service.create_evaluation_run(
                 v3_snapshot_id,
                 "algorithm-v1",

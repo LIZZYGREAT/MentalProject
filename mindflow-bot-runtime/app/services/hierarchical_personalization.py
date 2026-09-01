@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
-import json
 import math
 from statistics import mean
 from typing import Any, Mapping, Sequence
@@ -30,13 +29,12 @@ from app.models import (
     LearnedModelProfile,
     ParameterLearningRun,
     Participant,
-    ParticipantProfile,
 )
 from app.repositories import LearnedProfileRepository, promotion_parameters_hash
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
 from app.services.model_comparison import comparison_metrics, rolling_origin_splits
 from app.services.research_evaluation import (
-    DATASET_SCHEMA_V5,
+    DATASET_SCHEMA_V6,
     ResearchEvaluationService,
     STAGE5_INTERVENTION_EXCLUSION_MINUTES,
 )
@@ -47,9 +45,9 @@ from app.services.stage4_candidate_replay import (
 
 
 MODEL_FAMILY = "hierarchical-ctssm-residual.v2"
-LEARNING_VERSION = "stage5-hierarchical-partial-pooling.v2"
+LEARNING_VERSION = "stage5-hierarchical-partial-pooling.v3"
 RESIDUAL_VERSION = "stage5-residual-ridge-shadow.v2"
-PROMOTION_GATE_VERSION = "stage5-personalization-gate.v2"
+PROMOTION_GATE_VERSION = "stage5-personalization-gate.v3"
 MINIMUM_TRAINING_DAYS = 14
 MINIMUM_MATCHED_EMA = 30
 MINIMUM_WORKLOAD_LEVELS = 3
@@ -851,10 +849,14 @@ def rolling_personalization_validation(
         "peak_timing_non_inferior": _gate_non_increase(candidate["peak_timing_error_minutes"], comparators["current_personalized_model"]["peak_timing_error_minutes"]),
     }
     residual_metrics = metrics["candidate_with_residual_shadow"]
+    residual_metrics["coverage"] = None
+    residual_metrics["peak_timing_error_minutes"] = None
     residual_checks = {
         "oot_mae_improved": residual_metrics["mae"] is not None and candidate["mae"] is not None and residual_metrics["mae"] < candidate["mae"],
-        "coverage_not_decreased": _gate_non_decrease(residual_metrics["coverage"], candidate["coverage"]),
-        "peak_error_not_worse": _gate_non_increase(residual_metrics["peak_timing_error_minutes"], candidate["peak_timing_error_minutes"]),
+        "coverage_not_decreased": None,
+        "peak_error_not_worse": None,
+        "formal_residual_promotion_eligible": False,
+        "reason": "trajectory_and_interval_not_recomputed",
         "correction_bound": RESIDUAL_MAX,
         "mode": "shadow",
     }
@@ -876,15 +878,10 @@ def rolling_personalization_validation(
             "reason": "surrogate_predict_base_is_diagnostic_only",
         },
         "residual_gate": {
-            "version": "stage5-residual-gate.v1",
-            "passed": all(
-                residual_checks[name]
-                for name in (
-                    "oot_mae_improved",
-                    "coverage_not_decreased",
-                    "peak_error_not_worse",
-                )
-            ),
+            "version": "stage5-residual-diagnostic-gate.v2",
+            "passed": False,
+            "formal_residual_promotion_eligible": False,
+            "reason": "trajectory_and_interval_not_recomputed",
             "checks": residual_checks,
             "display": {
                 "ctssm_baseline": candidate,
@@ -1100,10 +1097,29 @@ def fit_residual_ridge_from_real_replay(
     }
 
 
+def _residual_shadow_comparison_metrics(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Keep point OOT metrics and mark un-recomputed trajectory metrics absent."""
+
+    metrics = comparison_metrics(rows)
+    for name in (
+        "interval_90_coverage",
+        "mean_interval_width",
+        "peak_magnitude_error",
+        "peak_timing_error_minutes",
+        "observed_peak_proxy_magnitude_error",
+        "observed_peak_proxy_timing_error_minutes",
+    ):
+        metrics[name] = None
+    metrics["peak_metric_source"] = "trajectory_and_interval_not_recomputed"
+    return metrics
+
+
 class Stage5PersonalizedReplayService:
     """Formal expanding-origin validation through the production CTSSM."""
 
-    FORMAL_ENGINE_VERSION = "stage5-real-ctssm-rolling-replay.v1"
+    FORMAL_ENGINE_VERSION = "stage5-real-ctssm-rolling-replay.v2"
 
     def __init__(self, extractor: Stage4CandidateReplayService):
         self.extractor = extractor
@@ -1176,9 +1192,7 @@ class Stage5PersonalizedReplayService:
         frozen: Mapping[str, Any],
         items: Sequence[Mapping[str, Any]],
         participant_id: uuid.UUID,
-        explicit_parameters: Mapping[str, Any] | None,
         current_parameters: Mapping[str, Any] | None,
-        trait_resilience: float | None,
     ) -> dict[str, Any]:
         all_samples, intervention_audit = _with_intervention_exclusions(
             frozen.get("samples", []), items
@@ -1212,6 +1226,7 @@ class Stage5PersonalizedReplayService:
         latest_fit = None
         latest_residual = None
         replay_call_count = 0
+        split_information_sets = []
         for split in splits:
             test_day = date.fromisoformat(split["test_days"][0])
             origin = datetime.combine(test_day, time.min, self.timezone).astimezone(
@@ -1230,10 +1245,18 @@ class Stage5PersonalizedReplayService:
                 and not row.get("exclude_from_natural_dynamics_fit")
                 and _aware(row.get("available_at") or row["observed_at"]) < origin
             ]
+            split_resilience, resilience_provenance = trait_resilience_as_of(
+                items, participant_id, origin
+            )
+            split_explicit, explicit_provenance = explicit_profile_as_of(
+                items, participant_id, origin
+            )
+            resilience_provenance["usage"] = "evaluation_trait_resilience"
+            explicit_provenance["usage"] = "evaluation_explicit_profile"
             fitted = fit_partial_pooling(
                 population_training,
                 training,
-                trait_resilience=trait_resilience,
+                trait_resilience=split_resilience,
                 target_participant_id=participant_id,
                 knowledge_cutoff=origin,
             )
@@ -1249,24 +1272,35 @@ class Stage5PersonalizedReplayService:
                 for name in PARAMETERS
             }
             global_parameters = _hierarchical_runtime_parameters(
-                global_values, trait_resilience=trait_resilience
+                global_values, trait_resilience=split_resilience
             )
             candidate_parameters = _hierarchical_runtime_parameters(
-                fitted["parameters"], trait_resilience=trait_resilience
+                fitted["parameters"], trait_resilience=split_resilience
             )
             comparator_parameters = {
                 "global_model": global_parameters,
                 "explicit_profile_model": _deep_merge_parameters(
-                    global_parameters, explicit_parameters
+                    global_parameters, split_explicit
                 ),
                 "current_personalized_model": _deep_merge_parameters(
                     _deep_merge_parameters(global_parameters, current_parameters),
-                    explicit_parameters,
+                    split_explicit,
                 ),
                 "new_candidate_model": _deep_merge_parameters(
-                    candidate_parameters, explicit_parameters
+                    candidate_parameters, split_explicit
                 ),
             }
+            split_information_sets.append(
+                {
+                    "split_index": split["split_index"],
+                    "origin_cutoff": origin.isoformat(),
+                    "trait_resilience": resilience_provenance,
+                    "explicit_profile": explicit_provenance,
+                    "comparator_information_set": (
+                        "same_origin_calendar_state_observations_trait_and_explicit.v1"
+                    ),
+                }
+            )
 
             residual_training = []
             for row in training:
@@ -1345,6 +1379,10 @@ class Stage5PersonalizedReplayService:
                         ),
                         "residual_correction": correction,
                         "runtime_applied": False,
+                        "prediction_lower": None,
+                        "prediction_upper": None,
+                        "trajectory_peak_stress": None,
+                        "trajectory_peak_time": None,
                     }
                     predictions["candidate_with_residual_shadow"].append(shadow)
                     split_rows["candidate_with_residual_shadow"].append(shadow)
@@ -1357,13 +1395,22 @@ class Stage5PersonalizedReplayService:
                     "training_sample_count": len(training),
                     "population_sample_count": len(population_training),
                     "metrics": {
-                        name: comparison_metrics(values)
+                        name: (
+                            _residual_shadow_comparison_metrics(values)
+                            if name == "candidate_with_residual_shadow"
+                            else comparison_metrics(values)
+                        )
                         for name, values in split_rows.items()
                     },
                 }
             )
         metrics = {
-            name: comparison_metrics(values) for name, values in predictions.items()
+            name: (
+                _residual_shadow_comparison_metrics(values)
+                if name == "candidate_with_residual_shadow"
+                else comparison_metrics(values)
+            )
+            for name, values in predictions.items()
         }
         candidate = metrics["new_candidate_model"]
         comparator_names = (
@@ -1416,14 +1463,10 @@ class Stage5PersonalizedReplayService:
             "oot_mae_improved": residual_metrics["mae"] is not None
             and candidate["mae"] is not None
             and residual_metrics["mae"] < candidate["mae"],
-            "coverage_not_decreased": _gate_non_decrease(
-                residual_metrics["interval_90_coverage"],
-                candidate["interval_90_coverage"],
-            ),
-            "peak_error_not_worse": _gate_non_increase(
-                residual_metrics["peak_timing_error_minutes"],
-                candidate["peak_timing_error_minutes"],
-            ),
+            "coverage_not_decreased": None,
+            "peak_error_not_worse": None,
+            "formal_residual_promotion_eligible": False,
+            "reason": "trajectory_and_interval_not_recomputed",
         }
         return {
             "rolling_origin": {
@@ -1442,8 +1485,10 @@ class Stage5PersonalizedReplayService:
                 "formal_promotion_eligible": True,
             },
             "residual_gate": {
-                "version": "stage5-residual-gate.v2",
-                "passed": all(residual_checks.values()),
+                "version": "stage5-residual-gate.v3-point-shadow",
+                "passed": False,
+                "formal_residual_promotion_eligible": False,
+                "reason": "trajectory_and_interval_not_recomputed",
                 "checks": {
                     **residual_checks,
                     "correction_bound": RESIDUAL_MAX,
@@ -1465,6 +1510,7 @@ class Stage5PersonalizedReplayService:
                 "same_calendar_state_and_knowledge_rule": True,
                 "simulator_call_count": replay_call_count,
                 "population_prior_splits": population_provenance,
+                "split_information_sets": split_information_sets,
                 "intervention_exclusion": intervention_audit,
                 "previous_feature_rule": "observed_and_created_strictly_before_target.v1",
                 "surrogate_predict_base_used": False,
@@ -1474,13 +1520,35 @@ class Stage5PersonalizedReplayService:
         }
 
 
-def _trait_resilience(items: Sequence[Mapping[str, Any]], participant_id: uuid.UUID) -> float | None:
+def trait_resilience_as_of(
+    items: Sequence[Mapping[str, Any]],
+    participant_id: uuid.UUID,
+    knowledge_cutoff: datetime,
+    *,
+    inclusive: bool = False,
+) -> tuple[float | None, dict[str, Any]]:
+    """Return the latest BRS available at a causal knowledge boundary."""
+
+    cutoff = _aware(knowledge_cutoff)
     candidates = []
     for item in items:
-        if item["item_type"] != "psychometric" or item["participant_id"] != participant_id:
+        if item["item_type"] != "psychometric" or str(
+            item["participant_id"]
+        ) != str(participant_id):
             continue
         metadata = dict(item["metadata"])
         if str(metadata.get("instrument_name") or "").upper() != "BRS":
+            continue
+        try:
+            administered_at = _aware(metadata.get("administered_at"))
+            created_at = _aware(metadata.get("created_at"))
+        except (TypeError, ValueError):
+            continue
+        available_at = max(administered_at, created_at)
+        outside_boundary = (
+            available_at > cutoff if inclusive else available_at >= cutoff
+        )
+        if outside_boundary:
             continue
         scores = dict(metadata.get("scores") or {})
         score = next(
@@ -1490,8 +1558,81 @@ def _trait_resilience(items: Sequence[Mapping[str, Any]], participant_id: uuid.U
         if score is None and _number(scores.get("total")) is not None:
             score = float(scores["total"]) / 6.0
         if score is not None and 1.0 <= score <= 5.0:
-            candidates.append((str(metadata.get("administered_at") or ""), (score - 1.0) / 4.0))
-    return max(candidates)[1] if candidates else None
+            candidates.append(
+                (
+                    available_at,
+                    administered_at,
+                    created_at,
+                    str(metadata.get("assessment_id") or item.get("source_id") or ""),
+                    (score - 1.0) / 4.0,
+                )
+            )
+    selected = max(candidates, default=None)
+    provenance = {
+        "assessment_id": selected[3] if selected else None,
+        "administered_at": selected[1].isoformat() if selected else None,
+        "created_at": selected[2].isoformat() if selected else None,
+        "available_at": selected[0].isoformat() if selected else None,
+        "origin_cutoff": cutoff.isoformat(),
+        "knowledge_cutoff": cutoff.isoformat(),
+        "cutoff_operator": "<=" if inclusive else "<",
+        "prior_version": BRS_PRIOR_VERSION,
+        "trait_resilience": selected[4] if selected else None,
+    }
+    return (selected[4] if selected else None), provenance
+
+
+def explicit_profile_as_of(
+    items: Sequence[Mapping[str, Any]],
+    participant_id: uuid.UUID,
+    knowledge_cutoff: datetime,
+    *,
+    inclusive: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve frozen explicit model parameters at a causal boundary."""
+
+    cutoff = _aware(knowledge_cutoff)
+    candidates = []
+    for item in items:
+        if item["item_type"] != "participant_profile" or str(
+            item["participant_id"]
+        ) != str(participant_id):
+            continue
+        metadata = dict(item["metadata"])
+        try:
+            created_at = _aware(metadata.get("created_at"))
+            version = int(metadata.get("version"))
+        except (TypeError, ValueError):
+            continue
+        outside_boundary = created_at > cutoff if inclusive else created_at >= cutoff
+        if outside_boundary:
+            continue
+        parameters = dict(metadata.get("model_params") or {})
+        candidates.append(
+            (
+                created_at,
+                version,
+                str(metadata.get("profile_id") or item.get("source_id") or ""),
+                parameters,
+                str(metadata.get("parameters_hash") or ""),
+                str(metadata.get("source") or "participant_profiles"),
+            )
+        )
+    selected = max(candidates, default=None, key=lambda value: (value[0], value[1]))
+    provenance = {
+        "profile_id": selected[2] if selected else None,
+        "version": selected[1] if selected else None,
+        "created_at": selected[0].isoformat() if selected else None,
+        "parameters_hash": selected[4] if selected else hashlib.sha256(
+            b"{}"
+        ).hexdigest(),
+        "source": selected[5] if selected else None,
+        "origin_cutoff": cutoff.isoformat(),
+        "knowledge_cutoff": cutoff.isoformat(),
+        "cutoff_operator": "<=" if inclusive else "<",
+        "snapshot_item_type": "participant_profile",
+    }
+    return (dict(selected[3]) if selected else {}), provenance
 
 
 def _uncertainty_payload(fitted: Mapping[str, Any], residual: Mapping[str, Any]) -> dict[str, Any]:
@@ -1574,6 +1715,28 @@ class ParameterLearningService:
             ).scalars().all()
             return [self._view(row) for row in rows]
 
+    def _resolve_scheduled_integrity_error(
+        self,
+        error: IntegrityError,
+        *,
+        participant_id: uuid.UUID,
+        schedule_key: str,
+    ) -> dict[str, Any]:
+        """Return only the exact weekly duplicate; rethrow unrelated failures."""
+
+        with self.database.session() as session:
+            existing = session.execute(
+                select(ParameterLearningRun).where(
+                    ParameterLearningRun.participant_id == participant_id,
+                    ParameterLearningRun.model_family == MODEL_FAMILY,
+                    ParameterLearningRun.run_kind == "scheduled",
+                    ParameterLearningRun.schedule_key == schedule_key,
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise error
+            return self._view(existing)
+
     def _snapshot(
         self, snapshot_id: uuid.UUID, participant_id: uuid.UUID
     ) -> tuple[DatasetSnapshot, list[dict[str, Any]], dict[str, Any]]:
@@ -1587,7 +1750,7 @@ class ParameterLearningService:
             integrity = self.snapshot_integrity.verify(
                 snapshot,
                 rows,
-                supported_schema_versions={DATASET_SCHEMA_V5},
+                supported_schema_versions={DATASET_SCHEMA_V6},
                 participant_id=participant_id,
             )
             return snapshot, list(integrity["items"]), {
@@ -1614,28 +1777,6 @@ class ParameterLearningService:
             "stage4_promotion_decision_id": selection.get("promotion_decision_id"),
             "stage4_status": selection.get("status"),
         }
-
-    def _explicit_as_of(self, participant_id: uuid.UUID, cutoff: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
-        with self.database.session() as session:
-            row = session.execute(
-                select(ParticipantProfile)
-                .where(
-                    ParticipantProfile.participant_id == participant_id,
-                    ParticipantProfile.created_at <= cutoff,
-                )
-                .order_by(desc(ParticipantProfile.version))
-                .limit(1)
-            ).scalar_one_or_none()
-            payload = dict(row.profile_json or {}) if row else {}
-            parameters = dict(payload.get("model_params") or payload.get("params") or {})
-            provenance = {
-                "version": row.version if row else None,
-                "created_at": row.created_at.isoformat() if row else None,
-                "sha256": hashlib.sha256(
-                    json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest(),
-            }
-            return parameters, provenance
 
     def train_snapshot(
         self,
@@ -1674,7 +1815,13 @@ class ParameterLearningService:
             if str(row.get("participant_id")) == str(participant_id)
         ]
         gate = minimum_data_gate(individual)
-        resilience = _trait_resilience(items, participant_id)
+        resilience, resilience_provenance = trait_resilience_as_of(
+            items,
+            participant_id,
+            snapshot.observation_cutoff,
+            inclusive=True,
+        )
+        resilience_provenance["usage"] = "deployment_trait_resilience"
         fitted = fit_partial_pooling(
             natural_population,
             individual,
@@ -1685,14 +1832,18 @@ class ParameterLearningService:
         current = self.learned_profiles.runtime_active(participant_id)
         before = dict((current or {}).get("parameters") or {})
         base_active_identity = self._active_identity(current)
-        explicit, explicit_provenance = self._explicit_as_of(participant_id, snapshot.observation_cutoff)
+        _deployment_explicit, explicit_provenance = explicit_profile_as_of(
+            items,
+            participant_id,
+            snapshot.observation_cutoff,
+            inclusive=True,
+        )
+        explicit_provenance["usage"] = "deployment_explicit_profile"
         validation = self.formal_replay.validate(
             frozen=frozen,
             items=items,
             participant_id=participant_id,
-            explicit_parameters=explicit,
             current_parameters=before,
-            trait_resilience=resilience,
         )
         residual = dict(validation.get("latest_residual_model") or {})
         candidate = runtime_candidate_parameters(fitted)
@@ -1710,6 +1861,7 @@ class ParameterLearningService:
             "population_prior": fitted["population_prior"],
             "parameter_evidence": fitted["uncertainty"],
             "trait_resilience": resilience,
+            "deployment_trait_resilience_provenance": resilience_provenance,
             "explicit_profile_provenance": explicit_provenance,
             "schedule": "weekly_dataset_snapshot" if run_kind == "scheduled" else "manual_dataset_snapshot",
             "run_kind": run_kind,
@@ -1768,22 +1920,17 @@ class ParameterLearningService:
                     window_start=window_start,
                     window_end=window_end,
                     source=LEARNING_VERSION,
-                    model_version="mindflow-ctssm-runtime-v10",
+                    model_version="mindflow-ctssm-runtime-v11",
                     validation_status="candidate" if status == "candidate" else "rejected",
                 )
-        except IntegrityError:
+        except IntegrityError as error:
             if run_kind != "scheduled":
                 raise
-            with self.database.session() as session:
-                existing = session.execute(
-                    select(ParameterLearningRun).where(
-                        ParameterLearningRun.participant_id == participant_id,
-                        ParameterLearningRun.model_family == MODEL_FAMILY,
-                        ParameterLearningRun.run_kind == "scheduled",
-                        ParameterLearningRun.schedule_key == schedule_key,
-                    )
-                ).scalar_one()
-                return self._view(existing)
+            return self._resolve_scheduled_integrity_error(
+                error,
+                participant_id=participant_id,
+                schedule_key=str(schedule_key),
+            )
         with self.database.session() as session:
             return self._view(session.get(ParameterLearningRun, run_id))
 
@@ -1802,6 +1949,11 @@ class ParameterLearningService:
                 raise ValueError("candidate did not pass personalized promotion gate")
             if promotion_gate.get("formal_promotion_eligible") is not True:
                 raise ValueError("candidate was not validated by formal real replay")
+            if promotion_gate.get("version") != PROMOTION_GATE_VERSION:
+                raise ValueError("unsupported personalized promotion gate version")
+            formal_audit = dict(validation.get("formal_replay_audit") or {})
+            if formal_audit.get("engine") != self.formal_replay.FORMAL_ENGINE_VERSION:
+                raise ValueError("unsupported Stage-5 formal replay engine")
             if not bool((run.training_metrics.get("minimum_data_gate") or {}).get("passed")):
                 raise ValueError("candidate did not pass minimum data gate")
             candidate = dict(run.parameters_candidate or {})
@@ -1861,7 +2013,7 @@ class ParameterLearningService:
                 window_start=candidate_profile.window_start,
                 window_end=candidate_profile.window_end,
                 source=f"{LEARNING_VERSION}.promoted",
-                model_version="mindflow-ctssm-runtime-v10",
+                model_version="mindflow-ctssm-runtime-v11",
                 validation_status="validated",
             )
             run.status = "promoted"
@@ -1908,7 +2060,7 @@ class ParameterLearningService:
                 .where(
                     DatasetSnapshot.date_start == date_start,
                     DatasetSnapshot.date_end == through,
-                    DatasetSnapshot.schema_version == DATASET_SCHEMA_V5,
+                    DatasetSnapshot.schema_version == DATASET_SCHEMA_V6,
                 )
                 .order_by(desc(DatasetSnapshot.created_at))
             ).scalars().first()

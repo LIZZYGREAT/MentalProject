@@ -28,6 +28,15 @@ SCHEMA_ITEM_COUNTS = {
         "care_intervention_exposure",
         "warning_delivery",
     ),
+    "mindflow-research-dataset-v6": (
+        "participant",
+        "psychometric",
+        "daily_review",
+        "slow_state",
+        "care_intervention_exposure",
+        "warning_delivery",
+        "participant_profile",
+    ),
 }
 
 

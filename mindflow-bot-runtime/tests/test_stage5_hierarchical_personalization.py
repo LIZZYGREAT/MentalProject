@@ -10,17 +10,20 @@ from app.models import (
     DatasetSnapshotItem,
     LearnedModelProfile,
     ParameterLearningRun,
+    ParticipantProfile,
 )
 from app.repositories import LearnedProfileRepository
 from app.services.hierarchical_personalization import (
     LEARNING_VERSION,
     MODEL_FAMILY,
+    PROMOTION_GATE_VERSION,
     RESIDUAL_MAX,
     ParameterLearningService,
     Stage5PersonalizedReplayService,
     _causal_previous_features,
     _with_intervention_exclusions,
     estimate_population_prior,
+    explicit_profile_as_of,
     evidence_counts,
     fit_partial_pooling,
     fit_residual_ridge,
@@ -28,9 +31,11 @@ from app.services.hierarchical_personalization import (
     predict_residual,
     rolling_personalization_validation,
     runtime_candidate_parameters,
+    trait_resilience_as_of,
 )
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
-from app.services.research_evaluation import DATASET_SCHEMA_V5
+from app.services.research_evaluation import DATASET_SCHEMA_V6
+from app.services.research_evaluation import ResearchEvaluationService
 from tests.helpers import memory_database, participant
 
 
@@ -266,6 +271,119 @@ def test_post_intervention_rows_are_versioned_and_excluded_from_core_fit():
     assert audit["policy_version"].endswith(".v1")
 
 
+def test_brs_and_explicit_profile_resolve_at_strict_knowledge_cutoff():
+    participant_id = uuid.uuid4()
+    items = [
+        {
+            "item_type": "psychometric",
+            "source_id": "brs-day-10",
+            "participant_id": participant_id,
+            "metadata": {
+                "assessment_id": "brs-day-10",
+                "instrument_name": "BRS",
+                "scores": {"mean": 4.0},
+                "administered_at": "2030-01-10T08:00:00+00:00",
+                "created_at": "2030-01-10T09:00:00+00:00",
+            },
+        },
+        {
+            "item_type": "psychometric",
+            "source_id": "brs-day-20",
+            "participant_id": participant_id,
+            "metadata": {
+                "assessment_id": "brs-day-20",
+                "instrument_name": "BRS",
+                "scores": {"mean": 1.0},
+                "administered_at": "2030-01-20T08:00:00+00:00",
+                "created_at": "2030-01-20T09:00:00+00:00",
+            },
+        },
+        {
+            "item_type": "participant_profile",
+            "source_id": "profile-v1",
+            "participant_id": participant_id,
+            "metadata": {
+                "profile_id": "profile-v1",
+                "version": 1,
+                "model_params": {"S_star_init": 45.0},
+                "parameters_hash": "hash-v1",
+                "created_at": "2030-01-05T08:00:00+00:00",
+            },
+        },
+        {
+            "item_type": "participant_profile",
+            "source_id": "profile-v2",
+            "participant_id": participant_id,
+            "metadata": {
+                "profile_id": "profile-v2",
+                "version": 2,
+                "model_params": {"S_star_init": 90.0},
+                "parameters_hash": "hash-v2",
+                "created_at": "2030-01-20T08:00:00+00:00",
+            },
+        },
+    ]
+
+    resilience, brs_audit = trait_resilience_as_of(
+        items, participant_id, datetime(2030, 1, 15, tzinfo=timezone.utc)
+    )
+    explicit, profile_audit = explicit_profile_as_of(
+        items, participant_id, datetime(2030, 1, 15, tzinfo=timezone.utc)
+    )
+    explicit_day_21, profile_day_21 = explicit_profile_as_of(
+        items, participant_id, datetime(2030, 1, 21, tzinfo=timezone.utc)
+    )
+
+    assert resilience == 0.75
+    assert brs_audit["assessment_id"] == "brs-day-10"
+    assert brs_audit["available_at"] == "2030-01-10T09:00:00+00:00"
+    assert explicit == {"S_star_init": 45.0}
+    assert profile_audit["profile_id"] == "profile-v1"
+    assert explicit_day_21 == {"S_star_init": 90.0}
+    assert profile_day_21["profile_id"] == "profile-v2"
+
+
+def test_dataset_v6_freezes_append_only_explicit_profile_history():
+    database = memory_database()
+    person = participant(database, "stage5-explicit-history")
+    with database.session() as session:
+        session.add_all(
+            [
+                ParticipantProfile(
+                    participant_id=person.id,
+                    version=1,
+                    profile_json={"model_params": {"S_star_init": 45.0}},
+                    created_at=datetime(2030, 1, 5, tzinfo=timezone.utc),
+                ),
+                ParticipantProfile(
+                    participant_id=person.id,
+                    version=2,
+                    profile_json={"model_params": {"S_star_init": 65.0}},
+                    created_at=datetime(2030, 1, 20, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot = service.create_dataset_snapshot(
+        date_start=date(2030, 1, 1),
+        date_end=date(2030, 1, 25),
+        participant_filter={"participant_codes": [person.participant_code]},
+        observation_cutoff=datetime(2030, 1, 26, tzinfo=timezone.utc),
+        calendar_cutoff=datetime(2030, 1, 26, tzinfo=timezone.utc),
+    )
+    profile_items = [
+        item
+        for item in service.snapshot_items(uuid.UUID(snapshot["id"]))
+        if item["item_type"] == "participant_profile"
+    ]
+
+    assert snapshot["schema_version"] == DATASET_SCHEMA_V6
+    assert snapshot["manifest"]["participant_profile_count"] == 2
+    assert sorted(item["metadata"]["version"] for item in profile_items) == [1, 2]
+    assert profile_items[0]["metadata"]["parameters_hash"]
+
+
 @pytest.mark.parametrize("variant", ["m0", "m1", "m2", "m3"])
 def test_formal_validator_calls_production_replay_and_preserves_family(
     variant, monkeypatch
@@ -350,9 +468,7 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
         },
         items=[],
         participant_id=target_id,
-        explicit_parameters={},
         current_parameters={"model_selection": {"active_variant": variant}},
-        trait_resilience=None,
     )
 
     assert extractor.model.calls > 0
@@ -363,6 +479,113 @@ def test_formal_validator_calls_production_replay_and_preserves_family(
     assert result["formal_replay_audit"]["population_prior_splits"][0][
         "target_excluded"
     ] is True
+    assert result["residual_gate"]["passed"] is False
+    assert result["residual_gate"]["formal_residual_promotion_eligible"] is False
+    assert result["residual_gate"]["reason"] == (
+        "trajectory_and_interval_not_recomputed"
+    )
+    assert result["residual_gate"]["checks"]["coverage_not_decreased"] is None
+    assert result["residual_gate"]["checks"]["peak_error_not_worse"] is None
+    assert result["residual_gate"]["checks"][
+        "formal_residual_promotion_eligible"
+    ] is False
+
+    if variant == "m1":
+        def future_items(brs_score, explicit_baseline):
+            return [
+                {
+                    "item_type": "psychometric",
+                    "source_id": "future-brs",
+                    "participant_id": target_id,
+                    "metadata": {
+                        "assessment_id": "future-brs",
+                        "instrument_name": "BRS",
+                        "scores": {"mean": brs_score},
+                        "administered_at": "2030-01-20T08:00:00+00:00",
+                        "created_at": "2030-01-20T09:00:00+00:00",
+                    },
+                },
+                {
+                    "item_type": "participant_profile",
+                    "source_id": "future-profile",
+                    "participant_id": target_id,
+                    "metadata": {
+                        "profile_id": "future-profile",
+                        "version": 2,
+                        "model_params": {"S_star_init": explicit_baseline},
+                        "parameters_hash": f"future-{explicit_baseline}",
+                        "created_at": "2030-01-20T08:00:00+00:00",
+                    },
+                },
+            ]
+
+        common = {
+            "frozen": {
+                "samples": population,
+                "calendars": calendars,
+                "observation_history": {str(target_id): []},
+            },
+            "participant_id": target_id,
+            "current_parameters": {"model_selection": {"active_variant": variant}},
+        }
+        future_low = service.validate(
+            **common, items=future_items(1.0, 20.0)
+        )
+        future_high = service.validate(
+            **common, items=future_items(5.0, 90.0)
+        )
+
+        assert future_low["rolling_origin"]["splits"][0] == future_high[
+            "rolling_origin"
+        ]["splits"][0]
+        assert future_low["comparison"] == future_high["comparison"]
+        assert future_low["promotion_gate"] == future_high["promotion_gate"]
+        assert future_low["latest_fit"]["parameters"] == future_high[
+            "latest_fit"
+        ]["parameters"]
+        information_set = future_low["formal_replay_audit"][
+            "split_information_sets"
+        ][0]
+        assert information_set["trait_resilience"]["assessment_id"] is None
+        assert information_set["explicit_profile"]["profile_id"] is None
+
+        causal_items = future_items(1.0, 90.0) + [
+            {
+                "item_type": "psychometric",
+                "source_id": "past-brs",
+                "participant_id": target_id,
+                "metadata": {
+                    "assessment_id": "past-brs",
+                    "instrument_name": "BRS",
+                    "scores": {"mean": 4.0},
+                    "administered_at": "2030-01-10T08:00:00+00:00",
+                    "created_at": "2030-01-10T09:00:00+00:00",
+                },
+            },
+            {
+                "item_type": "participant_profile",
+                "source_id": "past-profile",
+                "participant_id": target_id,
+                "metadata": {
+                    "profile_id": "past-profile",
+                    "version": 1,
+                    "model_params": {"S_star_init": 45.0},
+                    "parameters_hash": "past-profile-hash",
+                    "created_at": "2030-01-05T08:00:00+00:00",
+                },
+            },
+        ]
+        causal = service.validate(**common, items=causal_items)
+        causal_information = causal["formal_replay_audit"][
+            "split_information_sets"
+        ][0]
+        assert causal_information["trait_resilience"]["assessment_id"] == "past-brs"
+        assert causal_information["trait_resilience"]["prior_version"].endswith(
+            ".v1"
+        )
+        assert causal_information["explicit_profile"]["profile_id"] == (
+            "past-profile"
+        )
 
 
 def test_rolling_origin_compares_all_required_models_and_residual_gate():
@@ -391,6 +614,10 @@ def test_rolling_origin_compares_all_required_models_and_residual_gate():
     } <= set(result["comparison"]["new_candidate_model"])
     assert result["residual_gate"]["checks"]["correction_bound"] == 1.0
     assert result["residual_gate"]["checks"]["mode"] == "shadow"
+    assert result["residual_gate"]["checks"]["coverage_not_decreased"] is None
+    assert result["residual_gate"]["checks"]["peak_error_not_worse"] is None
+    assert result["residual_gate"]["passed"] is False
+    assert result["residual_gate"]["formal_residual_promotion_eligible"] is False
     assert result["promotion_gate"]["passed"] is False
     assert result["promotion_gate"]["formal_promotion_eligible"] is False
 
@@ -446,6 +673,10 @@ def test_candidate_and_promoted_profiles_are_distinct_and_runtime_audited():
                     "promotion_gate": {
                         "passed": True,
                         "formal_promotion_eligible": True,
+                        "version": PROMOTION_GATE_VERSION,
+                    },
+                    "formal_replay_audit": {
+                        "engine": service.formal_replay.FORMAL_ENGINE_VERSION
                     },
                     "comparison": {},
                     "uncertainty": uncertainty,
@@ -512,7 +743,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
                 participant_filter={"participant_codes": ["stage5-training"]},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V5,
+                schema_version=DATASET_SCHEMA_V6,
                 manifest_json={},
             )
     item_row = DatasetSnapshotItem(
@@ -530,7 +761,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
             )
     item_view = DatasetSnapshotIntegrityService.item_view(item_row)
     contract = {
-        "schema_version": DATASET_SCHEMA_V5,
+        "schema_version": DATASET_SCHEMA_V6,
         "date_start": "2030-01-01",
         "date_end": "2030-01-19",
         "participant_filter": {"participant_codes": ["stage5-training"]},
@@ -538,7 +769,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
         "calendar_cutoff": cutoff.isoformat(),
     }
     snapshot_row.manifest_json = {
-        "schema_version": DATASET_SCHEMA_V5,
+        "schema_version": DATASET_SCHEMA_V6,
         "participant_count": 1,
         "observation_count": 0,
         "forecast_count": 0,
@@ -548,6 +779,7 @@ def test_training_service_persists_run_and_candidate_profile_from_snapshot(monke
         "slow_state_count": 0,
         "care_intervention_exposure_count": 0,
         "warning_delivery_count": 0,
+        "participant_profile_count": 0,
         "item_count": 1,
         "manifest_hash": DatasetSnapshotIntegrityService.manifest_hash(
             contract, [item_view]
@@ -632,7 +864,7 @@ def test_promotion_rejects_candidate_when_base_active_profile_has_changed():
                 participant_filter={},
                 observation_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 20, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V5,
+                schema_version=DATASET_SCHEMA_V6,
                 manifest_json={},
             )
         )
@@ -655,6 +887,10 @@ def test_promotion_rejects_candidate_when_base_active_profile_has_changed():
                     "promotion_gate": {
                         "passed": True,
                         "formal_promotion_eligible": True,
+                        "version": PROMOTION_GATE_VERSION,
+                    },
+                    "formal_replay_audit": {
+                        "engine": service.formal_replay.FORMAL_ENGINE_VERSION
                     },
                     "uncertainty": uncertainty,
                 },
@@ -731,7 +967,7 @@ def test_scheduled_week_has_database_level_idempotency_constraint():
                 participant_filter={},
                 observation_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
                 calendar_cutoff=datetime(2030, 1, 8, tzinfo=timezone.utc),
-                schema_version=DATASET_SCHEMA_V5,
+                schema_version=DATASET_SCHEMA_V6,
                 manifest_json={},
             )
         )
@@ -768,3 +1004,22 @@ def test_scheduled_week_has_database_level_idempotency_constraint():
                     status="rejected",
                 )
             )
+
+
+def test_unrelated_scheduled_integrity_error_is_rethrown_unchanged():
+    database = memory_database()
+    service = ParameterLearningService(database, "Asia/Shanghai")
+    error = IntegrityError(
+        "INSERT unrelated constraint",
+        {},
+        RuntimeError("different database constraint"),
+    )
+
+    with pytest.raises(IntegrityError) as caught:
+        service._resolve_scheduled_integrity_error(
+            error,
+            participant_id=uuid.uuid4(),
+            schedule_key="2030-W01",
+        )
+
+    assert caught.value is error

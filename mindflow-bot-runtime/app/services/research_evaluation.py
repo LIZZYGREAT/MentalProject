@@ -31,6 +31,7 @@ from app.models import (
     LearnedModelProfile,
     ModelEvaluationRun,
     Participant,
+    ParticipantProfile,
     ParticipantSlowState,
     PsychometricAssessment,
     StateObservation,
@@ -48,7 +49,8 @@ DATASET_SCHEMA_V2 = "mindflow-research-dataset-v2"
 DATASET_SCHEMA_V3 = "mindflow-research-dataset-v3"
 DATASET_SCHEMA_V4 = "mindflow-research-dataset-v4"
 DATASET_SCHEMA_V5 = "mindflow-research-dataset-v5"
-DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V5
+DATASET_SCHEMA_V6 = "mindflow-research-dataset-v6"
+DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V6
 STAGE5_INTERVENTION_EXCLUSION_MINUTES = 120
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
 EVALUATION_CODE_VERSION = "stage4-evaluation.v7"
@@ -1030,6 +1032,18 @@ class ResearchEvaluationService:
                     ParticipantSlowState.effective_at,
                 )
             ).scalars().all()
+            participant_profiles = session.execute(
+                select(ParticipantProfile)
+                .where(
+                    ParticipantProfile.participant_id.in_(participant_ids),
+                    ParticipantProfile.created_at <= observation_cutoff,
+                )
+                .order_by(
+                    ParticipantProfile.participant_id,
+                    ParticipantProfile.created_at,
+                    ParticipantProfile.version,
+                )
+            ).scalars().all()
             exposure_lower = lower - timedelta(
                 minutes=STAGE5_INTERVENTION_EXCLUSION_MINUTES
             )
@@ -1109,6 +1123,31 @@ class ResearchEvaluationService:
                         "scores": dict(assessment.scores_json or {}),
                         "administered_at": administered.isoformat(),
                         "created_at": _aware(assessment.created_at).isoformat(),
+                    },
+                )
+            )
+
+        for profile in participant_profiles:
+            created_at = _aware(profile.created_at)
+            payload = dict(profile.profile_json or {})
+            model_parameters = dict(
+                payload.get("model_params") or payload.get("params") or {}
+            )
+            freeze(
+                self._item(
+                    "participant_profile",
+                    str(profile.id),
+                    "participant-profile-model-parameters.v1",
+                    profile.participant_id,
+                    created_at.astimezone(self.timezone).date(),
+                    {
+                        "profile_id": str(profile.id),
+                        "participant_id": str(profile.participant_id),
+                        "version": profile.version,
+                        "model_params": model_parameters,
+                        "created_at": created_at.isoformat(),
+                        "source": str(payload.get("source") or "participant_profiles"),
+                        "parameters_hash": _hash(model_parameters),
                     },
                 )
             )
@@ -1366,6 +1405,7 @@ class ResearchEvaluationService:
                 "care_intervention_exposure"
             ),
             "warning_delivery_count": type_count("warning_delivery"),
+            "participant_profile_count": type_count("participant_profile"),
             "item_count": len(items),
             "manifest_hash": manifest_hash,
         }
@@ -1522,6 +1562,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V3,
             DATASET_SCHEMA_V4,
             DATASET_SCHEMA_V5,
+            DATASET_SCHEMA_V6,
         }:
             raise ValueError("unsupported dataset schema version")
         if manifest.get("schema_version") != schema_version:
@@ -1548,7 +1589,11 @@ class ResearchEvaluationService:
                 )
         elif schema_version == DATASET_SCHEMA_V3:
             expected_counts["participant_count"] = participant_item_count
-        elif schema_version in {DATASET_SCHEMA_V4, DATASET_SCHEMA_V5}:
+        elif schema_version in {
+            DATASET_SCHEMA_V4,
+            DATASET_SCHEMA_V5,
+            DATASET_SCHEMA_V6,
+        }:
             expected_counts["participant_count"] = participant_item_count
             expected_counts.update(
                 {
@@ -1563,7 +1608,7 @@ class ResearchEvaluationService:
                     ),
                 }
             )
-            if schema_version == DATASET_SCHEMA_V5:
+            if schema_version in {DATASET_SCHEMA_V5, DATASET_SCHEMA_V6}:
                 expected_counts.update(
                     {
                         "care_intervention_exposure_count": sum(
@@ -1576,6 +1621,10 @@ class ResearchEvaluationService:
                         ),
                     }
                 )
+            if schema_version == DATASET_SCHEMA_V6:
+                expected_counts["participant_profile_count"] = sum(
+                    item["item_type"] == "participant_profile" for item in items
+                )
         if any(manifest.get(key) != value for key, value in expected_counts.items()):
             raise ValueError("dataset snapshot manifest/items count mismatch")
         if (
@@ -1583,6 +1632,7 @@ class ResearchEvaluationService:
                 DATASET_SCHEMA_V3,
                 DATASET_SCHEMA_V4,
                 DATASET_SCHEMA_V5,
+                DATASET_SCHEMA_V6,
             }
             and participant_item_count <= 0
         ):
@@ -1602,6 +1652,7 @@ class ResearchEvaluationService:
             DATASET_SCHEMA_V3,
             DATASET_SCHEMA_V4,
             DATASET_SCHEMA_V5,
+            DATASET_SCHEMA_V6,
         }:
             participant_ids = {
                 item["participant_id"]
