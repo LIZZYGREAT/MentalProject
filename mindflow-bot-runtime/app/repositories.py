@@ -302,10 +302,7 @@ class LearnedProfileRepository:
     STAGE5_RUNTIME_VERSION = "mindflow-ctssm-runtime-v11"
     STAGE5_PROMOTION_GATE_VERSION = "stage5-personalization-gate.v3"
     STAGE5_FORMAL_REPLAY_ENGINE = "stage5-real-ctssm-rolling-replay.v2"
-    STAGE5_CAUSAL_DATASET_SCHEMAS = {
-        "mindflow-research-dataset-v6",
-        "mindflow-research-dataset-v7",
-    }
+    STAGE5_CAUSAL_DATASET_SCHEMAS = {"mindflow-research-dataset-v7"}
 
     def __init__(self, database: Database):
         self.database = database
@@ -377,9 +374,13 @@ class LearnedProfileRepository:
             statement = statement.with_for_update()
         rows = session.execute(statement).scalars().all()
         for row in rows:
-            valid, _evidence = self.runtime_validity_in_session(session, row)
+            valid, evidence = self.runtime_validity_in_session(session, row)
             if valid:
                 view = self._view(row)
+                view["runtime_validation"] = {
+                    **evidence,
+                    "runtime_valid": True,
+                }
                 return view
         return None
 
@@ -415,6 +416,7 @@ class LearnedProfileRepository:
 
         if selection.get("status") == "stage5_promoted":
             evidence["proof_type"] = "stage5_parameter_learning_run"
+            evidence["provenance_type"] = "stage5_promotion"
             try:
                 learning_run_id = uuid.UUID(
                     str(selection.get("parameter_learning_run_id") or "")
@@ -506,7 +508,15 @@ class LearnedProfileRepository:
         evidence["proof_type"] = "stage4_or_m0"
         if active_variant == "m0":
             evidence.update(
-                {"runtime_valid": True, "reason": "m0_runtime_profile"}
+                {
+                    "runtime_valid": True,
+                    "provenance_type": (
+                        "legacy_m0"
+                        if row.model_version == "legacy"
+                        else "validated_m0"
+                    ),
+                    "reason": "m0_runtime_profile",
+                }
             )
             return True, evidence
         try:
@@ -535,6 +545,7 @@ class LearnedProfileRepository:
         )
         evidence.update(
             {
+                "provenance_type": "stage4_promotion",
                 "promotion_decision_id": (
                     str(decision.id) if decision is not None else None
                 ),

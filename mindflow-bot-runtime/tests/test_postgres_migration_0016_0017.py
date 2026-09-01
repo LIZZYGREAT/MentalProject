@@ -831,6 +831,81 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 ),
                 {"id": old_promoted_stage5_profile},
             ) == "rejected"
+            v11_v6_run = uuid.uuid4()
+            v11_v6_profile = uuid.uuid4()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO parameter_learning_runs (
+                        id, participant_id, dataset_snapshot_id, model_family,
+                        run_kind, schedule_key, parameters_before,
+                        parameters_candidate, training_metrics,
+                        validation_metrics, sample_count, status, created_at
+                    ) VALUES (
+                        :id, :participant_id, :snapshot_id,
+                        'hierarchical-ctssm-residual.v2', 'manual', NULL,
+                        '{}'::jsonb, '{"S_star_init": 55.0}'::jsonb,
+                        '{}'::jsonb,
+                        '{"promotion_gate": {"version": "stage5-personalization-gate.v3", "passed": true, "formal_promotion_eligible": true}, "formal_replay_audit": {"engine": "stage5-real-ctssm-rolling-replay.v2"}}'::jsonb,
+                        30, 'promoted', :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": v11_v6_run,
+                    "participant_id": participant_id,
+                    "snapshot_id": dataset_snapshot_id,
+                    "created_at": now,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO learned_model_profiles (
+                        id, participant_id, version, parameters_json,
+                        uncertainty_json, source, model_version,
+                        validation_status, sample_count, day_count, confidence,
+                        window_start, window_end, created_at
+                    ) VALUES (
+                        :id, :participant_id, 3,
+                        jsonb_build_object(
+                            'S_star_init', 55.0,
+                            'model_selection', jsonb_build_object(
+                                'status', 'stage5_promoted',
+                                'parameter_learning_run_id', CAST(:run_id AS TEXT),
+                                'active_variant', 'm1'
+                            )
+                        ),
+                        '{}'::jsonb, 'stage5-v11-pre-v7',
+                        'mindflow-ctssm-runtime-v11', 'validated',
+                        30, 14, 0.8, '2030-01-01', '2030-01-14', :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": v11_v6_profile,
+                    "participant_id": participant_id,
+                    "run_id": v11_v6_run,
+                    "created_at": now,
+                },
+            )
+            command.upgrade(config, "0035_stage5_v7_runtime_cutover")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0035_stage5_v7_runtime_cutover"
+            assert connection.scalar(
+                text(
+                    "SELECT status FROM parameter_learning_runs WHERE id = :id"
+                ),
+                {"id": v11_v6_run},
+            ) == "rejected"
+            assert connection.scalar(
+                text(
+                    "SELECT validation_status FROM learned_model_profiles "
+                    "WHERE id = :id"
+                ),
+                {"id": v11_v6_profile},
+            ) == "rejected"
             stage5_columns = {
                 column["name"]
                 for column in inspect(connection).get_columns(
@@ -1035,7 +1110,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             assert v3_snapshot["schema_version"] == DATASET_SCHEMA_V7
             assert v3_snapshot["manifest"]["participant_count"] == 1
             assert v3_snapshot["manifest"]["participant_profile_count"] == 1
-            assert v3_snapshot["manifest"]["learned_model_profile_count"] == 2
+            assert v3_snapshot["manifest"]["learned_model_profile_count"] == 3
             v3_snapshot_id = uuid.UUID(v3_snapshot["id"])
             memberships = service.snapshot_items(v3_snapshot_id, "participant")
             assert len(memberships) == 1
@@ -1051,7 +1126,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             frozen_learned_profiles = service.snapshot_items(
                 v3_snapshot_id, "learned_model_profile"
             )
-            assert len(frozen_learned_profiles) == 2
+            assert len(frozen_learned_profiles) == 3
             rejected_frozen = next(
                 item
                 for item in frozen_learned_profiles

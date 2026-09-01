@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0034_dataset_v7_active_history -->
+<!-- ALEMBIC_HEAD: 0035_stage5_v7_runtime_cutover -->
 
 ## 运行边界
 
@@ -191,7 +191,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0034_dataset_v7_active_history`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0035_stage5_v7_runtime_cutover`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -283,7 +283,7 @@ stress/vitality、recovery window 与 semantic dimensions 的 Ridge residual；�
 定时校准通过现有 scheduler 接口每周至多创建一次
 56 日 Dataset Snapshot 与参数学习运行，不再在每次 EMA 后即时重拟合。晋级保留 candidate 画像，
 另写 validated Active 画像；`runtime_active()` 对 Stage 5 画像强制验证 runtime-v11、v2 模型族、
-v3 promotion gate、formal replay v2、v6/v7 因果 Dataset、promoted run 及候选参数逐项匹配。
+v3 promotion gate、formal replay v2、仅 v7 因果 Dataset、promoted run 及候选参数逐项匹配。
 任一证据不满足都会 fail closed 并回退到更早的合法 Stage 4/M0 画像。晋级还会在 participant/profile 行锁内比较训练时冻结的 Active
 profile id/version/hash、模型变体、spec 与 Stage-4 decision；不一致即拒绝为
 `stale_parameter_learning_candidate`。Admin 研究页显示 Calibration Runs、Parameter History、Candidate vs
@@ -313,6 +313,14 @@ Active 时明确回退 Current M0。快照 cutoff 之后才生成的 live Active
 读取为 `deployment_base_active_identity_at_train_time`，继续参与 stale-promotion CAS。0034 保留
 旧记录但将 runtime-v10 的 Stage 5 promoted validated 画像及其关联 promoted run 标记 rejected，
 避免旧 v5/gate-v2/replay-v1 证据继续影响生产。
+
+0035 完成 Stage 5 v7 production cutover：保留历史，但撤销所有关联非 v7 Dataset 的 promoted
+run 与 runtime-v11 validated Stage-5 profile。Repository 是生产信任边界，`runtime_active()`
+返回只读 `runtime_validation` proof；Forecast 对 Stage 4/Stage 5 均消费该 proof，缺失或伪造 proof
+继续 fail closed 到 M0。Rolling-Origin 的 Current Personalized 严格复用生产 layering
+`system defaults → learned → explicit`，不再以 Stage-5 population prior 补齐 sparse learned。
+最终 Candidate family 从 snapshot-cutoff frozen Active 获取；train-time live Active 只用于 CAS，
+两者不一致时以 `active_changed_after_snapshot_cutoff_require_resnapshot` 拒绝并要求重建快照。
 
 `rolling-origin-knowledge-causal.v2` 以测试日当地 00:00 作为 split origin；训练 EMA 的
 `created_at`、BRS 的 `max(administered_at, created_at)` 与 Slow State 的

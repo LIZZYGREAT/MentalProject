@@ -145,6 +145,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0034_dataset_v7_active_history"
     )
     assert migration_0034.down_revision == "0033_dataset_v6_profile_history"
+    migration_0035 = next(
+        migration for migration in migrations
+        if migration.revision == "0035_stage5_v7_runtime_cutover"
+    )
+    assert migration_0035.down_revision == "0034_dataset_v7_active_history"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
@@ -282,6 +287,23 @@ def test_0034_freezes_active_history_and_revokes_old_promotions(monkeypatch):
         "WHERE item_type = 'learned_model_profile'"
     ]
     assert "'learned_model_profile'" not in checks[-1][2]
+
+
+def test_0035_revokes_pre_v7_stage5_production_eligibility(monkeypatch):
+    migration = _migration(VERSIONS / "0035_stage5_v7_runtime_cutover.py")
+    statements = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert len(statements) == 2
+    assert "parameter_learning_runs" in statements[0]
+    assert "runs.status = 'promoted'" in statements[0]
+    assert "schema_version <> 'mindflow-research-dataset-v7'" in statements[0]
+    assert "learned_model_profiles" in statements[1]
+    assert "mindflow-ctssm-runtime-v11" in statements[1]
+    assert "stage5_promoted" in statements[1]
+    assert "schema_version <> 'mindflow-research-dataset-v7'" in statements[1]
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

@@ -33,6 +33,7 @@ from app.models import (
 from app.repositories import LearnedProfileRepository, promotion_parameters_hash
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
 from app.services.model_comparison import comparison_metrics, rolling_origin_splits
+from app.services.profile_calibration import layered_profile
 from app.services.research_evaluation import (
     DATASET_SCHEMA_V7,
     ResearchEvaluationService,
@@ -904,6 +905,24 @@ def _deep_merge_parameters(
     return result
 
 
+def _production_current_parameters(
+    learned: Mapping[str, Any] | None,
+    explicit: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply the exact production system-default/learned/explicit layering."""
+
+    explicit_row = (
+        {"version": None, "profile": {"model_params": dict(explicit)}}
+        if explicit
+        else None
+    )
+    learned_row = (
+        {"version": None, "parameters": dict(learned)} if learned else None
+    )
+    effective, _layers = layered_profile(explicit_row, learned_row)
+    return dict(effective.get("model_params") or {})
+
+
 def _hierarchical_runtime_parameters(
     values: Mapping[str, float], *, trait_resilience: float | None = None
 ) -> dict[str, Any]:
@@ -1295,8 +1314,8 @@ class Stage5PersonalizedReplayService:
                 "explicit_profile_model": _deep_merge_parameters(
                     global_parameters, split_explicit
                 ),
-                "current_personalized_model": _deep_merge_parameters(
-                    _deep_merge_parameters(global_parameters, split_current),
+                "current_personalized_model": _production_current_parameters(
+                    split_current,
                     split_explicit,
                 ),
                 "new_candidate_model": _deep_merge_parameters(
@@ -1943,6 +1962,38 @@ class ParameterLearningService:
         current = self.learned_profiles.runtime_active(participant_id)
         before = dict((current or {}).get("parameters") or {})
         base_active_identity = self._active_identity(current)
+        deployment_current, deployment_current_provenance = (
+            active_learned_profile_as_of(
+                items,
+                participant_id,
+                snapshot.observation_cutoff,
+                inclusive=True,
+            )
+        )
+        deployment_active_identity = self._active_identity(
+            {
+                "id": deployment_current_provenance.get("profile_id"),
+                "version": deployment_current_provenance.get("version"),
+                "parameters": deployment_current,
+            }
+            if deployment_current_provenance.get("profile_id")
+            else None
+        )
+        deployment_current_provenance["usage"] = (
+            "deployment_current_profile_at_snapshot_cutoff"
+        )
+        deployment_family_gate = {
+            "passed": deployment_active_identity == base_active_identity,
+            "reason": (
+                "snapshot_cutoff_active_matches_train_time_live"
+                if deployment_active_identity == base_active_identity
+                else "active_changed_after_snapshot_cutoff_require_resnapshot"
+            ),
+            "snapshot_cutoff": snapshot.observation_cutoff.isoformat(),
+            "snapshot_cutoff_active_identity": deployment_active_identity,
+            "train_time_live_active_identity": base_active_identity,
+            "provenance": deployment_current_provenance,
+        }
         _deployment_explicit, explicit_provenance = explicit_profile_as_of(
             items,
             participant_id,
@@ -1961,7 +2012,9 @@ class ParameterLearningService:
         uncertainty = _uncertainty_payload(fitted, residual)
         status = (
             "candidate"
-            if gate["passed"] and validation["promotion_gate"]["passed"]
+            if gate["passed"]
+            and validation["promotion_gate"]["passed"]
+            and deployment_family_gate["passed"]
             else "rejected"
         )
         run_id = uuid.uuid4()
@@ -1983,22 +2036,26 @@ class ParameterLearningService:
                 **base_active_identity,
                 "usage": "deployment_base_active_identity_at_train_time",
             },
+            "deployment_family_evidence": deployment_family_gate,
         }
         validation_metrics = {
             **validation,
             "uncertainty": uncertainty,
             "candidate_profile_status": status,
+            "deployment_family_gate": deployment_family_gate,
         }
         model_selection = {
-            **dict(before.get("model_selection") or {}),
+            **dict(deployment_current.get("model_selection") or {}),
             "workflow": "stage5_candidate_active",
             "status": f"stage5_{status}",
             "parameter_learning_run_id": str(run_id),
             "dataset_snapshot_id": str(snapshot_id),
             "promotion_gate_version": PROMOTION_GATE_VERSION,
             "residual_mode": "shadow",
-            "active_variant": base_active_identity["active_variant"],
-            "model_spec_version": base_active_identity["model_spec_version"],
+            "active_variant": deployment_active_identity["active_variant"],
+            "model_spec_version": deployment_active_identity[
+                "model_spec_version"
+            ],
         }
         profile_parameters = {**candidate, "model_selection": model_selection}
         window_start = min((date.fromisoformat(str(row["local_date"])) for row in individual), default=snapshot.date_start)
@@ -2070,6 +2127,29 @@ class ParameterLearningService:
                 raise ValueError("unsupported Stage-5 formal replay engine")
             if not bool((run.training_metrics.get("minimum_data_gate") or {}).get("passed")):
                 raise ValueError("candidate did not pass minimum data gate")
+            snapshot = session.get(DatasetSnapshot, run.dataset_snapshot_id)
+            if snapshot is None or snapshot.schema_version != DATASET_SCHEMA_V7:
+                raise ValueError("Stage-5 promotion requires Dataset Schema v7")
+            deployment_family_evidence = dict(
+                (run.training_metrics or {}).get("deployment_family_evidence")
+                or {}
+            )
+            validation_family_gate = dict(
+                validation.get("deployment_family_gate") or {}
+            )
+            if (
+                deployment_family_evidence.get("passed") is not True
+                or validation_family_gate != deployment_family_evidence
+            ):
+                raise ValueError(
+                    "active_changed_after_snapshot_cutoff_require_resnapshot"
+                )
+            deployment_identity = dict(
+                deployment_family_evidence.get(
+                    "snapshot_cutoff_active_identity"
+                )
+                or {}
+            )
             candidate = dict(run.parameters_candidate or {})
             hierarchical = dict(candidate.get("hierarchical_parameters") or {})
             if set(PARAMETERS) - set(hierarchical):
@@ -2109,8 +2189,18 @@ class ParameterLearningService:
             )
             if candidate_profile is None:
                 raise ValueError("candidate learned profile is missing")
+            candidate_selection = dict(
+                candidate_profile.parameters_json.get("model_selection") or {}
+            )
+            if (
+                candidate_selection.get("active_variant")
+                != deployment_identity.get("active_variant")
+                or candidate_selection.get("model_spec_version")
+                != deployment_identity.get("model_spec_version")
+            ):
+                raise ValueError("candidate deployment family provenance mismatch")
             selection = {
-                **dict((candidate_profile.parameters_json.get("model_selection") or {})),
+                **candidate_selection,
                 "status": "stage5_promoted",
                 "promoted_at": datetime.now(timezone.utc).isoformat(),
                 "residual_mode": "shadow",

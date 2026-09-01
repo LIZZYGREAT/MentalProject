@@ -21,7 +21,6 @@ from app.repositories import (
     LearnedProfileRepository,
     WarningScheduleRepository,
     ForecastInputChangedError,
-    promotion_parameters_hash,
 )
 from algorithm.dynamic_state_model import model_variant_metadata, normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
@@ -91,21 +90,23 @@ def enforce_promoted_model_selection(
         effective_selection.get("active_variant") or "m0"
     ) == "m0":
         return effective_profile
-    learned_selection = dict(
-        (
-            ((learned_row or {}).get("parameters") or {}).get(
-                "model_selection"
-            )
-            or {}
-        )
+    learned_parameters = dict((learned_row or {}).get("parameters") or {})
+    learned_selection = dict(learned_parameters.get("model_selection") or {})
+    proof = dict((learned_row or {}).get("runtime_validation") or {})
+    variant = normalize_model_variant(
+        learned_selection.get("active_variant") or "m0"
     )
     selection_is_proven = bool(
         learned_row is not None
+        and proof.get("runtime_valid") is True
+        and proof.get("provenance_type")
+        in {"stage4_promotion", "stage5_promotion"}
+        and str(proof.get("profile_id") or "")
+        == str(learned_row.get("id") or "")
+        and normalize_model_variant(proof.get("active_variant") or "m0")
+        == variant
+        and effective_parameters == learned_parameters
         and effective_selection == learned_selection
-        and learned_selection.get("status")
-        == "retained_from_empirical_evidence"
-        and learned_selection.get("parameters_hash")
-        == promotion_parameters_hash(effective_parameters)
     )
     if selection_is_proven:
         return effective_profile

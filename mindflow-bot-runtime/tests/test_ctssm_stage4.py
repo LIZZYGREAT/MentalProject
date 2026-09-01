@@ -37,7 +37,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V7,
     ResearchEvaluationService,
 )
-from app.services.profile_calibration import ProfileCalibrationService
+from app.services.profile_calibration import ProfileCalibrationService, layered_profile
 from app.services.model_comparison import PROMOTION_GATE_VERSION
 from app.services.model_promotion import ModelPromotionService
 from app.services.research_evaluation import EVALUATION_CODE_VERSION
@@ -1624,7 +1624,17 @@ def test_explicit_profile_override_cannot_mutate_promoted_candidate():
         "promotion_decision_id": str(uuid.uuid4()),
         "parameters_hash": promotion_parameters_hash(candidate),
     }
-    learned = {"parameters": {**candidate, "model_selection": selection}}
+    learned_id = str(uuid.uuid4())
+    learned = {
+        "id": learned_id,
+        "parameters": {**candidate, "model_selection": selection},
+        "runtime_validation": {
+            "runtime_valid": True,
+            "provenance_type": "stage4_promotion",
+            "profile_id": learned_id,
+            "active_variant": "m1",
+        },
+    }
     valid = enforce_promoted_model_selection(
         {"model_params": {**candidate, "model_selection": selection}}, learned
     )
@@ -1644,3 +1654,72 @@ def test_explicit_profile_override_cannot_mutate_promoted_candidate():
         "active_variant": "m0",
         "status": "promotion_provenance_missing",
     }
+
+
+@pytest.mark.parametrize(
+    ("variant", "family"),
+    [
+        ("wm0", "workload-aware-stress-ctssm.m0"),
+        ("m1", "stress-vitality-ctssm.m1"),
+        ("m2", "stress-vitality-pc-ctssm.m2"),
+        ("m3", "stress-vitality-pc-fatigue-ctssm.m3"),
+    ],
+)
+def test_forecast_trusts_repository_validated_stage5_proof(variant, family):
+    profile_id = str(uuid.uuid4())
+    parameters = {
+        "S_star_init": 52.0,
+        "model_selection": {
+            "active_variant": variant,
+            "status": "stage5_promoted",
+            "parameter_learning_run_id": str(uuid.uuid4()),
+        },
+    }
+    learned = {
+        "id": profile_id,
+        "version": 4,
+        "parameters": parameters,
+        "runtime_validation": {
+            "runtime_valid": True,
+            "provenance_type": "stage5_promotion",
+            "profile_id": profile_id,
+            "active_variant": variant,
+            "checks": {"causal_dataset_schema": True},
+        },
+    }
+    effective, _layers = layered_profile(None, learned)
+    protected = enforce_promoted_model_selection(effective, learned)
+    identity = production_model_identity(
+        protected, AssessmentModel("Asia/Shanghai")
+    )
+
+    assert protected["model_params"]["model_selection"][
+        "active_variant"
+    ] == variant
+    assert identity["model_variant"] == variant
+    assert identity["model_family"] == family
+    assert identity["model_spec_version"].endswith(f":{variant}")
+
+
+def test_forecast_rejects_fake_stage5_proof():
+    parameters = {
+        "S_star_init": 52.0,
+        "model_selection": {
+            "active_variant": "m2",
+            "status": "stage5_promoted",
+            "parameter_learning_run_id": str(uuid.uuid4()),
+        },
+    }
+    fake = {"id": str(uuid.uuid4()), "parameters": parameters}
+    effective, _layers = layered_profile(None, fake)
+
+    protected = enforce_promoted_model_selection(effective, fake)
+    identity = production_model_identity(
+        protected, AssessmentModel("Asia/Shanghai")
+    )
+
+    assert protected["model_params"]["model_selection"] == {
+        "active_variant": "m0",
+        "status": "promotion_provenance_missing",
+    }
+    assert identity["model_variant"] == "m0"
