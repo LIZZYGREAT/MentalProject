@@ -29,6 +29,7 @@ from app.repositories_daily_review import (
 from app.services.daily_review_service import DailyReviewService
 from app.services.research_evaluation import ResearchEvaluationService
 from app.services.model_promotion import ModelPromotionService
+from app.services.hierarchical_personalization import ParameterLearningService
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
@@ -61,6 +62,9 @@ class AdminAPI:
             repository.database, settings.timezone_name
         )
         self.promotions = ModelPromotionService(
+            repository.database, settings.timezone_name
+        )
+        self.parameter_learning = ParameterLearningService(
             repository.database, settings.timezone_name
         )
         self.signer = SessionSigner(
@@ -892,6 +896,72 @@ class AdminAPI:
             return _json_error(str(exc) or "invalid_request", 400)
         return JSONResponse(result, status_code=201)
 
+    async def parameter_learning_dashboard(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        participant_id = None
+        participant_code = str(
+            request.query_params.get("participant_code") or ""
+        ).strip()
+        if participant_code:
+            participant_id = await asyncio.to_thread(
+                self.repository.participant_id, participant_code
+            )
+            if participant_id is None:
+                return _json_error("participant_not_found", 404)
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.parameter_learning.admin_dashboard,
+                participant_id=participant_id,
+            )
+        )
+
+    async def parameter_learning_runs(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=request.method == "POST")
+        if session is None:
+            return _json_error(
+                "unauthorized_or_csrf" if request.method == "POST" else "unauthorized",
+                401,
+            )
+        if request.method == "GET":
+            return JSONResponse(
+                {"items": await asyncio.to_thread(self.parameter_learning.list_runs)}
+            )
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        try:
+            value = await request.json()
+            snapshot_id = uuid.UUID(str(value.get("dataset_snapshot_id") or ""))
+            participant_code = str(value.get("participant_code") or "").strip()
+            participant_id = await asyncio.to_thread(
+                self.repository.participant_id, participant_code
+            )
+            if participant_id is None:
+                return _json_error("participant_not_found", 404)
+            result = await asyncio.to_thread(
+                self.parameter_learning.train_snapshot,
+                snapshot_id,
+                participant_id,
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse(result, status_code=201)
+
+    async def promote_parameter_learning_run(self, request: Request) -> Response:
+        session = await self._authorized(request, csrf=True)
+        if session is None:
+            return _json_error("unauthorized_or_csrf", 401)
+        if session.role not in {"admin", "superadmin"}:
+            return _json_error("forbidden", 403)
+        try:
+            run_id = uuid.UUID(request.path_params["run_id"])
+            result = await asyncio.to_thread(
+                self.parameter_learning.promote, run_id
+            )
+        except (TypeError, ValueError) as exc:
+            return _json_error(str(exc) or "invalid_request", 400)
+        return JSONResponse(result, status_code=201)
+
     async def incidents(self, request: Request) -> Response:
         if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
@@ -992,6 +1062,9 @@ class AdminAPI:
             Route(f"{prefix}/research/dataset-snapshots/{{snapshot_id}}/items", self.dataset_snapshot_items, methods=["GET"]),
             Route(f"{prefix}/research/evaluation-runs", self.evaluation_runs, methods=["GET", "POST"]),
             Route(f"{prefix}/research/evaluation-runs/{{run_id}}/promote", self.promote_evaluation_run, methods=["POST"]),
+            Route(f"{prefix}/research/parameter-learning", self.parameter_learning_dashboard, methods=["GET"]),
+            Route(f"{prefix}/research/parameter-learning-runs", self.parameter_learning_runs, methods=["GET", "POST"]),
+            Route(f"{prefix}/research/parameter-learning-runs/{{run_id}}/promote", self.promote_parameter_learning_run, methods=["POST"]),
             Route(f"{prefix}/research/model-comparison", self.model_comparison, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/longitudinal", self.participant_longitudinal, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/evaluation", self.participant_evaluation, methods=["GET"]),

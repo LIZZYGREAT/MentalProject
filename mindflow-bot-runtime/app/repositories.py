@@ -68,6 +68,7 @@ from app.models import (
     PsychometricAssessment,
     LearnedModelProfile,
     ModelPromotionDecision,
+    ParameterLearningRun,
     ForecastCurrentnessEvent,
     ForecastSnapshot,
     RuntimeIncident,
@@ -303,6 +304,8 @@ class LearnedProfileRepository:
     def _view(row: LearnedModelProfile) -> dict[str, Any]:
         uncertainty = dict(row.uncertainty_json or {})
         return {
+            "id": str(row.id),
+            "participant_id": str(row.participant_id),
             "version": row.version,
             "parameters": dict(row.parameters_json),
             "uncertainty": uncertainty,
@@ -353,6 +356,32 @@ class LearnedProfileRepository:
                 view = self._view(row)
                 parameters = dict(view["parameters"])
                 selection = dict(parameters.get("model_selection") or {})
+                if selection.get("status") == "stage5_promoted":
+                    try:
+                        learning_run_id = uuid.UUID(
+                            str(selection.get("parameter_learning_run_id") or "")
+                        )
+                    except ValueError:
+                        learning_run_id = None
+                    learning_run = (
+                        session.get(ParameterLearningRun, learning_run_id)
+                        if learning_run_id is not None
+                        else None
+                    )
+                    statistical_parameters = {
+                        name: value
+                        for name, value in parameters.items()
+                        if name != "model_selection"
+                    }
+                    if (
+                        learning_run is not None
+                        and learning_run.participant_id == participant_id
+                        and learning_run.status == "promoted"
+                        and dict(learning_run.parameters_candidate or {})
+                        == statistical_parameters
+                    ):
+                        return view
+                    continue
                 active_variant = normalize_model_variant(
                     selection.get("active_variant") or "m0"
                 )

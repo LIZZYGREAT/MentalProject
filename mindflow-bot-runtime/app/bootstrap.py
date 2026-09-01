@@ -45,7 +45,7 @@ from app.services.card_action_service import CardActionService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
-from app.services.profile_calibration import ProfileCalibrationService
+from app.services.hierarchical_personalization import ParameterLearningService
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
@@ -72,7 +72,7 @@ class BusinessServices:
     device_flows: DeviceFlowService
     presentations: PresentationOutbox
     card_actions: CardActionService
-    profile_calibration: ProfileCalibrationService
+    profile_calibration: ParameterLearningService
     pressure_curves: PressureCurveService
     daily_review_schedules: DailyReviewScheduleRepository
     daily_review_responses: DailyReviewResponseRepository
@@ -150,12 +150,11 @@ def build_business_services(
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
     psychometrics = PsychometricAssessmentRepository(database)
-    profile_calibration = ProfileCalibrationService(
-        observations,
-        forecast_snapshots,
-        learned_profiles,
+    # Stage 5 replaces per-EMA refitting with a weekly immutable-snapshot run.
+    # The scheduler still consumes the small maybe_calibrate interface.
+    profile_calibration = ParameterLearningService(
+        database,
         settings.timezone_name,
-        psychometrics=psychometrics,
     )
     forecast_coordinator = ForecastCoordinator(
         participants=ParticipantRepository(database), profiles=profiles,

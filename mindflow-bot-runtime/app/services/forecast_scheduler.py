@@ -18,7 +18,11 @@ from app.repositories import (
     WarningScheduleRepository,
 )
 from app.services.forecast_coordinator import ForecastCoordinator
-from app.services.profile_calibration import ProfileCalibrationService
+from typing import Protocol
+
+
+class CalibrationService(Protocol):
+    def maybe_calibrate(self, participant_id: uuid.UUID, *, through): ...
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +38,7 @@ class ForecastScheduler:
         forecast_max_concurrency: int = 1, warning_max_attempts: int = 5,
         warning_retry_base_seconds: int = 60, warning_claim_lease_seconds: int = 120,
         warning_delivery_policy: WarningDeliveryPolicyConfig | None = None,
-        profile_calibration: ProfileCalibrationService | None = None,
+        profile_calibration: CalibrationService | None = None,
         incidents: RuntimeIncidentRepository | None = None,
         care_card_enabled: bool = False,
     ):

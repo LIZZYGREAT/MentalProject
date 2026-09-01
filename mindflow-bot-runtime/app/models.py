@@ -898,6 +898,66 @@ class ModelPromotionDecision(Base):
     promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ParameterLearningRun(Base):
+    """Auditable Stage-5 candidate training and promotion workflow."""
+
+    __tablename__ = "parameter_learning_runs"
+    __table_args__ = (
+        Index(
+            "ix_parameter_learning_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index(
+            "ix_parameter_learning_snapshot_created",
+            "dataset_snapshot_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "status IN ('candidate', 'rejected', 'promoted')",
+            name="ck_parameter_learning_status",
+        ),
+        CheckConstraint(
+            "sample_count >= 0",
+            name="ck_parameter_learning_sample_count",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    dataset_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("dataset_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    model_family: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_before: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    parameters_candidate: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    training_metrics: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    validation_metrics: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="candidate"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class WarningSchedule(Base):
     __tablename__ = "warning_schedules"
     __table_args__ = (

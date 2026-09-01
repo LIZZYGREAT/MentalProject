@@ -125,6 +125,48 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0030_model_promotion_decisions"
     )
     assert migration_0030.down_revision == "0029_ctssm_vnext_recovery_snapshot"
+    migration_0031 = next(
+        migration for migration in migrations
+        if migration.revision == "0031_parameter_learning_runs"
+    )
+    assert migration_0031.down_revision == "0030_model_promotion_decisions"
+
+
+def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
+    migration = _migration(VERSIONS / "0031_parameter_learning_runs.py")
+    tables = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *items, **kwargs: tables.append(
+            (name, {item.name for item in items if hasattr(item, "name")})
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+
+    migration.upgrade()
+
+    assert tables[0][0] == "parameter_learning_runs"
+    assert {
+        "participant_id",
+        "dataset_snapshot_id",
+        "model_family",
+        "parameters_before",
+        "parameters_candidate",
+        "training_metrics",
+        "validation_metrics",
+        "sample_count",
+        "status",
+        "created_at",
+    } <= tables[0][1]
+    assert len(indexes) == 2
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(
