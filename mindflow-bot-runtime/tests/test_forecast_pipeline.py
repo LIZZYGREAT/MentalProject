@@ -420,16 +420,18 @@ def test_external_enrichment_is_single_flight_durable_and_identity_free():
             participant.id, [event()], consent=True
         )
         completed = 0
+        completion_event = asyncio.Event()
 
         async def done():
             nonlocal completed
             completed += 1
+            completion_event.set()
 
         await asyncio.gather(
             semantics.enqueue(participant.id, misses, done),
             semantics.enqueue(participant.id, misses, done),
         )
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(completion_event.wait(), timeout=5.0)
         prepared, _revision, status, second_misses = semantics.prepare(
             participant.id, [event()], consent=True
         )

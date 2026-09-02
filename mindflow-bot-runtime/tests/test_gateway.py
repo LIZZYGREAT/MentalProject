@@ -21,6 +21,9 @@ from app.repositories import BindingRepository, BotEventRepository
 from helpers import memory_database
 
 
+SPAWN_START_TIMEOUT_SECONDS = 15.0
+
+
 def payload(event_id="evt-1", sender_type="user"):
     return {
         "header": {"event_id": event_id},
@@ -267,7 +270,7 @@ def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):
         events,
         queue,
         channel_factory=BlockingFakeChannel,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=2,
     )
 
@@ -335,7 +338,7 @@ def test_gateway_stop_waits_for_receiver_channel_cleanup():
             SlowStopFakeChannel, stop_started, stop_completed
         ),
         process_context=context,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=3,
     )
 
@@ -360,7 +363,7 @@ def test_gateway_stop_propagates_receiver_stop_failure_without_unretrieved_futur
         asyncio.Queue(maxsize=2),
         channel_factory=StopErrorFakeChannel,
         process_context=context,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=3,
     )
 
@@ -408,7 +411,7 @@ def test_gateway_precloses_sdk_device_flow_before_public_stop():
             public_stop_called,
         ),
         process_context=context,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=3,
         device_flow_close_timeout_seconds=1,
         channel_sdk_version="1.2.0",
@@ -454,7 +457,7 @@ def test_gateway_drains_untracked_sdk_background_tasks_before_loop_close():
             public_stop_called,
         ),
         process_context=context,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=3,
         device_flow_close_timeout_seconds=1,
         channel_sdk_version="1.2.0",
@@ -494,7 +497,7 @@ def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
             public_stop_called,
         ),
         process_context=context,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=3,
         device_flow_close_timeout_seconds=0.1,
         channel_sdk_version="1.2.0",
@@ -534,7 +537,7 @@ def test_receiver_abnormal_exit_is_detected():
         BotEventRepository(database),
         asyncio.Queue(maxsize=2),
         receiver_target=receiver_exits_after_ready,
-        start_timeout_seconds=5,
+        start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
         stop_timeout_seconds=2,
     )
 

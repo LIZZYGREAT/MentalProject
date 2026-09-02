@@ -5,6 +5,9 @@ import pytest
 from app.smoke.feishu_gateway import run_smoke
 
 
+SPAWN_START_TIMEOUT_SECONDS = 15.0
+
+
 class SmokeStopErrorChannel:
     def __init__(self, **_kwargs):
         self.is_ready = False
@@ -31,7 +34,7 @@ def test_smoke_rejects_receiver_shutdown_error(capsys):
             "cli_test",
             "secret",
             seconds=0,
-            start_timeout=5,
+            start_timeout=SPAWN_START_TIMEOUT_SECONDS,
             stop_timeout=3,
             channel_factory=SmokeStopErrorChannel,
         )

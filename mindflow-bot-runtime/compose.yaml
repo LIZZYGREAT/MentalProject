@@ -54,6 +54,29 @@ services:
     memswap_limit: ${BOT_MEMORY_SWAP_LIMIT:-1280m}
     pids_limit: ${BOT_PID_LIMIT:-128}
 
+  acceptance:
+    profiles: ["acceptance"]
+    build:
+      context: ..
+      dockerfile: mindflow-bot-runtime/Dockerfile
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-development}
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}
+      MINDFLOW_TEST_POSTGRES_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}
+      MINDFLOW_REQUIRE_POSTGRES_TESTS: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python3", "-m", "pytest", "-q", "tests"]
+    restart: "no"
+    cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}
+    mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1536m}
+    memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-2048m}
+    pids_limit: ${ACCEPTANCE_PID_LIMIT:-256}
+
   admin:
     build:
       context: ..

@@ -7,6 +7,7 @@ RUNNER = (
     / "run_acceptance_tests.sh"
 )
 DEPLOY = RUNNER.parent / "deploy_runtime.sh"
+COMPOSE = RUNNER.parents[1] / "compose.yaml"
 
 
 def test_acceptance_runner_requires_clean_tree_and_running_revision_parity():
@@ -19,6 +20,9 @@ def test_acceptance_runner_requires_clean_tree_and_running_revision_parity():
     assert "exec -T admin" in source
     assert "RUNNING_BOT_REVISION" in source
     assert "RUNNING_ADMIN_REVISION" in source
+    assert "ACCEPTANCE_IMAGE_REVISION" in source
+    assert "run --rm --no-deps acceptance" in source
+    assert "run --rm --no-deps bot" not in source
     assert "docker compose -f \"$COMPOSE_FILE\" build" not in source
 
 
@@ -31,10 +35,43 @@ def test_acceptance_runner_checks_mounts_and_runs_full_suite_with_postgres_guard
         "mental-health-care/SKILL.md"
     ) in source
     assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
+    assert "MINDFLOW_TEST_POSTGRES_URL is required for acceptance" in source
+    assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
+    assert "mindflow_acceptance_test|mindflow_test_*" in source
+    assert "refusing acceptance tests outside" in source
     assert "--user root" in source
     assert "pytest==8.4.1" in source
     assert "pytest-asyncio==1.1.0" in source
     assert "exec python3 -m pytest -q tests" in source
+    assert "acceptance sh -eu -c" in source
+
+
+def test_acceptance_service_is_isolated_from_production_bot_limits_and_state():
+    source = COMPOSE.read_text(encoding="utf-8")
+    acceptance = source.split("\n  acceptance:\n", 1)[1].split(
+        "\n  admin:\n", 1
+    )[0]
+
+    assert 'profiles: ["acceptance"]' in acceptance
+    assert "context: .." in acceptance
+    assert "dockerfile: mindflow-bot-runtime/Dockerfile" in acceptance
+    assert "BUILD_REVISION: ${BUILD_REVISION:-development}" in acceptance
+    assert "env_file:" in acceptance
+    assert "DATABASE_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}" in acceptance
+    assert "MINDFLOW_REQUIRE_POSTGRES_TESTS: \"1\"" in acceptance
+    assert "postgres:" in acceptance
+    assert "migrate:" not in acceptance
+    assert "claude-state-init:" not in acceptance
+    assert "ports:" not in acceptance
+    assert "volumes:" not in acceptance
+    assert "claude_state" not in acceptance
+    assert 'command: ["python3", "-m", "pytest", "-q", "tests"]' in acceptance
+    assert "cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}" in acceptance
+    assert "mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1536m}" in acceptance
+    assert "memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-2048m}" in acceptance
+    assert "pids_limit: ${ACCEPTANCE_PID_LIMIT:-256}" in acceptance
+    assert "${BOT_CPU_LIMIT" not in acceptance
+    assert "${BOT_MEMORY_LIMIT" not in acceptance
 
 
 def test_deploy_runtime_injects_head_migrates_then_recreates_services():
