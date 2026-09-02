@@ -59,6 +59,19 @@ MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
 EVALUATION_CODE_VERSION = "stage4-evaluation.v7"
 MATCH_TOLERANCE_SECONDS = 150
 EVALUATION_MODES = {"historical_online", "offline_replay"}
+STAGE5_MODEL_IDENTITY_FIELDS = {
+    "provenance_type",
+    "parameter_learning_run_id",
+    "parameter_learning_model_family",
+    "parameter_learning_model_version",
+    "dataset_snapshot_id",
+    "dataset_schema_version",
+    "parameter_learning_gate_version",
+    "parameter_learning_replay_engine",
+    "parameter_learning_candidate_hash",
+    "validated_effective_parameters_hash",
+    "base_promotion_decision_id",
+}
 MODEL_IDENTITY_FILTER_FIELDS = {
     "engine_version",
     "model_family",
@@ -66,7 +79,7 @@ MODEL_IDENTITY_FILTER_FIELDS = {
     "model_spec_version",
     "promotion_decision_id",
     "promotion_parameters_hash",
-}
+} | STAGE5_MODEL_IDENTITY_FIELDS
 
 
 def _aware(value: datetime) -> datetime:
@@ -521,6 +534,7 @@ class ResearchEvaluationService:
             default={},
         )
         local_date = observed_at.astimezone(self.timezone).date()
+        forecast_output = dict(forecast.get("output") or {})
         context = {
             **self._event_context(forecast, forecast_timestamp),
             "time_of_day": observed_at.astimezone(self.timezone).strftime("%H:%M"),
@@ -544,6 +558,10 @@ class ResearchEvaluationService:
             "promotion_parameters_hash": (forecast.get("output") or {}).get(
                 "promotion_parameters_hash"
             ),
+            **{
+                field: forecast_output.get(field)
+                for field in STAGE5_MODEL_IDENTITY_FIELDS
+            },
             "forecast_peak_stress": _score(peak, "stress_0_10"),
             "forecast_peak_time": peak.get("time"),
         }
@@ -1383,6 +1401,10 @@ class ResearchEvaluationService:
                 "promotion_parameters_hash": (forecast.get("output") or {}).get(
                     "promotion_parameters_hash"
                 ),
+                **{
+                    field: (forecast.get("output") or {}).get(field)
+                    for field in STAGE5_MODEL_IDENTITY_FIELDS
+                },
                 "initial_state": dict(
                     (forecast.get("output") or {}).get("initial_state") or {}
                 ),
@@ -1795,6 +1817,16 @@ class ResearchEvaluationService:
                 dict((item["metadata"].get("context") or {}))
                 for item in source_items
             ]
+            model_identity = {
+                field: sorted(
+                    {
+                        str(context.get(field))
+                        for context in contexts
+                        if context.get(field) is not None
+                    }
+                )
+                for field in sorted(MODEL_IDENTITY_FILTER_FIELDS)
+            }
             return {
                 "observation_ids": sorted(
                     str(
@@ -1827,6 +1859,16 @@ class ResearchEvaluationService:
                         if context.get("promotion_parameters_hash")
                     }
                 ),
+                "parameter_learning_run_ids": model_identity[
+                    "parameter_learning_run_id"
+                ],
+                "validated_effective_parameters_hashes": model_identity[
+                    "validated_effective_parameters_hash"
+                ],
+                "parameter_learning_model_versions": model_identity[
+                    "parameter_learning_model_version"
+                ],
+                "model_identity": model_identity,
             }
         config = {
             "evaluation_mode": evaluation_mode,
@@ -1875,6 +1917,9 @@ class ResearchEvaluationService:
                     matched_items.append(item)
             matches = [dict(item["metadata"]) for item in matched_items]
             config["evaluation_source_set"] = source_set(matched_items)
+            config["matched_model_identity"] = config[
+                "evaluation_source_set"
+            ]["model_identity"]
             config["matched_promotion_decision_ids"] = sorted(
                 {
                     str((item.get("context") or {}).get("promotion_decision_id"))

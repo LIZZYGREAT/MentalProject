@@ -2296,10 +2296,21 @@ class ParameterLearningService:
                 raise ValueError(
                     "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
                 )
-            if current_explicit_identity != frozen_explicit_identity:
+            explicit_model_parameters_unchanged = (
+                current_explicit_identity.get("parameters_hash")
+                == frozen_explicit_identity.get("parameters_hash")
+            )
+            if not explicit_model_parameters_unchanged:
                 raise ValueError(
                     "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
                 )
+            validation["explicit_profile_promotion_audit"] = {
+                "validated_explicit_profile_record": frozen_explicit_identity,
+                "current_explicit_profile_record": current_explicit_identity,
+                "explicit_model_parameters_unchanged": (
+                    explicit_model_parameters_unchanged
+                ),
+            }
             validated_effective_hash = str(
                 effective_profile_evidence.get(
                     "validated_effective_parameters_hash"
@@ -2416,6 +2427,100 @@ class ParameterLearningService:
             result["active_profile"] = active
             return result
 
+    @staticmethod
+    def _is_weekly_snapshot_unique_error(error: IntegrityError) -> bool:
+        original = getattr(error, "orig", None)
+        diagnostic = getattr(original, "diag", None)
+        constraint_name = getattr(diagnostic, "constraint_name", None)
+        if constraint_name is not None:
+            return str(constraint_name) == "uq_dataset_snapshot_weekly_batch"
+        message = str(original or error).casefold()
+        return (
+            "uq_dataset_snapshot_weekly_batch" in message
+            or (
+                "unique constraint failed" in message
+                and "dataset_snapshots.purpose" in message
+                and "dataset_snapshots.schedule_key" in message
+            )
+        )
+
+    def _verify_weekly_snapshot(
+        self,
+        snapshot: DatasetSnapshot,
+        *,
+        date_start: date,
+        date_end: date,
+        schedule_key: str,
+    ) -> dict[str, Any]:
+        if snapshot.date_start != date_start or snapshot.date_end != date_end:
+            raise ValueError("weekly_batch_boundary_conflict")
+        if (
+            snapshot.schema_version != DATASET_SCHEMA_V7
+            or snapshot.purpose != DATASET_PURPOSE_STAGE5_WEEKLY
+            or snapshot.schedule_key != schedule_key
+            or dict(snapshot.participant_filter or {})
+            != {"participant_codes": []}
+        ):
+            raise ValueError("weekly_batch_identity_conflict")
+        return self.research._snapshot_view(snapshot)
+
+    def _weekly_snapshot_winner(
+        self,
+        *,
+        date_start: date,
+        date_end: date,
+        schedule_key: str,
+    ) -> dict[str, Any] | None:
+        with self.database.session() as session:
+            snapshot = session.execute(
+                select(DatasetSnapshot).where(
+                    DatasetSnapshot.purpose == DATASET_PURPOSE_STAGE5_WEEKLY,
+                    DatasetSnapshot.schedule_key == schedule_key,
+                )
+            ).scalar_one_or_none()
+            if snapshot is None:
+                return None
+            return self._verify_weekly_snapshot(
+                snapshot,
+                date_start=date_start,
+                date_end=date_end,
+                schedule_key=schedule_key,
+            )
+
+    def _get_or_create_weekly_snapshot(
+        self,
+        *,
+        date_start: date,
+        date_end: date,
+        schedule_key: str,
+    ) -> dict[str, Any]:
+        existing = self._weekly_snapshot_winner(
+            date_start=date_start,
+            date_end=date_end,
+            schedule_key=schedule_key,
+        )
+        if existing is not None:
+            return existing
+        try:
+            return self.research.create_dataset_snapshot(
+                date_start=date_start,
+                date_end=date_end,
+                participant_filter={},
+                purpose=DATASET_PURPOSE_STAGE5_WEEKLY,
+                schedule_key=schedule_key,
+            )
+        except IntegrityError as error:
+            if not self._is_weekly_snapshot_unique_error(error):
+                raise
+            winner = self._weekly_snapshot_winner(
+                date_start=date_start,
+                date_end=date_end,
+                schedule_key=schedule_key,
+            )
+            if winner is None:
+                raise error
+            return winner
+
     def maybe_calibrate(self, participant_id: uuid.UUID, *, through: date) -> dict[str, Any]:
         iso = through.isocalendar()
         schedule_key = f"{iso.year}-W{iso.week:02d}"
@@ -2439,33 +2544,10 @@ class ParameterLearningService:
         date_start = through - timedelta(days=self.SNAPSHOT_WINDOW_DAYS - 1)
         # One durable weekly batch supplies the actual population prior. Its
         # identity is purpose + ISO schedule key, never a guessed date range.
-        with self.database.session() as session:
-            existing_snapshot = session.execute(
-                select(DatasetSnapshot)
-                .where(
-                    DatasetSnapshot.purpose == DATASET_PURPOSE_STAGE5_WEEKLY,
-                    DatasetSnapshot.schedule_key == schedule_key,
-                    DatasetSnapshot.schema_version == DATASET_SCHEMA_V7,
-                )
-                .order_by(desc(DatasetSnapshot.created_at))
-            ).scalars().first()
-            if existing_snapshot is not None and dict(
-                existing_snapshot.participant_filter or {}
-            ) != {"participant_codes": []}:
-                existing_snapshot = None
-            existing_snapshot_id = (
-                str(existing_snapshot.id) if existing_snapshot is not None else None
-            )
-        snapshot = (
-            {"id": existing_snapshot_id}
-            if existing_snapshot_id is not None
-            else self.research.create_dataset_snapshot(
-                date_start=date_start,
-                date_end=through,
-                participant_filter={},
-                purpose=DATASET_PURPOSE_STAGE5_WEEKLY,
-                schedule_key=schedule_key,
-            )
+        snapshot = self._get_or_create_weekly_snapshot(
+            date_start=date_start,
+            date_end=through,
+            schedule_key=schedule_key,
         )
         run = self.train_snapshot(
             uuid.UUID(snapshot["id"]),

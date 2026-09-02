@@ -680,8 +680,9 @@ class LearnedProfileRepository:
                     provenance_explicit_identity
                     == validated_explicit_identity
                 ),
-                "explicit_profile_identity_matches": (
-                    current_explicit_identity == validated_explicit_identity
+                "explicit_model_parameters_unchanged": (
+                    current_explicit_identity.get("parameters_hash")
+                    == validated_explicit_identity.get("parameters_hash")
                 ),
                 "effective_parameters_hash_matches": bool(
                     validated_effective_hash
@@ -701,6 +702,12 @@ class LearnedProfileRepository:
                     "parameter_learning_run_id": (
                         str(learning_run.id) if learning_run is not None else None
                     ),
+                    "parameter_learning_model_family": (
+                        learning_run.model_family
+                        if learning_run is not None
+                        else None
+                    ),
+                    "parameter_learning_model_version": view["model_version"],
                     "dataset_snapshot_id": (
                         str(snapshot.id) if snapshot is not None else None
                     ),
@@ -708,6 +715,31 @@ class LearnedProfileRepository:
                         snapshot.schema_version if snapshot is not None else None
                     ),
                     "deployment_family_evidence": deployment_family_evidence,
+                    "parameter_learning_gate_version": gate.get("version"),
+                    "parameter_learning_replay_engine": formal_audit.get(
+                        "engine"
+                    ),
+                    "parameter_learning_candidate_hash": (
+                        promotion_parameters_hash(
+                            dict(learning_run.parameters_candidate or {})
+                        )
+                        if learning_run is not None
+                        else None
+                    ),
+                    "base_promotion_decision_id": (
+                        snapshot_active_identity.get(
+                            "stage4_promotion_decision_id"
+                        )
+                    ),
+                    "validated_explicit_profile_record": (
+                        validated_explicit_identity
+                    ),
+                    "current_explicit_profile_record": (
+                        current_explicit_identity
+                    ),
+                    "explicit_model_parameters_unchanged": checks[
+                        "explicit_model_parameters_unchanged"
+                    ],
                     "validated_explicit_profile_identity": (
                         validated_explicit_identity
                     ),

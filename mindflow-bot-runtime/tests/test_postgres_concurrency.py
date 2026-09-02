@@ -7,7 +7,7 @@ uses and drops its own random schema.
 
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import threading
 import uuid
 from zoneinfo import ZoneInfo
@@ -20,7 +20,9 @@ from app.db import Base, Database, build_engine
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    DatasetSnapshot,
     ForecastCurrentnessEvent,
+    ParameterLearningRun,
     WarningSchedule,
 )
 from app.repositories import (
@@ -42,6 +44,10 @@ from app.repositories_care import (
 from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.forecast_coordinator import _sha
+from app.services.hierarchical_personalization import (
+    MODEL_FAMILY,
+    ParameterLearningService,
+)
 from app.services.token_service import (
     OAuthTokenSet,
     TokenEncryptionService,
@@ -133,6 +139,85 @@ def _warning(database: Database, participant_id: uuid.UUID):
     with database.session() as session:
         warning_id = session.query(WarningSchedule.id).scalar()
     return warnings, preferences, warning_id, now
+
+
+def test_postgres_weekly_snapshot_concurrent_get_or_create(postgres_database):
+    participants = [
+        ParticipantRepository(postgres_database).create("PG-STAGE5-WEEKLY-A"),
+        ParticipantRepository(postgres_database).create("PG-STAGE5-WEEKLY-B"),
+    ]
+    services = [
+        ParameterLearningService(postgres_database, "Asia/Shanghai")
+        for _ in participants
+    ]
+    create_barrier = threading.Barrier(2)
+
+    for service in services:
+        original_create = service.research.create_dataset_snapshot
+
+        def concurrent_create(*, _create=original_create, **kwargs):
+            create_barrier.wait(timeout=5)
+            return _create(**kwargs)
+
+        service.research.create_dataset_snapshot = concurrent_create
+
+        def durable_train(
+            snapshot_id,
+            participant_id,
+            *,
+            run_kind,
+            schedule_key,
+        ):
+            run_id = uuid.uuid4()
+            with postgres_database.session() as session:
+                session.add(
+                    ParameterLearningRun(
+                        id=run_id,
+                        participant_id=participant_id,
+                        dataset_snapshot_id=snapshot_id,
+                        model_family=MODEL_FAMILY,
+                        run_kind=run_kind,
+                        schedule_key=schedule_key,
+                        parameters_before={},
+                        parameters_candidate={},
+                        training_metrics={},
+                        validation_metrics={},
+                        sample_count=0,
+                        status="rejected",
+                    )
+                )
+            return {"id": str(run_id), "status": "rejected"}
+
+        service.train_snapshot = durable_train
+
+    through = date(2030, 2, 24)
+
+    def calibrate(index):
+        return services[index].maybe_calibrate(
+            participants[index].id, through=through
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(calibrate, index) for index in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+
+    assert len({result["snapshot"]["id"] for result in results}) == 1
+    with postgres_database.session() as session:
+        snapshots = session.query(DatasetSnapshot).filter(
+            DatasetSnapshot.purpose == "stage5_weekly_calibration",
+            DatasetSnapshot.schedule_key == "2030-W08",
+        ).all()
+        runs = session.query(ParameterLearningRun).filter(
+            ParameterLearningRun.model_family == MODEL_FAMILY,
+            ParameterLearningRun.run_kind == "scheduled",
+            ParameterLearningRun.schedule_key == "2030-W08",
+        ).all()
+    assert len(snapshots) == 1
+    assert len(runs) == 2
+    assert {run.participant_id for run in runs} == {
+        participant.id for participant in participants
+    }
+    assert {run.dataset_snapshot_id for run in runs} == {snapshots[0].id}
 
 
 def test_postgres_calendar_recovery_claim_has_one_winner(postgres_database):

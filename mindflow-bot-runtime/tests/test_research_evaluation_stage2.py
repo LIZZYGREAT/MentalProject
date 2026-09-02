@@ -521,6 +521,126 @@ def test_historical_online_filters_exact_promotion_identity_without_mixing_revis
     ] == []
 
 
+def test_research_filter_by_parameter_learning_run():
+    database = memory_database()
+    person = participant(database, "STAGE5-IDENTITY-FILTER")
+    service = ResearchEvaluationService(database, "Asia/Shanghai")
+    snapshot_id = uuid.uuid4()
+    cutoff = datetime(2030, 4, 2, tzinfo=timezone.utc)
+    local_day = date(2030, 4, 1)
+    identities = [
+        ("run-a", "effective-a", "mindflow-ctssm-runtime-v11"),
+        ("run-b", "effective-b", "mindflow-ctssm-runtime-v12"),
+    ]
+    items = [
+        service._item(
+            "match_source",
+            f"stage5-identity-observation-{index}",
+            "forecast-observation-grid.v2",
+            person.id,
+            local_day,
+            {
+                "participant_id": str(person.id),
+                "local_date": local_day.isoformat(),
+                "forecast_id": f"stage5-identity-forecast-{index}",
+                "forecast_version": f"stage5-identity-v{index}",
+                "observation_id": f"stage5-identity-observation-{index}",
+                "observed_at": f"2030-04-01T{index + 8:02d}:00:00+00:00",
+                "predicted_stress": 5.0 + index,
+                "actual_stress": 6.0 + index,
+                "residual": 1.0,
+                "prediction_lower": 0.0,
+                "prediction_upper": 10.0,
+                "context": {
+                    "engine_version": "mindflow-ctssm-runtime-v7",
+                    "model_variant": "m0",
+                    "provenance_type": "stage5_promotion",
+                    "parameter_learning_run_id": run_id,
+                    "validated_effective_parameters_hash": effective_hash,
+                    "parameter_learning_model_version": model_version,
+                },
+            },
+        )
+        for index, (run_id, effective_hash, model_version) in enumerate(
+            identities
+        )
+    ]
+    contract = {
+        "schema_version": DATASET_SCHEMA_V2,
+        "date_start": local_day.isoformat(),
+        "date_end": local_day.isoformat(),
+        "participant_filter": {},
+        "observation_cutoff": cutoff.isoformat(),
+        "calendar_cutoff": cutoff.isoformat(),
+    }
+    manifest = {
+        "schema_version": DATASET_SCHEMA_V2,
+        "item_count": len(items),
+        "observation_count": 0,
+        "forecast_count": 0,
+        "calendar_count": 0,
+        "manifest_hash": service._manifest_hash(contract, items),
+    }
+    with database.session() as session:
+        session.add(
+            DatasetSnapshot(
+                id=snapshot_id,
+                date_start=local_day,
+                date_end=local_day,
+                participant_filter={},
+                observation_cutoff=cutoff,
+                calendar_cutoff=cutoff,
+                schema_version=DATASET_SCHEMA_V2,
+                manifest_json=manifest,
+            )
+        )
+        session.add_all(
+            [
+                DatasetSnapshotItem(
+                    dataset_snapshot_id=snapshot_id,
+                    item_type=item["item_type"],
+                    source_id=item["source_id"],
+                    source_version=item["source_version"],
+                    participant_id=item["participant_id"],
+                    local_date=item["local_date"],
+                    source_hash=item["source_hash"],
+                    metadata_json=item["metadata"],
+                )
+                for item in items
+            ]
+        )
+
+    by_run = service.create_evaluation_run(
+        snapshot_id,
+        "stage5-run-a",
+        model_identity_filter={"parameter_learning_run_id": "run-a"},
+    )
+    by_hash = service.create_evaluation_run(
+        snapshot_id,
+        "stage5-effective-b",
+        model_identity_filter={
+            "validated_effective_parameters_hash": "effective-b"
+        },
+    )
+    by_version = service.create_evaluation_run(
+        snapshot_id,
+        "stage5-runtime-v11",
+        model_identity_filter={
+            "parameter_learning_model_version": "mindflow-ctssm-runtime-v11"
+        },
+    )
+
+    assert by_run["metrics"]["matched_observation_count"] == 1
+    assert by_hash["metrics"]["matched_observation_count"] == 1
+    assert by_version["metrics"]["matched_observation_count"] == 1
+    assert by_run["metrics"]["config"]["matched_model_identity"][
+        "parameter_learning_run_id"
+    ] == ["run-a"]
+    assert by_run["metrics"]["config"]["evaluation_source_set"][
+        "parameter_learning_run_ids"
+    ] == ["run-a"]
+
+
 def test_longitudinal_parameter_history_and_data_quality_cover_stage2_gates():
     database = memory_database()
     person = participant(database, "synthetic-stage2")

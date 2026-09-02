@@ -62,6 +62,21 @@ from services.workload import (
 logger = logging.getLogger(__name__)
 
 
+STAGE5_MODEL_PROVENANCE_FIELDS = (
+    "provenance_type",
+    "parameter_learning_run_id",
+    "parameter_learning_model_family",
+    "parameter_learning_model_version",
+    "dataset_snapshot_id",
+    "dataset_schema_version",
+    "parameter_learning_gate_version",
+    "parameter_learning_replay_engine",
+    "parameter_learning_candidate_hash",
+    "validated_effective_parameters_hash",
+    "base_promotion_decision_id",
+)
+
+
 class CalendarRefreshPendingError(RuntimeError):
     """A calendar write succeeded but its authoritative read-back did not."""
 
@@ -80,6 +95,9 @@ def enforce_promoted_model_selection(
 ) -> dict[str, Any]:
     """Fail closed when the final layered profile is not the promoted model."""
 
+    effective_profile = dict(effective_profile)
+    # This field is authorization output, never profile input.
+    effective_profile.pop("runtime_model_provenance", None)
     effective_parameters = dict(
         effective_profile.get("model_params")
         or effective_profile.get("params")
@@ -91,8 +109,6 @@ def enforce_promoted_model_selection(
     effective_variant = normalize_model_variant(
         effective_selection.get("active_variant") or "m0"
     )
-    if effective_variant == "m0":
-        return effective_profile
     learned_parameters = dict((learned_row or {}).get("parameters") or {})
     learned_selection = dict(learned_parameters.get("model_selection") or {})
     proof = dict((learned_row or {}).get("runtime_validation") or {})
@@ -122,7 +138,7 @@ def enforce_promoted_model_selection(
             == validated_hash
             and proof.get("current_effective_parameters_hash")
             == validated_hash
-            and checks.get("explicit_profile_identity_matches") is True
+            and checks.get("explicit_model_parameters_unchanged") is True
             and checks.get("effective_parameters_hash_matches") is True
         )
     else:
@@ -138,7 +154,17 @@ def enforce_promoted_model_selection(
             "model_params": authorized_model_parameters(
                 effective_parameters, variant
             ),
+            "runtime_model_provenance": {
+                field: proof.get(field)
+                for field in STAGE5_MODEL_PROVENANCE_FIELDS
+            }
+            if proof.get("provenance_type") == "stage5_promotion"
+            else None,
         }
+    if effective_variant == "m0" and learned_selection.get(
+        "status"
+    ) != "stage5_promoted":
+        return effective_profile
     effective_parameters["model_selection"] = {
         "active_variant": "m0",
         "status": "promotion_provenance_missing",
@@ -157,6 +183,10 @@ def production_model_identity(
         or {}
     )
     selection = dict(parameters.get("model_selection") or {})
+    runtime_provenance = dict(
+        effective_profile.get("runtime_model_provenance") or {}
+    )
+    is_stage5 = runtime_provenance.get("provenance_type") == "stage5_promotion"
     variant = normalize_model_variant(selection.get("active_variant") or "m0")
     metadata = model_variant_metadata(variant)
     promoted = variant != "m0"
@@ -167,18 +197,37 @@ def production_model_identity(
     spec_version = str(
         getattr(model, "MODEL_SPEC_VERSION", "stress-ctssm-model-spec.v1")
     )
-    return {
+    identity = {
         "engine_version": promoted_engine if promoted else base_engine,
         "model_family": str(metadata["canonical"]),
         "model_variant": variant,
         "model_spec_version": f"{spec_version}:{variant}",
+        "provenance_type": (
+            "stage5_promotion"
+            if is_stage5
+            else "stage4_promotion"
+            if selection.get("promotion_decision_id")
+            else None
+        ),
         "promotion_decision_id": (
-            str(selection.get("promotion_decision_id") or "") or None
+            None
+            if is_stage5
+            else str(selection.get("promotion_decision_id") or "") or None
         ),
         "promotion_parameters_hash": (
-            str(selection.get("parameters_hash") or "") or None
+            None
+            if is_stage5
+            else str(selection.get("parameters_hash") or "") or None
         ),
     }
+    identity.update(
+        {
+            field: runtime_provenance.get(field) if is_stage5 else None
+            for field in STAGE5_MODEL_PROVENANCE_FIELDS
+            if field != "provenance_type"
+        }
+    )
+    return identity
 
 
 def normalized_calendar_revision(events: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:

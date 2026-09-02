@@ -1692,7 +1692,7 @@ def test_forecast_trusts_repository_validated_stage5_proof(variant, family):
             "current_effective_parameters_hash": validated_hash,
             "checks": {
                 "causal_dataset_schema": True,
-                "explicit_profile_identity_matches": True,
+                "explicit_model_parameters_unchanged": True,
                 "effective_parameters_hash_matches": True,
             },
         },

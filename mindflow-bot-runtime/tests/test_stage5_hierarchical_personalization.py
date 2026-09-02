@@ -19,7 +19,10 @@ from app.repositories import (
     promotion_parameters_hash,
     stage5_effective_parameters_hash,
 )
-from app.services.forecast_coordinator import enforce_promoted_model_selection
+from app.services.forecast_coordinator import (
+    enforce_promoted_model_selection,
+    production_model_identity,
+)
 from app.services.hierarchical_personalization import (
     LEARNING_VERSION,
     MODEL_FAMILY,
@@ -150,6 +153,129 @@ def _validated_effective_profile(candidate, explicit=None, *, variant="m0"):
             _production_current_parameters(candidate, explicit), variant
         ),
     }
+
+
+def _authorized_stage5_profile(
+    *, variant="m0", run_id=None, base_promotion_decision_id=None
+):
+    run_id = str(run_id or uuid.uuid4())
+    profile_id = str(uuid.uuid4())
+    snapshot_id = str(uuid.uuid4())
+    parameters = {
+        "S_star_init": 52.0,
+        "model_selection": {
+            "active_variant": variant,
+            "status": "stage5_promoted",
+            "parameter_learning_run_id": run_id,
+            "promotion_decision_id": base_promotion_decision_id,
+            "parameters_hash": "must-not-be-used-as-stage5-proof",
+        },
+    }
+    validated_hash = stage5_effective_parameters_hash(parameters, variant)
+    proof = {
+        "runtime_valid": True,
+        "provenance_type": "stage5_promotion",
+        "profile_id": profile_id,
+        "active_variant": variant,
+        "parameter_learning_run_id": run_id,
+        "parameter_learning_model_family": MODEL_FAMILY,
+        "parameter_learning_model_version": "mindflow-ctssm-runtime-v11",
+        "dataset_snapshot_id": snapshot_id,
+        "dataset_schema_version": DATASET_SCHEMA_V7,
+        "parameter_learning_gate_version": PROMOTION_GATE_VERSION,
+        "parameter_learning_replay_engine": (
+            "stage5-real-ctssm-rolling-replay.v2"
+        ),
+        "parameter_learning_candidate_hash": f"candidate-{run_id}",
+        "validated_effective_parameters_hash": validated_hash,
+        "base_promotion_decision_id": base_promotion_decision_id,
+        "current_effective_parameters_hash": validated_hash,
+        "checks": {
+            "explicit_model_parameters_unchanged": True,
+            "effective_parameters_hash_matches": True,
+        },
+    }
+    learned = {
+        "id": profile_id,
+        "parameters": parameters,
+        "runtime_validation": proof,
+    }
+    effective, _layers = layered_profile(None, learned)
+    return enforce_promoted_model_selection(effective, learned), proof
+
+
+def test_stage5_model_identity_distinguishes_personalized_m0():
+    model = AssessmentModel("Asia/Shanghai")
+    global_m0 = production_model_identity({"model_params": {}}, model)
+    personalized, proof = _authorized_stage5_profile(variant="m0")
+    personalized_m0 = production_model_identity(personalized, model)
+    next_personalized, next_proof = _authorized_stage5_profile(variant="m0")
+    next_personalized_m0 = production_model_identity(next_personalized, model)
+
+    assert global_m0["model_variant"] == personalized_m0["model_variant"] == "m0"
+    assert global_m0["parameter_learning_run_id"] is None
+    assert personalized_m0["parameter_learning_run_id"] == proof[
+        "parameter_learning_run_id"
+    ]
+    assert personalized_m0["validated_effective_parameters_hash"] == proof[
+        "validated_effective_parameters_hash"
+    ]
+    assert personalized_m0["parameter_learning_run_id"] != (
+        next_personalized_m0["parameter_learning_run_id"]
+    )
+    assert personalized_m0 != next_personalized_m0
+
+
+def test_stage5_identity_contains_parameter_learning_provenance():
+    protected, proof = _authorized_stage5_profile(variant="m1")
+    identity = production_model_identity(
+        protected, AssessmentModel("Asia/Shanghai")
+    )
+
+    for field in (
+        "parameter_learning_run_id",
+        "dataset_snapshot_id",
+        "parameter_learning_model_version",
+        "parameter_learning_gate_version",
+        "parameter_learning_replay_engine",
+        "parameter_learning_candidate_hash",
+        "validated_effective_parameters_hash",
+    ):
+        assert identity[field] == proof[field]
+    assert identity["model_variant"] == "m1"
+    assert identity["parameter_learning_model_version"] == (
+        "mindflow-ctssm-runtime-v11"
+    )
+
+
+def test_stage4_and_stage5_provenance_are_not_mixed():
+    model = AssessmentModel("Asia/Shanghai")
+    stage4_decision = str(uuid.uuid4())
+    stage4 = production_model_identity(
+        {
+            "model_params": {
+                "model_selection": {
+                    "active_variant": "m1",
+                    "promotion_decision_id": stage4_decision,
+                    "parameters_hash": "stage4-hash",
+                }
+            }
+        },
+        model,
+    )
+    protected, proof = _authorized_stage5_profile(
+        variant="m1", base_promotion_decision_id=stage4_decision
+    )
+    stage5 = production_model_identity(protected, model)
+
+    assert stage4["promotion_decision_id"] == stage4_decision
+    assert stage4["parameter_learning_run_id"] is None
+    assert stage5["promotion_decision_id"] is None
+    assert stage5["promotion_parameters_hash"] is None
+    assert stage5["parameter_learning_run_id"] == proof[
+        "parameter_learning_run_id"
+    ]
+    assert stage5["base_promotion_decision_id"] == stage4_decision
 
 
 def _seed_promotable_m0_candidate(database, person):
@@ -2143,6 +2269,91 @@ def test_promotion_requires_resnapshot_when_explicit_profile_changed_after_cutof
         assert session.get(ParameterLearningRun, run_id).status == "candidate"
 
 
+def test_non_model_profile_update_does_not_block_promotion():
+    database = memory_database()
+    person = participant(database, "stage5-explicit-non-model-promotion")
+    service, run_id, _snapshot_id = _seed_promotable_m0_candidate(
+        database, person
+    )
+    with database.session() as session:
+        session.add(
+            ParticipantProfile(
+                participant_id=person.id,
+                version=1,
+                profile_json={"preferred_name": "New display name"},
+            )
+        )
+
+    promoted = service.promote(run_id)
+
+    assert promoted["status"] == "promoted"
+    audit = promoted["validation_metrics"][
+        "explicit_profile_promotion_audit"
+    ]
+    assert audit["explicit_model_parameters_unchanged"] is True
+    assert audit["validated_explicit_profile_record"]["profile_id"] is None
+    assert audit["current_explicit_profile_record"]["profile_id"] is not None
+
+
+def test_non_model_profile_update_keeps_stage5_active():
+    database = memory_database()
+    person = participant(database, "stage5-explicit-non-model-runtime")
+    service, run_id, _snapshot_id = _seed_promotable_m0_candidate(
+        database, person
+    )
+    service.promote(run_id)
+    with database.session() as session:
+        session.add(
+            ParticipantProfile(
+                participant_id=person.id,
+                version=1,
+                profile_json={"preferred_name": "Updated name only"},
+            )
+        )
+
+    active = LearnedProfileRepository(database).runtime_active(person.id)
+
+    assert active is not None
+    evidence = active["runtime_validation"]
+    assert evidence["provenance_type"] == "stage5_promotion"
+    assert evidence["parameter_learning_model_family"] == MODEL_FAMILY
+    assert evidence["parameter_learning_model_version"] == (
+        "mindflow-ctssm-runtime-v11"
+    )
+    assert evidence["dataset_schema_version"] == DATASET_SCHEMA_V7
+    assert evidence["parameter_learning_gate_version"] == PROMOTION_GATE_VERSION
+    assert evidence["parameter_learning_replay_engine"] == (
+        "stage5-real-ctssm-rolling-replay.v2"
+    )
+    with database.session() as session:
+        run = session.get(ParameterLearningRun, run_id)
+        assert evidence["parameter_learning_candidate_hash"] == (
+            promotion_parameters_hash(run.parameters_candidate)
+        )
+    assert evidence["explicit_model_parameters_unchanged"] is True
+    assert evidence["validated_explicit_profile_record"]["profile_id"] is None
+    assert evidence["current_explicit_profile_record"]["profile_id"] is not None
+
+
+def test_model_params_update_invalidates_stage5_active():
+    database = memory_database()
+    person = participant(database, "stage5-explicit-model-runtime")
+    service, run_id, _snapshot_id = _seed_promotable_m0_candidate(
+        database, person
+    )
+    service.promote(run_id)
+    with database.session() as session:
+        session.add(
+            ParticipantProfile(
+                participant_id=person.id,
+                version=1,
+                profile_json={"model_params": {"S_star_init": 61.0}},
+            )
+        )
+
+    assert LearnedProfileRepository(database).runtime_active(person.id) is None
+
+
 def test_promotion_rechecks_immutable_dataset_snapshot_integrity():
     database = memory_database()
     person = participant(database, "stage5-promotion-integrity")
@@ -2261,6 +2472,64 @@ def test_weekly_calibration_does_not_reuse_same_date_manual_snapshot(monkeypatch
         assert len(snapshots) == 2
         assert snapshots[0].purpose == "manual_research"
         assert snapshots[1].purpose == "stage5_weekly_calibration"
+
+
+def test_weekly_snapshot_concurrent_get_or_create(monkeypatch):
+    database = memory_database()
+    service = ParameterLearningService(database, "Asia/Shanghai")
+    winner = {
+        "id": str(uuid.uuid4()),
+        "date_start": "2030-02-06",
+        "date_end": "2030-02-24",
+        "purpose": "stage5_weekly_calibration",
+        "schedule_key": "2030-W08",
+        "participant_filter": {"participant_codes": []},
+        "schema_version": DATASET_SCHEMA_V7,
+    }
+    winner_reads = iter((None, winner))
+    monkeypatch.setattr(
+        service,
+        "_weekly_snapshot_winner",
+        lambda **kwargs: next(winner_reads),
+    )
+    conflict = IntegrityError(
+        "INSERT dataset_snapshots",
+        {},
+        RuntimeError(
+            "duplicate key violates unique constraint "
+            '"uq_dataset_snapshot_weekly_batch"'
+        ),
+    )
+    monkeypatch.setattr(
+        service.research,
+        "create_dataset_snapshot",
+        lambda **kwargs: (_ for _ in ()).throw(conflict),
+    )
+
+    resolved = service._get_or_create_weekly_snapshot(
+        date_start=date(2030, 2, 6),
+        date_end=date(2030, 2, 24),
+        schedule_key="2030-W08",
+    )
+
+    assert resolved == winner
+
+
+def test_weekly_snapshot_boundary_conflict_fails_closed():
+    database = memory_database()
+    person = participant(database, "stage5-weekly-boundary")
+    research = ResearchEvaluationService(database, "Asia/Shanghai")
+    research.create_dataset_snapshot(
+        date_start=date(2030, 2, 5),
+        date_end=date(2030, 2, 24),
+        participant_filter={},
+        purpose="stage5_weekly_calibration",
+        schedule_key="2030-W08",
+    )
+    service = ParameterLearningService(database, "Asia/Shanghai")
+
+    with pytest.raises(ValueError, match="weekly_batch_boundary_conflict"):
+        service.maybe_calibrate(person.id, through=date(2030, 2, 24))
 
 
 def test_unrelated_scheduled_integrity_error_is_rethrown_unchanged():
