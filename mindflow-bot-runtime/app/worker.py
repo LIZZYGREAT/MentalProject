@@ -35,6 +35,7 @@ from app.presentation.contracts import (
     ResponseSegment,
     RuntimeResponse,
 )
+from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import PresentationOutbox
@@ -72,7 +73,8 @@ class ProgressState:
     first_tool_started_at: float | None = None
     tool_started_at: dict[str, float] = field(default_factory=dict)
     tool_durations_ms: list[float] = field(default_factory=list)
-    grace_elapsed: bool = False
+    force_silent: bool = False
+    tool_activity_seen: bool = False
     final_ready: bool = False
     pending_text: str | None = None
     pending_key: str | None = None
@@ -129,7 +131,8 @@ class BotWorker:
         progress_presenter: ProgressPresenter | None = None,
         response_orchestrator: ResponseOrchestrator | None = None,
         max_retries: int = 1,
-        progress_delay_seconds: int = 3,
+        generic_progress_delay_seconds: float = 10.0,
+        tool_progress_grace_seconds: float = 1.2,
         progress_cooldown_seconds: int = 3,
         progress_max_messages: int = 2,
         incidents: RuntimeIncidentRepository | None = None,
@@ -147,7 +150,12 @@ class BotWorker:
         self.response_orchestrator = response_orchestrator or ResponseOrchestrator()
         self.model = model
         self.max_retries = max_retries
-        self.progress_delay_seconds = progress_delay_seconds
+        self.generic_progress_delay_seconds = max(
+            0.0, float(generic_progress_delay_seconds)
+        )
+        self.tool_progress_grace_seconds = max(
+            0.0, float(tool_progress_grace_seconds)
+        )
         self.progress_cooldown_seconds = progress_cooldown_seconds
         # A bot event owns at most one user-visible processing message. Keep
         # accepting the legacy setting so existing deployments do not fail at
@@ -357,7 +365,9 @@ class BotWorker:
 
     async def _run_agent(self, event: BotEvent, ctx: AgentContext, run_id) -> None:
         started = time.monotonic()
-        progress = ProgressState()
+        progress = ProgressState(
+            force_silent=should_force_silent_progress(event.text)
+        )
         message_created_at = event.create_time
         if message_created_at.tzinfo is None:
             message_created_at = message_created_at.replace(tzinfo=timezone.utc)
@@ -401,21 +411,36 @@ class BotWorker:
             progress.last_sent_at = now
             progress.sent_keys.add(key)
 
-        async def delayed_progress() -> None:
-            await asyncio.sleep(self.progress_delay_seconds)
+        async def delayed_generic_progress() -> None:
+            await asyncio.sleep(self.generic_progress_delay_seconds)
             async with progress.lock:
-                progress.grace_elapsed = True
+                if (
+                    progress.final_ready
+                    or progress.force_silent
+                    or progress.sent
+                    or progress.tool_activity_seen
+                ):
+                    return
+                suggestion = self.progress_presenter.delayed(
+                    event.text, state=progress
+                )
+                if suggestion:
+                    await emit_locked(suggestion, key="delayed")
+
+        async def delayed_tool_progress() -> None:
+            await asyncio.sleep(self.tool_progress_grace_seconds)
+            async with progress.lock:
+                if progress.final_ready:
+                    return
                 suggestion = progress.pending_text
                 key = progress.pending_key
-                if suggestion is None:
-                    suggestion = self.progress_presenter.delayed(
-                        event.text, state=progress
-                    )
-                    key = "delayed"
                 if suggestion and key:
                     await emit_locked(suggestion, key=key)
 
+        tool_timer: asyncio.Task[None] | None = None
+
         async def on_activity(activity: AgentActivityEvent) -> None:
+            nonlocal tool_timer
             async with progress.lock:
                 now = time.monotonic()
                 if progress.first_activity_at is None:
@@ -424,6 +449,7 @@ class BotWorker:
                 if tool_name:
                     progress.used_tools.add(tool_name)
                 if activity.kind == "tool_started" and tool_name:
+                    progress.tool_activity_seen = True
                     if progress.first_tool_started_at is None:
                         progress.first_tool_started_at = now
                     progress.tool_started_at[tool_name] = now
@@ -438,8 +464,11 @@ class BotWorker:
                     key = self.progress_presenter.key_for(activity, state=progress)
                     progress.pending_text = suggestion
                     progress.pending_key = key
-                    if progress.grace_elapsed:
-                        await emit_locked(suggestion, key=key)
+                    if tool_timer is None or tool_timer.done():
+                        tool_timer = asyncio.create_task(
+                            delayed_tool_progress(),
+                            name=f"tool-progress-{event.event_id}",
+                        )
 
         async def close_progress_before_final() -> None:
             # If a processing send already owns the lock, wait until the
@@ -447,10 +476,17 @@ class BotWorker:
             # a threshold-edge timer can no longer start a processing send.
             async with progress.lock:
                 progress.final_ready = True
-            timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
+            generic_timer.cancel()
+            timers = [generic_timer]
+            if tool_timer is not None:
+                tool_timer.cancel()
+                timers.append(tool_timer)
+            await asyncio.gather(*timers, return_exceptions=True)
 
-        timer = asyncio.create_task(delayed_progress())
+        generic_timer = asyncio.create_task(
+            delayed_generic_progress(),
+            name=f"generic-progress-{event.event_id}",
+        )
         try:
             agent_started = time.monotonic()
             response = await self.runtime.handle_message(
@@ -570,8 +606,12 @@ class BotWorker:
             delivered = await self._deliver(event, FALLBACK_TEMPORARY)
             status = "failed_replied" if delivered else "reply_pending"
         finally:
-            timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
+            generic_timer.cancel()
+            timers = [generic_timer]
+            if tool_timer is not None:
+                tool_timer.cancel()
+                timers.append(tool_timer)
+            await asyncio.gather(*timers, return_exceptions=True)
             if self._active_event_by_participant.get(ctx.participant_id) == event.event_id:
                 self._active_event_by_participant.pop(ctx.participant_id, None)
         if progress.first_activity_at is not None:

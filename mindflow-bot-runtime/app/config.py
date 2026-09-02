@@ -93,7 +93,8 @@ class Settings:
     agent_session_idle_seconds: int = 120
     claude_timeout_seconds: int = 90
     claude_max_turns: int = 8
-    progress_delay_seconds: int = 3
+    generic_progress_delay_seconds: float = 10.0
+    tool_progress_grace_seconds: float = 1.2
     progress_cooldown_seconds: int = 3
     progress_max_messages: int = 1
     response_segmentation_enabled: bool = True
@@ -280,7 +281,12 @@ class Settings:
             ),
             claude_timeout_seconds=_int(values, "CLAUDE_TIMEOUT_SECONDS", 90),
             claude_max_turns=_int(values, "CLAUDE_MAX_TURNS", 8),
-            progress_delay_seconds=_int(values, "PROGRESS_DELAY_SECONDS", 3),
+            generic_progress_delay_seconds=_float(
+                values, "GENERIC_PROGRESS_DELAY_SECONDS", 10.0
+            ),
+            tool_progress_grace_seconds=_float(
+                values, "TOOL_PROGRESS_GRACE_SECONDS", 1.2
+            ),
             progress_cooldown_seconds=_int(
                 values, "PROGRESS_COOLDOWN_SECONDS", 3
             ),

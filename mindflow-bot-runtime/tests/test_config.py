@@ -81,7 +81,8 @@ def test_response_ux_defaults_and_presentation_model_fallback():
         valid_environment(), base_dir=Path(__file__).resolve().parents[1]
     )
 
-    assert settings.progress_delay_seconds == 3
+    assert settings.generic_progress_delay_seconds == 10
+    assert settings.tool_progress_grace_seconds == 1.2
     assert settings.progress_cooldown_seconds == 3
     assert settings.progress_max_messages == 1
     assert settings.response_segmentation_enabled is True
@@ -93,6 +94,23 @@ def test_response_ux_defaults_and_presentation_model_fallback():
     assert settings.presentation_agent_timeout_seconds == 4
     assert settings.presentation_model == "deepseek-v4-flash"
     assert settings.claude_partial_messages_enabled is False
+
+
+def test_progress_timers_have_independent_configuration():
+    environment = valid_environment()
+    environment.update(
+        {
+            "GENERIC_PROGRESS_DELAY_SECONDS": "8.5",
+            "TOOL_PROGRESS_GRACE_SECONDS": "0.75",
+        }
+    )
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.generic_progress_delay_seconds == 8.5
+    assert settings.tool_progress_grace_seconds == 0.75
 
 
 def test_haiku_and_subagent_must_use_the_same_model():

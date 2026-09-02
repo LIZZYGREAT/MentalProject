@@ -261,7 +261,10 @@ async def run() -> None:
         progress_presenter=ProgressPresenter(),
         response_orchestrator=response_orchestrator,
         max_retries=settings.feishu_send_max_retries,
-        progress_delay_seconds=settings.progress_delay_seconds,
+        generic_progress_delay_seconds=(
+            settings.generic_progress_delay_seconds
+        ),
+        tool_progress_grace_seconds=settings.tool_progress_grace_seconds,
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
         incidents=incidents,

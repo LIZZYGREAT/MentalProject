@@ -3,10 +3,13 @@ import json
 import threading
 import time
 
+import pytest
+
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
 from app.presentation.contracts import AgentActivityEvent
+from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.presentation.semantic_segmenter import SemanticSegmenter
 from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
@@ -58,7 +61,8 @@ def _bound_system(
     runtime,
     sender,
     *,
-    delay=0.02,
+    generic_delay=0.02,
+    tool_grace=0.02,
     orchestrator=None,
 ):
     database = memory_database()
@@ -83,7 +87,8 @@ def _bound_system(
         runtime,
         sender,
         model="fake",
-        progress_delay_seconds=delay,
+        generic_progress_delay_seconds=generic_delay,
+        tool_progress_grace_seconds=tool_grace,
         progress_max_messages=4,
         response_orchestrator=orchestrator,
     )
@@ -104,11 +109,145 @@ def test_fast_reply_sends_only_one_final_message():
             return "final"
 
     sender = RecordingSender()
-    gateway, queue, worker, _ = _bound_system(FastRuntime(), sender, delay=0.05)
+    gateway, queue, worker, _ = _bound_system(
+        FastRuntime(), sender, generic_delay=0.05, tool_grace=0.05
+    )
 
     asyncio.run(_send(gateway, queue, worker, text="你好"))
 
     assert [item[1] for item in sender.sent] == ["final"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["你好", "在吗？", "谢谢", "好的", "收到", "晚安"],
+)
+def test_slow_social_turn_stays_silent_until_agent_final(text):
+    class SlowSocialRuntime:
+        async def handle_message(self, *_args, **_kwargs):
+            await asyncio.sleep(0.04)
+            return "agent final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        SlowSocialRuntime(), sender, generic_delay=0.01, tool_grace=0.01
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text=text))
+
+    assert [item[1] for item in sender.sent] == ["agent final"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["看下日程", "看下压力", "生成曲线", "好的，那帮我看看下午的日程"],
+)
+def test_business_requests_are_not_force_silent(text):
+    assert should_force_silent_progress(text) is False
+
+
+@pytest.mark.parametrize("text", ["您好！", "OK.", "嗯嗯。", "早上好？"])
+def test_silent_policy_normalizes_case_and_trailing_punctuation(text):
+    assert should_force_silent_progress(text) is True
+
+
+def test_silent_policy_does_not_expand_to_unlisted_social_language():
+    assert should_force_silent_progress("你好呀") is False
+
+
+def test_fast_tool_finishes_inside_tool_grace_without_progress():
+    class FastToolRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.005)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        FastToolRuntime(), sender, generic_delay=1, tool_grace=0.05
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="看下日程"))
+
+    assert [item[1] for item in sender.sent] == ["final"]
+
+
+def test_long_no_tool_turn_sends_one_generic_progress_before_final():
+    class LongTextRuntime:
+        async def handle_message(self, *_args, **_kwargs):
+            await asyncio.sleep(0.04)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        LongTextRuntime(), sender, generic_delay=0.01, tool_grace=1
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="详细解释压力曲线与日程的差异"))
+
+    texts = [item[1] for item in sender.sent]
+    assert len(texts) == 2
+    assert texts[-1] == "final"
+    assert texts[0] != "final"
+
+
+def test_no_tool_turn_finishing_before_generic_delay_sends_only_final():
+    class MediumTextRuntime:
+        async def handle_message(self, *_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        MediumTextRuntime(), sender, generic_delay=0.05, tool_grace=1
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="解释一下这个结果"))
+
+    assert [item[1] for item in sender.sent] == ["final"]
+
+
+def test_multiple_tool_stages_still_send_at_most_one_progress():
+    class MultiToolRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.02)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="care_run_today_assessment"
+                )
+            )
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="care_get_pressure_curve"
+                )
+            )
+            await asyncio.sleep(0.02)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        MultiToolRuntime(), sender, generic_delay=1, tool_grace=0.005
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="看看下午压力"))
+
+    texts = [item[1] for item in sender.sent]
+    assert len(texts) == 2
+    assert texts[-1] == "final"
+    assert texts[0] in {
+        "我先看看相关日程。",
+        "日程信息拿到了，我正在结合这些安排计算压力变化。",
+        "我正在结合今天的状态和日程计算压力趋势。",
+    }
 
 
 def test_slow_tool_reply_sends_one_contextual_processing_before_final():
@@ -116,19 +255,21 @@ def test_slow_tool_reply_sends_one_contextual_processing_before_final():
         async def handle_message(self, *_args, on_activity, **_kwargs):
             await on_activity(
                 AgentActivityEvent(
-                    kind="tool_started", tool_name="care_get_pressure_curve"
+                    kind="tool_started", tool_name="calendar_list_events"
                 )
             )
             await asyncio.sleep(0.05)
             return "final"
 
     sender = RecordingSender()
-    gateway, queue, worker, _ = _bound_system(SlowRuntime(), sender, delay=0.01)
+    gateway, queue, worker, _ = _bound_system(
+        SlowRuntime(), sender, generic_delay=1, tool_grace=0.01
+    )
 
     asyncio.run(_send(gateway, queue, worker))
 
     texts = [item[1] for item in sender.sent]
-    assert texts == ["我正在结合今天的状态和日程计算压力趋势。", "final"]
+    assert texts == ["我先看看相关日程。", "final"]
     assert sender.sent[0][3] < sender.sent[1][3]
 
 
@@ -154,7 +295,9 @@ def test_threshold_race_waits_for_inflight_processing_send_before_final():
 
     async def scenario():
         sender = BlockingProgressSender()
-        gateway, queue, worker, _ = _bound_system(RaceRuntime(), sender, delay=0)
+        gateway, queue, worker, _ = _bound_system(
+            RaceRuntime(), sender, generic_delay=0, tool_grace=1
+        )
         task = asyncio.create_task(_send(gateway, queue, worker))
         started = await asyncio.to_thread(sender.progress_started.wait, 1)
         assert started is True
@@ -200,7 +343,11 @@ def test_multi_segment_final_never_allows_late_processing():
     )
     sender = RecordingSender()
     gateway, queue, worker, _ = _bound_system(
-        SlowAnalysisRuntime(), sender, delay=0.01, orchestrator=orchestrator
+        SlowAnalysisRuntime(),
+        sender,
+        generic_delay=1,
+        tool_grace=0.01,
+        orchestrator=orchestrator,
     )
 
     asyncio.run(_send(gateway, queue, worker))
@@ -224,7 +371,7 @@ def test_completed_final_is_not_recovered_as_processing_after_restart():
     runtime = Runtime()
     first_sender = RecordingSender()
     gateway, queue, first_worker, events = _bound_system(
-        runtime, first_sender, delay=0.05
+        runtime, first_sender, generic_delay=0.05, tool_grace=0.05
     )
     asyncio.run(_send(gateway, queue, first_worker, event_id="completed"))
 
@@ -239,7 +386,8 @@ def test_completed_final_is_not_recovered_as_processing_after_restart():
         runtime,
         second_sender,
         model="fake",
-        progress_delay_seconds=0,
+        generic_progress_delay_seconds=0,
+        tool_progress_grace_seconds=0,
     )
     duplicate_accepted = gateway.accept_payload(
         payload("completed", "message-completed", "ou_1", "oc_1", "request")
@@ -269,7 +417,7 @@ def test_restart_during_agent_turn_reuses_one_event_level_processing_message():
     async def scenario():
         sender = IdempotentRecordingSender()
         gateway, queue, first_worker, events = _bound_system(
-            InterruptedRuntime(), sender, delay=0
+            InterruptedRuntime(), sender, generic_delay=0, tool_grace=0
         )
         first = asyncio.create_task(
             _send(gateway, queue, first_worker, event_id="restart-active")
@@ -293,7 +441,8 @@ def test_restart_during_agent_turn_reuses_one_event_level_processing_message():
             RecoveredRuntime(),
             sender,
             model="fake",
-            progress_delay_seconds=0,
+            generic_progress_delay_seconds=0,
+            tool_progress_grace_seconds=0,
             progress_max_messages=1,
         )
         item = recovered[0]

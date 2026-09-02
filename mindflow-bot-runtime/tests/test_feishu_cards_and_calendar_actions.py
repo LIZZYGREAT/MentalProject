@@ -326,7 +326,9 @@ def test_worker_delivers_staged_card_before_final_text():
     worker = BotWorker(
         queue, identity, events, AgentRunRepository(database),
         SkillLoader(skill_path()), Runtime(), sender, None, outbox,
-        model="fake", progress_delay_seconds=60,
+        model="fake",
+        generic_progress_delay_seconds=60,
+        tool_progress_grace_seconds=60,
     )
 
     async def scenario():

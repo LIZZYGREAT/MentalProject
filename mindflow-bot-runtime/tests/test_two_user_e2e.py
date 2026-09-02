@@ -286,7 +286,8 @@ def test_stop_bypasses_running_turn_and_interrupts_runtime():
         runtime,
         sender,
         model="fake",
-        progress_delay_seconds=60,
+        generic_progress_delay_seconds=60,
+        tool_progress_grace_seconds=60,
     )
 
     async def scenario():
@@ -340,7 +341,8 @@ def test_fast_tool_reply_finishes_inside_grace_without_processing_message():
         ProgressRuntime(),
         sender,
         model="fake",
-        progress_delay_seconds=60,
+        generic_progress_delay_seconds=60,
+        tool_progress_grace_seconds=60,
         progress_cooldown_seconds=1,
         progress_max_messages=2,
     )
