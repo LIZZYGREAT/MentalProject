@@ -17,7 +17,7 @@ from app.integrations.feishu.cards import (
     daily_review_card,
     pressure_curve_card,
 )
-from app.integrations.feishu.client import FeishuClient
+from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.card_callback import FeishuCardCallbackServer
 from app.integrations.feishu.gateway import (
     BotEvent,
@@ -82,6 +82,7 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
 def test_daily_checkin_card_uses_json_2_form_submit_contract():
     card = daily_checkin_card()
     assert card["schema"] == "2.0"
+    assert card["config"]["update_multi"] is True
     assert "elements" not in card
     form = next(
         item for item in card["body"]["elements"] if item["tag"] == "form"
@@ -263,6 +264,7 @@ def test_feishu_client_sends_card_as_interactive_message():
     assert seen == [("oc-chat", "interactive", card)]
     serialized = seen[0][2]
     assert serialized["schema"] == "2.0"
+    assert serialized["config"]["update_multi"] is True
     assert any(
         element["tag"] == "form"
         for element in serialized["body"]["elements"]
@@ -368,6 +370,85 @@ def test_worker_delivers_staged_card_before_final_text():
     asyncio.run(scenario())
     assert [item[0] for item in sender.sent[-2:]] == ["card", "text"]
     assert sender.sent[-1][2] == "曲线卡片已生成。"
+
+
+def test_worker_logs_feishu_card_failure_details_and_sends_fallback(caplog):
+    database = memory_database()
+    person = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue(maxsize=4)
+    gateway = FeishuGateway("app", "secret", identity, events, queue)
+    outbox = PresentationOutbox()
+    sensitive_card_value = "access-token-must-not-be-logged"
+
+    class Runtime:
+        async def handle_message(self, ctx, _text, **_kwargs):
+            outbox.stage_card(ctx.agent_run_id, {
+                "schema": "2.0",
+                "body": {"elements": [{"content": sensitive_card_value}]},
+            })
+            return "曲线卡片已生成。"
+
+    class Sender:
+        def __init__(self):
+            self.sent = []
+
+        def send_text(self, chat_id, text):
+            self.sent.append(("text", chat_id, text))
+            return f"om-{len(self.sent)}"
+
+        def send_card(self, chat_id, card):
+            self.sent.append(("card", chat_id, card))
+            raise FeishuSendError(
+                "Failed to create card content, ext=ErrPath config.update_multi",
+                code=230099,
+                retryable=True,
+                operation="send_message",
+            )
+
+    sender = Sender()
+    worker = BotWorker(
+        queue, identity, events, AgentRunRepository(database),
+        SkillLoader(skill_path()), Runtime(), sender, None, outbox,
+        model="fake",
+        max_retries=0,
+        generic_progress_delay_seconds=60,
+        tool_progress_grace_seconds=60,
+    )
+
+    async def scenario():
+        gateway.accept_payload({
+            "header": {"event_id": "bind-event"},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou"}},
+                "message": {
+                    "message_id": "bind-message", "chat_id": "oc", "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": json.dumps({"text": f"/bind {code}"}),
+                },
+            },
+        })
+        await worker.process(await queue.get())
+        gateway.accept_event(BotEvent(
+            "curve-event", "curve-message", "app", "ou", "oc", "给我压力曲线",
+            datetime.now(TZ), "p2p",
+        ))
+        await worker.process(await queue.get())
+
+    caplog.set_level("WARNING")
+    asyncio.run(scenario())
+
+    assert [item[0] for item in sender.sent[-2:]] == ["card", "text"]
+    assert sender.sent[-1][2] == (
+        "曲线卡片已生成。\n\n卡片暂时未能发送，请稍后再试。"
+    )
+    assert "230099" in caplog.text
+    assert "Failed to create card content" in caplog.text
+    assert "ErrPath config.update_multi" in caplog.text
+    assert "operation=send_message" in caplog.text
+    assert sensitive_card_value not in caplog.text
 
 
 def test_calendar_create_event_uses_user_token_primary_calendar_and_idempotency(monkeypatch):

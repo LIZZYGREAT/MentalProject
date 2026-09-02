@@ -557,11 +557,15 @@ class BotWorker:
                     card_delivery_failed = True
                     logger.warning(
                         "feishu_card_send_failed event_id=%s message_id=%s "
-                        "error_code=%s retryable=%s",
+                        "error_code=%s retryable=%s error_class=%s "
+                        "operation=%s error_message=%s",
                         event.event_id,
                         event.message_id,
                         exc.code,
                         exc.retryable,
+                        exc.error_class,
+                        exc.operation,
+                        str(exc)[:1000],
                     )
                     await self._record_incident(
                         severity="error",

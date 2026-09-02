@@ -274,6 +274,7 @@ def test_daily_review_validation_and_card_contract():
     schedule_id = str(uuid.uuid4())
     card = daily_review_card(schedule_id=schedule_id, local_date="2030-01-15")
     assert card["schema"] == "2.0"
+    assert card["config"]["update_multi"] is True
     assert "elements" not in card
     assert "body" in card
     form = next(

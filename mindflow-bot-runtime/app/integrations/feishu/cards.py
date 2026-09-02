@@ -39,7 +39,7 @@ def daily_checkin_card() -> dict[str, Any]:
     return {
         "schema": "2.0",
         "config": {
-            "update_multi": False,
+            "update_multi": True,
             "enable_forward": False,
         },
         "header": {
@@ -301,7 +301,7 @@ def daily_review_card(
     })
     return {
         "schema": "2.0",
-        "config": {"update_multi": False, "enable_forward": False},
+        "config": {"update_multi": True, "enable_forward": False},
         "header": {"template": "purple", "title": {"tag": "plain_text", "content": "MindFlow 每日回顾"}},
         "body": {
             "direction": "vertical",
