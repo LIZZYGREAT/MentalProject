@@ -906,6 +906,32 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 ),
                 {"id": v11_v6_profile},
             ) == "rejected"
+            command.upgrade(config, "0036_stage5_effective_profile")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0036_stage5_effective_profile"
+            dataset_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "dataset_snapshots"
+                )
+            }
+            assert {"purpose", "schedule_key"} <= dataset_columns
+            assert connection.scalar(
+                text(
+                    "SELECT purpose FROM dataset_snapshots WHERE id = :id"
+                ),
+                {"id": dataset_snapshot_id},
+            ) == "manual_research"
+            dataset_indexes = {
+                item["name"]: item
+                for item in inspect(connection).get_indexes(
+                    "dataset_snapshots"
+                )
+            }
+            assert dataset_indexes[
+                "uq_dataset_snapshot_weekly_batch"
+            ]["unique"] is True
             stage5_columns = {
                 column["name"]
                 for column in inspect(connection).get_columns(

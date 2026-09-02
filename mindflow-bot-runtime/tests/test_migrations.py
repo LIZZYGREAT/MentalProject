@@ -150,6 +150,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0035_stage5_v7_runtime_cutover"
     )
     assert migration_0035.down_revision == "0034_dataset_v7_active_history"
+    migration_0036 = next(
+        migration for migration in migrations
+        if migration.revision == "0036_stage5_effective_profile"
+    )
+    assert migration_0036.down_revision == "0035_stage5_v7_runtime_cutover"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
@@ -304,6 +309,53 @@ def test_0035_revokes_pre_v7_stage5_production_eligibility(monkeypatch):
     assert "mindflow-ctssm-runtime-v11" in statements[1]
     assert "stage5_promoted" in statements[1]
     assert "schema_version <> 'mindflow-research-dataset-v7'" in statements[1]
+
+
+def test_0036_adds_durable_weekly_dataset_batch_identity(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0036_stage5_effective_profile_batches.py"
+    )
+    columns = []
+    checks = []
+    indexes = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(migration.op, "alter_column", lambda *a, **k: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields), kwargs)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert [column.name for _, column in columns] == [
+        "purpose",
+        "schedule_key",
+    ]
+    assert "purpose = 'manual_research'" in statements[0]
+    assert checks == [
+        (
+            "ck_dataset_snapshot_batch_identity",
+            "dataset_snapshots",
+            "(purpose = 'stage5_weekly_calibration' AND schedule_key IS NOT NULL) "
+            "OR (purpose <> 'stage5_weekly_calibration' AND schedule_key IS NULL)",
+        )
+    ]
+    assert indexes[0][0] == "uq_dataset_snapshot_weekly_batch"
+    assert indexes[0][3]["postgresql_where"] is not None
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

@@ -52,6 +52,8 @@ DATASET_SCHEMA_V5 = "mindflow-research-dataset-v5"
 DATASET_SCHEMA_V6 = "mindflow-research-dataset-v6"
 DATASET_SCHEMA_V7 = "mindflow-research-dataset-v7"
 DATASET_SCHEMA_VERSION = DATASET_SCHEMA_V7
+DATASET_PURPOSE_MANUAL = "manual_research"
+DATASET_PURPOSE_STAGE5_WEEKLY = "stage5_weekly_calibration"
 STAGE5_INTERVENTION_EXCLUSION_MINUTES = 120
 MATCH_SCHEMA_VERSION = "forecast-observation-grid.v2"
 EVALUATION_CODE_VERSION = "stage4-evaluation.v7"
@@ -953,9 +955,19 @@ class ResearchEvaluationService:
         participant_filter: dict[str, Any] | None = None,
         observation_cutoff: datetime | None = None,
         calendar_cutoff: datetime | None = None,
+        purpose: str = DATASET_PURPOSE_MANUAL,
+        schedule_key: str | None = None,
     ) -> dict[str, Any]:
         lower, upper = self._bounds(date_start, date_end)
         requested = dict(participant_filter or {})
+        purpose = str(purpose or "").strip()
+        if purpose not in {
+            DATASET_PURPOSE_MANUAL,
+            DATASET_PURPOSE_STAGE5_WEEKLY,
+        }:
+            raise ValueError("unsupported dataset snapshot purpose")
+        if (purpose == DATASET_PURPOSE_STAGE5_WEEKLY) != bool(schedule_key):
+            raise ValueError("weekly snapshots require a durable schedule key")
         if set(requested) - {"participant_codes"}:
             raise ValueError("unsupported participant filter")
         raw_codes = requested.get("participant_codes") or []
@@ -1449,6 +1461,8 @@ class ResearchEvaluationService:
             "schema_version": DATASET_SCHEMA_VERSION,
             "date_start": date_start.isoformat(),
             "date_end": date_end.isoformat(),
+            "purpose": purpose,
+            "schedule_key": schedule_key,
             "participant_filter": participant_filter,
             "observation_cutoff": observation_cutoff.isoformat(),
             "calendar_cutoff": calendar_cutoff.isoformat(),
@@ -1457,6 +1471,8 @@ class ResearchEvaluationService:
         type_count = lambda kind: sum(item["item_type"] == kind for item in items)
         manifest = {
             "schema_version": DATASET_SCHEMA_VERSION,
+            "purpose": purpose,
+            "schedule_key": schedule_key,
             "participant_count": type_count("participant"),
             "observation_count": type_count("observation"),
             "forecast_count": type_count("forecast"),
@@ -1479,6 +1495,8 @@ class ResearchEvaluationService:
                 id=snapshot_id,
                 date_start=date_start,
                 date_end=date_end,
+                purpose=purpose,
+                schedule_key=schedule_key,
                 participant_filter=participant_filter,
                 observation_cutoff=observation_cutoff,
                 calendar_cutoff=calendar_cutoff,
@@ -1511,6 +1529,8 @@ class ResearchEvaluationService:
             "created_at": _iso(row.created_at),
             "date_start": row.date_start.isoformat(),
             "date_end": row.date_end.isoformat(),
+            "purpose": row.purpose,
+            "schedule_key": row.schedule_key,
             "participant_filter": dict(row.participant_filter),
             "observation_cutoff": _aware(row.observation_cutoff).isoformat(),
             "calendar_cutoff": _aware(row.calendar_cutoff).isoformat(),
@@ -1721,6 +1741,15 @@ class ResearchEvaluationService:
             "observation_cutoff": snapshot_view["observation_cutoff"],
             "calendar_cutoff": snapshot_view["calendar_cutoff"],
         }
+        if "purpose" in manifest or "schedule_key" in manifest:
+            if (
+                manifest.get("purpose") != snapshot_view["purpose"]
+                or manifest.get("schedule_key")
+                != snapshot_view["schedule_key"]
+            ):
+                raise ValueError("dataset snapshot batch identity mismatch")
+            contract["purpose"] = snapshot_view["purpose"]
+            contract["schedule_key"] = snapshot_view["schedule_key"]
         manifest_hash = self._manifest_hash(contract, items)
         if manifest_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")

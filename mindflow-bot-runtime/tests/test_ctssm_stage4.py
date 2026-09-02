@@ -16,7 +16,10 @@ from app.repositories import (
     ParticipantSlowStateRepository,
     PsychometricAssessmentRepository,
 )
-from app.repositories import promotion_parameters_hash
+from app.repositories import (
+    promotion_parameters_hash,
+    stage5_effective_parameters_hash,
+)
 from app.services.forecast_coordinator import (
     enforce_promoted_model_selection,
     production_model_identity,
@@ -1675,6 +1678,7 @@ def test_forecast_trusts_repository_validated_stage5_proof(variant, family):
             "parameter_learning_run_id": str(uuid.uuid4()),
         },
     }
+    validated_hash = stage5_effective_parameters_hash(parameters, variant)
     learned = {
         "id": profile_id,
         "version": 4,
@@ -1684,7 +1688,13 @@ def test_forecast_trusts_repository_validated_stage5_proof(variant, family):
             "provenance_type": "stage5_promotion",
             "profile_id": profile_id,
             "active_variant": variant,
-            "checks": {"causal_dataset_schema": True},
+            "validated_effective_parameters_hash": validated_hash,
+            "current_effective_parameters_hash": validated_hash,
+            "checks": {
+                "causal_dataset_schema": True,
+                "explicit_profile_identity_matches": True,
+                "effective_parameters_hash_matches": True,
+            },
         },
     }
     effective, _layers = layered_profile(None, learned)

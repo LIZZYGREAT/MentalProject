@@ -135,6 +135,18 @@ class DatasetSnapshotIntegrityService:
         manifest = dict(snapshot.manifest_json or {})
         if manifest.get("schema_version") != schema:
             raise ValueError("dataset snapshot schema/manifest mismatch")
+        has_batch_identity = (
+            "purpose" in manifest or "schedule_key" in manifest
+        )
+        if snapshot.purpose == "stage5_weekly_calibration" and not (
+            has_batch_identity and snapshot.schedule_key
+        ):
+            raise ValueError("dataset snapshot batch identity mismatch")
+        if has_batch_identity and (
+            manifest.get("purpose") != snapshot.purpose
+            or manifest.get("schedule_key") != snapshot.schedule_key
+        ):
+            raise ValueError("dataset snapshot batch identity mismatch")
         expected_counts = {
             "item_count": len(items),
             "observation_count": sum(
@@ -194,6 +206,9 @@ class DatasetSnapshotIntegrityService:
             "observation_cutoff": _utc_iso(snapshot.observation_cutoff),
             "calendar_cutoff": _utc_iso(snapshot.calendar_cutoff),
         }
+        if has_batch_identity:
+            contract["purpose"] = snapshot.purpose
+            contract["schedule_key"] = snapshot.schedule_key
         calculated_hash = self.manifest_hash(contract, items)
         if calculated_hash != manifest.get("manifest_hash"):
             raise ValueError("dataset snapshot manifest mismatch")

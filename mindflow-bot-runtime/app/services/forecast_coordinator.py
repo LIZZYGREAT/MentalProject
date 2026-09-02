@@ -21,6 +21,8 @@ from app.repositories import (
     LearnedProfileRepository,
     WarningScheduleRepository,
     ForecastInputChangedError,
+    authorized_model_parameters,
+    stage5_effective_parameters_hash,
 )
 from algorithm.dynamic_state_model import model_variant_metadata, normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
@@ -86,9 +88,10 @@ def enforce_promoted_model_selection(
     effective_selection = dict(
         effective_parameters.get("model_selection") or {}
     )
-    if normalize_model_variant(
+    effective_variant = normalize_model_variant(
         effective_selection.get("active_variant") or "m0"
-    ) == "m0":
+    )
+    if effective_variant == "m0":
         return effective_profile
     learned_parameters = dict((learned_row or {}).get("parameters") or {})
     learned_selection = dict(learned_parameters.get("model_selection") or {})
@@ -96,20 +99,46 @@ def enforce_promoted_model_selection(
     variant = normalize_model_variant(
         learned_selection.get("active_variant") or "m0"
     )
-    selection_is_proven = bool(
+    common_proof = bool(
         learned_row is not None
         and proof.get("runtime_valid") is True
-        and proof.get("provenance_type")
-        in {"stage4_promotion", "stage5_promotion"}
         and str(proof.get("profile_id") or "")
         == str(learned_row.get("id") or "")
         and normalize_model_variant(proof.get("active_variant") or "m0")
         == variant
-        and effective_parameters == learned_parameters
         and effective_selection == learned_selection
     )
+    if proof.get("provenance_type") == "stage5_promotion":
+        validated_hash = str(
+            proof.get("validated_effective_parameters_hash") or ""
+        )
+        checks = dict(proof.get("checks") or {})
+        selection_is_proven = bool(
+            common_proof
+            and validated_hash
+            and stage5_effective_parameters_hash(
+                effective_parameters, variant
+            )
+            == validated_hash
+            and proof.get("current_effective_parameters_hash")
+            == validated_hash
+            and checks.get("explicit_profile_identity_matches") is True
+            and checks.get("effective_parameters_hash_matches") is True
+        )
+    else:
+        # Stage 4 retains its exact learned-parameter promotion hash contract.
+        selection_is_proven = bool(
+            common_proof
+            and proof.get("provenance_type") == "stage4_promotion"
+            and effective_parameters == learned_parameters
+        )
     if selection_is_proven:
-        return effective_profile
+        return {
+            **effective_profile,
+            "model_params": authorized_model_parameters(
+                effective_parameters, variant
+            ),
+        }
     effective_parameters["model_selection"] = {
         "active_variant": "m0",
         "status": "promotion_provenance_missing",

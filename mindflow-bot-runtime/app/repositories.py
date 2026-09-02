@@ -17,7 +17,10 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
-from algorithm.dynamic_state_model import normalize_model_variant
+from algorithm.dynamic_state_model import (
+    model_variant_metadata,
+    normalize_model_variant,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +85,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _utc_iso(value: datetime) -> str:
+    return (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    ).isoformat()
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -100,7 +111,56 @@ def promotion_parameters_hash(parameters: Mapping[str, Any]) -> str:
         for key, value in dict(parameters).items()
         if key != "model_selection"
     }
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return profile_parameters_hash(payload)
+
+
+def profile_parameters_hash(parameters: Mapping[str, Any]) -> str:
+    """Hash an exact effective/explicit parameter document canonically."""
+
+    return hashlib.sha256(
+        _canonical_json(dict(parameters)).encode("utf-8")
+    ).hexdigest()
+
+
+def _layer_model_parameters(
+    learned: Mapping[str, Any], explicit: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Mirror the production learned/explicit overlay used by layered_profile."""
+
+    effective = dict(learned)
+    for key, value in dict(explicit).items():
+        if isinstance(value, dict) and isinstance(effective.get(key), dict):
+            effective[key] = {**effective[key], **value}
+        else:
+            effective[key] = value
+    return effective
+
+
+def authorized_model_parameters(
+    parameters: Mapping[str, Any], variant: str
+) -> dict[str, Any]:
+    """Bind an already-authorized selection to the engine's canonical family."""
+
+    normalized = normalize_model_variant(variant)
+    result = {
+        **dict(parameters),
+        "model_family": str(model_variant_metadata(normalized)["canonical"]),
+    }
+    selection = dict(result.get("model_selection") or {})
+    selection["runtime_authorized"] = True
+    selection["active_variant"] = normalized
+    result["model_selection"] = selection
+    return result
+
+
+def stage5_effective_parameters_hash(
+    parameters: Mapping[str, Any], variant: str
+) -> str:
+    """Hash the final Stage-5 parameters including derived engine family."""
+
+    return promotion_parameters_hash(
+        authorized_model_parameters(parameters, variant)
+    )
 
 
 class ForecastInputChangedError(RuntimeError):
@@ -273,7 +333,7 @@ class ProfileRepository:
             return {
                 "version": row.version,
                 "profile": dict(row.profile_json),
-                "created_at": row.created_at.isoformat(),
+                "created_at": _utc_iso(row.created_at),
             }
 
     def save(self, participant_id: uuid.UUID, profile: dict[str, Any]) -> int:
@@ -439,6 +499,95 @@ class LearnedProfileRepository:
             )
             gate = dict(validation.get("promotion_gate") or {})
             formal_audit = dict(validation.get("formal_replay_audit") or {})
+            training = dict(
+                (learning_run.training_metrics if learning_run is not None else {})
+                or {}
+            )
+            deployment_family_evidence = dict(
+                training.get("deployment_family_evidence") or {}
+            )
+            validation_family_gate = dict(
+                validation.get("deployment_family_gate") or {}
+            )
+            snapshot_active_identity = dict(
+                deployment_family_evidence.get(
+                    "snapshot_cutoff_active_identity"
+                )
+                or {}
+            )
+            effective_profile_evidence = dict(
+                training.get("validated_effective_profile") or {}
+            )
+            validation_effective_gate = dict(
+                validation.get("validated_effective_profile") or {}
+            )
+            validated_explicit_identity = dict(
+                effective_profile_evidence.get("explicit_profile_identity")
+                or {}
+            )
+            validated_explicit_provenance = dict(
+                effective_profile_evidence.get(
+                    "explicit_profile_provenance"
+                )
+                or {}
+            )
+            provenance_explicit_identity = {
+                name: validated_explicit_provenance.get(name)
+                for name in (
+                    "profile_id",
+                    "version",
+                    "created_at",
+                    "parameters_hash",
+                    "source",
+                )
+            }
+            explicit_row = session.execute(
+                select(ParticipantProfile)
+                .where(ParticipantProfile.participant_id == row.participant_id)
+                .order_by(desc(ParticipantProfile.version))
+                .limit(1)
+            ).scalar_one_or_none()
+            explicit_payload = dict(
+                explicit_row.profile_json if explicit_row is not None else {}
+            )
+            explicit_parameters = dict(
+                explicit_payload.get("model_params")
+                or explicit_payload.get("params")
+                or {}
+            )
+            current_explicit_identity = {
+                "profile_id": (
+                    str(explicit_row.id) if explicit_row is not None else None
+                ),
+                "version": (
+                    explicit_row.version if explicit_row is not None else None
+                ),
+                "created_at": (
+                    _utc_iso(explicit_row.created_at)
+                    if explicit_row is not None
+                    else None
+                ),
+                "parameters_hash": profile_parameters_hash(
+                    explicit_parameters
+                ),
+                "source": (
+                    str(explicit_payload.get("source") or "participant_profiles")
+                    if explicit_row is not None
+                    else None
+                ),
+            }
+            effective_parameters = _layer_model_parameters(
+                parameters, explicit_parameters
+            )
+            current_effective_hash = stage5_effective_parameters_hash(
+                effective_parameters, active_variant
+            )
+            validated_effective_hash = str(
+                effective_profile_evidence.get(
+                    "validated_effective_parameters_hash"
+                )
+                or ""
+            )
             statistical_parameters = {
                 name: value
                 for name, value in parameters.items()
@@ -481,6 +630,70 @@ class LearnedProfileRepository:
                     and snapshot.schema_version
                     in self.STAGE5_CAUSAL_DATASET_SCHEMAS
                 ),
+                "deployment_family_passed": (
+                    deployment_family_evidence.get("passed") is True
+                ),
+                "deployment_family_training_validation_match": (
+                    deployment_family_evidence == validation_family_gate
+                ),
+                "selection_active_variant_matches_snapshot": (
+                    active_variant
+                    == normalize_model_variant(
+                        snapshot_active_identity.get("active_variant") or "m0"
+                    )
+                ),
+                "selection_model_spec_matches_snapshot": (
+                    selection.get("model_spec_version")
+                    == snapshot_active_identity.get("model_spec_version")
+                ),
+                "selection_dataset_snapshot_matches_run": bool(
+                    learning_run is not None
+                    and str(selection.get("dataset_snapshot_id") or "")
+                    == str(learning_run.dataset_snapshot_id)
+                ),
+                "selection_workflow_stage5": (
+                    selection.get("workflow") == "stage5_candidate_active"
+                ),
+                "selection_gate_version_matches_run": (
+                    selection.get("promotion_gate_version")
+                    == gate.get("version")
+                ),
+                "selection_learning_run_matches": bool(
+                    learning_run is not None
+                    and str(selection.get("parameter_learning_run_id") or "")
+                    == str(learning_run.id)
+                ),
+                "effective_profile_evidence_passed": (
+                    effective_profile_evidence.get("passed") is True
+                ),
+                "effective_profile_training_validation_match": (
+                    effective_profile_evidence == validation_effective_gate
+                ),
+                "effective_profile_snapshot_cutoff_matches": bool(
+                    snapshot is not None
+                    and effective_profile_evidence.get("snapshot_cutoff")
+                    == _utc_iso(snapshot.observation_cutoff)
+                    and deployment_family_evidence.get("snapshot_cutoff")
+                    == _utc_iso(snapshot.observation_cutoff)
+                ),
+                "explicit_profile_provenance_matches_identity": (
+                    provenance_explicit_identity
+                    == validated_explicit_identity
+                ),
+                "explicit_profile_identity_matches": (
+                    current_explicit_identity == validated_explicit_identity
+                ),
+                "effective_parameters_hash_matches": bool(
+                    validated_effective_hash
+                    and current_effective_hash == validated_effective_hash
+                    and str(
+                        selection.get(
+                            "validated_effective_parameters_hash"
+                        )
+                        or ""
+                    )
+                    == validated_effective_hash
+                ),
             }
             valid = all(checks.values())
             evidence.update(
@@ -493,6 +706,19 @@ class LearnedProfileRepository:
                     ),
                     "dataset_schema_version": (
                         snapshot.schema_version if snapshot is not None else None
+                    ),
+                    "deployment_family_evidence": deployment_family_evidence,
+                    "validated_explicit_profile_identity": (
+                        validated_explicit_identity
+                    ),
+                    "current_explicit_profile_identity": (
+                        current_explicit_identity
+                    ),
+                    "validated_effective_parameters_hash": (
+                        validated_effective_hash or None
+                    ),
+                    "current_effective_parameters_hash": (
+                        current_effective_hash
                     ),
                     "checks": checks,
                     "runtime_valid": valid,

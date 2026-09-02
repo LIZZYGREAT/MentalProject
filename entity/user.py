@@ -28,9 +28,13 @@ class User:
         if not isinstance(selection, dict):
             selection = {}
         status = str(selection.get("status") or "")
+        runtime_authorized = status == "retained_from_empirical_evidence" or (
+            status == "stage5_promoted"
+            and selection.get("runtime_authorized") is True
+        )
         active_variant = (
             normalize_model_variant(selection.get("active_variant", "m0"))
-            if status == "retained_from_empirical_evidence"
+            if runtime_authorized
             else "m0"
         )
         self.params["model_family"] = MODEL_VARIANTS[active_variant]["canonical"]

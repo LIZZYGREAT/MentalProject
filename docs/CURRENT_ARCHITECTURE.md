@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 15 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0035_stage5_v7_runtime_cutover -->
+<!-- ALEMBIC_HEAD: 0036_stage5_effective_profile -->
 
 ## 运行边界
 
@@ -191,7 +191,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0035_stage5_v7_runtime_cutover`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0036_stage5_effective_profile`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -321,6 +321,13 @@ run 与 runtime-v11 validated Stage-5 profile。Repository 是生产信任边界
 `system defaults → learned → explicit`，不再以 Stage-5 population prior 补齐 sparse learned。
 最终 Candidate family 从 snapshot-cutoff frozen Active 获取；train-time live Active 只用于 CAS，
 两者不一致时以 `active_changed_after_snapshot_cutoff_require_resnapshot` 拒绝并要求重建快照。
+
+0036 为 Dataset Snapshot 增加 durable `purpose + schedule_key` 批次身份，周校准只复用
+`stage5_weekly_calibration + YYYY-Www` 的同一批次，不再按日期范围猜测。Stage 5 promotion 在事务内
+重验完整 snapshot manifest/items，并以 snapshot-cutoff Explicit identity 做 CAS；promoted profile
+保存 `validated_effective_parameters_hash`，Repository 与 Forecast 共同验证最终 learned + Explicit
+参数后才允许 non-M0，同时将 active family/spec、Dataset、Gate、workflow 和 learning run 全部锚定
+到 promotion evidence。
 
 `rolling-origin-knowledge-causal.v2` 以测试日当地 00:00 作为 split origin；训练 EMA 的
 `created_at`、BRS 的 `max(administered_at, created_at)` 与 Slow State 的

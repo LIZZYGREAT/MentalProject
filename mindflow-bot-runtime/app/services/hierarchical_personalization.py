@@ -29,12 +29,19 @@ from app.models import (
     LearnedModelProfile,
     ParameterLearningRun,
     Participant,
+    ParticipantProfile,
 )
-from app.repositories import LearnedProfileRepository, promotion_parameters_hash
+from app.repositories import (
+    LearnedProfileRepository,
+    profile_parameters_hash,
+    promotion_parameters_hash,
+    stage5_effective_parameters_hash,
+)
 from app.services.dataset_snapshot_integrity import DatasetSnapshotIntegrityService
 from app.services.model_comparison import comparison_metrics, rolling_origin_splits
 from app.services.profile_calibration import layered_profile
 from app.services.research_evaluation import (
+    DATASET_PURPOSE_STAGE5_WEEKLY,
     DATASET_SCHEMA_V7,
     ResearchEvaluationService,
     STAGE5_INTERVENTION_EXCLUSION_MINUTES,
@@ -1318,7 +1325,7 @@ class Stage5PersonalizedReplayService:
                     split_current,
                     split_explicit,
                 ),
-                "new_candidate_model": _deep_merge_parameters(
+                "new_candidate_model": _production_current_parameters(
                     candidate_parameters, split_explicit
                 ),
             }
@@ -1908,6 +1915,53 @@ class ParameterLearningService:
             "stage4_status": selection.get("status"),
         }
 
+    @staticmethod
+    def _explicit_identity_from_provenance(
+        provenance: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "profile_id": provenance.get("profile_id"),
+            "version": provenance.get("version"),
+            "created_at": provenance.get("created_at"),
+            "parameters_hash": provenance.get("parameters_hash"),
+            "source": provenance.get("source"),
+        }
+
+    @staticmethod
+    def _current_explicit_in_session(
+        session: Any,
+        participant_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        statement = (
+            select(ParticipantProfile)
+            .where(ParticipantProfile.participant_id == participant_id)
+            .order_by(desc(ParticipantProfile.version))
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        row = session.execute(statement).scalar_one_or_none()
+        payload = dict(row.profile_json if row is not None else {})
+        parameters = dict(
+            payload.get("model_params") or payload.get("params") or {}
+        )
+        identity = {
+            "profile_id": str(row.id) if row is not None else None,
+            "version": row.version if row is not None else None,
+            "created_at": (
+                _aware(row.created_at).isoformat() if row is not None else None
+            ),
+            "parameters_hash": profile_parameters_hash(parameters),
+            "source": (
+                str(payload.get("source") or "participant_profiles")
+                if row is not None
+                else None
+            ),
+        }
+        return parameters, identity
+
     def train_snapshot(
         self,
         snapshot_id: uuid.UUID,
@@ -1989,12 +2043,12 @@ class ParameterLearningService:
                 if deployment_active_identity == base_active_identity
                 else "active_changed_after_snapshot_cutoff_require_resnapshot"
             ),
-            "snapshot_cutoff": snapshot.observation_cutoff.isoformat(),
+            "snapshot_cutoff": _aware(snapshot.observation_cutoff).isoformat(),
             "snapshot_cutoff_active_identity": deployment_active_identity,
             "train_time_live_active_identity": base_active_identity,
             "provenance": deployment_current_provenance,
         }
-        _deployment_explicit, explicit_provenance = explicit_profile_as_of(
+        deployment_explicit, explicit_provenance = explicit_profile_as_of(
             items,
             participant_id,
             snapshot.observation_cutoff,
@@ -2009,6 +2063,23 @@ class ParameterLearningService:
         residual = dict(validation.get("latest_residual_model") or {})
         candidate = runtime_candidate_parameters(fitted)
         candidate["residual_model"] = residual
+        deployment_explicit_identity = self._explicit_identity_from_provenance(
+            explicit_provenance
+        )
+        validated_effective_parameters_hash = stage5_effective_parameters_hash(
+            _production_current_parameters(candidate, deployment_explicit),
+            deployment_active_identity["active_variant"],
+        )
+        validated_effective_profile = {
+            "version": "stage5-effective-profile-provenance.v1",
+            "passed": True,
+            "snapshot_cutoff": _aware(snapshot.observation_cutoff).isoformat(),
+            "explicit_profile_identity": deployment_explicit_identity,
+            "explicit_profile_provenance": explicit_provenance,
+            "validated_effective_parameters_hash": (
+                validated_effective_parameters_hash
+            ),
+        }
         uncertainty = _uncertainty_payload(fitted, residual)
         status = (
             "candidate"
@@ -2037,12 +2108,14 @@ class ParameterLearningService:
                 "usage": "deployment_base_active_identity_at_train_time",
             },
             "deployment_family_evidence": deployment_family_gate,
+            "validated_effective_profile": validated_effective_profile,
         }
         validation_metrics = {
             **validation,
             "uncertainty": uncertainty,
             "candidate_profile_status": status,
             "deployment_family_gate": deployment_family_gate,
+            "validated_effective_profile": validated_effective_profile,
         }
         model_selection = {
             **dict(deployment_current.get("model_selection") or {}),
@@ -2056,6 +2129,11 @@ class ParameterLearningService:
             "model_spec_version": deployment_active_identity[
                 "model_spec_version"
             ],
+            "validated_effective_parameters_hash": (
+                validated_effective_parameters_hash
+            ),
+            "parameters_hash": validated_effective_parameters_hash,
+            "explicit_profile_identity": deployment_explicit_identity,
         }
         profile_parameters = {**candidate, "model_selection": model_selection}
         window_start = min((date.fromisoformat(str(row["local_date"])) for row in individual), default=snapshot.date_start)
@@ -2130,6 +2208,22 @@ class ParameterLearningService:
             snapshot = session.get(DatasetSnapshot, run.dataset_snapshot_id)
             if snapshot is None or snapshot.schema_version != DATASET_SCHEMA_V7:
                 raise ValueError("Stage-5 promotion requires Dataset Schema v7")
+            snapshot_rows = session.execute(
+                select(DatasetSnapshotItem).where(
+                    DatasetSnapshotItem.dataset_snapshot_id == snapshot.id
+                )
+            ).scalars().all()
+            try:
+                self.snapshot_integrity.verify(
+                    snapshot,
+                    snapshot_rows,
+                    supported_schema_versions={DATASET_SCHEMA_V7},
+                    participant_id=run.participant_id,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "dataset_snapshot_integrity_mismatch"
+                ) from exc
             deployment_family_evidence = dict(
                 (run.training_metrics or {}).get("deployment_family_evidence")
                 or {}
@@ -2151,6 +2245,78 @@ class ParameterLearningService:
                 or {}
             )
             candidate = dict(run.parameters_candidate or {})
+            effective_profile_evidence = dict(
+                (run.training_metrics or {}).get(
+                    "validated_effective_profile"
+                )
+                or {}
+            )
+            validation_effective_gate = dict(
+                validation.get("validated_effective_profile") or {}
+            )
+            if (
+                effective_profile_evidence.get("passed") is not True
+                or validation_effective_gate != effective_profile_evidence
+            ):
+                raise ValueError(
+                    "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
+                )
+            current_explicit, current_explicit_identity = (
+                self._current_explicit_in_session(
+                    session,
+                    run.participant_id,
+                    for_update=True,
+                )
+            )
+            frozen_explicit_identity = dict(
+                effective_profile_evidence.get("explicit_profile_identity")
+                or {}
+            )
+            frozen_explicit_provenance = dict(
+                effective_profile_evidence.get(
+                    "explicit_profile_provenance"
+                )
+                or {}
+            )
+            provenance_identity = {
+                name: frozen_explicit_provenance.get(name)
+                for name in (
+                    "profile_id",
+                    "version",
+                    "created_at",
+                    "parameters_hash",
+                    "source",
+                )
+            }
+            if (
+                provenance_identity != frozen_explicit_identity
+                or effective_profile_evidence.get("snapshot_cutoff")
+                != _aware(snapshot.observation_cutoff).isoformat()
+            ):
+                raise ValueError(
+                    "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
+                )
+            if current_explicit_identity != frozen_explicit_identity:
+                raise ValueError(
+                    "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
+                )
+            validated_effective_hash = str(
+                effective_profile_evidence.get(
+                    "validated_effective_parameters_hash"
+                )
+                or ""
+            )
+            if (
+                not validated_effective_hash
+                or stage5_effective_parameters_hash(
+                    _production_current_parameters(candidate, current_explicit),
+                    deployment_identity.get("active_variant") or "m0",
+                )
+                != validated_effective_hash
+            ):
+                raise ValueError(
+                    "explicit_profile_changed_after_snapshot_cutoff_require_resnapshot"
+                )
             hierarchical = dict(candidate.get("hierarchical_parameters") or {})
             if set(PARAMETERS) - set(hierarchical):
                 raise ValueError("candidate is missing separated Stage-5 parameters")
@@ -2193,10 +2359,26 @@ class ParameterLearningService:
                 candidate_profile.parameters_json.get("model_selection") or {}
             )
             if (
-                candidate_selection.get("active_variant")
+                candidate_selection.get("workflow")
+                != "stage5_candidate_active"
+                or str(candidate_selection.get("parameter_learning_run_id") or "")
+                != str(run.id)
+                or str(candidate_selection.get("dataset_snapshot_id") or "")
+                != str(run.dataset_snapshot_id)
+                or candidate_selection.get("promotion_gate_version")
+                != promotion_gate.get("version")
+                or candidate_selection.get("active_variant")
                 != deployment_identity.get("active_variant")
                 or candidate_selection.get("model_spec_version")
                 != deployment_identity.get("model_spec_version")
+                or candidate_selection.get(
+                    "validated_effective_parameters_hash"
+                )
+                != validated_effective_hash
+                or dict(
+                    candidate_selection.get("explicit_profile_identity") or {}
+                )
+                != frozen_explicit_identity
             ):
                 raise ValueError("candidate deployment family provenance mismatch")
             selection = {
@@ -2255,15 +2437,14 @@ class ParameterLearningService:
             if participant is None:
                 raise ValueError("participant not found")
         date_start = through - timedelta(days=self.SNAPSHOT_WINDOW_DAYS - 1)
-        # One cohort snapshot supplies the actual population prior. Reuse the
-        # same weekly boundary for later participants instead of silently
-        # estimating a "population" from one participant.
+        # One durable weekly batch supplies the actual population prior. Its
+        # identity is purpose + ISO schedule key, never a guessed date range.
         with self.database.session() as session:
             existing_snapshot = session.execute(
                 select(DatasetSnapshot)
                 .where(
-                    DatasetSnapshot.date_start == date_start,
-                    DatasetSnapshot.date_end == through,
+                    DatasetSnapshot.purpose == DATASET_PURPOSE_STAGE5_WEEKLY,
+                    DatasetSnapshot.schedule_key == schedule_key,
                     DatasetSnapshot.schema_version == DATASET_SCHEMA_V7,
                 )
                 .order_by(desc(DatasetSnapshot.created_at))
@@ -2282,6 +2463,8 @@ class ParameterLearningService:
                 date_start=date_start,
                 date_end=through,
                 participant_filter={},
+                purpose=DATASET_PURPOSE_STAGE5_WEEKLY,
+                schedule_key=schedule_key,
             )
         )
         run = self.train_snapshot(

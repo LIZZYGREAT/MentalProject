@@ -131,8 +131,16 @@ class ModelPromotionService:
             "observation_cutoff": iso(snapshot.observation_cutoff),
             "calendar_cutoff": iso(snapshot.calendar_cutoff),
         }
-        calculated = ResearchEvaluationService._manifest_hash(contract, items)
         manifest = dict(snapshot.manifest_json or {})
+        if "purpose" in manifest or "schedule_key" in manifest:
+            if (
+                manifest.get("purpose") != snapshot.purpose
+                or manifest.get("schedule_key") != snapshot.schedule_key
+            ):
+                raise ValueError("dataset snapshot batch identity mismatch")
+            contract["purpose"] = snapshot.purpose
+            contract["schedule_key"] = snapshot.schedule_key
+        calculated = ResearchEvaluationService._manifest_hash(contract, items)
         expected = str(manifest.get("manifest_hash") or "")
         if not expected or calculated != expected:
             raise ValueError("dataset snapshot manifest mismatch")

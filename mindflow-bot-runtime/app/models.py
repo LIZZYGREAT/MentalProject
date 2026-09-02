@@ -710,7 +710,24 @@ class DatasetSnapshot(Base):
     __tablename__ = "dataset_snapshots"
     __table_args__ = (
         Index("ix_dataset_snapshot_created", "created_at"),
+        Index(
+            "uq_dataset_snapshot_weekly_batch",
+            "purpose",
+            "schedule_key",
+            unique=True,
+            postgresql_where=text(
+                "purpose = 'stage5_weekly_calibration'"
+            ),
+            sqlite_where=text(
+                "purpose = 'stage5_weekly_calibration'"
+            ),
+        ),
         CheckConstraint("date_start <= date_end", name="ck_dataset_snapshot_dates"),
+        CheckConstraint(
+            "(purpose = 'stage5_weekly_calibration' AND schedule_key IS NOT NULL) "
+            "OR (purpose <> 'stage5_weekly_calibration' AND schedule_key IS NULL)",
+            name="ck_dataset_snapshot_batch_identity",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -721,6 +738,10 @@ class DatasetSnapshot(Base):
     )
     date_start: Mapped[date] = mapped_column(Date, nullable=False)
     date_end: Mapped[date] = mapped_column(Date, nullable=False)
+    purpose: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="manual_research"
+    )
+    schedule_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
     participant_filter: Mapped[dict] = mapped_column(
         JSON_VALUE, nullable=False, default=dict
     )
