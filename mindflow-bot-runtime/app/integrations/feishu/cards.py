@@ -37,8 +37,8 @@ def daily_checkin_card() -> dict[str, Any]:
         {"text": {"tag": "plain_text", "content": "否"}, "value": "false"},
     ]
     return {
+        "schema": "2.0",
         "config": {
-            "wide_screen_mode": True,
             "update_multi": False,
             "enable_forward": False,
         },
@@ -46,82 +46,114 @@ def daily_checkin_card() -> dict[str, Any]:
             "template": "turquoise",
             "title": {"tag": "plain_text", "content": "每日状态记录"},
         },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "12px",
+            "elements": [
+                {
+                    "tag": "markdown",
                     "content": "请按此刻感受填写。0 表示最低，10 表示最高。",
                 },
-            },
-            {
-                "tag": "form",
-                "name": "mindflow_daily_checkin",
-                "elements": [
-                    {
-                        "tag": "select_static",
-                        "name": "stress",
-                        "required": True,
-                        "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
-                        "label": {"tag": "plain_text", "content": "当前压力"},
-                        "options": scale_options,
-                    },
-                    {
-                        "tag": "select_static",
-                        "name": "energy",
-                        "required": True,
-                        "placeholder": {"tag": "plain_text", "content": "选择 0–10"},
-                        "label": {"tag": "plain_text", "content": "当前精力"},
-                        "options": scale_options,
-                    },
-                    {
-                        "tag": "input",
-                        "name": "activity",
-                        "required": True,
-                        "max_length": 120,
-                        "placeholder": {"tag": "plain_text", "content": "例如：在图书馆写作业"},
-                        "label": {"tag": "plain_text", "content": "正在做什么"},
-                    },
-                    {
-                        "tag": "select_static",
-                        "name": "stress_event_since_last",
-                        "required": True,
-                        "placeholder": {"tag": "plain_text", "content": "请选择"},
-                        "label": {"tag": "plain_text", "content": "上次记录后有压力事件吗"},
-                        "options": boolean_options,
-                    },
-                    {
-                        "tag": "select_static",
-                        "name": "event_ongoing",
-                        "required": True,
-                        "placeholder": {"tag": "plain_text", "content": "请选择"},
-                        "label": {"tag": "plain_text", "content": "该事件仍在持续吗"},
-                        "options": boolean_options,
-                    },
-                    {
-                        "tag": "button",
-                        "name": "submit_checkin",
-                        "action_type": "form_submit",
-                        "type": "primary",
-                        "text": {"tag": "plain_text", "content": "提交记录"},
-                        "value": {"mindflow_action": "submit_checkin", "version": "1"},
-                        "confirm": {
-                            "title": {"tag": "plain_text", "content": "提交状态记录"},
-                            "text": {"tag": "plain_text", "content": "确认提交本次记录吗？"},
+                {
+                    "tag": "form",
+                    "name": "mindflow_daily_checkin",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "name": "stress",
+                            "required": True,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "选择 0–10",
+                            },
+                            "label": {"tag": "plain_text", "content": "当前压力"},
+                            "options": scale_options,
                         },
-                    },
-                ],
-            },
-            {
-                "tag": "note",
-                "elements": [
-                    {
-                        "tag": "plain_text",
-                        "content": "用于日常状态建模，不是医学问卷或诊断量表。",
-                    }
-                ],
-            },
-        ],
+                        {
+                            "tag": "select_static",
+                            "name": "energy",
+                            "required": True,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "选择 0–10",
+                            },
+                            "label": {"tag": "plain_text", "content": "当前精力"},
+                            "options": scale_options,
+                        },
+                        {
+                            "tag": "input",
+                            "name": "activity",
+                            "required": True,
+                            "max_length": 120,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "例如：在图书馆写作业",
+                            },
+                            "label": {"tag": "plain_text", "content": "正在做什么"},
+                        },
+                        {
+                            "tag": "select_static",
+                            "name": "stress_event_since_last",
+                            "required": True,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "请选择",
+                            },
+                            "label": {
+                                "tag": "plain_text",
+                                "content": "上次记录后有压力事件吗",
+                            },
+                            "options": boolean_options,
+                        },
+                        {
+                            "tag": "select_static",
+                            "name": "event_ongoing",
+                            "required": True,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "请选择",
+                            },
+                            "label": {
+                                "tag": "plain_text",
+                                "content": "该事件仍在持续吗",
+                            },
+                            "options": boolean_options,
+                        },
+                        {
+                            "tag": "button",
+                            "name": "submit_checkin",
+                            "type": "primary",
+                            "text": {"tag": "plain_text", "content": "提交记录"},
+                            "form_action_type": "submit",
+                            "behaviors": [
+                                {
+                                    "type": "callback",
+                                    "value": {
+                                        "mindflow_action": "submit_checkin",
+                                        "version": "1",
+                                    },
+                                }
+                            ],
+                            "confirm": {
+                                "title": {
+                                    "tag": "plain_text",
+                                    "content": "提交状态记录",
+                                },
+                                "text": {
+                                    "tag": "plain_text",
+                                    "content": "确认提交本次记录吗？",
+                                },
+                            },
+                        },
+                    ],
+                },
+                {
+                    "tag": "markdown",
+                    "text_size": "notation",
+                    "content": "用于日常状态建模，不是医学问卷或诊断量表。",
+                },
+            ],
+        },
     }
 
 
@@ -160,10 +192,7 @@ def daily_review_card(
         description = f"**{prompt}**"
         if guidance:
             description += f"\n{guidance}"
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": description},
-        })
+        elements.append({"tag": "markdown", "content": description})
         elements.append({
             "tag": "select_static", "name": name, "required": required,
             "placeholder": {
@@ -190,13 +219,8 @@ def daily_review_card(
         guidance="0 = 没有明显压力　·　10 = 当天最难承受的程度",
     )
     elements.append({
-        "tag": "div",
-        "text": {
-            "tag": "lark_md",
-            "content": (
-                f"**④ 回顾 {local_date}：当天最高压力大约出现在什么时候？**"
-            ),
-        },
+        "tag": "markdown",
+        "content": f"**④ 回顾 {local_date}：当天最高压力大约出现在什么时候？**",
     })
     elements.append({
         "tag": "select_static", "name": "peak_period", "required": True,
@@ -218,11 +242,8 @@ def daily_review_card(
         guidance="0 = 基本耗尽　·　10 = 仍然非常充足",
     )
     elements.append({
-        "tag": "div",
-        "text": {
-            "tag": "lark_md",
-            "content": "💡 第 ⑤、⑥ 项会用于帮助估计下一天的起始状态。",
-        },
+        "tag": "markdown",
+        "content": "💡 第 ⑤、⑥ 项会用于帮助估计下一天的起始状态。",
     })
     add_scale(
         "energy_consumption",
@@ -253,51 +274,58 @@ def daily_review_card(
             1000,
         ),
     ):
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**{prompt}**"},
-        })
-        elements.append({
+        elements.append({"tag": "markdown", "content": f"**{prompt}**"})
+        input_element = {
             "tag": "input", "name": name, "required": False, "max_length": maximum,
             "placeholder": {"tag": "plain_text", "content": placeholder},
             "label": {"tag": "plain_text", "content": prompt},
-        })
+        }
+        if name == "free_text":
+            input_element.update({"input_type": "multiline_text", "rows": 3})
+        elements.append(input_element)
     elements.append({
-        "tag": "div",
-        "text": {
-            "tag": "lark_md",
-            "content": (
-                "以上文字主要用于回顾和研究分析，目前不会直接改变压力曲线数值。"
-            ),
-        },
+        "tag": "markdown",
+        "content": "以上文字主要用于回顾和研究分析，目前不会直接改变压力曲线数值。",
     })
     elements.append({
         "tag": "button", "name": "daily_review_submit",
-        "action_type": "form_submit", "type": "primary",
+        "type": "primary",
         "text": {"tag": "plain_text", "content": "提交每日回顾"},
-        "value": {
-            "mindflow_action": "daily_review_submit", "version": "1",
-            "schedule_id": schedule_id, "local_date": local_date,
-            "card_version": card_version,
-        },
+        "form_action_type": "submit",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "daily_review_submit", "version": "1",
+                    "schedule_id": schedule_id, "local_date": local_date,
+                    "card_version": card_version,
+                },
+            }
+        ],
     })
     return {
-        "config": {"wide_screen_mode": True, "update_multi": False, "enable_forward": False},
+        "schema": "2.0",
+        "config": {"update_multi": False, "enable_forward": False},
         "header": {"template": "purple", "title": {"tag": "plain_text", "content": "MindFlow 每日回顾"}},
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "12px",
+            "elements": [
+                {
+                    "tag": "markdown",
                     "content": (
                         f"回顾 **{local_date}**。这是回顾反馈，不会改写当天原始预测。\n"
                         "如果这是次日补填，请回忆上方标注日期当天的状态，不要填写此刻状态。"
                     ),
                 },
-            },
-            {"tag": "form", "name": "mindflow_daily_review", "elements": elements},
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": "用于日常回顾与建模，不是医学诊断。"}]},
-        ],
+                {"tag": "form", "name": "mindflow_daily_review", "elements": elements},
+                {
+                    "tag": "markdown",
+                    "text_size": "notation",
+                    "content": "用于日常回顾与建模，不是医学诊断。",
+                },
+            ],
+        },
     }
 
 

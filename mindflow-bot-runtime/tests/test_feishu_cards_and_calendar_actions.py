@@ -12,7 +12,11 @@ from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.tools.care import _recurrence_from_args
-from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
+from app.integrations.feishu.cards import (
+    daily_checkin_card,
+    daily_review_card,
+    pressure_curve_card,
+)
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.card_callback import FeishuCardCallbackServer
 from app.integrations.feishu.gateway import (
@@ -75,9 +79,14 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
     assert actions == {"request_checkin", "view_today_calendar"}
 
 
-def test_daily_checkin_card_is_a_fixed_form_submit_workflow():
+def test_daily_checkin_card_uses_json_2_form_submit_contract():
     card = daily_checkin_card()
-    form = next(item for item in card["elements"] if item["tag"] == "form")
+    assert card["schema"] == "2.0"
+    assert "elements" not in card
+    form = next(
+        item for item in card["body"]["elements"] if item["tag"] == "form"
+    )
+    assert form["name"] == "mindflow_daily_checkin"
     fields = {item.get("name"): item for item in form["elements"]}
 
     assert set(fields) == {
@@ -88,11 +97,16 @@ def test_daily_checkin_card_is_a_fixed_form_submit_workflow():
         "event_ongoing",
         "submit_checkin",
     }
-    assert fields["submit_checkin"]["action_type"] == "form_submit"
-    assert fields["submit_checkin"]["value"] == {
+    button = fields["submit_checkin"]
+    assert button["form_action_type"] == "submit"
+    assert "action_type" not in button
+    assert button["behaviors"] == [{
+        "type": "callback",
+        "value": {
         "mindflow_action": "submit_checkin",
         "version": "1",
-    }
+        },
+    }]
 
 
 def test_card_callback_server_exposes_only_configured_callback_and_health_routes():
@@ -226,9 +240,18 @@ def test_feishu_client_sends_card_as_interactive_message():
         seen.append((chat_id, msg_type, content)) or "om-card"
     )
 
-    card = {"schema": "2.0", "body": {"elements": []}}
+    card = daily_review_card(
+        schedule_id="daily-review-schedule",
+        local_date="2030-01-15",
+    )
     assert client.send_card("oc-chat", card) == "om-card"
     assert seen == [("oc-chat", "interactive", card)]
+    serialized = seen[0][2]
+    assert serialized["schema"] == "2.0"
+    assert any(
+        element["tag"] == "form"
+        for element in serialized["body"]["elements"]
+    )
 
 
 def test_pressure_curve_tool_stages_reviewed_card_for_current_run():

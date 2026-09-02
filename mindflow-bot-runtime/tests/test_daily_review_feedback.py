@@ -1,14 +1,20 @@
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import asyncio
+import hashlib
+import json
 import uuid
+from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 
 from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
+from app.integrations.feishu.card_callback import FeishuCardCallbackServer
 from app.integrations.feishu.cards import daily_review_card
 from app.models import (
     ForecastCurrentnessEvent,
@@ -28,6 +34,7 @@ from app.repositories_daily_review import (
 )
 from app.services.daily_review_scheduler import DailyReviewScheduler
 from app.services.daily_review_service import DailyReviewService
+from app.services.card_action_service import CardActionService
 from app.services.curve_analysis import analyze_curve
 from app.services.forecast_initial_state import ForecastInitialStateResolver
 from app.services.pressure_curve_service import PressureCurveView
@@ -264,9 +271,35 @@ def test_unknown_peak_period_never_uses_submission_time_as_a_fake_peak_anchor():
 
 
 def test_daily_review_validation_and_card_contract():
-    card = daily_review_card(schedule_id=str(uuid.uuid4()), local_date="2030-01-15")
-    form = next(element for element in card["elements"] if element["tag"] == "form")
+    schedule_id = str(uuid.uuid4())
+    card = daily_review_card(schedule_id=schedule_id, local_date="2030-01-15")
+    assert card["schema"] == "2.0"
+    assert "elements" not in card
+    assert "body" in card
+    form = next(
+        element
+        for element in card["body"]["elements"]
+        if element["tag"] == "form"
+    )
+    assert form["name"] == "mindflow_daily_review"
     form_elements = form["elements"]
+    component_names = [
+        element["name"] for element in form_elements if element.get("name")
+    ]
+    assert len(component_names) == len(set(component_names))
+    assert set(component_names) == {
+        "start_stress",
+        "start_energy",
+        "peak_stress",
+        "peak_period",
+        "end_stress",
+        "end_energy",
+        "energy_consumption",
+        "main_stressor",
+        "recovery_note",
+        "free_text",
+        "daily_review_submit",
+    }
     fields = {element.get("name"): element for element in form_elements}
     prompts = {
         "start_stress": "① 回顾 2030-01-15：当天早晨刚开始一天时，你的压力有多高？",
@@ -281,12 +314,57 @@ def test_daily_review_validation_and_card_contract():
     for name, prompt in prompts.items():
         field_index = form_elements.index(fields[name])
         visible_description = form_elements[field_index - 1]
-        assert visible_description["tag"] == "div"
-        assert visible_description["text"]["tag"] == "lark_md"
-        assert prompt in visible_description["text"]["content"]
+        assert visible_description["tag"] == "markdown"
+        assert prompt in visible_description["content"]
 
+    required_fields = {
+        "start_stress",
+        "start_energy",
+        "peak_stress",
+        "peak_period",
+        "end_stress",
+        "end_energy",
+    }
+    optional_fields = {
+        "energy_consumption",
+        "main_stressor",
+        "recovery_note",
+        "free_text",
+    }
+    assert all(fields[name]["required"] is True for name in required_fields)
+    assert all(fields[name]["required"] is False for name in optional_fields)
+    assert [option["value"] for option in fields["start_stress"]["options"]] == [
+        str(value) for value in range(11)
+    ]
+    assert [option["value"] for option in fields["peak_period"]["options"]] == [
+        "overnight",
+        "early_morning",
+        "morning",
+        "noon",
+        "afternoon",
+        "evening",
+        "late_night",
+        "unknown",
+    ]
     assert fields["energy_consumption"]["required"] is False
-    assert fields["daily_review_submit"]["action_type"] == "form_submit"
+    assert fields["main_stressor"]["max_length"] == 300
+    assert fields["recovery_note"]["max_length"] == 300
+    assert fields["free_text"]["max_length"] == 1000
+    assert fields["free_text"]["input_type"] == "multiline_text"
+    assert fields["free_text"]["rows"] == 3
+    button = fields["daily_review_submit"]
+    assert button["form_action_type"] == "submit"
+    assert "action_type" not in button
+    assert button["behaviors"] == [{
+        "type": "callback",
+        "value": {
+            "mindflow_action": "daily_review_submit",
+            "version": "1",
+            "schedule_id": schedule_id,
+            "local_date": "2030-01-15",
+            "card_version": "daily-review-v1",
+        },
+    }]
     serialized = str(card)
     assert "0 = 完全没有压力" in serialized
     assert "10 = 已经非常难承受" in serialized
@@ -298,6 +376,143 @@ def test_daily_review_validation_and_card_contract():
     assert "如果这是次日补填" in serialized
     assert "不要填写此刻状态" in serialized
     assert "现在/今天结束时" not in serialized
+
+
+def test_daily_review_p2_callback_persists_form_values_and_retrospective():
+    database = memory_database()
+    person = participant(database, "DR-P2-CALLBACK")
+    now = datetime.now(timezone.utc)
+    target = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    original = _seed_forecast(database, person.id, target)
+    schedule = DailyReviewScheduleRepository(database).ensure(
+        person.id,
+        target,
+        now - timedelta(minutes=1),
+    )
+    action_value = {
+        "mindflow_action": "daily_review_submit",
+        "version": "1",
+        "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+        "card_version": schedule["card_version"],
+    }
+    form_value = _values()
+    service = CardActionService(
+        ObservationRepository(database),
+        daily_reviews=_service(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+    )
+    handled = []
+
+    def handle_action(event):
+        handled.append(event)
+        return service.handle(
+            person.id,
+            message_id=event.message_id,
+            callback_event_id=event.event_id,
+            action_value=event.action_value,
+            form_value=event.form_value,
+        )
+
+    server = FeishuCardCallbackServer(
+        app_id="app",
+        verification_token="verification-token",
+        encrypt_key="encrypt-key",
+        action_handler=handle_action,
+        host="127.0.0.1",
+        port=8123,
+        path="/feishu/card/callback",
+    )
+    callback_body = json.dumps(
+        {
+            "schema": "2.0",
+            "header": {
+                "event_id": "daily-review-p2-event",
+                "event_type": "card.action.trigger",
+                "token": "verification-token",
+                "app_id": "app",
+                "tenant_key": "tenant",
+            },
+            "event": {
+                "operator": {"open_id": "ou-daily-review-user"},
+                "token": "update-token",
+                "action": {
+                    "tag": "button",
+                    "name": "daily_review_submit",
+                    "value": action_value,
+                    "form_value": form_value,
+                },
+                "context": {
+                    "open_message_id": "om-daily-review-card",
+                    "open_chat_id": "oc-daily-review-chat",
+                },
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+    timestamp = str(int(now.timestamp()))
+    nonce = "daily-review-nonce"
+    signature = hashlib.sha256(
+        (timestamp + nonce + "encrypt-key").encode() + callback_body
+    ).hexdigest()
+    async def post_callback():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="https://callback.test",
+        ) as client:
+            return await client.post(
+                "/feishu/card/callback",
+                content=callback_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Lark-Request-Timestamp": timestamp,
+                    "X-Lark-Request-Nonce": nonce,
+                    "X-Lark-Signature": signature,
+                },
+            )
+
+    callback_response = asyncio.run(post_callback())
+
+    assert callback_response.status_code == 200
+    assert callback_response.json()["toast"] == {
+        "type": "success",
+        "content": "每日回顾已记录并生成回顾估计。",
+    }
+    assert len(handled) == 1
+    assert handled[0].action_value == action_value
+    assert handled[0].form_value == form_value
+    response = DailyReviewResponseRepository(database).latest(person.id, target)
+    assert response is not None
+    assert {
+        "start_stress": response["start_stress"],
+        "start_energy": response["start_energy"],
+        "peak_stress": response["peak_stress"],
+        "peak_period": response["peak_period"],
+        "end_stress": response["end_stress"],
+        "end_energy": response["end_energy"],
+    } == {
+        "start_stress": 3.0,
+        "start_energy": 8.0,
+        "peak_stress": 9.0,
+        "peak_period": "evening",
+        "end_stress": 5.0,
+        "end_energy": 4.0,
+    }
+    assert response["energy_consumption"] == 7.0
+    assert response["main_stressor"] == "presentation"
+    assert response["recovery_note"] == "walk"
+    assert response["free_text"] == "stable"
+    retrospective = RetrospectiveCurveRepository(database).latest(person.id, target)
+    assert retrospective is not None
+    assert retrospective["daily_review_response_id"] == response["id"]
+    assert retrospective["source_forecast_id"] == original["id"]
+    unchanged = ForecastSnapshotRepository(database).latest(person.id, target)
+    assert unchanged["id"] == original["id"]
+    assert unchanged["forecast_version"] == original["forecast_version"]
+    assert unchanged["curve"] == original["curve"]
 
 
 def test_daily_review_energy_consumption_is_optional_diagnostic():
@@ -394,7 +609,12 @@ def test_cross_midnight_catch_up_uses_scheduled_closing_anchor_and_real_submit_t
     )
     restart = datetime(2030, 1, 15, 16, 5, tzinfo=timezone.utc)
     counts = asyncio.run(scheduler.run_once(restart))
-    action = sent[0][1]["elements"][1]["elements"][-1]["value"]
+    form = next(
+        element
+        for element in sent[0][1]["body"]["elements"]
+        if element["tag"] == "form"
+    )
+    action = form["elements"][-1]["behaviors"][0]["value"]
 
     service = _service(database)
     result = service.submit(
@@ -511,7 +731,12 @@ def test_next_morning_recovered_card_still_uses_previous_day_closing_anchor():
     assert "如果这是次日补填" in recovered_copy
     assert "不要填写此刻状态" in recovered_copy
     assert "现在/今天结束时" not in recovered_copy
-    action = recovered_card["elements"][1]["elements"][-1]["value"]
+    form = next(
+        element
+        for element in recovered_card["body"]["elements"]
+        if element["tag"] == "form"
+    )
+    action = form["elements"][-1]["behaviors"][0]["value"]
     result = _service(database).submit(
         person.id,
         callback_event_id="callback-late-recovery",
@@ -1662,9 +1887,30 @@ def test_scheduler_sends_once_after_source_forecast_recovers():
     assert recovered["sent"] == 1
     assert repeated["sent"] == 0
     assert len(sent) == 1
-    assert DailyReviewScheduleRepository(database).get(
-        schedule["id"]
-    )["status"] == "sent"
+    stored_schedule = DailyReviewScheduleRepository(database).get(schedule["id"])
+    assert stored_schedule["status"] == "sent"
+    sent_chat_id, sent_card, message_uuid = sent[0]
+    assert sent_chat_id == "chat-1"
+    assert message_uuid == schedule["id"]
+    assert sent_card["schema"] == "2.0"
+    assert "elements" not in sent_card
+    form = next(
+        element
+        for element in sent_card["body"]["elements"]
+        if element["tag"] == "form"
+    )
+    button = next(
+        element
+        for element in form["elements"]
+        if element.get("name") == "daily_review_submit"
+    )
+    assert button["behaviors"][0]["value"] == {
+        "mindflow_action": "daily_review_submit",
+        "version": "1",
+        "schedule_id": schedule["id"],
+        "local_date": target.isoformat(),
+        "card_version": stored_schedule["card_version"],
+    }
 
 
 def test_schedule_claim_lease_retry_and_stable_message_uuid():
