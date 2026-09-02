@@ -1067,10 +1067,6 @@ class ParticipantCarePreference(Base):
     allow_schedule_suggestions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     allow_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     preferred_support_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
-    inferred_support_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
-    disabled_intervention_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
-    interruption_tolerance: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
-    preferred_reminder_windows: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -1107,10 +1103,6 @@ class CareInterventionEvent(Base):
     template_id: Mapped[str] = mapped_column(String(128), nullable=False)
     template_version: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
-    vulnerability_score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    receptivity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    decision_score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    decision_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
@@ -1151,66 +1143,6 @@ class CareInterventionFeedback(Base):
     optional_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     callback_event_id: Mapped[str] = mapped_column(String(160), unique=True, nullable=False)
-
-
-class CareInterventionOutcome(Base):
-    """Observed proximal outcomes; these rows never imply causal effect."""
-
-    __tablename__ = "care_intervention_outcomes"
-    __table_args__ = (
-        Index("ix_care_outcome_participant_created", "participant_id", "created_at"),
-    )
-
-    intervention_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("care_intervention_events.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    participant_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("participants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    baseline_state: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    followup_30m: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
-    followup_60m: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
-    helpful_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
-    user_action: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    context_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-
-
-class InterventionRandomizationEvent(Base):
-    """MRT-ready audit shape; runtime randomization remains disabled in Stage 6."""
-
-    __tablename__ = "intervention_randomization_events"
-    __table_args__ = (
-        Index("ix_mrt_participant_decision", "participant_id", "decision_time"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    participant_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("participants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    eligibility: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    context: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    candidate_actions: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
-    assigned_action: Mapped[str] = mapped_column(String(64), nullable=False)
-    randomization_probability: Mapped[float] = mapped_column(Float, nullable=False)
-    proximal_outcome: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
 
 
 class RuntimeIncident(Base):

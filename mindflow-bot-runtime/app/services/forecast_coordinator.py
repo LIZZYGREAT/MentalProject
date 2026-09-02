@@ -36,7 +36,6 @@ from app.services.care_context import (
 )
 from app.services.care_intervention_policy import CARE_INTERVENTION_POLICY_VERSION
 from app.services.care_templates import CARE_TEMPLATE_LIBRARY_VERSION
-from app.services.care_jitai import CARE_JITAI_VERSION, RECEPTIVITY_MODEL_VERSION
 from app.services.forecast_initial_state import (
     ForecastInitialState,
     ForecastInitialStateResolver,
@@ -299,7 +298,6 @@ class ForecastCoordinator:
         learned_profiles: LearnedProfileRepository | None = None,
         retrospective_curves: RetrospectiveCurveRepository | None = None,
         care_preferences: ParticipantCarePreferenceRepository | None = None,
-        care_interventions: Any | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -321,7 +319,6 @@ class ForecastCoordinator:
         self.initial_states = ForecastInitialStateResolver()
         self.care_messages = CareMessageService(timezone_name)
         self.care_preferences = care_preferences
-        self.care_interventions = care_interventions
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
         self.dependency_refresh: ForecastDependencyRefreshService | None = None
@@ -355,8 +352,6 @@ class ForecastCoordinator:
             "care_message_schema_version": CARE_MESSAGE_SCHEMA_VERSION,
             "care_intervention_policy_version": CARE_INTERVENTION_POLICY_VERSION,
             "care_template_library_version": CARE_TEMPLATE_LIBRARY_VERSION,
-            "care_jitai_version": CARE_JITAI_VERSION,
-            "receptivity_model_version": RECEPTIVITY_MODEL_VERSION,
         }
         return _sha(payload), payload
 
@@ -373,7 +368,39 @@ class ForecastCoordinator:
         raw_candidates = list(output.get("alerts") or [])
         facts = dict(care_inputs or {})
         preferences = dict(facts.get("care_preferences") or {})
-        contextual_candidates = [
+        if self.care_preferences is not None:
+            allowed_candidates = []
+            for alert in raw_candidates:
+                try:
+                    hour, minute = (
+                        int(part)
+                        for part in str(alert.get("time") or "00:00")[:5].split(":")
+                    )
+                    risk_time = datetime.combine(
+                        target, time(hour, minute), self.timezone
+                    )
+                except (TypeError, ValueError):
+                    continue
+                scheduled_at = risk_time - timedelta(
+                    minutes=self.warning_lead_minutes
+                )
+                if self.care_preferences.allows_scheduled_at(
+                    preferences, scheduled_at
+                ):
+                    allowed_candidates.append(alert)
+            raw_candidates = allowed_candidates
+        selected_candidates = self.warning_policy.select_daily_candidates(
+            raw_candidates
+        )
+        if self.care_preferences is not None:
+            user_max = int(
+                preferences.get(
+                    "effective_max_proactive_care_per_day",
+                    self.warning_policy.max_daily_sends,
+                )
+            )
+            selected_candidates = selected_candidates[: max(0, user_max)]
+        selected = [
             self.care_messages.contextualize_alert(
                 alert,
                 source="forecast_warning",
@@ -390,30 +417,9 @@ class ForecastCoordinator:
                 profile=facts.get("profile"),
                 profile_version=facts.get("profile_version"),
                 care_preferences=preferences or None,
-                care_history=facts.get("care_history"),
             )
-            for alert in raw_candidates
+            for alert in selected_candidates
         ]
-        eligible_candidates = [
-            alert
-            for alert in contextual_candidates
-            if str((alert.get("care_plan") or {}).get("decision_rule") or "")
-            not in {"hold", "hold_explicitly_disabled"}
-        ]
-        # Receptivity filtering must happen before the daily budget is filled;
-        # otherwise an unreceptive early candidate can prevent a later valid
-        # opportunity from being considered.
-        selected = self.warning_policy.select_daily_candidates(
-            eligible_candidates
-        )
-        if self.care_preferences is not None:
-            user_max = int(
-                preferences.get(
-                    "effective_max_proactive_care_per_day",
-                    self.warning_policy.max_daily_sends,
-                )
-            )
-            selected = selected[: max(0, user_max)]
         windows = self._warning_windows(selected, target)
         serialized_windows = [
             self._serializable_warning(item) for item in windows
@@ -753,15 +759,6 @@ class ForecastCoordinator:
                 if self.care_preferences is not None
                 else None
             ),
-            "care_history": (
-                await asyncio.to_thread(
-                    self.care_interventions.decision_context,
-                    participant_id,
-                    at=local_now,
-                )
-                if self.care_interventions is not None
-                else None
-            ),
         }
         observation_revision = _sha(observations)
         profile_revision = _sha({
@@ -1047,36 +1044,14 @@ class ForecastCoordinator:
                 continue
             try:
                 hour, minute = (int(part) for part in str(alert.get("time") or "00:00")[:5].split(":"))
-                predicted_risk_time = datetime.combine(
-                    target, time(hour, minute), self.timezone
-                )
+                risk_time = datetime.combine(target, time(hour, minute), self.timezone)
             except (TypeError, ValueError):
                 continue
-            target_time = predicted_risk_time - timedelta(
-                minutes=self.warning_lead_minutes
+            target_time = risk_time - timedelta(minutes=self.warning_lead_minutes)
+            valid_until = min(
+                target_time + timedelta(minutes=self.warning_late_grace_minutes),
+                risk_time,
             )
-            recommended = (alert.get("care_plan") or {}).get("scheduled_at")
-            if recommended:
-                try:
-                    target_time = datetime.fromisoformat(str(recommended)).astimezone(
-                        self.timezone
-                    )
-                except ValueError:
-                    pass
-            risk_time = predicted_risk_time
-            if target_time >= predicted_risk_time:
-                # A JITAI delay is an after-risk Care opportunity. Preserve
-                # the model risk instant in payload provenance while giving
-                # the delivery repository a real future authorization window.
-                risk_time = target_time + timedelta(
-                    minutes=max(
-                        self.warning_lead_minutes,
-                        self.warning_late_grace_minutes + 1,
-                    )
-                )
-            valid_until = target_time + timedelta(minutes=self.warning_late_grace_minutes)
-            if target_time <= risk_time:
-                valid_until = min(valid_until, risk_time)
             level = str(alert.get("tier") or alert.get("intensity_zone") or "1")
             stressors = sorted(str(value) for value in (alert.get("dominant_stressors") or []))
             current_events = sorted(str(value) for value in (alert.get("current_events") or []))
@@ -1105,15 +1080,6 @@ class ForecastCoordinator:
                 "warning_level": level, "payload": {
                     **alert,
                     "risk_time": risk_time.isoformat(),
-                    **(
-                        {
-                            "predicted_risk_time": (
-                                predicted_risk_time.isoformat()
-                            )
-                        }
-                        if risk_time != predicted_risk_time
-                        else {}
-                    ),
                     "episode_trigger_fingerprint": trigger_fingerprint,
                     "episode_trigger_fingerprint_version": 2,
                 },

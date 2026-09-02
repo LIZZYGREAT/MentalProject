@@ -154,19 +154,18 @@ def test_forecast_save_rejects_observation_revision_that_lost_a_race():
         observed_at=observed_at,
         source_message_id="before-calculation",
     )
-    calculation_cutoff = datetime.now(timezone.utc)
     calculated_rows = observations.for_local_date(
         participant.id,
         target,
         timezone_name="Asia/Shanghai",
-        as_of=calculation_cutoff,
+        as_of=datetime.now(timezone.utc),
     )
     calculated_revision = _sha(calculated_rows)
     observations.add(
         participant.id,
         "checkin",
         {"stress_0_10": 8, "energy_0_10": 2},
-        observed_at=calculation_cutoff - timedelta(seconds=1),
+        observed_at=datetime.now(timezone.utc),
         source_message_id="won-race",
     )
 
@@ -1769,11 +1768,9 @@ def test_legacy_forecast_without_warning_revision_is_recomputed():
         "episode_drift_minutes": 15,
         "care_context_schema_version": "care_context.v2",
         "care_recent_observation_max_age_minutes": 360,
-        "care_message_schema_version": "care_message.v3",
+        "care_message_schema_version": "care_message.v2",
         "care_intervention_policy_version": "care_intervention_policy.v3",
         "care_template_library_version": "care_template_library.v3",
-        "care_jitai_version": "care-jitai.v1",
-        "receptivity_model_version": "receptivity-logistic-v1",
     }
     assert prediction.calls == 2
 

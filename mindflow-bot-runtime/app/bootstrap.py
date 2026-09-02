@@ -170,7 +170,6 @@ def build_business_services(
         learned_profiles=learned_profiles,
         retrospective_curves=retrospective_curves,
         care_preferences=care_preferences,
-        care_interventions=care_interventions,
     )
     dependency_refresh = ForecastDependencyRefreshService(
         forecast_snapshots,

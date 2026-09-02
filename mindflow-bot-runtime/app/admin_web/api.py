@@ -30,8 +30,6 @@ from app.services.daily_review_service import DailyReviewService
 from app.services.research_evaluation import ResearchEvaluationService
 from app.services.model_promotion import ModelPromotionService
 from app.services.hierarchical_personalization import ParameterLearningService
-from app.services.care_effectiveness import CareEffectivenessService
-from app.services.care_what_if import CareWhatIfSimulationService
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
@@ -68,15 +66,6 @@ class AdminAPI:
         )
         self.parameter_learning = ParameterLearningService(
             repository.database, settings.timezone_name
-        )
-        self.care_effects = CareEffectivenessService(
-            repository.database, settings.timezone_name
-        )
-        self.what_if = (
-            CareWhatIfSimulationService(pressure_curves.coordinator)
-            if pressure_curves is not None
-            and getattr(pressure_curves, "coordinator", None) is not None
-            else None
         )
         self.signer = SessionSigner(
             settings.admin_session_secret or "test-admin-session-secret",
@@ -607,76 +596,6 @@ class AdminAPI:
             )
         )
 
-    async def care_effect_admin(self, request: Request) -> Response:
-        if await self._authorized(request) is None:
-            return _json_error("unauthorized", 401)
-        date_start, date_end, error = self._research_dates(request, default_days=28)
-        if error:
-            return error
-        participant_id = None
-        participant_code = str(request.query_params.get("participant_code") or "").strip()
-        if participant_code:
-            participant_id = await asyncio.to_thread(
-                self.repository.participant_id, participant_code
-            )
-            if participant_id is None:
-                return _json_error("participant_not_found", 404)
-        return JSONResponse(
-            await asyncio.to_thread(
-                self.care_effects.descriptive_effects,
-                date_start,
-                date_end,
-                participant_id=participant_id,
-            )
-        )
-
-    async def weekly_insights(self, request: Request) -> Response:
-        participant_id, error = await self._participant(request)
-        if error:
-            return error
-        try:
-            through = date.fromisoformat(
-                request.query_params.get("through")
-                or datetime.now(ZoneInfo(self.settings.timezone_name)).date().isoformat()
-            )
-        except ValueError:
-            return _json_error("invalid_date", 400)
-        return JSONResponse(
-            await asyncio.to_thread(
-                self.care_effects.weekly_insights,
-                participant_id,
-                through=through,
-            )
-        )
-
-    async def care_what_if(self, request: Request) -> Response:
-        session = await self._authorized(request, csrf=True)
-        if session is None:
-            return _json_error("unauthorized_or_csrf", 401)
-        if self.what_if is None:
-            return _json_error("forecast_service_unavailable", 503)
-        participant_id = await asyncio.to_thread(
-            self.repository.participant_id, request.path_params["participant_code"]
-        )
-        if participant_id is None:
-            return _json_error("participant_not_found", 404)
-        try:
-            value = await request.json()
-            target = date.fromisoformat(str(value.get("local_date") or ""))
-            result = await asyncio.to_thread(
-                self.what_if.simulate,
-                participant_id,
-                target,
-                event_id=str(value.get("event_id") or ""),
-                new_start_time=str(value.get("new_start_time") or ""),
-                new_end_time=str(value.get("new_end_time") or ""),
-            )
-        except (ValueError, LookupError) as exc:
-            return _json_error(str(exc), 400)
-        except Exception:
-            return _json_error("invalid_json", 400)
-        return JSONResponse(result)
-
     async def research_dashboard(self, request: Request) -> Response:
         if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
@@ -1130,8 +1049,6 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/pressure-curve/{{local_date}}", self.curve_json, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/warnings", self.warnings, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/care-timeline", self.care_timeline, methods=["GET"]),
-            Route(f"{prefix}/participants/{{participant_code}}/weekly-insights", self.weekly_insights, methods=["GET"]),
-            Route(f"{prefix}/participants/{{participant_code}}/care-what-if", self.care_what_if, methods=["POST"]),
             Route(f"{prefix}/participants/{{participant_code}}/daily-reviews", self.daily_reviews_list, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/daily-reviews/{{local_date}}", self.daily_reviews_date, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}", self.retrospective_curve, methods=["GET"]),
@@ -1139,7 +1056,6 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/reanalysis", self.reanalyse_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/research/dashboard", self.research_dashboard, methods=["GET"]),
             Route(f"{prefix}/research/workload", self.workload_dashboard, methods=["GET"]),
-            Route(f"{prefix}/research/care-effects", self.care_effect_admin, methods=["GET"]),
             Route(f"{prefix}/data-quality", self.data_quality, methods=["GET"]),
             Route(f"{prefix}/research/matches/rebuild", self.rebuild_research_matches, methods=["POST"]),
             Route(f"{prefix}/research/dataset-snapshots", self.dataset_snapshots, methods=["GET", "POST"]),

@@ -39,7 +39,7 @@ class CareTemplateLibrary:
     def render(
         self, context: CareContext, plan: CareMessagePlan
     ) -> RenderedCareMessage:
-        context_line = "为什么提醒我：" + self._context_line(context)
+        context_line = self._context_line(context)
         action = self._action_line(context, plan)
         choice = (
             "这只是根据日程和近期状态做出的趋势提醒；如果你现在感觉还好，可以直接忽略。"

@@ -178,7 +178,7 @@ def test_warning_lifecycle_is_mirrored_to_normalized_care_event():
         assert care.source_warning_id == warning.id
         assert care.source_forecast_id == warning.forecast_id
         assert care.forecast_version == warning.forecast_version
-        assert care.intervention_type == "micro_break"
+        assert care.intervention_type == "transition_buffer"
         assert care.status == "pending"
 
     warning_id, _ = _send_first(database, warnings)
@@ -223,10 +223,11 @@ def test_controlled_care_preference_has_distinct_provenance_and_actions():
     assert "短暂散步" in contextual["message"]
     assert "药物" not in contextual["message"]
     assert "snooze_30" not in contextual["care_plan"]["actions"]
-    assert set(contextual["care_plan"]["actions"]) == {
+    assert set(contextual["care_plan"]["actions"]) >= {
+        "ack",
+        "mute_today",
         "helpful",
         "not_relevant",
-        "disable_type",
     }
 
     legacy_fallback = CareMessageService(
@@ -311,7 +312,7 @@ def test_future_reserved_preferences_are_not_exposed_by_user_tools():
     assert public == {"care_enabled": True, "version": 1}
 
 
-def test_high_vulnerability_in_quiet_hours_moves_to_next_acceptable_window():
+def test_quiet_hours_filter_before_policy_so_later_allowed_risks_are_considered():
     database = memory_database()
     preferences = ParticipantCarePreferenceRepository(
         database,
@@ -345,7 +346,7 @@ def test_high_vulnerability_in_quiet_hours_moves_to_next_acceptable_window():
         for index, risk_time in enumerate(("10:00", "15:00", "20:00"))
     ]
 
-    selected, windows, _ = coordinator._derive_warning_state(
+    selected, _, _ = coordinator._derive_warning_state(
         {"alerts": alerts},
         DAY,
         {
@@ -357,16 +358,7 @@ def test_high_vulnerability_in_quiet_hours_moves_to_next_acceptable_window():
         },
     )
 
-    assert [item["time"] for item in selected] == ["10:00", "15:00"]
-    assert selected[0]["care_plan"]["decision_rule"] == "next_acceptable_window"
-    assert selected[0]["care_plan"]["scheduled_at"].startswith(
-        f"{DAY.isoformat()}T11:00:00"
-    )
-    assert windows[0]["target_time"].astimezone(preferences.timezone).hour == 11
-    assert windows[0]["risk_time"] > windows[0]["valid_until"]
-    assert windows[0]["payload"]["predicted_risk_time"].startswith(
-        f"{DAY.isoformat()}T10:00:00"
-    )
+    assert [item["time"] for item in selected] == ["15:00", "20:00"]
 
 
 def test_user_preferences_are_stricter_than_system_cap_and_cancel_disallowed():
