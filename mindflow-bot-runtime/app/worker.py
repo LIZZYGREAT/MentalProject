@@ -382,6 +382,7 @@ class BotWorker:
                 ),
             )
         }
+        generic_wakeup = asyncio.Event()
 
         async def emit_locked(text: str, *, key: str) -> None:
             """Send while holding progress.lock so final cannot overtake it."""
@@ -411,27 +412,35 @@ class BotWorker:
             progress.sent += 1
             progress.last_sent_at = now
             progress.sent_keys.add(key)
+            generic_wakeup.set()
 
         async def delayed_generic_progress() -> None:
             await asyncio.sleep(self.generic_progress_delay_seconds)
-            async with progress.lock:
-                contextual_owner_active = bool(
-                    progress.pending_tool_name
-                    and progress.pending_tool_name in progress.tool_started_at
-                    and progress.pending_text
-                )
-                if (
-                    progress.final_ready
-                    or progress.force_silent
-                    or progress.sent
-                    or contextual_owner_active
-                ):
-                    return
-                suggestion = self.progress_presenter.delayed(
-                    event.text, state=progress
-                )
-                if suggestion:
-                    await emit_locked(suggestion, key="delayed")
+            while True:
+                async with progress.lock:
+                    if (
+                        progress.final_ready
+                        or progress.force_silent
+                        or progress.sent
+                    ):
+                        return
+                    contextual_owner_active = bool(
+                        progress.pending_tool_name
+                        and progress.pending_tool_name in progress.tool_started_at
+                        and progress.pending_text
+                    )
+                    if not contextual_owner_active:
+                        suggestion = self.progress_presenter.delayed(
+                            event.text, state=progress
+                        )
+                        if suggestion:
+                            await emit_locked(suggestion, key="delayed")
+                        return
+                    # Clear under the same lock used by owner transitions so a
+                    # completion wake-up cannot be lost between the state check
+                    # and the wait below.
+                    generic_wakeup.clear()
+                await generic_wakeup.wait()
 
         async def delayed_tool_progress(
             expected_tool_name: str,
@@ -481,6 +490,7 @@ class BotWorker:
                         if tool_timer is not None and not tool_timer.done():
                             tool_timer.cancel()
                         tool_timer = None
+                        generic_wakeup.set()
                 suggestion = self.progress_presenter.present(activity, state=progress)
                 if suggestion:
                     key = self.progress_presenter.key_for(activity, state=progress)
@@ -503,6 +513,7 @@ class BotWorker:
             # a threshold-edge timer can no longer start a processing send.
             async with progress.lock:
                 progress.final_ready = True
+                generic_wakeup.set()
             generic_timer.cancel()
             timers = [generic_timer, *tool_timers]
             for pending_timer in tool_timers:

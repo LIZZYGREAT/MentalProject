@@ -281,7 +281,40 @@ def test_generic_fallback_resumes_after_fast_tool_completes():
     texts = [item[1] for item in sender.sent]
     assert len(texts) == 2
     assert texts[-1] == "final"
-    assert texts[0] != "我先看看相关日程。"
+    assert texts[0] != "final"
+    assert "我先看看相关日程。" not in texts
+
+
+def test_generic_deadline_waits_for_short_contextual_owner_then_resumes():
+    class DeadlineOwnerRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await asyncio.sleep(0.04)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.02)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_succeeded", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.07)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        DeadlineOwnerRuntime(), sender, generic_delay=0.05, tool_grace=0.08
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="处理一个复杂请求"))
+
+    texts = [item[1] for item in sender.sent]
+    assert len(texts) == 2
+    assert texts[-1] == "final"
+    assert texts[0] != "final"
+    assert "我先看看相关日程。" not in texts
 
 
 def test_long_no_tool_turn_sends_one_generic_progress_before_final():
