@@ -18,6 +18,18 @@ depends_on = None
 def upgrade() -> None:
     json_default_list = sa.text("'[]'::jsonb")
     op.add_column(
+        "warning_schedules",
+        sa.Column("authorization_deadline", sa.DateTime(timezone=True), nullable=True),
+    )
+    op.execute(
+        "UPDATE warning_schedules "
+        "SET authorization_deadline = risk_time "
+        "WHERE authorization_deadline IS NULL"
+    )
+    op.alter_column(
+        "warning_schedules", "authorization_deadline", nullable=False
+    )
+    op.add_column(
         "participant_care_preferences",
         sa.Column("inferred_support_types", postgresql.JSONB(), server_default=json_default_list, nullable=False),
     )
@@ -28,6 +40,11 @@ def upgrade() -> None:
     op.add_column(
         "participant_care_preferences",
         sa.Column("interruption_tolerance", sa.Float(), server_default="0.5", nullable=False),
+    )
+    op.create_check_constraint(
+        "ck_care_interruption_tolerance",
+        "participant_care_preferences",
+        "interruption_tolerance BETWEEN 0 AND 1",
     )
     op.add_column(
         "participant_care_preferences",
@@ -103,6 +120,12 @@ def downgrade() -> None:
     op.drop_column("care_intervention_events", "receptivity_score")
     op.drop_column("care_intervention_events", "vulnerability_score")
     op.drop_column("participant_care_preferences", "preferred_reminder_windows")
+    op.drop_constraint(
+        "ck_care_interruption_tolerance",
+        "participant_care_preferences",
+        type_="check",
+    )
     op.drop_column("participant_care_preferences", "interruption_tolerance")
     op.drop_column("participant_care_preferences", "disabled_intervention_types")
     op.drop_column("participant_care_preferences", "inferred_support_types")
+    op.drop_column("warning_schedules", "authorization_deadline")

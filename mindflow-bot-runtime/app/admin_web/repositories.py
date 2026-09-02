@@ -529,6 +529,7 @@ class AdminRepository:
                     "forecast_version": row.forecast_version,
                     "target_time": _iso(row.target_time),
                     "risk_time": _iso(row.risk_time),
+                    "authorization_deadline": _iso(row.authorization_deadline),
                     "valid_until": _iso(row.valid_until),
                     "warning_level": row.warning_level,
                     "status": row.status,

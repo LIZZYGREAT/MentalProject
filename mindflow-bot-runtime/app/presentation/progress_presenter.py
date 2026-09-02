@@ -16,6 +16,7 @@ TOOL_STAGE = {
     "care_get_recent_state": "context",
     "care_run_today_assessment": "assessment",
     "care_get_pressure_curve": "forecast",
+    "care_simulate_schedule_change": "what_if",
     "care_get_checkin_card": "card",
     "care_record_checkin": "record_checkin",
     "care_get_support": "support",
@@ -64,6 +65,8 @@ class ProgressPresenter:
                 if previous_stage == "calendar":
                     return "日程信息拿到了，我正在结合这些安排计算压力变化。"
                 return "我正在结合今天的状态和日程计算压力趋势。"
+            if stage == "what_if":
+                return "我正在比较这次时间调整前后的压力变化。"
             if stage == "card":
                 if previous_stage == "forecast":
                     return "压力趋势已经算好了，我在整理成更直观的结果。"

@@ -1063,20 +1063,14 @@ class ForecastCoordinator:
                     )
                 except ValueError:
                     pass
-            risk_time = predicted_risk_time
-            if target_time >= predicted_risk_time:
-                # A JITAI delay is an after-risk Care opportunity. Preserve
-                # the model risk instant in payload provenance while giving
-                # the delivery repository a real future authorization window.
-                risk_time = target_time + timedelta(
-                    minutes=max(
-                        self.warning_lead_minutes,
-                        self.warning_late_grace_minutes + 1,
-                    )
-                )
             valid_until = target_time + timedelta(minutes=self.warning_late_grace_minutes)
-            if target_time <= risk_time:
-                valid_until = min(valid_until, risk_time)
+            if target_time <= predicted_risk_time:
+                valid_until = min(valid_until, predicted_risk_time)
+            authorization_deadline = (
+                predicted_risk_time
+                if target_time < predicted_risk_time
+                else valid_until
+            )
             level = str(alert.get("tier") or alert.get("intensity_zone") or "1")
             stressors = sorted(str(value) for value in (alert.get("dominant_stressors") or []))
             current_events = sorted(str(value) for value in (alert.get("current_events") or []))
@@ -1099,21 +1093,14 @@ class ForecastCoordinator:
             result.append({
                 "warning_identity": identity, "target_time": target_time.astimezone(timezone.utc),
                 "episode_identity": episode_identity,
-                "risk_time": risk_time.astimezone(timezone.utc),
+                "risk_time": predicted_risk_time.astimezone(timezone.utc),
+                "authorization_deadline": authorization_deadline.astimezone(timezone.utc),
                 "valid_until": valid_until.astimezone(timezone.utc),
                 "episode_drift_minutes": self.warning_episode_drift_minutes,
                 "warning_level": level, "payload": {
                     **alert,
-                    "risk_time": risk_time.isoformat(),
-                    **(
-                        {
-                            "predicted_risk_time": (
-                                predicted_risk_time.isoformat()
-                            )
-                        }
-                        if risk_time != predicted_risk_time
-                        else {}
-                    ),
+                    "risk_time": predicted_risk_time.isoformat(),
+                    "authorization_deadline": authorization_deadline.isoformat(),
                     "episode_trigger_fingerprint": trigger_fingerprint,
                     "episode_trigger_fingerprint_version": 2,
                 },
@@ -1126,6 +1113,7 @@ class ForecastCoordinator:
             **item,
             "target_time": item["target_time"].isoformat(),
             "risk_time": item["risk_time"].isoformat(),
+            "authorization_deadline": item["authorization_deadline"].isoformat(),
             "valid_until": item["valid_until"].isoformat(),
         }
 

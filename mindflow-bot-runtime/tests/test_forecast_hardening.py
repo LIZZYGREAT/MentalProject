@@ -812,6 +812,7 @@ def test_delivery_authorization_rechecks_risk_time_after_claim_race():
         row = session.query(WarningSchedule).one()
         row.status = "pending"
         row.risk_time = TEST_NOW
+        row.authorization_deadline = TEST_NOW
         row.valid_until = TEST_NOW + timedelta(minutes=5)
         warning_id = row.id
         forecast_version = row.forecast_version

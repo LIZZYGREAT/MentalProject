@@ -23,8 +23,8 @@ from app.models import (
 )
 
 
-CARE_EFFECT_VERSION = "care-effect-descriptive.v1"
-WEEKLY_INSIGHT_VERSION = "weekly-insight-evidence-gate.v1"
+CARE_EFFECT_VERSION = "care-effect-descriptive.v2"
+WEEKLY_INSIGHT_VERSION = "weekly-insight-evidence-gate.v2"
 
 
 def _aware(value: datetime) -> datetime:
@@ -56,6 +56,69 @@ def _uncertainty(values: list[float]) -> dict[str, float] | None:
     }
 
 
+def _wilson_uncertainty(values: list[float]) -> dict[str, Any] | None:
+    """Wilson interval for Bernoulli helpfulness observations."""
+
+    if not values:
+        return None
+    n = len(values)
+    mean = statistics.fmean(values)
+    z = 1.96
+    denominator = 1.0 + (z * z / n)
+    centre = (mean + z * z / (2.0 * n)) / denominator
+    margin = (
+        z
+        * math.sqrt((mean * (1.0 - mean) / n) + (z * z / (4.0 * n * n)))
+        / denominator
+    )
+    return {
+        "standard_error": round(math.sqrt(mean * (1.0 - mean) / n), 4),
+        "lower_95": round(max(0.0, centre - margin), 4),
+        "upper_95": round(min(1.0, centre + margin), 4),
+        "method": "wilson",
+    }
+
+
+def _baseline_values(outcome: CareInterventionOutcome) -> tuple[float | None, float | None]:
+    baseline = dict(outcome.baseline_state or {})
+    predicted = dict(baseline.get("predicted_baseline") or {})
+    observed = dict(baseline.get("observed_baseline") or {})
+    # Legacy fallback is read-only compatibility for already materialized rows.
+    predicted_stress = _stress(predicted) if predicted else _stress(baseline)
+    observed_stress = _stress(observed) if observed else None
+    return predicted_stress, observed_stress
+
+
+def _recovery_episode_changes(curve: list[dict[str, Any]]) -> list[float]:
+    """Return one pre/post stress delta per contiguous recovery episode."""
+
+    changes: list[float] = []
+    index = 0
+    while index < len(curve):
+        if float(curve[index].get("recovery_resource") or 0.0) < 0.35:
+            index += 1
+            continue
+        start = index
+        while (
+            index + 1 < len(curve)
+            and float(curve[index + 1].get("recovery_resource") or 0.0) >= 0.35
+        ):
+            index += 1
+        end = index
+        pre_index = max(0, start - 1)
+        post_index = min(len(curve) - 1, end + 1)
+        try:
+            before = float(curve[pre_index].get("stress_0_10"))
+            after = float(curve[post_index].get("stress_0_10"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(before) and math.isfinite(after):
+                changes.append(after - before)
+        index += 1
+    return changes
+
+
 class CareEffectivenessService:
     def __init__(self, database: Database, timezone_name: str):
         self.database = database
@@ -82,32 +145,48 @@ class CareEffectivenessService:
             for intervention in interventions:
                 outcome = session.get(CareInterventionOutcome, intervention.id)
                 if outcome is None:
-                    context = dict(intervention.context_json or {})
-                    care_context = dict(context.get("care_context") or {})
-                    outcome = CareInterventionOutcome(
-                        intervention_id=intervention.id,
-                        participant_id=intervention.participant_id,
-                        baseline_state={
-                            "stress_0_10": care_context.get("stress_0_10"),
-                            "vitality_0_10": care_context.get("vitality_0_10"),
-                            "measured_at": care_context.get("risk_time"),
-                            "source": "forecast_at_decision_time",
-                        },
-                        context_json={
-                            "observational_only": True,
-                            "intervention_type": intervention.intervention_type,
-                            "receptivity_score": intervention.receptivity_score,
-                        },
-                        created_at=cutoff,
-                        updated_at=cutoff,
+                    from app.repositories_care import CareInterventionRepository
+
+                    outcome = CareInterventionRepository._ensure_outcome_in_session(
+                        session, intervention, cutoff
                     )
-                    session.add(outcome)
                     created += 1
                 changed = self._match_followups(session, intervention, outcome, cutoff)
                 if changed:
                     updated += 1
             session.flush()
         return {"created": created, "updated": updated}
+
+    @staticmethod
+    def attach_observation_in_session(
+        session: Any, observation: StateObservation
+    ) -> int:
+        """Materialize eligible follow-ups when a check-in is committed."""
+
+        if observation.observation_type != "checkin":
+            return 0
+        observed_at = _aware(observation.observed_at)
+        cutoff = _aware(observation.created_at)
+        interventions = session.execute(
+            select(CareInterventionEvent).where(
+                CareInterventionEvent.participant_id == observation.participant_id,
+                CareInterventionEvent.sent_at.is_not(None),
+                CareInterventionEvent.sent_at < observed_at,
+                CareInterventionEvent.sent_at >= observed_at - timedelta(minutes=75),
+            )
+        ).scalars().all()
+        changed = 0
+        from app.repositories_care import CareInterventionRepository
+
+        for intervention in interventions:
+            outcome = CareInterventionRepository._ensure_outcome_in_session(
+                session, intervention, cutoff
+            )
+            if CareEffectivenessService._match_followups(
+                session, intervention, outcome, cutoff
+            ):
+                changed += 1
+        return changed
 
     @staticmethod
     def _match_followups(
@@ -127,7 +206,7 @@ class CareEffectivenessService:
                 StateObservation.observation_type == "checkin",
             ).order_by(StateObservation.observed_at)
         ).scalars().all()
-        baseline = _stress(dict(outcome.baseline_state or {}))
+        predicted_baseline, observed_baseline = _baseline_values(outcome)
 
         def nearest(minutes: int, lower: int, upper: int) -> dict[str, Any] | None:
             candidates = [
@@ -144,12 +223,16 @@ class CareEffectivenessService:
                 ),
             )
             value = _stress(dict(row.payload_json or {}))
+            energy = (row.payload_json or {}).get("energy_0_10")
             return {
                 "observation_id": str(row.id),
                 "observed_at": _aware(row.observed_at).isoformat(),
                 "stress_0_10": value,
-                "stress_change": round(value - baseline, 4)
-                if value is not None and baseline is not None else None,
+                "energy_0_10": energy,
+                "observed_stress_change": round(value - observed_baseline, 4)
+                if value is not None and observed_baseline is not None else None,
+                "forecast_residual": round(value - predicted_baseline, 4)
+                if value is not None and predicted_baseline is not None else None,
                 "available_at": _aware(row.created_at).isoformat(),
             }
 
@@ -176,7 +259,6 @@ class CareEffectivenessService:
         *,
         participant_id: uuid.UUID | None = None,
     ) -> dict[str, Any]:
-        self.refresh_outcomes(participant_id)
         start = datetime.combine(date_start, time.min, self.timezone).astimezone(timezone.utc)
         end = datetime.combine(date_end + timedelta(days=1), time.min, self.timezone).astimezone(timezone.utc)
         with self.database.session() as session:
@@ -197,7 +279,7 @@ class CareEffectivenessService:
             )
         grouped: dict[tuple[str, str, str, str], list[tuple[Any, Any]]] = defaultdict(list)
         for intervention, outcome in rows:
-            baseline = _stress(dict(outcome.baseline_state or {}))
+            baseline, _observed = _baseline_values(outcome)
             stress_band = "unknown" if baseline is None else "high" if baseline >= 7 else "medium" if baseline >= 4 else "low"
             context = dict(outcome.context_json or {}).get("care_context") or dict(intervention.context_json or {}).get("care_context") or {}
             workload = "high" if context.get("current_events") or context.get("dominant_stressors") else "low"
@@ -207,8 +289,10 @@ class CareEffectivenessService:
         groups = []
         for (kind, stress_band, workload, period), items in sorted(grouped.items()):
             ratings = [float(outcome.helpful_rating) for _, outcome in items if outcome.helpful_rating is not None]
-            delta30 = [float(outcome.followup_30m["stress_change"]) for _, outcome in items if outcome.followup_30m and outcome.followup_30m.get("stress_change") is not None]
-            delta60 = [float(outcome.followup_60m["stress_change"]) for _, outcome in items if outcome.followup_60m and outcome.followup_60m.get("stress_change") is not None]
+            delta30 = [float(outcome.followup_30m["observed_stress_change"]) for _, outcome in items if outcome.followup_30m and outcome.followup_30m.get("observed_stress_change") is not None]
+            delta60 = [float(outcome.followup_60m["observed_stress_change"]) for _, outcome in items if outcome.followup_60m and outcome.followup_60m.get("observed_stress_change") is not None]
+            residual30 = [float(outcome.followup_30m["forecast_residual"]) for _, outcome in items if outcome.followup_30m and outcome.followup_30m.get("forecast_residual") is not None]
+            residual60 = [float(outcome.followup_60m["forecast_residual"]) for _, outcome in items if outcome.followup_60m and outcome.followup_60m.get("forecast_residual") is not None]
             receptivity = [float(item.receptivity_score) for item, _ in items if item.receptivity_score is not None]
             groups.append({
                 "intervention_type": kind,
@@ -218,13 +302,18 @@ class CareEffectivenessService:
                 "sample_count": len(items),
                 "helpful_sample_count": len(ratings),
                 "helpful_rate": _mean(ratings),
-                "stress_change_30m": _mean(delta30),
-                "stress_change_60m": _mean(delta60),
+                "helpful_binary_observations": ratings,
+                "observed_stress_change_30m": _mean(delta30),
+                "observed_stress_change_60m": _mean(delta60),
+                "forecast_residual_30m": _mean(residual30),
+                "forecast_residual_60m": _mean(residual60),
                 "receptivity": _mean(receptivity),
                 "uncertainty": {
-                    "helpful_rate": _uncertainty(ratings),
-                    "stress_change_30m": _uncertainty(delta30),
-                    "stress_change_60m": _uncertainty(delta60),
+                    "helpful_rate": _wilson_uncertainty(ratings),
+                    "observed_stress_change_30m": _uncertainty(delta30),
+                    "observed_stress_change_60m": _uncertainty(delta60),
+                    "forecast_residual_30m": _uncertainty(residual30),
+                    "forecast_residual_60m": _uncertainty(residual60),
                 },
                 "causal_effect": None,
             })
@@ -268,23 +357,21 @@ class CareEffectivenessService:
             workloads = [float(point.get("workload") or 0.0) for point in curve]
             if workloads:
                 daily_workload.append(statistics.fmean(workloads))
-            for left, right in zip(curve, curve[1:]):
-                if float(left.get("recovery_resource") or 0.0) >= 0.35:
-                    recovery_changes.append(
-                        float(right.get("stress_0_10") or 0.0)
-                        - float(left.get("stress_0_10") or 0.0)
-                    )
+            recovery_changes.extend(_recovery_episode_changes(curve))
         candidates = [
             ("pressure_pattern", daily_peaks, "本周每日预测压力峰值的平均水平"),
             ("workload_pattern", daily_workload, "本周每日平均 workload"),
-            ("recovery_pattern", recovery_changes, "恢复窗口后一个时间步的平均压力变化"),
+            ("recovery_pattern", recovery_changes, "每个连续恢复 episode 前后的平均压力变化"),
         ]
         for group in effects["groups"]:
-            ratings_count = int(group["helpful_sample_count"])
-            if ratings_count:
+            ratings = [
+                float(value)
+                for value in group.get("helpful_binary_observations") or []
+            ]
+            if ratings:
                 candidates.append((
                     f"care_feedback:{group['intervention_type']}",
-                    [float(group["helpful_rate"])] * ratings_count,
+                    ratings,
                     f"{group['intervention_type']} 的有帮助反馈率",
                 ))
         insights = []

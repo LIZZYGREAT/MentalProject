@@ -136,6 +136,7 @@ def test_progress_presenter_keeps_generic_copy_available_after_tool_activity():
     [
         ("care_record_checkin", "我在记录这次状态。"),
         ("care_get_support", "我在结合当前状态整理更合适的支持建议。"),
+        ("care_simulate_schedule_change", "我正在比较这次时间调整前后的压力变化。"),
         ("care_update_preferences", "我正在更新你的提醒与关怀设置。"),
         ("care_respond_to_latest_intervention", "我正在记录这次反馈。"),
     ],
@@ -147,6 +148,15 @@ def test_progress_presenter_maps_all_remaining_registered_care_tools(
         AgentActivityEvent(kind="tool_started", tool_name=tool_name),
         state=ProgressState(),
     ) == expected
+
+
+def test_simulate_schedule_change_has_contextual_progress():
+    assert ProgressPresenter().present(
+        AgentActivityEvent(
+            kind="tool_started", tool_name="care_simulate_schedule_change"
+        ),
+        state=ProgressState(),
+    ) == "我正在比较这次时间调整前后的压力变化。"
 
 
 def test_generic_progress_copy_uses_a_bounded_deterministic_template_pool():

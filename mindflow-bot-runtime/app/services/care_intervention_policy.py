@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from app.services.care_context import CareContext
+from app.services.care_jitai import normalized_intervention_type
 
 
 CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v3"
@@ -135,27 +136,12 @@ class CareInterventionPolicy:
                 "score": 0.86,
             })
 
-        preference_boosts = {
-            "micro_break": "micro_break",
-            "task_decomposition": "workload_decomposition",
-            "transition_buffer": "transition_buffer",
-            "brief_check_in": "brief_check_in",
-            "protected_break": "protected_break",
-            "priority_review": "workload_decomposition",
-            "hydration_movement": "recovery",
-            "schedule_adjustment_suggestion": "schedule_adjustment",
-        }
         preferred = set(context.profile_summary.preferred_support_types)
         for candidate in candidates:
-            matched = next(
-                (
-                    preference
-                    for preference, intervention_type in preference_boosts.items()
-                    if preference in preferred
-                    and candidate["intervention_type"] == intervention_type
-                ),
-                None,
+            normalized_type = normalized_intervention_type(
+                candidate["intervention_type"]
             )
+            matched = normalized_type if normalized_type in preferred else None
             candidate["preference_matched"] = matched
             candidate["score"] = min(
                 1.0,

@@ -26,6 +26,7 @@ from app.models import (
 from app.services.care_jitai import (
     INTERVENTION_OPTIONS,
     normalized_intervention_type,
+    normalized_intervention_types,
 )
 
 
@@ -41,16 +42,7 @@ CARE_ACTIONS = {
 }
 CARE_CARD_ACTIONS = ["helpful", "not_relevant", "snooze_30", "disable_type"]
 OPERATIONAL_CARE_ACTIONS = {"ack", "snooze_30", "mute_today"}
-PREFERRED_SUPPORT_TYPES = {
-    "micro_break",
-    "hydration",
-    "walk",
-    "task_decomposition",
-    "transition_buffer",
-    "recovery",
-    "trusted_person",
-    *INTERVENTION_OPTIONS,
-}
+PREFERRED_SUPPORT_TYPES = set(INTERVENTION_OPTIONS)
 
 
 def _aware(value: datetime) -> datetime:
@@ -73,6 +65,14 @@ def _in_quiet_hours(value: time, start: time | None, end: time | None) -> bool:
     if start < end:
         return start <= value < end
     return value >= start or value < end
+
+
+def _state_number(payload: Mapping[str, Any], key: str) -> float | None:
+    try:
+        value = float(payload.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 <= value <= 10.0 else None
 
 
 class ParticipantCarePreferenceRepository:
@@ -135,6 +135,7 @@ class ParticipantCarePreferenceRepository:
             "allow_schedule_suggestions",
             "allow_follow_up",
             "preferred_support_types",
+            "reenable_intervention_types",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -159,7 +160,9 @@ class ParticipantCarePreferenceRepository:
             before = self._view(row)
             self._apply_changes(row, changes)
             after_values = self._view(row)
-            material_keys = allowed
+            material_keys = (
+                allowed - {"reenable_intervention_types"}
+            ) | {"disabled_intervention_types"}
             if (
                 (created_preference and bool(changes))
                 or any(
@@ -303,12 +306,19 @@ class ParticipantCarePreferenceRepository:
         row.quiet_hours_end = end
         if "preferred_support_types" in changes:
             raw_types = changes["preferred_support_types"]
-            if not isinstance(raw_types, (list, tuple)):
-                raise ValueError("preferred_support_types must be a list")
-            normalized = sorted({str(value) for value in raw_types})
+            normalized = normalized_intervention_types(raw_types)
             if not set(normalized) <= PREFERRED_SUPPORT_TYPES:
                 raise ValueError("preferred_support_types contains unsupported values")
             row.preferred_support_types = normalized
+        if "reenable_intervention_types" in changes:
+            reenabled = set(
+                normalized_intervention_types(
+                    changes["reenable_intervention_types"]
+                )
+            )
+            row.disabled_intervention_types = sorted(
+                set(row.disabled_intervention_types or []) - reenabled
+            )
 
     def _cancel_disallowed_in_session(
         self,
@@ -545,17 +555,44 @@ class CareInterventionRepository:
             return outcome
         stored = dict(intervention.context_json or {})
         care_context = dict(stored.get("care_context") or {})
+        sent_at = _aware(intervention.sent_at or changed_at)
+        observed = session.execute(
+            select(StateObservation).where(
+                StateObservation.participant_id == intervention.participant_id,
+                StateObservation.observation_type == "checkin",
+                StateObservation.observed_at <= sent_at,
+                StateObservation.observed_at >= sent_at - timedelta(minutes=90),
+                StateObservation.created_at <= sent_at,
+            ).order_by(
+                desc(StateObservation.observed_at),
+                desc(StateObservation.created_at),
+            ).limit(1)
+        ).scalar_one_or_none()
+        observed_payload = dict(observed.payload_json or {}) if observed else {}
         outcome = CareInterventionOutcome(
             intervention_id=intervention.id,
             participant_id=intervention.participant_id,
             baseline_state={
-                "stress_0_10": care_context.get("stress_0_10"),
-                "vitality_0_10": care_context.get("vitality_0_10"),
-                "measured_at": care_context.get("risk_time") or (
-                    _aware(intervention.sent_at).isoformat()
-                    if intervention.sent_at else None
+                "schema_version": "care-outcome-baseline.v2",
+                "predicted_baseline": {
+                    "stress_0_10": care_context.get("stress_0_10"),
+                    "vitality_0_10": care_context.get("vitality_0_10"),
+                    "forecast_id": str(intervention.source_forecast_id),
+                    "forecast_version": intervention.forecast_version,
+                    "risk_time": care_context.get("risk_time"),
+                    "source": "forecast_at_decision_time",
+                },
+                "observed_baseline": (
+                    {
+                        "observation_id": str(observed.id),
+                        "observed_at": _aware(observed.observed_at).isoformat(),
+                        "stress_0_10": _state_number(observed_payload, "stress_0_10"),
+                        "energy_0_10": _state_number(observed_payload, "energy_0_10"),
+                    }
+                    if observed is not None
+                    and _state_number(observed_payload, "stress_0_10") is not None
+                    else None
                 ),
-                "source": "forecast_at_decision_time",
             },
             context_json={
                 "observational_only": True,
@@ -583,23 +620,19 @@ class CareInterventionRepository:
                 ).order_by(desc(CareInterventionEvent.sent_at)).limit(1)
             ).scalar_one_or_none()
             dismissal = session.execute(
-                select(CareInterventionFeedback.id).where(
+                select(CareInterventionFeedback).where(
                     CareInterventionFeedback.participant_id == participant_id,
-                    CareInterventionFeedback.submitted_at >= decision_time - timedelta(hours=24),
+                    CareInterventionFeedback.submitted_at <= decision_time,
                     CareInterventionFeedback.action_selected.in_(
                         ("not_relevant", "snooze_30", "disable_type")
                     ),
-                ).limit(1)
-            ).first()
-            interval = (
-                (decision_time - _aware(latest.sent_at)).total_seconds() / 60.0
-                if latest and latest.sent_at else 1440.0
-            )
+                ).order_by(desc(CareInterventionFeedback.submitted_at)).limit(1)
+            ).scalar_one_or_none()
             return {
-                "previous_warning_interval_minutes": round(max(0.0, interval), 2),
-                "recent_dismissal": dismissal is not None,
                 "last_intervention_at": _aware(latest.sent_at).isoformat()
                 if latest and latest.sent_at else None,
+                "last_dismissal_at": _aware(dismissal.submitted_at).isoformat()
+                if dismissal is not None else None,
             }
 
     def latest_sent(self, participant_id: uuid.UUID) -> dict[str, Any] | None:
@@ -747,7 +780,6 @@ class CareInterventionRepository:
                     intervention.action_at = changed_at
                     intervention.updated_at = changed_at
                     intervention.status = "type_disabled"
-                    self._disable_type_in_session(session, intervention, changed_at)
                     action_result = "recorded"
                 self._update_outcome_and_learning_in_session(
                     session, intervention, normalized_action, changed_at
@@ -799,10 +831,8 @@ class CareInterventionRepository:
         outcome = self._ensure_outcome_in_session(session, intervention, changed_at)
         outcome.user_action = action
         outcome.updated_at = changed_at
-        if action == "helpful":
-            outcome.helpful_rating = 1.0
-        elif action in {"not_relevant", "disable_type"}:
-            outcome.helpful_rating = 0.0
+        context = dict(outcome.context_json or {})
+        learning = dict(context.get("learning_state") or {})
         preference = session.get(
             ParticipantCarePreference, intervention.participant_id, with_for_update=True
         )
@@ -812,50 +842,73 @@ class CareInterventionRepository:
             )
             session.add(preference)
             session.flush()
+        before = (
+            tuple(preference.inferred_support_types or []),
+            tuple(preference.disabled_intervention_types or []),
+            preference.interruption_tolerance,
+            tuple(preference.preferred_reminder_windows or []),
+        )
         inferred = set(preference.inferred_support_types or [])
-        if action == "helpful":
-            inferred.add(intervention.intervention_type)
-        elif action in {"not_relevant", "disable_type"}:
-            inferred.discard(intervention.intervention_type)
+        intervention_type = normalized_intervention_type(
+            intervention.intervention_type
+        )
+        tolerance = (
+            float(preference.interruption_tolerance)
+            if preference.interruption_tolerance is not None
+            else 0.5
+        )
+        rating_deltas = {"helpful": 0.05, "not_relevant": -0.1}
+        old_rating_action = learning.get("rating_action")
+        if action in rating_deltas and action != old_rating_action:
+            if old_rating_action in rating_deltas:
+                tolerance -= rating_deltas[str(old_rating_action)]
+            tolerance += rating_deltas[action]
+            if action == "helpful":
+                inferred.add(intervention_type)
+                outcome.helpful_rating = 1.0
+            else:
+                inferred.discard(intervention_type)
+                outcome.helpful_rating = 0.0
+            learning["rating_action"] = action
+        if action == "snooze_30" and not learning.get("snooze_applied"):
+            tolerance -= 0.1
+            learning["snooze_applied"] = True
+        if action == "disable_type" and not learning.get("type_opt_out"):
+            tolerance -= 0.1
+            inferred.discard(intervention_type)
+            disabled = set(preference.disabled_intervention_types or [])
+            disabled.add(intervention_type)
+            preference.disabled_intervention_types = sorted(disabled)
+            learning["type_opt_out"] = True
+            context["type_opt_out"] = True
         preference.inferred_support_types = sorted(inferred)
-        tolerance = float(preference.interruption_tolerance or 0.5)
-        if action in {"snooze_30", "not_relevant", "disable_type"}:
-            tolerance = max(0.0, tolerance - 0.1)
-        elif action == "helpful":
-            tolerance = min(1.0, tolerance + 0.05)
-        preference.interruption_tolerance = round(tolerance, 3)
-        if action == "snooze_30" and intervention.sent_at:
+        preference.interruption_tolerance = round(
+            max(0.0, min(1.0, tolerance)), 3
+        )
+        if (
+            action == "snooze_30"
+            and learning.get("snooze_applied")
+            and not learning.get("snooze_window_applied")
+            and intervention.sent_at
+        ):
             local_hour = _aware(intervention.sent_at).astimezone(
                 self.preferences.timezone
             ).hour
             windows = set(preference.preferred_reminder_windows or [])
             windows.add(f"{(local_hour + 1) % 24:02d}:00-{(local_hour + 2) % 24:02d}:00")
             preference.preferred_reminder_windows = sorted(windows)[:6]
-        preference.version = int(preference.version or 0) + 1
-        preference.updated_at = changed_at
-
-    def _disable_type_in_session(
-        self,
-        session: Any,
-        intervention: CareInterventionEvent,
-        changed_at: datetime,
-    ) -> None:
-        preference = session.get(
-            ParticipantCarePreference, intervention.participant_id, with_for_update=True
+            learning["snooze_window_applied"] = True
+        context["learning_state"] = learning
+        outcome.context_json = context
+        after = (
+            tuple(preference.inferred_support_types or []),
+            tuple(preference.disabled_intervention_types or []),
+            preference.interruption_tolerance,
+            tuple(preference.preferred_reminder_windows or []),
         )
-        if preference is None:
-            preference = ParticipantCarePreference(
-                participant_id=intervention.participant_id, version=0
-            )
-            session.add(preference)
-            session.flush()
-        disabled = set(preference.disabled_intervention_types or [])
-        disabled.add(normalized_intervention_type(intervention.intervention_type))
-        preference.disabled_intervention_types = sorted(
-            value for value in disabled if value in INTERVENTION_OPTIONS
-        )
-        preference.version = int(preference.version or 0) + 1
-        preference.updated_at = changed_at
+        if after != before:
+            preference.version = int(preference.version or 0) + 1
+            preference.updated_at = changed_at
 
     def _create_snooze_in_session(
         self,
@@ -931,7 +984,8 @@ class CareInterventionRepository:
             warning_identity=identity,
             episode_identity=identity,
             target_time=target,
-            risk_time=target + timedelta(minutes=15),
+            risk_time=original.risk_time,
+            authorization_deadline=target + timedelta(minutes=15),
             valid_until=target + timedelta(minutes=10),
             warning_level=original.warning_level,
             status="pending",

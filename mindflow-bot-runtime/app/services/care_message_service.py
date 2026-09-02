@@ -14,7 +14,10 @@ from app.services.care_templates import (
     CARE_TEMPLATE_LIBRARY_VERSION,
     CareTemplateLibrary,
 )
-from app.services.care_jitai import CareJITAIEngine
+from app.services.care_jitai import (
+    CareJITAIEngine,
+    normalized_intervention_types,
+)
 
 
 CARE_MESSAGE_SCHEMA_VERSION = "care_message.v3"
@@ -42,11 +45,17 @@ class CareMessageService:
         care_history: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         effective_preferences = dict(care_preferences or {})
-        explicit_types = list(effective_preferences.get("preferred_support_types") or [])
+        explicit_types = normalized_intervention_types(
+            list(effective_preferences.get("preferred_support_types") or [])
+        )
+        effective_preferences["preferred_support_types"] = explicit_types
         if not explicit_types:
-            effective_preferences["preferred_support_types"] = list(
-                effective_preferences.get("inferred_support_types") or []
+            effective_preferences["preferred_support_types"] = normalized_intervention_types(
+                list(effective_preferences.get("inferred_support_types") or [])
             )
+        effective_preferences["disabled_intervention_types"] = normalized_intervention_types(
+            list(effective_preferences.get("disabled_intervention_types") or [])
+        )
         context = self.contexts.build(
             source=source,
             local_date=local_date,

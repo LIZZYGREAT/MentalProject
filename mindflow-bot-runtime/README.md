@@ -30,7 +30,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
-- SDK MCP 只暴露十五个业务 Tool，participant identity 只来自 frozen `AgentContext`。
+- SDK MCP 只暴露十六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
 - 飞书 `card.action.trigger` 通过独立的已验签 HTTPS 回调入口进入固定后端处理器；卡片回调不经过对话模型。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
@@ -38,7 +38,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 
-## 十五个业务 Tool
+## 十六个业务 Tool
 
 1. `care_get_today_context`
 2. `care_record_checkin`
@@ -278,7 +278,7 @@ Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以�
 1. `FeishuChannel` 长连接稳定，bot restart count 为 0；
 2. 容器内 Claude Agent SDK 能通过 DeepSeek 返回结果；
 3. 连续消息按 participant 排队，`/stop` 能中断 active turn；
-4. 十五个 MCP Tool 真实调用、审计和身份隔离正确；
+4. 十六个 MCP Tool 真实调用、审计和身份隔离正确；
 5. container recreate 后 session resume、pending reply 和 OAuth Token 均可恢复；
 6. 日志不含 Secret、Token、完整 Prompt 或 MCP 身份上下文。
 

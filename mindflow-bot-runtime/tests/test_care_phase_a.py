@@ -220,7 +220,7 @@ def test_controlled_care_preference_has_distinct_provenance_and_actions():
 
     assert contextual["care_provenance"]["profile_version"] is None
     assert contextual["care_provenance"]["care_preference_version"] == 4
-    assert "短暂散步" in contextual["message"]
+    assert "补水" in contextual["message"]
     assert "药物" not in contextual["message"]
     assert "snooze_30" not in contextual["care_plan"]["actions"]
     assert set(contextual["care_plan"]["actions"]) == {
@@ -363,10 +363,8 @@ def test_high_vulnerability_in_quiet_hours_moves_to_next_acceptable_window():
         f"{DAY.isoformat()}T11:00:00"
     )
     assert windows[0]["target_time"].astimezone(preferences.timezone).hour == 11
-    assert windows[0]["risk_time"] > windows[0]["valid_until"]
-    assert windows[0]["payload"]["predicted_risk_time"].startswith(
-        f"{DAY.isoformat()}T10:00:00"
-    )
+    assert windows[0]["risk_time"] < windows[0]["target_time"]
+    assert windows[0]["authorization_deadline"] > windows[0]["target_time"]
 
 
 def test_user_preferences_are_stricter_than_system_cap_and_cancel_disallowed():
@@ -394,7 +392,7 @@ def test_user_preferences_are_stricter_than_system_cap_and_cancel_disallowed():
     )
     assert updated["version"] == 1
     assert updated["effective_max_proactive_care_per_day"] == 1
-    assert updated["preferred_support_types"] == ["hydration", "walk"]
+    assert updated["preferred_support_types"] == ["hydration_movement"]
 
     with database.session() as session:
         rows = session.query(WarningSchedule).order_by(
@@ -1010,7 +1008,7 @@ def test_admin_timeline_exposes_preferences_provenance_and_append_only_feedback(
 
     timeline = AdminRepository(database).care_timeline(participant.id)
     assert timeline["preferences"]["allow_follow_up"] is False
-    assert timeline["preferences"]["preferred_support_types"] == ["walk"]
+    assert timeline["preferences"]["preferred_support_types"] == ["hydration_movement"]
     assert len(timeline["items"]) == 1
     item = timeline["items"][0]
     assert item["source_warning_id"] == str(intervention_id)

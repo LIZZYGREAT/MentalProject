@@ -368,6 +368,8 @@ def test_0037_adds_jitai_outcome_and_mrt_ready_contracts(monkeypatch):
     columns = []
     tables = []
     checks = []
+    statements = []
+    alterations = []
     monkeypatch.setattr(
         migration.op,
         "add_column",
@@ -386,12 +388,19 @@ def test_0037_adds_jitai_outcome_and_mrt_ready_contracts(monkeypatch):
         lambda name, table, condition: checks.append((name, table, condition)),
     )
     monkeypatch.setattr(migration.op, "create_index", lambda *a, **k: None)
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda *args, **kwargs: alterations.append((args, kwargs)),
+    )
 
     migration.upgrade()
 
     assert ("care_intervention_events", "vulnerability_score") in columns
     assert ("care_intervention_events", "receptivity_score") in columns
     assert ("care_intervention_events", "decision_score") in columns
+    assert ("warning_schedules", "authorization_deadline") in columns
     assert {name for name, _ in tables} == {
         "care_intervention_outcomes",
         "intervention_randomization_events",
@@ -407,7 +416,17 @@ def test_0037_adds_jitai_outcome_and_mrt_ready_contracts(monkeypatch):
         "context_json",
         "created_at",
     } <= outcome_columns
-    assert checks[0][0] == "ck_care_jitai_scores"
+    assert "ck_care_outcome_helpful" in outcome_columns
+    assert "ck_mrt_probability" in dict(tables)["intervention_randomization_events"]
+    assert {name for name, _, _ in checks} == {
+        "ck_care_interruption_tolerance",
+        "ck_care_jitai_scores",
+    }
+    assert "SET authorization_deadline = risk_time" in statements[0]
+    assert alterations[0] == (
+        ("warning_schedules", "authorization_deadline"),
+        {"nullable": False},
+    )
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

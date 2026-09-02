@@ -1479,6 +1479,12 @@ class ObservationRepository:
                 )
                 session.add(row)
                 session.flush()
+                if observation_type == "checkin":
+                    from app.services.care_effectiveness import CareEffectivenessService
+
+                    CareEffectivenessService.attach_observation_in_session(
+                        session, row
+                    )
                 return ObservationWriteResult(
                     observation_id=row.id,
                     observed_at=self._aware(row.observed_at),
@@ -2570,6 +2576,12 @@ class WarningScheduleRepository:
     def _aware(value: datetime) -> datetime:
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
+    @classmethod
+    def _authorization_deadline(cls, value: Any) -> datetime:
+        if isinstance(value, dict):
+            return cls._aware(value.get("authorization_deadline") or value["risk_time"])
+        return cls._aware(value.authorization_deadline or value.risk_time)
+
     @staticmethod
     def _mirror_care(session: Any, row: WarningSchedule) -> None:
         from app.repositories_care import CareInterventionRepository
@@ -2636,6 +2648,7 @@ class WarningScheduleRepository:
             ),
             "episode_identity": row.episode_identity,
             "target_time": row.target_time.isoformat(), "risk_time": row.risk_time.isoformat(),
+            "authorization_deadline": row.authorization_deadline.isoformat(),
             "valid_until": row.valid_until.isoformat(), "warning_level": row.warning_level,
             "status": row.status, "payload": dict(row.payload_json),
             "attempt_count": row.attempt_count,
@@ -2759,7 +2772,7 @@ class WarningScheduleRepository:
         desired = [
             item for item in warnings
             if self._aware(item["valid_until"]) >= now
-            and self._aware(item["risk_time"]) > now
+            and self._authorization_deadline(item) > now
         ]
         rows = session.execute(
             select(WarningSchedule).where(
@@ -2873,6 +2886,8 @@ class WarningScheduleRepository:
                     schedule_changed = (
                         self._aware(row.target_time) != self._aware(item["target_time"])
                         or self._aware(row.risk_time) != self._aware(item["risk_time"])
+                        or self._authorization_deadline(row)
+                        != self._authorization_deadline(item)
                         or self._aware(row.valid_until) != self._aware(item["valid_until"])
                     )
                     next_allowed = (
@@ -2884,7 +2899,7 @@ class WarningScheduleRepository:
                     legal_new_window = (
                         schedule_changed
                         and due <= self._aware(item["valid_until"])
-                        and due < self._aware(item["risk_time"])
+                        and due < self._authorization_deadline(item)
                     )
                     if (
                         legal_new_window
@@ -2941,7 +2956,9 @@ class WarningScheduleRepository:
                     forecast_id=forecast_id, forecast_version=forecast_version,
                     warning_identity=identity, target_time=item["target_time"],
                     episode_identity=episode_identity,
-                    risk_time=item["risk_time"], valid_until=item["valid_until"],
+                    risk_time=item["risk_time"],
+                    authorization_deadline=self._authorization_deadline(item),
+                    valid_until=item["valid_until"],
                     warning_level=item["warning_level"], status=status,
                     payload_json=payload, next_attempt_at=next_attempt_at,
                 )
@@ -2967,6 +2984,7 @@ class WarningScheduleRepository:
             schedule_changed = (
                 self._aware(row.target_time) != self._aware(item["target_time"])
                 or self._aware(row.risk_time) != self._aware(item["risk_time"])
+                or self._authorization_deadline(row) != self._authorization_deadline(item)
                 or self._aware(row.valid_until) != self._aware(item["valid_until"])
             )
             changed = (
@@ -2990,7 +3008,7 @@ class WarningScheduleRepository:
                 # Re-entering the latest desired set is enough to reactivate
                 # an untouched cancelled row; the schedule may be identical.
                 due = max(self._aware(item["target_time"]), now)
-                if due <= self._aware(item["valid_until"]) and due < self._aware(item["risk_time"]):
+                if due <= self._aware(item["valid_until"]) and due < self._authorization_deadline(item):
                     row.status = "pending"
                     row.next_attempt_at = due
             elif (
@@ -3007,7 +3025,7 @@ class WarningScheduleRepository:
                 # This was previously omitted, leaving a permanently active
                 # row whose next attempt was outside its moved window.
                 due = max(self._aware(item["target_time"]), now)
-                if due >= self._aware(item["risk_time"]) or due > self._aware(item["valid_until"]):
+                if due >= self._authorization_deadline(item) or due > self._aware(item["valid_until"]):
                     row.status = "expired"
                     row.next_attempt_at = None
                 else:
@@ -3017,6 +3035,7 @@ class WarningScheduleRepository:
             row.payload_json = desired_payload
             row.target_time = item["target_time"]
             row.risk_time = item["risk_time"]
+            row.authorization_deadline = self._authorization_deadline(item)
             row.valid_until = item["valid_until"]
             row.warning_level = item["warning_level"]
             row.episode_identity = item["episode_identity"]
@@ -3029,7 +3048,7 @@ class WarningScheduleRepository:
             if (
                 row.status in self.ACTIVE
                 and self._aware(row.valid_until) >= now
-                and self._aware(row.risk_time) > now
+                and self._authorization_deadline(row) > now
             ):
                 row.status = "cancelled"
                 row.claim_token = None
@@ -3178,7 +3197,8 @@ class WarningScheduleRepository:
                     f"{source.episode_identity}\0same_day_late_care".encode("utf-8")
                 ).hexdigest(),
                 target_time=now,
-                risk_time=local_end,
+                risk_time=source.risk_time,
+                authorization_deadline=local_end,
                 valid_until=local_end,
                 warning_level=source.warning_level,
                 status="pending",
@@ -3343,7 +3363,7 @@ class WarningScheduleRepository:
                 WarningSchedule.status.in_(self.ACTIVE),
                 or_(
                     WarningSchedule.valid_until < now,
-                    WarningSchedule.risk_time <= now,
+                    WarningSchedule.authorization_deadline <= now,
                 ),
             )).scalars().all()
             for row in expired:
@@ -3370,7 +3390,7 @@ class WarningScheduleRepository:
                     WarningSchedule.target_time <= now,
                     or_(WarningSchedule.next_attempt_at.is_(None), WarningSchedule.next_attempt_at <= now),
                     WarningSchedule.valid_until >= now,
-                    WarningSchedule.risk_time > now,
+                    WarningSchedule.authorization_deadline > now,
                     ForecastSnapshot.valid.is_(True),
                     ForecastSnapshot.forecast_version == WarningSchedule.forecast_version,
                 ).order_by(WarningSchedule.target_time).limit(limit)
@@ -3403,7 +3423,7 @@ class WarningScheduleRepository:
                 return None
             if row.status == "claimed" and row.lease_until and self._aware(row.lease_until) >= now:
                 return None
-            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
+            if self._aware(row.valid_until) < now or self._authorization_deadline(row) <= now:
                 row.status = "expired"
                 row.claim_token = None
                 row.claimed_at = None
@@ -3438,7 +3458,7 @@ class WarningScheduleRepository:
                     row.lease_until = None
                     row.authorized_at = None
                     retry_at = now + timedelta(minutes=5)
-                    if retry_at >= self._aware(row.risk_time):
+                    if retry_at >= self._authorization_deadline(row):
                         row.status = "expired"
                         row.next_attempt_at = None
                     else:
@@ -3524,7 +3544,7 @@ class WarningScheduleRepository:
                     )
                     if next_allowed > now:
                         if (
-                            next_allowed < self._aware(row.risk_time)
+                            next_allowed < self._authorization_deadline(row)
                             and next_allowed <= self._aware(row.valid_until)
                         ):
                             row.status = "pending"
@@ -3572,7 +3592,7 @@ class WarningScheduleRepository:
                 or self._aware(row.lease_until) < now
             ):
                 return False
-            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
+            if self._aware(row.valid_until) < now or self._authorization_deadline(row) <= now:
                 row.status = "expired"
                 row.claim_token = None
                 row.claimed_at = None
@@ -3680,7 +3700,7 @@ class WarningScheduleRepository:
                 delay = retry_base_seconds * (2 ** max(0, row.attempt_count - 1))
                 next_attempt = now + timedelta(seconds=delay)
                 if (
-                    next_attempt >= self._aware(row.risk_time)
+                    next_attempt >= self._authorization_deadline(row)
                     or next_attempt > self._aware(row.valid_until)
                 ):
                     row.status = "expired"
@@ -3716,7 +3736,7 @@ class WarningScheduleRepository:
             now = self._aware(now)
             next_attempt = now + timedelta(minutes=5)
             if (
-                next_attempt >= self._aware(row.risk_time)
+                next_attempt >= self._authorization_deadline(row)
                 or next_attempt > self._aware(row.valid_until)
             ):
                 row.status = "expired"
@@ -3742,7 +3762,7 @@ class WarningScheduleRepository:
                 WarningSchedule.status == "delivery_unavailable",
                 or_(
                     WarningSchedule.valid_until < now,
-                    WarningSchedule.risk_time <= now,
+                    WarningSchedule.authorization_deadline <= now,
                 ),
             )).scalars().all()
             for row in expired:
@@ -3752,7 +3772,7 @@ class WarningScheduleRepository:
             rows = session.execute(select(WarningSchedule).where(
                 WarningSchedule.status == "delivery_unavailable",
                 WarningSchedule.valid_until >= now,
-                WarningSchedule.risk_time > now,
+                WarningSchedule.authorization_deadline > now,
                 WarningSchedule.next_attempt_at <= now,
             ).limit(limit)).scalars().all()
             return [self._view(row) for row in rows]
@@ -3771,7 +3791,7 @@ class WarningScheduleRepository:
             row = session.get(WarningSchedule, warning_id, with_for_update=True)
             if row is None or row.status != "delivery_unavailable":
                 return
-            if self._aware(row.valid_until) < now or self._aware(row.risk_time) <= now:
+            if self._aware(row.valid_until) < now or self._authorization_deadline(row) <= now:
                 row.status = "expired"
             elif available:
                 row.status = "pending"
@@ -3779,7 +3799,7 @@ class WarningScheduleRepository:
             else:
                 next_attempt = now + timedelta(minutes=5)
                 if (
-                    next_attempt >= self._aware(row.risk_time)
+                    next_attempt >= self._authorization_deadline(row)
                     or next_attempt > self._aware(row.valid_until)
                 ):
                     row.status = "expired"

@@ -27,15 +27,35 @@ _OPTION_MAP = {
     "micro_break": "micro_break",
     "transition_buffer": "micro_break",
     "protected_break": "protected_break",
+    "priority_review": "priority_review",
     "workload_decomposition": "priority_review",
+    "task_decomposition": "priority_review",
     "recovery": "hydration_movement",
+    "hydration": "hydration_movement",
+    "walk": "hydration_movement",
+    "hydration_movement": "hydration_movement",
     "pause_and_seek_support": "social_support",
+    "trusted_person": "social_support",
+    "social_support": "social_support",
     "schedule_adjustment": "schedule_adjustment_suggestion",
+    "schedule_adjustment_suggestion": "schedule_adjustment_suggestion",
 }
 
 
 def normalized_intervention_type(value: Any) -> str:
     return _OPTION_MAP.get(str(value or "").strip(), "brief_check_in")
+
+
+def normalized_intervention_types(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        raise ValueError("intervention types must be a list")
+    normalized: set[str] = set()
+    for value in values:
+        raw = str(value or "").strip()
+        if raw not in _OPTION_MAP:
+            raise ValueError(f"unsupported intervention type: {raw}")
+        normalized.add(_OPTION_MAP[raw])
+    return sorted(normalized)
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -176,14 +196,25 @@ class CareJITAIEngine:
         )
         active_type = str((context.active_event or {}).get("event_type") or "").casefold()
         interruptibility = 0.15 if active_type in {"course", "meeting", "exam"} else 0.35 if context.active_event else 0.90
-        interval_minutes = _number(recent.get("previous_warning_interval_minutes"), 1440.0)
+        last_intervention_at = self._instant(recent.get("last_intervention_at"))
+        last_dismissal_at = self._instant(recent.get("last_dismissal_at"))
+        interval_minutes = (
+            max(0.0, (risk_time - last_intervention_at).total_seconds() / 60.0)
+            if last_intervention_at is not None and last_intervention_at <= risk_time
+            else _number(recent.get("previous_warning_interval_minutes"), 1440.0)
+        )
+        recent_dismissal = (
+            risk_time - timedelta(hours=24) <= last_dismissal_at <= risk_time
+            if last_dismissal_at is not None
+            else bool(recent.get("recent_dismissal"))
+        )
         receptivity_features = {
             "time_of_day": 1.0 if 7 <= local_clock.hour < 22 else 0.0,
             "event_interruptibility": interruptibility,
             "stress_level": predicted,
             "warning_level": _clamp(level / 3.0),
             "previous_warning_interval": _clamp(interval_minutes / 240.0),
-            "recent_dismissal": 1.0 if recent.get("recent_dismissal") else 0.0,
+            "recent_dismissal": 1.0 if recent_dismissal else 0.0,
             "quiet_hours": 1.0 if quiet else 0.0,
             "preferred_window": 1.0
             if self._matches_preferred_window(
@@ -264,6 +295,16 @@ class CareJITAIEngine:
         if candidate.date() != risk_time.astimezone(self.timezone).date():
             return None
         return candidate if candidate <= risk_time + timedelta(hours=3) else None
+
+    @staticmethod
+    def _instant(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
 
     @staticmethod
     def _matches_preferred_window(

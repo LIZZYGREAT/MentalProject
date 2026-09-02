@@ -311,6 +311,23 @@ class CareTools:
                         "uniqueItems": True,
                         "maxItems": 7,
                     },
+                    "reenable_intervention_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "brief_check_in",
+                                "micro_break",
+                                "protected_break",
+                                "priority_review",
+                                "hydration_movement",
+                                "social_support",
+                                "schedule_adjustment_suggestion",
+                            ],
+                        },
+                        "uniqueItems": True,
+                        "maxItems": 7,
+                    },
                 },
                 "minProperties": 1,
                 "additionalProperties": False,

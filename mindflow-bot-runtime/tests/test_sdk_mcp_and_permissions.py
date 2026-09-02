@@ -236,6 +236,11 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         properties = set(spec.parameters.get("properties", {}))
         assert properties.isdisjoint(FORBIDDEN_FIELDS)
 
+    preference_spec = next(
+        spec for spec in registry.specs if spec.name == "care_update_preferences"
+    )
+    assert "reenable_intervention_types" in preference_spec.parameters["properties"]
+
     delete_spec = next(
         spec for spec in registry.specs if spec.name == "calendar_delete_event"
     )

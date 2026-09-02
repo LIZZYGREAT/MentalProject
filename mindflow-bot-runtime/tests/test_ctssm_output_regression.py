@@ -94,7 +94,7 @@ def test_production_ctssm_fixture_is_stable_after_legacy_removal():
         "3b674b9753941b253047a42fc305efea884dd011e68e0a6239bb8315ea821a8c"
     )
     assert _sha(warning_windows) == (
-        "d32b572cee8e70c37e5571265ff2b4c22b0cf34c9d4e9da8a86d25be15ad8bce"
+        "846fe6712ade21c2d1d5f3f8f8f975f21735866930abfdf7da9bf2f4b0616319"
     )
     assert _sha(result.confidence_series) == (
         "64a0bab1313af875ecef28e137f128dc98f27b254b159d03aa87ce1897e22c95"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 import uuid
 
@@ -32,23 +32,19 @@ class CareWhatIfSimulationService:
         if start.tzinfo is None or end.tzinfo is None or end <= start:
             raise ValueError("what-if times must be timezone-aware and end after start")
         destination_date = start.astimezone(self.coordinator.timezone).date()
-        affected_dates = [local_date]
-        if destination_date != local_date:
-            affected_dates.append(destination_date)
-        affected_dates = sorted(affected_dates)
+        first_date = min(local_date, destination_date)
+        last_date = max(local_date, destination_date)
+        affected_dates = [
+            first_date + timedelta(days=offset)
+            for offset in range((last_date - first_date).days + 1)
+        ]
         current_by_date: dict[date, dict[str, Any]] = {}
         calendar_by_date: dict[date, dict[str, Any]] = {}
         for target in affected_dates:
             current = self.coordinator.forecasts.latest(participant_id, target)
-            if current is None:
-                raise LookupError(
-                    f"current_forecast_not_found:{target.isoformat()}"
-                )
             calendar = self.coordinator.calendar_snapshots.get(participant_id, target)
-            if calendar is None:
-                raise LookupError(
-                    f"calendar_snapshot_not_found:{target.isoformat()}"
-                )
+            if current is None or calendar is None:
+                raise LookupError(f"scenario_input_unavailable:{target.isoformat()}")
             current_by_date[target] = current
             calendar_by_date[target] = calendar
         source_events = deepcopy(list(calendar_by_date[local_date].get("events") or []))
@@ -67,9 +63,9 @@ class CareWhatIfSimulationService:
                     "semantic": semantic,
                 }
             if normalized_id == str(event_id):
-                event["start_time"] = start.isoformat()
-                event["end_time"] = end.isoformat()
                 moved_event = deepcopy(event)
+                moved_event["start_time"] = start.isoformat()
+                moved_event["end_time"] = end.isoformat()
                 changed = True
         if not changed:
             raise LookupError("calendar_event_not_found")
@@ -90,10 +86,14 @@ class CareWhatIfSimulationService:
             calendar = calendar_by_date[target]
             original_curve = list(current.get("curve") or [])
             original_curves.extend(original_curve)
+            events = deepcopy(list(calendar.get("events") or []))
             if target == local_date:
-                events = source_events
-            else:
-                events = deepcopy(list(calendar.get("events") or []))
+                events = [
+                    event for event in events
+                    if str(event.get("id") or event.get("event_id") or "")
+                    != str(event_id)
+                ]
+            if target == destination_date:
                 events = [
                     event for event in events
                     if str(event.get("id") or event.get("event_id") or "")
@@ -132,16 +132,7 @@ class CareWhatIfSimulationService:
                 initial_state=initial_override,
             )
             scenario_curve = list(scenario.get("trajectory") or [])
-            if (
-                scenario.get("stress_0_10") is not None
-                and scenario.get("vitality_0_10") is not None
-            ):
-                previous_scenario_terminal = {
-                    "stress_0_10": float(scenario["stress_0_10"]),
-                    "vitality_0_10": float(scenario["vitality_0_10"]),
-                }
-            else:
-                previous_scenario_terminal = None
+            previous_scenario_terminal = self._terminal_state(scenario)
             previous_target = target
             scenario_curves.extend(scenario_curve)
             per_date[target.isoformat()] = {
@@ -176,16 +167,38 @@ class CareWhatIfSimulationService:
         }
 
     @staticmethod
+    def _terminal_state(result: dict[str, Any]) -> dict[str, float] | None:
+        terminal = dict(result.get("terminal_state") or {})
+        curve = list(result.get("trajectory") or [])
+        if not terminal and curve:
+            terminal = dict(curve[-1])
+        stress = result.get("stress_0_10", terminal.get("stress_0_10"))
+        vitality = result.get("vitality_0_10", terminal.get("vitality_0_10"))
+        if stress is None or vitality is None:
+            return None
+        return {
+            "stress_0_10": float(stress),
+            "vitality_0_10": float(vitality),
+        }
+
+    @staticmethod
     def _metrics(curve: list[dict[str, Any]]) -> dict[str, float]:
         stress = [float(point.get("stress_0_10") or 0.0) for point in curve]
         workload = [float(point.get("workload") or 0.0) for point in curve]
-        recoveries = [
-            point for point in curve
-            if float(point.get("recovery_resource") or 0.0) >= 0.35
+        recovery_flags = [
+            float(point.get("recovery_resource") or 0.0) >= 0.35
+            for point in curve
         ]
+        recovery_window_count = sum(
+            1
+            for index, active in enumerate(recovery_flags)
+            if active and (index == 0 or not recovery_flags[index - 1])
+        )
+        recovery_duration = sum(5 for active in recovery_flags if active)
         return {
             "peak_stress": round(max(stress) if stress else 0.0, 4),
             "high_stress_duration_minutes": float(sum(5 for value in stress if value >= 7.0)),
             "mean_workload": round(sum(workload) / len(workload), 4) if workload else 0.0,
-            "recovery_windows": float(len(recoveries)),
+            "recovery_window_count": float(recovery_window_count),
+            "recovery_duration_minutes": float(recovery_duration),
         }

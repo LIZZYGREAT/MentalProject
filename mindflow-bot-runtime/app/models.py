@@ -35,6 +35,12 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _warning_authorization_deadline(context: object) -> datetime:
+    """Keep legacy constructors compatible while defaulting deadline to risk."""
+
+    return context.get_current_parameters()["risk_time"]  # type: ignore[attr-defined]
+
+
 class Participant(Base):
     __tablename__ = "participants"
 
@@ -1029,6 +1035,11 @@ class WarningSchedule(Base):
     episode_identity: Mapped[str] = mapped_column(String(64), nullable=False)
     target_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     risk_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    authorization_deadline: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_warning_authorization_deadline,
+    )
     valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     warning_level: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
@@ -1050,6 +1061,12 @@ class WarningSchedule(Base):
 
 class ParticipantCarePreference(Base):
     __tablename__ = "participant_care_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "interruption_tolerance BETWEEN 0 AND 1",
+            name="ck_care_interruption_tolerance",
+        ),
+    )
 
     participant_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -1082,6 +1099,12 @@ class CareInterventionEvent(Base):
         UniqueConstraint("source_warning_id", name="uq_care_intervention_warning"),
         Index("ix_care_intervention_participant_scheduled", "participant_id", "scheduled_at"),
         Index("ix_care_intervention_status_scheduled", "status", "scheduled_at"),
+        CheckConstraint(
+            "(vulnerability_score IS NULL OR vulnerability_score BETWEEN 0 AND 1) AND "
+            "(receptivity_score IS NULL OR receptivity_score BETWEEN 0 AND 1) AND "
+            "(decision_score IS NULL OR decision_score BETWEEN 0 AND 1)",
+            name="ck_care_jitai_scores",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1159,6 +1182,10 @@ class CareInterventionOutcome(Base):
     __tablename__ = "care_intervention_outcomes"
     __table_args__ = (
         Index("ix_care_outcome_participant_created", "participant_id", "created_at"),
+        CheckConstraint(
+            "helpful_rating IS NULL OR helpful_rating BETWEEN 0 AND 1",
+            name="ck_care_outcome_helpful",
+        ),
     )
 
     intervention_id: Mapped[uuid.UUID] = mapped_column(
@@ -1191,6 +1218,10 @@ class InterventionRandomizationEvent(Base):
     __tablename__ = "intervention_randomization_events"
     __table_args__ = (
         Index("ix_mrt_participant_decision", "participant_id", "decision_time"),
+        CheckConstraint(
+            "randomization_probability BETWEEN 0 AND 1",
+            name="ck_mrt_probability",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
