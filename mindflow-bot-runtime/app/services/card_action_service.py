@@ -114,6 +114,7 @@ class CardActionService:
                     if result.get("action_result") == "scheduled"
                     else "已记录延后选择，但受当前提醒上限或设置限制，未新增提醒。"
                 ),
+                "disable_type": "已关闭这一类主动关怀提醒；显式选择会优先于自动学习。",
             }.get(care_action, "关怀反馈已记录。")
             return {
                 "ok": True,

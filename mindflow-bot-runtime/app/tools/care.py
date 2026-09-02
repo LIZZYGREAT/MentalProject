@@ -27,6 +27,7 @@ from app.repositories import (
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_message_service import CareMessageService
 from app.services.care_context import CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
+from app.services.care_what_if import CareWhatIfSimulationService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.calendar_mutation_impact import CalendarMutationImpactResolver
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
@@ -188,6 +189,10 @@ class CareTools:
         )
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.what_if = (
+            CareWhatIfSimulationService(forecast_coordinator)
+            if forecast_coordinator is not None else None
+        )
         self.calendar_mutation_impact = CalendarMutationImpactResolver(
             timezone_name
         )
@@ -295,6 +300,12 @@ class CareTools:
                                 "transition_buffer",
                                 "recovery",
                                 "trusted_person",
+                                "brief_check_in",
+                                "protected_break",
+                                "priority_review",
+                                "hydration_movement",
+                                "social_support",
+                                "schedule_adjustment_suggestion",
                             ],
                         },
                         "uniqueItems": True,
@@ -322,6 +333,7 @@ class CareTools:
                             "not_relevant",
                             "too_early",
                             "too_late",
+                            "disable_type",
                         ],
                     },
                     "comment": {"type": "string", "maxLength": 500},
@@ -346,6 +358,22 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_pressure_curve,
+        )
+        registry.register(
+            "care_simulate_schedule_change",
+            "Simulate moving one event on a copied Calendar scenario, recompute Forecast, and compare peak stress, high-stress duration, workload, and recovery windows without mutating the real Calendar.",
+            {
+                "type": "object",
+                "properties": {
+                    "local_date": {"type": "string", "format": "date"},
+                    "event_id": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "new_start_time": {"type": "string", "format": "date-time"},
+                    "new_end_time": {"type": "string", "format": "date-time"},
+                },
+                "required": ["local_date", "event_id", "new_start_time", "new_end_time"],
+                "additionalProperties": False,
+            },
+            self.simulate_schedule_change,
         )
         registry.register(
             "care_get_checkin_card",
@@ -762,6 +790,26 @@ class CareTools:
             },
             "curve_analysis": analysis.to_dict(),
             "calendar_degraded": bool(result.get("calendar_degraded")),
+        }
+
+    def simulate_schedule_change(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.what_if is None:
+            raise RuntimeError("what-if simulation is unavailable")
+        try:
+            target = date.fromisoformat(str(args.get("local_date") or ""))
+        except ValueError as exc:
+            raise ValueError("local_date must be YYYY-MM-DD") from exc
+        return {
+            "ok": True,
+            **self.what_if.simulate(
+                ctx.participant_id,
+                target,
+                event_id=str(args.get("event_id") or ""),
+                new_start_time=str(args.get("new_start_time") or ""),
+                new_end_time=str(args.get("new_end_time") or ""),
+            ),
         }
 
     async def _refresh_calendar_mutation_forecasts(

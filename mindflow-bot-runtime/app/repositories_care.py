@@ -15,11 +15,17 @@ from app.db import Database
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    CareInterventionOutcome,
     DailyReviewSchedule,
     Participant,
     ParticipantCarePreference,
+    StateObservation,
     WarningSchedule,
     utc_now,
+)
+from app.services.care_jitai import (
+    INTERVENTION_OPTIONS,
+    normalized_intervention_type,
 )
 
 
@@ -31,8 +37,9 @@ CARE_ACTIONS = {
     "not_relevant",
     "too_early",
     "too_late",
+    "disable_type",
 }
-CARE_CARD_ACTIONS = ["ack", "snooze_30", "mute_today", "helpful", "not_relevant"]
+CARE_CARD_ACTIONS = ["helpful", "not_relevant", "snooze_30", "disable_type"]
 OPERATIONAL_CARE_ACTIONS = {"ack", "snooze_30", "mute_today"}
 PREFERRED_SUPPORT_TYPES = {
     "micro_break",
@@ -42,6 +49,7 @@ PREFERRED_SUPPORT_TYPES = {
     "transition_buffer",
     "recovery",
     "trusted_person",
+    *INTERVENTION_OPTIONS,
 }
 
 
@@ -93,6 +101,10 @@ class ParticipantCarePreferenceRepository:
             "allow_schedule_suggestions": False,
             "allow_follow_up": True,
             "preferred_support_types": [],
+            "inferred_support_types": [],
+            "disabled_intervention_types": [],
+            "interruption_tolerance": 0.5,
+            "preferred_reminder_windows": [],
             "muted_until": None,
             "version": 0,
             "updated_at": None,
@@ -430,6 +442,10 @@ class ParticipantCarePreferenceRepository:
             "allow_schedule_suggestions": bool(row.allow_schedule_suggestions),
             "allow_follow_up": bool(row.allow_follow_up),
             "preferred_support_types": list(row.preferred_support_types or []),
+            "inferred_support_types": list(row.inferred_support_types or []),
+            "disabled_intervention_types": list(row.disabled_intervention_types or []),
+            "interruption_tolerance": round(float(row.interruption_tolerance), 3),
+            "preferred_reminder_windows": list(row.preferred_reminder_windows or []),
             "muted_until": (
                 _aware(row.muted_until).isoformat() if row.muted_until else None
             ),
@@ -467,9 +483,9 @@ class CareInterventionRepository:
             "participant_id": warning.participant_id,
             "source_forecast_id": warning.forecast_id,
             "forecast_version": warning.forecast_version,
-            "intervention_type": str(
-                plan.get("intervention_type") or "generic_fallback"
-            )[:64],
+            "intervention_type": normalized_intervention_type(
+                plan.get("option_type") or plan.get("intervention_type")
+            ),
             "template_id": str(
                 provenance.get("template_id") or plan.get("template_id") or "legacy-fallback"
             )[:128],
@@ -479,6 +495,10 @@ class CareInterventionRepository:
             "reason_code": str(
                 plan.get("reason_code") or "forecast_warning"
             )[:128],
+            "vulnerability_score": plan.get("vulnerability_score"),
+            "receptivity_score": plan.get("receptivity_score"),
+            "decision_score": plan.get("decision_score"),
+            "decision_json": dict(plan.get("jitai_decision") or {}),
             "scheduled_at": warning.target_time,
             "sent_at": warning.sent_at,
             "delivery_status": delivery_status,
@@ -494,22 +514,93 @@ class CareInterventionRepository:
             "updated_at": warning.updated_at,
         }
         if row is None:
-            session.add(
-                CareInterventionEvent(
+            row = CareInterventionEvent(
                     id=warning.id,
                     source_warning_id=warning.id,
                     status=status,
                     created_at=warning.updated_at,
                     **values,
                 )
+            session.add(row)
+        else:
+            for key, value in values.items():
+                if key == "updated_at" and row.user_action and row.updated_at:
+                    value = max(_aware(row.updated_at), _aware(value))
+                setattr(row, key, value)
+            if not row.user_action:
+                row.status = status
+        if warning.sent_at is not None:
+            CareInterventionRepository._ensure_outcome_in_session(
+                session, row, warning.updated_at
             )
-            return
-        for key, value in values.items():
-            if key == "updated_at" and row.user_action and row.updated_at:
-                value = max(_aware(row.updated_at), _aware(value))
-            setattr(row, key, value)
-        if not row.user_action:
-            row.status = status
+
+    @staticmethod
+    def _ensure_outcome_in_session(
+        session: Any,
+        intervention: CareInterventionEvent,
+        changed_at: datetime,
+    ) -> CareInterventionOutcome:
+        outcome = session.get(CareInterventionOutcome, intervention.id)
+        if outcome is not None:
+            return outcome
+        stored = dict(intervention.context_json or {})
+        care_context = dict(stored.get("care_context") or {})
+        outcome = CareInterventionOutcome(
+            intervention_id=intervention.id,
+            participant_id=intervention.participant_id,
+            baseline_state={
+                "stress_0_10": care_context.get("stress_0_10"),
+                "vitality_0_10": care_context.get("vitality_0_10"),
+                "measured_at": care_context.get("risk_time") or (
+                    _aware(intervention.sent_at).isoformat()
+                    if intervention.sent_at else None
+                ),
+                "source": "forecast_at_decision_time",
+            },
+            context_json={
+                "observational_only": True,
+                "intervention_type": intervention.intervention_type,
+                "receptivity_score": intervention.receptivity_score,
+                "decision_score": intervention.decision_score,
+                "care_context": care_context,
+            },
+            created_at=changed_at,
+            updated_at=changed_at,
+        )
+        session.add(outcome)
+        return outcome
+
+    def decision_context(
+        self, participant_id: uuid.UUID, *, at: datetime | None = None
+    ) -> dict[str, Any]:
+        decision_time = _aware(at or utc_now())
+        with self.database.session() as session:
+            latest = session.execute(
+                select(CareInterventionEvent).where(
+                    CareInterventionEvent.participant_id == participant_id,
+                    CareInterventionEvent.sent_at.is_not(None),
+                    CareInterventionEvent.sent_at <= decision_time,
+                ).order_by(desc(CareInterventionEvent.sent_at)).limit(1)
+            ).scalar_one_or_none()
+            dismissal = session.execute(
+                select(CareInterventionFeedback.id).where(
+                    CareInterventionFeedback.participant_id == participant_id,
+                    CareInterventionFeedback.submitted_at >= decision_time - timedelta(hours=24),
+                    CareInterventionFeedback.action_selected.in_(
+                        ("not_relevant", "snooze_30", "disable_type")
+                    ),
+                ).limit(1)
+            ).first()
+            interval = (
+                (decision_time - _aware(latest.sent_at)).total_seconds() / 60.0
+                if latest and latest.sent_at else 1440.0
+            )
+            return {
+                "previous_warning_interval_minutes": round(max(0.0, interval), 2),
+                "recent_dismissal": dismissal is not None,
+                "last_intervention_at": _aware(latest.sent_at).isoformat()
+                if latest and latest.sent_at else None,
+            }
 
     def latest_sent(self, participant_id: uuid.UUID) -> dict[str, Any] | None:
         with self.database.session() as session:
@@ -651,6 +742,16 @@ class CareInterventionRepository:
                     intervention.updated_at = changed_at
                     intervention.status = "acknowledged"
                     action_result = "recorded"
+                elif normalized_action == "disable_type":
+                    intervention.user_action = normalized_action
+                    intervention.action_at = changed_at
+                    intervention.updated_at = changed_at
+                    intervention.status = "type_disabled"
+                    self._disable_type_in_session(session, intervention, changed_at)
+                    action_result = "recorded"
+                self._update_outcome_and_learning_in_session(
+                    session, intervention, normalized_action, changed_at
+                )
                 session.flush()
                 return {
                     "created": True,
@@ -687,6 +788,74 @@ class CareInterventionRepository:
                         requested_action=normalized_action,
                     )
             raise
+
+    def _update_outcome_and_learning_in_session(
+        self,
+        session: Any,
+        intervention: CareInterventionEvent,
+        action: str,
+        changed_at: datetime,
+    ) -> None:
+        outcome = self._ensure_outcome_in_session(session, intervention, changed_at)
+        outcome.user_action = action
+        outcome.updated_at = changed_at
+        if action == "helpful":
+            outcome.helpful_rating = 1.0
+        elif action in {"not_relevant", "disable_type"}:
+            outcome.helpful_rating = 0.0
+        preference = session.get(
+            ParticipantCarePreference, intervention.participant_id, with_for_update=True
+        )
+        if preference is None:
+            preference = ParticipantCarePreference(
+                participant_id=intervention.participant_id, version=0
+            )
+            session.add(preference)
+            session.flush()
+        inferred = set(preference.inferred_support_types or [])
+        if action == "helpful":
+            inferred.add(intervention.intervention_type)
+        elif action in {"not_relevant", "disable_type"}:
+            inferred.discard(intervention.intervention_type)
+        preference.inferred_support_types = sorted(inferred)
+        tolerance = float(preference.interruption_tolerance or 0.5)
+        if action in {"snooze_30", "not_relevant", "disable_type"}:
+            tolerance = max(0.0, tolerance - 0.1)
+        elif action == "helpful":
+            tolerance = min(1.0, tolerance + 0.05)
+        preference.interruption_tolerance = round(tolerance, 3)
+        if action == "snooze_30" and intervention.sent_at:
+            local_hour = _aware(intervention.sent_at).astimezone(
+                self.preferences.timezone
+            ).hour
+            windows = set(preference.preferred_reminder_windows or [])
+            windows.add(f"{(local_hour + 1) % 24:02d}:00-{(local_hour + 2) % 24:02d}:00")
+            preference.preferred_reminder_windows = sorted(windows)[:6]
+        preference.version = int(preference.version or 0) + 1
+        preference.updated_at = changed_at
+
+    def _disable_type_in_session(
+        self,
+        session: Any,
+        intervention: CareInterventionEvent,
+        changed_at: datetime,
+    ) -> None:
+        preference = session.get(
+            ParticipantCarePreference, intervention.participant_id, with_for_update=True
+        )
+        if preference is None:
+            preference = ParticipantCarePreference(
+                participant_id=intervention.participant_id, version=0
+            )
+            session.add(preference)
+            session.flush()
+        disabled = set(preference.disabled_intervention_types or [])
+        disabled.add(normalized_intervention_type(intervention.intervention_type))
+        preference.disabled_intervention_types = sorted(
+            value for value in disabled if value in INTERVENTION_OPTIONS
+        )
+        preference.version = int(preference.version or 0) + 1
+        preference.updated_at = changed_at
 
     def _create_snooze_in_session(
         self,
@@ -898,6 +1067,10 @@ class CareInterventionRepository:
             "template_id": row.template_id,
             "template_version": row.template_version,
             "reason_code": row.reason_code,
+            "vulnerability_score": row.vulnerability_score,
+            "receptivity_score": row.receptivity_score,
+            "decision_score": row.decision_score,
+            "decision": dict(row.decision_json or {}),
             "scheduled_at": _aware(row.scheduled_at).isoformat(),
             "sent_at": _aware(row.sent_at).isoformat() if row.sent_at else None,
             "status": row.status,

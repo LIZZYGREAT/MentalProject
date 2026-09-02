@@ -139,6 +139,11 @@ class CareInterventionPolicy:
             "micro_break": "micro_break",
             "task_decomposition": "workload_decomposition",
             "transition_buffer": "transition_buffer",
+            "brief_check_in": "brief_check_in",
+            "protected_break": "protected_break",
+            "priority_review": "workload_decomposition",
+            "hydration_movement": "recovery",
+            "schedule_adjustment_suggestion": "schedule_adjustment",
         }
         preferred = set(context.profile_summary.preferred_support_types)
         for candidate in candidates:
@@ -188,11 +193,10 @@ class CareInterventionPolicy:
             context_quality=context.context_quality,
             facts_used=context.fact_codes,
             actions=(
-                "ack",
-                *(("snooze_30",) if context.allow_follow_up else ()),
-                "mute_today",
                 "helpful",
                 "not_relevant",
+                *(("snooze_30",) if context.allow_follow_up else ()),
+                "disable_type",
             ),
             ranking_score=round(max(0.0, min(ranking_score, 1.0)), 3),
             preference_matched=preference_matched,
