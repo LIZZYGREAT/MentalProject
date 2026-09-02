@@ -14,9 +14,10 @@ from app.services.care_templates import (
     CARE_TEMPLATE_LIBRARY_VERSION,
     CareTemplateLibrary,
 )
+from app.services.care_jitai import CareJITAIEngine
 
 
-CARE_MESSAGE_SCHEMA_VERSION = "care_message.v2"
+CARE_MESSAGE_SCHEMA_VERSION = "care_message.v3"
 
 
 class CareMessageService:
@@ -24,6 +25,7 @@ class CareMessageService:
         self.contexts = CareContextBuilder(timezone_name)
         self.policy = CareInterventionPolicy()
         self.templates = CareTemplateLibrary()
+        self.jitai = CareJITAIEngine(timezone_name)
 
     def contextualize_alert(
         self,
@@ -37,7 +39,14 @@ class CareMessageService:
         profile: Mapping[str, Any] | None,
         profile_version: int | None,
         care_preferences: Mapping[str, Any] | None = None,
+        care_history: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        effective_preferences = dict(care_preferences or {})
+        explicit_types = list(effective_preferences.get("preferred_support_types") or [])
+        if not explicit_types:
+            effective_preferences["preferred_support_types"] = list(
+                effective_preferences.get("inferred_support_types") or []
+            )
         context = self.contexts.build(
             source=source,
             local_date=local_date,
@@ -47,10 +56,37 @@ class CareMessageService:
             recent_observation=recent_observation,
             profile=profile,
             profile_version=profile_version,
-            care_preferences=care_preferences,
+            care_preferences=effective_preferences or None,
         )
         plan = self.policy.plan(context)
         rendered = self.templates.render(context, plan)
+        decision = self.jitai.decide(
+            context=context,
+            alert=alert,
+            proposed_type=plan.intervention_type,
+            preferences=effective_preferences,
+            history=care_history,
+        )
+        if decision.option_type in set(
+            effective_preferences.get("disabled_intervention_types") or []
+        ):
+            decision = type(decision)(
+                **{
+                    **decision.to_dict(),
+                    "decision_rule": "hold_explicitly_disabled",
+                    "scheduled_at": None,
+                }
+            )
+        plan_payload = {
+            **plan.to_dict(),
+            "option_type": decision.option_type,
+            "vulnerability_score": decision.vulnerability_score,
+            "receptivity_score": decision.receptivity_score,
+            "decision_score": decision.decision_score,
+            "decision_rule": decision.decision_rule,
+            "scheduled_at": decision.scheduled_at,
+            "jitai_decision": decision.to_dict(),
+        }
         provenance = {
             "schema_version": CARE_MESSAGE_SCHEMA_VERSION,
             "source": context.source,
@@ -81,13 +117,17 @@ class CareMessageService:
                 context.recent_observation_max_age_minutes
             ),
             "context_quality": context.context_quality,
+            "vulnerability_score": decision.vulnerability_score,
+            "receptivity_score": decision.receptivity_score,
+            "decision_score": decision.decision_score,
+            "decision_rule": decision.decision_rule,
         }
         result = dict(alert)
         result.pop("message", None)
         result.update(
             {
                 "message": rendered.message,
-                "care_plan": plan.to_dict(),
+                "care_plan": plan_payload,
                 "care_context": context.to_dict(),
                 "care_provenance": provenance,
             }

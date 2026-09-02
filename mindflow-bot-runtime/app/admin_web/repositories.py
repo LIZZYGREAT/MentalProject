@@ -16,6 +16,7 @@ from app.models import (
     CalendarSnapshot,
     CareInterventionEvent,
     CareInterventionFeedback,
+    CareInterventionOutcome,
     FeishuBinding,
     FeishuOAuthToken,
     ForecastSnapshot,
@@ -582,6 +583,27 @@ class AdminRepository:
                         "callback_event_id": feedback.callback_event_id,
                     }
                 )
+            outcome_rows = (
+                session.execute(
+                    select(CareInterventionOutcome).where(
+                        CareInterventionOutcome.intervention_id.in_(event_ids)
+                    )
+                ).scalars().all()
+                if event_ids else []
+            )
+            outcomes = {
+                row.intervention_id: {
+                    "baseline_state": _redact(dict(row.baseline_state or {})),
+                    "followup_30m": _redact(dict(row.followup_30m or {})) if row.followup_30m else None,
+                    "followup_60m": _redact(dict(row.followup_60m or {})) if row.followup_60m else None,
+                    "helpful_rating": row.helpful_rating,
+                    "user_action": row.user_action,
+                    "context": _redact(dict(row.context_json or {})),
+                    "created_at": _iso(row.created_at),
+                    "updated_at": _iso(row.updated_at),
+                }
+                for row in outcome_rows
+            }
             return {
                 "preferences": self._care_preference_view(preference),
                 "items": [
@@ -594,6 +616,10 @@ class AdminRepository:
                         "template_id": row.template_id,
                         "template_version": row.template_version,
                         "reason_code": row.reason_code,
+                        "vulnerability_score": row.vulnerability_score,
+                        "receptivity_score": row.receptivity_score,
+                        "decision_score": row.decision_score,
+                        "decision": _redact(dict(row.decision_json or {})),
                         "scheduled_at": _iso(row.scheduled_at),
                         "sent_at": _iso(row.sent_at),
                         "status": row.status,
@@ -605,6 +631,7 @@ class AdminRepository:
                         "context": _redact(dict(row.context_json)),
                         "actions": list(row.actions_json),
                         "feedback": feedback_by_event.get(row.id, []),
+                        "outcome": outcomes.get(row.id),
                         "created_at": _iso(row.created_at),
                         "updated_at": _iso(row.updated_at),
                     }
@@ -636,6 +663,10 @@ class AdminRepository:
             "allow_schedule_suggestions": bool(row.allow_schedule_suggestions),
             "allow_follow_up": bool(row.allow_follow_up),
             "preferred_support_types": list(row.preferred_support_types or []),
+            "inferred_support_types": list(row.inferred_support_types or []),
+            "disabled_intervention_types": list(row.disabled_intervention_types or []),
+            "interruption_tolerance": row.interruption_tolerance,
+            "preferred_reminder_windows": list(row.preferred_reminder_windows or []),
             "muted_until": _iso(row.muted_until),
             "version": row.version,
             "updated_at": _iso(row.updated_at),

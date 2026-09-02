@@ -155,6 +155,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
         if migration.revision == "0036_stage5_effective_profile"
     )
     assert migration_0036.down_revision == "0035_stage5_v7_runtime_cutover"
+    migration_0037 = next(
+        migration for migration in migrations
+        if migration.revision == "0037_stage6_care_jitai"
+    )
+    assert migration_0037.down_revision == "0036_stage5_effective_profile"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
@@ -356,6 +361,53 @@ def test_0036_adds_durable_weekly_dataset_batch_identity(monkeypatch):
     ]
     assert indexes[0][0] == "uq_dataset_snapshot_weekly_batch"
     assert indexes[0][3]["postgresql_where"] is not None
+
+
+def test_0037_adds_jitai_outcome_and_mrt_ready_contracts(monkeypatch):
+    migration = _migration(VERSIONS / "0037_stage6_care_jitai.py")
+    columns = []
+    tables = []
+    checks = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *items, **kwargs: tables.append(
+            (name, {item.name for item in items if hasattr(item, "name")})
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "create_index", lambda *a, **k: None)
+
+    migration.upgrade()
+
+    assert ("care_intervention_events", "vulnerability_score") in columns
+    assert ("care_intervention_events", "receptivity_score") in columns
+    assert ("care_intervention_events", "decision_score") in columns
+    assert {name for name, _ in tables} == {
+        "care_intervention_outcomes",
+        "intervention_randomization_events",
+    }
+    outcome_columns = dict(tables)["care_intervention_outcomes"]
+    assert {
+        "intervention_id",
+        "baseline_state",
+        "followup_30m",
+        "followup_60m",
+        "helpful_rating",
+        "user_action",
+        "context_json",
+        "created_at",
+    } <= outcome_columns
+    assert checks[0][0] == "ck_care_jitai_scores"
 
 
 def test_0021_makes_energy_consumption_nullable_and_has_safe_downgrade(

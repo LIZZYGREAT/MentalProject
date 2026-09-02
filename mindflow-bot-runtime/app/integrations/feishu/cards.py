@@ -339,6 +339,7 @@ def care_intervention_card(
         "mute_today": ("今天不再提醒", "default"),
         "helpful": ("有帮助", "default"),
         "not_relevant": ("不太相关", "default"),
+        "disable_type": ("不想收到这类提醒", "default"),
     }
     buttons = []
     for action in actions:
@@ -389,7 +390,7 @@ def care_intervention_card(
                 {
                     "tag": "markdown",
                     "text_size": "notation",
-                    "content": "这是非临床的趋势提醒；你可以忽略、延后或关闭今天的提醒。",
+                    "content": "这是非临床的趋势提醒；你可以忽略、延后或关闭这一类提醒。",
                 },
             ],
         },

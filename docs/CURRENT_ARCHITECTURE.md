@@ -2,9 +2,9 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 15 -->
+<!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0036_stage5_effective_profile -->
+<!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
 
 ## 运行边界
 
