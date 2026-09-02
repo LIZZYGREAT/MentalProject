@@ -73,8 +73,8 @@ services:
     command: ["python3", "-m", "pytest", "-q", "tests"]
     restart: "no"
     cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}
-    mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1536m}
-    memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-2048m}
+    mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1024m}
+    memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-1536m}
     pids_limit: ${ACCEPTANCE_PID_LIMIT:-256}
 
   admin:
