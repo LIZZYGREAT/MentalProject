@@ -59,6 +59,10 @@ def daily_checkin_card() -> dict[str, Any]:
                     "name": "mindflow_daily_checkin",
                     "elements": [
                         {
+                            "tag": "markdown",
+                            "content": "**当前压力**",
+                        },
+                        {
                             "tag": "select_static",
                             "name": "stress",
                             "required": True,
@@ -66,8 +70,11 @@ def daily_checkin_card() -> dict[str, Any]:
                                 "tag": "plain_text",
                                 "content": "选择 0–10",
                             },
-                            "label": {"tag": "plain_text", "content": "当前压力"},
                             "options": scale_options,
+                        },
+                        {
+                            "tag": "markdown",
+                            "content": "**当前精力**",
                         },
                         {
                             "tag": "select_static",
@@ -77,7 +84,6 @@ def daily_checkin_card() -> dict[str, Any]:
                                 "tag": "plain_text",
                                 "content": "选择 0–10",
                             },
-                            "label": {"tag": "plain_text", "content": "当前精力"},
                             "options": scale_options,
                         },
                         {
@@ -92,6 +98,10 @@ def daily_checkin_card() -> dict[str, Any]:
                             "label": {"tag": "plain_text", "content": "正在做什么"},
                         },
                         {
+                            "tag": "markdown",
+                            "content": "**上次记录后有压力事件吗**",
+                        },
+                        {
                             "tag": "select_static",
                             "name": "stress_event_since_last",
                             "required": True,
@@ -99,11 +109,11 @@ def daily_checkin_card() -> dict[str, Any]:
                                 "tag": "plain_text",
                                 "content": "请选择",
                             },
-                            "label": {
-                                "tag": "plain_text",
-                                "content": "上次记录后有压力事件吗",
-                            },
                             "options": boolean_options,
+                        },
+                        {
+                            "tag": "markdown",
+                            "content": "**该事件仍在持续吗**",
                         },
                         {
                             "tag": "select_static",
@@ -112,10 +122,6 @@ def daily_checkin_card() -> dict[str, Any]:
                             "placeholder": {
                                 "tag": "plain_text",
                                 "content": "请选择",
-                            },
-                            "label": {
-                                "tag": "plain_text",
-                                "content": "该事件仍在持续吗",
                             },
                             "options": boolean_options,
                         },
@@ -177,14 +183,6 @@ def daily_review_card(
         ("不确定", "unknown"),
     ]
     elements: list[dict[str, Any]] = []
-    field_labels = {
-        "start_stress": "早晨起始压力",
-        "start_energy": "早晨起始精力",
-        "peak_stress": "全天最高压力",
-        "end_stress": "当天收尾压力",
-        "end_energy": "当天收尾精力",
-        "energy_consumption": "全天精力消耗（选填）",
-    }
 
     def add_scale(
         name: str, *, prompt: str, guidance: str = "", required: bool = True
@@ -199,7 +197,6 @@ def daily_review_card(
                 "tag": "plain_text",
                 "content": "选择 0–10" if required else "选填 0–10",
             },
-            "label": {"tag": "plain_text", "content": field_labels[name]},
             "options": scale_options,
         })
 
@@ -225,7 +222,6 @@ def daily_review_card(
     elements.append({
         "tag": "select_static", "name": "peak_period", "required": True,
         "placeholder": {"tag": "plain_text", "content": "选择大致时段"},
-        "label": {"tag": "plain_text", "content": "最高压力出现时段"},
         "options": [
             {"text": {"tag": "plain_text", "content": label}, "value": value}
             for label, value in period_options

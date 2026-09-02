@@ -87,7 +87,8 @@ def test_daily_checkin_card_uses_json_2_form_submit_contract():
         item for item in card["body"]["elements"] if item["tag"] == "form"
     )
     assert form["name"] == "mindflow_daily_checkin"
-    fields = {item.get("name"): item for item in form["elements"]}
+    form_elements = form["elements"]
+    fields = {item.get("name"): item for item in form_elements if item.get("name")}
 
     assert set(fields) == {
         "stress",
@@ -97,6 +98,20 @@ def test_daily_checkin_card_uses_json_2_form_submit_contract():
         "event_ongoing",
         "submit_checkin",
     }
+    select_prompts = {
+        "stress": "当前压力",
+        "energy": "当前精力",
+        "stress_event_since_last": "上次记录后有压力事件吗",
+        "event_ongoing": "该事件仍在持续吗",
+    }
+    for name, prompt in select_prompts.items():
+        select = fields[name]
+        assert select["tag"] == "select_static"
+        assert "label" not in select
+        visible_description = form_elements[form_elements.index(select) - 1]
+        assert visible_description["tag"] == "markdown"
+        assert prompt in visible_description["content"]
+    assert fields["activity"]["label"]["content"] == "正在做什么"
     button = fields["submit_checkin"]
     assert button["form_action_type"] == "submit"
     assert "action_type" not in button

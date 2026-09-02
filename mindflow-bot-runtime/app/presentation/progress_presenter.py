@@ -17,6 +17,10 @@ TOOL_STAGE = {
     "care_run_today_assessment": "assessment",
     "care_get_pressure_curve": "forecast",
     "care_get_checkin_card": "card",
+    "care_record_checkin": "record_checkin",
+    "care_get_support": "support",
+    "care_update_preferences": "preferences",
+    "care_respond_to_latest_intervention": "intervention_feedback",
     "calendar_create_event": "calendar_mutation",
     "calendar_update_event": "calendar_mutation",
     "calendar_delete_event": "calendar_mutation",
@@ -64,6 +68,14 @@ class ProgressPresenter:
                 if previous_stage == "forecast":
                     return "压力趋势已经算好了，我在整理成更直观的结果。"
                 return "我在准备这次状态记录。"
+            if stage == "record_checkin":
+                return "我在记录这次状态。"
+            if stage == "support":
+                return "我在结合当前状态整理更合适的支持建议。"
+            if stage == "preferences":
+                return "我正在更新你的提醒与关怀设置。"
+            if stage == "intervention_feedback":
+                return "我正在记录这次反馈。"
             if tool_name == "calendar_create_event":
                 return "我正在核对时间并创建这条日程。"
             if tool_name == "calendar_update_event":
@@ -75,7 +87,7 @@ class ProgressPresenter:
     def delayed(
         self, user_text: str = "", *, state: ProgressPresentationState
     ) -> str | None:
-        if state.sent or state.last_stage is not None:
+        if state.sent:
             return None
         digest = hashlib.sha256(str(user_text).encode("utf-8")).digest()
         return _GENERIC_PROGRESS_MESSAGES[digest[0] % len(_GENERIC_PROGRESS_MESSAGES)]

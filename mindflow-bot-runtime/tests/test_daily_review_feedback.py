@@ -333,6 +333,11 @@ def test_daily_review_validation_and_card_contract():
     }
     assert all(fields[name]["required"] is True for name in required_fields)
     assert all(fields[name]["required"] is False for name in optional_fields)
+    review_selects = [
+        element for element in form_elements if element["tag"] == "select_static"
+    ]
+    assert review_selects
+    assert all("label" not in select for select in review_selects)
     assert [option["value"] for option in fields["start_stress"]["options"]] == [
         str(value) for value in range(11)
     ]

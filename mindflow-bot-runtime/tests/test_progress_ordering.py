@@ -176,6 +176,114 @@ def test_fast_tool_finishes_inside_tool_grace_without_progress():
     assert [item[1] for item in sender.sent] == ["final"]
 
 
+def test_unmapped_tool_does_not_suppress_generic_fallback():
+    class UnmappedToolRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="unmapped_registered_tool"
+                )
+            )
+            await asyncio.sleep(0.08)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        UnmappedToolRuntime(), sender, generic_delay=0.03, tool_grace=0.01
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="处理一个长任务"))
+
+    texts = [item[1] for item in sender.sent]
+    assert len(texts) == 2
+    assert texts[-1] == "final"
+    assert texts[0] != "final"
+
+
+def test_completed_fast_tool_cancels_stale_contextual_progress():
+    class CompletedToolRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.01)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_succeeded", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.12)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        CompletedToolRuntime(), sender, generic_delay=1, tool_grace=0.08
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="看下日程"))
+
+    assert [item[1] for item in sender.sent] == ["final"]
+
+
+def test_new_tool_stage_restarts_its_full_grace_period():
+    class SwitchingStageRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.06)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="care_run_today_assessment"
+                )
+            )
+            await asyncio.sleep(0.04)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        SwitchingStageRuntime(), sender, generic_delay=1, tool_grace=0.08
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="看看下午压力"))
+
+    assert [item[1] for item in sender.sent] == ["final"]
+
+
+def test_generic_fallback_resumes_after_fast_tool_completes():
+    class ToolThenReasoningRuntime:
+        async def handle_message(self, *_args, on_activity, **_kwargs):
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_started", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.01)
+            await on_activity(
+                AgentActivityEvent(
+                    kind="tool_succeeded", tool_name="calendar_list_events"
+                )
+            )
+            await asyncio.sleep(0.1)
+            return "final"
+
+    sender = RecordingSender()
+    gateway, queue, worker, _ = _bound_system(
+        ToolThenReasoningRuntime(), sender, generic_delay=0.08, tool_grace=0.05
+    )
+
+    asyncio.run(_send(gateway, queue, worker, text="详细分析今天的日程"))
+
+    texts = [item[1] for item in sender.sent]
+    assert len(texts) == 2
+    assert texts[-1] == "final"
+    assert texts[0] != "我先看看相关日程。"
+
+
 def test_long_no_tool_turn_sends_one_generic_progress_before_final():
     class LongTextRuntime:
         async def handle_message(self, *_args, **_kwargs):

@@ -74,10 +74,11 @@ class ProgressState:
     tool_started_at: dict[str, float] = field(default_factory=dict)
     tool_durations_ms: list[float] = field(default_factory=list)
     force_silent: bool = False
-    tool_activity_seen: bool = False
     final_ready: bool = False
+    pending_tool_name: str | None = None
     pending_text: str | None = None
     pending_key: str | None = None
+    tool_progress_generation: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -414,11 +415,16 @@ class BotWorker:
         async def delayed_generic_progress() -> None:
             await asyncio.sleep(self.generic_progress_delay_seconds)
             async with progress.lock:
+                contextual_owner_active = bool(
+                    progress.pending_tool_name
+                    and progress.pending_tool_name in progress.tool_started_at
+                    and progress.pending_text
+                )
                 if (
                     progress.final_ready
                     or progress.force_silent
                     or progress.sent
-                    or progress.tool_activity_seen
+                    or contextual_owner_active
                 ):
                     return
                 suggestion = self.progress_presenter.delayed(
@@ -427,10 +433,18 @@ class BotWorker:
                 if suggestion:
                     await emit_locked(suggestion, key="delayed")
 
-        async def delayed_tool_progress() -> None:
+        async def delayed_tool_progress(
+            expected_tool_name: str,
+            expected_generation: int,
+        ) -> None:
             await asyncio.sleep(self.tool_progress_grace_seconds)
             async with progress.lock:
-                if progress.final_ready:
+                if (
+                    progress.final_ready
+                    or progress.tool_progress_generation != expected_generation
+                    or progress.pending_tool_name != expected_tool_name
+                    or expected_tool_name not in progress.tool_started_at
+                ):
                     return
                 suggestion = progress.pending_text
                 key = progress.pending_key
@@ -438,6 +452,7 @@ class BotWorker:
                     await emit_locked(suggestion, key=key)
 
         tool_timer: asyncio.Task[None] | None = None
+        tool_timers: set[asyncio.Task[None]] = set()
 
         async def on_activity(activity: AgentActivityEvent) -> None:
             nonlocal tool_timer
@@ -449,7 +464,6 @@ class BotWorker:
                 if tool_name:
                     progress.used_tools.add(tool_name)
                 if activity.kind == "tool_started" and tool_name:
-                    progress.tool_activity_seen = True
                     if progress.first_tool_started_at is None:
                         progress.first_tool_started_at = now
                     progress.tool_started_at[tool_name] = now
@@ -459,16 +473,29 @@ class BotWorker:
                         progress.tool_durations_ms.append(
                             round((now - tool_started) * 1000, 1)
                         )
+                    if progress.pending_tool_name == tool_name:
+                        progress.pending_tool_name = None
+                        progress.pending_text = None
+                        progress.pending_key = None
+                        progress.tool_progress_generation += 1
+                        if tool_timer is not None and not tool_timer.done():
+                            tool_timer.cancel()
+                        tool_timer = None
                 suggestion = self.progress_presenter.present(activity, state=progress)
                 if suggestion:
                     key = self.progress_presenter.key_for(activity, state=progress)
+                    progress.pending_tool_name = tool_name
                     progress.pending_text = suggestion
                     progress.pending_key = key
-                    if tool_timer is None or tool_timer.done():
-                        tool_timer = asyncio.create_task(
-                            delayed_tool_progress(),
-                            name=f"tool-progress-{event.event_id}",
-                        )
+                    progress.tool_progress_generation += 1
+                    if tool_timer is not None and not tool_timer.done():
+                        tool_timer.cancel()
+                    generation = progress.tool_progress_generation
+                    tool_timer = asyncio.create_task(
+                        delayed_tool_progress(tool_name, generation),
+                        name=f"tool-progress-{event.event_id}-{generation}",
+                    )
+                    tool_timers.add(tool_timer)
 
         async def close_progress_before_final() -> None:
             # If a processing send already owns the lock, wait until the
@@ -477,10 +504,9 @@ class BotWorker:
             async with progress.lock:
                 progress.final_ready = True
             generic_timer.cancel()
-            timers = [generic_timer]
-            if tool_timer is not None:
-                tool_timer.cancel()
-                timers.append(tool_timer)
+            timers = [generic_timer, *tool_timers]
+            for pending_timer in tool_timers:
+                pending_timer.cancel()
             await asyncio.gather(*timers, return_exceptions=True)
 
         generic_timer = asyncio.create_task(
@@ -607,10 +633,9 @@ class BotWorker:
             status = "failed_replied" if delivered else "reply_pending"
         finally:
             generic_timer.cancel()
-            timers = [generic_timer]
-            if tool_timer is not None:
-                tool_timer.cancel()
-                timers.append(tool_timer)
+            timers = [generic_timer, *tool_timers]
+            for pending_timer in tool_timers:
+                pending_timer.cancel()
             await asyncio.gather(*timers, return_exceptions=True)
             if self._active_event_by_participant.get(ctx.participant_id) == event.event_id:
                 self._active_event_by_participant.pop(ctx.participant_id, None)
