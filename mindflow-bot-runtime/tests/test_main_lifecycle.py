@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from app import main as app_main
 
 
@@ -60,11 +62,28 @@ def test_ws_transport_enables_daily_review_scheduler():
     assert app_main._should_start_daily_review_scheduler(settings, available) is True
 
 
+def _card_action_event():
+    return SimpleNamespace(
+        event_id="provider-event",
+        message_id="om-card",
+        app_id="app",
+        open_id="ou-user",
+        chat_id="oc-chat",
+        action_tag="button",
+        action_value={"mindflow_action": "submit_checkin"},
+        form_value={},
+    )
+
+
 def test_card_action_handler_updates_original_card_after_success():
     participant = SimpleNamespace(id="participant-1")
 
     class CardActions:
+        def __init__(self):
+            self.calls = 0
+
         def handle(self, participant_id, **kwargs):
+            self.calls += 1
             assert participant_id == participant.id
             assert kwargs["callback_event_id"] == "provider-event"
             return {"ok": True, "reply_text": "已记录"}
@@ -77,23 +96,123 @@ def test_card_action_handler_updates_original_card_after_success():
             self.updated.append((message_id, card))
 
     sender = Sender()
+    card_actions = CardActions()
     handler = app_main._build_card_action_handler(
-        SimpleNamespace(resolve=lambda *_args: participant), CardActions(), sender
+        SimpleNamespace(resolve=lambda *_args: participant), card_actions, sender
     )
-    result = handler(
-        SimpleNamespace(
-            event_id="provider-event",
-            message_id="om-card",
-            app_id="app",
-            open_id="ou-user",
-            chat_id="oc-chat",
-            action_tag="button",
-            action_value={"mindflow_action": "submit_checkin"},
-            form_value={},
-        )
-    )
+    result = handler(_card_action_event())
     assert result["ok"] is True
+    assert result["card_update_ok"] is True
+    assert card_actions.calls == 1
     assert sender.updated == [("om-card", result["card"])]
+
+
+def test_card_action_handler_keeps_success_when_card_update_fails_after_commit():
+    participant = SimpleNamespace(id="participant-1")
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, participant_id, **_kwargs):
+            self.calls += 1
+            assert participant_id == participant.id
+            return {"ok": True, "reply_text": "已记录"}
+
+    class Sender:
+        def __init__(self):
+            self.update_calls = 0
+            self.messages = []
+
+        def update_card(self, _message_id, _card):
+            self.update_calls += 1
+            raise RuntimeError("card patch failed")
+
+        def send_text(self, chat_id, text):
+            self.messages.append((chat_id, text))
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    sender = Sender()
+    card_actions = CardActions()
+    incidents = Incidents()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+        incidents,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["ok"] is True
+    assert result["card_update_ok"] is False
+    assert card_actions.calls == 1
+    assert sender.update_calls == 1
+    assert sender.messages == [
+        (
+            "oc-chat",
+            "操作已记录，但卡片状态暂未更新，无需重复提交。",
+        )
+    ]
+    assert incidents.records[0]["event_name"] == (
+        "card_action_card_update_failed_after_commit"
+    )
+    assert incidents.records[0]["error_code"] == "card_update_failed_after_commit"
+
+
+def test_card_action_handler_preserves_business_failure_behavior():
+    participant = SimpleNamespace(id="participant-1")
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            raise ValueError("business failed")
+
+    class Sender:
+        def __init__(self):
+            self.update_calls = 0
+            self.messages = []
+
+        def update_card(self, _message_id, _card):
+            self.update_calls += 1
+
+        def send_text(self, chat_id, text):
+            self.messages.append((chat_id, text))
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    sender = Sender()
+    card_actions = CardActions()
+    incidents = Incidents()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+        incidents,
+    )
+
+    with pytest.raises(ValueError, match="business failed"):
+        handler(_card_action_event())
+
+    assert card_actions.calls == 1
+    assert sender.update_calls == 0
+    assert sender.messages == [("oc-chat", "操作未能完成，请稍后重试。")]
+    assert incidents.records[0]["event_name"] == "card_action_failed"
+    assert incidents.records[0]["error_code"] == "business_failed"
 
 
 def test_sigterm_during_gateway_start_still_cancels_start(monkeypatch):

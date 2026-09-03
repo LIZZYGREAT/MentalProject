@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+from app import main as app_main
 from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
@@ -218,6 +219,138 @@ def test_card_callback_server_exposes_only_configured_callback_and_health_routes
         assert event.action_value["mindflow_action"] == "submit_checkin"
 
     asyncio.run(verify_url_challenge())
+
+
+def test_http_card_callback_stays_successful_when_source_card_update_fails():
+    participant = SimpleNamespace(id="participant-1")
+    replacement_card = {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "markdown", "content": "已记录"}]},
+    }
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, participant_id, **_kwargs):
+            self.calls += 1
+            assert participant_id == participant.id
+            return {
+                "ok": True,
+                "reply_text": "记录成功",
+                "card": replacement_card,
+            }
+
+    class Sender:
+        def __init__(self):
+            self.update_calls = 0
+            self.messages = []
+
+        def update_card(self, _message_id, _card):
+            self.update_calls += 1
+            raise RuntimeError("card patch failed")
+
+        def send_text(self, chat_id, text):
+            self.messages.append((chat_id, text))
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    card_actions = CardActions()
+    sender = Sender()
+    incidents = Incidents()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+        incidents,
+    )
+    server = FeishuCardCallbackServer(
+        app_id="app",
+        verification_token="verification-token",
+        encrypt_key="encrypt-key",
+        action_handler=handler,
+        host="127.0.0.1",
+        port=8123,
+        path="/feishu/card/callback",
+    )
+
+    async def send_callback():
+        callback_body = json.dumps(
+            {
+                "schema": "2.0",
+                "header": {
+                    "event_id": "event-card-update-failure",
+                    "event_type": "card.action.trigger",
+                    "token": "verification-token",
+                    "app_id": "app",
+                    "tenant_key": "tenant",
+                },
+                "event": {
+                    "operator": {"open_id": "ou-user"},
+                    "token": "update-token",
+                    "action": {
+                        "tag": "button",
+                        "value": {
+                            "mindflow_action": "submit_checkin",
+                            "version": "1",
+                        },
+                        "form_value": {"stress": "7"},
+                    },
+                    "context": {
+                        "open_message_id": "om-card",
+                        "open_chat_id": "oc-chat",
+                    },
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        timestamp = "1786200000"
+        nonce = "nonce"
+        signature = hashlib.sha256(
+            (timestamp + nonce + "encrypt-key").encode() + callback_body
+        ).hexdigest()
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="https://callback.test"
+        ) as client:
+            return await client.post(
+                "/feishu/card/callback",
+                content=callback_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Lark-Request-Timestamp": timestamp,
+                    "X-Lark-Request-Nonce": nonce,
+                    "X-Lark-Signature": signature,
+                },
+            )
+
+    response = asyncio.run(send_callback())
+
+    assert response.status_code == 200
+    assert response.json()["toast"] == {
+        "type": "success",
+        "content": "记录成功",
+    }
+    assert response.json()["card"] == {
+        "type": "raw",
+        "data": replacement_card,
+    }
+    assert card_actions.calls == 1
+    assert sender.update_calls == 1
+    assert sender.messages == [
+        (
+            "oc-chat",
+            "操作已记录，但卡片状态暂未更新，无需重复提交。",
+        )
+    ]
+    assert incidents.records[0]["event_name"] == (
+        "card_action_card_update_failed_after_commit"
+    )
 
 
 def test_recurrence_builder_exposes_only_reviewed_rfc5545_subset():

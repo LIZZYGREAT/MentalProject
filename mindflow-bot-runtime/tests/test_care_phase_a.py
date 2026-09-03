@@ -223,11 +223,13 @@ def test_controlled_care_preference_has_distinct_provenance_and_actions():
     assert "补水" in contextual["message"]
     assert "药物" not in contextual["message"]
     assert "snooze_30" not in contextual["care_plan"]["actions"]
-    assert set(contextual["care_plan"]["actions"]) == {
+    assert contextual["care_plan"]["actions"] == (
+        "ack",
         "helpful",
         "not_relevant",
+        "mute_today",
         "disable_type",
-    }
+    )
 
     legacy_fallback = CareMessageService(
         "Asia/Shanghai"
@@ -1022,7 +1024,7 @@ def test_admin_timeline_exposes_preferences_provenance_and_append_only_feedback(
     assert item["feedback"][0]["optional_comment"] == "这次时间不合适"
 
 
-def test_scheduler_uses_care_card_only_when_verified_callback_mode_is_enabled():
+def test_scheduler_uses_care_card_when_card_action_transport_is_available():
     database, participants, _, warnings, _, _ = _setup()
 
     class Bindings:
@@ -1066,6 +1068,119 @@ def test_scheduler_uses_care_card_only_when_verified_callback_mode_is_enabled():
     assert warning_id == card["body"]["elements"][1]["columns"][0][
         "elements"
     ][0]["behaviors"][0]["value"]["intervention_id"]
+
+
+def _production_care_card(*, allow_follow_up: bool):
+    database, participants, _, warnings, _, _ = _setup(
+        code=f"CARE-PRODUCTION-{allow_follow_up}"
+    )
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        {
+            "time": "10:00",
+            "tier": 2,
+            "S": 7.8,
+            "V": 2.5,
+            "F": 0.7,
+            "trigger_source": "sustained_intensity",
+            "care_action": "brief_check_in",
+            "current_events": [],
+            "dominant_stressors": [],
+        },
+        source="forecast_warning",
+        local_date=DAY,
+        calendar_events=[],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+        care_preferences={
+            "version": 1,
+            "allow_follow_up": allow_follow_up,
+        },
+    )
+    with database.session() as session:
+        warning = session.query(WarningSchedule).one()
+        warning.payload_json = contextual
+
+    class Bindings:
+        def get_for_participant(self, _participant_id):
+            return {"chat_id": "oc-production-care"}
+
+    class Sender:
+        def __init__(self):
+            self.card = None
+
+        def send_card(self, _chat_id, card, *, message_uuid=None):
+            self.card = card
+            return "om-production-care"
+
+        def send_text(self, *_args, **_kwargs):
+            raise AssertionError("production Care must use an interactive card")
+
+    sender = Sender()
+    scheduler = ForecastScheduler(
+        coordinator=SimpleNamespace(),
+        participants=participants,
+        warnings=warnings,
+        bindings=Bindings(),
+        sender=sender,
+        timezone_name="Asia/Shanghai",
+        daily_prepare_local_time="07:30",
+        calendar_sync_interval_seconds=999,
+        warning_poll_interval_seconds=999,
+        calendar_oauth_app_id="calendar-app",
+        care_card_enabled=True,
+    )
+    due = warnings.pending(NOW + timedelta(minutes=1))
+    asyncio.run(scheduler._deliver_warning(due[0]))
+    assert sender.card is not None
+    return list(contextual["care_plan"]["actions"]), sender.card
+
+
+def _card_actions_and_column_sizes(card):
+    actions = []
+    column_sizes = []
+    for element in card["body"]["elements"]:
+        if element.get("tag") != "column_set":
+            continue
+        columns = element.get("columns") or []
+        column_sizes.append(len(columns))
+        for column in columns:
+            button = column["elements"][0]
+            actions.append(button["behaviors"][0]["value"]["mindflow_action"])
+    return actions, column_sizes
+
+
+def test_production_care_delivery_preserves_all_six_policy_actions():
+    policy_actions, card = _production_care_card(allow_follow_up=True)
+    assert policy_actions == [
+        "ack",
+        "snooze_30",
+        "helpful",
+        "not_relevant",
+        "mute_today",
+        "disable_type",
+    ]
+    actions, column_sizes = _card_actions_and_column_sizes(card)
+    assert actions == [f"care_{action}" for action in policy_actions]
+    assert actions[-1] == "care_disable_type"
+    assert column_sizes == [2, 2, 2]
+
+
+def test_production_care_delivery_without_follow_up_removes_only_snooze():
+    policy_actions, card = _production_care_card(allow_follow_up=False)
+    assert policy_actions == [
+        "ack",
+        "helpful",
+        "not_relevant",
+        "mute_today",
+        "disable_type",
+    ]
+    actions, column_sizes = _card_actions_and_column_sizes(card)
+    assert actions == [f"care_{action}" for action in policy_actions]
+    assert "care_snooze_30" not in actions
+    assert "care_disable_type" in actions
+    assert column_sizes == [2, 2, 1]
 
 
 def test_care_card_delivery_recovers_after_restart_with_the_same_message_uuid(

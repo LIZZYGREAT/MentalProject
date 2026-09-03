@@ -125,6 +125,7 @@ def _build_card_action_handler(
     def record_failure(
         event: Any,
         *,
+        event_name: str = "card_action_failed",
         summary: str,
         error_code: str | None,
         error_class: str | None,
@@ -132,26 +133,36 @@ def _build_card_action_handler(
         severity: str = "error",
     ) -> None:
         logging.getLogger(__name__).error(
-            "feishu_card_action_failed event_id=%s message_id=%s error_code=%s",
+            "%s event_id=%s message_id=%s error_code=%s",
+            event_name,
             event.event_id,
             event.message_id,
             error_code,
         )
         if incidents is not None:
-            incidents.record(
-                severity=severity,
-                subsystem="feishu_card_action",
-                event_name="card_action_failed",
-                summary=summary,
-                participant_id=participant_id,
-                bot_event_id=event.event_id,
-                error_code=error_code,
-                error_class=error_class,
-                details={
-                    "message_id": event.message_id,
-                    "action_tag": event.action_tag,
-                },
-            )
+            try:
+                incidents.record(
+                    severity=severity,
+                    subsystem="feishu_card_action",
+                    event_name=event_name,
+                    summary=summary,
+                    participant_id=participant_id,
+                    bot_event_id=event.event_id,
+                    error_code=error_code,
+                    error_class=error_class,
+                    details={
+                        "message_id": event.message_id,
+                        "action_tag": event.action_tag,
+                    },
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "feishu_card_action_incident_record_failed "
+                    "event_id=%s message_id=%s incident_event=%s",
+                    event.event_id,
+                    event.message_id,
+                    event_name,
+                )
 
     def notify_failure(event: Any) -> None:
         try:
@@ -159,6 +170,20 @@ def _build_card_action_handler(
         except Exception:
             logging.getLogger(__name__).exception(
                 "feishu_card_action_failure_notice_failed "
+                "event_id=%s message_id=%s",
+                event.event_id,
+                event.message_id,
+            )
+
+    def notify_card_update_failure(event: Any) -> None:
+        try:
+            sender.send_text(
+                event.chat_id,
+                "操作已记录，但卡片状态暂未更新，无需重复提交。",
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "feishu_card_action_update_notice_failed "
                 "event_id=%s message_id=%s",
                 event.event_id,
                 event.message_id,
@@ -211,14 +236,15 @@ def _build_card_action_handler(
         except Exception as exc:
             record_failure(
                 event,
+                event_name="card_action_card_update_failed_after_commit",
                 summary="CardAction succeeded but source card update failed",
-                error_code="card_update_failed",
+                error_code="card_update_failed_after_commit",
                 error_class=type(exc).__name__,
                 participant_id=participant.id,
             )
-            notify_failure(event)
-            raise
-        return result
+            notify_card_update_failure(event)
+            return {**result, "card_update_ok": False}
+        return {**result, "card_update_ok": True}
 
     return handle_card_action
 

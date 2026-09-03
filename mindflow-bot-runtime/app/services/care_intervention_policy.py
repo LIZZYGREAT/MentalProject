@@ -179,9 +179,11 @@ class CareInterventionPolicy:
             context_quality=context.context_quality,
             facts_used=context.fact_codes,
             actions=(
+                "ack",
+                *(("snooze_30",) if context.allow_follow_up else ()),
                 "helpful",
                 "not_relevant",
-                *(("snooze_30",) if context.allow_follow_up else ()),
+                "mute_today",
                 "disable_type",
             ),
             ranking_score=round(max(0.0, min(ranking_score, 1.0)), 3),

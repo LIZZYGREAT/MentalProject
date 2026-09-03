@@ -327,6 +327,7 @@ class ForecastScheduler:
                     "mute_today",
                     "helpful",
                     "not_relevant",
+                    "disable_type",
                 }
             ]
             if self.care_card_enabled and care_actions:
