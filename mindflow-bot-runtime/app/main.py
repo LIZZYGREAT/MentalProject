@@ -315,6 +315,7 @@ async def run() -> None:
         ),
         incidents=incidents,
         care_card_enabled=bool(card_callback is not None),
+        care_outcome_refresh=business.care_outcome_refresh,
     )
     daily_review_scheduler = DailyReviewScheduler(
         schedules=business.daily_review_schedules,

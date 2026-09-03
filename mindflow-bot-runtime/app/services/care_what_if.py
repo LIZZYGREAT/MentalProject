@@ -8,8 +8,14 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from app.services.forecast_coordinator import enforce_promoted_model_selection
+from app.services.forecast_coordinator import (
+    enforce_promoted_model_selection,
+    production_model_identity,
+)
 from app.services.profile_calibration import layered_profile
+from services.course_catalog import COURSE_CATALOG_REVISION
+from services.event_lifecycle import EVENT_SCHEMA_VERSION
+from services.workload import WORKLOAD_MODEL_VERSION, WORKLOAD_SCHEMA_VERSION
 
 
 WHAT_IF_VERSION = "care-what-if.v1"
@@ -44,6 +50,11 @@ class CareWhatIfSimulationService:
         end = datetime.fromisoformat(str(new_end_time).replace("Z", "+00:00"))
         if start.tzinfo is None or end.tzinfo is None or end <= start:
             raise ValueError("what-if times must be timezone-aware and end after start")
+        if (
+            start.astimezone(self.coordinator.timezone).date()
+            != end.astimezone(self.coordinator.timezone).date()
+        ):
+            raise ValueError("cross-midnight what-if move is not supported")
         destination_date = start.astimezone(self.coordinator.timezone).date()
         first_date = min(local_date, destination_date)
         last_date = max(local_date, destination_date)
@@ -54,35 +65,42 @@ class CareWhatIfSimulationService:
         current_by_date: dict[date, dict[str, Any]] = {}
         calendar_by_date: dict[date, dict[str, Any]] = {}
         forecast_events_by_date: dict[date, list[dict[str, Any]]] = {}
+        explicit = self.coordinator.profiles.current(participant_id)
+        learned = (
+            self.coordinator.learned_profiles.runtime_active(participant_id)
+            if self.coordinator.learned_profiles is not None else None
+        )
+        profile, profile_layers = layered_profile(explicit, learned)
+        profile = enforce_promoted_model_selection(profile, learned)
         for target in affected_dates:
             current = self.coordinator.forecasts.latest(participant_id, target)
             calendar = self.coordinator.calendar_snapshots.get(participant_id, target)
             if current is None or calendar is None:
                 raise LookupError(f"scenario_input_unavailable:{target.isoformat()}")
+            self._assert_replay_compatible(
+                current,
+                calendar,
+                explicit_profile_version=profile_layers["explicit_version"],
+                learned_profile_version=profile_layers["learned_version"],
+                effective_profile=profile,
+                target=target,
+            )
             current_by_date[target] = current
             calendar_by_date[target] = calendar
             forecast_events_by_date[target] = self._rebuild_forecast_events(
                 current, calendar
             )
         source_events = forecast_events_by_date[local_date]
-        changed = False
         moved_event: dict[str, Any] | None = None
         for event in source_events:
             normalized_id = str(event.get("id") or event.get("event_id") or "")
             if normalized_id == str(event_id):
                 moved_event = deepcopy(event)
-                moved_event["start_time"] = start.isoformat()
-                moved_event["end_time"] = end.isoformat()
-                changed = True
-        if not changed:
+        if moved_event is None:
             raise LookupError("calendar_event_not_found")
-        explicit = self.coordinator.profiles.current(participant_id)
-        learned = (
-            self.coordinator.learned_profiles.runtime_active(participant_id)
-            if self.coordinator.learned_profiles is not None else None
-        )
-        profile, _layers = layered_profile(explicit, learned)
-        profile = enforce_promoted_model_selection(profile, learned)
+        self._assert_move_contract(moved_event, start, end)
+        moved_event["start_time"] = start.isoformat()
+        moved_event["end_time"] = end.isoformat()
         original_curves: list[dict[str, Any]] = []
         scenario_curves: list[dict[str, Any]] = []
         per_date: dict[str, Any] = {}
@@ -180,11 +198,95 @@ class CareWhatIfSimulationService:
         else:
             text = str(value or "").strip()
             if not text:
-                return datetime.now(timezone_value)
+                raise ValueError("source forecast generated_at is required")
             parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             raise ValueError("source forecast generated_at must be timezone-aware")
         return parsed
+
+    def _assert_replay_compatible(
+        self,
+        current_forecast: dict[str, Any],
+        calendar_snapshot: dict[str, Any],
+        *,
+        explicit_profile_version: Any,
+        learned_profile_version: Any,
+        effective_profile: dict[str, Any],
+        target: date,
+    ) -> None:
+        prefix = f"scenario_source_stale:{target.isoformat()}"
+        source_calendar_revision = current_forecast.get("calendar_revision")
+        if (
+            not source_calendar_revision
+            or calendar_snapshot.get("calendar_revision")
+            != source_calendar_revision
+            or calendar_snapshot.get("snapshot_state")
+            == "mutation_refresh_pending"
+        ):
+            raise LookupError(f"{prefix}:calendar_revision")
+
+        output = dict(current_forecast.get("output") or {})
+        source_layers = output.get("profile_layers")
+        if not isinstance(source_layers, dict) or (
+            source_layers.get("explicit_version") != explicit_profile_version
+            or source_layers.get("learned_version") != learned_profile_version
+        ):
+            raise LookupError(f"{prefix}:profile_version")
+
+        runtime_identity = production_model_identity(
+            effective_profile, self.coordinator.prediction.model
+        )
+        if (
+            current_forecast.get("algorithm_version")
+            != runtime_identity["engine_version"]
+            or output.get("model_family") != runtime_identity["model_family"]
+            or output.get("model_variant") != runtime_identity["model_variant"]
+            or output.get("model_spec_version")
+            != runtime_identity["model_spec_version"]
+        ):
+            raise LookupError(f"{prefix}:model_identity")
+
+        runtime_contract = {
+            "event_schema_version": EVENT_SCHEMA_VERSION,
+            "course_catalog_revision": COURSE_CATALOG_REVISION,
+            "workload_schema_version": WORKLOAD_SCHEMA_VERSION,
+            "workload_model_version": WORKLOAD_MODEL_VERSION,
+        }
+        if any(output.get(key) != value for key, value in runtime_contract.items()):
+            raise LookupError(f"{prefix}:event_contract")
+
+    def _assert_move_contract(
+        self,
+        source_event: dict[str, Any],
+        proposed_start: datetime,
+        proposed_end: datetime,
+    ) -> None:
+        try:
+            source_start = datetime.fromisoformat(
+                str(source_event.get("start_time") or "").replace("Z", "+00:00")
+            )
+            source_end = datetime.fromisoformat(
+                str(source_event.get("end_time") or "").replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("source event times are invalid") from exc
+        if (
+            source_start.tzinfo is None
+            or source_end.tzinfo is None
+            or source_end <= source_start
+        ):
+            raise ValueError(
+                "source event times must be timezone-aware and end after start"
+            )
+        if (
+            source_start.astimezone(self.coordinator.timezone).date()
+            != source_end.astimezone(self.coordinator.timezone).date()
+        ):
+            raise ValueError("cross-midnight what-if move is not supported")
+        original_duration = (source_end - source_start).total_seconds()
+        proposed_duration = (proposed_end - proposed_start).total_seconds()
+        if abs(original_duration - proposed_duration) > 60:
+            raise ValueError("what-if move must preserve event duration")
 
     @classmethod
     def _rebuild_forecast_events(

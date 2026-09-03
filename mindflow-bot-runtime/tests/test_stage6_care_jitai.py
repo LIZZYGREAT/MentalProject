@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from copy import deepcopy
 import logging
@@ -38,13 +39,57 @@ from app.services.care_message_service import CareMessageService
 from app.services.card_action_service import CardActionService
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.care_what_if import CareWhatIfSimulationService
-from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.forecast_coordinator import (
+    ForecastCoordinator,
+    production_model_identity,
+)
+from app.services.forecast_scheduler import ForecastScheduler
 from app.tools.care import CareTools
+from services.course_catalog import COURSE_CATALOG_REVISION
+from services.event_lifecycle import EVENT_SCHEMA_VERSION
+from services.workload import WORKLOAD_MODEL_VERSION, WORKLOAD_SCHEMA_VERSION
 from helpers import memory_database
 
 
 DAY = date(2030, 1, 15)
 SENT = datetime(2030, 1, 15, 4, 0, tzinfo=timezone.utc)
+_REPLAY_MODEL = object()
+_REPLAY_IDENTITY = production_model_identity({}, _REPLAY_MODEL)
+
+
+def _replay_output(**overrides):
+    output = {
+        "profile_layers": {"explicit_version": None, "learned_version": None},
+        "model_family": _REPLAY_IDENTITY["model_family"],
+        "model_variant": _REPLAY_IDENTITY["model_variant"],
+        "model_spec_version": _REPLAY_IDENTITY["model_spec_version"],
+        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "course_catalog_revision": COURSE_CATALOG_REVISION,
+        "workload_schema_version": WORKLOAD_SCHEMA_VERSION,
+        "workload_model_version": WORKLOAD_MODEL_VERSION,
+    }
+    output.update(overrides)
+    return output
+
+
+def _replay_forecast(**overrides):
+    forecast = {
+        "calendar_revision": "calendar-revision",
+        "algorithm_version": _REPLAY_IDENTITY["engine_version"],
+    }
+    forecast.update(overrides)
+    return forecast
+
+
+def _replay_calendar(events, **overrides):
+    calendar = {
+        "calendar_revision": "calendar-revision",
+        "snapshot_state": "current",
+        "events": events,
+        "degraded": False,
+    }
+    calendar.update(overrides)
+    return calendar
 
 
 def _contextual(**history):
@@ -306,7 +351,7 @@ def test_what_if_removes_moved_event_from_source_day():
 
     class Forecasts:
         def latest(self, *_args):
-            return {
+            return _replay_forecast(**{
                 "id": uuid.uuid4(),
                 "forecast_version": "forecast",
                 "generated_at": SENT,
@@ -315,12 +360,14 @@ def test_what_if_removes_moved_event_from_source_day():
                     {"stress_0_10": 8.0, "workload": 0.8},
                     {"stress_0_10": 7.5, "workload": 0.6},
                 ],
-                "output": {"initial_state": {"stress_0_10": 4, "vitality_0_10": 7}},
-            }
+                "output": _replay_output(
+                    initial_state={"stress_0_10": 4, "vitality_0_10": 7}
+                ),
+            })
 
     class Calendars:
         def get(self, *_args):
-            return {"events": source_events, "degraded": False}
+            return _replay_calendar(source_events)
 
     class Profiles:
         def current(self, *_args):
@@ -332,6 +379,7 @@ def test_what_if_removes_moved_event_from_source_day():
 
     class Prediction:
         calls = 0
+        model = _REPLAY_MODEL
 
         def calculate(self, **kwargs):
             self.calls += 1
@@ -382,16 +430,18 @@ def test_what_if_propagates_terminal_state_across_intermediate_days():
 
     class Forecasts:
         def latest(self, _participant, target):
-            return {
+            return _replay_forecast(**{
                 "id": uuid.uuid5(uuid.NAMESPACE_DNS, target.isoformat()),
                 "forecast_version": f"forecast-{target}", "generated_at": SENT,
                 "semantic_input": [], "curve": [],
-                "output": {"initial_state": {"stress_0_10": 4, "vitality_0_10": 7}},
-            }
+                "output": _replay_output(
+                    initial_state={"stress_0_10": 4, "vitality_0_10": 7}
+                ),
+            })
 
     class Calendars:
         def get(self, _participant, target):
-            return {"events": [source_event] if target == DAY else [], "degraded": False}
+            return _replay_calendar([source_event] if target == DAY else [])
 
     class Profiles:
         def current(self, *_args):
@@ -403,6 +453,7 @@ def test_what_if_propagates_terminal_state_across_intermediate_days():
 
     class Prediction:
         initial_states = []
+        model = _REPLAY_MODEL
 
         def calculate(self, **kwargs):
             self.initial_states.append(dict(kwargs["initial_state"]))
@@ -667,7 +718,15 @@ def test_preference_vocabulary_normalizes_legacy_values():
         normalized_intervention_types(["unknown_support"])
 
 
-def _semantic_what_if_run():
+def _semantic_what_if_run(
+    *,
+    forecast_overrides=None,
+    output_overrides=None,
+    calendar_overrides=None,
+    raw_events_override=None,
+    new_start_time="2030-01-15T12:00:00+08:00",
+    new_end_time="2030-01-15T13:00:00+08:00",
+):
     participant_id = uuid.uuid4()
     raw_events = [
         {
@@ -681,6 +740,7 @@ def _semantic_what_if_run():
             "end_time": "2030-01-15T15:00:00+08:00",
         },
     ]
+    raw_events = deepcopy(raw_events_override or raw_events)
     semantics = {
         "moved": {"source": "hybrid", "workload_prior": 0.81, "identity": "moved-semantic"},
         "unchanged": {"source": "hybrid", "workload_prior": 0.63, "identity": "unchanged-semantic"},
@@ -702,7 +762,12 @@ def _semantic_what_if_run():
 
     class Forecasts:
         def latest(self, *_args):
-            return {
+            output = _replay_output(
+                initial_state={"stress_0_10": 4, "vitality_0_10": 7},
+                classified_calendar_events=classified,
+            )
+            output.update(output_overrides or {})
+            forecast = _replay_forecast(**{
                 "id": uuid.uuid4(), "forecast_version": "forecast",
                 "generated_at": SENT.isoformat(),
                 "semantic_input": [
@@ -710,15 +775,14 @@ def _semantic_what_if_run():
                     for event_id, semantic in semantics.items()
                 ],
                 "curve": [],
-                "output": {
-                    "initial_state": {"stress_0_10": 4, "vitality_0_10": 7},
-                    "classified_calendar_events": classified,
-                },
-            }
+                "output": output,
+            })
+            forecast.update(forecast_overrides or {})
+            return forecast
 
     class Calendars:
         def get(self, *_args):
-            return {"events": raw_events, "degraded": False}
+            return _replay_calendar(raw_events, **(calendar_overrides or {}))
 
     class Profiles:
         def current(self, *_args):
@@ -733,6 +797,7 @@ def _semantic_what_if_run():
 
     class Prediction:
         events = None
+        model = _REPLAY_MODEL
 
         def calculate(self, **kwargs):
             self.events = deepcopy(kwargs["calendar_events"])
@@ -752,8 +817,8 @@ def _semantic_what_if_run():
 
     result = CareWhatIfSimulationService(Coordinator()).simulate(
         participant_id, DAY, event_id="moved",
-        new_start_time="2030-01-15T12:00:00+08:00",
-        new_end_time="2030-01-15T13:00:00+08:00",
+        new_start_time=new_start_time,
+        new_end_time=new_end_time,
     )
     by_id = {item["id"]: item for item in Coordinator.prediction.events}
     return result, by_id, Coordinator.observations.as_of, semantics
@@ -784,6 +849,112 @@ def test_what_if_moved_event_keeps_source_semantic_identity():
     assert events["moved"]["task_type"] == "ddl"
     assert events["moved"]["course_code"] == "RM101"
     assert events["moved"]["start_time"] == "2030-01-15T12:00:00+08:00"
+
+
+def test_what_if_rejects_calendar_revision_drift():
+    with pytest.raises(
+        LookupError,
+        match=r"scenario_source_stale:2030-01-15:calendar_revision",
+    ):
+        _semantic_what_if_run(
+            calendar_overrides={"calendar_revision": "new-calendar-revision"}
+        )
+
+
+def test_what_if_rejects_mutation_refresh_pending_snapshot():
+    with pytest.raises(
+        LookupError,
+        match=r"scenario_source_stale:2030-01-15:calendar_revision",
+    ):
+        _semantic_what_if_run(
+            calendar_overrides={"snapshot_state": "mutation_refresh_pending"}
+        )
+
+
+def test_what_if_rejects_profile_version_drift():
+    with pytest.raises(
+        LookupError,
+        match=r"scenario_source_stale:2030-01-15:profile_version",
+    ):
+        _semantic_what_if_run(output_overrides={
+            "profile_layers": {"explicit_version": 2, "learned_version": None}
+        })
+
+
+def test_what_if_rejects_model_identity_drift():
+    with pytest.raises(
+        LookupError,
+        match=r"scenario_source_stale:2030-01-15:model_identity",
+    ):
+        _semantic_what_if_run(output_overrides={"model_variant": "m3"})
+
+
+def test_what_if_rejects_event_contract_drift():
+    with pytest.raises(
+        LookupError,
+        match=r"scenario_source_stale:2030-01-15:event_contract",
+    ):
+        _semantic_what_if_run(
+            output_overrides={"workload_model_version": "obsolete-workload"}
+        )
+
+
+def test_what_if_rejects_missing_source_generated_at():
+    with pytest.raises(ValueError, match="source forecast generated_at is required"):
+        _semantic_what_if_run(forecast_overrides={"generated_at": None})
+
+
+def test_what_if_rejects_naive_source_generated_at():
+    with pytest.raises(
+        ValueError, match="source forecast generated_at must be timezone-aware"
+    ):
+        _semantic_what_if_run(
+            forecast_overrides={"generated_at": "2030-01-15T04:00:00"}
+        )
+
+
+def test_what_if_move_preserves_duration():
+    result, events, _as_of, _semantics = _semantic_what_if_run()
+    moved = events["moved"]
+    moved_start = datetime.fromisoformat(moved["start_time"])
+    moved_end = datetime.fromisoformat(moved["end_time"])
+    assert moved_end - moved_start == timedelta(hours=1)
+    assert result["proposed_change"] == {
+        "start_time": "2030-01-15T12:00:00+08:00",
+        "end_time": "2030-01-15T13:00:00+08:00",
+    }
+
+
+def test_what_if_rejects_duration_change():
+    with pytest.raises(
+        ValueError, match="what-if move must preserve event duration"
+    ):
+        _semantic_what_if_run(
+            new_start_time="2030-01-15T12:00:00+08:00",
+            new_end_time="2030-01-15T14:00:00+08:00",
+        )
+
+
+def test_what_if_rejects_cross_midnight_source_event():
+    with pytest.raises(
+        ValueError, match="cross-midnight what-if move is not supported"
+    ):
+        _semantic_what_if_run(raw_events_override=[{
+            "id": "moved",
+            "summary": "跨日任务",
+            "start_time": "2030-01-15T23:30:00+08:00",
+            "end_time": "2030-01-16T00:30:00+08:00",
+        }])
+
+
+def test_what_if_rejects_cross_midnight_proposed_event():
+    with pytest.raises(
+        ValueError, match="cross-midnight what-if move is not supported"
+    ):
+        _semantic_what_if_run(
+            new_start_time="2030-01-15T23:30:00+08:00",
+            new_end_time="2030-01-16T00:30:00+08:00",
+        )
 
 
 def test_recovery_episode_requires_pre_boundary():
@@ -944,3 +1115,164 @@ def test_post_commit_care_outcome_refresh_materializes_followup():
     ) is True
     with database.session() as session:
         assert session.get(CareInterventionOutcome, intervention_id).followup_30m is not None
+
+
+def test_idempotent_checkin_retry_can_repair_care_outcome():
+    class ForecastRefreshSpy:
+        def on_observation_committed(self, **_kwargs):
+            return None
+
+    database = memory_database()
+    person = ParticipantRepository(database).create("STAGE6-RETRY-REPAIR")
+    intervention_id = _seed_intervention(database, person.id)
+    now = datetime.now(timezone.utc)
+    with database.session() as session:
+        intervention = session.get(CareInterventionEvent, intervention_id)
+        intervention.sent_at = now - timedelta(minutes=31)
+        intervention.scheduled_at = intervention.sent_at
+
+    actual_refresh = CareOutcomeRefreshService(database)
+
+    class FailOnceRefresh:
+        calls = 0
+
+        def on_observation_committed(self, participant_id, observation_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient care outcome failure")
+            return actual_refresh.on_observation_committed(
+                participant_id, observation_id
+            )
+
+    refresh = FailOnceRefresh()
+    observations = ObservationRepository(database)
+    tools = CareTools(
+        None,
+        observations,
+        None,
+        None,
+        "Asia/Shanghai",
+        None,
+        observation_refresh=ForecastRefreshSpy(),
+        care_outcome_refresh=refresh,
+    )
+    context = AgentContext(
+        person.id,
+        "STAGE6-RETRY-REPAIR",
+        "open",
+        "chat",
+        "retry-message",
+        uuid.uuid4(),
+    )
+    payload = {
+        "stress": 6,
+        "energy": 5,
+        "activity": "学习",
+        "stress_event_since_last": False,
+        "event_ongoing": False,
+    }
+    assert tools.record_checkin(context, payload)["created"] is True
+    with database.session() as session:
+        assert session.get(CareInterventionOutcome, intervention_id) is None
+    retry = tools.record_checkin(context, payload)
+    assert retry["created"] is False
+    assert refresh.calls == 2
+    with database.session() as session:
+        outcome = session.get(CareInterventionOutcome, intervention_id)
+        assert outcome.followup_30m is not None
+
+
+def _missed_followup_fixture(participant_code):
+    database = memory_database()
+    person = ParticipantRepository(database).create(participant_code)
+    intervention_id = _seed_intervention(database, person.id)
+    ObservationRepository(database).add(
+        person.id,
+        "checkin",
+        {"stress_0_10": 6.0},
+        observed_at=SENT + timedelta(minutes=31),
+        source_message_id=f"{participant_code}-followup",
+    )
+    return database, person, intervention_id
+
+
+def test_care_outcome_reconcile_repairs_missed_followup():
+    database, person, intervention_id = _missed_followup_fixture(
+        "STAGE6-RECONCILE-REPAIR"
+    )
+    result = CareOutcomeRefreshService(database).reconcile_recent(
+        person.id, as_of=SENT + timedelta(hours=2)
+    )
+    assert result == {"scanned": 1, "created": 1, "updated": 1}
+    with database.session() as session:
+        assert session.get(CareInterventionOutcome, intervention_id).followup_30m
+
+
+def test_care_outcome_reconcile_is_idempotent():
+    database, person, _intervention_id = _missed_followup_fixture(
+        "STAGE6-RECONCILE-IDEMPOTENT"
+    )
+    refresh = CareOutcomeRefreshService(database)
+    first = refresh.reconcile_recent(person.id, as_of=SENT + timedelta(hours=2))
+    second = refresh.reconcile_recent(person.id, as_of=SENT + timedelta(hours=2))
+    assert first == {"scanned": 1, "created": 1, "updated": 1}
+    assert second == {"scanned": 1, "created": 0, "updated": 0}
+
+
+def test_care_outcome_reconcile_is_bounded_to_recent_window():
+    database, person, intervention_id = _missed_followup_fixture(
+        "STAGE6-RECONCILE-BOUNDED"
+    )
+    result = CareOutcomeRefreshService(database).reconcile_recent(
+        person.id, as_of=SENT + timedelta(hours=25)
+    )
+    assert result == {"scanned": 0, "created": 0, "updated": 0}
+    with database.session() as session:
+        assert session.get(CareInterventionOutcome, intervention_id) is None
+
+
+def test_care_outcome_reconcile_failure_does_not_break_scheduler(caplog):
+    first = uuid.uuid4()
+    second = uuid.uuid4()
+
+    class Participants:
+        def active_ids(self):
+            return [first, second]
+
+    class Refresh:
+        calls = []
+
+        def reconcile_recent(self, participant_id, **_kwargs):
+            self.calls.append(participant_id)
+            if participant_id == first:
+                raise RuntimeError("forced reconcile failure")
+
+    class Incidents:
+        rows = []
+
+        def record(self, **values):
+            self.rows.append(values)
+
+    refresh = Refresh()
+    incidents = Incidents()
+    scheduler = ForecastScheduler(
+        coordinator=None,
+        participants=Participants(),
+        warnings=None,
+        bindings=None,
+        sender=None,
+        timezone_name="Asia/Shanghai",
+        daily_prepare_local_time="07:30",
+        calendar_sync_interval_seconds=999,
+        warning_poll_interval_seconds=999,
+        calendar_oauth_app_id="calendar-app",
+        warning_delivery_policy=WarningDeliveryPolicyConfig(2, 240),
+        incidents=incidents,
+        care_outcome_refresh=refresh,
+    )
+    caplog.set_level(logging.ERROR)
+    result = asyncio.run(scheduler._run_care_outcome_reconcile(SENT))
+    assert result == {"participants": 2, "failed": 1}
+    assert refresh.calls == [first, second]
+    assert incidents.rows[0]["participant_id"] == first
+    assert "care_outcome_reconcile_failed" in caplog.text

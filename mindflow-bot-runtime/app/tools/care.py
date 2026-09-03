@@ -570,7 +570,7 @@ class CareTools:
             payload,
             source_message_id=ctx.message_id,
         )
-        if write.created and self.care_outcome_refresh is not None:
+        if not write.idempotency_conflict and self.care_outcome_refresh is not None:
             try:
                 self.care_outcome_refresh.on_observation_committed(
                     ctx.participant_id, write.observation_id

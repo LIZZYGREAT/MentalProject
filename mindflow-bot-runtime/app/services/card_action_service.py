@@ -205,7 +205,7 @@ class CardActionService:
             },
             source_message_id=event_id[:128],
         )
-        if write.created and self.care_outcome_refresh is not None:
+        if not write.idempotency_conflict and self.care_outcome_refresh is not None:
             try:
                 self.care_outcome_refresh.on_observation_committed(
                     participant_id, write.observation_id

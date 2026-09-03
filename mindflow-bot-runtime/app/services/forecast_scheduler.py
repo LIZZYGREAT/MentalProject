@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 import logging
+from typing import Protocol
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -18,7 +19,7 @@ from app.repositories import (
     WarningScheduleRepository,
 )
 from app.services.forecast_coordinator import ForecastCoordinator
-from typing import Protocol
+from app.services.care_outcome_refresh import CareOutcomeRefreshService
 
 
 class CalibrationService(Protocol):
@@ -41,6 +42,8 @@ class ForecastScheduler:
         profile_calibration: CalibrationService | None = None,
         incidents: RuntimeIncidentRepository | None = None,
         care_card_enabled: bool = False,
+        care_outcome_refresh: CareOutcomeRefreshService | None = None,
+        care_outcome_reconcile_interval_seconds: int = 1200,
     ):
         self.coordinator = coordinator
         self.participants = participants
@@ -68,6 +71,10 @@ class ForecastScheduler:
         self.profile_calibration = profile_calibration
         self.incidents = incidents
         self.care_card_enabled = bool(care_card_enabled)
+        self.care_outcome_refresh = care_outcome_refresh
+        self.care_outcome_reconcile_interval = min(
+            1800, max(600, int(care_outcome_reconcile_interval_seconds))
+        )
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -81,7 +88,11 @@ class ForecastScheduler:
 
     async def run_forever(self) -> None:
         self.started.set()
-        await asyncio.gather(self._forecast_loop(), self._warning_loop())
+        await asyncio.gather(
+            self._forecast_loop(),
+            self._warning_loop(),
+            self._care_outcome_loop(),
+        )
 
     async def close(self) -> None:
         self._stop.set()
@@ -175,6 +186,63 @@ class ForecastScheduler:
                             type(exc).__name__,
                             str(exc)[:160],
                         )
+
+    async def _care_outcome_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.care_outcome_refresh is not None:
+                    await self._run_care_outcome_reconcile(
+                        datetime.now(timezone.utc)
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "care_outcome_reconcile_iteration_failed "
+                    "error_class=%s message=%s",
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
+                self._record_incident(
+                    severity="error",
+                    subsystem="care_outcome_reconcile",
+                    event_name="care_outcome_reconcile_iteration_failed",
+                    error_class=type(exc).__name__,
+                    summary=str(exc)[:1000],
+                )
+            await self._wait(self.care_outcome_reconcile_interval)
+
+    async def _run_care_outcome_reconcile(
+        self, as_of: datetime
+    ) -> dict[str, int]:
+        if self.care_outcome_refresh is None:
+            return {"participants": 0, "failed": 0}
+        participant_ids = await asyncio.to_thread(self.participants.active_ids)
+        failed = 0
+        for participant_id in participant_ids:
+            try:
+                await asyncio.to_thread(
+                    self.care_outcome_refresh.reconcile_recent,
+                    participant_id,
+                    as_of=as_of,
+                    lookback_hours=24,
+                )
+            except Exception as exc:
+                failed += 1
+                logger.exception(
+                    "care_outcome_reconcile_failed participant_id=%s "
+                    "error_class=%s message=%s",
+                    participant_id,
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
+                self._record_incident(
+                    severity="error",
+                    subsystem="care_outcome_reconcile",
+                    event_name="care_outcome_reconcile_failed",
+                    participant_id=participant_id,
+                    error_class=type(exc).__name__,
+                    summary=str(exc)[:1000],
+                )
+        return {"participants": len(participant_ids), "failed": failed}
 
     async def _warning_loop(self) -> None:
         while not self._stop.is_set():
