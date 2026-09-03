@@ -299,3 +299,69 @@ def test_postgres_audit_blocks_set_null_and_restrict_dependencies(postgres_clean
         assert session.get(EventAppraisalFeedback, expected[3]).source_forecast_id == (
             restricted_id
         )
+
+
+def test_postgres_audit_separates_legacy_and_current_authorization_gaps_read_only(
+    postgres_cleanup_database,
+):
+    database = postgres_cleanup_database
+    local_date = date(2026, 8, 28)
+    legacy_sent_at = datetime(2026, 8, 28, 8, tzinfo=timezone.utc)
+    enforcement_sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+    current_sent_at = datetime(2026, 8, 28, 10, tzinfo=timezone.utc)
+    with database.session() as session:
+        user = Participant(participant_code="P-PG-AUTHORIZATION")
+        session.add(user)
+        session.flush()
+        forecast = _forecast(
+            session, user.id, local_date, "production-pg-authorization"
+        )
+        legacy = _warning(session, user.id, forecast, local_date, status="sent")
+        baseline = _warning(session, user.id, forecast, local_date, status="sent")
+        current = _warning(session, user.id, forecast, local_date, status="sent")
+        legacy.authorized_at = None
+        legacy.sent_at = legacy_sent_at
+        baseline.authorized_at = enforcement_sent_at - timedelta(minutes=1)
+        baseline.sent_at = enforcement_sent_at
+        current.authorized_at = None
+        current.sent_at = current_sent_at
+        session.flush()
+        legacy_id, baseline_id, current_id = legacy.id, baseline.id, current.id
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    legacy_rows = {
+        row["id"]: row
+        for row in report["invariants"][
+            "legacy_sent_warnings_without_authorization"
+        ]
+    }
+    current_rows = {
+        row["id"]: row
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+    planned_ids = {row["id"] for row in report["cleanup_plan"]["rows"]}
+
+    assert legacy_rows[str(legacy_id)]["classification"] == (
+        "legacy_pre_observed_authorization_enforcement"
+    )
+    assert current_rows[str(current_id)]["reason"] == (
+        "missing_authorization_after_enforcement"
+    )
+    assert {str(legacy_id), str(baseline_id), str(current_id)}.isdisjoint(
+        planned_ids
+    )
+
+    with database.session() as session:
+        stored_legacy = session.get(WarningSchedule, legacy_id)
+        stored_baseline = session.get(WarningSchedule, baseline_id)
+        stored_current = session.get(WarningSchedule, current_id)
+        assert stored_legacy.authorized_at is None
+        assert stored_legacy.sent_at == legacy_sent_at
+        assert stored_baseline.authorized_at == (
+            enforcement_sent_at - timedelta(minutes=1)
+        )
+        assert stored_baseline.sent_at == enforcement_sent_at
+        assert stored_current.authorized_at is None
+        assert stored_current.sent_at == current_sent_at

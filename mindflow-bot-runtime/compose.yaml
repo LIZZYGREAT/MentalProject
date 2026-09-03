@@ -70,7 +70,28 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python3", "-m", "pytest", "-q", "tests"]
+    user: root
+    volumes:
+      - ./tests:/srv/runtime/tests:ro
+      - ../claude-runtime:/srv/claude-runtime:ro
+      - ../docs:/srv/docs:ro
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        test -f /srv/runtime/tests/test_postgres_test_guard.py
+        test -f /srv/docs/CURRENT_ARCHITECTURE.md
+        test -f /srv/claude-runtime/plugins/mindflow-care/skills/mental-health-care/SKILL.md
+
+        python3 -m pip install \
+          --quiet \
+          --no-cache-dir \
+          --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+          --trusted-host pypi.tuna.tsinghua.edu.cn \
+          -r /srv/runtime/requirements-dev.txt
+
+        exec python3 -m pytest -q /srv/runtime/tests
     restart: "no"
     cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}
     mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1024m}

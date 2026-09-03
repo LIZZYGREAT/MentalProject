@@ -40,15 +40,15 @@ def test_acceptance_runner_owns_maintenance_window_and_restores_runtime():
     build = source.index('build acceptance', stop)
     image_revision = source.index("ACCEPTANCE_IMAGE_REVISION=$(", build)
     image_parity = source.index("acceptance image revision mismatch", image_revision)
-    pytest = source.index("exec python3 -m pytest -q tests", image_parity)
-    restore = source.index("\nrestore_runtime\n", pytest)
+    acceptance = source.index("-e MINDFLOW_REQUIRE_POSTGRES_TESTS=1", image_parity)
+    restore = source.index("\nrestore_runtime\n", acceptance)
     restored_bot = source.index("RESTORED_BOT_REVISION=$(", restore)
     restored_admin = source.index("RESTORED_ADMIN_REVISION=$(", restored_bot)
     restored_parity = source.index("revision mismatch after maintenance", restored_admin)
 
     assert preflight_bot < preflight_admin < runtime_parity < trap
     assert trap < mark_stopped < stop < build
-    assert build < image_revision < image_parity < pytest < restore
+    assert build < image_revision < image_parity < acceptance < restore
     assert restore < restored_bot < restored_admin < restored_parity
 
     restore_body = source.split("restore_runtime() {", 1)[1].split("\n}\n", 1)[0]
@@ -59,24 +59,21 @@ def test_acceptance_runner_owns_maintenance_window_and_restores_runtime():
     assert 'while [ "$attempts" -lt 12 ]' in source
 
 
-def test_acceptance_runner_checks_mounts_and_runs_full_suite_with_postgres_guard():
+def test_acceptance_runner_delegates_test_setup_to_compose_with_postgres_guard():
     source = RUNNER.read_text(encoding="utf-8")
 
-    assert "test -f /srv/docs/CURRENT_ARCHITECTURE.md" in source
-    assert (
-        "test -f /srv/claude-runtime/plugins/mindflow-care/skills/"
-        "mental-health-care/SKILL.md"
-    ) in source
     assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
     assert "MINDFLOW_TEST_POSTGRES_URL is required for acceptance" in source
     assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
     assert "mindflow_acceptance_test|mindflow_test_*" in source
     assert "refusing acceptance tests outside" in source
-    assert "--user root" in source
-    assert "pytest==8.4.1" in source
-    assert "pytest-asyncio==1.1.0" in source
-    assert "exec python3 -m pytest -q tests" in source
-    assert "acceptance sh -eu -c" in source
+    assert "--user root" not in source
+    assert "python3 -m pip install" not in source
+    assert "pytest==" not in source
+    assert "pytest-asyncio==" not in source
+    assert '-v "$RUNTIME_ROOT/tests:' not in source
+    assert '-v "$PROJECT_ROOT/claude-runtime:' not in source
+    assert '-v "$PROJECT_ROOT/docs:' not in source
 
 
 def test_acceptance_service_is_isolated_from_production_bot_limits_and_state():
@@ -96,9 +93,20 @@ def test_acceptance_service_is_isolated_from_production_bot_limits_and_state():
     assert "migrate:" not in acceptance
     assert "claude-state-init:" not in acceptance
     assert "ports:" not in acceptance
-    assert "volumes:" not in acceptance
+    assert "user: root" in acceptance
+    assert "volumes:" in acceptance
+    assert "./tests:/srv/runtime/tests:ro" in acceptance
+    assert "../docs:/srv/docs:ro" in acceptance
+    assert "../claude-runtime:/srv/claude-runtime:ro" in acceptance
     assert "claude_state" not in acceptance
-    assert 'command: ["python3", "-m", "pytest", "-q", "tests"]' in acceptance
+    assert "test -f /srv/runtime/tests/test_postgres_test_guard.py" in acceptance
+    assert "test -f /srv/docs/CURRENT_ARCHITECTURE.md" in acceptance
+    assert (
+        "test -f /srv/claude-runtime/plugins/mindflow-care/skills/"
+        "mental-health-care/SKILL.md"
+    ) in acceptance
+    assert "-r /srv/runtime/requirements-dev.txt" in acceptance
+    assert "exec python3 -m pytest -q /srv/runtime/tests" in acceptance
     assert "cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}" in acceptance
     assert "mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1024m}" in acceptance
     assert "memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-1536m}" in acceptance

@@ -280,6 +280,13 @@ def _warning(database, participant_id, forecast_id, local_date, *, status, forec
         return row.id
 
 
+def _set_warning_delivery(database, warning_id, *, authorized_at, sent_at):
+    with database.session() as session:
+        row = session.get(WarningSchedule, warning_id)
+        row.authorized_at = authorized_at
+        row.sent_at = sent_at
+
+
 def test_audit_uses_production_warning_status_and_complete_invariants():
     database = memory_database()
     user = participant(database, "P-REAL-INVARIANTS")
@@ -309,6 +316,203 @@ def test_audit_uses_production_warning_status_and_complete_invariants():
 
     assert {str(stale_warning), str(mismatch_warning)} <= stale
     assert str(sent_warning) in invalid_sent
+
+
+def test_audit_classifies_missing_authorization_before_observed_enforcement_as_legacy():
+    database = memory_database()
+    user = participant(database, "P-REAL-AUTH-LEGACY")
+    local_date = date(2026, 8, 28)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="production-auth-boundary"
+    )
+    legacy_id = _warning(
+        database,
+        user.id,
+        forecast_id,
+        local_date,
+        status="sent",
+        forecast_version="production-auth-boundary",
+    )
+    baseline_id = _warning(
+        database,
+        user.id,
+        forecast_id,
+        local_date,
+        status="sent",
+        forecast_version="production-auth-boundary",
+    )
+    legacy_sent_at = datetime(2026, 8, 28, 8, tzinfo=timezone.utc)
+    baseline_sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+    _set_warning_delivery(
+        database, legacy_id, authorized_at=None, sent_at=legacy_sent_at
+    )
+    _set_warning_delivery(
+        database,
+        baseline_id,
+        authorized_at=baseline_sent_at - timedelta(minutes=1),
+        sent_at=baseline_sent_at,
+    )
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    legacy = {
+        row["id"]: row
+        for row in report["invariants"][
+            "legacy_sent_warnings_without_authorization"
+        ]
+    }
+    current_ids = {
+        row["id"]
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+
+    assert legacy[str(legacy_id)]["classification"] == (
+        "legacy_pre_observed_authorization_enforcement"
+    )
+    assert str(legacy_id) not in current_ids
+    assert str(legacy_id) not in {
+        row["id"] for row in report["cleanup_plan"]["rows"]
+    }
+
+
+def test_audit_reports_post_enforcement_missing_authorization_as_current_violation():
+    database = memory_database()
+    user = participant(database, "P-REAL-AUTH-CURRENT")
+    local_date = date(2026, 8, 28)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="production-auth-current"
+    )
+    baseline_id = _warning(
+        database, user.id, forecast_id, local_date,
+        status="sent", forecast_version="production-auth-current",
+    )
+    current_id = _warning(
+        database, user.id, forecast_id, local_date,
+        status="sent", forecast_version="production-auth-current",
+    )
+    baseline_sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+    _set_warning_delivery(
+        database, baseline_id,
+        authorized_at=baseline_sent_at - timedelta(minutes=1),
+        sent_at=baseline_sent_at,
+    )
+    _set_warning_delivery(
+        database, current_id, authorized_at=None,
+        sent_at=baseline_sent_at + timedelta(minutes=1),
+    )
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    current = {
+        row["id"]: row
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+    legacy_ids = {
+        row["id"]
+        for row in report["invariants"][
+            "legacy_sent_warnings_without_authorization"
+        ]
+    }
+
+    assert current[str(current_id)]["reason"] == (
+        "missing_authorization_after_enforcement"
+    )
+    assert str(current_id) not in legacy_ids
+
+
+def test_audit_always_reports_sent_warning_without_sent_time_as_current_violation():
+    database = memory_database()
+    user = participant(database, "P-REAL-AUTH-MISSING-SENT")
+    local_date = date(2026, 8, 28)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="production-missing-sent"
+    )
+    warning_id = _warning(
+        database, user.id, forecast_id, local_date,
+        status="sent", forecast_version="production-missing-sent",
+    )
+    _set_warning_delivery(
+        database,
+        warning_id,
+        authorized_at=datetime(2026, 8, 28, 9, tzinfo=timezone.utc),
+        sent_at=None,
+    )
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    current = {
+        row["id"]: row
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+
+    assert current[str(warning_id)]["reason"] == "missing_sent_at"
+
+
+def test_audit_always_reports_warning_sent_before_authorization_as_current_violation():
+    database = memory_database()
+    user = participant(database, "P-REAL-AUTH-ORDER")
+    local_date = date(2026, 8, 28)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="production-auth-order"
+    )
+    warning_id = _warning(
+        database, user.id, forecast_id, local_date,
+        status="sent", forecast_version="production-auth-order",
+    )
+    sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+    _set_warning_delivery(
+        database,
+        warning_id,
+        authorized_at=sent_at + timedelta(minutes=1),
+        sent_at=sent_at,
+    )
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    current = {
+        row["id"]: row
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+
+    assert current[str(warning_id)]["reason"] == "sent_before_authorization"
+
+
+def test_audit_fails_closed_when_no_authorization_enforcement_baseline_exists():
+    database = memory_database()
+    user = participant(database, "P-REAL-AUTH-NO-BASELINE")
+    local_date = date(2026, 8, 28)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="production-no-baseline"
+    )
+    warning_id = _warning(
+        database, user.id, forecast_id, local_date,
+        status="sent", forecast_version="production-no-baseline",
+    )
+    original_sent_at = datetime(2026, 8, 28, 9, tzinfo=timezone.utc)
+    _set_warning_delivery(
+        database, warning_id, authorized_at=None, sent_at=original_sent_at
+    )
+
+    report = audit_synthetic_data(database.engine, today=local_date)
+    current = {
+        row["id"]: row
+        for row in report["invariants"][
+            "sent_warnings_without_authorization_or_sent_time"
+        ]
+    }
+
+    assert report["invariants"]["legacy_sent_warnings_without_authorization"] == []
+    assert current[str(warning_id)]["reason"] == (
+        "missing_authorization_without_enforcement_baseline"
+    )
+    with database.session() as session:
+        unchanged = session.get(WarningSchedule, warning_id)
+        assert unchanged.authorized_at is None
+        assert unchanged.sent_at == original_sent_at.replace(tzinfo=None)
 
 
 def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():

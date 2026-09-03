@@ -141,13 +141,51 @@ def _invariants(session: Session) -> dict[str, list[dict[str, Any]]]:
         .group_by(ForecastSnapshot.participant_id, ForecastSnapshot.local_date)
         .having(func.count(ForecastSnapshot.id) > 1)
     ).all()
-    invalid_sent = session.scalars(
+    authorization_enforcement_observed_at = session.scalar(
+        select(func.min(WarningSchedule.sent_at)).where(
+            WarningSchedule.status == "sent",
+            WarningSchedule.authorized_at.is_not(None),
+            WarningSchedule.sent_at.is_not(None),
+            WarningSchedule.sent_at >= WarningSchedule.authorized_at,
+        )
+    )
+    unresolved_sent = session.scalars(
         select(WarningSchedule).where(
             WarningSchedule.status == "sent",
             or_(WarningSchedule.authorized_at.is_(None), WarningSchedule.sent_at.is_(None),
                 WarningSchedule.sent_at < WarningSchedule.authorized_at),
         )
     ).all()
+    invalid_sent: list[dict[str, Any]] = []
+    legacy_sent: list[dict[str, Any]] = []
+    for row in unresolved_sent:
+        item = {
+            "id": str(row.id),
+            "participant_id": str(row.participant_id),
+            "authorized_at": _jsonable(row.authorized_at),
+            "sent_at": _jsonable(row.sent_at),
+        }
+        if row.sent_at is None:
+            item["reason"] = "missing_sent_at"
+            invalid_sent.append(item)
+        elif row.authorized_at is not None and row.sent_at < row.authorized_at:
+            item["reason"] = "sent_before_authorization"
+            invalid_sent.append(item)
+        elif (
+            authorization_enforcement_observed_at is not None
+            and row.sent_at < authorization_enforcement_observed_at
+        ):
+            item["classification"] = (
+                "legacy_pre_observed_authorization_enforcement"
+            )
+            legacy_sent.append(item)
+        else:
+            item["reason"] = (
+                "missing_authorization_after_enforcement"
+                if authorization_enforcement_observed_at is not None
+                else "missing_authorization_without_enforcement_baseline"
+            )
+            invalid_sent.append(item)
     stale_active = session.execute(
         select(WarningSchedule, ForecastSnapshot)
         .outerjoin(ForecastSnapshot, ForecastSnapshot.id == WarningSchedule.forecast_id)
@@ -162,10 +200,8 @@ def _invariants(session: Session) -> dict[str, list[dict[str, Any]]]:
             "participant_id": str(row.participant_id),
             "local_date": row.local_date.isoformat(), "row_count": row.row_count,
         } for row in duplicate_valid],
-        "sent_warnings_without_authorization_or_sent_time": [{
-            "id": str(row.id), "participant_id": str(row.participant_id),
-            "authorized_at": _jsonable(row.authorized_at), "sent_at": _jsonable(row.sent_at),
-        } for row in invalid_sent],
+        "sent_warnings_without_authorization_or_sent_time": invalid_sent,
+        "legacy_sent_warnings_without_authorization": legacy_sent,
         "active_warnings_on_stale_forecasts": [{
             "warning_id": str(warning.id), "forecast_id": str(warning.forecast_id),
             "participant_id": str(warning.participant_id),

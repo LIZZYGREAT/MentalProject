@@ -82,25 +82,10 @@ if [ "$ACCEPTANCE_IMAGE_REVISION" != "$HOST_REVISION" ]; then
 fi
 
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
-  --user root \
   -e MINDFLOW_TEST_POSTGRES_URL="$MINDFLOW_TEST_POSTGRES_URL" \
   -e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL" \
   -e MINDFLOW_REQUIRE_POSTGRES_TESTS=1 \
-  -v "$RUNTIME_ROOT/tests:/srv/runtime/tests:ro" \
-  -v "$PROJECT_ROOT/claude-runtime:/srv/claude-runtime:ro" \
-  -v "$PROJECT_ROOT/docs:/srv/docs:ro" \
-  acceptance sh -eu -c '
-    test -f /srv/docs/CURRENT_ARCHITECTURE.md
-    test -f /srv/claude-runtime/plugins/mindflow-care/skills/mental-health-care/SKILL.md
-    python3 -m pip install \
-      --quiet \
-      --no-cache-dir \
-      --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-      --trusted-host pypi.tuna.tsinghua.edu.cn \
-      pytest==8.4.1 \
-      pytest-asyncio==1.1.0
-    exec python3 -m pytest -q tests
-  '
+  acceptance
 
 restore_runtime
 
