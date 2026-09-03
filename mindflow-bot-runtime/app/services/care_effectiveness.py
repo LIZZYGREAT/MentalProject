@@ -296,6 +296,10 @@ class CareEffectivenessService:
             period = "morning" if local_hour < 12 else "afternoon" if local_hour < 18 else "evening"
             grouped[(intervention.intervention_type, stress_band, workload, period)].append((intervention, outcome))
         groups = []
+        all_ratings: list[float] = []
+        all_receptivity: list[float] = []
+        followup_30m_count = 0
+        followup_60m_count = 0
         for (kind, stress_band, workload, period), items in sorted(grouped.items()):
             ratings = [float(outcome.helpful_rating) for _, outcome in items if outcome.helpful_rating is not None]
             delta30 = [float(outcome.followup_30m["observed_stress_change"]) for _, outcome in items if outcome.followup_30m and outcome.followup_30m.get("observed_stress_change") is not None]
@@ -303,6 +307,10 @@ class CareEffectivenessService:
             residual30 = [float(outcome.followup_30m["forecast_residual"]) for _, outcome in items if outcome.followup_30m and outcome.followup_30m.get("forecast_residual") is not None]
             residual60 = [float(outcome.followup_60m["forecast_residual"]) for _, outcome in items if outcome.followup_60m and outcome.followup_60m.get("forecast_residual") is not None]
             receptivity = [float(item.receptivity_score) for item, _ in items if item.receptivity_score is not None]
+            all_ratings.extend(ratings)
+            all_receptivity.extend(receptivity)
+            followup_30m_count += len(delta30)
+            followup_60m_count += len(delta60)
             groups.append({
                 "intervention_type": kind,
                 "stress_level": stress_band,
@@ -310,6 +318,9 @@ class CareEffectivenessService:
                 "time_of_day": period,
                 "sample_count": len(items),
                 "helpful_sample_count": len(ratings),
+                "helpful_count": int(sum(ratings)),
+                "followup_30m_sample_count": len(delta30),
+                "followup_60m_sample_count": len(delta60),
                 "helpful_rate": _mean(ratings),
                 "helpful_binary_observations": ratings,
                 "observed_stress_change_30m": _mean(delta30),
@@ -334,6 +345,18 @@ class CareEffectivenessService:
             "mrt_rows_present": bool(mrt_count),
             "date_start": date_start.isoformat(),
             "date_end": date_end.isoformat(),
+            "summary": {
+                # The grouping keys form a mutually-exclusive partition, so
+                # these totals do not double count interventions.
+                "group_count": len(groups),
+                "total_sample_count": len(rows),
+                "helpful_sample_count": len(all_ratings),
+                "helpful_count": int(sum(all_ratings)),
+                "overall_helpful_rate": _mean(all_ratings),
+                "followup_30m_sample_count": followup_30m_count,
+                "followup_60m_sample_count": followup_60m_count,
+                "mean_receptivity": _mean(all_receptivity),
+            },
             "groups": groups,
         }
 

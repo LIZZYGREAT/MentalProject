@@ -26,6 +26,7 @@ from app.services.forecast_dependency_refresh import ForecastDependencyRefreshSe
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.curve_analysis import analyze_curve
 from app.services.pressure_curve_renderer import PressureCurveRenderer
+from settings.visual_defaults import FIGSIZE
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PendingImageCard,
@@ -795,7 +796,8 @@ def test_renderer_matches_m0_state_definition_and_reference_visual_style():
     }
     figure = renderer._draw_core_plot(curve, analysis, model_output)
     try:
-        assert tuple(figure.get_size_inches()) == (14.0, 9.0)
+        assert tuple(figure.get_size_inches()) == FIGSIZE
+        assert FIGSIZE[0] / FIGSIZE[1] == pytest.approx(16 / 9, rel=0.02)
         assert len(figure.axes) == 3  # pressure, M0 inputs, alert confidence
         pressure_axis, input_axis, confidence_axis = figure.axes
         assert pressure_axis.get_ylabel() == "心理压力（0–100）"

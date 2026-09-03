@@ -224,6 +224,72 @@ def test_dynamic_vitality_chart_keeps_legacy_primary_palette():
         plt.close(figure)
 
 
+def test_full_day_dense_events_warnings_and_optional_fields_render_safely():
+    curve = [
+        {
+            "time": f"{minute // 60:02d}:{minute % 60:02d}",
+            "stress_0_10": 4.0 + (minute / 1435) * 3.0,
+        }
+        for minute in range(0, 1440, 5)
+    ]
+    events = [
+        {
+            "summary": f"密集日程 {index}",
+            "start_time": f"2030-01-15T{index % 24:02d}:00:00+08:00",
+            "end_time": f"2030-01-15T{(index + 1) % 24:02d}:00:00+08:00",
+            "event_type": "other",
+            "importance": "high" if index % 4 == 0 else "normal",
+        }
+        for index in range(24)
+    ]
+    analysis = analyze_curve(
+        curve,
+        calendar_events=events,
+        warning_windows=[
+            {
+                "risk_time": "2030-01-15T18:00:00+08:00",
+                "warning_level": "high",
+                "payload": {"type": "高风险关注"},
+            }
+        ],
+    )
+
+    renderer = PressureCurveRenderer()
+    png = renderer.render(curve, analysis, stress_only=True)
+    figure = renderer._draw_core_plot(curve, analysis, stress_only=True)
+    plt, _font_name = renderer._pyplot()
+    try:
+        axis = figure.axes[0]
+        assert curve[0]["time"] == "00:00"
+        assert curve[-1]["time"] == "23:55"
+        assert axis.get_xlim()[0] <= 0
+        assert axis.get_xlim()[1] >= 23.9
+        assert any(text.get_text() == "高风险关注" for text in axis.texts)
+        assert png.startswith(b"\x89PNG")
+    finally:
+        plt.close(figure)
+
+
+def test_historical_chart_does_not_draw_a_false_current_time_marker():
+    curve = [
+        {"time": "00:00", "stress_0_10": 4.0},
+        {"time": "23:55", "stress_0_10": 5.0},
+    ]
+    renderer = PressureCurveRenderer()
+    figure = renderer._draw_core_plot(
+        curve,
+        analyze_curve(curve),
+        {"_render_is_today": False},
+        stress_only=True,
+    )
+    plt, _font_name = renderer._pyplot()
+    try:
+        labels = [line.get_label() for line in figure.axes[0].lines]
+        assert "当前时刻" not in labels
+    finally:
+        plt.close(figure)
+
+
 def test_event_palette_matches_sqlite_auth_deployment_branch():
     assert EVENT_COLOR_MAP == {
         "course": ("#4169E1", "课程"),

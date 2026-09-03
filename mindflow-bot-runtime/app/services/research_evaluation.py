@@ -381,6 +381,7 @@ class ResearchEvaluationService:
             "date_start": date_start.isoformat(),
             "date_end": date_end.isoformat(),
             "participant_id": str(participant_id) if participant_id else None,
+            "match_tolerance_minutes": MATCH_TOLERANCE_SECONDS / 60,
             "series_mode": "latest_descriptive",
             "series": forecast_series,
             "actual_ema": actual_series,

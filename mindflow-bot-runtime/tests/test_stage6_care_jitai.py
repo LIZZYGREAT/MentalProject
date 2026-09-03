@@ -326,6 +326,16 @@ def test_descriptive_effects_never_claim_causality():
     assert report["groups"][0]["causal_effect"] is None
     assert report["groups"][0]["observed_stress_change_30m"] == -1.0
     assert report["groups"][0]["forecast_residual_30m"] == -1.0
+    assert report["summary"] == {
+        "group_count": 1,
+        "total_sample_count": 1,
+        "helpful_sample_count": 1,
+        "helpful_count": 1,
+        "overall_helpful_rate": 1.0,
+        "followup_30m_sample_count": 1,
+        "followup_60m_sample_count": 1,
+        "mean_receptivity": 0.7,
+    }
 
 
 def test_research_effect_get_aggregation_is_read_only():

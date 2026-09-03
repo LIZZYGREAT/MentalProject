@@ -32,6 +32,11 @@ from app.services.model_promotion import ModelPromotionService
 from app.services.hierarchical_personalization import ParameterLearningService
 from app.services.care_effectiveness import CareEffectivenessService
 from app.services.care_what_if import CareWhatIfSimulationService
+from app.services.participant_overview import ParticipantOverviewService
+from app.services.workload_diagnostic_renderer import (
+    WorkloadDataNotFoundError,
+    WorkloadDiagnosticRenderer,
+)
 from app.repositories import ForecastSnapshotRepository, ObservationRepository
 
 
@@ -72,6 +77,10 @@ class AdminAPI:
         self.care_effects = CareEffectivenessService(
             repository.database, settings.timezone_name
         )
+        self.participant_overviews = ParticipantOverviewService(
+            repository.database, settings.timezone_name
+        )
+        self.workload_renderer = WorkloadDiagnosticRenderer()
         self.what_if = (
             CareWhatIfSimulationService(pressure_curves.coordinator)
             if pressure_curves is not None
@@ -535,6 +544,25 @@ class AdminAPI:
             return _json_error(str(exc), 409)
         return JSONResponse(value)
 
+    async def participant_overview(self, request: Request) -> Response:
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        try:
+            through = date.fromisoformat(
+                request.query_params.get("through")
+                or datetime.now(ZoneInfo(self.settings.timezone_name)).date().isoformat()
+            )
+        except ValueError:
+            return _json_error("invalid_date", 400)
+        return JSONResponse(
+            await asyncio.to_thread(
+                self.participant_overviews.build,
+                participant_id,
+                through=through,
+            )
+        )
+
     async def reanalyse_retrospective_curve(self, request: Request) -> Response:
         session = await self._authorized(request, csrf=True)
         if session is None:
@@ -714,12 +742,14 @@ class AdminAPI:
             )
         )
 
-    async def workload_dashboard(self, request: Request) -> Response:
+    async def _workload_payload(
+        self, request: Request
+    ) -> tuple[dict[str, Any] | None, Response | None]:
         if await self._authorized(request) is None:
-            return _json_error("unauthorized", 401)
+            return None, _json_error("unauthorized", 401)
         date_start, date_end, error = self._research_dates(request)
         if error:
-            return error
+            return None, error
         participant_id = None
         participant_code = str(
             request.query_params.get("participant_code") or ""
@@ -729,14 +759,46 @@ class AdminAPI:
                 self.repository.participant_id, participant_code
             )
             if participant_id is None:
-                return _json_error("participant_not_found", 404)
-        return JSONResponse(
-            await asyncio.to_thread(
-                self.research.workload_diagnostics,
-                date_start,
-                date_end,
-                participant_id,
-            )
+                return None, _json_error("participant_not_found", 404)
+        payload = await asyncio.to_thread(
+            self.research.workload_diagnostics,
+            date_start,
+            date_end,
+            participant_id,
+        )
+        payload["participant_code"] = participant_code or None
+        return payload, None
+
+    async def workload_dashboard(self, request: Request) -> Response:
+        payload, error = await self._workload_payload(request)
+        return error or JSONResponse(payload)
+
+    async def workload_chart(self, request: Request) -> Response:
+        payload, error = await self._workload_payload(request)
+        if error:
+            return error
+        chart = request.path_params["chart"]
+        try:
+            if chart == "demand-vs-forecast":
+                png = await asyncio.to_thread(
+                    self.workload_renderer.demand_vs_forecast, payload
+                )
+            elif chart == "forecast-vs-ema":
+                png = await asyncio.to_thread(
+                    self.workload_renderer.forecast_vs_ema, payload
+                )
+            elif chart == "residual":
+                png = await asyncio.to_thread(self.workload_renderer.residual, payload)
+                if png is None:
+                    return _json_error("workload_data_not_found", 404)
+            else:
+                return _json_error("workload_chart_not_found", 404)
+        except WorkloadDataNotFoundError:
+            return _json_error("workload_data_not_found", 404)
+        return Response(
+            png,
+            media_type="image/png",
+            headers={"Cache-Control": "private, no-store"},
         )
 
     async def participant_longitudinal(self, request: Request) -> Response:
@@ -1119,6 +1181,7 @@ class AdminAPI:
             Route(f"{prefix}/dashboard", self.dashboard, methods=["GET"]),
             Route(f"{prefix}/participants", self.participants, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}", self.participant, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/overview", self.participant_overview, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/messages", self.messages, methods=["GET"]),
             Route(f"{prefix}/messages/{{event_id}}", self.message, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/observations", self.observations, methods=["GET"]),
@@ -1139,6 +1202,7 @@ class AdminAPI:
             Route(f"{prefix}/participants/{{participant_code}}/retrospective-curve/{{local_date}}/reanalysis", self.reanalyse_retrospective_curve, methods=["POST"]),
             Route(f"{prefix}/research/dashboard", self.research_dashboard, methods=["GET"]),
             Route(f"{prefix}/research/workload", self.workload_dashboard, methods=["GET"]),
+            Route(f"{prefix}/research/workload/chart/{{chart}}.png", self.workload_chart, methods=["GET"]),
             Route(f"{prefix}/research/care-effects", self.care_effect_admin, methods=["GET"]),
             Route(f"{prefix}/data-quality", self.data_quality, methods=["GET"]),
             Route(f"{prefix}/research/matches/rebuild", self.rebuild_research_matches, methods=["POST"]),

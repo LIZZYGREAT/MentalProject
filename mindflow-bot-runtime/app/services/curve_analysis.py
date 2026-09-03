@@ -267,6 +267,7 @@ def analyze_curve(
             "minute": parsed[0],
             "summary": title,
             "event_type": event_type,
+            "importance": event.get("importance"),
             "start_time": event.get("start_time"),
             "end_time": event.get("end_time"),
             "end_time_local": end_parsed[1] if end_parsed else parsed[1],

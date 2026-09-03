@@ -42,7 +42,6 @@ COPY core_engine/ /srv/project/core_engine/
 COPY entity/ /srv/project/entity/
 COPY event/ /srv/project/event/
 COPY settings/ /srv/project/settings/
-COPY strategy/ /srv/project/strategy/
 COPY utils/ /srv/project/utils/
 COPY entry/ /srv/project/entry/
 COPY services/ /srv/project/services/

@@ -1,6 +1,6 @@
 """Shared defaults for the sqlite-auth-deployment style forecast chart."""
 
-FIGSIZE = (14, 9)
+FIGSIZE = (14.4, 8.1)
 S_PANEL_HEIGHT_RATIO = 3
 E_PANEL_HEIGHT_RATIO = 1
 PLOT_DPI = 120

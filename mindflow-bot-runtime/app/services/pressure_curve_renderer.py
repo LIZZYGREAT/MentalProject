@@ -116,6 +116,35 @@ class PressureCurveRenderer:
             "figure.facecolor": "white",
         }
 
+    @staticmethod
+    def _apply_reference_style(*axes: Any) -> None:
+        """Apply the restrained white-background grid used by the reference."""
+
+        for axis in axes:
+            if axis is not None:
+                axis.grid(True, linestyle="--", linewidth=0.8, alpha=0.26)
+
+    @staticmethod
+    def _event_style(event: dict[str, Any]) -> tuple[str, str, float]:
+        event_type = str(event.get("event_type") or "other").strip().lower()
+        event_type = _EVENT_TYPE_ALIASES.get(event_type, event_type)
+        if event_type in EVENT_COLOR_MAP:
+            color, type_name = EVENT_COLOR_MAP[event_type]
+        else:
+            color = (
+                "#b45309"
+                if str(event.get("importance") or "").lower()
+                in {"high", "critical"}
+                else "#64748b"
+            )
+            type_name = "其他"
+        return color, type_name, 0.30 if event_type == "sleep" else 0.18
+
+    @staticmethod
+    def _finalize_figure(figure: Any, title: str) -> None:
+        figure.suptitle(title, fontsize=16, weight="bold")
+        figure.tight_layout(rect=(0, 0, 1, 0.97))
+
     def _draw_core_plot(
         self,
         curve: list[dict[str, Any]],
@@ -230,7 +259,7 @@ class PressureCurveRenderer:
                 "心理压力（0–100）", color="royalblue", fontsize=13, weight="bold"
             )
             stress_axis.tick_params(axis="y", labelcolor="royalblue")
-            stress_axis.grid(True, linestyle="--", alpha=0.3)
+            self._apply_reference_style(stress_axis)
 
             transform = stress_axis.get_xaxis_transform()
             for index, event in enumerate(analysis.important_calendar_events):
@@ -238,12 +267,7 @@ class PressureCurveRenderer:
                 end = int(event.get("end_minute", start))
                 if end < start:
                     end = 1440
-                event_type = str(event.get("event_type") or "other").strip().lower()
-                event_type = _EVENT_TYPE_ALIASES.get(event_type, event_type)
-                color, type_name = EVENT_COLOR_MAP.get(
-                    event_type, ("#7f7f7f", "其他")
-                )
-                alpha = 0.30 if event_type == "sleep" else 0.20
+                color, type_name, alpha = self._event_style(event)
                 start_hour = start / 60.0
                 end_hour = end / 60.0
                 stress_axis.axvspan(start_hour, end_hour, color=color, alpha=alpha)
@@ -252,7 +276,8 @@ class PressureCurveRenderer:
                         start_hour, end_hour, color=color, alpha=alpha
                     )
                 midpoint = start_hour + (end_hour - start_hour) / 2.0
-                y_position = EVENT_LABEL_Y_OFFSETS[index % len(EVENT_LABEL_Y_OFFSETS)]
+                label_lanes = (*EVENT_LABEL_Y_OFFSETS, 0.77)
+                y_position = label_lanes[index % len(label_lanes)]
                 label = (
                     f"[{type_name}] {str(event['summary'])[:18]}\n"
                     f"{event['time']}-{event.get('end_time_local', event['time'])}"
@@ -334,7 +359,12 @@ class PressureCurveRenderer:
                     arrowprops={"arrowstyle": "->", "color": "red"},
                 )
 
-            current_minute = time_to_minute(analysis.current_time)
+            show_current_time = bool(
+                (model_output or {}).get("_render_is_today", True)
+            )
+            current_minute = (
+                time_to_minute(analysis.current_time) if show_current_time else None
+            )
             if current_minute is not None:
                 current_hour = current_minute / 60.0
                 stress_axis.axvline(
@@ -440,7 +470,7 @@ class PressureCurveRenderer:
                 title = "今日压力趋势与影响因素"
 
             if secondary_axis is not None:
-                secondary_axis.grid(True, linestyle="--", alpha=0.3)
+                self._apply_reference_style(secondary_axis)
                 secondary_axis.set_xlabel("时间 (24h)", fontsize=12)
                 secondary_axis.set_xlim(min(times), max(times))
                 secondary_axis.set_xticks(range(0, 25, 2))
@@ -471,8 +501,7 @@ class PressureCurveRenderer:
                     loc="center left", bbox_to_anchor=(0.01, 0.65), fontsize=10
                 )
 
-            figure.suptitle(title, fontsize=16, weight="bold")
-            figure.tight_layout()
+            self._finalize_figure(figure, title)
             return figure
 
     def render(

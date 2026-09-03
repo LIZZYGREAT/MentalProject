@@ -72,7 +72,10 @@ class PressureCurveService:
             self.renderer.render,
             curve,
             analysis,
-            dict(forecast.get("output") or {}),
+            {
+                **dict(forecast.get("output") or {}),
+                "_render_is_today": target == datetime.now(self.timezone).date(),
+            },
             stress_only=stress_only,
         )
         return PressureCurveView(forecast, analysis, png_bytes)
@@ -125,7 +128,10 @@ class PressureCurveService:
                 self.renderer.render,
                 curve,
                 analysis,
-                output,
+                {
+                    **output,
+                    "_render_is_today": target == datetime.now(self.timezone).date(),
+                },
                 stress_only=stress_only,
             )
         return PressureCurveView(forecast, analysis, png_bytes)
