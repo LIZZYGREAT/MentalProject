@@ -55,6 +55,7 @@ def receiver_process_main(
     channel_factory: Callable[..., Any] | None = None,
     device_flow_close_timeout_seconds: float = 8.0,
     channel_sdk_version: str | None = None,
+    card_action_enabled: bool = False,
 ) -> None:
     """Run FeishuChannel in a fresh interpreter with a process-local loop."""
 
@@ -74,6 +75,13 @@ def receiver_process_main(
     logger = logging.getLogger(__name__)
     shutdown_in_progress = threading.Event()
 
+    if card_action_enabled:
+        from app.integrations.feishu.channel_card_ws_compat import (
+            install_card_ws_compat,
+        )
+
+        install_card_ws_compat()
+
     if channel_factory is None:
         from lark_channel import FeishuChannel
 
@@ -84,12 +92,14 @@ def receiver_process_main(
     lark_logger.addFilter(shutdown_filter)
 
     from app.integrations.feishu.gateway import (
+        FeishuChannelCardActionAdapter,
         FeishuChannelMessageAdapter,
         InvalidBotEvent,
     )
     from app.integrations.feishu.channel_shutdown import stop_feishu_channel_cleanly
 
     adapter = FeishuChannelMessageAdapter(app_id)
+    card_action_adapter = FeishuChannelCardActionAdapter(app_id)
     channel: Any | None = None
     stop_lock = threading.Lock()
     stop_started = False
@@ -149,6 +159,28 @@ def receiver_process_main(
             output_queue.put({"kind": "event", "payload": event.to_ipc_payload()})
 
         channel.on("message", on_message)
+
+        if card_action_enabled:
+            def on_card_action(card_action: Any) -> None:
+                try:
+                    event = card_action_adapter.adapt(card_action)
+                except InvalidBotEvent as exc:
+                    logger.debug(
+                        "feishu_receiver_card_action_ignored reason=%s",
+                        str(exc) or type(exc).__name__,
+                    )
+                    return
+                logger.info(
+                    "feishu_receiver_card_action_adapted "
+                    "event_id=%s message_id=%s",
+                    event.event_id,
+                    event.message_id,
+                )
+                output_queue.put(
+                    {"kind": "card_action", "payload": event.to_ipc_payload()}
+                )
+
+            channel.on("cardAction", on_card_action)
 
         def monitor_lifecycle() -> None:
             ready_sent = False

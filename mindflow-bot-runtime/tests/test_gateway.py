@@ -2,6 +2,7 @@ import asyncio
 from functools import partial
 import inspect
 import multiprocessing
+import queue as sync_queue
 import threading
 import time
 from types import SimpleNamespace
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import (
+    CardActionEvent,
+    FeishuChannelCardActionAdapter,
     FeishuChannelMessageAdapter,
     FeishuEventParser,
     FeishuGateway,
@@ -87,6 +90,40 @@ def channel_message(*, message_id="msg-channel", content_type="text", is_bot=Fal
         raw_content_type=content_type,
         content_text="channel hello",
     )
+
+
+def channel_card_action(*, event_id="card-provider-1"):
+    return SimpleNamespace(
+        message_id="om-card",
+        chat_id="oc-card",
+        operator=SimpleNamespace(open_id="ou-card"),
+        action=SimpleNamespace(
+            tag="button",
+            value={"mindflow_action": "care_helpful", "version": "1"},
+            form_value={"note": "private"},
+        ),
+        raw={"header": {"event_id": event_id}},
+    )
+
+
+class CardActionFakeChannel:
+    def __init__(self, stop_event, registrations, **_kwargs):
+        self.stop_event = stop_event
+        self.registrations = registrations
+        self.handlers = {}
+        self.is_ready = False
+
+    def on(self, name, handler):
+        self.registrations.append(name)
+        self.handlers[name] = handler
+
+    def start(self):
+        self.is_ready = True
+        self.handlers["cardAction"](channel_card_action())
+        self.stop_event.set()
+
+    def stop(self):
+        self.stop_event.set()
 
 
 class BlockingFakeChannel:
@@ -256,6 +293,62 @@ def test_channel_adapter_keeps_stable_fields_and_filters_unsupported_messages():
     ):
         with __import__("pytest").raises(InvalidBotEvent):
             adapter.adapt(message)
+
+
+def test_gateway_preserves_card_action_identity():
+    event = FeishuChannelCardActionAdapter("cli_test").adapt(
+        channel_card_action(event_id="provider-card-event")
+    )
+    assert event.event_id == "provider-card-event"
+    assert event.message_id == "om-card"
+    assert event.chat_id == "oc-card"
+    assert event.open_id == "ou-card"
+    assert event.action_tag == "button"
+    assert event.action_value["mindflow_action"] == "care_helpful"
+    assert event.form_value == {"note": "private"}
+    assert CardActionEvent.from_ipc_payload(event.to_ipc_payload()) == event
+
+
+def test_receiver_registers_card_action():
+    output = sync_queue.Queue()
+    stop_event = threading.Event()
+    registrations = []
+    receiver_process_main(
+        "cli_test",
+        "secret",
+        output,
+        stop_event,
+        partial(CardActionFakeChannel, stop_event, registrations),
+        card_action_enabled=True,
+    )
+    assert registrations[:2] == ["message", "cardAction"]
+
+
+def test_receiver_card_action_emits_ipc_envelope():
+    output = sync_queue.Queue()
+    stop_event = threading.Event()
+    receiver_process_main(
+        "cli_test",
+        "secret",
+        output,
+        stop_event,
+        partial(CardActionFakeChannel, stop_event, []),
+        card_action_enabled=True,
+    )
+    envelopes = []
+    while not output.empty():
+        envelopes.append(output.get_nowait())
+    card_envelope = next(item for item in envelopes if item["kind"] == "card_action")
+    assert card_envelope["payload"] == {
+        "event_id": "card-provider-1",
+        "message_id": "om-card",
+        "app_id": "cli_test",
+        "open_id": "ou-card",
+        "chat_id": "oc-card",
+        "action_tag": "button",
+        "action_value": {"mindflow_action": "care_helpful", "version": "1"},
+        "form_value": {"note": "private"},
+    }
 
 
 def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):
@@ -626,3 +719,69 @@ def test_normal_ingress_logs_safe_event_metadata(caplog):
     assert "secret-value" not in combined
     assert "ou_test" not in combined
     assert "oc_test" not in combined
+
+
+def test_gateway_consumes_card_action_ipc():
+    database = memory_database()
+    handled = []
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        asyncio.Queue(maxsize=2),
+        card_action_handler=handled.append,
+    )
+    event = FeishuChannelCardActionAdapter("cli_test").adapt(channel_card_action())
+
+    async def scenario():
+        gateway._output_queue = sync_queue.Queue()
+        gateway._stopping = True
+        gateway._closed = asyncio.get_running_loop().create_future()
+        gateway._output_queue.put(
+            {"kind": "card_action", "payload": event.to_ipc_payload()}
+        )
+        gateway._output_queue.put({"kind": "stopped"})
+        await gateway._consume_receiver_output()
+
+    asyncio.run(scenario())
+    assert handled == [event]
+
+
+def test_gateway_card_action_failure_is_isolated(caplog):
+    database = memory_database()
+    attempts = []
+
+    def handler(event):
+        attempts.append(event.event_id)
+        if len(attempts) == 1:
+            raise RuntimeError("expected action failure")
+
+    gateway = FeishuGateway(
+        "cli_test",
+        "secret",
+        IdentityService(database, BindingRepository(database)),
+        BotEventRepository(database),
+        asyncio.Queue(maxsize=2),
+        card_action_handler=handler,
+    )
+    first = FeishuChannelCardActionAdapter("cli_test").adapt(channel_card_action())
+    second = FeishuChannelCardActionAdapter("cli_test").adapt(
+        channel_card_action(event_id="card-provider-2")
+    )
+
+    async def scenario():
+        gateway._output_queue = sync_queue.Queue()
+        gateway._stopping = True
+        gateway._closed = asyncio.get_running_loop().create_future()
+        for event in (first, second):
+            gateway._output_queue.put(
+                {"kind": "card_action", "payload": event.to_ipc_payload()}
+            )
+        gateway._output_queue.put({"kind": "stopped"})
+        await gateway._consume_receiver_output()
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(scenario())
+    assert attempts == ["card-provider-1", "card-provider-2"]
+    assert "feishu_gateway_card_action_failed" in caplog.text

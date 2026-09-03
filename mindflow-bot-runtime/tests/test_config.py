@@ -47,24 +47,23 @@ def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
     assert enabled.profile_calibration_enabled is True
 
 
-def test_daily_review_is_disabled_by_default_and_requires_card_callback():
+def test_daily_review_is_disabled_by_default_and_ws_transport_enables_it():
     environment = valid_environment()
     settings = Settings.from_env(
         environment, base_dir=Path(__file__).resolve().parents[1]
     )
     assert settings.daily_review_enabled is False
+    assert settings.feishu_card_action_transport == "ws"
 
     environment["DAILY_REVIEW_ENABLED"] = "true"
-    with pytest.raises(
-        ValueError,
-        match="DAILY_REVIEW_ENABLED requires FEISHU_CARD_CALLBACK_ENABLED",
-    ):
-        Settings.from_env(
-            environment, base_dir=Path(__file__).resolve().parents[1]
-        )
+    enabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert enabled.daily_review_enabled is True
 
     environment.update(
         {
+            "FEISHU_CARD_ACTION_TRANSPORT": "http",
             "FEISHU_CARD_CALLBACK_ENABLED": "true",
             "FEISHU_CARD_VERIFICATION_TOKEN": "verification-token",
             "FEISHU_CARD_ENCRYPT_KEY": "encrypt-key",
@@ -206,6 +205,7 @@ def test_partial_calendar_credentials_are_rejected(name, value):
 
 def test_card_callback_requires_verified_encrypted_configuration_when_enabled():
     environment = valid_environment()
+    environment["FEISHU_CARD_ACTION_TRANSPORT"] = "http"
     environment["FEISHU_CARD_CALLBACK_ENABLED"] = "true"
 
     with pytest.raises(ValueError, match="FEISHU_CARD_VERIFICATION_TOKEN"):
@@ -226,6 +226,26 @@ def test_card_callback_requires_verified_encrypted_configuration_when_enabled():
     assert settings.feishu_card_callback_enabled is True
     assert settings.feishu_card_callback_port == 8123
     assert settings.feishu_card_callback_path == "/feishu/card/callback"
+
+
+def test_ws_and_http_card_action_ingress_cannot_be_enabled_together():
+    environment = valid_environment()
+    environment["FEISHU_CARD_CALLBACK_ENABLED"] = "true"
+
+    with pytest.raises(ValueError, match="must be false"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
+def test_card_action_transport_rejects_unknown_mode():
+    environment = valid_environment()
+    environment["FEISHU_CARD_ACTION_TRANSPORT"] = "auto"
+
+    with pytest.raises(ValueError, match="must be ws or http"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
 
 
 def test_bot_validation_is_not_coupled_to_admin_credentials():

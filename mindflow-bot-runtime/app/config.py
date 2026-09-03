@@ -79,6 +79,7 @@ class Settings:
     claude_default_sonnet_model: str
     claude_default_haiku_model: str
     claude_code_subagent_model: str
+    feishu_card_action_transport: str = "ws"
     feishu_card_callback_enabled: bool = False
     feishu_card_callback_host: str = "0.0.0.0"
     feishu_card_callback_port: int = 8000
@@ -247,6 +248,9 @@ class Settings:
             claude_code_subagent_model=values.get(
                 "CLAUDE_CODE_SUBAGENT_MODEL", ""
             ).strip(),
+            feishu_card_action_transport=values.get(
+                "FEISHU_CARD_ACTION_TRANSPORT", "ws"
+            ).strip().lower(),
             feishu_card_callback_enabled=_bool(
                 values, "FEISHU_CARD_CALLBACK_ENABLED", False
             ),
@@ -456,6 +460,16 @@ class Settings:
             raise ValueError(
                 "CLAUDE_CODE_SUBAGENT_MODEL must match CLAUDE_DEFAULT_HAIKU_MODEL"
             )
+        if self.feishu_card_action_transport not in {"ws", "http"}:
+            raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
+        if (
+            self.feishu_card_action_transport == "ws"
+            and self.feishu_card_callback_enabled
+        ):
+            raise ValueError(
+                "FEISHU_CARD_CALLBACK_ENABLED must be false when "
+                "FEISHU_CARD_ACTION_TRANSPORT=ws"
+            )
         if self.feishu_card_callback_enabled:
             missing_callback = [
                 name
@@ -474,9 +488,16 @@ class Settings:
                 raise ValueError("FEISHU_CARD_CALLBACK_PATH must start with /")
             if self.feishu_card_callback_port > 65535:
                 raise ValueError("FEISHU_CARD_CALLBACK_PORT must be <= 65535")
-        if self.daily_review_enabled and not self.feishu_card_callback_enabled:
+        card_action_transport_available = (
+            self.feishu_card_action_transport == "ws"
+            or (
+                self.feishu_card_action_transport == "http"
+                and self.feishu_card_callback_enabled
+            )
+        )
+        if self.daily_review_enabled and not card_action_transport_available:
             raise ValueError(
-                "DAILY_REVIEW_ENABLED requires FEISHU_CARD_CALLBACK_ENABLED=true"
+                "DAILY_REVIEW_ENABLED requires an available CardAction transport"
             )
         if self.app_env == "production" and not self.database_url.startswith(
             ("postgresql://", "postgresql+psycopg://")

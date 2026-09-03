@@ -363,6 +363,24 @@ def care_intervention_card(
                 ],
             }
         )
+    button_rows = []
+    for offset in range(0, len(buttons), 2):
+        button_rows.append(
+            {
+                "tag": "column_set",
+                "flex_mode": "bisect",
+                "horizontal_spacing": "8px",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [button],
+                    }
+                    for button in buttons[offset:offset + 2]
+                ],
+            }
+        )
     return {
         "schema": "2.0",
         "config": {
@@ -379,25 +397,63 @@ def care_intervention_card(
             "direction": "vertical",
             "elements": [
                 {"tag": "markdown", "content": str(message)[:1000]},
-                {
-                    "tag": "column_set",
-                    "flex_mode": "bisect",
-                    "horizontal_spacing": "8px",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 1,
-                            "elements": [button],
-                        }
-                        for button in buttons
-                    ],
-                },
+                *button_rows,
                 {
                     "tag": "markdown",
                     "text_size": "notation",
                     "content": "这是非临床的趋势提醒；你可以忽略、延后或关闭这一类提醒。",
                 },
+            ],
+        },
+    }
+
+
+def care_intervention_result_card(
+    *, message: str, result_text: str
+) -> dict[str, Any]:
+    """Replace an acted-on Care card with a final state and no action buttons."""
+
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "MindFlow 关怀提醒"},
+        },
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "MindFlow 关怀提醒"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": str(message)[:1000]},
+                {"tag": "markdown", "content": str(result_text)[:500]},
+            ],
+        },
+    }
+
+
+def card_action_result_card(*, message: str) -> dict[str, Any]:
+    """Generic final card used when a successful form action has no own card."""
+
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "MindFlow"},
+        },
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "MindFlow"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": str(message or "已提交")[:1000]}
             ],
         },
     }

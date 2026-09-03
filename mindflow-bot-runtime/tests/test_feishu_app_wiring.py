@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,6 +61,35 @@ def test_bot_client_gateway_and_scheduler_sender_use_bot_credentials():
     ]
     # main passes this single sender object to both BotWorker and ForecastScheduler.
     assert sender is not None
+
+
+def test_ws_transport_wires_card_handler_and_http_transport_does_not():
+    seen = []
+    handler = object()
+
+    def gateway_factory(*_args, **kwargs):
+        seen.append(kwargs.get("card_action_handler"))
+        return object()
+
+    _build_bot_transport(
+        settings(),
+        object(),
+        object(),
+        object(),
+        card_action_handler=handler,
+        client_factory=lambda *_args: object(),
+        gateway_factory=gateway_factory,
+    )
+    _build_bot_transport(
+        replace(settings(), feishu_card_action_transport="http"),
+        object(),
+        object(),
+        object(),
+        card_action_handler=handler,
+        client_factory=lambda *_args: object(),
+        gateway_factory=gateway_factory,
+    )
+    assert seen == [handler, None]
 
 
 def test_admin_connect_uses_calendar_credentials():

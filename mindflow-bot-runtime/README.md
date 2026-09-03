@@ -78,8 +78,8 @@ LLM，而由固定后端 action allowlist 处理。
 - `FEISHU_BOT_APP_ID`、`FEISHU_BOT_APP_SECRET`：Lizzy 的 WebSocket ingress、回复和 Warning sender。
 - `FEISHU_CALENDAR_APP_ID`、`FEISHU_CALENDAR_APP_SECRET`：Calendar OAuth、Token 和 Calendar API provider（测试环境为“喵学姐”）。若正式 Bot App 已有 Calendar 权限，可将两项都留空，自动复用 Bot credential。
 - “喵学姐”需在开放平台开通 `calendar:calendar:readonly`、`calendar:calendar.event:create`、`calendar:calendar.event:update` 和 `calendar:calendar.event:delete` 用户权限并发布应用版本。新增权限后，已有参与者需要重新发送 `/calendar` 完成授权。
-- Bot 应用需要配置新版卡片回传交互请求地址（`https://你的域名/feishu/card/callback`），并把同一组 Verification Token 与 Encrypt Key 写入 Runtime。每日状态问卷与主动 Care 卡片都由固定后端校验；未启用可信回调时，主动 Care 自动降级为纯文本。
-- 设置 `FEISHU_CARD_CALLBACK_ENABLED=true`，并配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。生产环境应由反向代理提供公网 HTTPS，只把回调路径转发到 Bot 容器端口。
+- CardAction 默认设置 `FEISHU_CARD_ACTION_TRANSPORT=ws`，在飞书开放平台用 WebSocket/长连接接收 `card.action.trigger`；此模式不需要公网 HTTPS、Verification Token 或 Encrypt Key，并保持 `FEISHU_CARD_CALLBACK_ENABLED=false`。
+- HTTP fallback 使用 `FEISHU_CARD_ACTION_TRANSPORT=http` 和 `FEISHU_CARD_CALLBACK_ENABLED=true`，同时配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。同一 CardAction 不得同时启用 WS 与 HTTP ingress。
 - `DEEPSEEK_API_KEY`
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 - `CLAUDE_MODEL`：主会话模型或 Claude Code alias。

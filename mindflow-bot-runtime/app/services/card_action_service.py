@@ -14,7 +14,11 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.integrations.feishu.cards import daily_checkin_card, today_calendar_card
+from app.integrations.feishu.cards import (
+    care_intervention_result_card,
+    daily_checkin_card,
+    today_calendar_card,
+)
 from app.repositories import ObservationRepository
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
@@ -123,12 +127,30 @@ class CardActionService:
                 ),
                 "disable_type": "已关闭这一类主动关怀提醒；显式选择会优先于自动学习。",
             }.get(care_action, "关怀反馈已记录。")
+            displayed_action = str(result.get("recorded_action") or care_action)
+            result_text = {
+                "ack": "✓ 已记录：知道了",
+                "helpful": "✓ 已记录：有帮助",
+                "not_relevant": "✓ 已记录：不太相关",
+                "mute_today": "✓ 已记录：今天不再提醒",
+                "snooze_30": (
+                    "✓ 已记录：30 分钟后提醒"
+                    if result.get("action_result") == "scheduled"
+                    else "✓ 已记录：延后选择（未新增提醒）"
+                ),
+                "disable_type": "✓ 已记录：不想收到这类提醒",
+            }.get(displayed_action, "✓ 关怀反馈已记录")
+            intervention = result.get("intervention") or {}
             return {
                 "ok": True,
                 "care_intervention_id": str(intervention_id),
                 "created": bool(result["created"]),
                 "action_result": result.get("action_result"),
                 "reply_text": reply,
+                "card": care_intervention_result_card(
+                    message=str(intervention.get("message") or "关怀提醒"),
+                    result_text=result_text,
+                ),
             }
         if action_name == "request_checkin":
             return {

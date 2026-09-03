@@ -22,15 +22,15 @@ def _log_startup_phase(name: str) -> None:
 
 
 def _should_start_daily_review_scheduler(
-    settings: Any, card_callback: Any
+    settings: Any, card_action_transport_available: bool
 ) -> bool:
     """Fail closed if an interactive Daily Review card cannot submit."""
 
     if not bool(settings.daily_review_enabled):
         return False
-    if card_callback is None:
+    if not card_action_transport_available:
         logging.getLogger(__name__).error(
-            "daily_review_scheduler_disabled callback_unavailable"
+            "daily_review_scheduler_disabled card_action_transport_unavailable"
         )
         return False
     return True
@@ -42,6 +42,8 @@ def _build_bot_transport(
     events: Any,
     queue: Any,
     *,
+    sender: Any = None,
+    card_action_handler: Any = None,
     client_factory: Any = None,
     gateway_factory: Any = None,
 ) -> tuple[Any, Any]:
@@ -53,9 +55,10 @@ def _build_bot_transport(
         from app.integrations.feishu.gateway import FeishuGateway
 
         gateway_factory = FeishuGateway
-    sender = client_factory(
-        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
-    )
+    if sender is None:
+        sender = client_factory(
+            settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+        )
     gateway = gateway_factory(
         settings.feishu_bot_app_id,
         settings.feishu_bot_app_secret,
@@ -67,8 +70,157 @@ def _build_bot_transport(
         device_flow_close_timeout_seconds=(
             settings.feishu_gateway_device_flow_close_timeout_seconds
         ),
+        card_action_handler=(
+            card_action_handler
+            if settings.feishu_card_action_transport == "ws"
+            else None
+        ),
     )
     return sender, gateway
+
+
+def _card_action_transport_available(settings: Any, card_callback: Any) -> bool:
+    return bool(
+        settings.feishu_card_action_transport == "ws"
+        or (
+            settings.feishu_card_action_transport == "http"
+            and card_callback is not None
+        )
+    )
+
+
+def _build_card_callback(
+    settings: Any, action_handler: Any, *, server_factory: Any = None
+) -> Any:
+    if (
+        settings.feishu_card_action_transport != "http"
+        or not settings.feishu_card_callback_enabled
+    ):
+        return None
+    if server_factory is None:
+        from app.integrations.feishu.card_callback import FeishuCardCallbackServer
+
+        server_factory = FeishuCardCallbackServer
+    return server_factory(
+        app_id=settings.feishu_bot_app_id,
+        verification_token=settings.feishu_card_verification_token,
+        encrypt_key=settings.feishu_card_encrypt_key,
+        action_handler=action_handler,
+        host=settings.feishu_card_callback_host,
+        port=settings.feishu_card_callback_port,
+        path=settings.feishu_card_callback_path,
+    )
+
+
+def _build_card_action_handler(
+    identity: Any,
+    card_actions: Any,
+    sender: Any,
+    incidents: Any = None,
+) -> Any:
+    """Build the single business entry shared by WS and HTTP CardAction."""
+
+    from app.integrations.feishu.cards import card_action_result_card
+
+    def record_failure(
+        event: Any,
+        *,
+        summary: str,
+        error_code: str | None,
+        error_class: str | None,
+        participant_id: Any = None,
+        severity: str = "error",
+    ) -> None:
+        logging.getLogger(__name__).error(
+            "feishu_card_action_failed event_id=%s message_id=%s error_code=%s",
+            event.event_id,
+            event.message_id,
+            error_code,
+        )
+        if incidents is not None:
+            incidents.record(
+                severity=severity,
+                subsystem="feishu_card_action",
+                event_name="card_action_failed",
+                summary=summary,
+                participant_id=participant_id,
+                bot_event_id=event.event_id,
+                error_code=error_code,
+                error_class=error_class,
+                details={
+                    "message_id": event.message_id,
+                    "action_tag": event.action_tag,
+                },
+            )
+
+    def notify_failure(event: Any) -> None:
+        try:
+            sender.send_text(event.chat_id, "操作未能完成，请稍后重试。")
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "feishu_card_action_failure_notice_failed "
+                "event_id=%s message_id=%s",
+                event.event_id,
+                event.message_id,
+            )
+
+    def handle_card_action(event: Any) -> dict[str, Any]:
+        participant = None
+        try:
+            participant = identity.resolve(event.app_id, event.open_id)
+            if participant is None:
+                raise ValueError("card operator is not bound to a participant")
+            result = card_actions.handle(
+                participant.id,
+                message_id=event.message_id,
+                callback_event_id=event.event_id,
+                action_value=event.action_value,
+                form_value=event.form_value,
+            )
+        except Exception as exc:
+            record_failure(
+                event,
+                summary="CardAction business handling failed",
+                error_code="business_failed",
+                error_class=type(exc).__name__,
+                participant_id=getattr(participant, "id", None),
+            )
+            notify_failure(event)
+            raise
+
+        if not result.get("ok"):
+            record_failure(
+                event,
+                summary="CardAction was rejected",
+                error_code=str(result.get("error") or "action_rejected"),
+                error_class=None,
+                participant_id=participant.id,
+                severity="warning",
+            )
+            notify_failure(event)
+            return result
+
+        card = result.get("card")
+        if not isinstance(card, dict) or not card:
+            card = card_action_result_card(
+                message=str(result.get("reply_text") or "已提交")
+            )
+            result = {**result, "card": card}
+        try:
+            sender.update_card(event.message_id, card)
+        except Exception as exc:
+            record_failure(
+                event,
+                summary="CardAction succeeded but source card update failed",
+                error_code="card_update_failed",
+                error_class=type(exc).__name__,
+                participant_id=participant.id,
+            )
+            notify_failure(event)
+            raise
+        return result
+
+    return handle_card_action
 
 
 async def _run_gateway_until_shutdown(gateway: Any, on_ready: Any = None) -> None:
@@ -131,8 +283,8 @@ async def run() -> None:
     from app.config import Settings
     from app.db import Database, build_engine
     from app.identity.service import IdentityService
+    from app.integrations.feishu.client import FeishuClient
     from app.integrations.feishu.gateway import BotEvent
-    from app.integrations.feishu.card_callback import FeishuCardCallbackServer
     from app.repositories import (
         AgentRunRepository, BindingRepository, BotEventRepository,
         ClaudeSessionRepository, ParticipantRepository, RuntimeIncidentRepository,
@@ -246,7 +398,20 @@ async def run() -> None:
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(
         maxsize=settings.queue_max_size
     )
-    sender, gateway = _build_bot_transport(settings, identity, events, queue)
+    sender = FeishuClient(
+        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+    )
+    handle_card_action = _build_card_action_handler(
+        identity, business.card_actions, sender, incidents
+    )
+    sender, gateway = _build_bot_transport(
+        settings,
+        identity,
+        events,
+        queue,
+        sender=sender,
+        card_action_handler=handle_card_action,
+    )
     worker = BotWorker(
         queue,
         identity,
@@ -269,30 +434,9 @@ async def run() -> None:
         progress_max_messages=settings.progress_max_messages,
         incidents=incidents,
     )
-    def handle_card_action(event: Any) -> dict[str, Any]:
-        participant = identity.resolve(event.app_id, event.open_id)
-        if participant is None:
-            raise ValueError("card operator is not bound to a participant")
-        return business.card_actions.handle(
-            participant.id,
-            message_id=event.message_id,
-            callback_event_id=event.event_id,
-            action_value=event.action_value,
-            form_value=event.form_value,
-        )
-
-    card_callback = (
-        FeishuCardCallbackServer(
-            app_id=settings.feishu_bot_app_id,
-            verification_token=settings.feishu_card_verification_token,
-            encrypt_key=settings.feishu_card_encrypt_key,
-            action_handler=handle_card_action,
-            host=settings.feishu_card_callback_host,
-            port=settings.feishu_card_callback_port,
-            path=settings.feishu_card_callback_path,
-        )
-        if settings.feishu_card_callback_enabled
-        else None
+    card_callback = _build_card_callback(settings, handle_card_action)
+    card_action_transport_available = _card_action_transport_available(
+        settings, card_callback
     )
     scheduler = ForecastScheduler(
         coordinator=business.forecast_coordinator,
@@ -314,7 +458,7 @@ async def run() -> None:
             if settings.profile_calibration_enabled else None
         ),
         incidents=incidents,
-        care_card_enabled=bool(card_callback is not None),
+        care_card_enabled=card_action_transport_available,
         care_outcome_refresh=business.care_outcome_refresh,
     )
     daily_review_scheduler = DailyReviewScheduler(
@@ -361,7 +505,9 @@ async def run() -> None:
         forecast_tasks = asyncio.create_task(
             scheduler.run_forever(), name="forecast-scheduler"
         )
-        if _should_start_daily_review_scheduler(settings, card_callback):
+        if _should_start_daily_review_scheduler(
+            settings, card_action_transport_available
+        ):
             daily_review_tasks = asyncio.create_task(
                 daily_review_scheduler.run_forever(), name="daily-review-scheduler"
             )

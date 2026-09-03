@@ -7,6 +7,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 
 from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
@@ -14,6 +15,7 @@ from app.integrations.feishu.calendar import CalendarService, build_recurrence_r
 from app.tools.care import _recurrence_from_args
 from app.integrations.feishu.cards import (
     care_intervention_card,
+    care_intervention_result_card,
     daily_checkin_card,
     daily_review_card,
     pressure_curve_card,
@@ -273,6 +275,73 @@ def test_feishu_client_sends_card_as_interactive_message():
     )
 
 
+def test_feishu_client_updates_interactive_card():
+    requests = []
+
+    class Messages:
+        def patch(self, request):
+            requests.append(request)
+            return SimpleNamespace(success=lambda: True)
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    card = care_intervention_result_card(
+        message="提醒", result_text="✓ 已记录：有帮助"
+    )
+    assert client.update_card("om-card", card) is None
+    assert requests[0].message_id == "om-card"
+    assert json.loads(requests[0].request_body.content) == card
+
+
+def test_feishu_client_update_card_surfaces_error():
+    class Messages:
+        def patch(self, _request):
+            return SimpleNamespace(
+                success=lambda: False, code=230001, msg="card update rejected"
+            )
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    with pytest.raises(FeishuSendError, match="card update rejected") as caught:
+        client.update_card("om-card", {"schema": "2.0"})
+    assert caught.value.operation == "update_card"
+    assert caught.value.retryable is False
+
+
+def test_feishu_client_message_uuid_accepts_50_and_rejects_51_characters():
+    requests = []
+
+    class Messages:
+        def create(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om-message"),
+            )
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    assert client.send_text("oc-chat", "ok", message_uuid="a" * 50) == "om-message"
+    assert requests[0].request_body.uuid == "a" * 50
+    with pytest.raises(ValueError, match="at most 50"):
+        client.send_text("oc-chat", "bad", message_uuid="b" * 51)
+
+
 def test_care_intervention_card_uses_json2_shared_card_contract():
     card = care_intervention_card(
         intervention_id="care-test-id",
@@ -293,6 +362,7 @@ def test_care_intervention_card_uses_json2_shared_card_contract():
     for element in card["body"]["elements"]:
         if element.get("tag") != "column_set":
             continue
+        assert len(element.get("columns", [])) <= 2
         for column in element.get("columns", []):
             buttons.extend(
                 item
@@ -318,6 +388,58 @@ def test_care_intervention_card_uses_json2_shared_card_contract():
         "care_snooze_30",
         "care_disable_type",
     }
+
+
+def test_care_intervention_result_card_removes_action_buttons():
+    card = care_intervention_result_card(
+        message="原关怀内容", result_text="✓ 已记录：有帮助"
+    )
+    serialized = json.dumps(card, ensure_ascii=False)
+    assert card["header"]["title"]["content"] == "MindFlow 关怀提醒"
+    assert "原关怀内容" in serialized
+    assert "✓ 已记录：有帮助" in serialized
+    assert '"tag": "button"' not in serialized
+
+
+def test_care_success_returns_replacement_card():
+    database = memory_database()
+    person = participant(database, "CARE-RESULT-CARD")
+    intervention_id = uuid.uuid4()
+
+    class CareInterventions:
+        def apply_action(self, participant_id, requested_id, **_kwargs):
+            assert participant_id == person.id
+            assert requested_id == intervention_id
+            return {
+                "created": True,
+                "action_result": "recorded",
+                "intervention": {"message": "请稍微休息一下。"},
+            }
+
+    service = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+        care_interventions=CareInterventions(),
+    )
+    result = service.handle(
+        person.id,
+        message_id="om-care",
+        callback_event_id="provider-event",
+        action_value={
+            "mindflow_action": "care_helpful",
+            "version": "1",
+            "intervention_id": str(intervention_id),
+        },
+        form_value={},
+    )
+    serialized = json.dumps(result["card"], ensure_ascii=False)
+    assert result["ok"] is True
+    assert result["reply_text"]
+    assert "请稍微休息一下。" in serialized
+    assert "✓ 已记录：有帮助" in serialized
+    assert '"tag": "button"' not in serialized
 
 
 def test_feishu_client_sends_care_card_as_interactive_message():

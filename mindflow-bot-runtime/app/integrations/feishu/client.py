@@ -54,6 +54,41 @@ class FeishuClient:
             return self._send_message(chat_id, "interactive", card)
         return self._send_message(chat_id, "interactive", card, message_uuid=message_uuid)
 
+    def update_card(self, message_id: str, card: dict[str, Any]) -> None:
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id:
+            raise ValueError("Feishu message_id is required")
+        if not isinstance(card, dict) or not card:
+            raise ValueError("Feishu card must be a non-empty object")
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+        body = (
+            PatchMessageRequestBody.builder()
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        request = (
+            PatchMessageRequest.builder()
+            .message_id(normalized_message_id)
+            .request_body(body)
+            .build()
+        )
+        try:
+            response = self._client.im.v1.message.patch(request)
+        except Exception as exc:
+            raise FeishuSendError(
+                "Feishu card update request failed", operation="update_card"
+            ) from exc
+        if not response or not response.success():
+            code = getattr(response, "code", None)
+            retryable = code not in {230001, 230003, 230006, 99991672}
+            raise FeishuSendError(
+                str(getattr(response, "msg", "Feishu card update failed")),
+                code=code,
+                retryable=retryable,
+                operation="update_card",
+            )
+
     def upload_image(self, png_bytes: bytes) -> str:
         if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:
             raise ValueError("Feishu image upload requires non-empty bytes")
@@ -101,6 +136,9 @@ class FeishuClient:
         self, chat_id: str, msg_type: str, content: dict[str, Any], *,
         message_uuid: str | None = None,
     ) -> str:
+        normalized_uuid = str(message_uuid or "").strip()
+        if len(normalized_uuid) > 50:
+            raise ValueError("Feishu message_uuid must be at most 50 characters")
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
         body_builder = (
@@ -109,7 +147,6 @@ class FeishuClient:
             .msg_type(msg_type)
             .content(json.dumps(content, ensure_ascii=False))
         )
-        normalized_uuid = str(message_uuid or "").strip()
         if normalized_uuid:
             body_builder = body_builder.uuid(normalized_uuid)
         body = body_builder.build()

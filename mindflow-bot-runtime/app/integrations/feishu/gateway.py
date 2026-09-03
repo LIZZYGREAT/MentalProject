@@ -98,6 +98,41 @@ class CardActionEvent:
     action_value: dict[str, Any]
     form_value: dict[str, Any]
 
+    def to_ipc_payload(self) -> dict[str, Any]:
+        """Return the SDK-free CardAction contract shared with the receiver."""
+
+        return {
+            "event_id": self.event_id,
+            "message_id": self.message_id,
+            "app_id": self.app_id,
+            "open_id": self.open_id,
+            "chat_id": self.chat_id,
+            "action_tag": self.action_tag,
+            "action_value": dict(self.action_value),
+            "form_value": dict(self.form_value),
+        }
+
+    @classmethod
+    def from_ipc_payload(cls, payload: dict[str, Any]) -> "CardActionEvent":
+        required = ("event_id", "message_id", "app_id", "open_id", "chat_id")
+        values = {name: str(payload.get(name) or "").strip() for name in required}
+        action_value = payload.get("action_value")
+        form_value = payload.get("form_value")
+        if not all(values.values()):
+            raise InvalidBotEvent("card action IPC event is missing routing fields")
+        if not isinstance(action_value, dict) or not isinstance(form_value, dict):
+            raise InvalidBotEvent("card action IPC values must be objects")
+        return cls(
+            event_id=values["event_id"],
+            message_id=values["message_id"],
+            app_id=values["app_id"],
+            open_id=values["open_id"],
+            chat_id=values["chat_id"],
+            action_tag=str(payload.get("action_tag") or "")[:64],
+            action_value=dict(action_value),
+            form_value=dict(form_value),
+        )
+
 
 class FeishuCardActionAdapter:
     def __init__(self, app_id: str):
@@ -151,10 +186,8 @@ class FeishuCardActionAdapter:
             default=str,
         )
         provider_event_id = str(callback_event_id or "").strip()
-        event_id = (
-            "card-event:" + hashlib.sha256(provider_event_id.encode("utf-8")).hexdigest()
-            if provider_event_id
-            else "card:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+        event_id = provider_event_id or (
+            "card:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
         )
         return CardActionEvent(
             event_id=event_id,
@@ -165,6 +198,27 @@ class FeishuCardActionAdapter:
             action_tag=tag,
             action_value=dict(value),
             form_value=dict(form_value),
+        )
+
+
+class FeishuChannelCardActionAdapter(FeishuCardActionAdapter):
+    """Map the Channel SDK CardActionEvent while retaining its raw event id."""
+
+    def adapt(self, event: Any) -> CardActionEvent:
+        raw = getattr(event, "raw", None)
+        raw = raw if isinstance(raw, dict) else {}
+        header = raw.get("header") or {}
+        provider_event_id = (
+            header.get("event_id")
+            if isinstance(header, dict)
+            else None
+        ) or raw.get("event_id")
+        return self._build(
+            callback_event_id=provider_event_id,
+            message_id=getattr(event, "message_id", ""),
+            chat_id=getattr(event, "chat_id", ""),
+            open_id=getattr(getattr(event, "operator", None), "open_id", ""),
+            action=getattr(event, "action", None),
         )
 
 
@@ -287,6 +341,7 @@ class FeishuGateway:
         stop_timeout_seconds: float = 8.0,
         device_flow_close_timeout_seconds: float = 8.0,
         channel_sdk_version: str | None = None,
+        card_action_handler: Callable[[CardActionEvent], Any] | None = None,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -302,6 +357,7 @@ class FeishuGateway:
         self.stop_timeout_seconds = stop_timeout_seconds
         self.device_flow_close_timeout_seconds = device_flow_close_timeout_seconds
         self.channel_sdk_version = channel_sdk_version
+        self.card_action_handler = card_action_handler
         self._loop: asyncio.AbstractEventLoop | None = None
         self._process: Any | None = None
         self._process_started = False
@@ -422,6 +478,7 @@ class FeishuGateway:
                 self.channel_factory,
                 self.device_flow_close_timeout_seconds,
                 self.channel_sdk_version,
+                self.card_action_handler is not None,
             ),
             daemon=True,
         )
@@ -594,6 +651,46 @@ class FeishuGateway:
                     event.chat_type,
                 )
                 self.accept_event(event)
+                continue
+            if kind == "card_action":
+                try:
+                    event = CardActionEvent.from_ipc_payload(
+                        envelope.get("payload") or {}
+                    )
+                except InvalidBotEvent:
+                    logger.warning("feishu_receiver_invalid_card_action")
+                    continue
+                if event.app_id != self.app_id:
+                    logger.warning(
+                        "feishu_receiver_card_action_app_mismatch "
+                        "event_id=%s message_id=%s",
+                        event.event_id,
+                        event.message_id,
+                    )
+                    continue
+                logger.info(
+                    "feishu_gateway_ipc_card_action_received "
+                    "event_id=%s message_id=%s",
+                    event.event_id,
+                    event.message_id,
+                )
+                if self.card_action_handler is None:
+                    logger.warning(
+                        "feishu_gateway_card_action_unhandled "
+                        "event_id=%s message_id=%s",
+                        event.event_id,
+                        event.message_id,
+                    )
+                    continue
+                try:
+                    await asyncio.to_thread(self.card_action_handler, event)
+                except Exception:
+                    logger.exception(
+                        "feishu_gateway_card_action_failed "
+                        "event_id=%s message_id=%s",
+                        event.event_id,
+                        event.message_id,
+                    )
                 continue
             if kind == "error":
                 error_type = str(envelope.get("error_type") or "ReceiverError")
