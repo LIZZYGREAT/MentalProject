@@ -351,11 +351,16 @@ def care_intervention_card(
                 "tag": "button",
                 "type": button_type,
                 "text": {"tag": "plain_text", "content": label},
-                "value": {
-                    "mindflow_action": f"care_{action}",
-                    "version": "1",
-                    "intervention_id": str(intervention_id),
-                },
+                "behaviors": [
+                    {
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": f"care_{action}",
+                            "version": "1",
+                            "intervention_id": str(intervention_id),
+                        },
+                    }
+                ],
             }
         )
     return {
@@ -473,13 +478,25 @@ def pressure_curve_card(
                     "tag": "button",
                     "type": "primary",
                     "text": {"tag": "plain_text", "content": "记录当前状态"},
-                    "value": {"mindflow_action": "request_checkin", "version": "1"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "request_checkin",
+                            "version": "1",
+                        },
+                    }],
                 },
                 {
                     "tag": "button",
                     "type": "default",
                     "text": {"tag": "plain_text", "content": "查看今日日程"},
-                    "value": {"mindflow_action": "view_today_calendar", "version": "1"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "view_today_calendar",
+                            "version": "1",
+                        },
+                    }],
                 },
                 {
                     "tag": "markdown",
@@ -516,7 +533,13 @@ def today_calendar_card(
                     "tag": "button",
                     "type": "primary",
                     "text": {"tag": "plain_text", "content": "记录当前状态"},
-                    "value": {"mindflow_action": "request_checkin", "version": "1"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "request_checkin",
+                            "version": "1",
+                        },
+                    }],
                 },
             ]
         },

@@ -17,6 +17,7 @@ from app.integrations.feishu.cards import (
     daily_checkin_card,
     daily_review_card,
     pressure_curve_card,
+    today_calendar_card,
 )
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.card_callback import FeishuCardCallbackServer
@@ -73,7 +74,7 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
     assert "M0" not in summary
     assert "当前精力" not in summary
     actions = {
-        item.get("value", {}).get("mindflow_action")
+        item.get("behaviors", [{}])[0].get("value", {}).get("mindflow_action")
         for item in card["body"]["elements"]
         if item.get("tag") == "button"
     }
@@ -299,19 +300,24 @@ def test_care_intervention_card_uses_json2_shared_card_contract():
                 if item.get("tag") == "button"
             )
 
-    actions = {
-        button["value"]["mindflow_action"]
-        for button in buttons
-    }
-    assert actions == {
+    assert len(buttons) == 4
+    payloads = []
+    for button in buttons:
+        assert "value" not in button
+        assert len(button["behaviors"]) == 1
+        behavior = button["behaviors"][0]
+        assert behavior["type"] == "callback"
+        payload = behavior["value"]
+        assert payload["version"] == "1"
+        assert payload["intervention_id"] == "care-test-id"
+        payloads.append(payload["mindflow_action"])
+
+    assert set(payloads) == {
         "care_helpful",
         "care_not_relevant",
         "care_snooze_30",
         "care_disable_type",
     }
-    for button in buttons:
-        assert button["value"]["version"] == "1"
-        assert button["value"]["intervention_id"] == "care-test-id"
 
 
 def test_feishu_client_sends_care_card_as_interactive_message():
@@ -331,6 +337,53 @@ def test_feishu_client_sends_care_card_as_interactive_message():
     assert message_id == "om-care-card"
     assert seen == [("oc-test", "interactive", card)]
     assert seen[0][2]["config"]["update_multi"] is True
+
+
+def test_json2_callback_buttons_never_use_root_value():
+    def buttons_in(value):
+        found = []
+        if isinstance(value, dict):
+            if value.get("tag") == "button":
+                found.append(value)
+            for nested in value.values():
+                found.extend(buttons_in(nested))
+        elif isinstance(value, list):
+            for nested in value:
+                found.extend(buttons_in(nested))
+        return found
+
+    analysis = analyze_curve([
+        {"time": "09:00", "stress_0_10": 4.0, "vitality_0_10": 7.0},
+        {"time": "10:00", "stress_0_10": 8.0, "vitality_0_10": 5.0},
+    ])
+    cards = [
+        care_intervention_card(
+            intervention_id="care-test-id",
+            message="测试提醒",
+            actions=["helpful", "not_relevant"],
+        ),
+        pressure_curve_card(
+            analysis,
+            image_key="img-key",
+            local_date="2030-01-15",
+        ),
+        today_calendar_card([], local_date="2030-01-15"),
+        daily_checkin_card(),
+        daily_review_card(
+            schedule_id="daily-review-schedule",
+            local_date="2030-01-15",
+        ),
+    ]
+
+    for card in cards:
+        assert card["schema"] == "2.0"
+        buttons = buttons_in(card)
+        assert buttons
+        for button in buttons:
+            assert "value" not in button
+            assert len(button.get("behaviors") or []) == 1
+            assert button["behaviors"][0]["type"] == "callback"
+            assert button["behaviors"][0]["value"]["mindflow_action"]
 
 
 def test_pressure_curve_tool_stages_reviewed_card_for_current_run():

@@ -934,12 +934,16 @@ def test_card_actions_are_allowlisted_participant_bound_and_feedback_is_separate
         for column in card["body"]["elements"][1]["columns"]
     ]
     assert card["config"]["enable_forward"] is False
-    assert {button["value"]["mindflow_action"] for button in buttons} == {
+    assert {
+        button["behaviors"][0]["value"]["mindflow_action"]
+        for button in buttons
+    } == {
         "care_ack",
         "care_helpful",
     }
     assert all(
-        button["value"]["intervention_id"] == str(intervention_id)
+        button["behaviors"][0]["value"]["intervention_id"]
+        == str(intervention_id)
         for button in buttons
     )
 
@@ -1061,7 +1065,7 @@ def test_scheduler_uses_care_card_only_when_verified_callback_mode_is_enabled():
     assert card["config"]["enable_forward"] is False
     assert warning_id == card["body"]["elements"][1]["columns"][0][
         "elements"
-    ][0]["value"]["intervention_id"]
+    ][0]["behaviors"][0]["value"]["intervention_id"]
 
 
 def test_care_card_delivery_recovers_after_restart_with_the_same_message_uuid(
