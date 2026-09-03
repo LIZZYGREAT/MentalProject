@@ -8,6 +8,7 @@ from sqlalchemy import delete, func, select
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    CareInterventionOutcome,
     DailyReviewResponse,
     ForecastCurrentnessEvent,
     ForecastSnapshot,
@@ -169,6 +170,25 @@ def test_cleanup_rejects_tampered_or_stale_plans_and_rolls_back():
     assert _counts(database)["forecast_snapshots"] == 0
 
 
+def test_cleanup_rejects_obsolete_schema_v2_plan():
+    database = memory_database()
+    synthetic_user = participant(database, "FIXTURE-SCHEMA-V2")
+    _forecast(
+        database,
+        synthetic_user.id,
+        date(2039, 5, 3),
+        marker="synthetic-schema-v2",
+    )
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    assert report["schema_version"] == 3
+    assert report["cleanup_plan"]["schema_version"] == 3
+    obsolete_plan = deepcopy(report["cleanup_plan"])
+    obsolete_plan["schema_version"] = 2
+
+    with pytest.raises(CleanupPlanError, match="unsupported cleanup plan schema"):
+        cleanup_from_plan(database.engine, obsolete_plan)
+
+
 def test_audit_reports_forecast_and_warning_invariant_violations():
     database = memory_database()
     user = participant(database, "P-REAL-002")
@@ -276,7 +296,13 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
             action_selected="helpful",
             callback_event_id=f"callback-{uuid.uuid4().hex}",
         )
-        session.add_all([currentness, feedback])
+        outcome = CareInterventionOutcome(
+            intervention_id=care_id,
+            participant_id=user.id,
+            baseline_state={"stress": 7, "energy": 3},
+            context_json={"source": "synthetic-dependency"},
+        )
+        session.add_all([currentness, feedback, outcome])
         session.flush()
         currentness_id, feedback_id = currentness.id, feedback.id
 
@@ -285,6 +311,10 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
     planned = {(row["table"], row["id"]) for row in report["cleanup_plan"]["rows"]}
     assert ("forecast_currentness_events", str(currentness_id)) in planned
     assert ("care_intervention_feedback", str(feedback_id)) in planned
+    assert ("care_intervention_outcomes", str(care_id)) in planned
+    assert report["cleanup_plan"]["expected_cleanup_counts"][
+        "care_intervention_outcomes"
+    ] == 1
     assert {impact["planned_action"] for impact in impacts} == {"explicit_delete"}
 
     cleanup_from_plan(
@@ -293,6 +323,7 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
     with database.session() as session:
         assert session.get(ForecastCurrentnessEvent, currentness_id) is None
         assert session.get(CareInterventionFeedback, feedback_id) is None
+        assert session.get(CareInterventionOutcome, care_id) is None
         assert session.get(WarningSchedule, warning_id) is None
 
 

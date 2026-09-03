@@ -15,14 +15,14 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.models import (
-    CareInterventionEvent, CareInterventionFeedback, DailyReviewResponse,
-    ForecastCurrentnessEvent, ForecastSnapshot, Participant,
-    RetrospectiveCurveSnapshot, WarningSchedule,
+    CareInterventionEvent, CareInterventionFeedback, CareInterventionOutcome,
+    DailyReviewResponse, ForecastCurrentnessEvent, ForecastSnapshot,
+    Participant, RetrospectiveCurveSnapshot, WarningSchedule,
 )
 from app.repositories import WarningScheduleRepository
 
 
-PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 3
 FUTURE_HORIZON_DAYS = 365
 OPERATOR_APPROVAL_REASON = "operator_approved_after_audit"
 _MARKER_RE = re.compile(
@@ -326,6 +326,9 @@ def audit_synthetic_data(
         feedback_rows = session.scalars(select(CareInterventionFeedback).where(
             CareInterventionFeedback.intervention_id.in_(final_care)
         )).all() if final_care else []
+        outcome_rows = session.scalars(select(CareInterventionOutcome).where(
+            CareInterventionOutcome.intervention_id.in_(final_care)
+        )).all() if final_care else []
         for row in currentness_rows:
             impacts["cascade_delete"].append(_impact(
                 table="forecast_currentness_events", row_id=row.id,
@@ -333,6 +336,10 @@ def audit_synthetic_data(
         for row in feedback_rows:
             impacts["cascade_delete"].append(_impact(
                 table="care_intervention_feedback", row_id=row.id,
+                relation="intervention_id -> care_intervention_events.id", planned_action="explicit_delete"))
+        for row in outcome_rows:
+            impacts["cascade_delete"].append(_impact(
+                table="care_intervention_outcomes", row_id=row.intervention_id,
                 relation="intervention_id -> care_intervention_events.id", planned_action="explicit_delete"))
         invariants = _invariants(session)
 
@@ -393,12 +400,21 @@ def approve_cleanup_candidates(
 
 _MODELS = {
     "care_intervention_feedback": CareInterventionFeedback,
+    "care_intervention_outcomes": CareInterventionOutcome,
     "forecast_currentness_events": ForecastCurrentnessEvent,
     "care_intervention_events": CareInterventionEvent,
     "warning_schedules": WarningSchedule,
     "forecast_snapshots": ForecastSnapshot,
 }
 _DELETE_ORDER = tuple(_MODELS)
+_PRIMARY_KEYS = {
+    "care_intervention_feedback": CareInterventionFeedback.id,
+    "care_intervention_outcomes": CareInterventionOutcome.intervention_id,
+    "forecast_currentness_events": ForecastCurrentnessEvent.id,
+    "care_intervention_events": CareInterventionEvent.id,
+    "warning_schedules": WarningSchedule.id,
+    "forecast_snapshots": ForecastSnapshot.id,
+}
 _INTEGER_ID_TABLES = {"forecast_currentness_events"}
 
 
@@ -440,7 +456,8 @@ def cleanup_from_plan(
         before: dict[str, int] = {}
         for table, model in _MODELS.items():
             expected = ids.get(table, set())
-            found = set(session.scalars(select(model.id).where(model.id.in_(expected))).all()) if expected else set()
+            primary_key = _PRIMARY_KEYS[table]
+            found = set(session.scalars(select(primary_key).where(primary_key.in_(expected))).all()) if expected else set()
             if found != expected:
                 raise CleanupPlanError(f"{table} changed after audit; refusing cleanup")
             before[table] = int(session.scalar(select(func.count()).select_from(model)) or 0)
@@ -450,13 +467,18 @@ def cleanup_from_plan(
         care_ids = ids.get("care_intervention_events", set())
         currentness_ids = ids.get("forecast_currentness_events", set())
         feedback_ids = ids.get("care_intervention_feedback", set())
+        outcome_ids = ids.get("care_intervention_outcomes", set())
         actual_currentness = set(session.scalars(select(ForecastCurrentnessEvent.id).where(
             ForecastCurrentnessEvent.forecast_id.in_(forecast_ids)
         )).all()) if forecast_ids else set()
         actual_feedback = set(session.scalars(select(CareInterventionFeedback.id).where(
             CareInterventionFeedback.intervention_id.in_(care_ids)
         )).all()) if care_ids else set()
-        if actual_currentness != currentness_ids or actual_feedback != feedback_ids:
+        actual_outcomes = set(session.scalars(select(CareInterventionOutcome.intervention_id).where(
+            CareInterventionOutcome.intervention_id.in_(care_ids)
+        )).all()) if care_ids else set()
+        if (actual_currentness != currentness_ids or actual_feedback != feedback_ids
+                or actual_outcomes != outcome_ids):
             raise CleanupPlanError("CASCADE dependencies changed after audit; refusing cleanup")
 
         unplanned_warnings = session.scalars(select(WarningSchedule.id).where(
@@ -487,7 +509,7 @@ def cleanup_from_plan(
         for table in _DELETE_ORDER:
             selected = ids.get(table, set())
             if selected:
-                session.execute(delete(_MODELS[table]).where(_MODELS[table].id.in_(selected)))
+                session.execute(delete(_MODELS[table]).where(_PRIMARY_KEYS[table].in_(selected)))
         session.flush()
         remaining = {table: int(session.scalar(select(func.count()).select_from(model)) or 0)
                      for table, model in _MODELS.items()}
@@ -496,7 +518,9 @@ def cleanup_from_plan(
             raise CleanupPlanError("cleanup row-count mismatch; transaction rolled back")
         for table, selected in ids.items():
             model = _MODELS[table]
-            if selected and session.scalar(select(func.count()).select_from(model).where(model.id.in_(selected))):
+            if selected and session.scalar(select(func.count()).select_from(model).where(
+                _PRIMARY_KEYS[table].in_(selected)
+            )):
                 raise CleanupPlanError(f"planned {table} rows remain after delete")
         if execute:
             session.commit()

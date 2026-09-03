@@ -10,6 +10,7 @@ from app.db import Base, Database, build_engine
 from app.models import (
     CareInterventionEvent,
     CareInterventionFeedback,
+    CareInterventionOutcome,
     DailyReviewResponse,
     ForecastCurrentnessEvent,
     ForecastSnapshot,
@@ -137,7 +138,13 @@ def test_postgres_cleanup_explicitly_plans_and_deletes_cascade_rows(postgres_cle
             action_selected="helpful",
             callback_event_id=f"callback-{uuid.uuid4().hex}",
         )
-        session.add_all([currentness, feedback])
+        outcome = CareInterventionOutcome(
+            intervention_id=care.id,
+            participant_id=user.id,
+            baseline_state={"stress": 7, "energy": 3},
+            context_json={"source": "synthetic-pg-cascade"},
+        )
+        session.add_all([currentness, feedback, outcome])
         session.flush()
         ids = forecast.id, warning.id, care.id, currentness.id, feedback.id
 
@@ -145,6 +152,10 @@ def test_postgres_cleanup_explicitly_plans_and_deletes_cascade_rows(postgres_cle
     planned = {(row["table"], row["id"]) for row in report["cleanup_plan"]["rows"]}
     assert ("forecast_currentness_events", str(ids[3])) in planned
     assert ("care_intervention_feedback", str(ids[4])) in planned
+    assert ("care_intervention_outcomes", str(ids[2])) in planned
+    assert report["cleanup_plan"]["expected_cleanup_counts"][
+        "care_intervention_outcomes"
+    ] == 1
     cleanup_from_plan(
         database.engine, report["cleanup_plan"], execute=True, backup_confirmed=True
     )
@@ -154,6 +165,7 @@ def test_postgres_cleanup_explicitly_plans_and_deletes_cascade_rows(postgres_cle
         assert session.get(CareInterventionEvent, ids[2]) is None
         assert session.get(ForecastCurrentnessEvent, ids[3]) is None
         assert session.get(CareInterventionFeedback, ids[4]) is None
+        assert session.get(CareInterventionOutcome, ids[2]) is None
 
 
 def test_postgres_audit_blocks_set_null_and_restrict_dependencies(postgres_cleanup_database):
