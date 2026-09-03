@@ -43,6 +43,7 @@ from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
+from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from app.services.hierarchical_personalization import ParameterLearningService
@@ -83,6 +84,7 @@ class BusinessServices:
     mutation_refresh: ForecastMutationRefreshQueue
     care_preferences: ParticipantCarePreferenceRepository
     care_interventions: CareInterventionRepository
+    care_outcome_refresh: CareOutcomeRefreshService
 
 
 def build_business_services(
@@ -191,6 +193,7 @@ def build_business_services(
         timezone_name=settings.timezone_name,
         dependency_refresh=dependency_refresh,
     )
+    care_outcome_refresh = CareOutcomeRefreshService(database)
     card_actions = CardActionService(
         observations,
         calendar,
@@ -198,6 +201,7 @@ def build_business_services(
         daily_reviews=daily_reviews,
         observation_refresh=observation_refresh,
         care_interventions=care_interventions,
+        care_outcome_refresh=care_outcome_refresh,
     )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
@@ -221,6 +225,7 @@ def build_business_services(
         mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
+        care_outcome_refresh=care_outcome_refresh,
     ).register(registry)
     return BusinessServices(
         profiles=profiles,
@@ -248,4 +253,5 @@ def build_business_services(
         mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
+        care_outcome_refresh=care_outcome_refresh,
     )

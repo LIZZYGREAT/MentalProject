@@ -105,8 +105,11 @@ def _recovery_episode_changes(curve: list[dict[str, Any]]) -> list[float]:
         ):
             index += 1
         end = index
-        pre_index = max(0, start - 1)
-        post_index = min(len(curve) - 1, end + 1)
+        if start == 0 or end + 1 >= len(curve):
+            index += 1
+            continue
+        pre_index = start - 1
+        post_index = end + 1
         try:
             before = float(curve[pre_index].get("stress_0_10"))
             after = float(curve[post_index].get("stress_0_10"))
@@ -274,9 +277,15 @@ class CareEffectivenessService:
                     CareInterventionEvent.participant_id == participant_id
                 )
             rows = session.execute(query).all()
-            mrt_count = session.scalar(
-                select(InterventionRandomizationEvent.id).limit(1)
+            mrt_query = select(InterventionRandomizationEvent.id).where(
+                InterventionRandomizationEvent.decision_time >= start,
+                InterventionRandomizationEvent.decision_time < end,
             )
+            if participant_id is not None:
+                mrt_query = mrt_query.where(
+                    InterventionRandomizationEvent.participant_id == participant_id
+                )
+            mrt_count = session.scalar(mrt_query.limit(1))
         grouped: dict[tuple[str, str, str, str], list[tuple[Any, Any]]] = defaultdict(list)
         for intervention, outcome in rows:
             baseline, _observed = _baseline_values(outcome)
@@ -359,9 +368,21 @@ class CareEffectivenessService:
                 daily_workload.append(statistics.fmean(workloads))
             recovery_changes.extend(_recovery_episode_changes(curve))
         candidates = [
-            ("pressure_pattern", daily_peaks, "本周每日预测压力峰值的平均水平"),
-            ("workload_pattern", daily_workload, "本周每日平均 workload"),
-            ("recovery_pattern", recovery_changes, "每个连续恢复 episode 前后的平均压力变化"),
+            {
+                "kind": "pressure_pattern", "values": daily_peaks,
+                "statement": "本周每日预测压力峰值的平均水平",
+                "uncertainty_method": "normal_mean",
+            },
+            {
+                "kind": "workload_pattern", "values": daily_workload,
+                "statement": "本周每日平均 workload",
+                "uncertainty_method": "normal_mean",
+            },
+            {
+                "kind": "recovery_pattern", "values": recovery_changes,
+                "statement": "每个连续恢复 episode 前后的平均压力变化",
+                "uncertainty_method": "normal_mean",
+            },
         ]
         for group in effects["groups"]:
             ratings = [
@@ -369,20 +390,29 @@ class CareEffectivenessService:
                 for value in group.get("helpful_binary_observations") or []
             ]
             if ratings:
-                candidates.append((
-                    f"care_feedback:{group['intervention_type']}",
-                    ratings,
-                    f"{group['intervention_type']} 的有帮助反馈率",
-                ))
+                candidates.append({
+                    "kind": f"care_feedback:{group['intervention_type']}",
+                    "values": ratings,
+                    "statement": f"{group['intervention_type']} 的有帮助反馈率",
+                    "uncertainty_method": "wilson",
+                })
         insights = []
         suppressed = []
-        for kind, values, statement in candidates:
+        for candidate in candidates:
+            kind = str(candidate["kind"])
+            values = list(candidate["values"])
+            method = str(candidate["uncertainty_method"])
             payload = {
                 "insight_type": kind,
                 "sample_count": len(values),
                 "effect_estimate": _mean(values),
-                "uncertainty": _uncertainty(values),
-                "statement": statement,
+                "uncertainty": (
+                    _wilson_uncertainty(values)
+                    if method == "wilson"
+                    else _uncertainty(values)
+                ),
+                "uncertainty_method": method,
+                "statement": str(candidate["statement"]),
                 "evidence_type": "observational",
             }
             (insights if len(values) >= minimum_sample_count else suppressed).append(payload)

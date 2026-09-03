@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -16,6 +17,10 @@ from zoneinfo import ZoneInfo
 from app.integrations.feishu.cards import daily_checkin_card, today_calendar_card
 from app.repositories import ObservationRepository
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
+from app.services.care_outcome_refresh import CareOutcomeRefreshService
+
+
+logger = logging.getLogger(__name__)
 
 
 def _boolean(value: Any, field: str) -> bool:
@@ -47,6 +52,7 @@ class CardActionService:
         daily_reviews: Any = None,
         observation_refresh: ObservationForecastRefreshService,
         care_interventions: Any = None,
+        care_outcome_refresh: CareOutcomeRefreshService | None = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -54,6 +60,7 @@ class CardActionService:
         self.daily_reviews = daily_reviews
         self.observation_refresh = observation_refresh
         self.care_interventions = care_interventions
+        self.care_outcome_refresh = care_outcome_refresh
 
     @staticmethod
     def _fallback_event_id(
@@ -198,6 +205,16 @@ class CardActionService:
             },
             source_message_id=event_id[:128],
         )
+        if write.created and self.care_outcome_refresh is not None:
+            try:
+                self.care_outcome_refresh.on_observation_committed(
+                    participant_id, write.observation_id
+                )
+            except Exception:
+                logger.exception(
+                    "care outcome refresh failed after card check-in commit",
+                    extra={"observation_id": str(write.observation_id)},
+                )
         self.observation_refresh.on_observation_committed(
             participant_id=participant_id,
             observed_at=write.observed_at,

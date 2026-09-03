@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from app.services.forecast_coordinator import enforce_promoted_model_selection
 from app.services.profile_calibration import layered_profile
@@ -15,6 +16,18 @@ WHAT_IF_VERSION = "care-what-if.v1"
 
 
 class CareWhatIfSimulationService:
+    CLASSIFICATION_FIELDS = (
+        "event_type",
+        "task_type",
+        "course_name",
+        "course_code",
+        "related_course_name",
+        "related_course_code",
+        "course_match_confidence",
+        "course_match_source",
+        "course_catalog_revision",
+    )
+
     def __init__(self, coordinator: Any):
         self.coordinator = coordinator
 
@@ -40,6 +53,7 @@ class CareWhatIfSimulationService:
         ]
         current_by_date: dict[date, dict[str, Any]] = {}
         calendar_by_date: dict[date, dict[str, Any]] = {}
+        forecast_events_by_date: dict[date, list[dict[str, Any]]] = {}
         for target in affected_dates:
             current = self.coordinator.forecasts.latest(participant_id, target)
             calendar = self.coordinator.calendar_snapshots.get(participant_id, target)
@@ -47,21 +61,14 @@ class CareWhatIfSimulationService:
                 raise LookupError(f"scenario_input_unavailable:{target.isoformat()}")
             current_by_date[target] = current
             calendar_by_date[target] = calendar
-        source_events = deepcopy(list(calendar_by_date[local_date].get("events") or []))
+            forecast_events_by_date[target] = self._rebuild_forecast_events(
+                current, calendar
+            )
+        source_events = forecast_events_by_date[local_date]
         changed = False
-        semantic_by_id = {
-            str(item.get("event_id")): item.get("semantic")
-            for item in list(current_by_date[local_date].get("semantic_input") or [])
-        }
         moved_event: dict[str, Any] | None = None
         for event in source_events:
             normalized_id = str(event.get("id") or event.get("event_id") or "")
-            semantic = semantic_by_id.get(normalized_id)
-            if semantic:
-                event["metadata"] = {
-                    **dict(event.get("metadata") or {}),
-                    "semantic": semantic,
-                }
             if normalized_id == str(event_id):
                 moved_event = deepcopy(event)
                 moved_event["start_time"] = start.isoformat()
@@ -86,7 +93,7 @@ class CareWhatIfSimulationService:
             calendar = calendar_by_date[target]
             original_curve = list(current.get("curve") or [])
             original_curves.extend(original_curve)
-            events = deepcopy(list(calendar.get("events") or []))
+            events = deepcopy(forecast_events_by_date[target])
             if target == local_date:
                 events = [
                     event for event in events
@@ -100,8 +107,8 @@ class CareWhatIfSimulationService:
                     != str(event_id)
                 ]
                 events.append(deepcopy(moved_event))
-            generated_at = current.get("generated_at") or datetime.now(
-                self.coordinator.timezone
+            generated_at = self._generated_at(
+                current.get("generated_at"), self.coordinator.timezone
             )
             observations = self.coordinator.observations.for_local_date(
                 participant_id,
@@ -165,6 +172,60 @@ class CareWhatIfSimulationService:
             "per_date": per_date,
             "confirmation_required_before_calendar_mutation": True,
         }
+
+    @staticmethod
+    def _generated_at(value: Any, timezone_value: ZoneInfo) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            text = str(value or "").strip()
+            if not text:
+                return datetime.now(timezone_value)
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("source forecast generated_at must be timezone-aware")
+        return parsed
+
+    @classmethod
+    def _rebuild_forecast_events(
+        cls,
+        current_forecast: dict[str, Any],
+        calendar_snapshot: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        semantic_by_id = {
+            str(item.get("event_id") or item.get("id") or ""): deepcopy(
+                item.get("semantic")
+            )
+            for item in list(current_forecast.get("semantic_input") or [])
+            if item.get("semantic") is not None
+        }
+        classified_by_id = {
+            str(item.get("id") or item.get("event_id") or ""): item
+            for item in list(
+                (current_forecast.get("output") or {}).get(
+                    "classified_calendar_events"
+                )
+                or []
+            )
+        }
+        rebuilt: list[dict[str, Any]] = []
+        for raw_event in list(calendar_snapshot.get("events") or []):
+            event = deepcopy(raw_event)
+            event_id = str(event.get("id") or event.get("event_id") or "")
+            classified = classified_by_id.get(event_id)
+            if classified is not None:
+                for field in cls.CLASSIFICATION_FIELDS:
+                    value = classified.get(field)
+                    if value is not None:
+                        event[field] = deepcopy(value)
+            semantic = semantic_by_id.get(event_id)
+            if semantic is not None:
+                event["metadata"] = {
+                    **dict(event.get("metadata") or {}),
+                    "semantic": semantic,
+                }
+            rebuilt.append(event)
+        return rebuilt
 
     @staticmethod
     def _terminal_state(result: dict[str, Any]) -> dict[str, float] | None:

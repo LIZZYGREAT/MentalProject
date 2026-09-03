@@ -1479,12 +1479,6 @@ class ObservationRepository:
                 )
                 session.add(row)
                 session.flush()
-                if observation_type == "checkin":
-                    from app.services.care_effectiveness import CareEffectivenessService
-
-                    CareEffectivenessService.attach_observation_in_session(
-                        session, row
-                    )
                 return ObservationWriteResult(
                     observation_id=row.id,
                     observed_at=self._aware(row.observed_at),

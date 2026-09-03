@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+import logging
 from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_message_service import CareMessageService
 from app.services.care_context import CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
 from app.services.care_what_if import CareWhatIfSimulationService
+from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.calendar_mutation_impact import CalendarMutationImpactResolver
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
@@ -40,6 +42,9 @@ from app.services.presentation_service import (
     PresentationOutbox,
 )
 from app.services.token_service import TokenRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -163,6 +168,7 @@ class CareTools:
         mutation_refresh: ForecastMutationRefreshQueue | None = None,
         care_preferences: Any = None,
         care_interventions: Any = None,
+        care_outcome_refresh: CareOutcomeRefreshService | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -189,6 +195,7 @@ class CareTools:
         )
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.care_outcome_refresh = care_outcome_refresh
         self.what_if = (
             CareWhatIfSimulationService(forecast_coordinator)
             if forecast_coordinator is not None else None
@@ -563,6 +570,16 @@ class CareTools:
             payload,
             source_message_id=ctx.message_id,
         )
+        if write.created and self.care_outcome_refresh is not None:
+            try:
+                self.care_outcome_refresh.on_observation_committed(
+                    ctx.participant_id, write.observation_id
+                )
+            except Exception:
+                logger.exception(
+                    "care outcome refresh failed after tool check-in commit",
+                    extra={"observation_id": str(write.observation_id)},
+                )
         self.observation_refresh.on_observation_committed(
             participant_id=ctx.participant_id,
             observed_at=write.observed_at,

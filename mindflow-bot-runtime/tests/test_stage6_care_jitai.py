@@ -1,4 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
+from copy import deepcopy
+import logging
 import uuid
 
 import pytest
@@ -12,6 +14,7 @@ from app.models import (
     ParticipantCarePreference,
     WarningSchedule,
 )
+from app.agent.context import AgentContext
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.repositories import (
     ObservationRepository,
@@ -32,8 +35,11 @@ from app.services.care_jitai import (
     normalized_intervention_types,
 )
 from app.services.care_message_service import CareMessageService
+from app.services.card_action_service import CardActionService
+from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.care_what_if import CareWhatIfSimulationService
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.tools.care import CareTools
 from helpers import memory_database
 
 
@@ -209,7 +215,7 @@ def test_outcome_matching_respects_post_decision_windows_and_feedback_learning()
     effects = CareEffectivenessService(database, "Asia/Shanghai")
     result = effects.refresh_outcomes(person.id, as_of=SENT + timedelta(hours=2))
 
-    assert result == {"created": 0, "updated": 1}
+    assert result == {"created": 1, "updated": 1}
     with database.session() as session:
         outcome = session.get(CareInterventionOutcome, intervention_id)
         assert outcome.baseline_state["observed_baseline"]["stress_0_10"] == 8.0
@@ -659,3 +665,282 @@ def test_preference_vocabulary_normalizes_legacy_values():
     )
     with pytest.raises(ValueError, match="unsupported intervention type"):
         normalized_intervention_types(["unknown_support"])
+
+
+def _semantic_what_if_run():
+    participant_id = uuid.uuid4()
+    raw_events = [
+        {
+            "id": "moved", "summary": "移动任务",
+            "start_time": "2030-01-15T10:00:00+08:00",
+            "end_time": "2030-01-15T11:00:00+08:00",
+        },
+        {
+            "id": "unchanged", "summary": "保留任务",
+            "start_time": "2030-01-15T14:00:00+08:00",
+            "end_time": "2030-01-15T15:00:00+08:00",
+        },
+    ]
+    semantics = {
+        "moved": {"source": "hybrid", "workload_prior": 0.81, "identity": "moved-semantic"},
+        "unchanged": {"source": "hybrid", "workload_prior": 0.63, "identity": "unchanged-semantic"},
+    }
+    classified = [
+        {
+            "id": "moved", "event_type": "task", "task_type": "ddl",
+            "course_name": "研究方法", "course_code": "RM101",
+            "course_match_confidence": 0.95, "course_match_source": "catalog",
+            "course_catalog_revision": "catalog-v1",
+        },
+        {
+            "id": "unchanged", "event_type": "course", "task_type": "general",
+            "course_name": "统计学", "course_code": "STAT101",
+            "course_match_confidence": 0.9, "course_match_source": "catalog",
+            "course_catalog_revision": "catalog-v1",
+        },
+    ]
+
+    class Forecasts:
+        def latest(self, *_args):
+            return {
+                "id": uuid.uuid4(), "forecast_version": "forecast",
+                "generated_at": SENT.isoformat(),
+                "semantic_input": [
+                    {"event_id": event_id, "semantic": semantic}
+                    for event_id, semantic in semantics.items()
+                ],
+                "curve": [],
+                "output": {
+                    "initial_state": {"stress_0_10": 4, "vitality_0_10": 7},
+                    "classified_calendar_events": classified,
+                },
+            }
+
+    class Calendars:
+        def get(self, *_args):
+            return {"events": raw_events, "degraded": False}
+
+    class Profiles:
+        def current(self, *_args):
+            return None
+
+    class Observations:
+        as_of = None
+
+        def for_local_date(self, *_args, **kwargs):
+            self.as_of = kwargs["as_of"]
+            return []
+
+    class Prediction:
+        events = None
+
+        def calculate(self, **kwargs):
+            self.events = deepcopy(kwargs["calendar_events"])
+            return {"trajectory": [{
+                "stress_0_10": 5.0, "vitality_0_10": 6.0,
+            }]}
+
+    class Coordinator:
+        forecasts = Forecasts()
+        calendar_snapshots = Calendars()
+        profiles = Profiles()
+        learned_profiles = None
+        observations = Observations()
+        prediction = Prediction()
+        from zoneinfo import ZoneInfo
+        timezone = ZoneInfo("Asia/Shanghai")
+
+    result = CareWhatIfSimulationService(Coordinator()).simulate(
+        participant_id, DAY, event_id="moved",
+        new_start_time="2030-01-15T12:00:00+08:00",
+        new_end_time="2030-01-15T13:00:00+08:00",
+    )
+    by_id = {item["id"]: item for item in Coordinator.prediction.events}
+    return result, by_id, Coordinator.observations.as_of, semantics
+
+
+def test_what_if_accepts_repository_iso_generated_at():
+    result, _events, as_of, _semantics = _semantic_what_if_run()
+    assert result["simulation_only"] is True
+    assert isinstance(as_of, datetime)
+    assert as_of == SENT
+
+
+def test_what_if_preserves_semantics_for_unchanged_events():
+    _result, events, _as_of, semantics = _semantic_what_if_run()
+    assert events["unchanged"]["metadata"]["semantic"] == semantics["unchanged"]
+
+
+def test_what_if_preserves_classification_for_unchanged_events():
+    _result, events, _as_of, _semantics = _semantic_what_if_run()
+    assert events["unchanged"]["event_type"] == "course"
+    assert events["unchanged"]["course_code"] == "STAT101"
+    assert events["unchanged"]["course_match_source"] == "catalog"
+
+
+def test_what_if_moved_event_keeps_source_semantic_identity():
+    _result, events, _as_of, semantics = _semantic_what_if_run()
+    assert events["moved"]["metadata"]["semantic"] == semantics["moved"]
+    assert events["moved"]["task_type"] == "ddl"
+    assert events["moved"]["course_code"] == "RM101"
+    assert events["moved"]["start_time"] == "2030-01-15T12:00:00+08:00"
+
+
+def test_recovery_episode_requires_pre_boundary():
+    assert _recovery_episode_changes([
+        {"stress_0_10": 8, "recovery_resource": 0.5},
+        {"stress_0_10": 7, "recovery_resource": 0.5},
+        {"stress_0_10": 6, "recovery_resource": 0.0},
+    ]) == []
+
+
+def test_recovery_episode_requires_post_boundary():
+    assert _recovery_episode_changes([
+        {"stress_0_10": 8, "recovery_resource": 0.0},
+        {"stress_0_10": 7, "recovery_resource": 0.5},
+        {"stress_0_10": 6, "recovery_resource": 0.5},
+    ]) == []
+
+
+def test_recovery_episode_with_both_boundaries_is_counted():
+    assert _recovery_episode_changes([
+        {"stress_0_10": 8, "recovery_resource": 0.0},
+        {"stress_0_10": 7, "recovery_resource": 0.5},
+        {"stress_0_10": 6, "recovery_resource": 0.5},
+        {"stress_0_10": 5, "recovery_resource": 0.0},
+    ]) == [-3.0]
+
+
+def _weekly_feedback_insight(ratings, participant_code):
+    database = memory_database()
+    person = ParticipantRepository(database).create(participant_code)
+    service = CareEffectivenessService(database, "Asia/Shanghai")
+    service.descriptive_effects = lambda *_args, **_kwargs: {"groups": [{
+        "intervention_type": "micro_break",
+        "helpful_binary_observations": ratings,
+    }]}
+    report = service.weekly_insights(person.id, through=DAY, minimum_sample_count=5)
+    return next(
+        item for item in report["insights"]
+        if item["insight_type"].startswith("care_feedback")
+    )
+
+
+def test_weekly_helpful_uncertainty_uses_wilson_for_all_success():
+    insight = _weekly_feedback_insight([1.0] * 5, "STAGE6-WILSON-SUCCESS")
+    assert insight["uncertainty_method"] == "wilson"
+    assert insight["uncertainty"]["method"] == "wilson"
+    assert insight["uncertainty"]["lower_95"] < 1.0
+    assert insight["uncertainty"]["upper_95"] == 1.0
+
+
+def test_weekly_helpful_uncertainty_uses_wilson_for_all_failure():
+    insight = _weekly_feedback_insight([0.0] * 5, "STAGE6-WILSON-FAILURE")
+    assert insight["uncertainty_method"] == "wilson"
+    assert insight["uncertainty"]["method"] == "wilson"
+    assert insight["uncertainty"]["lower_95"] == 0.0
+    assert insight["uncertainty"]["upper_95"] > 0.0
+
+
+def _mrt_row(participant_id, decision_time):
+    return InterventionRandomizationEvent(
+        participant_id=participant_id, decision_time=decision_time,
+        eligibility=True, context={}, candidate_actions=["micro_break"],
+        assigned_action="micro_break", randomization_probability=0.5,
+    )
+
+
+def test_mrt_rows_present_respects_date_scope():
+    database = memory_database()
+    person = ParticipantRepository(database).create("STAGE6-MRT-DATE")
+    with database.session() as session:
+        session.add(_mrt_row(person.id, SENT))
+    service = CareEffectivenessService(database, "Asia/Shanghai")
+    assert service.descriptive_effects(DAY, DAY, participant_id=person.id)["mrt_rows_present"] is True
+    later = DAY + timedelta(days=2)
+    assert service.descriptive_effects(later, later, participant_id=person.id)["mrt_rows_present"] is False
+
+
+def test_mrt_rows_present_respects_participant_scope():
+    database = memory_database()
+    first = ParticipantRepository(database).create("STAGE6-MRT-FIRST")
+    second = ParticipantRepository(database).create("STAGE6-MRT-SECOND")
+    with database.session() as session:
+        session.add(_mrt_row(first.id, SENT))
+    service = CareEffectivenessService(database, "Asia/Shanghai")
+    assert service.descriptive_effects(DAY, DAY, participant_id=first.id)["mrt_rows_present"] is True
+    assert service.descriptive_effects(DAY, DAY, participant_id=second.id)["mrt_rows_present"] is False
+
+
+def test_checkin_persists_when_care_outcome_refresh_fails(caplog):
+    class FailingOutcomeRefresh:
+        def on_observation_committed(self, *_args, **_kwargs):
+            raise RuntimeError("forced outcome refresh failure")
+
+    class ForecastRefreshSpy:
+        calls = 0
+
+        def on_observation_committed(self, **_kwargs):
+            self.calls += 1
+
+    caplog.set_level(logging.ERROR)
+    database = memory_database()
+    tool_person = ParticipantRepository(database).create("STAGE6-TOOL-CHECKIN")
+    observations = ObservationRepository(database)
+    tool_forecast_refresh = ForecastRefreshSpy()
+    tools = CareTools(
+        None, observations, None, None, "Asia/Shanghai", None,
+        observation_refresh=tool_forecast_refresh,
+        care_outcome_refresh=FailingOutcomeRefresh(),
+    )
+    tool_result = tools.record_checkin(
+        AgentContext(
+            tool_person.id, "STAGE6-TOOL-CHECKIN", "open", "chat", "tool-message", uuid.uuid4()
+        ),
+        {
+            "stress": 6, "energy": 5, "activity": "学习",
+            "stress_event_since_last": False, "event_ongoing": False,
+        },
+    )
+    assert tool_result["ok"] is True
+    assert observations.recent(tool_person.id)[0]["id"] == tool_result["observation_id"]
+    assert tool_forecast_refresh.calls == 1
+
+    card_person = ParticipantRepository(database).create("STAGE6-CARD-CHECKIN")
+    card_forecast_refresh = ForecastRefreshSpy()
+    card_service = CardActionService(
+        observations, observation_refresh=card_forecast_refresh,
+        care_outcome_refresh=FailingOutcomeRefresh(),
+    )
+    card_result = card_service.handle(
+        card_person.id, message_id="card-message", callback_event_id="card-event",
+        action_value={"mindflow_action": "submit_checkin", "version": "1"},
+        form_value={
+            "stress": "7", "energy": "4", "activity": "复习",
+            "stress_event_since_last": "false", "event_ongoing": "true",
+        },
+    )
+    assert card_result["ok"] is True
+    assert observations.recent(card_person.id)[0]["id"] == card_result["observation_id"]
+    assert card_forecast_refresh.calls == 1
+    assert "care outcome refresh failed" in caplog.text
+
+
+def test_post_commit_care_outcome_refresh_materializes_followup():
+    database = memory_database()
+    person = ParticipantRepository(database).create("STAGE6-POST-COMMIT")
+    intervention_id = _seed_intervention(database, person.id)
+    observed_at = datetime.now(timezone.utc)
+    with database.session() as session:
+        intervention = session.get(CareInterventionEvent, intervention_id)
+        intervention.sent_at = observed_at - timedelta(minutes=31)
+        intervention.scheduled_at = intervention.sent_at
+    write = ObservationRepository(database).add_with_status(
+        person.id, "checkin", {"stress_0_10": 6.0},
+        observed_at=observed_at, source_message_id="post-commit",
+    )
+    assert CareOutcomeRefreshService(database).on_observation_committed(
+        person.id, write.observation_id
+    ) is True
+    with database.session() as session:
+        assert session.get(CareInterventionOutcome, intervention_id).followup_30m is not None
