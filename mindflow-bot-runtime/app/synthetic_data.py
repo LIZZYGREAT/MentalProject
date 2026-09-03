@@ -16,13 +16,14 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     CareInterventionEvent, CareInterventionFeedback, CareInterventionOutcome,
-    DailyReviewResponse, ForecastCurrentnessEvent, ForecastSnapshot,
-    Participant, RetrospectiveCurveSnapshot, WarningSchedule,
+    DailyReviewResponse, EventAppraisalFeedback, ForecastCurrentnessEvent,
+    ForecastObservationMatch, ForecastSnapshot, Participant,
+    RetrospectiveCurveSnapshot, WarningSchedule,
 )
 from app.repositories import WarningScheduleRepository
 
 
-PLAN_SCHEMA_VERSION = 3
+PLAN_SCHEMA_VERSION = 4
 FUTURE_HORIZON_DAYS = 365
 OPERATOR_APPROVAL_REASON = "operator_approved_after_audit"
 _MARKER_RE = re.compile(
@@ -280,8 +281,16 @@ def audit_synthetic_data(
         restrict_retrospectives = session.scalars(select(RetrospectiveCurveSnapshot).where(
             RetrospectiveCurveSnapshot.source_forecast_id.in_(forecast_ids)
         )).all() if forecast_ids else []
-        blocked_forecasts = {row.causal_source_forecast_id for row in restrict_responses} | {
+        appraisal_rows = session.scalars(select(EventAppraisalFeedback).where(
+            EventAppraisalFeedback.source_forecast_id.in_(forecast_ids)
+        )).all() if forecast_ids else []
+        restrict_blocked_forecasts = {
+            row.causal_source_forecast_id for row in restrict_responses
+        } | {
             row.source_forecast_id for row in restrict_retrospectives
+        }
+        set_null_blocked_forecasts = {
+            row.source_forecast_id for row in appraisal_rows
         }
         for row in restrict_responses:
             impacts["restrict_blockers"].append(_impact(
@@ -291,6 +300,11 @@ def audit_synthetic_data(
         for row in restrict_retrospectives:
             impacts["restrict_blockers"].append(_impact(
                 table="retrospective_curve_snapshots", row_id=row.id,
+                relation="source_forecast_id -> forecast_snapshots.id",
+                planned_action="block_forecast_cleanup"))
+        for row in appraisal_rows:
+            impacts["set_null"].append(_impact(
+                table="event_appraisal_feedback", row_id=row.id,
                 relation="source_forecast_id -> forecast_snapshots.id",
                 planned_action="block_forecast_cleanup"))
 
@@ -307,10 +321,16 @@ def audit_synthetic_data(
 
         for item in candidates:
             row_id = uuid.UUID(item["id"])
-            if item["table"] == "forecast_snapshots" and row_id in blocked_forecasts:
+            if (item["table"] == "forecast_snapshots"
+                    and row_id in restrict_blocked_forecasts):
                 item["eligible_for_cleanup"] = False
                 item["cleanup_blocked"] = True
                 item["reasons"].append("restrict_dependency_blocks_cleanup")
+            if (item["table"] == "forecast_snapshots"
+                    and row_id in set_null_blocked_forecasts):
+                item["eligible_for_cleanup"] = False
+                item["cleanup_blocked"] = True
+                item["reasons"].append("set_null_dependency_blocks_cleanup")
             if item["table"] == "care_intervention_events" and row_id in blocked_care:
                 item["eligible_for_cleanup"] = False
                 item["cleanup_blocked"] = True
@@ -323,6 +343,9 @@ def audit_synthetic_data(
         currentness_rows = session.scalars(select(ForecastCurrentnessEvent).where(
             ForecastCurrentnessEvent.forecast_id.in_(final_forecasts)
         )).all() if final_forecasts else []
+        forecast_match_rows = session.scalars(select(ForecastObservationMatch).where(
+            ForecastObservationMatch.forecast_id.in_(final_forecasts)
+        )).all() if final_forecasts else []
         feedback_rows = session.scalars(select(CareInterventionFeedback).where(
             CareInterventionFeedback.intervention_id.in_(final_care)
         )).all() if final_care else []
@@ -332,6 +355,10 @@ def audit_synthetic_data(
         for row in currentness_rows:
             impacts["cascade_delete"].append(_impact(
                 table="forecast_currentness_events", row_id=row.id,
+                relation="forecast_id -> forecast_snapshots.id", planned_action="explicit_delete"))
+        for row in forecast_match_rows:
+            impacts["cascade_delete"].append(_impact(
+                table="forecast_observation_matches", row_id=row.id,
                 relation="forecast_id -> forecast_snapshots.id", planned_action="explicit_delete"))
         for row in feedback_rows:
             impacts["cascade_delete"].append(_impact(
@@ -402,6 +429,7 @@ _MODELS = {
     "care_intervention_feedback": CareInterventionFeedback,
     "care_intervention_outcomes": CareInterventionOutcome,
     "forecast_currentness_events": ForecastCurrentnessEvent,
+    "forecast_observation_matches": ForecastObservationMatch,
     "care_intervention_events": CareInterventionEvent,
     "warning_schedules": WarningSchedule,
     "forecast_snapshots": ForecastSnapshot,
@@ -411,6 +439,7 @@ _PRIMARY_KEYS = {
     "care_intervention_feedback": CareInterventionFeedback.id,
     "care_intervention_outcomes": CareInterventionOutcome.intervention_id,
     "forecast_currentness_events": ForecastCurrentnessEvent.id,
+    "forecast_observation_matches": ForecastObservationMatch.id,
     "care_intervention_events": CareInterventionEvent.id,
     "warning_schedules": WarningSchedule.id,
     "forecast_snapshots": ForecastSnapshot.id,
@@ -466,10 +495,14 @@ def cleanup_from_plan(
         warning_ids = ids.get("warning_schedules", set())
         care_ids = ids.get("care_intervention_events", set())
         currentness_ids = ids.get("forecast_currentness_events", set())
+        forecast_match_ids = ids.get("forecast_observation_matches", set())
         feedback_ids = ids.get("care_intervention_feedback", set())
         outcome_ids = ids.get("care_intervention_outcomes", set())
         actual_currentness = set(session.scalars(select(ForecastCurrentnessEvent.id).where(
             ForecastCurrentnessEvent.forecast_id.in_(forecast_ids)
+        )).all()) if forecast_ids else set()
+        actual_forecast_matches = set(session.scalars(select(ForecastObservationMatch.id).where(
+            ForecastObservationMatch.forecast_id.in_(forecast_ids)
         )).all()) if forecast_ids else set()
         actual_feedback = set(session.scalars(select(CareInterventionFeedback.id).where(
             CareInterventionFeedback.intervention_id.in_(care_ids)
@@ -477,7 +510,9 @@ def cleanup_from_plan(
         actual_outcomes = set(session.scalars(select(CareInterventionOutcome.intervention_id).where(
             CareInterventionOutcome.intervention_id.in_(care_ids)
         )).all()) if care_ids else set()
-        if (actual_currentness != currentness_ids or actual_feedback != feedback_ids
+        if (actual_currentness != currentness_ids
+                or actual_forecast_matches != forecast_match_ids
+                or actual_feedback != feedback_ids
                 or actual_outcomes != outcome_ids):
             raise CleanupPlanError("CASCADE dependencies changed after audit; refusing cleanup")
 
@@ -493,6 +528,9 @@ def cleanup_from_plan(
             WarningSchedule.snoozed_from_intervention_id.in_(care_ids),
             WarningSchedule.id.not_in(warning_ids),
         )).all() if care_ids else []
+        appraisal_rows = session.scalars(select(EventAppraisalFeedback.id).where(
+            EventAppraisalFeedback.source_forecast_id.in_(forecast_ids)
+        )).all() if forecast_ids else []
         restrict_responses = session.scalars(select(DailyReviewResponse.id).where(
             DailyReviewResponse.causal_source_forecast_id.in_(forecast_ids)
         )).all() if forecast_ids else []
@@ -503,6 +541,10 @@ def cleanup_from_plan(
             raise CleanupPlanError("plan omits dependent rows and could cause an unplanned cascade")
         if set_null_warnings:
             raise CleanupPlanError("cleanup would modify an unplanned warning through SET NULL")
+        if appraisal_rows:
+            raise CleanupPlanError(
+                "cleanup would modify event appraisal feedback through SET NULL"
+            )
         if restrict_responses or restrict_retrospectives:
             raise CleanupPlanError("cleanup is blocked by a current RESTRICT dependency")
 

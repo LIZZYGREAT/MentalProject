@@ -10,9 +10,12 @@ from app.models import (
     CareInterventionFeedback,
     CareInterventionOutcome,
     DailyReviewResponse,
+    EventAppraisalFeedback,
     ForecastCurrentnessEvent,
+    ForecastObservationMatch,
     ForecastSnapshot,
     RetrospectiveCurveSnapshot,
+    StateObservation,
     WarningSchedule,
 )
 from app.synthetic_data import (
@@ -46,6 +49,39 @@ def _forecast(database, participant_id, local_date, *, marker: str, valid: bool 
         session.flush()
         row_id = row.id
     return row_id
+
+
+def _forecast_match(session, participant_id, forecast_id, local_date, *, marker):
+    forecast = session.get(ForecastSnapshot, forecast_id)
+    observed_at = datetime.combine(
+        local_date, datetime.min.time(), tzinfo=timezone.utc
+    ) + timedelta(hours=9)
+    observation = StateObservation(
+        participant_id=participant_id,
+        observation_type="ema",
+        source_message_id=f"{marker}-observation-{uuid.uuid4().hex}",
+        payload_json={"stress": 6},
+        observed_at=observed_at,
+    )
+    session.add(observation)
+    session.flush()
+    match = ForecastObservationMatch(
+        participant_id=participant_id,
+        local_date=local_date,
+        forecast_id=forecast_id,
+        forecast_version=forecast.forecast_version,
+        match_schema_version=f"{marker}-schema",
+        forecast_timestamp=observed_at,
+        observation_id=observation.id,
+        observed_at=observed_at,
+        predicted_stress=5.5,
+        actual_stress=6,
+        residual=0.5,
+        context_json={"source": marker},
+    )
+    session.add(match)
+    session.flush()
+    return match.id
 
 
 def _warning_and_care(database, participant_id, forecast_id, local_date, *, marker: str):
@@ -170,7 +206,10 @@ def test_cleanup_rejects_tampered_or_stale_plans_and_rolls_back():
     assert _counts(database)["forecast_snapshots"] == 0
 
 
-def test_cleanup_rejects_obsolete_schema_v2_plan():
+@pytest.mark.parametrize("obsolete_schema_version", [2, 3])
+def test_cleanup_rejects_obsolete_schema_v2_and_v3_plans(
+    obsolete_schema_version,
+):
     database = memory_database()
     synthetic_user = participant(database, "FIXTURE-SCHEMA-V2")
     _forecast(
@@ -180,10 +219,10 @@ def test_cleanup_rejects_obsolete_schema_v2_plan():
         marker="synthetic-schema-v2",
     )
     report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
-    assert report["schema_version"] == 3
-    assert report["cleanup_plan"]["schema_version"] == 3
+    assert report["schema_version"] == 4
+    assert report["cleanup_plan"]["schema_version"] == 4
     obsolete_plan = deepcopy(report["cleanup_plan"])
-    obsolete_plan["schema_version"] = 2
+    obsolete_plan["schema_version"] = obsolete_schema_version
 
     with pytest.raises(CleanupPlanError, match="unsupported cleanup plan schema"):
         cleanup_from_plan(database.engine, obsolete_plan)
@@ -302,6 +341,13 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
             baseline_state={"stress": 7, "energy": 3},
             context_json={"source": "synthetic-dependency"},
         )
+        match_id = _forecast_match(
+            session,
+            user.id,
+            forecast_id,
+            local_date,
+            marker="synthetic-dependency",
+        )
         session.add_all([currentness, feedback, outcome])
         session.flush()
         currentness_id, feedback_id = currentness.id, feedback.id
@@ -310,10 +356,14 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
     impacts = report["dependent_impacts"]["cascade_delete"]
     planned = {(row["table"], row["id"]) for row in report["cleanup_plan"]["rows"]}
     assert ("forecast_currentness_events", str(currentness_id)) in planned
+    assert ("forecast_observation_matches", str(match_id)) in planned
     assert ("care_intervention_feedback", str(feedback_id)) in planned
     assert ("care_intervention_outcomes", str(care_id)) in planned
     assert report["cleanup_plan"]["expected_cleanup_counts"][
         "care_intervention_outcomes"
+    ] == 1
+    assert report["cleanup_plan"]["expected_cleanup_counts"][
+        "forecast_observation_matches"
     ] == 1
     assert {impact["planned_action"] for impact in impacts} == {"explicit_delete"}
 
@@ -322,9 +372,130 @@ def test_audit_plans_cascade_dependents_explicitly_and_cleanup_deletes_them():
     )
     with database.session() as session:
         assert session.get(ForecastCurrentnessEvent, currentness_id) is None
+        assert session.get(ForecastObservationMatch, match_id) is None
         assert session.get(CareInterventionFeedback, feedback_id) is None
         assert session.get(CareInterventionOutcome, care_id) is None
         assert session.get(WarningSchedule, warning_id) is None
+
+
+def test_cleanup_rejects_forecast_match_changes_after_audit():
+    database = memory_database()
+    user = participant(database, "TEST-MATCH-STALE")
+    local_date = date(2035, 3, 5)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="synthetic-match-stale"
+    )
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    with database.session() as session:
+        _forecast_match(
+            session,
+            user.id,
+            forecast_id,
+            local_date,
+            marker="synthetic-match-stale",
+        )
+
+    for execute in (False, True):
+        with pytest.raises(
+            CleanupPlanError,
+            match="CASCADE dependencies changed after audit",
+        ):
+            cleanup_from_plan(
+                database.engine,
+                report["cleanup_plan"],
+                execute=execute,
+                backup_confirmed=execute,
+            )
+
+
+def test_event_appraisal_feedback_blocks_forecast_cleanup():
+    database = memory_database()
+    user = participant(database, "TEST-APPRAISAL-BLOCK")
+    local_date = date(2035, 3, 6)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="synthetic-appraisal-block"
+    )
+    with database.session() as session:
+        appraisal = EventAppraisalFeedback(
+            participant_id=user.id,
+            event_id="synthetic-appraisal-event",
+            mental_demand=8,
+            physical_demand=2,
+            temporal_demand=7,
+            effort=8,
+            frustration=6,
+            perceived_control=4,
+            actual_stress=7,
+            perceived_performance=6,
+            source_forecast_id=forecast_id,
+            source_forecast_version="synthetic-appraisal-block",
+            submitted_at=datetime(2035, 3, 6, 10, tzinfo=timezone.utc),
+        )
+        session.add(appraisal)
+        session.flush()
+        appraisal_id = appraisal.id
+
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    set_null = report["dependent_impacts"]["set_null"]
+    candidate = next(
+        row for row in report["candidates"] if row["id"] == str(forecast_id)
+    )
+    planned = {(row["table"], row["id"]) for row in report["cleanup_plan"]["rows"]}
+
+    assert any(
+        impact["table"] == "event_appraisal_feedback"
+        and impact["id"] == str(appraisal_id)
+        for impact in set_null
+    )
+    assert candidate["eligible_for_cleanup"] is False
+    assert candidate["cleanup_blocked"] is True
+    assert "set_null_dependency_blocks_cleanup" in candidate["reasons"]
+    assert ("forecast_snapshots", str(forecast_id)) not in planned
+
+
+def test_cleanup_rejects_appraisal_added_after_audit_without_nulling_provenance():
+    database = memory_database()
+    user = participant(database, "TEST-APPRAISAL-STALE")
+    local_date = date(2035, 3, 7)
+    forecast_id = _forecast(
+        database, user.id, local_date, marker="synthetic-appraisal-stale"
+    )
+    report = audit_synthetic_data(database.engine, today=date(2026, 8, 28))
+    with database.session() as session:
+        appraisal = EventAppraisalFeedback(
+            participant_id=user.id,
+            event_id="synthetic-appraisal-stale-event",
+            mental_demand=8,
+            physical_demand=2,
+            temporal_demand=7,
+            effort=8,
+            frustration=6,
+            perceived_control=4,
+            actual_stress=7,
+            perceived_performance=6,
+            source_forecast_id=forecast_id,
+            source_forecast_version="synthetic-appraisal-stale",
+            submitted_at=datetime(2035, 3, 7, 10, tzinfo=timezone.utc),
+        )
+        session.add(appraisal)
+        session.flush()
+        appraisal_id = appraisal.id
+
+    for execute in (False, True):
+        with pytest.raises(
+            CleanupPlanError,
+            match="event appraisal feedback through SET NULL",
+        ):
+            cleanup_from_plan(
+                database.engine,
+                report["cleanup_plan"],
+                execute=execute,
+                backup_confirmed=execute,
+            )
+    with database.session() as session:
+        assert session.get(EventAppraisalFeedback, appraisal_id).source_forecast_id == (
+            forecast_id
+        )
 
 
 def test_audit_blocks_set_null_and_restrict_side_effects_before_cleanup():
