@@ -361,6 +361,7 @@ def care_intervention_card(
     return {
         "schema": "2.0",
         "config": {
+            "update_multi": True,
             "width_mode": "fill",
             "enable_forward": False,
             "summary": {"content": "MindFlow 关怀提醒"},

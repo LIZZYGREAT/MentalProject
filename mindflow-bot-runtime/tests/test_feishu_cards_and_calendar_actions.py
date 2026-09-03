@@ -13,6 +13,7 @@ from app.agent.skill_loader import SkillLoader
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.tools.care import _recurrence_from_args
 from app.integrations.feishu.cards import (
+    care_intervention_card,
     daily_checkin_card,
     daily_review_card,
     pressure_curve_card,
@@ -269,6 +270,67 @@ def test_feishu_client_sends_card_as_interactive_message():
         element["tag"] == "form"
         for element in serialized["body"]["elements"]
     )
+
+
+def test_care_intervention_card_uses_json2_shared_card_contract():
+    card = care_intervention_card(
+        intervention_id="care-test-id",
+        message="测试提醒",
+        actions=[
+            "helpful",
+            "not_relevant",
+            "snooze_30",
+            "disable_type",
+        ],
+    )
+
+    assert card["schema"] == "2.0"
+    assert card["config"]["update_multi"] is True
+    assert card["config"]["enable_forward"] is False
+
+    buttons = []
+    for element in card["body"]["elements"]:
+        if element.get("tag") != "column_set":
+            continue
+        for column in element.get("columns", []):
+            buttons.extend(
+                item
+                for item in column.get("elements", [])
+                if item.get("tag") == "button"
+            )
+
+    actions = {
+        button["value"]["mindflow_action"]
+        for button in buttons
+    }
+    assert actions == {
+        "care_helpful",
+        "care_not_relevant",
+        "care_snooze_30",
+        "care_disable_type",
+    }
+    for button in buttons:
+        assert button["value"]["version"] == "1"
+        assert button["value"]["intervention_id"] == "care-test-id"
+
+
+def test_feishu_client_sends_care_card_as_interactive_message():
+    seen = []
+    client = FeishuClient.__new__(FeishuClient)
+    client._send_message = lambda chat_id, msg_type, content: (
+        seen.append((chat_id, msg_type, content)) or "om-care-card"
+    )
+
+    card = care_intervention_card(
+        intervention_id="care-test-id",
+        message="测试提醒",
+        actions=["helpful", "not_relevant"],
+    )
+    message_id = client.send_card("oc-test", card)
+
+    assert message_id == "om-care-card"
+    assert seen == [("oc-test", "interactive", card)]
+    assert seen[0][2]["config"]["update_multi"] is True
 
 
 def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
