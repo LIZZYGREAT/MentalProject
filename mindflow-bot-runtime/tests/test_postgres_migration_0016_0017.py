@@ -981,6 +981,83 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
                 connection
             ).get_table_names()
 
+            command.upgrade(config, "head")
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0037_stage6_care_jitai"
+
+            stage6_inspector = inspect(connection)
+            warning_columns = {
+                column["name"]: column
+                for column in stage6_inspector.get_columns(
+                    "warning_schedules"
+                )
+            }
+            assert "authorization_deadline" in warning_columns
+            assert warning_columns["authorization_deadline"]["nullable"] is False
+            for warning_id in (
+                source_warning_id,
+                child_warning_id,
+                invalid_warning_id,
+            ):
+                authorization_deadline, risk_time = connection.execute(
+                    text(
+                        "SELECT authorization_deadline, risk_time "
+                        "FROM warning_schedules WHERE id = :id"
+                    ),
+                    {"id": warning_id},
+                ).one()
+                assert authorization_deadline == risk_time
+
+            care_preference_columns = {
+                column["name"]
+                for column in stage6_inspector.get_columns(
+                    "participant_care_preferences"
+                )
+            }
+            assert {
+                "inferred_support_types",
+                "disabled_intervention_types",
+                "interruption_tolerance",
+                "preferred_reminder_windows",
+            } <= care_preference_columns
+
+            care_event_columns = {
+                column["name"]
+                for column in stage6_inspector.get_columns(
+                    "care_intervention_events"
+                )
+            }
+            assert {
+                "vulnerability_score",
+                "receptivity_score",
+                "decision_score",
+                "decision_json",
+            } <= care_event_columns
+
+            stage6_tables = set(stage6_inspector.get_table_names())
+            assert {
+                "care_intervention_outcomes",
+                "intervention_randomization_events",
+            } <= stage6_tables
+            outcome_foreign_keys = stage6_inspector.get_foreign_keys(
+                "care_intervention_outcomes"
+            )
+            assert any(
+                key["constrained_columns"] == ["intervention_id"]
+                and key["referred_table"] == "care_intervention_events"
+                and str((key.get("options") or {}).get("ondelete")).upper()
+                == "CASCADE"
+                for key in outcome_foreign_keys
+            )
+            assert any(
+                key["constrained_columns"] == ["participant_id"]
+                and key["referred_table"] == "participants"
+                for key in stage6_inspector.get_foreign_keys(
+                    "intervention_randomization_events"
+                )
+            )
+
             service = ResearchEvaluationService(
                 _ConnectionDatabase(connection), "Asia/Shanghai"
             )
