@@ -49,3 +49,31 @@ def test_authoritative_forecast_stays_server_rendered_and_responsive():
     assert "pressure-curve/${localDate}.png" in app
     assert "renderForecastChart" not in app
     assert ".forecast-chart-image { display:block; width:100%; max-width:100%" in css
+
+
+def test_workload_charts_explain_semantics_and_use_product_cards():
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "styles.css").read_text(encoding="utf-8")
+
+    assert "W(t)" in app and "不是新的心理状态" in app
+    assert "图 A · 任务负荷与预测压力" in app
+    assert "图 B · 预测压力与 EMA 观测" in app
+    assert "不表示因果效应" in app
+    assert "Residual 暂无足够样本" in app
+    assert "需要至少 2 个有效 EMA 匹配点" in app
+    assert ".diagnostic-card" in css
+    assert ".chart-query-meta" in css
+
+
+def test_ridge_status_and_stage5_controls_have_dedicated_layouts():
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "styles.css").read_text(encoding="utf-8")
+
+    assert "function workloadRidgeCard" in app
+    assert "status-badge" in app
+    assert "样本不足" in app
+    assert "renderKeyValueGrid(appraisal.ridge_fit||{})" not in app
+    assert "'stage5-form'" in app
+    assert ".stage5-form { grid-template-columns:minmax(300px,2fr) minmax(240px,1fr) minmax(160px,auto)" in css
+    assert ".stage5-form .field { grid-template-rows:18px 48px 18px" in css
+    assert ".stage5-form .filter-action button { min-width:160px" in css

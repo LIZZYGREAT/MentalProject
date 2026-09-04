@@ -6,13 +6,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
+import logging
 import math
 from pathlib import Path
 import statistics
 from typing import Any
 
 
+logger = logging.getLogger(__name__)
+
 _CJK_FONT_PATHS = (
+    Path("C:/Windows/Fonts/msyh.ttc"),
+    Path("C:/Windows/Fonts/msyhbd.ttc"),
+    Path("C:/Windows/Fonts/simhei.ttf"),
     Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
 )
@@ -21,8 +27,16 @@ _PREFERRED_CJK_FONT_NAMES = (
     "Noto Sans CJK JP",
     "Source Han Sans SC",
     "Microsoft YaHei",
+    "Microsoft YaHei UI",
     "SimHei",
 )
+
+_INK = "#29332f"
+_MUTED = "#6b756f"
+_GRID = "#dfe5e1"
+_WORKLOAD = "#397668"
+_FORECAST = "#4169e1"
+_ACTUAL = "#c94343"
 
 
 class WorkloadDataNotFoundError(LookupError):
@@ -50,6 +64,11 @@ class _Series:
 class WorkloadDiagnosticRenderer:
     """Keep unlike units in separate panels and EMA as discrete observations."""
 
+    def __init__(self) -> None:
+        # AdminAPI creates this renderer during application startup, so font
+        # discovery and the warmup canvas finish before any chart request.
+        self._pyplot()
+
     @staticmethod
     def _resolve_font_name(font_manager) -> str:
         available = {font.name for font in font_manager.fontManager.ttflist}
@@ -75,7 +94,28 @@ class WorkloadDiagnosticRenderer:
         from matplotlib import font_manager
         from matplotlib import pyplot as plt
 
-        return plt, WorkloadDiagnosticRenderer._resolve_font_name(font_manager)
+        font_name = WorkloadDiagnosticRenderer._resolve_font_name(font_manager)
+        # Force the selected CJK font through a real first canvas draw.  This
+        # warms Matplotlib's font lookup before the first Admin HTTP request,
+        # avoiding the previous first-render-only tofu/missing-glyph result.
+        with plt.rc_context(WorkloadDiagnosticRenderer._rc(font_name)):
+            warmup = plt.figure(figsize=(0.2, 0.2), dpi=40)
+            warmup.text(
+                0,
+                0,
+                "任务负荷预测压力观测样本不足日期时间～±·-",
+                fontfamily=font_name,
+            )
+            warmup.canvas.draw()
+            plt.close(warmup)
+        if font_name == "DejaVu Sans":
+            logger.warning("workload_diagnostic_cjk_font_unavailable")
+        else:
+            logger.info(
+                "workload_diagnostic_font_selected",
+                extra={"font_name": font_name},
+            )
+        return plt, font_name
 
     @staticmethod
     def _rc(font_name: str) -> dict[str, Any]:
@@ -85,7 +125,40 @@ class WorkloadDiagnosticRenderer:
             "axes.unicode_minus": False,
             "figure.facecolor": "white",
             "axes.facecolor": "white",
+            "axes.edgecolor": _GRID,
+            "axes.labelcolor": _INK,
+            "axes.titlecolor": _INK,
+            "text.color": _INK,
+            "xtick.color": _MUTED,
+            "ytick.color": _MUTED,
+            "axes.titlesize": 15,
+            "axes.labelsize": 12,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "legend.fontsize": 10,
         }
+
+    @staticmethod
+    def _apply_admin_research_style(*axes: Any) -> None:
+        """Apply the restrained visual language used by the Forecast chart."""
+
+        for axis in axes:
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+            axis.spines["left"].set_color(_GRID)
+            axis.spines["bottom"].set_color(_GRID)
+            axis.tick_params(axis="both", length=0, pad=7)
+            axis.grid(axis="y", color=_GRID, linewidth=0.8, alpha=0.62)
+            axis.set_axisbelow(True)
+
+    @staticmethod
+    def _style_legend(axis: Any, *, location: str = "upper right") -> None:
+        legend = axis.legend(loc=location, frameon=True)
+        if legend is not None:
+            legend.get_frame().set_facecolor("white")
+            legend.get_frame().set_edgecolor(_GRID)
+            legend.get_frame().set_linewidth(0.8)
+            legend.get_frame().set_alpha(0.94)
 
     @staticmethod
     def _timestamp(local_date: Any, time_value: Any) -> datetime | None:
@@ -173,13 +246,14 @@ class WorkloadDiagnosticRenderer:
         axis.xaxis.set_major_formatter(
             mdates.DateFormatter("%m-%d\n%H:%M" if multiple_days else "%H:%M")
         )
-        axis.grid(True, linestyle="--", alpha=0.25)
 
     @staticmethod
     def _png(figure, plt) -> bytes:
         output = BytesIO()
         try:
-            figure.savefig(output, format="png", bbox_inches="tight", dpi=140)
+            # Fixed canvas bounds keep all workload cards pixel-aligned; each
+            # renderer sets explicit subplot margins before reaching here.
+            figure.savefig(output, format="png", dpi=140)
             return output.getvalue()
         finally:
             plt.close(figure)
@@ -191,81 +265,84 @@ class WorkloadDiagnosticRenderer:
             figure, (demand_axis, stress_axis) = plt.subplots(
                 2,
                 1,
-                figsize=(14.4, 8.1),
+                figsize=(15, 8),
                 sharex=True,
-                gridspec_kw={"height_ratios": [1, 1.35]},
+                gridspec_kw={"height_ratios": [1, 1.18], "hspace": 0.16},
             )
             demand_axis.fill_between(
-                series.x, 0, series.workload, color="#0f766e", alpha=0.16
+                series.x, 0, series.workload, color=_WORKLOAD, alpha=0.08
             )
             demand_axis.plot(
-                series.x, series.workload, color="#0f766e", linewidth=2.0,
-                label="Workload Demand W(t)",
+                series.x,
+                series.workload,
+                color=_WORKLOAD,
+                linewidth=2.25,
+                label="任务负荷 W(t)",
             )
-            demand_axis.set_ylabel("任务需求代理量（0–1）", weight="bold")
+            demand_axis.set_ylabel("任务负荷 W(t)\n0-1", weight="bold")
             demand_axis.set_ylim(0, 1.05)
-            demand_axis.legend(loc="upper left")
+            self._style_legend(demand_axis)
             stress_axis.plot(
-                series.x, series.forecast, color="royalblue", linewidth=2.2,
-                label="Forecast Stress",
+                series.x,
+                series.forecast,
+                color=_FORECAST,
+                linewidth=2.45,
+                label="Forecast",
             )
-            stress_axis.set_ylabel("预测压力（0–10）", weight="bold")
+            stress_axis.set_ylabel("预测压力\n0-10", weight="bold")
             stress_axis.set_ylim(0, 10.5)
             stress_axis.set_xlabel("日期与时间")
-            stress_axis.legend(loc="upper left")
+            self._style_legend(stress_axis)
             multiple_days = series.x[0].date() != series.x[-1].date()
             self._decorate_time_axis(demand_axis, multiple_days=multiple_days)
             self._decorate_time_axis(stress_axis, multiple_days=multiple_days)
-            participant = payload.get("participant_code") or payload.get("participant_id") or "全部参与者"
-            figure.suptitle(
-                f"Workload Demand 与 Forecast Stress（{participant}）",
-                fontsize=16,
-                weight="bold",
-            )
-            figure.tight_layout()
+            self._apply_admin_research_style(demand_axis, stress_axis)
+            figure.subplots_adjust(left=0.10, right=0.975, top=0.97, bottom=0.11)
             return self._png(figure, plt)
 
     def forecast_vs_ema(self, payload: dict[str, Any]) -> bytes:
         series = self._prepare(payload)
         plt, font_name = self._pyplot()
         with plt.rc_context(self._rc(font_name)):
-            figure, axis = plt.subplots(figsize=(14.4, 8.1))
+            figure, axis = plt.subplots(figsize=(15, 7.2))
             axis.plot(
-                series.x, series.forecast, color="royalblue", linewidth=2.1,
-                label="Forecast Stress（连续曲线）",
+                series.x,
+                series.forecast,
+                color=_FORECAST,
+                linewidth=2.45,
+                label="Forecast 连续预测",
             )
             if series.ema_x:
                 axis.scatter(
-                    series.ema_x, series.ema_actual, color="#dc2626", s=48,
-                    edgecolors="white", linewidths=0.8, zorder=4,
-                    label=f"Actual EMA（n={len(series.ema_x)}）",
+                    series.ema_x,
+                    series.ema_actual,
+                    color=_ACTUAL,
+                    s=56,
+                    edgecolors="#8f2f2f",
+                    linewidths=0.8,
+                    zorder=4,
+                    label=f"Actual EMA 观测 (n={len(series.ema_x)})",
                 )
             axis.set_ylim(0, 10.5)
-            axis.set_ylabel("压力（0–10）", weight="bold")
+            axis.set_ylabel("压力 0-10", weight="bold")
             axis.set_xlabel("日期与时间")
             self._decorate_time_axis(
                 axis, multiple_days=series.x[0].date() != series.x[-1].date()
             )
-            axis.legend(loc="upper left")
-            tolerance = payload.get("match_tolerance_minutes", 5)
-            participant = payload.get("participant_code") or payload.get("participant_id") or "全部参与者"
-            axis.set_title(
-                f"Forecast 与 Actual EMA · {participant} · 匹配容差 ±{tolerance} 分钟",
-                fontsize=15,
-                weight="bold",
-            )
-            figure.tight_layout()
+            self._apply_admin_research_style(axis)
+            self._style_legend(axis)
+            figure.subplots_adjust(left=0.09, right=0.975, top=0.97, bottom=0.15)
             return self._png(figure, plt)
 
     def residual(self, payload: dict[str, Any]) -> bytes | None:
         series = self._prepare(payload)
-        if not series.ema_x:
+        if len(series.ema_x) < 2:
             return None
         plt, font_name = self._pyplot()
         with plt.rc_context(self._rc(font_name)):
             figure, axis = plt.subplots(figsize=(14.4, 5.2))
-            colors = ["#dc2626" if value > 0 else "#0f766e" for value in series.residual]
-            axis.axhline(0, color="#334155", linewidth=1.2)
+            colors = [_ACTUAL if value > 0 else _WORKLOAD for value in series.residual]
+            axis.axhline(0, color=_INK, linewidth=1.1)
             axis.vlines(series.ema_x, 0, series.residual, colors=colors, alpha=0.6)
             axis.scatter(series.ema_x, series.residual, color=colors, s=42, zorder=3)
             axis.set_ylabel("Residual（Actual − Forecast）", weight="bold")
@@ -273,8 +350,8 @@ class WorkloadDiagnosticRenderer:
             self._decorate_time_axis(
                 axis, multiple_days=series.x[0].date() != series.x[-1].date()
             )
-            axis.set_title("Forecast Residual 诊断", fontsize=15, weight="bold")
-            figure.tight_layout()
+            self._apply_admin_research_style(axis)
+            figure.subplots_adjust(left=0.10, right=0.975, top=0.96, bottom=0.20)
             return self._png(figure, plt)
 
     def render(self, payload: dict[str, Any]) -> WorkloadDiagnosticImages:
