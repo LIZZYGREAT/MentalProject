@@ -1,16 +1,20 @@
 ---
-document_status: ACTIVE
-project_status: NO_GO
+document_status: OBSOLETE
+project_status: HISTORICAL
 branch: production_runtime
 last_reviewed: 2026-08-29
 owner: project_operator
-superseded_by: null
+superseded_by:
+  - README.md
+  - ../docs/CURRENT_ARCHITECTURE.md
 archive_rule: 所有必须项完成并形成证据后，将 document_status 改为 COMPLETED；若被新台账替代，改为 OBSOLETE 并填写 superseded_by。
 ---
 
 # MindFlow 生产 Runtime 上线任务台账
 
-这是从“代码准备完成”到“20 人飞书实验可启动”的唯一任务台账。README 负责说明系统怎么使用；本文件只管理尚未完成的人工工作、验收证据和上线结论。
+> 本文件保留为 2026-08-29 上线准备历史记录，不再代表当前生产状态，也不再是当前唯一 ACTIVE 台账。
+
+以下内容按历史原貌保留，用于理解当时从“代码准备完成”到“20 人飞书实验可启动”的准备状态。
 
 ## 状态规则
 

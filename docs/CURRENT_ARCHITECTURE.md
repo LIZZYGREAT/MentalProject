@@ -5,6 +5,11 @@
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
 <!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
+<!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
+<!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
+<!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
+<!-- CAUSAL_CLAIM_ALLOWED: false -->
+<!-- MRT_RUNTIME_ENABLED: false -->
 
 ## 运行边界
 
@@ -14,9 +19,28 @@ MindFlow 是面向飞书私聊的 Python 后端，业务数据保存在 PostgreS
 
 ## Agent 与业务工具
 
-每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 15 个封闭 schema
+每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 16 个封闭 schema
 的 participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线和 Calendar。工具
 Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
+
+<!-- BUSINESS_TOOLS_BEGIN -->
+- `care_get_today_context`
+- `care_record_checkin`
+- `care_get_recent_state`
+- `care_run_today_assessment`
+- `care_get_support`
+- `care_update_preferences`
+- `care_respond_to_latest_intervention`
+- `care_get_pressure_curve`
+- `care_simulate_schedule_change`
+- `care_get_checkin_card`
+- `calendar_connection_status`
+- `calendar_list_calendars`
+- `calendar_list_events`
+- `calendar_create_event`
+- `calendar_update_event`
+- `calendar_delete_event`
+<!-- BUSINESS_TOOLS_END -->
 
 `calendar_update_event` 的 `start_time` 与 `end_time` 是互相依赖字段：两者同时提供或同时
 省略。底层 handler 也执行相同校验，避免 schema 与实现合同漂移。
@@ -191,7 +215,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0036_stage5_effective_profile`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0037_stage6_care_jitai`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -341,7 +365,9 @@ rate 不进入晋级参数。晋级 confidence 使用样本、天数、transitio
 `mindflow-ctssm-runtime-v7:m0`，已晋级 WM0/M1/M2/M3 使用 runtime v8，并在 Forecast output、
 ForecastObservationMatch context 与 Dataset v4 中冻结 `model_family`、`model_variant`、
 `model_spec_version`、`promotion_decision_id` 和 `promotion_parameters_hash`。Participant Admin
-页面的 current model 读取 `runtime_active()`；cohort evaluation 单独标记，不作为个体验证结果。
+页面的 current model 通过与 Overview knowledge cutoff 一致的 runtime-active-as-of resolver
+读取；cohort evaluation 单独标记，不作为个体验证结果。最新 candidate/rejected 画像只在独立
+研究审计区域显示，不进入当前模型、画像维度或关键参数。
 
 Current M0 不再复用 Dataset 中可能已经属于 M1/M2/M3 的历史生产预测，而是与 WM0/M1/M2/M3
 共同通过 `AssessmentModel → Simulator → step_latent_state` 真实回放；五个模型共享冻结 initial
@@ -394,9 +420,22 @@ M3 使用 `recovery-debt-dynamics.v1`：
 $dF/dt=\alpha_FW(t)(1-F)-\lambda_FR(t)F$，并约束 $F\in[0,1]$。这一 bounded dynamics
 使高负荷累积逐渐饱和、恢复只作用于已有恢复债，从而避免无界增长和负恢复债。
 
+## Stage 6 Care / JITAI 边界
+
+0037 将 JITAI-style context-aware intervention selection 接入 selection runtime，并记录
+Vulnerability、Receptivity、决策分数、干预曝光以及 30/60 分钟 proximal outcomes。Care
+effectiveness 当前只允许 `observational_descriptive`：`causal_claim_allowed = false`，
+`mrt_runtime_enabled = false`。系统具备 MRT-ready contracts，但尚未运行随机 MRT，也不据此
+声称已证明因果干预效果。
+
+CardAction 默认使用 `FEISHU_CARD_ACTION_TRANSPORT=ws` 且
+`FEISHU_CARD_CALLBACK_ENABLED=false`。WS 模式不要求公网 HTTPS；HTTP 是显式 fallback，启用时
+必须使用 `FEISHU_CARD_ACTION_TRANSPORT=http`、打开 callback 并配置验签所需参数。
+
 ## 自动漂移保护
 
-`tests/test_authoritative_docs.py` 校验本文的工具数、模型版本与 Alembic 唯一 head。专项测试
+`tests/test_authoritative_docs.py` 校验本文与 Runtime README 的 exact tool set、模型版本、
+Alembic 唯一 head、CardAction 默认值和 Stage 6 非因果边界。专项测试
 覆盖 Calendar fail-closed/degraded 分流、Today→Tomorrow 依赖、课程锁、Snooze、Care 偏好、
 micro-break、工具 schema 和迁移；完整结果以每次当前测试运行输出为准，不在权威文档固定
 长期 passed 数量。

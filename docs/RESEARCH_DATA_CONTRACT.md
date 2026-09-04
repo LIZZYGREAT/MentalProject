@@ -1,8 +1,12 @@
 # MindFlow Research Data Contract
 
-版本：v1（对应 Profile Schema v2）  
-状态：Stage 1 Gate 1  
-适用范围：后续建模、机器学习、研究分析与 Admin；本合同不修改 CTSSM 主方程。
+文档版本：Research Data Contract v2
+
+Profile Schema：v2
+
+状态：CURRENT
+
+覆盖范围：Stage 1–6 当前研究数据、因果时间边界、回顾、校准、个体化与评估；本合同不修改 CTSSM 主方程。
 
 ## 1. 数据类别与时间规则
 

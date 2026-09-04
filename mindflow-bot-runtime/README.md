@@ -31,30 +31,40 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
 - SDK MCP 只暴露十六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
-- 飞书 `card.action.trigger` 通过独立的已验签 HTTPS 回调入口进入固定后端处理器；卡片回调不经过对话模型。
+- 飞书 `card.action.trigger` 默认通过 WebSocket/长连接进入固定后端处理器；HTTP HTTPS callback 仅作 fallback，卡片动作不经过对话模型。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
+<!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
+<!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
+<!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
+<!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
+<!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
+<!-- CAUSAL_CLAIM_ALLOWED: false -->
+<!-- MRT_RUNTIME_ENABLED: false -->
 
 ## 十六个业务 Tool
 
-1. `care_get_today_context`
-2. `care_record_checkin`
-3. `care_get_recent_state`
-4. `care_run_today_assessment`
-5. `care_get_support`
-6. `care_update_preferences`
-7. `care_respond_to_latest_intervention`
-8. `care_get_pressure_curve`
-9. `care_get_checkin_card`
-10. `calendar_connection_status`
-11. `calendar_list_calendars`
-12. `calendar_list_events`
-13. `calendar_create_event`
-14. `calendar_update_event`
-15. `calendar_delete_event`
+<!-- BUSINESS_TOOLS_BEGIN -->
+- `care_get_today_context`
+- `care_record_checkin`
+- `care_get_recent_state`
+- `care_run_today_assessment`
+- `care_get_support`
+- `care_update_preferences`
+- `care_respond_to_latest_intervention`
+- `care_get_pressure_curve`
+- `care_simulate_schedule_change`
+- `care_get_checkin_card`
+- `calendar_connection_status`
+- `calendar_list_calendars`
+- `calendar_list_events`
+- `calendar_create_event`
+- `calendar_update_event`
+- `calendar_delete_event`
+<!-- BUSINESS_TOOLS_END -->
 
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
 身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
@@ -155,17 +165,17 @@ docker compose exec bot python3 -c "from app.config import Settings; s=Settings.
 
 ```powershell
 Copy-Item .\profiles\profile.example.json .\profiles\P001.json
-docker compose exec bot python -m app.admin create-participant P001
+docker compose exec bot python3 -m app.admin create-participant P001
 docker compose cp .\profiles\P001.json bot:/tmp/P001.json
-docker compose exec bot python -m app.admin set-profile P001 /tmp/P001.json
-docker compose exec bot python -m app.admin set-llm-consent P001
+docker compose exec bot python3 -m app.admin set-profile P001 /tmp/P001.json
+docker compose exec bot python3 -m app.admin set-llm-consent P001
 ```
 
 第一条命令只显示一次 `/bind <code>`；数据库仅保存绑定码 Hash。撤回外部 LLM
 授权：
 
 ```powershell
-docker compose exec bot python -m app.admin set-llm-consent P001 --revoke
+docker compose exec bot python3 -m app.admin set-llm-consent P001 --revoke
 ```
 
 ## Admin 账号与密码 Hash
@@ -213,8 +223,8 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0030_model_promotion_decisions`。新快照使用包含 Participant Membership、BRS 与 recovery
-证据的 Dataset Schema v4；0025 创建的 v2 和既有 v3 快照继续按原不可变合同评估。JSON 业务列在
+`0037_stage6_care_jitai`。新快照使用包含 Participant Membership、画像历史、Care exposure 与
+runtime-active history 的 Dataset Schema v7；既有 v2–v6 快照继续按各自不可变合同评估。JSON 业务列在
 PostgreSQL 使用 JSONB。Stage 3 增加独立派生的事件 workload、随时间 W(t)、Event Appraisal
 Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Appraisal/EMA 均按历史 current
 Forecast 冻结因果来源，workload revision 参与 Forecast cache identity。Stage 4 保留 Current M0
@@ -237,9 +247,14 @@ Gate 只读取 final rolling-training 的 `evaluation_parameter_gate_evidence`�
 不可辨识时独立 fail closed，不修改 OOS Gate。评估来源
 分别记录 identity filter 前的 `snapshot_source_set` 和实际进入 metrics 的 `evaluation_source_set`。
 
-部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。生产环境还需把
-飞书卡片回调配置为真实可访问的 HTTPS 地址；本地
-代码和测试无法替代域名、证书、反向代理及飞书后台的外部配置。
+部署脚本显式运行一次性的 `migrate` 服务，迁移成功后才重建 Bot 和 Admin。CardAction 生产默认
+通过 WebSocket/长连接接收，不要求公网 HTTPS。只有选择 HTTP fallback 时，才需要真实可访问的
+HTTPS 地址、域名、证书、反向代理及飞书后台配置。
+
+Stage 6 已将 JITAI-style context-aware intervention selection 接入 selection runtime，并追踪
+proximal outcomes。Care effectiveness 固定为 `observational_descriptive`；
+`causal_claim_allowed = false`、`mrt_runtime_enabled = false`。当前只能称为 MRT-ready
+contracts，不能声称已完成随机 MRT 或证明了因果干预效果。
 
 ## Response Presentation 性能策略
 
@@ -282,5 +297,5 @@ Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以�
 5. container recreate 后 session resume、pending reply 和 OAuth Token 均可恢复；
 6. 日志不含 Secret、Token、完整 Prompt 或 MCP 身份上下文。
 
-这些证据完成前，实验上线结论仍是 **NO-GO**。人工任务统一维护在
-[`PROJECT_TASKS.md`](PROJECT_TASKS.md)。
+这些证据完成前，实验上线结论仍是 **NO-GO**。`PROJECT_TASKS.md` 仅保留为
+2026-08-29 上线准备历史记录，不再代表当前生产状态或唯一 ACTIVE 台账。
