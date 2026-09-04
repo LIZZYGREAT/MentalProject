@@ -1,4 +1,4 @@
-"""Shared defaults for the sqlite-auth-deployment style forecast chart."""
+"""Shared defaults for MindFlow forecast and Admin pressure-curve charts."""
 
 FIGSIZE = (14.4, 8.1)
 S_PANEL_HEIGHT_RATIO = 3

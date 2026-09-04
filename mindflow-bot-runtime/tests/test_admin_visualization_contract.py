@@ -36,7 +36,9 @@ def test_care_effect_and_overview_copy_preserve_research_boundaries():
     assert "内部研究风险提示，不是诊断" in app
     assert "PARTICIPANT OVERVIEW V2" in app
     assert "source_field" in app
-    assert "/overview?through=" in app
+    assert "api(`/admin/api/participants/${encoded}/overview`)" in app
+    assert "api(`/admin/api/participants/${code}/overview`)" in app
+    assert "/overview?through=${encodeURIComponent(state.researchEnd)}" not in app
 
 
 def test_authoritative_forecast_stays_server_rendered_and_responsive():

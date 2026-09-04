@@ -79,26 +79,46 @@ class ParticipantOverviewService:
                 raise LookupError("participant_not_found")
             profile = session.execute(
                 select(ParticipantProfile)
-                .where(ParticipantProfile.participant_id == participant_id)
+                .where(
+                    ParticipantProfile.participant_id == participant_id,
+                    ParticipantProfile.created_at < upper,
+                )
                 .order_by(desc(ParticipantProfile.version))
                 .limit(1)
             ).scalar_one_or_none()
             learned = session.execute(
                 select(LearnedModelProfile)
-                .where(LearnedModelProfile.participant_id == participant_id)
+                .where(
+                    LearnedModelProfile.participant_id == participant_id,
+                    LearnedModelProfile.created_at < upper,
+                )
                 .order_by(desc(LearnedModelProfile.version))
                 .limit(1)
             ).scalar_one_or_none()
             slow = session.execute(
                 select(ParticipantSlowState)
-                .where(ParticipantSlowState.participant_id == participant_id)
-                .order_by(desc(ParticipantSlowState.effective_at))
+                .where(
+                    ParticipantSlowState.participant_id == participant_id,
+                    ParticipantSlowState.effective_at < upper,
+                    ParticipantSlowState.created_at < upper,
+                )
+                .order_by(
+                    desc(ParticipantSlowState.effective_at),
+                    desc(ParticipantSlowState.created_at),
+                )
                 .limit(1)
             ).scalar_one_or_none()
             observation = session.execute(
                 select(StateObservation)
-                .where(StateObservation.participant_id == participant_id)
-                .order_by(desc(StateObservation.observed_at))
+                .where(
+                    StateObservation.participant_id == participant_id,
+                    StateObservation.observed_at < upper,
+                    StateObservation.created_at < upper,
+                )
+                .order_by(
+                    desc(StateObservation.observed_at),
+                    desc(StateObservation.created_at),
+                )
                 .limit(1)
             ).scalar_one_or_none()
             forecasts = session.execute(
@@ -108,14 +128,20 @@ class ParticipantOverviewService:
                     ForecastSnapshot.local_date >= start_14,
                     ForecastSnapshot.local_date <= through,
                     ForecastSnapshot.valid.is_(True),
+                    ForecastSnapshot.generated_at < upper,
                 )
                 .order_by(ForecastSnapshot.local_date, ForecastSnapshot.generated_at)
             ).scalars().all()
-            latest_forecast = forecasts[-1] if forecasts else session.execute(
+            forecasts_by_date = {forecast.local_date: forecast for forecast in forecasts}
+            window_forecasts = list(forecasts_by_date.values())
+            target_forecast = forecasts_by_date.get(through)
+            latest_forecast = window_forecasts[-1] if window_forecasts else session.execute(
                 select(ForecastSnapshot)
                 .where(
                     ForecastSnapshot.participant_id == participant_id,
+                    ForecastSnapshot.local_date <= through,
                     ForecastSnapshot.valid.is_(True),
+                    ForecastSnapshot.generated_at < upper,
                 )
                 .order_by(desc(ForecastSnapshot.local_date), desc(ForecastSnapshot.generated_at))
                 .limit(1)
@@ -126,6 +152,7 @@ class ParticipantOverviewService:
                     StateObservation.participant_id == participant_id,
                     StateObservation.observed_at >= lower_14,
                     StateObservation.observed_at < upper,
+                    StateObservation.created_at < upper,
                 )
             ).scalars().all()
             review_days = session.execute(
@@ -154,7 +181,8 @@ class ParticipantOverviewService:
             ).scalars().all()
             last_message_at = session.scalar(
                 select(func.max(BotEvent.received_at)).where(
-                    BotEvent.participant_id == participant_id
+                    BotEvent.participant_id == participant_id,
+                    BotEvent.received_at < upper,
                 )
             )
 
@@ -164,7 +192,7 @@ class ParticipantOverviewService:
             _aware(row.observed_at).astimezone(self.timezone).date()
             for row in observations
         }
-        forecast_days = {row.local_date for row in forecasts}
+        forecast_days = {row.local_date for row in window_forecasts}
         ema_day_rate = min(1.0, len(observed_days) / eligible_days) if eligible_days else None
         forecast_day_rate = min(1.0, len(forecast_days) / eligible_days) if eligible_days else None
         review_rate = len(set(review_days)) / eligible_days if eligible_days else None
@@ -175,15 +203,15 @@ class ParticipantOverviewService:
             coverage_parts.append(min(1.0, learned.sample_count / 30.0))
         evidence_coverage = statistics.fmean(coverage_parts) if coverage_parts else None
 
-        latest_curve = list(latest_forecast.curve_json or []) if latest_forecast else []
+        target_curve = list(target_forecast.curve_json or []) if target_forecast else []
         valid_stress = [
-            value for value in (_number(point.get("stress_0_10")) for point in latest_curve)
+            value for value in (_number(point.get("stress_0_10")) for point in target_curve)
             if value is not None and 0 <= value <= 10
         ]
         peak_stress = max(valid_stress) if valid_stress else None
         peak_point = next(
             (
-                point for point in latest_curve
+                point for point in target_curve
                 if _number(point.get("stress_0_10")) == peak_stress
             ),
             None,
@@ -207,6 +235,7 @@ class ParticipantOverviewService:
             confidence: float | None,
             normalization: str,
             sample_count: int | None = None,
+            description: str | None = None,
         ) -> None:
             if value is None:
                 return
@@ -220,6 +249,7 @@ class ParticipantOverviewService:
                 "confidence": confidence,
                 "sample_count": sample_count,
                 "normalization": normalization,
+                "description": description,
                 "status": "observed",
             })
 
@@ -261,7 +291,7 @@ class ParticipantOverviewService:
         )
 
         daily_workload: list[float] = []
-        for forecast in forecasts:
+        for forecast in window_forecasts:
             values = [
                 value for value in (_number(point.get("workload")) for point in list(forecast.curve_json or []))
                 if value is not None and 0 <= value <= 1
@@ -270,14 +300,15 @@ class ParticipantOverviewService:
                 daily_workload.append(statistics.fmean(values))
         volatility = statistics.pstdev(daily_workload) if len(daily_workload) >= 3 else None
         dimension(
-            "schedule_volatility", "日程波动",
+            "workload_volatility", "任务负荷波动",
             _score(volatility, 0, 0.25) if volatility is not None else None,
             source="persisted_forecast_curve",
             source_field="daily_mean(workload)",
-            version="recent_14d_valid_forecasts",
+            version="recent_14d_latest_valid_forecast_per_day",
             confidence=min(1.0, len(daily_workload) / 14),
             normalization="population_sd_linear_clip_0_0.25_to_0_100",
             sample_count=len(daily_workload),
+            description="近 14 日有效 Forecast 中每日平均 W(t) 的标准差",
         )
         receptivity = [_number(value) for value in care_rows]
         receptivity = [value for value in receptivity if value is not None and 0 <= value <= 1]
@@ -309,7 +340,7 @@ class ParticipantOverviewService:
         assessments: list[dict[str, Any]] = []
         if peak_stress is not None:
             assessments.append({
-                "message": f"当前 Forecast 的预测峰值为 {peak_stress:.1f}/10，出现在 {str((peak_point or {}).get('time') or '未知时段')[:5]}。",
+                "message": f"{through.isoformat()} Forecast 的预测峰值为 {peak_stress:.1f}/10，出现在 {str((peak_point or {}).get('time') or '未知时段')[:5]}。",
                 "level": attention_level,
                 "evidence_keys": ["risk_summary.peak_stress", "current_model.forecast_id"],
                 "sample_count": len(valid_stress),
