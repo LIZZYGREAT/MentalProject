@@ -9,6 +9,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+from app.services.admin_chart_theme import (
+    admin_chart_rc,
+    apply_admin_chart_axes,
+    style_admin_chart_legend,
+)
 from app.services.curve_analysis import (
     CurveAnalysis,
     curve_points,
@@ -109,20 +114,13 @@ class PressureCurveRenderer:
 
     @staticmethod
     def _font_rc(font_name: str) -> dict[str, Any]:
-        return {
-            "font.family": "sans-serif",
-            "font.sans-serif": [font_name, "DejaVu Sans"],
-            "axes.unicode_minus": False,
-            "figure.facecolor": "white",
-        }
+        return admin_chart_rc(font_name)
 
     @staticmethod
     def _apply_reference_style(*axes: Any) -> None:
         """Apply the restrained white-background grid used by the reference."""
 
-        for axis in axes:
-            if axis is not None:
-                axis.grid(True, linestyle="--", linewidth=0.8, alpha=0.26)
+        apply_admin_chart_axes(*axes)
 
     @staticmethod
     def _event_style(event: dict[str, Any]) -> tuple[str, str, float]:
@@ -384,8 +382,10 @@ class PressureCurveRenderer:
                         alpha=0.75,
                     )
 
-            stress_axis.legend(
-                loc="center left", bbox_to_anchor=(0.01, 0.75), fontsize=10
+            style_admin_chart_legend(
+                stress_axis,
+                location="center left",
+                bbox_to_anchor=(0.01, 0.75),
             )
 
             if stress_only:
@@ -428,7 +428,7 @@ class PressureCurveRenderer:
                     weight="bold",
                 )
                 secondary_axis.set_ylim(0, 105)
-                secondary_axis.legend(loc="lower left", fontsize=10)
+                style_admin_chart_legend(secondary_axis, location="lower left")
                 title = "今日压力与活力趋势"
             else:
                 event_input = [point.event_stress_input for point in points]
@@ -466,7 +466,9 @@ class PressureCurveRenderer:
                     "压力影响强度（0–1）", fontsize=12, weight="bold"
                 )
                 secondary_axis.set_ylim(0, 1.05)
-                secondary_axis.legend(loc="upper left", fontsize=10, ncol=3)
+                style_admin_chart_legend(
+                    secondary_axis, location="upper left", ncol=3
+                )
                 title = "今日压力趋势与影响因素"
 
             if secondary_axis is not None:
@@ -497,8 +499,10 @@ class PressureCurveRenderer:
                     "预测置信度（0–1）", color="orange", fontsize=11
                 )
                 confidence_axis.tick_params(axis="y", labelcolor="orange")
-                confidence_axis.legend(
-                    loc="center left", bbox_to_anchor=(0.01, 0.65), fontsize=10
+                style_admin_chart_legend(
+                    confidence_axis,
+                    location="center left",
+                    bbox_to_anchor=(0.01, 0.65),
                 )
 
             self._finalize_figure(figure, title)
