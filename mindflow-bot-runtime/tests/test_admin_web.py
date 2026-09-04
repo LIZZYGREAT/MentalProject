@@ -91,8 +91,8 @@ def test_admin_profile_ui_has_the_four_research_layers():
     assert "LAYER C · SLOW STATE" in script
     assert "LAYER D · LEARNED PARAMETERS" in script
     assert "标准量表与历史变化" in script
-    assert "SCHEMA / COMPATIBILITY" in script
-    assert "这里只展示用户明确填写的 explicit 内容" in script
+    assert "高级审计信息" in script
+    assert "字段来源和更新时间保留在审计信息中" in script
     assert "layers.explicit?.data??p.profile" not in script
 
 
@@ -153,8 +153,9 @@ def test_admin_curve_marks_mismatched_retrospective_source_without_overlaying_it
     ).read_text(encoding="utf-8")
 
     assert "retrospective_matches_current_forecast===false" in source
-    assert "回顾估计基于 Forecast" in source
-    assert "服务端趋势图仅展示当前权威 Forecast" in source
+    assert "Daily Review 回顾估计与当前预测的数据来源不一致" in source
+    assert "请在“审计信息”中核对来源记录" in source
+    assert "回顾估计基于 Forecast" not in source
 
 
 def test_admin_daily_review_formats_optional_energy_and_peak_conflict():

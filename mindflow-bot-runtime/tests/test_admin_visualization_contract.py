@@ -34,7 +34,7 @@ def test_care_effect_and_overview_copy_preserve_research_boundaries():
     assert "该结果用于描述关联，不解释为因果效应。" in app
     assert "仅描述性散点，不拟合因果趋势。" in app
     assert "内部研究风险提示，不是诊断" in app
-    assert "PARTICIPANT OVERVIEW V2" in app
+    assert "用户概览" in app
     assert "source_field" in app
     assert "api(`/admin/api/participants/${encoded}/overview`)" in app
     assert "api(`/admin/api/participants/${code}/overview`)" in app
