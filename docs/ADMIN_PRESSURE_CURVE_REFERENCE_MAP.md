@@ -10,7 +10,7 @@ package them.
 | Reference file | Reference function or view | Current implementation |
 | --- | --- | --- |
 | `referrence/visualization/plotter.py` | `_draw_core_plot` | `mindflow-bot-runtime/app/services/pressure_curve_renderer.py::PressureCurveRenderer._draw_core_plot` |
-| `referrence/visualization/plotter.py` | `get_plot_image_base64` | `PressureCurveRenderer.render` returns PNG bytes; `PressureCurveService.render_persisted` supplies the persisted Forecast data |
+| `referrence/visualization/plotter.py` | `get_plot_image_base64` | `PressureCurveRenderer.render` returns PNG bytes; `PressureCurveService.read_persisted` supplies the persisted Forecast data |
 | `referrence/frontend/src/views/HomeView.vue` | `runPrediction`, `chartSource` | `mindflow-bot-runtime/app/admin_web/api.py::AdminAPI.pressure_curve_image` and `app/admin_web/static/app.js::pressureCurveImage` |
 | `referrence/frontend/src/views/HomeView.vue` | `<img v-if="chartSource" ...>` | Admin renders `/admin/api/participants/{participant_code}/pressure-curve/{local_date}.png` with an `<img>` element |
 
