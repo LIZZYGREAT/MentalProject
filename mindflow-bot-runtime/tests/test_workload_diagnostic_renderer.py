@@ -259,6 +259,34 @@ def test_admin_workload_png_routes_return_png_and_empty_residual_404(monkeypatch
     assert missing.json() == {"error": "workload_data_not_found"}
 
 
+def test_admin_workload_png_returns_503_when_cjk_font_is_unavailable(monkeypatch):
+    WorkloadDiagnosticRenderer._pyplot.cache_clear()
+
+    def unavailable(_font_manager):
+        raise RuntimeError("workload_diagnostic_cjk_font_unavailable")
+
+    monkeypatch.setattr(
+        WorkloadDiagnosticRenderer, "_resolve_font", staticmethod(unavailable)
+    )
+    monkeypatch.setattr(
+        ResearchEvaluationService,
+        "workload_diagnostics",
+        lambda *_args, **_kwargs: _payload(),
+    )
+    database = memory_database()
+    participant(database, "P001")
+    browser = TestClient(create_app(database, settings()))
+    login(browser)
+
+    response = browser.get(
+        "/admin/api/research/workload/chart/demand-vs-forecast.png"
+        "?date_start=2026-09-01&date_end=2026-09-02&participant_code=P001"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "workload_chart_font_unavailable"}
+
+
 def test_frontend_uses_python_images_and_never_rescales_workload_to_stress():
     source = (
         Path(__file__).resolve().parents[1]

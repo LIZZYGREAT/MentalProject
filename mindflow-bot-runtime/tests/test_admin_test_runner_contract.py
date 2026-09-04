@@ -12,7 +12,10 @@ def test_admin_runner_is_lightweight_revision_gated_and_non_destructive():
         "test_admin_forecast_visualization.py",
         "test_admin_security.py",
         "test_admin_visualization_contract.py",
+        "test_admin_user_facing_copy_contract.py",
         "test_admin_web.py",
+        "test_participant_overview.py",
+        "test_workload_diagnostic_renderer.py",
     ):
         assert f"/srv/runtime/tests/{test_file}" in source
 

@@ -34,7 +34,10 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
   /srv/runtime/tests/test_admin_forecast_visualization.py \
   /srv/runtime/tests/test_admin_security.py \
   /srv/runtime/tests/test_admin_visualization_contract.py \
-  /srv/runtime/tests/test_admin_web.py
+  /srv/runtime/tests/test_admin_user_facing_copy_contract.py \
+  /srv/runtime/tests/test_admin_web.py \
+  /srv/runtime/tests/test_participant_overview.py \
+  /srv/runtime/tests/test_workload_diagnostic_renderer.py
 TEST_RESULT=$?
 set -e
 

@@ -80,7 +80,7 @@ class AdminAPI:
         self.participant_overviews = ParticipantOverviewService(
             repository.database, settings.timezone_name
         )
-        self.workload_renderer = WorkloadDiagnosticRenderer()
+        self._workload_renderer: WorkloadDiagnosticRenderer | None = None
         self.what_if = (
             CareWhatIfSimulationService(pressure_curves.coordinator)
             if pressure_curves is not None
@@ -99,6 +99,11 @@ class AdminAPI:
                 ZoneInfo(self.settings.timezone_name)
             ).date().isoformat(),
         }
+
+    def _get_workload_renderer(self) -> WorkloadDiagnosticRenderer:
+        if self._workload_renderer is None:
+            self._workload_renderer = WorkloadDiagnosticRenderer()
+        return self._workload_renderer
 
     def _research_dates(self, request: Request, default_days: int = 14):
         today = datetime.now(ZoneInfo(self.settings.timezone_name)).date()
@@ -778,21 +783,27 @@ class AdminAPI:
         if error:
             return error
         chart = request.path_params["chart"]
+        if chart not in {"demand-vs-forecast", "forecast-vs-ema", "residual"}:
+            return _json_error("workload_chart_not_found", 404)
+        try:
+            renderer = self._get_workload_renderer()
+        except RuntimeError as exc:
+            if str(exc) == "workload_diagnostic_cjk_font_unavailable":
+                return _json_error("workload_chart_font_unavailable", 503)
+            raise
         try:
             if chart == "demand-vs-forecast":
                 png = await asyncio.to_thread(
-                    self.workload_renderer.demand_vs_forecast, payload
+                    renderer.demand_vs_forecast, payload
                 )
             elif chart == "forecast-vs-ema":
                 png = await asyncio.to_thread(
-                    self.workload_renderer.forecast_vs_ema, payload
+                    renderer.forecast_vs_ema, payload
                 )
             elif chart == "residual":
-                png = await asyncio.to_thread(self.workload_renderer.residual, payload)
+                png = await asyncio.to_thread(renderer.residual, payload)
                 if png is None:
                     return _json_error("workload_data_not_found", 404)
-            else:
-                return _json_error("workload_chart_not_found", 404)
         except WorkloadDataNotFoundError:
             return _json_error("workload_data_not_found", 404)
         return Response(

@@ -7,6 +7,7 @@ from starlette.testclient import TestClient
 from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
 from app.config import Settings
+from app.services.workload_diagnostic_renderer import WorkloadDiagnosticRenderer
 from helpers import memory_database, participant
 
 
@@ -67,6 +68,23 @@ def test_admin_frontend_and_public_health_are_available():
         "status": "ok",
         "database": "ok",
     }
+
+
+def test_admin_startup_does_not_require_workload_cjk_font(monkeypatch):
+    WorkloadDiagnosticRenderer._pyplot.cache_clear()
+
+    def unavailable(_font_manager):
+        raise RuntimeError("workload_diagnostic_cjk_font_unavailable")
+
+    monkeypatch.setattr(
+        WorkloadDiagnosticRenderer, "_resolve_font", staticmethod(unavailable)
+    )
+
+    browser = client()
+    session = login(browser)
+
+    assert session["username"] == "admin"
+    assert browser.get("/admin/api/participants").status_code == 200
 
 
 def test_admin_exposes_participant_bound_care_timeline_and_ui_tab():
