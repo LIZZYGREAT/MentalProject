@@ -71,6 +71,7 @@ from app.models import (
     PsychometricAssessment,
     DatasetSnapshot,
     LearnedModelProfile,
+    ModelEvaluationRun,
     ModelPromotionDecision,
     ParameterLearningRun,
     ForecastCurrentnessEvent,
@@ -416,6 +417,39 @@ class LearnedProfileRepository:
     ) -> Optional[dict[str, Any]]:
         """Resolve the active profile inside the caller's transaction."""
 
+        return self._runtime_active_in_session(
+            session,
+            participant_id,
+            for_update=for_update,
+        )
+
+    def runtime_active_as_of_in_session(
+        self,
+        session: Any,
+        participant_id: uuid.UUID,
+        *,
+        knowledge_cutoff: datetime,
+        for_update: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the profile whose complete runtime proof existed before cutoff."""
+
+        return self._runtime_active_in_session(
+            session,
+            participant_id,
+            for_update=for_update,
+            knowledge_cutoff=knowledge_cutoff,
+        )
+
+    def _runtime_active_in_session(
+        self,
+        session: Any,
+        participant_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+        knowledge_cutoff: datetime | None = None,
+    ) -> Optional[dict[str, Any]]:
+        """Shared production resolver, optionally bounded by knowledge time."""
+
         statement = (
             select(LearnedModelProfile)
             .where(
@@ -430,11 +464,19 @@ class LearnedProfileRepository:
             )
             .order_by(desc(LearnedModelProfile.version))
         )
+        if knowledge_cutoff is not None:
+            statement = statement.where(
+                LearnedModelProfile.created_at < knowledge_cutoff
+            )
         if for_update:
             statement = statement.with_for_update()
         rows = session.execute(statement).scalars().all()
         for row in rows:
-            valid, evidence = self.runtime_validity_in_session(session, row)
+            valid, evidence = self.runtime_validity_in_session(
+                session,
+                row,
+                knowledge_cutoff=knowledge_cutoff,
+            )
             if valid:
                 view = self._view(row)
                 view["runtime_validation"] = {
@@ -448,6 +490,8 @@ class LearnedProfileRepository:
         self,
         session: Any,
         row: LearnedModelProfile,
+        *,
+        knowledge_cutoff: datetime | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """Validate one learned-profile row against its durable promotion proof."""
 
@@ -472,6 +516,12 @@ class LearnedProfileRepository:
         )
         if not status_eligible:
             evidence["reason"] = "profile_validation_status_not_runtime_eligible"
+            return False, evidence
+
+        if knowledge_cutoff is not None and not self._known_before(
+            row.created_at, knowledge_cutoff
+        ):
+            evidence["reason"] = "profile_not_known_before_cutoff"
             return False, evidence
 
         if selection.get("status") == "stage5_promoted":
@@ -547,6 +597,16 @@ class LearnedProfileRepository:
                 .order_by(desc(ParticipantProfile.version))
                 .limit(1)
             ).scalar_one_or_none()
+            if knowledge_cutoff is not None:
+                explicit_row = session.execute(
+                    select(ParticipantProfile)
+                    .where(
+                        ParticipantProfile.participant_id == row.participant_id,
+                        ParticipantProfile.created_at < knowledge_cutoff,
+                    )
+                    .order_by(desc(ParticipantProfile.version))
+                    .limit(1)
+                ).scalar_one_or_none()
             explicit_payload = dict(
                 explicit_row.profile_json if explicit_row is not None else {}
             )
@@ -696,6 +756,49 @@ class LearnedProfileRepository:
                     == validated_effective_hash
                 ),
             }
+            if knowledge_cutoff is not None:
+                checks.update(
+                    {
+                        "profile_known_before_cutoff": self._known_before(
+                            row.created_at, knowledge_cutoff
+                        ),
+                        "learning_run_known_before_cutoff": bool(
+                            learning_run is not None
+                            and self._known_before(
+                                learning_run.created_at, knowledge_cutoff
+                            )
+                        ),
+                        "dataset_snapshot_known_before_cutoff": bool(
+                            snapshot is not None
+                            and self._known_before(
+                                snapshot.created_at, knowledge_cutoff
+                            )
+                        ),
+                    }
+                )
+                base_decision_id = snapshot_active_identity.get(
+                    "stage4_promotion_decision_id"
+                )
+                if active_variant != "m0":
+                    try:
+                        parsed_base_decision_id = uuid.UUID(
+                            str(base_decision_id or "")
+                        )
+                    except ValueError:
+                        parsed_base_decision_id = None
+                    base_decision = (
+                        session.get(
+                            ModelPromotionDecision, parsed_base_decision_id
+                        )
+                        if parsed_base_decision_id is not None
+                        else None
+                    )
+                    checks["base_promotion_known_before_cutoff"] = bool(
+                        base_decision is not None
+                        and self._promotion_proof_known_before(
+                            session, base_decision, knowledge_cutoff
+                        )
+                    )
             valid = all(checks.values())
             evidence.update(
                 {
@@ -801,6 +904,13 @@ class LearnedProfileRepository:
             }.get(active_variant)
             and decision.parameters_hash == promotion_parameters_hash(parameters)
         )
+        if knowledge_cutoff is not None:
+            valid = bool(
+                valid
+                and self._promotion_proof_known_before(
+                    session, decision, knowledge_cutoff
+                )
+            )
         evidence.update(
             {
                 "provenance_type": "stage4_promotion",
@@ -816,6 +926,40 @@ class LearnedProfileRepository:
             }
         )
         return valid, evidence
+
+    @staticmethod
+    def _known_before(value: datetime, cutoff: datetime) -> bool:
+        value_utc = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+        cutoff_utc = (
+            cutoff.replace(tzinfo=timezone.utc)
+            if cutoff.tzinfo is None
+            else cutoff.astimezone(timezone.utc)
+        )
+        return value_utc < cutoff_utc
+
+    @classmethod
+    def _promotion_proof_known_before(
+        cls,
+        session: Any,
+        decision: ModelPromotionDecision,
+        cutoff: datetime,
+    ) -> bool:
+        snapshot = session.get(DatasetSnapshot, decision.dataset_snapshot_id)
+        evaluation = session.get(
+            ModelEvaluationRun, decision.model_evaluation_run_id
+        )
+        return bool(
+            cls._known_before(decision.passed_at, cutoff)
+            and cls._known_before(decision.promoted_at, cutoff)
+            and snapshot is not None
+            and cls._known_before(snapshot.created_at, cutoff)
+            and evaluation is not None
+            and cls._known_before(evaluation.created_at, cutoff)
+        )
 
     def current(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
         """Compatibility alias for research callers; prefer latest()."""

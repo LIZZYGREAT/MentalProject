@@ -26,9 +26,10 @@ from app.models import (
 )
 from app.services.care_effectiveness import CareEffectivenessService
 from app.services.curve_analysis import HIGH_RISK, MEDIUM_RISK
+from app.repositories import LearnedProfileRepository
 
 
-OVERVIEW_SCHEMA_VERSION = "participant-overview.v2"
+OVERVIEW_SCHEMA_VERSION = "participant-overview.v3"
 
 
 def _aware(value: datetime) -> datetime:
@@ -86,7 +87,7 @@ class ParticipantOverviewService:
                 .order_by(desc(ParticipantProfile.version))
                 .limit(1)
             ).scalar_one_or_none()
-            learned = session.execute(
+            latest_learned = session.execute(
                 select(LearnedModelProfile)
                 .where(
                     LearnedModelProfile.participant_id == participant_id,
@@ -95,6 +96,13 @@ class ParticipantOverviewService:
                 .order_by(desc(LearnedModelProfile.version))
                 .limit(1)
             ).scalar_one_or_none()
+            runtime_active = LearnedProfileRepository(
+                self.database
+            ).runtime_active_as_of_in_session(
+                session,
+                participant_id,
+                knowledge_cutoff=upper,
+            )
             slow = session.execute(
                 select(ParticipantSlowState)
                 .where(
@@ -199,8 +207,10 @@ class ParticipantOverviewService:
         coverage_parts = [value for value in (ema_day_rate, forecast_day_rate) if value is not None]
         if profile is not None:
             coverage_parts.append(1.0)
-        if learned is not None:
-            coverage_parts.append(min(1.0, learned.sample_count / 30.0))
+        if runtime_active is not None:
+            coverage_parts.append(
+                min(1.0, runtime_active["sample_count"] / 30.0)
+            )
         evidence_coverage = statistics.fmean(coverage_parts) if coverage_parts else None
 
         target_curve = list(target_forecast.curve_json or []) if target_forecast else []
@@ -263,7 +273,7 @@ class ParticipantOverviewService:
             confidence=evidence_coverage,
             normalization="linear_clip_0_10_to_0_100",
         )
-        parameters = dict(learned.parameters_json or {}) if learned else {}
+        parameters = dict(runtime_active["parameters"]) if runtime_active else {}
         reactivity_key = next(
             (key for key in ("stress_reactivity_i", "stress_reactivity", "reactivity") if key in parameters),
             None,
@@ -274,10 +284,10 @@ class ParticipantOverviewService:
             _score(reactivity, 0, 1.5) if reactivity is not None else None,
             source="learned_model_profile",
             source_field=reactivity_key or "stress_reactivity_i",
-            version=learned.version if learned else None,
-            confidence=learned.confidence if learned else None,
+            version=runtime_active["version"] if runtime_active else None,
+            confidence=runtime_active["confidence"] if runtime_active else None,
             normalization="linear_clip_0_1.5_per_hour_to_0_100",
-            sample_count=learned.sample_count if learned else None,
+            sample_count=runtime_active["sample_count"] if runtime_active else None,
         )
         dimension(
             "recovery_capacity", "恢复能力",
@@ -362,13 +372,13 @@ class ParticipantOverviewService:
                 "sample_count": 0,
                 "confidence": 0.0,
             })
-        if learned is not None:
+        if runtime_active is not None:
             assessments.append({
-                "message": f"当前个体参数版本 v{learned.version}，validation 状态为 {learned.validation_status}。",
-                "level": "info" if learned.validation_status == "validated" else "attention",
+                "message": f"当前个体参数版本 v{runtime_active['version']}，validation 状态为 {runtime_active['validation_status']}。",
+                "level": "info" if runtime_active["validation_status"] == "validated" else "attention",
                 "evidence_keys": ["current_model.learned_profile_version", "key_parameters"],
-                "sample_count": learned.sample_count,
-                "confidence": learned.confidence,
+                "sample_count": runtime_active["sample_count"],
+                "confidence": runtime_active["confidence"],
             })
 
         latest_payload = dict(observation.payload_json or {}) if observation else {}
@@ -383,17 +393,16 @@ class ParticipantOverviewService:
             estimate = _number(raw)
             if estimate is None:
                 continue
-            uncertainty = dict(learned.uncertainty_json or {}).get(key) if learned else None
+            uncertainty = dict(runtime_active["uncertainty"]).get(key)
             key_parameters.append({
                 "parameter": key,
                 "estimate": estimate,
                 "uncertainty": uncertainty,
-                "version": learned.version if learned else None,
-                "sample_count": learned.sample_count if learned else None,
-                "validation_status": learned.validation_status if learned else None,
+                "version": runtime_active["version"],
+                "sample_count": runtime_active["sample_count"],
+                "validation_status": runtime_active["validation_status"],
                 "evidence_window": (
-                    f"{learned.window_start.isoformat()}–{learned.window_end.isoformat()}"
-                    if learned else None
+                    f"{runtime_active['window_start']}–{runtime_active['window_end']}"
                 ),
             })
 
@@ -414,9 +423,24 @@ class ParticipantOverviewService:
                 "forecast_version": latest_forecast.forecast_version if latest_forecast else None,
                 "algorithm_version": latest_forecast.algorithm_version if latest_forecast else None,
                 "model_family": dict(latest_forecast.output_json or {}).get("model_family") if latest_forecast else None,
-                "learned_profile_version": learned.version if learned else None,
-                "validation_status": learned.validation_status if learned else None,
+                "learned_profile_version": runtime_active["version"] if runtime_active else None,
+                "validation_status": runtime_active["validation_status"] if runtime_active else None,
             },
+            "latest_learned_profile": (
+                {
+                    "version": latest_learned.version,
+                    "validation_status": latest_learned.validation_status,
+                    "model_version": latest_learned.model_version,
+                    "sample_count": latest_learned.sample_count,
+                    "confidence": latest_learned.confidence,
+                    "is_runtime_active": bool(
+                        runtime_active is not None
+                        and runtime_active["id"] == str(latest_learned.id)
+                    ),
+                }
+                if latest_learned is not None
+                else None
+            ),
             "current_state": {
                 "latest_observed_at": _aware(observation.observed_at).isoformat() if observation else None,
                 "stress_0_10": _number(latest_payload.get("stress_0_10")),

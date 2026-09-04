@@ -5,14 +5,21 @@ from starlette.testclient import TestClient
 
 from app.admin_web.main import create_app
 from app.models import (
+    DatasetSnapshot,
     ForecastSnapshot,
     LearnedModelProfile,
+    ModelEvaluationRun,
+    ModelPromotionDecision,
     Participant,
     ParticipantProfile,
     ParticipantSlowState,
     StateObservation,
 )
-from app.repositories import ForecastSnapshotRepository, ObservationRepository
+from app.repositories import (
+    ForecastSnapshotRepository,
+    ObservationRepository,
+    promotion_parameters_hash,
+)
 from app.services.participant_overview import ParticipantOverviewService
 from helpers import memory_database, participant
 from test_admin_web import login, settings
@@ -199,7 +206,7 @@ def test_overview_api_is_participant_bound_and_requires_authentication():
     response = browser.get("/admin/api/participants/P002/overview?through=2026-09-03")
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == "participant-overview.v2"
+    assert response.json()["schema_version"] == "participant-overview.v3"
     assert response.json()["provenance"]["clinical_diagnosis"] is False
 
 
@@ -263,3 +270,249 @@ def test_historical_through_excludes_future_observation():
 
     assert result["current_state"]["stress_0_10"] == 4.2
     assert result["current_state"]["latest_observed_at"].startswith("2026-09-03")
+
+
+def _learned_profile(
+    participant_id,
+    version,
+    status,
+    reactivity,
+    created_at,
+    *,
+    model_selection=None,
+):
+    parameters = {"stress_reactivity_i": reactivity}
+    if model_selection is not None:
+        parameters["model_selection"] = model_selection
+    return LearnedModelProfile(
+        participant_id=participant_id,
+        version=version,
+        parameters_json=parameters,
+        uncertainty_json={"stress_reactivity_i": {"standard_error": 0.1}},
+        source="overview-test",
+        model_version="overview-test.v1",
+        validation_status=status,
+        sample_count=30 + version,
+        day_count=14,
+        confidence=0.8,
+        window_start=date(2026, 8, 15),
+        window_end=date(2026, 8, 31),
+        created_at=created_at,
+    )
+
+
+def test_latest_candidate_does_not_replace_older_runtime_active_profile():
+    database = memory_database()
+    user = participant(database, "P-LATEST-CANDIDATE")
+    with database.session() as session:
+        session.add_all(
+            [
+                _learned_profile(
+                    user.id,
+                    1,
+                    "validated",
+                    0.45,
+                    datetime(2026, 8, 30, tzinfo=timezone.utc),
+                ),
+                _learned_profile(
+                    user.id,
+                    2,
+                    "candidate",
+                    1.35,
+                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+
+    result = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 2)
+    )
+
+    assert result["current_model"]["learned_profile_version"] == 1
+    assert result["latest_learned_profile"]["version"] == 2
+    assert result["latest_learned_profile"]["is_runtime_active"] is False
+    assert result["key_parameters"][0]["estimate"] == 0.45
+
+
+def test_latest_rejected_does_not_replace_older_runtime_active_profile():
+    database = memory_database()
+    user = participant(database, "P-LATEST-REJECTED")
+    with database.session() as session:
+        session.add_all(
+            [
+                _learned_profile(
+                    user.id,
+                    3,
+                    "validated",
+                    0.55,
+                    datetime(2026, 8, 30, tzinfo=timezone.utc),
+                ),
+                _learned_profile(
+                    user.id,
+                    4,
+                    "rejected",
+                    1.45,
+                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+
+    result = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 2)
+    )
+
+    assert result["current_model"]["learned_profile_version"] == 3
+    assert result["latest_learned_profile"]["version"] == 4
+    assert result["latest_learned_profile"]["validation_status"] == "rejected"
+    assert result["latest_learned_profile"]["is_runtime_active"] is False
+    assert result["key_parameters"][0]["estimate"] == 0.55
+
+
+def test_candidate_only_profile_is_not_used_as_runtime_active_fallback():
+    database = memory_database()
+    user = participant(database, "P-CANDIDATE-ONLY")
+    with database.session() as session:
+        session.add(
+            _learned_profile(
+                user.id,
+                1,
+                "candidate",
+                1.2,
+                datetime(2026, 9, 1, tzinfo=timezone.utc),
+            )
+        )
+
+    result = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 2)
+    )
+
+    assert result["current_model"]["learned_profile_version"] is None
+    assert result["current_model"]["validation_status"] is None
+    assert result["latest_learned_profile"]["version"] == 1
+    assert result["latest_learned_profile"]["is_runtime_active"] is False
+    assert result["key_parameters"] == []
+    assert "stress_reactivity" not in {
+        item["key"] for item in result["profile_dimensions"]
+    }
+
+
+def _stage4_promoted_profile(
+    session,
+    participant_id,
+    *,
+    version,
+    profile_created_at,
+    proof_created_at,
+    reactivity,
+):
+    snapshot_id = uuid.uuid4()
+    evaluation_id = uuid.uuid4()
+    decision_id = uuid.uuid4()
+    snapshot = DatasetSnapshot(
+        id=snapshot_id,
+        created_at=proof_created_at,
+        date_start=date(2026, 8, 1),
+        date_end=date(2026, 8, 31),
+        participant_filter={"participant_id": str(participant_id)},
+        observation_cutoff=proof_created_at,
+        calendar_cutoff=proof_created_at,
+        schema_version="mindflow-research-dataset-v7",
+        manifest_json={},
+    )
+    evaluation = ModelEvaluationRun(
+        id=evaluation_id,
+        dataset_snapshot_id=snapshot_id,
+        model_version="overview-stage4.v1",
+        evaluation_mode="offline_replay",
+        evaluation_code_version="overview-test.v1",
+        participant_id=participant_id,
+        metrics_json={},
+        created_at=proof_created_at,
+        status="completed",
+    )
+    parameters = {"stress_reactivity_i": reactivity}
+    decision = ModelPromotionDecision(
+        id=decision_id,
+        model_evaluation_run_id=evaluation_id,
+        dataset_snapshot_id=snapshot_id,
+        participant_id=participant_id,
+        model_family="m1",
+        promotion_gate_version="overview-test-gate.v1",
+        evaluation_code_version="overview-test.v1",
+        parameters_hash=promotion_parameters_hash(parameters),
+        status="retained_from_empirical_evidence",
+        passed_at=proof_created_at,
+        promoted_at=proof_created_at,
+    )
+    profile = _learned_profile(
+        participant_id,
+        version,
+        "validated",
+        reactivity,
+        profile_created_at,
+        model_selection={
+            "active_variant": "m1",
+            "promotion_decision_id": str(decision_id),
+        },
+    )
+    session.add_all([snapshot, evaluation, decision, profile])
+
+
+def test_historical_cutoff_keeps_profile_active_before_later_promotion():
+    database = memory_database()
+    user = participant(database, "P-HISTORICAL-ACTIVE")
+    with database.session() as session:
+        session.add(
+            _learned_profile(
+                user.id,
+                3,
+                "validated",
+                0.5,
+                datetime(2026, 8, 30, tzinfo=timezone.utc),
+            )
+        )
+        _stage4_promoted_profile(
+            session,
+            user.id,
+            version=4,
+            profile_created_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
+            proof_created_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
+            reactivity=1.1,
+        )
+
+    historical = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 1)
+    )
+    current = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 4)
+    )
+
+    assert historical["current_model"]["learned_profile_version"] == 3
+    assert historical["latest_learned_profile"]["version"] == 3
+    assert current["current_model"]["learned_profile_version"] == 4
+
+
+def test_profile_before_cutoff_with_promotion_proof_after_cutoff_fails_closed():
+    database = memory_database()
+    user = participant(database, "P-LATE-PROOF")
+    with database.session() as session:
+        _stage4_promoted_profile(
+            session,
+            user.id,
+            version=1,
+            profile_created_at=datetime(2026, 9, 1, 8, tzinfo=timezone.utc),
+            proof_created_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+            reactivity=1.0,
+        )
+
+    historical = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 1)
+    )
+    current = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 2)
+    )
+
+    assert historical["latest_learned_profile"]["version"] == 1
+    assert historical["current_model"]["learned_profile_version"] is None
+    assert historical["key_parameters"] == []
+    assert current["current_model"]["learned_profile_version"] == 1
