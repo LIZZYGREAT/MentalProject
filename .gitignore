@@ -27,12 +27,20 @@ node_modules/
 dist/
 build/
 tmp/
-docs/
-!docs/
-docs/*
-!docs/MINDFLOW_DEPLOYMENT_RUNBOOK.md
-!docs/CURRENT_ARCHITECTURE.md
-!docs/RESEARCH_DATA_CONTRACT.md
+
+# Public documentation is tracked by default.
+
+# Local/private/generated documentation
+docs/private/
+docs/local/
+docs/_local/
+docs/generated/
+docs/tmp/
+docs/task/
+docs/assets/generated/
+docs/MindFlow_vNext_分阶段开发文档/
+docs/MindFlow_Component_Functional_Contract_and_Audit_Baseline.md
+docs/MindFlow系统架构与压力建模设计.md
 
 backups/
 referrence/*
