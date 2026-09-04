@@ -10,12 +10,38 @@ acceptance_preflight
 require_running_revision_parity
 
 RUNTIME_STOPPED=0
-trap restore_runtime EXIT HUP INT TERM
+BUILD_STARTED=0
+
+prepare_cleanup() {
+  original_status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+
+  if ! restore_runtime; then
+    acceptance_warning "runtime restoration failed during prepare cleanup"
+  fi
+
+  if [ "${BUILD_STARTED:-0}" = "1" ]; then
+    cap_acceptance_build_cache || true
+  fi
+
+  docker system df || acceptance_warning "failed to print docker system df"
+  df -h / || acceptance_warning "failed to print root filesystem usage"
+  docker ps || acceptance_warning "failed to print running containers"
+
+  exit "$original_status"
+}
+
+trap prepare_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Mark restoration as required before stop so a partial stop is recovered.
 RUNTIME_STOPPED=1
 docker compose -f "$COMPOSE_FILE" stop bot admin
 
+BUILD_STARTED=1
 docker compose -f "$COMPOSE_FILE" build acceptance
 
 if ! load_acceptance_image_revision || \
@@ -26,14 +52,5 @@ fi
 
 restore_runtime
 require_restored_revision_parity
-
-ACCEPTANCE_BUILD_CACHE_KEEP=${ACCEPTANCE_BUILD_CACHE_KEEP:-6GB}
-if ! docker builder prune -a -f --keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"; then
-  acceptance_warning "failed to cap Docker builder cache at $ACCEPTANCE_BUILD_CACHE_KEEP"
-fi
-
-docker system df
-df -h /
-docker ps
 
 echo "prepared acceptance image for revision $HOST_REVISION"

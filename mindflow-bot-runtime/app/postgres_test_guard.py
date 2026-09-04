@@ -1,8 +1,9 @@
-"""Fail-closed PostgreSQL target validation shared by destructive DB tests."""
+"""Fail-closed target validation for destructive PostgreSQL tests."""
 
 from __future__ import annotations
 
 import os
+import sys
 
 from sqlalchemy.engine import make_url
 
@@ -55,7 +56,10 @@ def get_test_postgres_connect_timeout_seconds() -> int:
 def validate_test_postgres_url(raw_url: str) -> str:
     if not raw_url.strip():
         raise ValueError("MINDFLOW_TEST_POSTGRES_URL is not configured")
-    parsed = make_url(raw_url)
+    try:
+        parsed = make_url(raw_url)
+    except Exception as exc:
+        raise ValueError("MINDFLOW_TEST_POSTGRES_URL is invalid") from exc
     if not parsed.drivername.startswith("postgresql"):
         raise ValueError("MINDFLOW_TEST_POSTGRES_URL must use PostgreSQL")
     host = (parsed.host or "").strip().lower()
@@ -63,7 +67,10 @@ def validate_test_postgres_url(raw_url: str) -> str:
         safe_host = host or "<missing>"
         raise ValueError(f"refusing PostgreSQL test host: {safe_host}")
     database_name = str(parsed.database or "")
-    if database_name != ALLOWED_EXACT_DATABASE and not database_name.startswith(ALLOWED_DATABASE_PREFIX):
+    if (
+        database_name != ALLOWED_EXACT_DATABASE
+        and not database_name.startswith(ALLOWED_DATABASE_PREFIX)
+    ):
         raise ValueError(
             "refusing PostgreSQL test outside mindflow_acceptance_test or mindflow_test_*"
         )
@@ -88,3 +95,22 @@ def optional_test_postgres_url() -> str | None:
             )
         return None
     return validate_test_postgres_url(raw_url)
+
+
+def validate_configured_test_postgres_target() -> None:
+    configured_test_postgres_url()
+    get_test_postgres_connect_timeout_seconds()
+
+
+def main() -> int:
+    try:
+        validate_configured_test_postgres_target()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print("PostgreSQL test target validation PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

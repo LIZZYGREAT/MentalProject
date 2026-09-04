@@ -161,6 +161,22 @@ require_current_acceptance_image() {
   fi
 }
 
+validate_postgres_target_with_acceptance_image() {
+  docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
+    -e MINDFLOW_TEST_POSTGRES_URL="${MINDFLOW_TEST_POSTGRES_URL:-}" \
+    acceptance \
+    python3 -m app.postgres_test_guard
+}
+
+cap_acceptance_build_cache() {
+  ACCEPTANCE_BUILD_CACHE_KEEP=${ACCEPTANCE_BUILD_CACHE_KEEP:-6GB}
+  if ! docker builder prune -a -f \
+    --keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"; then
+    acceptance_warning "failed to cap Docker builder cache at $ACCEPTANCE_BUILD_CACHE_KEEP"
+    return 1
+  fi
+}
+
 restore_runtime() {
   if [ "${RUNTIME_STOPPED:-0}" = "1" ]; then
     echo "restoring bot and admin after acceptance maintenance window"

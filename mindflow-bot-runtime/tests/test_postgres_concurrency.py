@@ -54,7 +54,7 @@ from app.services.token_service import (
     TokenRefreshService,
     TokenRepository,
 )
-from postgres_test_guard import (
+from app.postgres_test_guard import (
     get_test_postgres_connect_timeout_seconds,
     optional_test_postgres_url,
 )

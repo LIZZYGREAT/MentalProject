@@ -23,7 +23,7 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V7,
     ResearchEvaluationService,
 )
-from postgres_test_guard import (
+from app.postgres_test_guard import (
     get_test_postgres_connect_timeout_seconds,
     optional_test_postgres_url,
 )

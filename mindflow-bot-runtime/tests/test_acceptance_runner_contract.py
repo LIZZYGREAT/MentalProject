@@ -45,32 +45,66 @@ def test_common_reads_acceptance_revision_from_image_metadata():
     assert "run --rm" not in image_helper
 
 
-def test_prepare_runner_orders_preflight_maintenance_build_restore_and_cache_cap():
+def test_common_provides_cache_cap_and_lightweight_postgres_validation():
+    source = COMMON.read_text(encoding="utf-8")
+
+    assert "cap_acceptance_build_cache()" in source
+    assert "ACCEPTANCE_BUILD_CACHE_KEEP:-6GB" in source
+    assert "docker builder prune -a -f" in source
+    assert '--keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"' in source
+    assert "docker system prune" not in source
+    assert "volume prune" not in source
+
+    validator = source.split(
+        "validate_postgres_target_with_acceptance_image()", 1
+    )[1].split("\n}", 1)[0]
+    assert "run --rm --no-deps" in validator
+    assert "python3 -m app.postgres_test_guard" in validator
+    assert "pytest" not in validator
+
+
+def test_prepare_runner_orders_preflight_trap_stop_and_build():
     source = PREPARE.read_text(encoding="utf-8")
 
     clean = source.index("require_clean_working_tree")
     revision = source.index("load_host_revision", clean)
     preflight = source.index("acceptance_preflight", revision)
     running_parity = source.index("require_running_revision_parity", preflight)
-    trap = source.index("trap restore_runtime EXIT HUP INT TERM", running_parity)
+    trap = source.index("trap prepare_cleanup EXIT", running_parity)
     mark_stopped = source.index("RUNTIME_STOPPED=1", trap)
     stop = source.index("stop bot admin", mark_stopped)
-    build = source.index("build acceptance", stop)
+    build_started = source.index("BUILD_STARTED=1", stop)
+    build = source.index("build acceptance", build_started)
     image_parity = source.index("acceptance image revision mismatch", build)
     restore = source.index("\nrestore_runtime\n", image_parity)
     restored_parity = source.index("require_restored_revision_parity", restore)
-    cache_prune = source.index("docker builder prune", restored_parity)
 
     assert clean < revision < preflight < running_parity < trap
-    assert trap < mark_stopped < stop < build < image_parity
-    assert image_parity < restore < restored_parity < cache_prune
-    assert "ACCEPTANCE_BUILD_CACHE_KEEP:-6GB" in source
-    assert '--keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"' in source
-    assert "docker system prune" not in source
-    assert "volume prune" not in source
-    assert "docker system df" in source
-    assert "df -h /" in source
-    assert "docker ps" in source
+    assert trap < mark_stopped < stop < build_started < build < image_parity
+    assert image_parity < restore < restored_parity
+
+
+def test_prepare_exit_cleanup_restores_then_caps_failed_build_cache_and_preserves_status():
+    source = PREPARE.read_text(encoding="utf-8")
+    cleanup = source.split("prepare_cleanup() {", 1)[1].split("\n}", 1)[0]
+
+    save_status = cleanup.index("original_status=$?")
+    disable_traps = cleanup.index("trap - EXIT HUP INT TERM", save_status)
+    restore = cleanup.index("restore_runtime", disable_traps)
+    build_guard = cleanup.index('BUILD_STARTED:-0}" = "1"', restore)
+    cache_cap = cleanup.index("cap_acceptance_build_cache", build_guard)
+    docker_df = cleanup.index("docker system df", cache_cap)
+    root_df = cleanup.index("df -h /", docker_df)
+    docker_ps = cleanup.index("docker ps", root_df)
+    preserved_exit = cleanup.index('exit "$original_status"', docker_ps)
+
+    assert save_status < disable_traps < restore < build_guard < cache_cap
+    assert cache_cap < docker_df < root_df < docker_ps < preserved_exit
+    assert "BUILD_STARTED=1" in source
+    assert "cap_acceptance_build_cache || true" in cleanup
+    assert "trap 'exit 129' HUP" in source
+    assert "trap 'exit 130' INT" in source
+    assert "trap 'exit 143' TERM" in source
 
 
 def test_full_runner_never_builds_and_restores_after_running_acceptance():
@@ -79,19 +113,21 @@ def test_full_runner_never_builds_and_restores_after_running_acceptance():
     assert "build acceptance" not in source
     assert "python3 -m pip install" not in source
     assert "require_clean_working_tree" in source
-    assert "MINDFLOW_TEST_POSTGRES_URL is required for acceptance" in source
-    assert "mindflow_acceptance_test|mindflow_test_*" in source
     assert "require_running_revision_parity" in source
 
     preflight = source.index("acceptance_preflight")
     image_gate = source.index("require_current_acceptance_image", preflight)
-    trap = source.index("trap restore_runtime EXIT HUP INT TERM", image_gate)
+    postgres_validation = source.index(
+        "validate_postgres_target_with_acceptance_image", image_gate
+    )
+    trap = source.index("trap restore_runtime EXIT HUP INT TERM", postgres_validation)
     stop = source.index("stop bot admin", trap)
     acceptance = source.index("run --rm --no-deps", stop)
     restore = source.index("\nrestore_runtime\n", acceptance)
     restored_parity = source.index("require_restored_revision_parity", restore)
 
-    assert preflight < image_gate < trap < stop < acceptance < restore < restored_parity
+    assert preflight < image_gate < postgres_validation < trap
+    assert trap < stop < acceptance < restore < restored_parity
     assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
     assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
 

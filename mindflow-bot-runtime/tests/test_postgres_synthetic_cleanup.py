@@ -22,7 +22,7 @@ from app.models import (
     WarningSchedule,
 )
 from app.synthetic_data import CleanupPlanError, audit_synthetic_data, cleanup_from_plan
-from postgres_test_guard import (
+from app.postgres_test_guard import (
     get_test_postgres_connect_timeout_seconds,
     optional_test_postgres_url,
 )

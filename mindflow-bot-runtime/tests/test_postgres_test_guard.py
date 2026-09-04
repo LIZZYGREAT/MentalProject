@@ -1,9 +1,11 @@
 import pytest
 
-from postgres_test_guard import (
+from app.postgres_test_guard import (
     configured_test_postgres_url,
     get_test_postgres_connect_timeout_seconds,
+    main,
     optional_test_postgres_url,
+    validate_configured_test_postgres_target,
     validate_test_postgres_url,
 )
 
@@ -97,3 +99,28 @@ def test_postgres_connect_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS", value)
     with pytest.raises(ValueError, match="between 1 and 30"):
         get_test_postgres_connect_timeout_seconds()
+
+
+def test_full_target_validation_checks_host_and_timeout_before_success(monkeypatch):
+    monkeypatch.setenv(
+        "MINDFLOW_TEST_POSTGRES_URL",
+        "postgresql://tester:secret@localhost/mindflow_test_ci",
+    )
+    monkeypatch.setenv("MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="between 1 and 30"):
+        validate_configured_test_postgres_target()
+
+
+def test_validator_cli_rejects_production_host_without_password_leak(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv(
+        "MINDFLOW_TEST_POSTGRES_URL",
+        "postgresql://tester:super-secret@production-db.internal/mindflow_test_ci",
+    )
+
+    assert main() == 2
+    captured = capsys.readouterr()
+    assert "refusing PostgreSQL test host" in captured.err
+    assert "super-secret" not in captured.err
