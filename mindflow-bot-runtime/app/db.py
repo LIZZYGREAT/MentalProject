@@ -16,11 +16,18 @@ class Base(DeclarativeBase):
     pass
 
 
-def build_engine(database_url: str, *, echo: bool = False) -> Engine:
+def build_engine(
+    database_url: str,
+    *,
+    echo: bool = False,
+    connect_timeout_seconds: int | None = None,
+) -> Engine:
     if database_url.startswith("postgresql://"):
         database_url = "postgresql+psycopg://" + database_url[len("postgresql://") :]
     options = {"pool_pre_ping": True, "echo": echo, "future": True}
-    if database_url in {"sqlite://", "sqlite:///:memory:"}:
+    if database_url.startswith("postgresql+") and connect_timeout_seconds is not None:
+        options["connect_args"] = {"connect_timeout": connect_timeout_seconds}
+    elif database_url in {"sqlite://", "sqlite:///:memory:"}:
         options.update(
             {
                 "connect_args": {"check_same_thread": False},

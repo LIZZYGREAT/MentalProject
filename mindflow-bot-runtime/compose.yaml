@@ -5,6 +5,7 @@ services:
       dockerfile: mindflow-bot-runtime/Dockerfile
       args:
         BUILD_REVISION: ${BUILD_REVISION:-development}
+        INSTALL_DEV_DEPS: "0"
     env_file:
       - .env
     depends_on:
@@ -30,6 +31,7 @@ services:
       dockerfile: mindflow-bot-runtime/Dockerfile
       args:
         BUILD_REVISION: ${BUILD_REVISION:-development}
+        INSTALL_DEV_DEPS: "0"
     env_file:
       - .env
     depends_on:
@@ -56,17 +58,21 @@ services:
 
   acceptance:
     profiles: ["acceptance"]
+    image: ${ACCEPTANCE_IMAGE_NAME:-mindflow-acceptance:local}
     build:
       context: ..
       dockerfile: mindflow-bot-runtime/Dockerfile
       args:
         BUILD_REVISION: ${BUILD_REVISION:-development}
+        INSTALL_DEV_DEPS: "1"
     env_file:
       - .env
     environment:
       DATABASE_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}
       MINDFLOW_TEST_POSTGRES_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}
       MINDFLOW_REQUIRE_POSTGRES_TESTS: "1"
+      MINDFLOW_TEST_POSTGRES_ALLOWED_HOSTS: ${MINDFLOW_TEST_POSTGRES_ALLOWED_HOSTS:-postgres,localhost,127.0.0.1,::1}
+      MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: ${MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS:-5}
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,13 +90,6 @@ services:
         test -f /srv/docs/CURRENT_ARCHITECTURE.md
         test -f /srv/claude-runtime/plugins/mindflow-care/skills/mental-health-care/SKILL.md
 
-        python3 -m pip install \
-          --quiet \
-          --no-cache-dir \
-          --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-          --trusted-host pypi.tuna.tsinghua.edu.cn \
-          -r /srv/runtime/requirements-dev.txt
-
         exec python3 -m pytest -q /srv/runtime/tests
     restart: "no"
     cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}
@@ -104,6 +103,7 @@ services:
       dockerfile: mindflow-bot-runtime/Dockerfile
       args:
         BUILD_REVISION: ${BUILD_REVISION:-development}
+        INSTALL_DEV_DEPS: "0"
     env_file:
       - .env
     depends_on:

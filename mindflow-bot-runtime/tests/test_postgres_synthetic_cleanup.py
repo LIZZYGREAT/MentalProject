@@ -22,7 +22,10 @@ from app.models import (
     WarningSchedule,
 )
 from app.synthetic_data import CleanupPlanError, audit_synthetic_data, cleanup_from_plan
-from postgres_test_guard import optional_test_postgres_url
+from postgres_test_guard import (
+    get_test_postgres_connect_timeout_seconds,
+    optional_test_postgres_url,
+)
 
 
 @pytest.fixture
@@ -34,7 +37,10 @@ def postgres_cleanup_database():
     if raw_url is None:
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
     schema = f"mindflow_cleanup_{uuid.uuid4().hex}"
-    root_engine = build_engine(raw_url)
+    root_engine = build_engine(
+        raw_url,
+        connect_timeout_seconds=get_test_postgres_connect_timeout_seconds(),
+    )
     with root_engine.begin() as connection:
         connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     scoped_engine = root_engine.execution_options(schema_translate_map={None: schema})

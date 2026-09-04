@@ -1,5 +1,6 @@
 FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
 ARG BUILD_REVISION=development
+ARG INSTALL_DEV_DEPS=0
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/srv/runtime:/srv/project \
@@ -10,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt
+COPY mindflow-bot-runtime/requirements-dev.txt ./requirements-dev.txt
 RUN for source_file in \
       /etc/apt/sources.list.d/debian.sources \
       /etc/apt/sources.list; do \
@@ -28,11 +30,16 @@ RUN for source_file in \
       fonts-noto-cjk \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
-RUN pip install \
-    --no-cache-dir \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
-    -r requirements.txt
+RUN if [ "$INSTALL_DEV_DEPS" = "1" ]; then \
+      REQUIREMENTS_FILE=requirements-dev.txt; \
+    else \
+      REQUIREMENTS_FILE=requirements.txt; \
+    fi \
+ && pip install \
+      --no-cache-dir \
+      --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+      --trusted-host pypi.tuna.tsinghua.edu.cn \
+      -r "$REQUIREMENTS_FILE"
 RUN python -c "import claude_agent_sdk; print('claude-agent-sdk import ok')"
 
 COPY mindflow-bot-runtime/ /srv/runtime/

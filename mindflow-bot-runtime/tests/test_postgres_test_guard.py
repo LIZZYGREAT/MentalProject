@@ -2,6 +2,7 @@ import pytest
 
 from postgres_test_guard import (
     configured_test_postgres_url,
+    get_test_postgres_connect_timeout_seconds,
     optional_test_postgres_url,
     validate_test_postgres_url,
 )
@@ -13,6 +14,40 @@ from postgres_test_guard import (
 )
 def test_postgres_guard_accepts_only_documented_test_names(database_name):
     url = f"postgresql+psycopg://tester:secret@localhost/{database_name}"
+    assert validate_test_postgres_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["postgres", "localhost", "127.0.0.1", "[::1]"],
+)
+def test_postgres_guard_accepts_default_allowed_hosts(host):
+    url = f"postgresql+psycopg://tester:secret@{host}/mindflow_test_ci"
+    assert validate_test_postgres_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["production-db.internal", "db.example.com", "10.0.0.99"],
+)
+def test_postgres_guard_rejects_unapproved_hosts_without_leaking_password(host):
+    url = f"postgresql://tester:super-secret@{host}/mindflow_test_ci"
+    with pytest.raises(ValueError, match="refusing PostgreSQL test host") as exc_info:
+        validate_test_postgres_url(url)
+    assert "super-secret" not in str(exc_info.value)
+
+
+def test_postgres_guard_rejects_missing_host():
+    with pytest.raises(ValueError, match="refusing PostgreSQL test host"):
+        validate_test_postgres_url("postgresql:///mindflow_test_ci")
+
+
+def test_postgres_guard_allows_explicit_additional_host(monkeypatch):
+    monkeypatch.setenv(
+        "MINDFLOW_TEST_POSTGRES_ALLOWED_HOSTS",
+        "disposable-db.internal",
+    )
+    url = "postgresql://tester:secret@disposable-db.internal/mindflow_test_ci"
     assert validate_test_postgres_url(url) == url
 
 
@@ -47,3 +82,18 @@ def test_postgres_guard_can_skip_locally_but_fails_closed_for_acceptance(monkeyp
     monkeypatch.setenv("MINDFLOW_REQUIRE_POSTGRES_TESTS", "1")
     with pytest.raises(ValueError, match="required"):
         optional_test_postgres_url()
+
+
+def test_postgres_connect_timeout_defaults_to_five_and_accepts_override(monkeypatch):
+    monkeypatch.delenv("MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS", raising=False)
+    assert get_test_postgres_connect_timeout_seconds() == 5
+
+    monkeypatch.setenv("MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS", "12")
+    assert get_test_postgres_connect_timeout_seconds() == 12
+
+
+@pytest.mark.parametrize("value", ["", "zero", "0", "31", "-1", "1.5"])
+def test_postgres_connect_timeout_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError, match="between 1 and 30"):
+        get_test_postgres_connect_timeout_seconds()

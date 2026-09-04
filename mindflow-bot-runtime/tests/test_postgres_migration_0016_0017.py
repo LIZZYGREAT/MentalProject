@@ -23,7 +23,10 @@ from app.services.research_evaluation import (
     DATASET_SCHEMA_V7,
     ResearchEvaluationService,
 )
-from postgres_test_guard import optional_test_postgres_url
+from postgres_test_guard import (
+    get_test_postgres_connect_timeout_seconds,
+    optional_test_postgres_url,
+)
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
@@ -74,7 +77,10 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
     existing_review_id = uuid.uuid4()
     optional_review_id = uuid.uuid4()
     now = datetime(2030, 1, 15, 2, 0, tzinfo=timezone.utc)
-    engine = build_engine(raw_url)
+    engine = build_engine(
+        raw_url,
+        connect_timeout_seconds=get_test_postgres_connect_timeout_seconds(),
+    )
     config = Config(str(RUNTIME_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(RUNTIME_ROOT / "migrations"))
 

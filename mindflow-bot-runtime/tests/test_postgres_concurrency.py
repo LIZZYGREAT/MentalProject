@@ -54,7 +54,10 @@ from app.services.token_service import (
     TokenRefreshService,
     TokenRepository,
 )
-from postgres_test_guard import optional_test_postgres_url
+from postgres_test_guard import (
+    get_test_postgres_connect_timeout_seconds,
+    optional_test_postgres_url,
+)
 
 
 @pytest.fixture
@@ -67,7 +70,10 @@ def postgres_database():
         pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
 
     schema = f"mindflow_test_{uuid.uuid4().hex}"
-    root_engine = build_engine(raw_url)
+    root_engine = build_engine(
+        raw_url,
+        connect_timeout_seconds=get_test_postgres_connect_timeout_seconds(),
+    )
     with root_engine.begin() as connection:
         connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     scoped_engine = root_engine.execution_options(

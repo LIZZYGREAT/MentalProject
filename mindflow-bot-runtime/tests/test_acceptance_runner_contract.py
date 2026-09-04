@@ -1,118 +1,144 @@
 from pathlib import Path
 
 
-RUNNER = (
-    Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "run_acceptance_tests.sh"
-)
-DEPLOY = RUNNER.parent / "deploy_runtime.sh"
-COMPOSE = RUNNER.parents[1] / "compose.yaml"
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = RUNTIME_ROOT / "scripts"
+COMMON = SCRIPTS / "acceptance_common.sh"
+PREPARE = SCRIPTS / "prepare_acceptance_image.sh"
+RUNNER = SCRIPTS / "run_acceptance_tests.sh"
+DEPLOY = SCRIPTS / "deploy_runtime.sh"
+COMPOSE = RUNTIME_ROOT / "compose.yaml"
+DOCKERFILE = RUNTIME_ROOT / "Dockerfile"
+DEV_REQUIREMENTS = RUNTIME_ROOT / "requirements-dev.txt"
+ENV_EXAMPLE = RUNTIME_ROOT / ".env.example"
 
 
-def test_acceptance_runner_requires_clean_tree_and_running_revision_parity():
-    source = RUNNER.read_text(encoding="utf-8")
+def test_common_preflight_checks_docker_builder_recent_fatals_and_resources():
+    source = COMMON.read_text(encoding="utf-8")
 
-    assert "ALLOW_DIRTY_ACCEPTANCE" in source
-    assert "status --porcelain" in source
-    assert "working tree is dirty; commit/push before acceptance" in source
-    assert "exec -T bot" in source
-    assert "exec -T admin" in source
-    assert "RUNNING_BOT_REVISION" in source
-    assert "RUNNING_ADMIN_REVISION" in source
-    assert "ACCEPTANCE_IMAGE_REVISION" in source
-    assert "run --rm --no-deps acceptance" in source
-    assert "run --rm --no-deps bot" not in source
-    assert 'BUILD_REVISION="$HOST_REVISION"' in source
-    assert "export BUILD_REVISION" in source
-    assert 'build acceptance' in source
-
-
-def test_acceptance_runner_owns_maintenance_window_and_restores_runtime():
-    source = RUNNER.read_text(encoding="utf-8")
-
-    preflight_bot = source.index("RUNNING_BOT_REVISION=$(docker compose")
-    preflight_admin = source.index("RUNNING_ADMIN_REVISION=$(docker compose")
-    runtime_parity = source.index("revision mismatch before maintenance")
-    trap = source.index("trap restore_runtime EXIT HUP INT TERM")
-    mark_stopped = source.index("RUNTIME_STOPPED=1", trap)
-    stop = source.index('stop bot admin', mark_stopped)
-    build = source.index('build acceptance', stop)
-    image_revision = source.index("ACCEPTANCE_IMAGE_REVISION=$(", build)
-    image_parity = source.index("acceptance image revision mismatch", image_revision)
-    acceptance = source.index("-e MINDFLOW_REQUIRE_POSTGRES_TESTS=1", image_parity)
-    restore = source.index("\nrestore_runtime\n", acceptance)
-    restored_bot = source.index("RESTORED_BOT_REVISION=$(", restore)
-    restored_admin = source.index("RESTORED_ADMIN_REVISION=$(", restored_bot)
-    restored_parity = source.index("revision mismatch after maintenance", restored_admin)
-
-    assert preflight_bot < preflight_admin < runtime_parity < trap
-    assert trap < mark_stopped < stop < build
-    assert build < image_revision < image_parity < acceptance < restore
-    assert restore < restored_bot < restored_admin < restored_parity
-
-    restore_body = source.split("restore_runtime() {", 1)[1].split("\n}\n", 1)[0]
-    assert 'if [ "$RUNTIME_STOPPED" = "1" ]' in restore_body
-    assert 'up -d --no-deps bot admin' in restore_body
-    assert "RUNTIME_STOPPED=0" in restore_body
-    assert "read_restored_revision()" in source
-    assert 'while [ "$attempts" -lt 12 ]' in source
+    assert "docker info" in source
+    assert "docker buildx inspect default" in source
+    assert "Status:[[:space:]]*running" in source
+    assert 'journalctl -u docker -b --since "10 minutes ago" --no-pager' in source
+    assert "only one connection allowed" in source
+    assert "healthcheck failed fatally" in source
+    assert "session healthcheck failed fatally" in source
+    assert "Docker/BuildKit unhealthy; refusing acceptance operation" in source
+    assert "ACCEPTANCE_MIN_FREE_DISK_MB:-10240" in source
+    assert "df -Pk /" in source
+    assert "ACCEPTANCE_MIN_AVAILABLE_MEMORY_MB:-512" in source
+    assert "/^MemAvailable:/" in source
+    assert "MemFree" not in source
 
 
-def test_acceptance_runner_delegates_test_setup_to_compose_with_postgres_guard():
-    source = RUNNER.read_text(encoding="utf-8")
+def test_common_reads_acceptance_revision_from_image_metadata():
+    source = COMMON.read_text(encoding="utf-8")
 
-    assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
-    assert "MINDFLOW_TEST_POSTGRES_URL is required for acceptance" in source
-    assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
-    assert "mindflow_acceptance_test|mindflow_test_*" in source
-    assert "refusing acceptance tests outside" in source
-    assert "--user root" not in source
-    assert "python3 -m pip install" not in source
-    assert "pytest==" not in source
-    assert "pytest-asyncio==" not in source
-    assert '-v "$RUNTIME_ROOT/tests:' not in source
-    assert '-v "$PROJECT_ROOT/claude-runtime:' not in source
-    assert '-v "$PROJECT_ROOT/docs:' not in source
-
-
-def test_acceptance_service_is_isolated_from_production_bot_limits_and_state():
-    source = COMPOSE.read_text(encoding="utf-8")
-    acceptance = source.split("\n  acceptance:\n", 1)[1].split(
-        "\n  admin:\n", 1
+    assert "docker image inspect" in source
+    assert "BUILD_REVISION=" in source
+    assert "require_current_acceptance_image" in source
+    assert "acceptance image missing or stale" in source
+    assert "prepare_acceptance_image.sh first" in source
+    image_helper = source.split("load_acceptance_image_revision()", 1)[1].split(
+        "\n}", 1
     )[0]
+    assert "run --rm" not in image_helper
 
-    assert 'profiles: ["acceptance"]' in acceptance
-    assert "context: .." in acceptance
-    assert "dockerfile: mindflow-bot-runtime/Dockerfile" in acceptance
-    assert "BUILD_REVISION: ${BUILD_REVISION:-development}" in acceptance
-    assert "env_file:" in acceptance
-    assert "DATABASE_URL: ${MINDFLOW_TEST_POSTGRES_URL:-}" in acceptance
-    assert "MINDFLOW_REQUIRE_POSTGRES_TESTS: \"1\"" in acceptance
-    assert "postgres:" in acceptance
-    assert "migrate:" not in acceptance
-    assert "claude-state-init:" not in acceptance
-    assert "ports:" not in acceptance
-    assert "user: root" in acceptance
-    assert "volumes:" in acceptance
-    assert "./tests:/srv/runtime/tests:ro" in acceptance
-    assert "../docs:/srv/docs:ro" in acceptance
-    assert "../claude-runtime:/srv/claude-runtime:ro" in acceptance
-    assert "claude_state" not in acceptance
+
+def test_prepare_runner_orders_preflight_maintenance_build_restore_and_cache_cap():
+    source = PREPARE.read_text(encoding="utf-8")
+
+    clean = source.index("require_clean_working_tree")
+    revision = source.index("load_host_revision", clean)
+    preflight = source.index("acceptance_preflight", revision)
+    running_parity = source.index("require_running_revision_parity", preflight)
+    trap = source.index("trap restore_runtime EXIT HUP INT TERM", running_parity)
+    mark_stopped = source.index("RUNTIME_STOPPED=1", trap)
+    stop = source.index("stop bot admin", mark_stopped)
+    build = source.index("build acceptance", stop)
+    image_parity = source.index("acceptance image revision mismatch", build)
+    restore = source.index("\nrestore_runtime\n", image_parity)
+    restored_parity = source.index("require_restored_revision_parity", restore)
+    cache_prune = source.index("docker builder prune", restored_parity)
+
+    assert clean < revision < preflight < running_parity < trap
+    assert trap < mark_stopped < stop < build < image_parity
+    assert image_parity < restore < restored_parity < cache_prune
+    assert "ACCEPTANCE_BUILD_CACHE_KEEP:-6GB" in source
+    assert '--keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"' in source
+    assert "docker system prune" not in source
+    assert "volume prune" not in source
+    assert "docker system df" in source
+    assert "df -h /" in source
+    assert "docker ps" in source
+
+
+def test_full_runner_never_builds_and_restores_after_running_acceptance():
+    source = RUNNER.read_text(encoding="utf-8")
+
+    assert "build acceptance" not in source
+    assert "python3 -m pip install" not in source
+    assert "require_clean_working_tree" in source
+    assert "MINDFLOW_TEST_POSTGRES_URL is required for acceptance" in source
+    assert "mindflow_acceptance_test|mindflow_test_*" in source
+    assert "require_running_revision_parity" in source
+
+    preflight = source.index("acceptance_preflight")
+    image_gate = source.index("require_current_acceptance_image", preflight)
+    trap = source.index("trap restore_runtime EXIT HUP INT TERM", image_gate)
+    stop = source.index("stop bot admin", trap)
+    acceptance = source.index("run --rm --no-deps", stop)
+    restore = source.index("\nrestore_runtime\n", acceptance)
+    restored_parity = source.index("require_restored_revision_parity", restore)
+
+    assert preflight < image_gate < trap < stop < acceptance < restore < restored_parity
+    assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
+    assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
+
+
+def test_acceptance_image_bakes_dev_dependencies_and_runtime_only_runs_pytest():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dev_requirements = DEV_REQUIREMENTS.read_text(encoding="utf-8")
+    compose = COMPOSE.read_text(encoding="utf-8")
+    acceptance = compose.split("\n  acceptance:\n", 1)[1].split("\n  admin:\n", 1)[0]
+
+    assert "ARG INSTALL_DEV_DEPS=0" in dockerfile
+    assert "requirements-dev.txt" in dockerfile
+    assert "pytest==8.4.1" in dev_requirements
+    assert "pytest-asyncio==1.1.0" in dev_requirements
+    assert 'INSTALL_DEV_DEPS: "1"' in acceptance
+    assert "python3 -m pip install" not in acceptance
+    assert "apt-get" not in acceptance
+    assert "exec python3 -m pytest -q /srv/runtime/tests" in acceptance
     assert "test -f /srv/runtime/tests/test_postgres_test_guard.py" in acceptance
     assert "test -f /srv/docs/CURRENT_ARCHITECTURE.md" in acceptance
     assert (
         "test -f /srv/claude-runtime/plugins/mindflow-care/skills/"
         "mental-health-care/SKILL.md"
     ) in acceptance
-    assert "-r /srv/runtime/requirements-dev.txt" in acceptance
-    assert "exec python3 -m pytest -q /srv/runtime/tests" in acceptance
     assert "cpus: ${ACCEPTANCE_CPU_LIMIT:-1.5}" in acceptance
     assert "mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1024m}" in acceptance
     assert "memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-1536m}" in acceptance
     assert "pids_limit: ${ACCEPTANCE_PID_LIMIT:-256}" in acceptance
-    assert "${BOT_CPU_LIMIT" not in acceptance
-    assert "${BOT_MEMORY_LIMIT" not in acceptance
+
+
+def test_acceptance_environment_example_documents_safety_controls():
+    source = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    assert "ACCEPTANCE_MIN_FREE_DISK_MB=10240" in source
+    assert "ACCEPTANCE_MIN_AVAILABLE_MEMORY_MB=512" in source
+    assert "ACCEPTANCE_BUILD_CACHE_KEEP=6GB" in source
+    assert "ACCEPTANCE_CPU_LIMIT=1.5" in source
+    assert "ACCEPTANCE_MEMORY_LIMIT=1024m" in source
+    assert "ACCEPTANCE_MEMORY_SWAP_LIMIT=1536m" in source
+    assert "ACCEPTANCE_PID_LIMIT=256" in source
+    assert (
+        "MINDFLOW_TEST_POSTGRES_ALLOWED_HOSTS=postgres,localhost,127.0.0.1,::1"
+        in source
+    )
+    assert "MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS=5" in source
+    assert "postgres_data" in source
+    assert "production DATABASE_URL" in source
 
 
 def test_deploy_runtime_injects_head_migrates_then_recreates_services():
@@ -122,11 +148,11 @@ def test_deploy_runtime_injects_head_migrates_then_recreates_services():
     assert "commit/push before deployment" in source
     assert 'BUILD_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)' in source
     assert "export BUILD_REVISION" in source
-    build = source.index('build migrate bot admin')
-    postgres = source.index('up -d postgres')
-    state_init = source.index('run --rm --no-deps claude-state-init')
-    migrate = source.index('run --rm --no-deps migrate')
-    recreate = source.index('up -d --no-deps --force-recreate bot admin')
+    build = source.index("build migrate bot admin")
+    postgres = source.index("up -d postgres")
+    state_init = source.index("run --rm --no-deps claude-state-init")
+    migrate = source.index("run --rm --no-deps migrate")
+    recreate = source.index("up -d --no-deps --force-recreate bot admin")
     assert build < postgres < state_init < migrate < recreate
     assert "postgres did not become ready for deployment" in source
     assert "RUNNING_BOT_REVISION" in source
