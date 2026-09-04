@@ -5,6 +5,7 @@ import pytest
 from PIL import Image
 from starlette.testclient import TestClient
 
+from app.services import workload_diagnostic_renderer as renderer_module
 from app.admin_web.main import create_app
 from app.services.research_evaluation import ResearchEvaluationService
 from app.services.workload_diagnostic_renderer import (
@@ -88,21 +89,113 @@ def test_forecast_plus_two_ema_renders_residual_png():
 
 
 def test_first_and_repeated_render_use_a_font_with_required_chinese_glyphs():
-    from matplotlib import font_manager
     from matplotlib.ft2font import FT2Font
 
     renderer = WorkloadDiagnosticRenderer()
     first = renderer.demand_vs_forecast(_payload())
     repeated = renderer.demand_vs_forecast(_payload())
-    _, font_name = renderer._pyplot()
-    font_path = font_manager.findfont(
-        font_manager.FontProperties(family=font_name), fallback_to_default=False
-    )
+    _, font_name, font_path = renderer._pyplot()
     glyphs = FT2Font(font_path).get_charmap()
 
     assert first.startswith(b"\x89PNG")
     assert repeated.startswith(b"\x89PNG")
-    assert all(ord(character) in glyphs for character in "任务负荷预测压力观测样本不足")
+    assert font_name != "DejaVu Sans"
+    assert all(
+        ord(character) in glyphs
+        for character in renderer_module._REQUIRED_CHART_GLYPHS
+    )
+
+
+def test_font_resolution_skips_existing_candidate_without_required_glyphs(
+    monkeypatch, tmp_path
+):
+    unsupported = tmp_path / "candidate-a.ttf"
+    supported = tmp_path / "candidate-b.ttf"
+    unsupported.touch()
+    supported.touch()
+
+    class Registry:
+        def __init__(self):
+            self.added = []
+
+        def addfont(self, path):
+            self.added.append(path)
+
+    registry = Registry()
+
+    class FontProperties:
+        def __init__(self, *, fname=None, family=None):
+            self.fname = fname
+            self.family = family
+
+        def get_name(self):
+            return Path(self.fname).stem
+
+    class FakeFontManager:
+        fontManager = registry
+
+        @staticmethod
+        def findfont(*_args, **_kwargs):
+            raise ValueError("missing")
+
+    FakeFontManager.FontProperties = FontProperties
+
+    monkeypatch.setattr(
+        renderer_module, "_CJK_FONT_PATHS", (unsupported, supported)
+    )
+    monkeypatch.setattr(renderer_module, "_PREFERRED_CJK_FONT_NAMES", ())
+    monkeypatch.setattr(
+        WorkloadDiagnosticRenderer,
+        "_font_supports",
+        staticmethod(lambda path, _required: Path(path) == supported),
+    )
+
+    name, path = WorkloadDiagnosticRenderer._resolve_font(FakeFontManager)
+
+    assert name == "candidate-b"
+    assert path == str(supported.resolve())
+    assert registry.added == [str(supported)]
+
+
+def test_font_resolution_fails_when_no_candidate_has_required_glyphs(
+    monkeypatch, tmp_path
+):
+    candidate = tmp_path / "candidate.ttf"
+    candidate.touch()
+
+    class Registry:
+        @staticmethod
+        def addfont(_path):
+            raise AssertionError("unsupported font must not be registered")
+
+    class FontProperties:
+        def __init__(self, *, fname=None, family=None):
+            self.fname = fname
+            self.family = family
+
+    class FakeFontManager:
+        fontManager = Registry()
+
+        @staticmethod
+        def findfont(*_args, **_kwargs):
+            raise ValueError("missing")
+
+    FakeFontManager.FontProperties = FontProperties
+
+    monkeypatch.setattr(renderer_module, "_CJK_FONT_PATHS", (candidate,))
+    monkeypatch.setattr(
+        renderer_module, "_PREFERRED_CJK_FONT_NAMES", ("Missing CJK",)
+    )
+    monkeypatch.setattr(
+        WorkloadDiagnosticRenderer,
+        "_font_supports",
+        staticmethod(lambda _path, _required: False),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="workload_diagnostic_cjk_font_unavailable"
+    ):
+        WorkloadDiagnosticRenderer._resolve_font(FakeFontManager)
 
 
 def test_renderer_initialization_prewarms_font_cache_before_first_request():

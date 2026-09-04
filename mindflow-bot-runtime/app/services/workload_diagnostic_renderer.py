@@ -16,11 +16,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _CJK_FONT_PATHS = (
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
     Path("C:/Windows/Fonts/msyh.ttc"),
     Path("C:/Windows/Fonts/msyhbd.ttc"),
     Path("C:/Windows/Fonts/simhei.ttf"),
-    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
 )
 _PREFERRED_CJK_FONT_NAMES = (
     "Noto Sans CJK SC",
@@ -29,6 +29,10 @@ _PREFERRED_CJK_FONT_NAMES = (
     "Microsoft YaHei",
     "Microsoft YaHei UI",
     "SimHei",
+)
+_REQUIRED_CHART_GLYPHS = (
+    "任务负荷预测压力观测样本不足"
+    "日期时间当前实际残差参与者连续"
 )
 
 _INK = "#29332f"
@@ -70,20 +74,49 @@ class WorkloadDiagnosticRenderer:
         self._pyplot()
 
     @staticmethod
-    def _resolve_font_name(font_manager) -> str:
-        available = {font.name for font in font_manager.fontManager.ttflist}
-        for name in _PREFERRED_CJK_FONT_NAMES:
-            if name in available:
-                return name
+    def _font_supports(path: str | Path, required: str) -> bool:
+        from matplotlib.ft2font import FT2Font
+
+        try:
+            glyphs = FT2Font(str(path)).get_charmap()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return all(ord(character) in glyphs for character in required)
+
+    @staticmethod
+    def _resolve_font(font_manager) -> tuple[str, str]:
         for path in _CJK_FONT_PATHS:
-            if not path.exists():
+            if not path.exists() or not WorkloadDiagnosticRenderer._font_supports(
+                path, _REQUIRED_CHART_GLYPHS
+            ):
                 continue
             try:
                 font_manager.fontManager.addfont(str(path))
-                return str(font_manager.FontProperties(fname=str(path)).get_name())
+                name = str(font_manager.FontProperties(fname=str(path)).get_name())
+                return name, str(path.resolve())
             except (OSError, RuntimeError, ValueError):
                 continue
-        return "DejaVu Sans"
+        for name in _PREFERRED_CJK_FONT_NAMES:
+            try:
+                resolved = font_manager.findfont(
+                    font_manager.FontProperties(family=name),
+                    fallback_to_default=False,
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not WorkloadDiagnosticRenderer._font_supports(
+                resolved, _REQUIRED_CHART_GLYPHS
+            ):
+                continue
+            try:
+                font_manager.fontManager.addfont(str(resolved))
+                resolved_name = str(
+                    font_manager.FontProperties(fname=str(resolved)).get_name()
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            return resolved_name, str(Path(resolved).resolve())
+        raise RuntimeError("workload_diagnostic_cjk_font_unavailable")
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -94,7 +127,7 @@ class WorkloadDiagnosticRenderer:
         from matplotlib import font_manager
         from matplotlib import pyplot as plt
 
-        font_name = WorkloadDiagnosticRenderer._resolve_font_name(font_manager)
+        font_name, font_path = WorkloadDiagnosticRenderer._resolve_font(font_manager)
         # Force the selected CJK font through a real first canvas draw.  This
         # warms Matplotlib's font lookup before the first Admin HTTP request,
         # avoiding the previous first-render-only tofu/missing-glyph result.
@@ -103,19 +136,16 @@ class WorkloadDiagnosticRenderer:
             warmup.text(
                 0,
                 0,
-                "任务负荷预测压力观测样本不足日期时间～±·-",
+                _REQUIRED_CHART_GLYPHS + "～±·-",
                 fontfamily=font_name,
             )
             warmup.canvas.draw()
             plt.close(warmup)
-        if font_name == "DejaVu Sans":
-            logger.warning("workload_diagnostic_cjk_font_unavailable")
-        else:
-            logger.info(
-                "workload_diagnostic_font_selected",
-                extra={"font_name": font_name},
-            )
-        return plt, font_name
+        logger.info(
+            "workload_diagnostic_font_selected",
+            extra={"font_name": font_name, "font_path": font_path},
+        )
+        return plt, font_name, font_path
 
     @staticmethod
     def _rc(font_name: str) -> dict[str, Any]:
@@ -260,7 +290,7 @@ class WorkloadDiagnosticRenderer:
 
     def demand_vs_forecast(self, payload: dict[str, Any]) -> bytes:
         series = self._prepare(payload)
-        plt, font_name = self._pyplot()
+        plt, font_name, _font_path = self._pyplot()
         with plt.rc_context(self._rc(font_name)):
             figure, (demand_axis, stress_axis) = plt.subplots(
                 2,
@@ -302,7 +332,7 @@ class WorkloadDiagnosticRenderer:
 
     def forecast_vs_ema(self, payload: dict[str, Any]) -> bytes:
         series = self._prepare(payload)
-        plt, font_name = self._pyplot()
+        plt, font_name, _font_path = self._pyplot()
         with plt.rc_context(self._rc(font_name)):
             figure, axis = plt.subplots(figsize=(15, 7.2))
             axis.plot(
@@ -338,7 +368,7 @@ class WorkloadDiagnosticRenderer:
         series = self._prepare(payload)
         if len(series.ema_x) < 2:
             return None
-        plt, font_name = self._pyplot()
+        plt, font_name, _font_path = self._pyplot()
         with plt.rc_context(self._rc(font_name)):
             figure, axis = plt.subplots(figsize=(14.4, 5.2))
             colors = [_ACTUAL if value > 0 else _WORKLOAD for value in series.residual]
