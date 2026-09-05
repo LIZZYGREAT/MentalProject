@@ -1,0 +1,97 @@
+name: MindFlow CI
+
+on:
+  push:
+    branches:
+      - main
+      - production_runtime
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mindflow-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: mindflow
+          POSTGRES_PASSWORD: mindflow_ci
+          POSTGRES_DB: mindflow_acceptance_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mindflow -d mindflow_acceptance_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+
+      MINDFLOW_TEST_POSTGRES_URL: >-
+        postgresql+psycopg://mindflow:mindflow_ci@localhost:5432/mindflow_acceptance_test
+      MINDFLOW_REQUIRE_POSTGRES_TESTS: "1"
+      MINDFLOW_TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: "5"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            mindflow-bot-runtime/requirements.txt
+            mindflow-bot-runtime/requirements-dev.txt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fontconfig \
+            fonts-noto-cjk
+          fc-cache -f
+
+      - name: Install Python dependencies
+        working-directory: mindflow-bot-runtime
+        run: |
+          python -m pip install -r requirements-dev.txt
+
+      - name: Validate PostgreSQL test target
+        working-directory: mindflow-bot-runtime
+        run: |
+          python -m app.postgres_test_guard
+
+      - name: Run authoritative contract tests
+        working-directory: mindflow-bot-runtime
+        run: |
+          python -m pytest -q \
+            tests/test_authoritative_docs.py \
+            tests/test_participant_overview.py \
+            tests/test_stage6_care_jitai.py
+
+      - name: Run full test suite
+        working-directory: mindflow-bot-runtime
+        run: |
+          python -m pytest -q tests
