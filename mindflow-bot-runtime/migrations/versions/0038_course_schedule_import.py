@@ -35,6 +35,8 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("confirmed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("run_claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("run_claim_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
             "status IN ('pending_context','pending_confirmation','running','succeeded','partial_failed','cancelled','expired')",

@@ -22,7 +22,10 @@ MindFlow 是面向飞书私聊的 Python 后端，业务数据保存在 PostgreS
 配置。Vision 只生成严格结构化 Draft，不选择身份、不生成卡片、不写 Calendar。Draft 与
 逐项结果持久化；只有原绑定参与者点击固定确认按钮后，才使用该参与者自己的 Calendar
 OAuth 批量创建。重复确认复用稳定幂等身份，失败重试只处理未成功项，批量结束后合并执行
-Calendar mutation invalidation、Warning reconciliation 与 Forecast refresh。
+Calendar mutation invalidation、Warning reconciliation 与 Forecast refresh。Draft 的 running 状态使用
+10 分钟可续租 claim，过期后重置未落账的 running item 并恢复处理；整个图片下载、校验、编码、
+Vision 请求、严格解析与 Draft 创建共享同一并发上限。V1 只允许交互补齐学期首周周一与节次
+作息映射，并将完整预览和可确认导入限制为最多 20 项。
 
 ## Agent 与业务工具
 

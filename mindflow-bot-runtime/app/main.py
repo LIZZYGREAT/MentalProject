@@ -472,6 +472,7 @@ async def run() -> None:
         schedule_imports=business.course_schedule_imports,
         message_resources=message_resources,
         schedule_draft_ttl_minutes=settings.vision_import_draft_ttl_minutes,
+        schedule_image_max_concurrency=settings.vision_max_concurrency,
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(

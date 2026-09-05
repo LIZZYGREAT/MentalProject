@@ -50,7 +50,11 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     if missing & {"period_time_mapping", "actual_time"}:
         lines.extend(["", "这张课表只有“第1-2节”这类节次，没有具体上课时间。", "把学校作息时间告诉我后，我再生成日历。"])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
-    if not missing:
+    status = str(draft.get("status") or "")
+    if not missing and status in {"pending_confirmation", "partial_failed"}:
+        confirm_text = (
+            "重试失败项" if status == "partial_failed" else "确认添加到日历"
+        )
         elements.append({
             "tag": "column_set",
             "flex_mode": "bisect",
@@ -59,7 +63,7 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
                     "tag": "column", "width": "weighted", "weight": 1,
                     "elements": [{
                         "tag": "button", "type": "primary",
-                        "text": {"tag": "plain_text", "content": "确认添加到日历"},
+                        "text": {"tag": "plain_text", "content": confirm_text},
                         "behaviors": [{"type": "callback", "value": {
                             "mindflow_action": "course_schedule_import_confirm",
                             "version": "1", "import_id": str(draft["id"]),
@@ -81,6 +85,15 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         })
         lines.append("\n确认无误后，我再添加到日历。")
         elements[0]["content"] = "\n".join(lines)
+    elif status == "running":
+        lines.append("\n正在添加到日历，请稍候。")
+        elements[0]["content"] = "\n".join(lines)
+    elif status == "succeeded":
+        lines.append("\n这份课程表已经添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+    elif status in {"cancelled", "expired"}:
+        lines.append("\n这份课程表导入已取消或过期，请重新发送图片。")
+        elements[0]["content"] = "\n".join(lines)
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "enable_forward": False},
@@ -89,12 +102,73 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def course_schedule_result_card(message: str) -> dict[str, Any]:
+def course_schedule_result_card(
+    message: str,
+    *,
+    status: str | None = None,
+    import_id: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": _safe_schedule_text(message)}
+    ]
+    if error == "calendar_not_connected" and import_id:
+        elements.append(
+            _schedule_action_columns(
+                import_id,
+                confirm_text="确认添加到日历",
+                include_cancel=True,
+            )
+        )
+    elif status == "partial_failed" and import_id:
+        elements.append(
+            _schedule_action_columns(
+                import_id,
+                confirm_text="重试失败项",
+                include_cancel=False,
+            )
+        )
+    template = "green" if status in {"succeeded", "cancelled"} else "blue"
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "enable_forward": False},
-        "header": {"template": "green", "title": {"tag": "plain_text", "content": "课程表导入"}},
-        "body": {"elements": [{"tag": "markdown", "content": _safe_schedule_text(message)}]},
+        "header": {"template": template, "title": {"tag": "plain_text", "content": "课程表导入"}},
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def _schedule_action_columns(
+    import_id: str, *, confirm_text: str, include_cancel: bool
+) -> dict[str, Any]:
+    columns = [{
+        "tag": "column", "width": "weighted", "weight": 1,
+        "elements": [{
+            "tag": "button", "type": "primary",
+            "text": {"tag": "plain_text", "content": confirm_text},
+            "behaviors": [{"type": "callback", "value": {
+                "mindflow_action": "course_schedule_import_confirm",
+                "version": "1", "import_id": str(import_id),
+            }}],
+        }],
+    }]
+    if include_cancel:
+        columns.append({
+            "tag": "column", "width": "weighted", "weight": 1,
+            "elements": [{
+                "tag": "button", "type": "default",
+                "text": {"tag": "plain_text", "content": "取消"},
+                "behaviors": [{"type": "callback", "value": {
+                    "mindflow_action": "course_schedule_import_cancel",
+                    "version": "1", "import_id": str(import_id),
+                }}],
+            }],
+        })
+    else:
+        return columns[0]["elements"][0]
+    return {
+        "tag": "column_set",
+        "flex_mode": "bisect",
+        "columns": columns,
     }
 
 

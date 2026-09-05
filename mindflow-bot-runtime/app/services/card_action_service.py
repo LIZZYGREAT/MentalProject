@@ -123,7 +123,12 @@ class CardActionService:
             return {
                 **result,
                 "ok": True,
-                "card": course_schedule_result_card(reply_text),
+                "card": course_schedule_result_card(
+                    reply_text,
+                    status=str(result.get("status") or "") or None,
+                    import_id=str(result.get("import_id") or import_id),
+                    error=str(result.get("error") or "") or None,
+                ),
             }
         if action_name.startswith("care_"):
             if self.care_interventions is None:

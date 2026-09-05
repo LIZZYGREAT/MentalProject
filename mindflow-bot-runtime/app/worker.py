@@ -24,12 +24,18 @@ from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
 from app.integrations.feishu.cards import course_schedule_preview_card
+from app.integrations.feishu.message_resources import (
+    MessageResourceError,
+    MessageResourceTooLarge,
+    UnsupportedImageFormat,
+)
 from app.integrations.feishu.oauth import DeviceFlowService
 from app.repositories import (
     AgentRunRepository,
     BotEventRepository,
     RuntimeIncidentRepository,
 )
+from app.repositories_course_schedule import UnfillableScheduleContextError
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
@@ -43,6 +49,11 @@ from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import PresentationOutbox
 from app.services.presentation_service import PendingImageCard
+from app.services.course_schedule_vision import (
+    CourseScheduleVisionError,
+    CourseScheduleVisionUnavailable,
+    CourseScheduleVisionValidationFailure,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -156,6 +167,7 @@ class BotWorker:
         schedule_imports: object | None = None,
         message_resources: object | None = None,
         schedule_draft_ttl_minutes: int = 60,
+        schedule_image_max_concurrency: int = 1,
     ):
         self.queue = queue
         self.identity = identity
@@ -186,6 +198,9 @@ class BotWorker:
         self.schedule_imports = schedule_imports
         self.message_resources = message_resources
         self.schedule_draft_ttl_minutes = max(1, int(schedule_draft_ttl_minutes))
+        self._schedule_image_semaphore = asyncio.Semaphore(
+            max(1, int(schedule_image_max_concurrency))
+        )
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
@@ -481,25 +496,80 @@ class BotWorker:
                     event, course_schedule_preview_card(existing)
                 )
                 return
-            image = await self.message_resources.download_image(
-                event.message_id, str(event.image_key or "")
+            async with self._schedule_image_semaphore:
+                # Recheck after waiting so two deliveries of the same provider
+                # event cannot both enter the expensive image pipeline.
+                existing = await asyncio.to_thread(
+                    self.schedule_imports.drafts.get_by_source,
+                    participant_id,
+                    event.message_id,
+                )
+                if existing is not None:
+                    await self._deliver_card(
+                        event, course_schedule_preview_card(existing)
+                    )
+                    return
+                image = await self.message_resources.download_image(
+                    event.message_id, str(event.image_key or "")
+                )
+                result = await self.schedule_vision.parse(
+                    image.data, image.mime_type
+                )
+                if result.document_type != "course_schedule":
+                    await self._deliver(
+                        event, "这张图片看起来不是课程表，请换一张课程表图片。"
+                    )
+                    return
+                draft = await asyncio.to_thread(
+                    self.schedule_imports.drafts.create_draft,
+                    participant_id,
+                    source_message_id=event.message_id,
+                    source_image_hash=hashlib.sha256(image.data).hexdigest(),
+                    vision_model=self.schedule_vision.model,
+                    result=result,
+                    timezone_name=str(self.schedule_imports.timezone),
+                    ttl_minutes=self.schedule_draft_ttl_minutes,
+                )
+                del image
+                await self._deliver_card(
+                    event, course_schedule_preview_card(draft)
+                )
+        except UnfillableScheduleContextError as exc:
+            logger.info(
+                "course_schedule_context_unfillable event_id=%s missing=%s",
+                event.event_id,
+                sorted(exc.missing),
             )
-            result = await self.schedule_vision.parse(image.data, image.mime_type)
-            if result.document_type != "course_schedule":
-                await self._deliver(event, "这张图片看起来不是课程表，请换一张更清晰的课程表图片。")
-                return
-            draft = await asyncio.to_thread(
-                self.schedule_imports.drafts.create_draft,
-                participant_id,
-                source_message_id=event.message_id,
-                source_image_hash=hashlib.sha256(image.data).hexdigest(),
-                vision_model=self.schedule_vision.model,
-                result=result,
-                timezone_name=str(self.schedule_imports.timezone),
-                ttl_minutes=self.schedule_draft_ttl_minutes,
+            await self._deliver(
+                event, "这张课程表缺少星期、周次或可用时间，暂时无法可靠导入。请换一张信息更完整、清晰的图片。"
             )
-            del image
-            await self._deliver_card(event, course_schedule_preview_card(draft))
+        except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError) as exc:
+            logger.warning(
+                "course_schedule_image_rejected event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            await self._deliver(
+                event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
+            )
+        except CourseScheduleVisionValidationFailure as exc:
+            logger.warning(
+                "course_schedule_vision_validation_failed event_id=%s message_id=%s",
+                event.event_id,
+                event.message_id,
+            )
+            await self._deliver(
+                event, "无法可靠读取这张课程表，请换一张更清晰、完整的图片。"
+            )
+        except (CourseScheduleVisionUnavailable, CourseScheduleVisionError, MessageResourceError) as exc:
+            logger.warning(
+                "course_schedule_image_service_unavailable event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            await self._deliver(event, "课程表识别服务暂时不可用，请稍后再试。")
         except Exception as exc:
             logger.warning(
                 "course_schedule_image_processing_failed event_id=%s message_id=%s error_class=%s",
@@ -507,7 +577,7 @@ class BotWorker:
                 event.message_id,
                 type(exc).__name__,
             )
-            await self._deliver(event, "课程表图片暂时没能识别，请确认图片清晰且为 JPEG、PNG 或 WebP 后再试。")
+            await self._deliver(event, "课程表识别服务暂时不可用，请稍后再试。")
 
     async def _run_agent(self, event: BotEvent, ctx: AgentContext, run_id) -> None:
         started = time.monotonic()

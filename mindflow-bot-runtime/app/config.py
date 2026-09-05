@@ -130,7 +130,7 @@ class Settings:
     vision_max_concurrency: int = 1
     vision_max_image_bytes: int = 8 * 1024 * 1024
     vision_import_draft_ttl_minutes: int = 60
-    vision_schedule_max_items: int = 80
+    vision_schedule_max_items: int = 20
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -396,7 +396,7 @@ class Settings:
                 values, "VISION_IMPORT_DRAFT_TTL_MINUTES", 60
             ),
             vision_schedule_max_items=_int(
-                values, "VISION_SCHEDULE_MAX_ITEMS", 80
+                values, "VISION_SCHEDULE_MAX_ITEMS", 20
             ),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(

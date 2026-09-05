@@ -17,11 +17,22 @@ from app.models import CourseScheduleImport, CourseScheduleImportItem
 
 
 ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation", "partial_failed"}
+INTERACTIVE_CONTEXT_FIELDS = {"semester_start_date", "period_time_mapping"}
+DEFAULT_RUN_LEASE_SECONDS = 10 * 60
+
+
+class UnfillableScheduleContextError(ValueError):
+    def __init__(self, missing: set[str]):
+        self.missing = frozenset(missing)
+        super().__init__("schedule contains context that cannot be completed in V1")
 
 
 class CourseScheduleImportRepository:
-    def __init__(self, database: Database):
+    def __init__(
+        self, database: Database, *, run_lease_seconds: int = DEFAULT_RUN_LEASE_SECONDS
+    ):
         self.database = database
+        self.run_lease_seconds = max(1, int(run_lease_seconds))
 
     def create_draft(
         self,
@@ -37,7 +48,12 @@ class CourseScheduleImportRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         created_at = _aware(now or datetime.now(timezone.utc))
-        missing = required_context(result, semester_start_date=semester_start_date)
+        missing = derive_required_context(
+            result, semester_start_date=semester_start_date
+        )
+        unsupported = missing - INTERACTIVE_CONTEXT_FIELDS
+        if unsupported:
+            raise UnfillableScheduleContextError(unsupported)
         structured = result.to_dict()
         structured["missing_context"] = sorted(missing)
         row = CourseScheduleImport(
@@ -190,24 +206,40 @@ class CourseScheduleImportRepository:
             return self._view(session, row)
 
     def begin_confirmation(
-        self, participant_id: uuid.UUID, import_id: uuid.UUID | str
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
+        claimed_at = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
             self._require_owner(row, participant_id)
-            self._expire_if_needed(row, session)
+            self._expire_if_needed(row, session, now=claimed_at)
             if row.status == "succeeded":
                 return {**self._view(session, row), "claimed": False}
             if row.status == "running":
-                return {**self._view(session, row), "claimed": False}
+                lease_expires = (
+                    _aware(row.run_claim_expires_at)
+                    if row.run_claim_expires_at is not None
+                    else None
+                )
+                if lease_expires is not None and lease_expires > claimed_at:
+                    return {**self._view(session, row), "claimed": False}
+                for item in self._items(session, row.id):
+                    if item.status == "running":
+                        item.status = "pending"
+                        item.error_code = None
             if row.status in {"cancelled", "expired"}:
                 raise ValueError("draft is not confirmable")
             if row.status == "pending_context":
                 raise ValueError("draft is missing required context")
             row.status = "running"
-            row.confirmed_at = row.confirmed_at or datetime.now(timezone.utc)
+            row.confirmed_at = row.confirmed_at or claimed_at
+            self._set_run_lease(row, claimed_at)
             for item in self._items(session, row.id):
                 if item.status == "failed":
                     item.status = "pending"
@@ -215,8 +247,20 @@ class CourseScheduleImportRepository:
             session.flush()
             return {**self._view(session, row), "claimed": True}
 
-    def claim_item(self, import_id: uuid.UUID | str, item_id: uuid.UUID | str) -> bool:
+    def claim_item(
+        self,
+        import_id: uuid.UUID | str,
+        item_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        claimed_at = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
+            draft = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if draft is None or draft.status != "running":
+                return False
             row = session.get(
                 CourseScheduleImportItem, uuid.UUID(str(item_id)), with_for_update=True
             )
@@ -225,6 +269,20 @@ class CourseScheduleImportRepository:
             if row.status != "pending":
                 return False
             row.status = "running"
+            self._set_run_lease(draft, claimed_at)
+            return True
+
+    def renew_run_lease(
+        self, import_id: uuid.UUID | str, *, now: datetime | None = None
+    ) -> bool:
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None or row.status != "running":
+                return False
+            self._set_run_lease(row, claimed_at)
             return True
 
     def finish_item(
@@ -266,6 +324,7 @@ class CourseScheduleImportRepository:
                 row.completed_at = datetime.now(timezone.utc)
             else:
                 row.status = "partial_failed"
+            self._clear_run_lease(row)
             session.flush()
             return self._view(session, row)
 
@@ -277,12 +336,21 @@ class CourseScheduleImportRepository:
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
             self._require_owner(row, participant_id)
-            self._expire_if_needed(row, session)
+            expires = _aware(row.expires_at)
+            if expires <= datetime.now(timezone.utc) and row.status not in {
+                "succeeded", "cancelled", "expired"
+            }:
+                row.status = "expired"
+                self._clear_run_lease(row)
+            if row.status == "expired":
+                session.flush()
+                return self._view(session, row)
             if row.status == "running":
                 raise ValueError("running draft cannot be cancelled")
             if row.status not in {"succeeded", "expired"}:
                 row.status = "cancelled"
                 row.completed_at = datetime.now(timezone.utc)
+                self._clear_run_lease(row)
             session.flush()
             return self._view(session, row)
 
@@ -294,12 +362,15 @@ class CourseScheduleImportRepository:
             raise PermissionError("draft belongs to another participant")
 
     @staticmethod
-    def _expire_if_needed(row: CourseScheduleImport, session: Any) -> None:
+    def _expire_if_needed(
+        row: CourseScheduleImport, session: Any, *, now: datetime | None = None
+    ) -> None:
         expires = _aware(row.expires_at)
-        if expires <= datetime.now(timezone.utc) and row.status not in {
+        if expires <= _aware(now or datetime.now(timezone.utc)) and row.status not in {
             "succeeded", "cancelled", "expired"
         }:
             row.status = "expired"
+            CourseScheduleImportRepository._clear_run_lease(row)
         if row.status == "expired":
             # Persist expiry even though the caller must reject this operation.
             session.flush()
@@ -333,6 +404,13 @@ class CourseScheduleImportRepository:
             "created_at": _aware(row.created_at).isoformat(),
             "expires_at": _aware(row.expires_at).isoformat(),
             "confirmed_at": _aware(row.confirmed_at).isoformat() if row.confirmed_at else None,
+            "run_claimed_at": (
+                _aware(row.run_claimed_at).isoformat() if row.run_claimed_at else None
+            ),
+            "run_claim_expires_at": (
+                _aware(row.run_claim_expires_at).isoformat()
+                if row.run_claim_expires_at else None
+            ),
             "completed_at": _aware(row.completed_at).isoformat() if row.completed_at else None,
             "items": [
                 {
@@ -353,11 +431,22 @@ class CourseScheduleImportRepository:
             ],
         }
 
+    def _set_run_lease(self, row: CourseScheduleImport, claimed_at: datetime) -> None:
+        row.run_claimed_at = claimed_at
+        row.run_claim_expires_at = claimed_at + timedelta(
+            seconds=self.run_lease_seconds
+        )
 
-def required_context(
-    result: ScheduleVisionResult, *, semester_start_date: date | None
+    @staticmethod
+    def _clear_run_lease(row: CourseScheduleImport) -> None:
+        row.run_claimed_at = None
+        row.run_claim_expires_at = None
+
+
+def derive_required_context(
+    result: ScheduleVisionResult, *, semester_start_date: date | None = None
 ) -> set[str]:
-    missing = set(result.missing_context)
+    missing: set[str] = set()
     if semester_start_date is None:
         missing.add("semester_start_date")
     else:
@@ -365,9 +454,19 @@ def required_context(
     for course in result.courses:
         if course.weekday is None:
             missing.add("weekday")
+        if course.week_rule is None:
+            missing.add("week_rule")
         if course.start_time is None or course.end_time is None:
             missing.add("period_time_mapping" if course.period_start is not None else "actual_time")
     return missing
+
+
+def required_context(
+    result: ScheduleVisionResult, *, semester_start_date: date | None = None
+) -> set[str]:
+    """Backward-compatible alias for the backend-derived authority."""
+
+    return derive_required_context(result, semester_start_date=semester_start_date)
 
 
 def _parse_time(value: str | None) -> time | None:

@@ -61,7 +61,7 @@ class CourseScheduleItem:
     end_time: str | None
     location: str | None
     teacher: str | None
-    week_rule: WeekRule
+    week_rule: WeekRule | None
     uncertain_fields: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
@@ -102,7 +102,11 @@ class CourseScheduleItem:
             end_time=end_time,
             location=_optional_text(value.get("location"), 300),
             teacher=_optional_text(value.get("teacher"), 200),
-            week_rule=WeekRule.from_dict(value.get("week_rule")),
+            week_rule=(
+                WeekRule.from_dict(value.get("week_rule"))
+                if value.get("week_rule") is not None
+                else None
+            ),
             uncertain_fields=tuple(str(item)[:64] for item in uncertain),
         )
 
@@ -117,7 +121,7 @@ class ScheduleVisionResult:
     warnings: tuple[str, ...]
 
     @classmethod
-    def from_dict(cls, value: Any, *, max_items: int = 80) -> "ScheduleVisionResult":
+    def from_dict(cls, value: Any, *, max_items: int = 20) -> "ScheduleVisionResult":
         if not isinstance(value, dict):
             raise ScheduleVisionValidationError("vision result must be an object")
         allowed = {
@@ -161,13 +165,17 @@ class ScheduleVisionResult:
         result["courses"] = [
             {
                 **asdict(course),
-                "week_rule": {
-                    **asdict(course.week_rule),
-                    "explicit_weeks": (
-                        list(course.week_rule.explicit_weeks)
-                        if course.week_rule.explicit_weeks is not None else None
-                    ),
-                },
+                "week_rule": (
+                    {
+                        **asdict(course.week_rule),
+                        "explicit_weeks": (
+                            list(course.week_rule.explicit_weeks)
+                            if course.week_rule.explicit_weeks is not None else None
+                        ),
+                    }
+                    if course.week_rule is not None
+                    else None
+                ),
                 "uncertain_fields": list(course.uncertain_fields),
             }
             for course in self.courses

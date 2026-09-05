@@ -25,10 +25,18 @@ weekday 使用 1（周一）到 7（周日）。时间仅在图片明确出现�
 missing_context 只允许 semester_start_date、period_time_mapping、weekday、week_rule、actual_time。
 输出字段必须且只能是：document_type、semester_label、institution、courses、missing_context、warnings。
 每个 course 必须且只能包含：course_name、weekday、period_start、period_end、start_time、end_time、location、teacher、week_rule、uncertain_fields。
-week_rule 必须且只能包含：start_week、end_week、odd_even、explicit_weeks；odd_even 只能为 all、odd、even。"""
+周次无法确定时 week_rule 必须返回 null，不能猜测；否则 week_rule 必须且只能包含：start_week、end_week、odd_even、explicit_weeks；odd_even 只能为 all、odd、even。"""
 
 
 class CourseScheduleVisionError(RuntimeError):
+    pass
+
+
+class CourseScheduleVisionUnavailable(CourseScheduleVisionError):
+    pass
+
+
+class CourseScheduleVisionValidationFailure(CourseScheduleVisionError):
     pass
 
 
@@ -42,7 +50,7 @@ class CourseScheduleVisionService:
         enabled: bool = False,
         timeout_seconds: float = 25.0,
         max_concurrency: int = 1,
-        max_items: int = 80,
+        max_items: int = 20,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.api_url = str(api_url).strip()
@@ -56,32 +64,35 @@ class CourseScheduleVisionService:
 
     async def parse(self, image_bytes: bytes, mime_type: str) -> ScheduleVisionResult:
         if not self.enabled:
-            raise CourseScheduleVisionError("course schedule vision is disabled")
+            raise CourseScheduleVisionUnavailable("course schedule vision is disabled")
         if not self.api_key or not self.api_url or not self.model:
-            raise CourseScheduleVisionError("course schedule vision is not configured")
+            raise CourseScheduleVisionUnavailable("course schedule vision is not configured")
         if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
             raise ValueError("unsupported image MIME type")
-        encoded = base64.b64encode(bytes(image_bytes)).decode("ascii")
-        request = {
-            "model": self.model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "读取这张课程表，按规定 JSON 返回。"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        },
-                    ],
-                },
-            ],
-        }
+        encoded = ""
         try:
             async with self._semaphore:
+                encoded = base64.b64encode(bytes(image_bytes)).decode("ascii")
+                request = {
+                    "model": self.model,
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "读取这张课程表，按规定 JSON 返回。"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime_type};base64,{encoded}"
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                }
                 async with httpx.AsyncClient(
                     timeout=self.timeout_seconds, transport=self._transport
                 ) as client:
@@ -90,18 +101,31 @@ class CourseScheduleVisionService:
                         headers={"Authorization": f"Bearer {self.api_key}"},
                         json=request,
                     )
-            response.raise_for_status()
-            payload = response.json()
-            content = payload["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(
-                    str(item.get("text") or "")
-                    for item in content if isinstance(item, dict)
+                response.raise_for_status()
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = "".join(
+                        str(item.get("text") or "")
+                        for item in content if isinstance(item, dict)
+                    )
+                decoded = json.loads(str(content))
+                return ScheduleVisionResult.from_dict(
+                    decoded, max_items=self.max_items
                 )
-            decoded = json.loads(str(content))
-            return ScheduleVisionResult.from_dict(decoded, max_items=self.max_items)
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError,
-                ScheduleVisionValidationError) as exc:
-            raise CourseScheduleVisionError("vision response failed strict validation") from exc
+        except httpx.HTTPError as exc:
+            raise CourseScheduleVisionUnavailable(
+                "course schedule vision upstream failed"
+            ) from exc
+        except (
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ScheduleVisionValidationError,
+        ) as exc:
+            raise CourseScheduleVisionValidationFailure(
+                "vision response failed strict validation"
+            ) from exc
         finally:
             encoded = ""

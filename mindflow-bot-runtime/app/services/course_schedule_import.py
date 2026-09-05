@@ -60,9 +60,11 @@ class CourseScheduleImportService:
             return {
                 "ok": False,
                 "error": "calendar_not_connected",
+                "status": draft["status"],
+                "import_id": draft["id"],
                 "reply_text": (
-                    "还差一步日历授权。\n发送 /calendar 完成授权后，"
-                    "再回来确认这份课程表即可。"
+                    "课程表还没添加\n\n还差一步日历授权。\n"
+                    "发送 /calendar 完成授权后，再回来点确认。"
                 ),
             }
         claimed = await asyncio.to_thread(
@@ -106,6 +108,9 @@ class CourseScheduleImportService:
             last_event_id: str | None = None
             try:
                 for write in writes_by_item[item["id"]]:
+                    await asyncio.to_thread(
+                        self.drafts.renew_run_lease, import_id
+                    )
                     created = await self.calendar.create_event(
                         participant_id,
                         summary=write.summary,
@@ -163,7 +168,18 @@ class CourseScheduleImportService:
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
     ) -> dict[str, Any]:
         draft = self.drafts.cancel(participant_id, import_id)
-        return {"ok": True, "status": draft["status"], "reply_text": "已取消这次课程表导入。"}
+        status = draft["status"]
+        reply = {
+            "cancelled": "已取消这次课程表导入。",
+            "succeeded": "这份课程表已经添加到日历，不能再取消导入。",
+            "expired": "这份课程表导入已过期，请重新发送图片。",
+        }.get(status, "课程表导入状态没有改变。")
+        return {
+            "ok": status == "cancelled",
+            "status": status,
+            "import_id": draft["id"],
+            "reply_text": reply,
+        }
 
     def _calendar_write_enabled(self, participant_id: uuid.UUID) -> bool:
         status = self.tokens.status(participant_id)
@@ -327,6 +343,7 @@ class CourseScheduleImportService:
         return {
             "ok": failed == 0,
             "status": draft["status"],
+            "import_id": draft["id"],
             "succeeded": succeeded,
             "failed": failed,
             "reply_text": text,
