@@ -427,6 +427,15 @@ async def run() -> None:
     sender = FeishuClient(
         settings.feishu_bot_app_id, settings.feishu_bot_app_secret
     )
+    from app.integrations.feishu.message_resources import (
+        FeishuMessageResourceDownloader,
+    )
+
+    message_resources = FeishuMessageResourceDownloader(
+        sender,
+        max_bytes=settings.vision_max_image_bytes,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+    )
     handle_card_action = _build_card_action_handler(
         identity, business.card_actions, sender, incidents
     )
@@ -459,6 +468,10 @@ async def run() -> None:
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
         incidents=incidents,
+        schedule_vision=business.course_schedule_vision,
+        schedule_imports=business.course_schedule_imports,
+        message_resources=message_resources,
+        schedule_draft_ttl_minutes=settings.vision_import_draft_ttl_minutes,
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(
@@ -514,9 +527,11 @@ async def run() -> None:
                 app_id=saved.app_id,
                 open_id=saved.open_id,
                 chat_id=saved.chat_id,
-                text=saved.text,
                 create_time=saved.create_time,
                 chat_type=saved.chat_type,
+                message_type=saved.message_type,
+                text=saved.text,
+                image_key=saved.image_key,
             )
         )
     for participant_id in business.device_flows.pending_participants():

@@ -162,6 +162,11 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
     assert migration_0037.down_revision == "0036_stage5_effective_profile"
 
 
+def test_course_schedule_import_migration_extends_stage6_head():
+    migration_0038 = _migration(VERSIONS / "0038_course_schedule_import.py")
+    assert migration_0038.down_revision == "0037_stage6_care_jitai"
+
+
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
     migration = _migration(VERSIONS / "0031_parameter_learning_runs.py")
     tables = []

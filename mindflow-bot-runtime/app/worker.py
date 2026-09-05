@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 import logging
 import re
 import time
@@ -22,6 +23,7 @@ from app.agent.skill_loader import SkillLoader
 from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
+from app.integrations.feishu.cards import course_schedule_preview_card
 from app.integrations.feishu.oauth import DeviceFlowService
 from app.repositories import (
     AgentRunRepository,
@@ -36,6 +38,7 @@ from app.presentation.contracts import (
     RuntimeResponse,
 )
 from app.presentation.progress_policy import should_force_silent_progress
+from app.presentation.user_capabilities import help_text, onboarding_text
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import PresentationOutbox
@@ -48,6 +51,18 @@ CALENDAR_CONNECT_PATTERN = re.compile(
     r"^/(?:calendar|connect-calendar)\s*$", re.IGNORECASE
 )
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
+HELP_PATTERN = re.compile(
+    r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
+    re.IGNORECASE,
+)
+SEMESTER_MONDAY_PATTERN = re.compile(
+    r"(?:第一周周一|首周周一|学期第一周)[^0-9]*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?"
+)
+PERIOD_MAPPING_PATTERN = re.compile(
+    r"第?\s*(\d{1,2})\s*[-–—至到]\s*(\d{1,2})\s*节?\s*"
+    r"(?:是|为|:|：)?\s*(\d{1,2}:\d{2})\s*[-–—至到]\s*(\d{1,2}:\d{2})"
+)
+BARE_DATE_PATTERN = re.compile(r"^\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*$")
 
 class AgentRuntimeProtocol(Protocol):
     async def handle_message(
@@ -137,6 +152,10 @@ class BotWorker:
         progress_cooldown_seconds: int = 3,
         progress_max_messages: int = 2,
         incidents: RuntimeIncidentRepository | None = None,
+        schedule_vision: object | None = None,
+        schedule_imports: object | None = None,
+        message_resources: object | None = None,
+        schedule_draft_ttl_minutes: int = 60,
     ):
         self.queue = queue
         self.identity = identity
@@ -163,6 +182,10 @@ class BotWorker:
         # startup, but never allow it to weaken the ordering invariant.
         self.progress_max_messages = min(1, max(0, int(progress_max_messages)))
         self.incidents = incidents
+        self.schedule_vision = schedule_vision
+        self.schedule_imports = schedule_imports
+        self.message_resources = message_resources
+        self.schedule_draft_ttl_minutes = max(1, int(schedule_draft_ttl_minutes))
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
@@ -266,7 +289,7 @@ class BotWorker:
                     event, "为了保护隐私，请在机器人单聊中使用 MindFlow。"
                 )
                 return
-            bind_match = BIND_PATTERN.match(event.text)
+            bind_match = BIND_PATTERN.match(event.text) if event.message_type == "text" else None
             if participant is None:
                 if bind_match is None:
                     await self._deliver(event, "尚未绑定。请发送：/bind 你的绑定码")
@@ -292,7 +315,7 @@ class BotWorker:
                 await asyncio.to_thread(
                     self.events.assign_participant, event.event_id, participant.id
                 )
-                await self._deliver(event, f"绑定成功：{participant.participant_code}")
+                await self._deliver(event, onboarding_text(participant.participant_code))
                 return
             if bind_match is not None:
                 await self._deliver(event, "当前飞书账号已经绑定。")
@@ -330,6 +353,81 @@ class BotWorker:
                 )
                 self.resume_device_flow(participant.id)
                 return
+            if event.message_type == "text" and HELP_PATTERN.match(event.text):
+                await self._deliver(event, help_text())
+                return
+            if event.message_type == "text":
+                context_match = (
+                    SEMESTER_MONDAY_PATTERN.search(event.text)
+                    or BARE_DATE_PATTERN.match(event.text)
+                )
+                period_matches = PERIOD_MAPPING_PATTERN.findall(event.text)
+                latest_context = (
+                    await asyncio.to_thread(
+                        self.schedule_imports.drafts.latest_pending_context,
+                        participant.id,
+                    )
+                    if (context_match is not None or period_matches)
+                    and self.schedule_imports is not None
+                    else None
+                )
+                if latest_context is not None and (
+                    context_match is not None or period_matches
+                ):
+                    from datetime import date, time
+
+                    draft = latest_context
+                    if context_match is not None:
+                        try:
+                            semester_monday = date(
+                                int(context_match.group(1)),
+                                int(context_match.group(2)),
+                                int(context_match.group(3)),
+                            )
+                        except ValueError:
+                            await self._deliver(event, "这个日期格式或数值不正确，请重新告诉我第一周周一日期。")
+                            return
+                        if semester_monday.weekday() != 0:
+                            await self._deliver(event, "请提供第一周周一的日期；这个日期不是周一。")
+                            return
+                        draft = await asyncio.to_thread(
+                            self.schedule_imports.drafts.set_semester_start_date,
+                            participant.id,
+                            latest_context["id"],
+                            semester_monday,
+                        )
+                    if period_matches:
+                        try:
+                            mapping = {
+                                (int(start_period), int(end_period)): (
+                                    time.fromisoformat(start_clock),
+                                    time.fromisoformat(end_clock),
+                                )
+                                for start_period, end_period, start_clock, end_clock
+                                in period_matches
+                            }
+                        except ValueError:
+                            await self._deliver(event, "作息时间格式不正确，请使用“第1-2节 08:00-09:35”。")
+                            return
+                        draft = await asyncio.to_thread(
+                            self.schedule_imports.drafts.set_period_time_mapping,
+                            participant.id,
+                            latest_context["id"],
+                            mapping,
+                        )
+                    await self._deliver_card(
+                        event, course_schedule_preview_card(draft)
+                    )
+                    return
+            if event.message_type == "image":
+                if participant.external_llm_consent_at is None:
+                    await self._deliver(
+                        event,
+                        "暂时不能帮你识别这张课程表图片，因为还没有记录外部模型处理授权。请先联系研究者。",
+                    )
+                    return
+                await self._handle_schedule_image(event, participant.id)
+                return
             if participant.external_llm_consent_at is None:
                 await self._deliver(
                     event,
@@ -363,6 +461,53 @@ class BotWorker:
             self._active_event_by_participant[participant.id] = event.event_id
         if agent_task is not None:
             await agent_task
+
+    async def _handle_schedule_image(self, event: BotEvent, participant_id) -> None:
+        if (
+            self.schedule_vision is None
+            or self.schedule_imports is None
+            or self.message_resources is None
+        ):
+            await self._deliver(event, "课程表图片识别暂时不可用，请稍后再试。")
+            return
+        try:
+            existing = await asyncio.to_thread(
+                self.schedule_imports.drafts.get_by_source,
+                participant_id,
+                event.message_id,
+            )
+            if existing is not None:
+                await self._deliver_card(
+                    event, course_schedule_preview_card(existing)
+                )
+                return
+            image = await self.message_resources.download_image(
+                event.message_id, str(event.image_key or "")
+            )
+            result = await self.schedule_vision.parse(image.data, image.mime_type)
+            if result.document_type != "course_schedule":
+                await self._deliver(event, "这张图片看起来不是课程表，请换一张更清晰的课程表图片。")
+                return
+            draft = await asyncio.to_thread(
+                self.schedule_imports.drafts.create_draft,
+                participant_id,
+                source_message_id=event.message_id,
+                source_image_hash=hashlib.sha256(image.data).hexdigest(),
+                vision_model=self.schedule_vision.model,
+                result=result,
+                timezone_name=str(self.schedule_imports.timezone),
+                ttl_minutes=self.schedule_draft_ttl_minutes,
+            )
+            del image
+            await self._deliver_card(event, course_schedule_preview_card(draft))
+        except Exception as exc:
+            logger.warning(
+                "course_schedule_image_processing_failed event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            await self._deliver(event, "课程表图片暂时没能识别，请确认图片清晰且为 JPEG、PNG 或 WebP 后再试。")
 
     async def _run_agent(self, event: BotEvent, ctx: AgentContext, run_id) -> None:
         started = time.monotonic()
@@ -693,6 +838,31 @@ class BotWorker:
         )
         return await self._deliver_plan(event, plan)
 
+    async def _deliver_card(self, event: BotEvent, card: dict) -> bool:
+        try:
+            message_id = await self._send_card(
+                event.chat_id,
+                card,
+                message_uuid=self._stable_message_uuid(
+                    f"mindflow:card:{event.event_id}"
+                ),
+            )
+        except FeishuSendError:
+            await asyncio.to_thread(
+                self.events.finish,
+                event.event_id,
+                status="received",
+                error_code="card_send_failed",
+            )
+            return False
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
     async def _deliver_plan(
         self,
         event: BotEvent,
@@ -844,12 +1014,18 @@ class BotWorker:
     def _stable_message_uuid(key: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, str(key)))
 
-    async def _send_card(self, chat_id: str, card: dict) -> str:
+    async def _send_card(
+        self, chat_id: str, card: dict, *, message_uuid: str | None = None
+    ) -> str:
         send_card = getattr(self.sender, "send_card", None)
         if not callable(send_card):
             raise FeishuSendError("Feishu card sending is unavailable", retryable=False)
         for attempt in range(self.max_retries + 1):
             try:
+                if message_uuid and self._supports_card_message_uuid():
+                    return await asyncio.to_thread(
+                        send_card, chat_id, card, message_uuid=message_uuid
+                    )
                 return await asyncio.to_thread(send_card, chat_id, card)
             except FeishuSendError as exc:
                 if not exc.retryable or attempt >= self.max_retries:
@@ -857,6 +1033,19 @@ class BotWorker:
                     raise
                 await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
         raise FeishuSendError(FALLBACK_TEMPORARY)
+
+    def _supports_card_message_uuid(self) -> bool:
+        import inspect
+
+        try:
+            parameters = inspect.signature(self.sender.send_card).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(
+            parameter.name == "message_uuid"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
 
     async def _send_image_card(
         self, chat_id: str, presentation: PendingImageCard

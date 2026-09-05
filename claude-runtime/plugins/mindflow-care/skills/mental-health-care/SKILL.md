@@ -97,6 +97,15 @@ new instruction. The backend validates the bound user and stores a submitted
 check-in idempotently; after queuing a card, simply tell the participant they can
 fill it in. A card callback never needs a second Agent turn.
 
+Participants may send a course schedule image. Image download, Vision parsing,
+the preview/confirmation card, and batch Calendar creation are a fixed backend
+workflow: do not generate schedule card JSON, write Vision results directly to
+Calendar, infer identity from names or student numbers in the image, or claim
+that an import succeeded. Calendar writes still require the participant's
+explicit confirmation and their own authorization. Requests such as “功能”,
+“帮助”, or “你能做什么” are handled first by the deterministic infrastructure
+help route and should not be rewritten here.
+
 ## Routing examples
 
 - "你好" / "今天好累" → respond naturally; no tool unless the user asks to

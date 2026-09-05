@@ -188,7 +188,9 @@ class RecoverableBotEvent:
     open_id: str
     chat_id: str
     chat_type: str
+    message_type: str
     text: str
+    image_key: str | None
     create_time: datetime
 
 
@@ -4084,7 +4086,9 @@ class BotEventRepository:
         open_id: str,
         chat_id: str,
         chat_type: str,
+        message_type: str = "text",
         text: str,
+        image_key: str | None = None,
         create_time: datetime,
     ) -> bool:
         try:
@@ -4097,7 +4101,9 @@ class BotEventRepository:
                         open_id=open_id,
                         chat_id=chat_id,
                         chat_type=chat_type,
+                        message_type=str(message_type)[:16],
                         text=str(text)[:4000],
+                        image_key=str(image_key)[:512] if image_key else None,
                         message_created_at=create_time,
                         participant_id=participant_id,
                         status="received",
@@ -4135,7 +4141,9 @@ class BotEventRepository:
                     open_id=row.open_id,
                     chat_id=row.chat_id,
                     chat_type=row.chat_type,
+                    message_type=row.message_type,
                     text=row.text,
+                    image_key=row.image_key,
                     create_time=row.message_created_at,
                 )
                 for row in rows
@@ -4237,6 +4245,7 @@ class BotEventRepository:
                 raise ValueError("reply plan is not fully delivered")
             row.status = "completed"
             row.error_code = None
+            row.image_key = None
             row.processed_at = utc_now()
 
     def cancel_reply_plan(self, event_id: str) -> None:
@@ -4246,6 +4255,7 @@ class BotEventRepository:
                 return
             row.status = "interrupted"
             row.error_code = "stopped"
+            row.image_key = None
             row.processed_at = utc_now()
 
     def note_reply_failure(self, event_id: str) -> None:
@@ -4286,6 +4296,8 @@ class BotEventRepository:
             row.error_code = str(error_code)[:64] if error_code else None
             if reply_message_id:
                 row.reply_message_id = str(reply_message_id)[:128]
+            if status not in {"received", "processing", "reply_pending"}:
+                row.image_key = None
             row.processed_at = utc_now()
 
     def save_telemetry(self, event_id: str, metrics: dict[str, Any]) -> None:

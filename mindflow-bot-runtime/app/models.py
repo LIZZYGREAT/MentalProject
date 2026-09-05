@@ -403,7 +403,9 @@ class BotEvent(Base):
     open_id: Mapped[str] = mapped_column(String(128), nullable=False)
     chat_id: Mapped[str] = mapped_column(String(128), nullable=False)
     chat_type: Mapped[str] = mapped_column(String(32), nullable=False, default="p2p")
+    message_type: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    image_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     message_created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -422,6 +424,87 @@ class BotEvent(Base):
     telemetry_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CourseScheduleImport(Base):
+    __tablename__ = "course_schedule_imports"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "source_message_id",
+            name="uq_course_schedule_import_source",
+        ),
+        CheckConstraint(
+            "status IN ('pending_context','pending_confirmation','running','succeeded',"
+            "'partial_failed','cancelled','expired')",
+            name="ck_course_schedule_import_status",
+        ),
+        Index(
+            "ix_course_schedule_import_participant_status",
+            "participant_id", "status", "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_image_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    semester_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    vision_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    structured_result: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CourseScheduleImportItem(Base):
+    __tablename__ = "course_schedule_import_items"
+    __table_args__ = (
+        UniqueConstraint("import_id", "item_index", name="uq_course_schedule_item_index"),
+        UniqueConstraint("import_id", "normalized_key", name="uq_course_schedule_item_key"),
+        CheckConstraint(
+            "weekday IS NULL OR weekday BETWEEN 1 AND 7",
+            name="ck_course_schedule_item_weekday",
+        ),
+        CheckConstraint(
+            "status IN ('pending','running','succeeded','failed')",
+            name="ck_course_schedule_item_status",
+        ),
+        Index(
+            "ix_course_schedule_item_import_status",
+            "import_id", "status", "item_index",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    import_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_imports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    course_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    weekday: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    start_time: Mapped[time | None] = mapped_column(Time, nullable=True)
+    end_time: Mapped[time | None] = mapped_column(Time, nullable=True)
+    location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    week_rule_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    normalized_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    calendar_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class AgentRun(Base):

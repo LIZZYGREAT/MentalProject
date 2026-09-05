@@ -349,6 +349,25 @@ class ForecastMutationRefreshQueue:
 
         participant_id = uuid.UUID(row["participant_id"])
         operation_type = str(operation.get("operation_type") or "")
+        if operation_type == "course_schedule_batch_create":
+            create_event = getattr(calendar, "create_event", None)
+            requested_items = operation.get("requested")
+            if not callable(create_event) or not isinstance(requested_items, list):
+                return None
+            results = []
+            for item in requested_items:
+                if not isinstance(item, dict) or not item.get("source_message_id"):
+                    return None
+                results.append(await create_event(
+                    participant_id,
+                    summary=str(item["summary"]),
+                    description=str(item.get("description") or ""),
+                    start_time=datetime.fromisoformat(str(item["start_time"])),
+                    end_time=datetime.fromisoformat(str(item["end_time"])),
+                    recurrence=str(item.get("recurrence") or "") or None,
+                    source_message_id=str(item["source_message_id"]),
+                ))
+            return {"events": results, "replayed": True}
         requested = dict(operation.get("requested") or {})
         if operation_type == "create":
             create_event = getattr(calendar, "create_event", None)

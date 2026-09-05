@@ -46,6 +46,7 @@ services:
       CLAUDE_WORKDIR: /srv/claude-workspace
       CLAUDE_SETTINGS_PATH: /srv/claude-workspace/.claude/settings.json
       HOME: /home/mindflow
+      VISION_MAX_CONCURRENCY: ${VISION_MAX_CONCURRENCY:-1}
     volumes:
       - claude_state:/home/mindflow/.claude
     ports:

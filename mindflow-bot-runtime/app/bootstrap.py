@@ -32,6 +32,9 @@ from app.repositories_daily_review import (
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
+from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.services.course_schedule_import import CourseScheduleImportService
+from app.services.course_schedule_vision import CourseScheduleVisionService
 from app.services.daily_review_service import DailyReviewService
 from app.repositories_care import (
     CareInterventionRepository,
@@ -85,6 +88,8 @@ class BusinessServices:
     care_preferences: ParticipantCarePreferenceRepository
     care_interventions: CareInterventionRepository
     care_outcome_refresh: CareOutcomeRefreshService
+    course_schedule_imports: CourseScheduleImportService
+    course_schedule_vision: CourseScheduleVisionService
 
 
 def build_business_services(
@@ -194,6 +199,24 @@ def build_business_services(
         dependency_refresh=dependency_refresh,
     )
     care_outcome_refresh = CareOutcomeRefreshService(database)
+    course_schedule_imports = CourseScheduleImportService(
+        CourseScheduleImportRepository(database),
+        calendar,
+        token_repository,
+        timezone_name=settings.timezone_name,
+        forecast_coordinator=forecast_coordinator,
+        forecast_snapshots=forecast_snapshots,
+        mutation_refresh=mutation_refresh,
+    )
+    course_schedule_vision = CourseScheduleVisionService(
+        settings.vision_api_url,
+        settings.deepseek_api_key,
+        settings.vision_api_model,
+        enabled=settings.vision_api_enabled,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
+        max_items=settings.vision_schedule_max_items,
+    )
     card_actions = CardActionService(
         observations,
         calendar,
@@ -202,6 +225,7 @@ def build_business_services(
         observation_refresh=observation_refresh,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
     )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
@@ -254,4 +278,6 @@ def build_business_services(
         care_preferences=care_preferences,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
+        course_schedule_vision=course_schedule_vision,
     )

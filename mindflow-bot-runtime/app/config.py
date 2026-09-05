@@ -123,6 +123,14 @@ class Settings:
     semantic_api_timeout_seconds: float = 8.0
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    vision_api_enabled: bool = False
+    vision_api_url: str = "https://api.deepseek.com/chat/completions"
+    vision_api_model: str = "deepseek-v4-flash-vision-exp"
+    vision_api_timeout_seconds: float = 25.0
+    vision_max_concurrency: int = 1
+    vision_max_image_bytes: int = 8 * 1024 * 1024
+    vision_import_draft_ttl_minutes: int = 60
+    vision_schedule_max_items: int = 80
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -370,6 +378,26 @@ class Settings:
             semantic_materiality_threshold=_float(
                 values, "SEMANTIC_MATERIALITY_THRESHOLD", 0.03
             ),
+            vision_api_enabled=_bool(values, "VISION_API_ENABLED", False),
+            vision_api_url=values.get(
+                "VISION_API_URL", "https://api.deepseek.com/chat/completions"
+            ).strip(),
+            vision_api_model=values.get(
+                "VISION_API_MODEL", "deepseek-v4-flash-vision-exp"
+            ).strip(),
+            vision_api_timeout_seconds=_float(
+                values, "VISION_API_TIMEOUT_SECONDS", 25.0, minimum=0.1
+            ),
+            vision_max_concurrency=_int(values, "VISION_MAX_CONCURRENCY", 1),
+            vision_max_image_bytes=_int(
+                values, "VISION_MAX_IMAGE_BYTES", 8 * 1024 * 1024
+            ),
+            vision_import_draft_ttl_minutes=_int(
+                values, "VISION_IMPORT_DRAFT_TTL_MINUTES", 60
+            ),
+            vision_schedule_max_items=_int(
+                values, "VISION_SCHEDULE_MAX_ITEMS", 80
+            ),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
                 values, "WARNING_POLL_INTERVAL_SECONDS", 15
@@ -554,6 +582,10 @@ class Settings:
             raise ValueError(
                 "RESPONSE_SEGMENT_TARGET_CHARS must be <= RESPONSE_SEGMENT_MAX_CHARS"
             )
+        if self.vision_api_enabled and not (
+            self.vision_api_url and self.vision_api_model and self.deepseek_api_key
+        ):
+            raise ValueError("Vision API requires URL, model, and DEEPSEEK_API_KEY")
         if self.response_max_segments > 3:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:

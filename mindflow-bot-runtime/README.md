@@ -32,13 +32,14 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
 - SDK MCP 只暴露十六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
 - 飞书 `card.action.trigger` 默认通过 WebSocket/长连接进入固定后端处理器；HTTP HTTPS callback 仅作 fallback，卡片动作不经过对话模型。
+- 课程表图片只在外部模型授权存在时通过 Bot App 消息资源接口下载到内存并交给独立 Vision 配置；确认前不写 Calendar，确认者必须是 Draft 原绑定参与者。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
+<!-- ALEMBIC_HEAD: 0038_course_schedule_import -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -91,6 +92,8 @@ LLM，而由固定后端 action allowlist 处理。
 - CardAction 默认设置 `FEISHU_CARD_ACTION_TRANSPORT=ws`，在飞书开放平台用 WebSocket/长连接接收 `card.action.trigger`；此模式不需要公网 HTTPS、Verification Token 或 Encrypt Key，并保持 `FEISHU_CARD_CALLBACK_ENABLED=false`。
 - HTTP fallback 使用 `FEISHU_CARD_ACTION_TRANSPORT=http` 和 `FEISHU_CARD_CALLBACK_ENABLED=true`，同时配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。同一 CardAction 不得同时启用 WS 与 HTTP ingress。
 - `DEEPSEEK_API_KEY`
+- `VISION_API_ENABLED`、`VISION_API_URL`、`VISION_API_MODEL`、`VISION_API_TIMEOUT_SECONDS`：独立课程表 Vision 开关与 endpoint/model/timeout。
+- `VISION_MAX_CONCURRENCY`、`VISION_MAX_IMAGE_BYTES`、`VISION_IMPORT_DRAFT_TTL_MINUTES`、`VISION_SCHEDULE_MAX_ITEMS`：Vision 并发、图片、Draft 和条目上限；生产并发默认 `1`。
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 - `CLAUDE_MODEL`：主会话模型或 Claude Code alias。
 - `CLAUDE_DEFAULT_OPUS_MODEL`、`CLAUDE_DEFAULT_SONNET_MODEL`：都填写云端已验证的 DeepSeek `v4-pro` 模型 ID。
@@ -223,7 +226,7 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0037_stage6_care_jitai`。新快照使用包含 Participant Membership、画像历史、Care exposure 与
+`0038_course_schedule_import`。新快照使用包含 Participant Membership、画像历史、Care exposure 与
 runtime-active history 的 Dataset Schema v7；既有 v2–v6 快照继续按各自不可变合同评估。JSON 业务列在
 PostgreSQL 使用 JSONB。Stage 3 增加独立派生的事件 workload、随时间 W(t)、Event Appraisal
 Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Appraisal/EMA 均按历史 current

@@ -4,6 +4,103 @@ from __future__ import annotations
 
 from typing import Any
 
+
+def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
+    """Fixed schedule preview; callback carries only the opaque draft id."""
+
+    structured = dict(draft.get("structured_result") or {})
+    courses = list(structured.get("courses") or [])
+    missing = set(structured.get("missing_context") or [])
+    lines = [f"识别到 **{len(courses)}** 门课"]
+    uncertain: list[str] = []
+    weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+    for course in courses[:20]:
+        name = _safe_schedule_text(course.get("course_name") or "未命名课程")
+        weekday = course.get("weekday")
+        day = weekday_names[int(weekday) - 1] if isinstance(weekday, int) and 1 <= weekday <= 7 else "星期待确认"
+        start = course.get("start_time")
+        end = course.get("end_time")
+        period = (
+            f"{start}–{end}" if start and end
+            else f"第{course.get('period_start')}–{course.get('period_end')}节"
+            if course.get("period_start") and course.get("period_end")
+            else "时间待确认"
+        )
+        rule = dict(course.get("week_rule") or {})
+        if rule.get("explicit_weeks"):
+            week_text = ",".join(str(value) for value in rule["explicit_weeks"]) + "周"
+        else:
+            week_text = f"{rule.get('start_week')}–{rule.get('end_week')}周"
+            if rule.get("odd_even") == "odd":
+                week_text += "单周"
+            elif rule.get("odd_even") == "even":
+                week_text += "双周"
+        location = _safe_schedule_text(course.get("location") or "地点待确认")
+        lines.extend(["", f"**{name}**", f"{day} {period} · {week_text} · {location}"])
+        fields = list(course.get("uncertain_fields") or [])
+        if fields:
+            uncertain.append(f"- {name}：{', '.join(_safe_schedule_text(v) for v in fields)}")
+    if len(courses) > 20:
+        lines.extend(["", f"另有 {len(courses) - 20} 门课，确认时会一并处理。"])
+    warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]
+    if uncertain or warnings:
+        lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
+    if "semester_start_date" in missing:
+        lines.extend(["", "这张课表里没有学期第一周日期。", "告诉我第一周周一是哪天就可以继续。"])
+    if missing & {"period_time_mapping", "actual_time"}:
+        lines.extend(["", "这张课表只有“第1-2节”这类节次，没有具体上课时间。", "把学校作息时间告诉我后，我再生成日历。"])
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
+    if not missing:
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "bisect",
+            "columns": [
+                {
+                    "tag": "column", "width": "weighted", "weight": 1,
+                    "elements": [{
+                        "tag": "button", "type": "primary",
+                        "text": {"tag": "plain_text", "content": "确认添加到日历"},
+                        "behaviors": [{"type": "callback", "value": {
+                            "mindflow_action": "course_schedule_import_confirm",
+                            "version": "1", "import_id": str(draft["id"]),
+                        }}],
+                    }],
+                },
+                {
+                    "tag": "column", "width": "weighted", "weight": 1,
+                    "elements": [{
+                        "tag": "button", "type": "default",
+                        "text": {"tag": "plain_text", "content": "取消"},
+                        "behaviors": [{"type": "callback", "value": {
+                            "mindflow_action": "course_schedule_import_cancel",
+                            "version": "1", "import_id": str(draft["id"]),
+                        }}],
+                    }],
+                },
+            ],
+        })
+        lines.append("\n确认无误后，我再添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "课程表识别结果"}},
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def course_schedule_result_card(message: str) -> dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {"template": "green", "title": {"tag": "plain_text", "content": "课程表导入"}},
+        "body": {"elements": [{"tag": "markdown", "content": _safe_schedule_text(message)}]},
+    }
+
+
+def _safe_schedule_text(value: Any) -> str:
+    return str(value).replace("<", "＜").replace(">", "＞")[:500]
+
 from app.services.curve_analysis import CurveAnalysis, forecast_model_context
 
 

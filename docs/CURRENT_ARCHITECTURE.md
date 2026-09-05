@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
+<!-- ALEMBIC_HEAD: 0038_course_schedule_import -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -16,6 +16,13 @@
 MindFlow 是面向飞书私聊的 Python 后端，业务数据保存在 PostgreSQL。飞书 receiver 在独立
 进程接收事件，Bot 进程负责持久化、参与者绑定、授权、安全检查、Agent 调用、业务工具和
 可靠回复。参与者身份只来自后端绑定上下文，不从模型参数接收。
+
+文本与图片都通过同一 durable BotEvent ingress。课程表图片由 Bot App 的消息资源接口
+限时、限量下载到内存；仅在参与者已有外部模型授权时发送给独立的 DeepSeek Vision
+配置。Vision 只生成严格结构化 Draft，不选择身份、不生成卡片、不写 Calendar。Draft 与
+逐项结果持久化；只有原绑定参与者点击固定确认按钮后，才使用该参与者自己的 Calendar
+OAuth 批量创建。重复确认复用稳定幂等身份，失败重试只处理未成功项，批量结束后合并执行
+Calendar mutation invalidation、Warning reconciliation 与 Forecast refresh。
 
 ## Agent 与业务工具
 
@@ -215,7 +222,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0037_stage6_care_jitai`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0038_course_schedule_import`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot

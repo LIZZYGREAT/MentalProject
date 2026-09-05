@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
     care_intervention_result_card,
+    course_schedule_result_card,
     daily_checkin_card,
     today_calendar_card,
 )
@@ -57,6 +58,7 @@ class CardActionService:
         observation_refresh: ObservationForecastRefreshService,
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
+        course_schedule_imports: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -65,6 +67,7 @@ class CardActionService:
         self.observation_refresh = observation_refresh
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
+        self.course_schedule_imports = course_schedule_imports
 
     @staticmethod
     def _fallback_event_id(
@@ -96,6 +99,32 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "course_schedule_import_confirm", "course_schedule_import_cancel"
+        }:
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule import id is invalid") from exc
+            if action_name.endswith("_cancel"):
+                result = self.course_schedule_imports.cancel(participant_id, import_id)
+            else:
+                import asyncio
+
+                result = asyncio.run(
+                    self.course_schedule_imports.confirm(participant_id, import_id)
+                )
+            reply_text = str(result.get("reply_text") or "课程表操作已处理。")
+            # Missing Calendar authorization is a valid, non-mutating outcome.
+            return {
+                **result,
+                "ok": True,
+                "card": course_schedule_result_card(reply_text),
+            }
         if action_name.startswith("care_"):
             if self.care_interventions is None:
                 raise RuntimeError("care intervention service is unavailable")
