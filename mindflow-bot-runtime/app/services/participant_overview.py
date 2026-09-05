@@ -169,6 +169,8 @@ class ParticipantOverviewService:
                     DailyReviewResponse.participant_id == participant_id,
                     DailyReviewResponse.local_date >= start_14,
                     DailyReviewResponse.local_date <= through,
+                    DailyReviewResponse.submitted_at < upper,
+                    DailyReviewResponse.created_at < upper,
                 )
                 .distinct()
             ).scalars().all()
@@ -185,6 +187,7 @@ class ParticipantOverviewService:
                     CareInterventionEvent.participant_id == participant_id,
                     CareInterventionEvent.scheduled_at >= lower_28,
                     CareInterventionEvent.scheduled_at < upper,
+                    CareInterventionEvent.created_at < upper,
                 )
             ).scalars().all()
             last_message_at = session.scalar(
@@ -344,7 +347,10 @@ class ParticipantOverviewService:
         )
 
         care_effect = self.care_effects.descriptive_effects(
-            start_28, through, participant_id=participant_id
+            start_28,
+            through,
+            participant_id=participant_id,
+            knowledge_cutoff=upper,
         )
         care_summary = dict(care_effect.get("summary") or {})
         assessments: list[dict[str, Any]] = []

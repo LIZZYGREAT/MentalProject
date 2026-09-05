@@ -261,9 +261,15 @@ class CareEffectivenessService:
         date_end: date,
         *,
         participant_id: uuid.UUID | None = None,
+        knowledge_cutoff: datetime | None = None,
     ) -> dict[str, Any]:
         start = datetime.combine(date_start, time.min, self.timezone).astimezone(timezone.utc)
         end = datetime.combine(date_end + timedelta(days=1), time.min, self.timezone).astimezone(timezone.utc)
+        cutoff = (
+            _aware(knowledge_cutoff).astimezone(timezone.utc)
+            if knowledge_cutoff is not None
+            else None
+        )
         with self.database.session() as session:
             query = select(CareInterventionEvent, CareInterventionOutcome).join(
                 CareInterventionOutcome,
@@ -276,6 +282,13 @@ class CareEffectivenessService:
                 query = query.where(
                     CareInterventionEvent.participant_id == participant_id
                 )
+            if cutoff is not None:
+                query = query.where(
+                    CareInterventionEvent.sent_at < cutoff,
+                    CareInterventionEvent.created_at < cutoff,
+                    CareInterventionOutcome.created_at < cutoff,
+                    CareInterventionOutcome.updated_at < cutoff,
+                )
             rows = session.execute(query).all()
             mrt_query = select(InterventionRandomizationEvent.id).where(
                 InterventionRandomizationEvent.decision_time >= start,
@@ -284,6 +297,10 @@ class CareEffectivenessService:
             if participant_id is not None:
                 mrt_query = mrt_query.where(
                     InterventionRandomizationEvent.participant_id == participant_id
+                )
+            if cutoff is not None:
+                mrt_query = mrt_query.where(
+                    InterventionRandomizationEvent.created_at < cutoff
                 )
             mrt_count = session.scalar(mrt_query.limit(1))
         grouped: dict[tuple[str, str, str, str], list[tuple[Any, Any]]] = defaultdict(list)

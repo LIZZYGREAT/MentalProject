@@ -1,10 +1,13 @@
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import uuid
 
 from starlette.testclient import TestClient
 
 from app.admin_web.main import create_app
 from app.models import (
+    CareInterventionEvent,
+    CareInterventionOutcome,
+    DailyReviewResponse,
     DatasetSnapshot,
     ForecastSnapshot,
     LearnedModelProfile,
@@ -14,6 +17,7 @@ from app.models import (
     ParticipantProfile,
     ParticipantSlowState,
     StateObservation,
+    WarningSchedule,
 )
 from app.repositories import (
     ForecastSnapshotRepository,
@@ -141,6 +145,7 @@ def _save_forecast(
         session.get(ForecastSnapshot, uuid.UUID(saved["id"])).generated_at = datetime.combine(
             min(local_date, date(2026, 9, 4)), time(1), tzinfo=timezone.utc
         )
+    return uuid.UUID(saved["id"])
 
 
 def test_full_overview_has_sourced_dimensions_and_evidence_assessments():
@@ -270,6 +275,189 @@ def test_historical_through_excludes_future_observation():
 
     assert result["current_state"]["stress_0_10"] == 4.2
     assert result["current_state"]["latest_observed_at"].startswith("2026-09-03")
+
+
+def test_historical_through_excludes_daily_review_submitted_after_cutoff():
+    database = memory_database()
+    user = participant(database, "P-LATE-REVIEW")
+    submitted_at = datetime(2026, 9, 3, 16, 30, tzinfo=timezone.utc)
+    with database.session() as session:
+        session.get(Participant, user.id).created_at = datetime(
+            2026, 8, 20, tzinfo=timezone.utc
+        )
+        session.add(
+            DailyReviewResponse(
+                participant_id=user.id,
+                local_date=date(2026, 9, 3),
+                revision=1,
+                card_version="daily-review.v1",
+                callback_event_id="late-review",
+                submitted_at=submitted_at,
+                start_stress=4.0,
+                start_energy=6.0,
+                peak_stress=7.0,
+                peak_period="afternoon",
+                end_stress=5.0,
+                end_energy=4.0,
+                raw_json={},
+                created_at=submitted_at,
+            )
+        )
+
+    historical = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 3)
+    )
+    current = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 4)
+    )
+
+    assert historical["behavior_summary"]["daily_review_completed_days"] == 0
+    assert historical["behavior_summary"]["daily_review_completion_rate_14d"] == 0.0
+    assert current["behavior_summary"]["daily_review_completed_days"] == 1
+    assert current["behavior_summary"]["daily_review_completion_rate_14d"] > 0
+
+
+def _seed_care_intervention(
+    database,
+    participant_id,
+    *,
+    scheduled_at,
+    created_at,
+    receptivity=0.9,
+    outcome_created_at=None,
+    outcome_updated_at=None,
+):
+    local_date = scheduled_at.astimezone(timezone(timedelta(hours=8))).date()
+    forecast_id = _save_forecast(
+        database,
+        participant_id,
+        local_date,
+        version=f"care-{uuid.uuid4()}",
+    )
+    warning_id = uuid.uuid4()
+    intervention_id = uuid.uuid4()
+    with database.session() as session:
+        session.add(
+            WarningSchedule(
+                id=warning_id,
+                participant_id=participant_id,
+                local_date=local_date,
+                forecast_id=forecast_id,
+                forecast_version="care-overview-test",
+                warning_identity=str(warning_id),
+                episode_identity=str(intervention_id),
+                target_time=scheduled_at,
+                risk_time=scheduled_at + timedelta(minutes=30),
+                authorization_deadline=scheduled_at + timedelta(minutes=10),
+                valid_until=scheduled_at + timedelta(hours=1),
+                warning_level="2",
+                status="sent",
+                payload_json={},
+                authorized_at=scheduled_at,
+                sent_at=scheduled_at,
+                updated_at=created_at,
+            )
+        )
+        session.add(
+            CareInterventionEvent(
+                id=intervention_id,
+                participant_id=participant_id,
+                source_warning_id=warning_id,
+                source_forecast_id=forecast_id,
+                forecast_version="care-overview-test",
+                intervention_type="protected_break",
+                template_id="protected-break-v1",
+                template_version="1.0.0",
+                reason_code="overview-cutoff-test",
+                vulnerability_score=0.8,
+                receptivity_score=receptivity,
+                decision_score=0.72,
+                decision_json={"observational_only": True},
+                scheduled_at=scheduled_at,
+                sent_at=scheduled_at,
+                status="sent",
+                delivery_status="sent",
+                message_text="test",
+                context_json={},
+                actions_json=[],
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        if outcome_created_at is not None:
+            session.add(
+                CareInterventionOutcome(
+                    intervention_id=intervention_id,
+                    participant_id=participant_id,
+                    baseline_state={
+                        "predicted_baseline": {"stress_0_10": 7.0},
+                        "observed_baseline": {"stress_0_10": 7.0},
+                    },
+                    followup_30m={
+                        "observed_stress_change": -1.0,
+                        "forecast_residual": -1.0,
+                    },
+                    helpful_rating=1.0,
+                    context_json={"observational_only": True},
+                    created_at=outcome_created_at,
+                    updated_at=outcome_updated_at or outcome_created_at,
+                )
+            )
+    return intervention_id
+
+
+def test_historical_through_excludes_care_intervention_created_after_cutoff():
+    database = memory_database()
+    user = participant(database, "P-LATE-CARE")
+    _seed_care_intervention(
+        database,
+        user.id,
+        scheduled_at=datetime(2026, 9, 3, 8, tzinfo=timezone.utc),
+        created_at=datetime(2026, 9, 3, 17, tzinfo=timezone.utc),
+    )
+
+    historical = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 3)
+    )
+    current = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 4)
+    )
+
+    historical_dimensions = {
+        item["key"] for item in historical["profile_dimensions"]
+    }
+    current_dimensions = {
+        item["key"]: item for item in current["profile_dimensions"]
+    }
+    assert "receptivity" not in historical_dimensions
+    assert current_dimensions["receptivity"]["score_0_100"] == 90.0
+
+
+def test_historical_through_excludes_care_outcome_updated_after_cutoff():
+    database = memory_database()
+    user = participant(database, "P-LATE-CARE-OUTCOME")
+    _seed_care_intervention(
+        database,
+        user.id,
+        scheduled_at=datetime(2026, 9, 3, 8, tzinfo=timezone.utc),
+        created_at=datetime(2026, 9, 3, 8, tzinfo=timezone.utc),
+        outcome_created_at=datetime(2026, 9, 3, 9, tzinfo=timezone.utc),
+        outcome_updated_at=datetime(2026, 9, 3, 17, tzinfo=timezone.utc),
+    )
+
+    historical = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 3)
+    )
+    current = ParticipantOverviewService(database, "Asia/Shanghai").build(
+        user.id, through=date(2026, 9, 4)
+    )
+
+    assert historical["care_summary"]["total_sample_count"] == 0
+    assert historical["care_summary"]["helpful_sample_count"] == 0
+    assert historical["care_summary"]["followup_30m_sample_count"] == 0
+    assert current["care_summary"]["total_sample_count"] == 1
+    assert current["care_summary"]["helpful_sample_count"] == 1
+    assert current["care_summary"]["followup_30m_sample_count"] == 1
 
 
 def _learned_profile(
