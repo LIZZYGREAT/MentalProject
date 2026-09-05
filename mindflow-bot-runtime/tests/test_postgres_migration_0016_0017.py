@@ -10,6 +10,7 @@ import uuid
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
@@ -83,6 +84,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
     )
     config = Config(str(RUNTIME_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(RUNTIME_ROOT / "migrations"))
+    expected_head = ScriptDirectory.from_config(config).get_current_head()
 
     try:
         with engine.begin() as connection:
@@ -990,7 +992,7 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
             command.upgrade(config, "head")
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0037_stage6_care_jitai"
+            ) == expected_head
 
             stage6_inspector = inspect(connection)
             warning_columns = {
