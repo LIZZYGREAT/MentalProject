@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0038_course_schedule_import -->
+<!-- ALEMBIC_HEAD: 0039_course_schedule_recurrence_strategy -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -24,8 +24,11 @@ MindFlow 是面向飞书私聊的 Python 后端，业务数据保存在 PostgreS
 OAuth 批量创建。重复确认复用稳定幂等身份，失败重试只处理未成功项，批量结束后合并执行
 Calendar mutation invalidation、Warning reconciliation 与 Forecast refresh。Draft 的 running 状态使用
 10 分钟可续租 claim，过期后重置未落账的 running item 并恢复处理；整个图片下载、校验、编码、
-Vision 请求、严格解析与 Draft 创建共享同一并发上限。V1 只允许交互补齐学期首周周一与节次
-作息映射，并将完整预览和可确认导入限制为最多 20 项。
+Vision 请求、严格解析与 Draft 创建共享同一并发上限；同步图片下载超时后，底层线程真正结束前
+仍占用下载槽。V1 使用版本化的 1–14 节默认作息，只允许交互补齐学期首周周一与超出默认范围的
+节次作息映射，并将完整预览和可确认导入限制为最多 20 项。上下文完整后，用户必须明确选择保留
+课表周期或全部展开为单次日程；该策略在首次 Calendar 写入前持久化，写入开始后不可更改，并参与
+幂等键、授权恢复、部分失败重试和 stale-running 恢复。
 
 ## Agent 与业务工具
 
@@ -225,7 +228,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0038_course_schedule_import`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0039_course_schedule_recurrence_strategy`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot

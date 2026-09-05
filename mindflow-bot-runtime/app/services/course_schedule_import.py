@@ -3,30 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 import logging
 from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from app.integrations.feishu.calendar import build_recurrence_rule
+from app.domain.course_schedule_periods import DEFAULT_PERIOD_MAP_VERSION
+from app.domain.course_schedule_recurrence import (
+    COURSE_IMPORT_PLANNER_VERSION,
+    PRESERVE_SCHEDULE_PATTERN,
+    CalendarWrite,
+    CalendarWriteKind,
+    course_weeks,
+    plan_course_writes,
+)
 from app.repositories_course_schedule import CourseScheduleImportRepository
 
 
 logger = logging.getLogger(__name__)
-_WEEKDAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
-
-
-@dataclass(frozen=True)
-class CalendarWrite:
-    summary: str
-    start_time: datetime
-    end_time: datetime
-    description: str
-    recurrence: str | None
-    occurrence_identity: str
-    affected_dates: tuple[date, ...]
 
 
 class CourseScheduleImportService:
@@ -40,6 +35,7 @@ class CourseScheduleImportService:
         forecast_coordinator: Any = None,
         forecast_snapshots: Any = None,
         mutation_refresh: Any = None,
+        max_calendar_writes: int = 400,
     ) -> None:
         self.drafts = drafts
         self.calendar = calendar
@@ -48,23 +44,77 @@ class CourseScheduleImportService:
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
         self.mutation_refresh = mutation_refresh
+        self.max_calendar_writes = max(1, int(max_calendar_writes))
 
     async def confirm(
-        self, participant_id: uuid.UUID, import_id: uuid.UUID | str
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        recurrence_strategy: str | None = None,
     ) -> dict[str, Any]:
-        draft = await asyncio.to_thread(self.drafts.get, import_id)
-        self._require_owner(draft, participant_id)
+        draft = await asyncio.to_thread(
+            self.drafts.validate_for_confirmation, participant_id, import_id
+        )
         if draft["status"] == "succeeded":
             return self._result(draft, already_completed=True)
+        if recurrence_strategy is not None:
+            draft = await asyncio.to_thread(
+                self.drafts.set_recurrence_strategy,
+                participant_id,
+                import_id,
+                recurrence_strategy,
+            )
+        strategy = str(draft.get("recurrence_strategy") or "")
+        if not strategy:
+            return {
+                "ok": False,
+                "error": "recurrence_strategy_required",
+                "status": draft["status"],
+                "import_id": draft["id"],
+                "reply_text": "请先选择按课表周期添加，还是全部拆成单次日程。",
+            }
         if not self._calendar_write_enabled(participant_id):
             return {
                 "ok": False,
                 "error": "calendar_not_connected",
                 "status": draft["status"],
                 "import_id": draft["id"],
+                "recurrence_strategy": strategy,
                 "reply_text": (
                     "课程表还没添加\n\n还差一步日历授权。\n"
                     "发送 /calendar 完成授权后，再回来点确认。"
+                ),
+            }
+
+        writes_by_item: dict[str, list[CalendarWrite]] = {}
+        all_dates: set[date] = set()
+        draft_timezone = ZoneInfo(str(draft.get("timezone") or self.timezone.key))
+        for item in draft["items"]:
+            if item["status"] == "succeeded":
+                continue
+            writes = plan_course_writes(
+                draft,
+                item,
+                strategy=strategy,
+                timezone=draft_timezone,
+            )
+            writes_by_item[item["id"]] = writes
+            for write in writes:
+                all_dates.update(write.affected_dates)
+        planned_writes = sum(len(writes) for writes in writes_by_item.values())
+        if planned_writes > self.max_calendar_writes:
+            return {
+                "ok": False,
+                "error": "calendar_write_limit_exceeded",
+                "status": draft["status"],
+                "import_id": draft["id"],
+                "recurrence_strategy": strategy,
+                "planned_writes": planned_writes,
+                "reply_text": (
+                    f"按“全部拆成单次日程”会生成 {planned_writes} 个日程，"
+                    "超过当前一次导入上限。可以改用“按课表周期规则添加”，"
+                    "或缩小导入范围。"
                 ),
             }
         claimed = await asyncio.to_thread(
@@ -75,6 +125,8 @@ class CourseScheduleImportService:
                 return {
                     "ok": True,
                     "status": "running",
+                    "import_id": claimed["id"],
+                    "recurrence_strategy": strategy,
                     "succeeded": sum(
                         item["status"] == "succeeded" for item in claimed["items"]
                     ),
@@ -82,16 +134,6 @@ class CourseScheduleImportService:
                     "reply_text": "这份课程表正在添加，请不要重复操作。",
                 }
             return self._result(claimed, already_completed=claimed["status"] == "succeeded")
-
-        writes_by_item: dict[str, list[CalendarWrite]] = {}
-        all_dates: set[date] = set()
-        for item in claimed["items"]:
-            if item["status"] == "succeeded":
-                continue
-            writes = normalize_import_item(claimed, item, timezone=self.timezone)
-            writes_by_item[item["id"]] = writes
-            for write in writes:
-                all_dates.update(write.affected_dates)
 
         reconciliation = await self._prepare_reconciliation(
             participant_id, claimed, all_dates, writes_by_item
@@ -111,18 +153,23 @@ class CourseScheduleImportService:
                     await asyncio.to_thread(
                         self.drafts.renew_run_lease, import_id
                     )
-                    created = await self.calendar.create_event(
-                        participant_id,
-                        summary=write.summary,
-                        start_time=write.start_time,
-                        end_time=write.end_time,
-                        description=write.description,
-                        recurrence=write.recurrence,
-                        source_message_id=(
-                            f"schedule:{claimed['id']}:{item['normalized_key']}:"
-                            f"{write.occurrence_identity}"
-                        ),
+                    create = (
+                        self.calendar.create_recurring_event
+                        if write.write_kind == CalendarWriteKind.RECURRING
+                        else self.calendar.create_single_event
                     )
+                    create_args = {
+                        "summary": write.summary,
+                        "start_time": write.start_time,
+                        "end_time": write.end_time,
+                        "description": write.description,
+                        "source_message_id": self._source_identity(
+                            claimed, item, write, strategy
+                        ),
+                    }
+                    if write.write_kind == CalendarWriteKind.RECURRING:
+                        create_args["recurrence"] = write.recurrence
+                    created = await create(participant_id, **create_args)
                     last_event_id = str((created or {}).get("id") or "") or last_event_id
                     any_success = True
             except PermissionError:
@@ -213,6 +260,9 @@ class CourseScheduleImportService:
                 "operation_type": "course_schedule_batch_create",
                 "import_id": draft["id"],
                 "source_message_id": draft["source_message_id"],
+                "planner_version": COURSE_IMPORT_PLANNER_VERSION,
+                "period_map_version": DEFAULT_PERIOD_MAP_VERSION,
+                "recurrence_strategy": draft["recurrence_strategy"],
                 "requested": [
                     {
                         "summary": write.summary,
@@ -220,9 +270,12 @@ class CourseScheduleImportService:
                         "start_time": write.start_time.isoformat(),
                         "end_time": write.end_time.isoformat(),
                         "recurrence": write.recurrence or "",
-                        "source_message_id": (
-                            f"schedule:{draft['id']}:{item['normalized_key']}:"
-                            f"{write.occurrence_identity}"
+                        "write_kind": write.write_kind,
+                        "source_message_id": self._source_identity(
+                            draft,
+                            item,
+                            write,
+                            draft["recurrence_strategy"],
                         ),
                     }
                     for item in draft["items"]
@@ -334,96 +387,67 @@ class CourseScheduleImportService:
     def _result(draft: dict[str, Any], *, already_completed: bool = False) -> dict[str, Any]:
         succeeded = sum(item["status"] == "succeeded" for item in draft["items"])
         failed = sum(item["status"] == "failed" for item in draft["items"])
+        strategy_label = (
+            "按课表周期规则"
+            if draft.get("recurrence_strategy") == PRESERVE_SCHEDULE_PATTERN
+            else "全部单次"
+        )
+        strategy_text = f"\n当前导入方式：{strategy_label}。"
+        authorization_lost = any(
+            item["status"] == "failed"
+            and item.get("error_code") == "calendar_not_connected"
+            for item in draft["items"]
+        )
         if already_completed:
             text = "这份课程表已经添加过了，无需重复操作。"
+        elif authorization_lost:
+            text = (
+                "部分课程已经添加。\n剩余课程需要重新完成 /calendar 授权；"
+                "授权后可继续重试，不会重复已经成功的课程。"
+                + strategy_text
+            )
         elif failed:
-            text = f"已添加 {succeeded} 项，有 {failed} 项没能添加。\n你可以稍后只重试失败的内容。"
+            text = (
+                f"已添加 {succeeded} 项，有 {failed} 项没能添加。\n"
+                "你可以稍后只重试失败的内容。"
+                + strategy_text
+            )
         else:
             text = f"已添加 {succeeded} 项课程到日历。"
         return {
             "ok": failed == 0,
             "status": draft["status"],
             "import_id": draft["id"],
+            "recurrence_strategy": draft.get("recurrence_strategy"),
             "succeeded": succeeded,
             "failed": failed,
+            **({"error": "calendar_not_connected"} if authorization_lost else {}),
             "reply_text": text,
         }
+
+    @staticmethod
+    def _source_identity(
+        draft: dict[str, Any],
+        item: dict[str, Any],
+        write: CalendarWrite,
+        strategy: str,
+    ) -> str:
+        return (
+            f"schedule:{draft['id']}:{strategy}:{item['normalized_key']}:"
+            f"{write.occurrence_identity}"
+        )
 
 
 def normalize_import_item(
     draft: dict[str, Any], item: dict[str, Any], *, timezone: ZoneInfo
 ) -> list[CalendarWrite]:
-    if not draft.get("semester_start_date"):
-        raise ValueError("semester_start_date is required")
-    if item.get("weekday") is None or not item.get("start_time") or not item.get("end_time"):
-        raise ValueError("course item is missing actual date or time context")
-    semester_monday = date.fromisoformat(draft["semester_start_date"])
-    if semester_monday.weekday() != 0:
-        raise ValueError("semester_start_date must be a Monday")
-    weekday = int(item["weekday"])
-    rule = dict(item.get("week_rule") or {})
-    weeks = _weeks(rule)
-    start_clock = time.fromisoformat(item["start_time"])
-    end_clock = time.fromisoformat(item["end_time"])
-    description = "\n".join(
-        value for value in (
-            f"地点：{item['location']}" if item.get("location") else "",
-            "由 MindFlow 课程表导入",
-        ) if value
+    return plan_course_writes(
+        draft,
+        item,
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone,
     )
-    dates = tuple(
-        semester_monday + timedelta(weeks=week - 1, days=weekday - 1)
-        for week in weeks
-    )
-    explicit = rule.get("explicit_weeks") is not None
-    odd_even = str(rule.get("odd_even") or "all")
-    if explicit:
-        return [
-            CalendarWrite(
-                summary=item["course_name"],
-                start_time=datetime.combine(target, start_clock, timezone),
-                end_time=datetime.combine(target, end_clock, timezone),
-                description=description,
-                recurrence=None,
-                occurrence_identity=f"week-{week}",
-                affected_dates=(target,),
-            )
-            for week, target in zip(weeks, dates)
-        ]
-    interval = 1 if odd_even == "all" else 2
-    recurrence = build_recurrence_rule(
-        "WEEKLY",
-        interval=interval,
-        weekdays=[_WEEKDAYS[weekday - 1]],
-        count=len(weeks),
-    )
-    return [
-        CalendarWrite(
-            summary=item["course_name"],
-            start_time=datetime.combine(dates[0], start_clock, timezone),
-            end_time=datetime.combine(dates[0], end_clock, timezone),
-            description=description,
-            recurrence=recurrence,
-            occurrence_identity=f"weeks-{weeks[0]}-{weeks[-1]}-{odd_even}",
-            affected_dates=dates,
-        )
-    ]
 
 
 def _weeks(rule: dict[str, Any]) -> list[int]:
-    explicit = rule.get("explicit_weeks")
-    if explicit is not None:
-        result = sorted({int(value) for value in explicit})
-    else:
-        start = int(rule["start_week"])
-        end = int(rule["end_week"])
-        odd_even = str(rule.get("odd_even") or "all")
-        result = [
-            week for week in range(start, end + 1)
-            if odd_even == "all"
-            or (odd_even == "odd" and week % 2 == 1)
-            or (odd_even == "even" and week % 2 == 0)
-        ]
-    if not result:
-        raise ValueError("week rule has no occurrences")
-    return result
+    return course_weeks(rule)

@@ -136,7 +136,8 @@ class ScheduleVisionResult:
         courses_raw = value.get("courses")
         if not isinstance(courses_raw, list):
             raise ScheduleVisionValidationError("courses must be a list")
-        if len(courses_raw) > max_items:
+        effective_max_items = min(20, max(1, int(max_items)))
+        if len(courses_raw) > effective_max_items:
             raise ScheduleVisionValidationError("course item limit exceeded")
         courses = tuple(CourseScheduleItem.from_dict(item) for item in courses_raw)
         if document_type == "course_schedule" and not courses:

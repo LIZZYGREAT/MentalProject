@@ -131,6 +131,7 @@ class Settings:
     vision_max_image_bytes: int = 8 * 1024 * 1024
     vision_import_draft_ttl_minutes: int = 60
     vision_schedule_max_items: int = 20
+    vision_schedule_max_calendar_writes: int = 400
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -398,6 +399,9 @@ class Settings:
             vision_schedule_max_items=_int(
                 values, "VISION_SCHEDULE_MAX_ITEMS", 20
             ),
+            vision_schedule_max_calendar_writes=_int(
+                values, "VISION_SCHEDULE_MAX_CALENDAR_WRITES", 400
+            ),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
                 values, "WARNING_POLL_INTERVAL_SECONDS", 15
@@ -586,6 +590,8 @@ class Settings:
             self.vision_api_url and self.vision_api_model and self.deepseek_api_key
         ):
             raise ValueError("Vision API requires URL, model, and DEEPSEEK_API_KEY")
+        if self.vision_schedule_max_items > 20:
+            raise ValueError("VISION_SCHEDULE_MAX_ITEMS must be <= 20")
         if self.response_max_segments > 3:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:

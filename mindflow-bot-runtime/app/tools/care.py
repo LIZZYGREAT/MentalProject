@@ -132,6 +132,36 @@ def _recurrence_from_args(args: dict[str, Any], timezone_value: ZoneInfo) -> str
     return recurrence
 
 
+def _creation_recurrence_from_args(
+    args: dict[str, Any], timezone_value: ZoneInfo
+) -> tuple[str, str | None]:
+    mode = str(args.get("recurrence_mode") or "").strip().lower()
+    provided = {
+        name
+        for name in (
+            "recurrence_frequency",
+            "recurrence_weekdays",
+            "recurrence_count",
+            "recurrence_until",
+        )
+        if args.get(name) not in (None, "", [])
+    }
+    if args.get("recurrence_interval") not in (None, 1):
+        provided.add("recurrence_interval")
+    if mode == "single":
+        if provided:
+            raise ValueError("single calendar event cannot include recurrence fields")
+        return mode, None
+    if mode == "recurring":
+        if not args.get("recurrence_frequency"):
+            raise ValueError("recurring calendar event requires recurrence_frequency")
+        recurrence = _recurrence_from_args(args, timezone_value)
+        if not recurrence:
+            raise ValueError("recurring calendar event requires recurrence_frequency")
+        return mode, recurrence
+    raise ValueError("recurrence_mode must be single or recurring")
+
+
 def _validate_generated_weekly_recurrence(
     recurrence: str | None, start_time: datetime
 ) -> None:
@@ -446,6 +476,10 @@ class CareTools:
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "recurrence_mode": {
+                        "type": "string",
+                        "enum": ["single", "recurring"],
+                    },
                     "start_time": {
                         "type": "string",
                         "format": "date-time",
@@ -464,7 +498,9 @@ class CareTools:
                     },
                     **_recurrence_schema_properties(),
                 },
-                "required": ["summary", "start_time", "end_time"],
+                "required": [
+                    "summary", "start_time", "end_time", "recurrence_mode"
+                ],
                 "additionalProperties": False,
             },
             self.create_calendar_event,
@@ -1250,7 +1286,9 @@ class CareTools:
     ) -> dict[str, Any]:
         start_time = _parse_datetime(args["start_time"], self.timezone)
         end_time = _parse_datetime(args["end_time"], self.timezone)
-        recurrence = _recurrence_from_args(args, self.timezone)
+        recurrence_mode, recurrence = _creation_recurrence_from_args(
+            args, self.timezone
+        )
         requested_event = {
             "summary": str(args["summary"]),
             "description": str(args.get("description") or ""),
@@ -1276,16 +1314,22 @@ class CareTools:
             },
         )
         try:
-            event = await self.calendar.create_event(
-                ctx.participant_id,
-                summary=str(args["summary"]),
-                description=str(args.get("description") or ""),
-                start_time=start_time,
-                end_time=end_time,
-                reminder_minutes=args.get("reminder_minutes"),
-                recurrence=recurrence,
-                source_message_id=ctx.message_id,
+            create = (
+                self.calendar.create_single_event
+                if recurrence_mode == "single"
+                else self.calendar.create_recurring_event
             )
+            create_args = {
+                "summary": str(args["summary"]),
+                "description": str(args.get("description") or ""),
+                "start_time": start_time,
+                "end_time": end_time,
+                "reminder_minutes": args.get("reminder_minutes"),
+                "source_message_id": ctx.message_id,
+            }
+            if recurrence_mode == "recurring":
+                create_args["recurrence"] = recurrence
+            event = await create(ctx.participant_id, **create_args)
         except PermissionError as exc:
             await self._finish_remote_mutation_intent(
                 reconciliation, error=exc

@@ -207,6 +207,7 @@ def build_business_services(
         forecast_coordinator=forecast_coordinator,
         forecast_snapshots=forecast_snapshots,
         mutation_refresh=mutation_refresh,
+        max_calendar_writes=settings.vision_schedule_max_calendar_writes,
     )
     course_schedule_vision = CourseScheduleVisionService(
         settings.vision_api_url,

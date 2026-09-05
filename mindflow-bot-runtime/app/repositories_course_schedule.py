@@ -13,10 +13,20 @@ from sqlalchemy.exc import IntegrityError
 
 from app.contracts.course_schedule import ScheduleVisionResult
 from app.db import Database
+from app.domain.course_schedule_periods import (
+    DEFAULT_PERIOD_MAP_VERSION,
+    resolve_period_time,
+    split_period_mapping,
+)
+from app.domain.course_schedule_recurrence import (
+    COURSE_IMPORT_PLANNER_VERSION,
+    RECURRENCE_STRATEGIES,
+)
 from app.models import CourseScheduleImport, CourseScheduleImportItem
 
 
-ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation", "partial_failed"}
+ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
+EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
 INTERACTIVE_CONTEXT_FIELDS = {"semester_start_date", "period_time_mapping"}
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
 
@@ -48,13 +58,11 @@ class CourseScheduleImportRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         created_at = _aware(now or datetime.now(timezone.utc))
-        missing = derive_required_context(
-            result, semester_start_date=semester_start_date
-        )
+        structured = _prepare_structured_result(result)
+        missing = derive_required_context(result, semester_start_date=semester_start_date)
         unsupported = missing - INTERACTIVE_CONTEXT_FIELDS
         if unsupported:
             raise UnfillableScheduleContextError(unsupported)
-        structured = result.to_dict()
         structured["missing_context"] = sorted(missing)
         row = CourseScheduleImport(
             participant_id=participant_id,
@@ -73,12 +81,16 @@ class CourseScheduleImportRepository:
                 session.add(row)
                 session.flush()
                 for index, course in enumerate(result.courses):
+                    persisted_course = structured["courses"][index]
                     key_payload = {
                         "index": index,
                         "course": course.course_name,
                         "weekday": course.weekday,
                         "period": [course.period_start, course.period_end],
-                        "time": [course.start_time, course.end_time],
+                        "time": [
+                            persisted_course.get("start_time"),
+                            persisted_course.get("end_time"),
+                        ],
                         "location": course.location,
                         "week_rule": {
                             "start_week": course.week_rule.start_week,
@@ -99,8 +111,8 @@ class CourseScheduleImportRepository:
                             item_index=index,
                             course_name=course.course_name,
                             weekday=course.weekday,
-                            start_time=_parse_time(course.start_time),
-                            end_time=_parse_time(course.end_time),
+                            start_time=_parse_time(persisted_course.get("start_time")),
+                            end_time=_parse_time(persisted_course.get("end_time")),
                             location=course.location,
                             week_rule_json=key_payload["week_rule"],
                             normalized_key=normalized_key,
@@ -138,7 +150,10 @@ class CourseScheduleImportRepository:
             row = session.execute(
                 select(CourseScheduleImport).where(
                     CourseScheduleImport.participant_id == participant_id,
-                    CourseScheduleImport.status == "pending_context",
+                    CourseScheduleImport.status.in_(
+                        ["pending_context", "pending_confirmation"]
+                    ),
+                    CourseScheduleImport.recurrence_strategy.is_(None),
                     CourseScheduleImport.expires_at > now,
                 ).order_by(CourseScheduleImport.created_at.desc()).limit(1)
             ).scalar_one_or_none()
@@ -153,7 +168,7 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             self._expire_if_needed(row, session)
-            if row.status not in ACTIVE_DRAFT_STATUSES:
+            if row.status not in ACTIVE_DRAFT_STATUSES or row.recurrence_strategy:
                 raise ValueError("draft no longer accepts context")
             row.semester_start_date = value
             structured = dict(row.structured_result or {})
@@ -169,39 +184,95 @@ class CourseScheduleImportRepository:
         self,
         participant_id: uuid.UUID,
         import_id: uuid.UUID | str,
-        mapping: dict[tuple[int, int], tuple[time, time]],
+        mapping: dict[int | tuple[int, int], tuple[time, time]],
     ) -> dict[str, Any]:
         if not mapping:
             raise ValueError("period time mapping is empty")
-        if any(end <= start for start, end in mapping.values()):
-            raise ValueError("period end time must be after start time")
+        singles, ranges = split_period_mapping(mapping)
         with self.database.session() as session:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
             self._require_owner(row, participant_id)
             self._expire_if_needed(row, session)
-            if row.status not in ACTIVE_DRAFT_STATUSES:
+            if row.status not in ACTIVE_DRAFT_STATUSES or row.recurrence_strategy:
                 raise ValueError("draft no longer accepts context")
             structured = dict(row.structured_result or {})
             courses = [dict(value) for value in structured.get("courses") or []]
+            metadata = dict(structured.get("_metadata") or {})
+            sources = list(metadata.get("course_time_sources") or [])
+            sources.extend([None] * (len(courses) - len(sources)))
             items = self._items(session, row.id)
-            for course, item in zip(courses, items):
-                key = (course.get("period_start"), course.get("period_end"))
-                if key in mapping:
-                    start_clock, end_clock = mapping[key]
-                    course["start_time"] = start_clock.strftime("%H:%M")
-                    course["end_time"] = end_clock.strftime("%H:%M")
-                    item.start_time = start_clock
-                    item.end_time = end_clock
+            for index, (course, item) in enumerate(zip(courses, items)):
+                if sources[index] == "image":
+                    continue
+                resolved = resolve_period_time(
+                    course.get("period_start"),
+                    course.get("period_end"),
+                    period_mapping=singles,
+                    range_overrides=ranges,
+                )
+                if resolved is None:
+                    continue
+                start_clock, end_clock, source = resolved
+                course["start_time"] = start_clock.strftime("%H:%M")
+                course["end_time"] = end_clock.strftime("%H:%M")
+                item.start_time = start_clock
+                item.end_time = end_clock
+                sources[index] = source
             missing = set(structured.get("missing_context") or [])
             if all(course.get("start_time") and course.get("end_time") for course in courses):
                 missing.discard("period_time_mapping")
                 missing.discard("actual_time")
             structured["courses"] = courses
             structured["missing_context"] = sorted(missing)
+            metadata["course_time_sources"] = sources
+            structured["_metadata"] = metadata
             row.structured_result = structured
             row.status = "pending_context" if missing else "pending_confirmation"
+            session.flush()
+            return self._view(session, row)
+
+    def validate_for_confirmation(
+        self, participant_id: uuid.UUID, import_id: uuid.UUID | str
+    ) -> dict[str, Any]:
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session)
+            return self._view(session, row)
+
+    def set_recurrence_strategy(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        strategy: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(strategy).strip()
+        if normalized not in RECURRENCE_STRATEGIES:
+            raise ValueError("unsupported course recurrence strategy")
+        selected_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=selected_at)
+            if row.status in {"pending_context", "cancelled", "expired", "succeeded"}:
+                raise ValueError("draft does not accept a recurrence strategy")
+            items = self._items(session, row.id)
+            if row.recurrence_strategy == normalized:
+                return self._view(session, row)
+            if row.confirmed_at is not None or any(
+                item.status != "pending" for item in items
+            ):
+                raise ValueError("course recurrence strategy is immutable after writes begin")
+            row.recurrence_strategy = normalized
+            row.recurrence_confirmed_at = selected_at
             session.flush()
             return self._view(session, row)
 
@@ -237,6 +308,8 @@ class CourseScheduleImportRepository:
                 raise ValueError("draft is not confirmable")
             if row.status == "pending_context":
                 raise ValueError("draft is missing required context")
+            if row.recurrence_strategy not in RECURRENCE_STRATEGIES:
+                raise ValueError("draft has no confirmed recurrence strategy")
             row.status = "running"
             row.confirmed_at = row.confirmed_at or claimed_at
             self._set_run_lease(row, claimed_at)
@@ -337,9 +410,7 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             expires = _aware(row.expires_at)
-            if expires <= datetime.now(timezone.utc) and row.status not in {
-                "succeeded", "cancelled", "expired"
-            }:
+            if expires <= datetime.now(timezone.utc) and row.status in EXPIRABLE_STATUSES:
                 row.status = "expired"
                 self._clear_run_lease(row)
             if row.status == "expired":
@@ -366,9 +437,10 @@ class CourseScheduleImportRepository:
         row: CourseScheduleImport, session: Any, *, now: datetime | None = None
     ) -> None:
         expires = _aware(row.expires_at)
-        if expires <= _aware(now or datetime.now(timezone.utc)) and row.status not in {
-            "succeeded", "cancelled", "expired"
-        }:
+        if (
+            expires <= _aware(now or datetime.now(timezone.utc))
+            and row.status in EXPIRABLE_STATUSES
+        ):
             row.status = "expired"
             CourseScheduleImportRepository._clear_run_lease(row)
         if row.status == "expired":
@@ -401,6 +473,11 @@ class CourseScheduleImportRepository:
             "timezone": row.timezone,
             "vision_model": row.vision_model,
             "structured_result": dict(row.structured_result or {}),
+            "recurrence_strategy": row.recurrence_strategy,
+            "recurrence_confirmed_at": (
+                _aware(row.recurrence_confirmed_at).isoformat()
+                if row.recurrence_confirmed_at else None
+            ),
             "created_at": _aware(row.created_at).isoformat(),
             "expires_at": _aware(row.expires_at).isoformat(),
             "confirmed_at": _aware(row.confirmed_at).isoformat() if row.confirmed_at else None,
@@ -457,7 +534,10 @@ def derive_required_context(
         if course.week_rule is None:
             missing.add("week_rule")
         if course.start_time is None or course.end_time is None:
-            missing.add("period_time_mapping" if course.period_start is not None else "actual_time")
+            if course.period_start is None:
+                missing.add("actual_time")
+            elif resolve_period_time(course.period_start, course.period_end) is None:
+                missing.add("period_time_mapping")
     return missing
 
 
@@ -477,3 +557,28 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _prepare_structured_result(result: ScheduleVisionResult) -> dict[str, Any]:
+    structured = result.to_dict()
+    sources: list[str | None] = []
+    for raw, course in zip(structured["courses"], result.courses):
+        resolved = resolve_period_time(
+            course.period_start,
+            course.period_end,
+            actual_start=_parse_time(course.start_time),
+            actual_end=_parse_time(course.end_time),
+        )
+        if resolved is None:
+            sources.append(None)
+            continue
+        start_clock, end_clock, source = resolved
+        raw["start_time"] = start_clock.strftime("%H:%M")
+        raw["end_time"] = end_clock.strftime("%H:%M")
+        sources.append(source)
+    structured["_metadata"] = {
+        "planner_version": COURSE_IMPORT_PLANNER_VERSION,
+        "period_map_version": DEFAULT_PERIOD_MAP_VERSION,
+        "course_time_sources": sources,
+    }
+    return structured

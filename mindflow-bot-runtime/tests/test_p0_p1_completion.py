@@ -995,7 +995,7 @@ class _MutationCalendar:
     async def get_event(self, *_args):
         return dict(self.old)
 
-    async def create_event(self, _participant_id, **kwargs):
+    async def create_single_event(self, _participant_id, **kwargs):
         return {
             "id": "e1",
             "start_time": kwargs["start_time"].isoformat(),
@@ -1037,6 +1037,7 @@ def test_calendar_create_queues_forecast_refresh():
     tools, coordinator, mutation_refresh, ctx = _mutation_tools()
     result = asyncio.run(tools.create_calendar_event(ctx, {
         "summary": "复盘",
+        "recurrence_mode": "single",
         "start_time": "2030-01-15T09:00:00+08:00",
         "end_time": "2030-01-15T10:00:00+08:00",
     }))

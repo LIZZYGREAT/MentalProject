@@ -91,6 +91,59 @@ def build_recurrence_rule(
     return ";".join(parts)
 
 
+def _validate_recurrence_rule(value: str) -> str:
+    """Validate the exact backend-generated recurrence subset before dispatch."""
+
+    normalized = str(value or "").strip().upper()
+    if not normalized or "\n" in normalized or "\r" in normalized:
+        raise ValueError("recurring calendar event requires a recurrence rule")
+    parts: dict[str, str] = {}
+    for component in normalized.split(";"):
+        key, separator, item = component.partition("=")
+        if not separator or not key or not item or key in parts:
+            raise ValueError("calendar recurrence rule is invalid")
+        parts[key] = item
+    if set(parts) - {"FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL"}:
+        raise ValueError("calendar recurrence rule contains unsupported fields")
+    frequency = parts.get("FREQ")
+    if frequency not in _RECURRENCE_FREQUENCIES:
+        raise ValueError("unsupported calendar recurrence frequency")
+    try:
+        interval = int(parts.get("INTERVAL", "1"))
+    except ValueError as exc:
+        raise ValueError("calendar recurrence interval is invalid") from exc
+    if not 1 <= interval <= 99:
+        raise ValueError("calendar recurrence interval must be between 1 and 99")
+    weekdays = parts.get("BYDAY", "").split(",") if parts.get("BYDAY") else []
+    if weekdays:
+        if frequency != "WEEKLY" or len(set(weekdays)) != len(weekdays):
+            raise ValueError("calendar recurrence weekdays are invalid")
+        if any(day not in _RECURRENCE_WEEKDAYS for day in weekdays):
+            raise ValueError("calendar recurrence contains an invalid weekday")
+    if "COUNT" in parts and "UNTIL" in parts:
+        raise ValueError("calendar recurrence cannot use count and until together")
+    if "COUNT" in parts:
+        try:
+            count = int(parts["COUNT"])
+        except ValueError as exc:
+            raise ValueError("calendar recurrence count is invalid") from exc
+        if not 1 <= count <= 999:
+            raise ValueError("calendar recurrence count must be between 1 and 999")
+    if "UNTIL" in parts:
+        try:
+            datetime.strptime(parts["UNTIL"], "%Y%m%dT%H%M%SZ")
+        except ValueError as exc:
+            raise ValueError("calendar recurrence until is invalid") from exc
+    rebuilt = [f"FREQ={frequency}", f"INTERVAL={interval}"]
+    if weekdays:
+        rebuilt.append("BYDAY=" + ",".join(weekdays))
+    if "COUNT" in parts:
+        rebuilt.append(f"COUNT={int(parts['COUNT'])}")
+    if "UNTIL" in parts:
+        rebuilt.append("UNTIL=" + parts["UNTIL"])
+    return ";".join(rebuilt)
+
+
 class CalendarService:
     def __init__(
         self, tokens: TokenRefreshService, *, timeout_seconds: float = 12.0,
@@ -184,6 +237,87 @@ class CalendarService:
         description: str = "",
         reminder_minutes: int | None = None,
         recurrence: str | None = None,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        """Compatibility wrapper; new callers use the explicit methods below."""
+
+        if recurrence:
+            return await self.create_recurring_event(
+                participant_id,
+                summary=summary,
+                start_time=start_time,
+                end_time=end_time,
+                description=description,
+                reminder_minutes=reminder_minutes,
+                recurrence=recurrence,
+                source_message_id=source_message_id,
+            )
+        return await self.create_single_event(
+            participant_id,
+            summary=summary,
+            start_time=start_time,
+            end_time=end_time,
+            description=description,
+            reminder_minutes=reminder_minutes,
+            source_message_id=source_message_id,
+        )
+
+    async def create_single_event(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        summary: str,
+        start_time: datetime,
+        end_time: datetime,
+        description: str = "",
+        reminder_minutes: int | None = None,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        return await self._create_event(
+            participant_id,
+            summary=summary,
+            start_time=start_time,
+            end_time=end_time,
+            description=description,
+            reminder_minutes=reminder_minutes,
+            recurrence=None,
+            source_message_id=source_message_id,
+        )
+
+    async def create_recurring_event(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        summary: str,
+        start_time: datetime,
+        end_time: datetime,
+        recurrence: str,
+        description: str = "",
+        reminder_minutes: int | None = None,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        normalized_recurrence = _validate_recurrence_rule(recurrence)
+        return await self._create_event(
+            participant_id,
+            summary=summary,
+            start_time=start_time,
+            end_time=end_time,
+            description=description,
+            reminder_minutes=reminder_minutes,
+            recurrence=normalized_recurrence,
+            source_message_id=source_message_id,
+        )
+
+    async def _create_event(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        summary: str,
+        start_time: datetime,
+        end_time: datetime,
+        description: str,
+        reminder_minutes: int | None,
+        recurrence: str | None,
         source_message_id: str,
     ) -> dict[str, Any]:
         title = str(summary).strip()

@@ -112,6 +112,23 @@ def test_progress_timers_have_independent_configuration():
     assert settings.tool_progress_grace_seconds == 0.75
 
 
+def test_vision_schedule_item_cap_cannot_exceed_visible_preview_limit():
+    environment = valid_environment()
+    environment["VISION_SCHEDULE_MAX_ITEMS"] = "21"
+    with pytest.raises(ValueError, match="VISION_SCHEDULE_MAX_ITEMS.*20"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+    environment["VISION_SCHEDULE_MAX_ITEMS"] = "20"
+    environment["VISION_SCHEDULE_MAX_CALENDAR_WRITES"] = "401"
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.vision_schedule_max_items == 20
+    assert settings.vision_schedule_max_calendar_writes == 401
+
+
 def test_haiku_and_subagent_must_use_the_same_model():
     environment = valid_environment()
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = "wrong-model"

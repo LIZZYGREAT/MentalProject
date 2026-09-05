@@ -1,6 +1,7 @@
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import json
+import threading
 from types import SimpleNamespace
 import uuid
 from zoneinfo import ZoneInfo
@@ -41,6 +42,16 @@ from app.worker import BotWorker
 from app.services.course_schedule_import import (
     CourseScheduleImportService,
     normalize_import_item,
+)
+from app.domain.course_schedule_recurrence import (
+    EXPAND_ALL_OCCURRENCES,
+    PRESERVE_SCHEDULE_PATTERN,
+    CalendarWriteKind,
+    plan_course_writes,
+)
+from app.domain.course_schedule_periods import (
+    DEFAULT_SCHOOL_PERIODS,
+    resolve_period_time,
 )
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
@@ -195,6 +206,21 @@ def test_draft_persists_and_calendar_never_writes_before_confirm():
     assert draft["status"] == "pending_confirmation"
     restarted_repo = CourseScheduleImportRepository(database)
     assert restarted_repo.get(draft["id"])["items"][0]["status"] == "pending"
+    card = course_schedule_preview_card(draft)
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "按课表周期规则添加" in payload
+    assert "全部拆成单次日程" in payload
+    assert "取消" in payload
+    assert PRESERVE_SCHEDULE_PATTERN in payload
+    assert EXPAND_ALL_OCCURRENCES in payload
+    visible_text = "\n".join(
+        element.get("content", "") for element in card["body"]["elements"]
+    )
+    assert "重复方式：每周重复" in visible_text
+    assert not any(
+        token in visible_text
+        for token in ("RRULE", "FREQ", "recurrence_strategy", "planner_version")
+    )
 
 
 def test_weekly_odd_even_and_explicit_week_normalization():
@@ -225,6 +251,86 @@ def test_weekly_odd_even_and_explicit_week_normalization():
     assert all(write.recurrence is None for write in writes)
 
 
+def test_course_recurrence_planner_classifies_preserve_patterns():
+    timezone_name = ZoneInfo("Asia/Shanghai")
+
+    database = memory_database()
+    person = participant(database, "PLAN-WEEKLY")
+    _repo, weekly = _draft(database, person.id)
+    weekly_writes = plan_course_writes(
+        weekly, weekly["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(weekly_writes) == 1
+    assert weekly_writes[0].write_kind == CalendarWriteKind.RECURRING
+    assert "INTERVAL=1" in str(weekly_writes[0].recurrence)
+    assert "COUNT=16" in str(weekly_writes[0].recurrence)
+    assert len(weekly_writes[0].affected_dates) == 16
+
+    one_week_payload = vision_payload(explicit_weeks=[6])
+    one_week_result = ScheduleVisionResult.from_dict(one_week_payload)
+    one_week_repo = CourseScheduleImportRepository(database)
+    one_week = one_week_repo.create_draft(
+        person.id, source_message_id="plan-one-week", source_image_hash="2" * 64,
+        vision_model="vision-model", result=one_week_result,
+        timezone_name="Asia/Shanghai", semester_start_date=date(2026, 9, 7),
+    )
+    one_week_writes = plan_course_writes(
+        one_week, one_week["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(one_week_writes) == 1
+    assert one_week_writes[0].write_kind == CalendarWriteKind.SINGLE
+    assert one_week_writes[0].recurrence is None
+
+
+def test_explicit_periodic_and_irregular_course_weeks_are_deterministic():
+    timezone_name = ZoneInfo("Asia/Shanghai")
+    database = memory_database()
+    person = participant(database, "PLAN-EXPLICIT")
+    _repo, periodic = _draft(
+        database, person.id, explicit_weeks=[1, 3, 5, 7]
+    )
+    periodic_writes = plan_course_writes(
+        periodic, periodic["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(periodic_writes) == 1
+    assert periodic_writes[0].write_kind == CalendarWriteKind.RECURRING
+    assert "INTERVAL=2" in str(periodic_writes[0].recurrence)
+    assert "COUNT=4" in str(periodic_writes[0].recurrence)
+
+    database2 = memory_database()
+    person2 = participant(database2, "PLAN-IRREGULAR")
+    _repo, irregular = _draft(
+        database2, person2.id, explicit_weeks=[1, 2, 4, 7, 10]
+    )
+    irregular_writes = plan_course_writes(
+        irregular, irregular["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(irregular_writes) == 5
+    assert all(write.write_kind == CalendarWriteKind.SINGLE for write in irregular_writes)
+    assert [write.affected_dates[0] for write in irregular_writes] == [
+        date(2026, 9, 7) + timedelta(weeks=week - 1)
+        for week in [1, 2, 4, 7, 10]
+    ]
+
+
+def test_expand_all_occurrences_creates_only_independent_events():
+    database = memory_database()
+    person = participant(database, "PLAN-EXPAND")
+    _repo, draft = _draft(database, person.id)
+    writes = plan_course_writes(
+        draft, draft["items"][0], strategy=EXPAND_ALL_OCCURRENCES,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert len(writes) == 16
+    assert all(write.write_kind == CalendarWriteKind.SINGLE for write in writes)
+    assert all(write.recurrence is None for write in writes)
+    assert len({write.occurrence_identity for write in writes}) == 16
+
+
 class Tokens:
     def status(self, _participant_id):
         return {"connected": True, "scopes": ["calendar:calendar.event:create"]}
@@ -235,11 +341,25 @@ class Calendar:
         self.fail = fail
         self.calls = []
 
-    async def create_event(self, _participant_id, **kwargs):
+    async def _create(self, _participant_id, **kwargs):
         self.calls.append(kwargs)
         if self.fail:
             raise RuntimeError("provider failed")
         return {"id": f"event-{len(self.calls)}"}
+
+    async def create_single_event(self, participant_id, **kwargs):
+        kwargs["write_kind"] = "single"
+        return await self._create(participant_id, **kwargs)
+
+    async def create_recurring_event(self, participant_id, **kwargs):
+        kwargs["write_kind"] = "recurring"
+        return await self._create(participant_id, **kwargs)
+
+    async def create_event(self, participant_id, **kwargs):
+        if kwargs.get("recurrence"):
+            return await self.create_recurring_event(participant_id, **kwargs)
+        kwargs.pop("recurrence", None)
+        return await self.create_single_event(participant_id, **kwargs)
 
 
 def test_confirm_owner_idempotency_cancel_and_partial_retry():
@@ -251,7 +371,9 @@ def test_confirm_owner_idempotency_cancel_and_partial_retry():
     service = CourseScheduleImportService(repo, calendar, Tokens())
     with pytest.raises(PermissionError):
         asyncio.run(service.confirm(other.id, draft["id"]))
-    result = asyncio.run(service.confirm(owner.id, draft["id"]))
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert result["succeeded"] == 1
     assert len(calendar.calls) == 1
     repeated = asyncio.run(service.confirm(owner.id, draft["id"]))
@@ -263,7 +385,9 @@ def test_confirm_owner_idempotency_cancel_and_partial_retry():
     repo2, draft2 = _draft(database2, owner2.id)
     failing = Calendar(fail=True)
     service2 = CourseScheduleImportService(repo2, failing, Tokens())
-    partial = asyncio.run(service2.confirm(owner2.id, draft2["id"]))
+    partial = asyncio.run(service2.confirm(
+        owner2.id, draft2["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert partial["failed"] == 1
     failing.fail = False
     retried = asyncio.run(service2.confirm(owner2.id, draft2["id"]))
@@ -288,10 +412,89 @@ def test_confirm_without_calendar_keeps_draft_and_writes_nothing():
             return {"connected": False, "scopes": []}
 
     service = CourseScheduleImportService(repo, calendar, Disconnected())
-    result = asyncio.run(service.confirm(owner.id, draft["id"]))
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert result["error"] == "calendar_not_connected"
     assert calendar.calls == []
     assert repo.get(draft["id"])["status"] == "pending_confirmation"
+
+
+def test_recurrence_strategy_is_durable_and_immutable_after_writes_begin():
+    database = memory_database()
+    owner = participant(database, "STRATEGY-LOCK")
+    repo, draft = _draft(database, owner.id)
+    selected = repo.set_recurrence_strategy(
+        owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN
+    )
+    assert selected["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert selected["recurrence_confirmed_at"] is not None
+    repo.begin_confirmation(owner.id, draft["id"])
+    with pytest.raises(ValueError, match="immutable"):
+        repo.set_recurrence_strategy(
+            owner.id, draft["id"], EXPAND_ALL_OCCURRENCES
+        )
+
+
+def test_calendar_write_cap_rejects_before_any_provider_or_item_mutation():
+    database = memory_database()
+    owner = participant(database, "WRITE-CAP")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar()
+    service = CourseScheduleImportService(
+        repo, calendar, Tokens(), max_calendar_writes=15
+    )
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=EXPAND_ALL_OCCURRENCES
+    ))
+    persisted = repo.get(draft["id"])
+    assert result["error"] == "calendar_write_limit_exceeded"
+    assert result["planned_writes"] == 16
+    assert calendar.calls == []
+    assert persisted["status"] == "pending_confirmation"
+    assert all(item["status"] == "pending" for item in persisted["items"])
+    assert persisted["recurrence_strategy"] == EXPAND_ALL_OCCURRENCES
+
+
+def test_period_defaults_cover_one_to_fourteen_and_respect_priority():
+    expected = {
+        1: (time(8, 0), time(8, 45)),
+        2: (time(8, 55), time(9, 40)),
+        3: (time(10, 0), time(10, 45)),
+        4: (time(10, 55), time(11, 40)),
+        5: (time(12, 0), time(12, 45)),
+        6: (time(12, 55), time(13, 40)),
+        7: (time(14, 0), time(14, 45)),
+        8: (time(14, 55), time(15, 40)),
+        9: (time(16, 0), time(16, 45)),
+        10: (time(16, 55), time(17, 40)),
+        11: (time(18, 30), time(19, 15)),
+        12: (time(19, 25), time(20, 10)),
+        13: (time(20, 30), time(21, 15)),
+        14: (time(21, 25), time(22, 10)),
+    }
+    assert DEFAULT_SCHOOL_PERIODS == expected
+    for period, clocks in expected.items():
+        assert resolve_period_time(period, period) == (*clocks, "default")
+    assert resolve_period_time(1, 2) == (time(8), time(9, 40), "default")
+    assert resolve_period_time(3, 4) == (time(10), time(11, 40), "default")
+    assert resolve_period_time(7, 8) == (time(14), time(15, 40), "default")
+    assert resolve_period_time(9, 10) == (time(16), time(17, 40), "default")
+    assert resolve_period_time(11, 12) == (time(18, 30), time(20, 10), "default")
+    assert resolve_period_time(13, 14) == (time(20, 30), time(22, 10), "default")
+
+    user = {1: (time(7, 50), time(8, 35)), 2: (time(8, 45), time(9, 30))}
+    ranges = {(1, 2): (time(7, 40), time(9, 20))}
+    assert resolve_period_time(1, 2, period_mapping=user) == (
+        time(7, 50), time(9, 30), "user"
+    )
+    assert resolve_period_time(
+        1, 2, period_mapping=user, range_overrides=ranges
+    ) == (time(7, 40), time(9, 20), "user")
+    assert resolve_period_time(
+        1, 2, actual_start=time(8, 10), actual_end=time(9, 50),
+        period_mapping=user, range_overrides=ranges,
+    ) == (time(8, 10), time(9, 50), "image")
 
 
 def test_bind_and_help_use_stable_copy_without_agent():
@@ -371,7 +574,10 @@ def test_missing_context_card_has_no_confirm_and_context_can_be_completed():
     database = memory_database()
     person = participant(database, "P001")
     repo = CourseScheduleImportRepository(database)
-    result = ScheduleVisionResult.from_dict(vision_payload(actual_times=False))
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    result = ScheduleVisionResult.from_dict(payload)
     draft = repo.create_draft(
         person.id,
         source_message_id="om-context",
@@ -390,8 +596,8 @@ def test_missing_context_card_has_no_confirm_and_context_can_be_completed():
     draft = repo.set_period_time_mapping(
         person.id,
         draft["id"],
-        {(1, 2): (datetime.strptime("08:00", "%H:%M").time(),
-                  datetime.strptime("09:35", "%H:%M").time())},
+        {(15, 16): (datetime.strptime("08:00", "%H:%M").time(),
+                    datetime.strptime("09:35", "%H:%M").time())},
     )
     assert draft["status"] == "pending_confirmation"
     card_json = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
@@ -496,6 +702,90 @@ def test_expired_draft_is_rejected_and_persisted_as_expired():
     assert repo.get(draft["id"])["status"] == "expired"
 
 
+def test_pending_context_and_pending_confirmation_are_the_only_ttl_states():
+    old = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+    database = memory_database()
+    owner = participant(database, "TTL-CONTEXT")
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    repo = CourseScheduleImportRepository(database)
+    pending_context = repo.create_draft(
+        owner.id, source_message_id="ttl-context", source_image_hash="3" * 64,
+        vision_model="vision-model", result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai", ttl_minutes=1, now=old,
+    )
+    with pytest.raises(ValueError, match="expired"):
+        repo.validate_for_confirmation(owner.id, pending_context["id"])
+    assert repo.get(pending_context["id"])["status"] == "expired"
+
+    running_db = memory_database()
+    running_owner = participant(running_db, "TTL-RUNNING")
+    running_repo, running = _draft(running_db, running_owner.id)
+    running_repo.set_recurrence_strategy(
+        running_owner.id, running["id"], PRESERVE_SCHEDULE_PATTERN
+    )
+    started = running_repo.begin_confirmation(running_owner.id, running["id"])
+    _expire_draft_ttl(running_db, running["id"])
+    _expire_run_lease(running_db, running["id"])
+    reclaimed = running_repo.begin_confirmation(running_owner.id, running["id"])
+    assert started["status"] == "running"
+    assert reclaimed["claimed"] is True
+    assert reclaimed["status"] == "running"
+
+
+def test_partial_failed_import_remains_retryable_after_original_ttl():
+    database = memory_database()
+    owner = participant(database, "TTL-PARTIAL")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar(fail=True)
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["status"] == "partial_failed"
+    _expire_draft_ttl(database, draft["id"])
+    calendar.fail = False
+    retried = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert retried["status"] == "succeeded"
+
+
+def test_sync_download_timeout_holds_real_concurrency_slot_until_thread_exits():
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 8
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def blocking_download(message_id, _image_key):
+        if message_id == "first":
+            first_entered.set()
+            release_first.wait(timeout=2)
+        else:
+            second_entered.set()
+        return png
+
+    async def scenario():
+        downloader = FeishuMessageResourceDownloader(
+            object(), download=blocking_download, timeout_seconds=0.02,
+            max_concurrency=1,
+        )
+        with pytest.raises(MessageResourceError, match="timed out"):
+            await downloader.download_image("first", "image-a")
+        assert first_entered.is_set()
+        second = asyncio.create_task(
+            downloader.download_image("second", "image-b")
+        )
+        await asyncio.sleep(0.03)
+        assert not second_entered.is_set()
+        release_first.set()
+        result = await second
+        assert result.data == png
+        assert second_entered.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_batch_calendar_mutation_invalidates_and_enqueues_forecast_once():
     database = memory_database()
     owner = participant(database, "P001")
@@ -531,7 +821,9 @@ def test_batch_calendar_mutation_invalidates_and_enqueues_forecast_once():
         forecast_snapshots=forecasts,
         mutation_refresh=refresh,
     )
-    result = asyncio.run(service.confirm(owner.id, draft["id"]))
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert result["succeeded"] == 1
     assert len(forecasts.calls) == 1
     assert len(refresh.calls) == 1
@@ -543,6 +835,7 @@ def test_stale_running_draft_can_be_reclaimed():
     owner = participant(database, "P101")
     repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
     _unused, draft = _draft_with_repo(repo, owner.id, "stale-draft")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
     started = datetime.now(timezone.utc)
     first = repo.begin_confirmation(owner.id, draft["id"], now=started)
     assert first["claimed"] is True
@@ -561,6 +854,7 @@ def test_running_draft_with_live_lease_is_not_reclaimed():
     owner = participant(database, "P102")
     repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
     _unused, draft = _draft_with_repo(repo, owner.id, "live-draft")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
     started = datetime.now(timezone.utc)
     repo.begin_confirmation(owner.id, draft["id"], now=started)
 
@@ -576,6 +870,7 @@ def test_stale_running_items_reset_to_pending():
     owner = participant(database, "P103")
     repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
     _unused, draft = _draft_with_repo(repo, owner.id, "stale-item")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
     started = datetime.now(timezone.utc)
     running = repo.begin_confirmation(owner.id, draft["id"], now=started)
     assert repo.claim_item(
@@ -594,18 +889,28 @@ class IdempotentCalendar:
         self.attempts = []
         self.events = {}
 
-    async def create_event(self, _participant_id, **kwargs):
+    async def _create(self, _participant_id, **kwargs):
         source = kwargs["source_message_id"]
         self.attempts.append(source)
         if source not in self.events:
             self.events[source] = {"id": f"event-{len(self.events) + 1}"}
         return self.events[source]
 
+    async def create_single_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
+    async def create_recurring_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
+    async def create_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
 
 def test_restart_after_remote_create_does_not_duplicate_calendar_event():
     database = memory_database()
     owner = participant(database, "P104")
     repo, draft = _draft(database, owner.id)
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
     claimed = repo.begin_confirmation(owner.id, draft["id"])
     item = claimed["items"][0]
     assert repo.claim_item(draft["id"], item["id"])
@@ -613,7 +918,8 @@ def test_restart_after_remote_create_does_not_duplicate_calendar_event():
         claimed, item, timezone=ZoneInfo("Asia/Shanghai")
     )[0]
     source_id = (
-        f"schedule:{draft['id']}:{item['normalized_key']}:"
+        f"schedule:{draft['id']}:{PRESERVE_SCHEDULE_PATTERN}:"
+        f"{item['normalized_key']}:"
         f"{write.occurrence_identity}"
     )
     calendar = IdempotentCalendar()
@@ -643,6 +949,7 @@ def test_partial_success_then_crash_can_resume_and_finalize():
     database = memory_database()
     owner = participant(database, "P105")
     repo, draft = _two_course_draft(database, owner.id, "partial-crash")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
     claimed = repo.begin_confirmation(owner.id, draft["id"])
     first, second = claimed["items"]
     assert repo.claim_item(draft["id"], first["id"])
@@ -682,8 +989,9 @@ def test_calendar_not_connected_card_keeps_same_confirm_action():
         message_id="card-message",
         action_value={
             "mindflow_action": "course_schedule_import_confirm",
-            "version": "1",
+            "version": "2",
             "import_id": draft["id"],
+            "recurrence_strategy": PRESERVE_SCHEDULE_PATTERN,
         },
         form_value={},
     )
@@ -710,7 +1018,9 @@ def test_calendar_authorize_then_same_draft_confirm_succeeds():
 
     tokens = ToggleTokens()
     service = CourseScheduleImportService(repo, calendar, tokens)
-    first = asyncio.run(service.confirm(owner.id, draft["id"]))
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert first["error"] == "calendar_not_connected"
     assert first["import_id"] == draft["id"]
     tokens.connected = True
@@ -725,6 +1035,7 @@ def test_partial_failed_card_has_retry_failed_action():
         "已添加 18 项，有 2 项没能添加。",
         status="partial_failed",
         import_id=import_id,
+        recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
     )
     payload = json.dumps(card, ensure_ascii=False)
     assert "重试失败项" in payload
@@ -741,7 +1052,7 @@ def test_retry_failed_items_does_not_recreate_succeeded_items():
     class FailSecondOnce(Calendar):
         failed = False
 
-        async def create_event(self, participant_id, **kwargs):
+        async def _create(self, participant_id, **kwargs):
             self.calls.append(kwargs)
             if kwargs["summary"] == "线性代数" and not self.failed:
                 self.failed = True
@@ -750,13 +1061,53 @@ def test_retry_failed_items_does_not_recreate_succeeded_items():
 
     calendar = FailSecondOnce()
     service = CourseScheduleImportService(repo, calendar, Tokens())
-    first = asyncio.run(service.confirm(owner.id, draft["id"]))
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     assert first["status"] == "partial_failed"
     second = asyncio.run(service.confirm(owner.id, draft["id"]))
     assert second["status"] == "succeeded"
     summaries = [call["summary"] for call in calendar.calls]
     assert summaries.count("高等数学A") == 1
     assert summaries.count("线性代数") == 2
+
+
+def test_mid_batch_calendar_authorization_loss_preserves_strategy_and_resumes():
+    database = memory_database()
+    owner = participant(database, "AUTH-LOSS")
+    repo, draft = _two_course_draft(database, owner.id, "auth-loss")
+
+    class LoseAuthorizationOnce(Calendar):
+        denied = False
+
+        async def _create(self, participant_id, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["summary"] == "线性代数" and not self.denied:
+                self.denied = True
+                raise PermissionError("calendar authorization expired")
+            return {"id": f"event-{len(self.calls)}"}
+
+    calendar = LoseAuthorizationOnce()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["status"] == "partial_failed"
+    assert first["error"] == "calendar_not_connected"
+    assert first["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert "重新完成 /calendar 授权" in first["reply_text"]
+    assert "当前导入方式：按课表周期规则" in first["reply_text"]
+    assert repo.get(draft["id"])["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+
+    second = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert second["status"] == "succeeded"
+    summaries = [call["summary"] for call in calendar.calls]
+    assert summaries.count("高等数学A") == 1
+    assert summaries.count("线性代数") == 2
+    assert all(
+        f":{PRESERVE_SCHEDULE_PATTERN}:" in call["source_message_id"]
+        for call in calendar.calls
+    )
 
 
 def test_succeeded_card_is_terminal():
@@ -795,7 +1146,6 @@ def test_backend_derives_required_context():
     result = ScheduleVisionResult.from_dict(payload)
     assert derive_required_context(result, semester_start_date=None) == {
         "semester_start_date",
-        "period_time_mapping",
         "weekday",
         "week_rule",
     }
@@ -935,7 +1285,23 @@ def test_schedule_preview_limit_rejects_unseen_calendar_writes():
         for index in range(21)
     ]
     with pytest.raises(ScheduleVisionValidationError, match="item limit"):
-        ScheduleVisionResult.from_dict(payload)
+        ScheduleVisionResult.from_dict(payload, max_items=80)
+
+
+def test_defensive_preview_never_offers_calendar_actions_above_twenty_items():
+    courses = [dict(vision_payload()["courses"][0]) for _ in range(21)]
+    card = course_schedule_preview_card({
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": {"courses": courses, "missing_context": []},
+        "items": [],
+    })
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "课程数量超过 20 项" in payload
+    assert "course_schedule_import_confirm" not in payload
+    assert "按课表周期规则添加" not in payload
 
 
 def test_cancel_reply_matches_persisted_terminal_status():
@@ -943,7 +1309,9 @@ def test_cancel_reply_matches_persisted_terminal_status():
     owner = participant(database, "P110")
     repo, draft = _draft(database, owner.id)
     service = CourseScheduleImportService(repo, Calendar(), Tokens())
-    asyncio.run(service.confirm(owner.id, draft["id"]))
+    asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
     succeeded = service.cancel(owner.id, draft["id"])
     assert succeeded["status"] == "succeeded"
     assert "不能再取消" in succeeded["reply_text"]
@@ -999,6 +1367,12 @@ def _expire_run_lease(database, import_id):
     with database.session() as session:
         row = session.get(CourseScheduleImport, uuid.UUID(str(import_id)))
         row.run_claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+
+def _expire_draft_ttl(database, import_id):
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(str(import_id)))
+        row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
 
 
 def _assert_unfillable(payload, expected):

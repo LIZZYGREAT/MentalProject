@@ -435,6 +435,7 @@ async def run() -> None:
         sender,
         max_bytes=settings.vision_max_image_bytes,
         timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
     )
     handle_card_action = _build_card_action_handler(
         identity, business.card_actions, sender, incidents

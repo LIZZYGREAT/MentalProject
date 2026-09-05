@@ -438,6 +438,16 @@ class CourseScheduleImport(Base):
             "'partial_failed','cancelled','expired')",
             name="ck_course_schedule_import_status",
         ),
+        CheckConstraint(
+            "recurrence_strategy IS NULL OR recurrence_strategy IN "
+            "('preserve_schedule_pattern','expand_all_occurrences')",
+            name="ck_course_schedule_import_recurrence_strategy",
+        ),
+        CheckConstraint(
+            "status NOT IN ('running','partial_failed','succeeded') "
+            "OR recurrence_strategy IS NOT NULL",
+            name="ck_course_schedule_import_strategy_required_after_start",
+        ),
         Index(
             "ix_course_schedule_import_participant_status",
             "participant_id", "status", "created_at",
@@ -459,6 +469,10 @@ class CourseScheduleImport(Base):
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)
     vision_model: Mapped[str] = mapped_column(String(128), nullable=False)
     structured_result: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    recurrence_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    recurrence_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

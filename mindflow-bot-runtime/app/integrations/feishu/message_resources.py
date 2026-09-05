@@ -35,21 +35,28 @@ class FeishuMessageResourceDownloader:
         *,
         max_bytes: int = 8 * 1024 * 1024,
         timeout_seconds: float = 12.0,
+        max_concurrency: int = 1,
         download: Callable[[str, str], bytes] | None = None,
     ) -> None:
         self.client = client
         self.max_bytes = int(max_bytes)
         self.timeout_seconds = float(timeout_seconds)
         self.download = download or client.download_message_image
+        self._download_slots = asyncio.Semaphore(max(1, int(max_concurrency)))
         if self.max_bytes < 1 or self.timeout_seconds <= 0:
             raise ValueError("message resource limits must be positive")
 
     async def download_image(self, message_id: str, image_key: str) -> DownloadedImage:
+        await self._download_slots.acquire()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._download_bounded, str(message_id), str(image_key)
+            )
+        )
+        task.add_done_callback(self._release_download_slot)
         try:
             raw = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._download_bounded, str(message_id), str(image_key)
-                ),
+                asyncio.shield(task),
                 timeout=self.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
@@ -63,6 +70,14 @@ class FeishuMessageResourceDownloader:
         if mime_type is None:
             raise UnsupportedImageFormat("only JPEG, PNG, and WebP images are supported")
         return DownloadedImage(data=data, mime_type=mime_type)
+
+    def _release_download_slot(self, task: asyncio.Task[bytes]) -> None:
+        self._download_slots.release()
+        if task.cancelled():
+            return
+        # Consume an exception when the caller already timed out or was
+        # cancelled so the detached to_thread task cannot emit a warning.
+        task.exception()
 
     def _download_bounded(self, message_id: str, image_key: str) -> bytes:
         try:

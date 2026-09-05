@@ -104,7 +104,7 @@ class CardActionService:
         }:
             if self.course_schedule_imports is None:
                 raise RuntimeError("course schedule import service is unavailable")
-            if str(action.get("version") or "") != "1":
+            if str(action.get("version") or "") != "2":
                 return {"ok": False, "error": "unsupported_card_action_version"}
             try:
                 import_id = uuid.UUID(str(action.get("import_id") or ""))
@@ -115,8 +115,20 @@ class CardActionService:
             else:
                 import asyncio
 
+                recurrence_strategy = str(
+                    action.get("recurrence_strategy") or ""
+                ).strip()
+                if recurrence_strategy not in {
+                    "preserve_schedule_pattern", "expand_all_occurrences"
+                }:
+                    raise ValueError("course recurrence strategy is invalid")
+
                 result = asyncio.run(
-                    self.course_schedule_imports.confirm(participant_id, import_id)
+                    self.course_schedule_imports.confirm(
+                        participant_id,
+                        import_id,
+                        recurrence_strategy=recurrence_strategy,
+                    )
                 )
             reply_text = str(result.get("reply_text") or "课程表操作已处理。")
             # Missing Calendar authorization is a valid, non-mutating outcome.
@@ -128,6 +140,9 @@ class CardActionService:
                     status=str(result.get("status") or "") or None,
                     import_id=str(result.get("import_id") or import_id),
                     error=str(result.get("error") or "") or None,
+                    recurrence_strategy=(
+                        str(result.get("recurrence_strategy") or "") or None
+                    ),
                 ),
             }
         if action_name.startswith("care_"):

@@ -70,7 +70,7 @@ SEMESTER_MONDAY_PATTERN = re.compile(
     r"(?:第一周周一|首周周一|学期第一周)[^0-9]*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?"
 )
 PERIOD_MAPPING_PATTERN = re.compile(
-    r"第?\s*(\d{1,2})\s*[-–—至到]\s*(\d{1,2})\s*节?\s*"
+    r"第?\s*(\d{1,2})(?:\s*[-–—至到]\s*(\d{1,2}))?\s*节?\s*"
     r"(?:是|为|:|：)?\s*(\d{1,2}:\d{2})\s*[-–—至到]\s*(\d{1,2}:\d{2})"
 )
 BARE_DATE_PATTERN = re.compile(r"^\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*$")
@@ -414,7 +414,10 @@ class BotWorker:
                     if period_matches:
                         try:
                             mapping = {
-                                (int(start_period), int(end_period)): (
+                                (
+                                    (int(start_period), int(end_period))
+                                    if end_period else int(start_period)
+                                ): (
                                     time.fromisoformat(start_clock),
                                     time.fromisoformat(end_clock),
                                 )

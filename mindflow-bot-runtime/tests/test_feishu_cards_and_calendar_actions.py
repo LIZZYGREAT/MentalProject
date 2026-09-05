@@ -12,8 +12,9 @@ import pytest
 from app import main as app_main
 from app.agent.context import AgentContext
 from app.agent.skill_loader import SkillLoader
+from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
-from app.tools.care import _recurrence_from_args
+from app.tools.care import _creation_recurrence_from_args, _recurrence_from_args
 from app.integrations.feishu.cards import (
     care_intervention_card,
     care_intervention_result_card,
@@ -373,8 +374,42 @@ def test_generated_weekly_recurrence_requires_start_weekday_in_byday():
                 "recurrence_frequency": "WEEKLY",
                 "recurrence_weekdays": ["TU"],
             },
-            TZ,
-        )
+        TZ,
+    )
+
+
+def test_calendar_create_contract_requires_explicit_recurrence_mode():
+    registry = ToolRegistry()
+    CareTools(None, None, None, None, "Asia/Shanghai", None).register(registry)
+    spec = next(value for value in registry.specs if value.name == "calendar_create_event")
+    assert "recurrence_mode" in spec.parameters["required"]
+    assert spec.parameters["properties"]["recurrence_mode"]["enum"] == [
+        "single", "recurring"
+    ]
+
+
+def test_calendar_create_recurrence_mode_rejects_conflicting_semantics():
+    assert _creation_recurrence_from_args(
+        {"recurrence_mode": "single"}, TZ
+    ) == ("single", None)
+    for conflicting in (
+        {"recurrence_frequency": "WEEKLY"},
+        {"recurrence_count": 8},
+        {"recurrence_interval": 2},
+    ):
+        with pytest.raises(ValueError, match="cannot include"):
+            _creation_recurrence_from_args(
+                {"recurrence_mode": "single", **conflicting}, TZ
+            )
+    with pytest.raises(ValueError, match="requires recurrence_frequency"):
+        _creation_recurrence_from_args({"recurrence_mode": "recurring"}, TZ)
+    with pytest.raises(ValueError, match="count and until"):
+        _creation_recurrence_from_args({
+            "recurrence_mode": "recurring",
+            "recurrence_frequency": "DAILY",
+            "recurrence_count": 3,
+            "recurrence_until": "2030-01-10T10:00:00+08:00",
+        }, TZ)
 
     assert _recurrence_from_args(
         {
@@ -870,10 +905,11 @@ def test_calendar_create_event_uses_user_token_primary_calendar_and_idempotency(
                 },
             })
 
+    Client.calls = []
     monkeypatch.setattr("app.integrations.feishu.calendar.httpx.AsyncClient", Client)
     calendar = CalendarService(Tokens(), timezone_name="Asia/Shanghai")
     start = datetime(2030, 1, 15, 9, 0, tzinfo=TZ)
-    result = asyncio.run(calendar.create_event(
+    result = asyncio.run(calendar.create_single_event(
         person_id,
         summary="项目复盘",
         description="讨论下一步",
@@ -890,6 +926,74 @@ def test_calendar_create_event_uses_user_token_primary_calendar_and_idempotency(
     assert len(create_call[2]["idempotency_key"]) == 64
     assert create_call[3]["reminders"] == [{"minutes": 15}]
     assert create_call[3]["start_time"]["timezone"] == "Asia/Shanghai"
+    assert "recurrence" not in create_call[3]
+
+
+def test_calendar_recurring_create_uses_shared_endpoint_with_validated_rule(monkeypatch):
+    person_id = uuid.uuid4()
+
+    class Tokens:
+        async def get_access_token(self, _participant_id):
+            return "user-token"
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        calls = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, params, json=None):
+            self.calls.append((url, json))
+            if url.endswith("/calendars/primary"):
+                return Response({
+                    "code": 0,
+                    "data": {"calendar": {"calendar_id": "primary/calendar"}},
+                })
+            return Response({
+                "code": 0,
+                "data": {"event": {"event_id": "event-recurring", **json}},
+            })
+
+    Client.calls = []
+    monkeypatch.setattr("app.integrations.feishu.calendar.httpx.AsyncClient", Client)
+    calendar = CalendarService(Tokens(), timezone_name="Asia/Shanghai")
+    start = datetime(2030, 1, 7, 9, 0, tzinfo=TZ)
+    recurrence = "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;COUNT=8"
+    result = asyncio.run(calendar.create_recurring_event(
+        person_id,
+        summary="每周复盘",
+        start_time=start,
+        end_time=start + timedelta(hours=1),
+        recurrence=recurrence,
+        source_message_id="message-recurring",
+    ))
+    assert result["id"] == "event-recurring"
+    assert Client.calls[1][0].endswith("/calendars/primary%2Fcalendar/events")
+    assert Client.calls[1][1]["recurrence"] == recurrence
+    with pytest.raises(ValueError, match="requires a recurrence rule"):
+        asyncio.run(calendar.create_recurring_event(
+            person_id,
+            summary="无效重复",
+            start_time=start,
+            end_time=start + timedelta(hours=1),
+            recurrence="",
+            source_message_id="message-invalid-recurring",
+        ))
 
 
 def test_calendar_update_and_delete_use_exact_primary_calendar_event(monkeypatch):

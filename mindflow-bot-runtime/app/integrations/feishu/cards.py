@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from app.domain.course_schedule_recurrence import (
+    EXPAND_ALL_OCCURRENCES,
+    PRESERVE_SCHEDULE_PATTERN,
+    describe_course_write_plan,
+    plan_course_writes,
+)
 
 
 def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
@@ -10,11 +18,12 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
 
     structured = dict(draft.get("structured_result") or {})
     courses = list(structured.get("courses") or [])
+    items = list(draft.get("items") or [])
     missing = set(structured.get("missing_context") or [])
     lines = [f"识别到 **{len(courses)}** 门课"]
     uncertain: list[str] = []
     weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-    for course in courses[:20]:
+    for index, course in enumerate(courses[:20]):
         name = _safe_schedule_text(course.get("course_name") or "未命名课程")
         weekday = course.get("weekday")
         day = weekday_names[int(weekday) - 1] if isinstance(weekday, int) and 1 <= weekday <= 7 else "星期待确认"
@@ -37,11 +46,19 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
                 week_text += "双周"
         location = _safe_schedule_text(course.get("location") or "地点待确认")
         lines.extend(["", f"**{name}**", f"{day} {period} · {week_text} · {location}"])
+        if not missing and index < len(items):
+            writes = plan_course_writes(
+                draft,
+                items[index],
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                timezone=ZoneInfo(str(draft.get("timezone") or "Asia/Shanghai")),
+            )
+            lines.append(f"重复方式：{describe_course_write_plan(writes)}")
         fields = list(course.get("uncertain_fields") or [])
         if fields:
             uncertain.append(f"- {name}：{', '.join(_safe_schedule_text(v) for v in fields)}")
     if len(courses) > 20:
-        lines.extend(["", f"另有 {len(courses) - 20} 门课，确认时会一并处理。"])
+        lines.extend(["", "课程数量超过 20 项，请拆分图片后重新导入。"])
     warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]
     if uncertain or warnings:
         lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
@@ -51,40 +68,30 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         lines.extend(["", "这张课表只有“第1-2节”这类节次，没有具体上课时间。", "把学校作息时间告诉我后，我再生成日历。"])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     status = str(draft.get("status") or "")
-    if not missing and status in {"pending_confirmation", "partial_failed"}:
-        confirm_text = (
-            "重试失败项" if status == "partial_failed" else "确认添加到日历"
-        )
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "bisect",
-            "columns": [
-                {
-                    "tag": "column", "width": "weighted", "weight": 1,
-                    "elements": [{
-                        "tag": "button", "type": "primary",
-                        "text": {"tag": "plain_text", "content": confirm_text},
-                        "behaviors": [{"type": "callback", "value": {
-                            "mindflow_action": "course_schedule_import_confirm",
-                            "version": "1", "import_id": str(draft["id"]),
-                        }}],
-                    }],
-                },
-                {
-                    "tag": "column", "width": "weighted", "weight": 1,
-                    "elements": [{
-                        "tag": "button", "type": "default",
-                        "text": {"tag": "plain_text", "content": "取消"},
-                        "behaviors": [{"type": "callback", "value": {
-                            "mindflow_action": "course_schedule_import_cancel",
-                            "version": "1", "import_id": str(draft["id"]),
-                        }}],
-                    }],
-                },
-            ],
-        })
+    if not missing and len(courses) <= 20 and status == "pending_confirmation":
+        elements.extend([
+            _schedule_action_button(
+                draft["id"],
+                "按课表周期规则添加",
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                primary=True,
+            ),
+            _schedule_action_button(
+                draft["id"],
+                "全部拆成单次日程",
+                strategy=EXPAND_ALL_OCCURRENCES,
+            ),
+            _schedule_cancel_button(draft["id"]),
+        ])
         lines.append("\n确认无误后，我再添加到日历。")
         elements[0]["content"] = "\n".join(lines)
+    elif not missing and status == "partial_failed" and draft.get("recurrence_strategy"):
+        elements.append(_schedule_action_button(
+            draft["id"],
+            "重试失败项",
+            strategy=str(draft["recurrence_strategy"]),
+            primary=True,
+        ))
     elif status == "running":
         lines.append("\n正在添加到日历，请稍候。")
         elements[0]["content"] = "\n".join(lines)
@@ -108,26 +115,41 @@ def course_schedule_result_card(
     status: str | None = None,
     import_id: str | None = None,
     error: str | None = None,
+    recurrence_strategy: str | None = None,
 ) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": _safe_schedule_text(message)}
     ]
-    if error == "calendar_not_connected" and import_id:
-        elements.append(
-            _schedule_action_columns(
+    if error == "calendar_not_connected" and import_id and recurrence_strategy:
+        elements.append(_schedule_action_button(
+            import_id,
+            "重试失败项" if status == "partial_failed" else "继续按已选择策略添加",
+            strategy=recurrence_strategy,
+            primary=True,
+        ))
+        if status != "partial_failed":
+            elements.append(_schedule_cancel_button(import_id))
+    elif status == "partial_failed" and import_id and recurrence_strategy:
+        elements.append(_schedule_action_button(
+            import_id,
+            "重试失败项",
+            strategy=recurrence_strategy,
+            primary=True,
+        ))
+    elif (
+        error == "calendar_write_limit_exceeded"
+        and import_id
+        and recurrence_strategy == EXPAND_ALL_OCCURRENCES
+    ):
+        elements.extend([
+            _schedule_action_button(
                 import_id,
-                confirm_text="确认添加到日历",
-                include_cancel=True,
-            )
-        )
-    elif status == "partial_failed" and import_id:
-        elements.append(
-            _schedule_action_columns(
-                import_id,
-                confirm_text="重试失败项",
-                include_cancel=False,
-            )
-        )
+                "改用按课表周期规则添加",
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                primary=True,
+            ),
+            _schedule_cancel_button(import_id),
+        ])
     template = "green" if status in {"succeeded", "cancelled"} else "blue"
     return {
         "schema": "2.0",
@@ -137,38 +159,36 @@ def course_schedule_result_card(
     }
 
 
-def _schedule_action_columns(
-    import_id: str, *, confirm_text: str, include_cancel: bool
+def _schedule_action_button(
+    import_id: str,
+    text: str,
+    *,
+    strategy: str,
+    primary: bool = False,
 ) -> dict[str, Any]:
-    columns = [{
-        "tag": "column", "width": "weighted", "weight": 1,
-        "elements": [{
-            "tag": "button", "type": "primary",
-            "text": {"tag": "plain_text", "content": confirm_text},
-            "behaviors": [{"type": "callback", "value": {
-                "mindflow_action": "course_schedule_import_confirm",
-                "version": "1", "import_id": str(import_id),
-            }}],
-        }],
-    }]
-    if include_cancel:
-        columns.append({
-            "tag": "column", "width": "weighted", "weight": 1,
-            "elements": [{
-                "tag": "button", "type": "default",
-                "text": {"tag": "plain_text", "content": "取消"},
-                "behaviors": [{"type": "callback", "value": {
-                    "mindflow_action": "course_schedule_import_cancel",
-                    "version": "1", "import_id": str(import_id),
-                }}],
-            }],
-        })
-    else:
-        return columns[0]["elements"][0]
     return {
-        "tag": "column_set",
-        "flex_mode": "bisect",
-        "columns": columns,
+        "tag": "button",
+        "type": "primary" if primary else "default",
+        "text": {"tag": "plain_text", "content": text},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_confirm",
+            "version": "2",
+            "import_id": str(import_id),
+            "recurrence_strategy": strategy,
+        }}],
+    }
+
+
+def _schedule_cancel_button(import_id: str) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "type": "default",
+        "text": {"tag": "plain_text", "content": "取消"},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_cancel",
+            "version": "2",
+            "import_id": str(import_id),
+        }}],
     }
 
 
