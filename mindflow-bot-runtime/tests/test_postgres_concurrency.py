@@ -121,9 +121,14 @@ def _forecast(database: Database, participant_id: uuid.UUID, local_date):
     )
 
 
-def _warning(database: Database, participant_id: uuid.UUID):
+def _warning(
+    database: Database,
+    participant_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+):
     warnings, preferences = _runtime_repositories(database)
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
     forecast = _forecast(database, participant_id, local_date)
     warnings.sync(
@@ -323,8 +328,9 @@ def test_postgres_semantic_cache_concurrent_quality_is_monotonic(
 
 def test_postgres_different_callback_snoozes_create_one_child(postgres_database):
     participant = ParticipantRepository(postgres_database).create("PG-SNOOZE")
+    safe_now = datetime(2030, 1, 15, 2, 0, tzinfo=timezone.utc)
     warnings, preferences, warning_id, now = _warning(
-        postgres_database, participant.id
+        postgres_database, participant.id, now=safe_now
     )
     claimed = warnings.claim_if_current(warning_id, now=now)
     assert claimed is not None
@@ -357,7 +363,13 @@ def test_postgres_different_callback_snoozes_create_one_child(postgres_database)
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(snooze, ("pg-snooze-a", "pg-snooze-b")))
 
-    assert len({result["follow_up_warning_id"] for result in results}) == 1
+    follow_up_ids = {result["follow_up_warning_id"] for result in results}
+    assert None not in follow_up_ids
+    assert len(follow_up_ids) == 1
+    assert all(
+        result["action_result"] in {"scheduled", "already_recorded"}
+        for result in results
+    )
     with postgres_database.session() as session:
         assert session.query(WarningSchedule).count() == 2
         assert session.query(CareInterventionFeedback).count() == 1
