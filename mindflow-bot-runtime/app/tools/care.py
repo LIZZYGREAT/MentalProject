@@ -1291,6 +1291,7 @@ class CareTools:
         )
         requested_event = {
             "summary": str(args["summary"]),
+            "recurrence_mode": recurrence_mode,
             "description": str(args.get("description") or ""),
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),

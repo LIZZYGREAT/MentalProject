@@ -245,6 +245,9 @@ def test_calendar_create_persists_preintent_before_remote_call_and_resolves():
                     row = session.query(CalendarMutationReconciliation).one()
                     observed_remote_statuses.append([row.status])
                     assert row.work_json["operation"]["operation_type"] == "create"
+                    assert row.work_json["operation"]["requested"][
+                        "recurrence_mode"
+                    ] == "single"
                 return {
                     "id": "provider-event-1",
                     "start_time": values["start_time"].isoformat(),

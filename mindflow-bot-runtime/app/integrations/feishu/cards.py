@@ -136,20 +136,15 @@ def course_schedule_result_card(
             strategy=recurrence_strategy,
             primary=True,
         ))
-    elif (
-        error == "calendar_write_limit_exceeded"
-        and import_id
-        and recurrence_strategy == EXPAND_ALL_OCCURRENCES
-    ):
-        elements.extend([
-            _schedule_action_button(
+    elif error == "calendar_write_limit_exceeded" and import_id:
+        if recurrence_strategy == EXPAND_ALL_OCCURRENCES:
+            elements.append(_schedule_action_button(
                 import_id,
                 "改用按课表周期规则添加",
                 strategy=PRESERVE_SCHEDULE_PATTERN,
                 primary=True,
-            ),
-            _schedule_cancel_button(import_id),
-        ])
+            ))
+        elements.append(_schedule_cancel_button(import_id))
     template = "green" if status in {"succeeded", "cancelled"} else "blue"
     return {
         "schema": "2.0",

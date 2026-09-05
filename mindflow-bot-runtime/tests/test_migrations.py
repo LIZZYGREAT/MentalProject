@@ -165,6 +165,10 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
 def test_course_schedule_import_migration_extends_stage6_head():
     migration_0038 = _migration(VERSIONS / "0038_course_schedule_import.py")
     assert migration_0038.down_revision == "0037_stage6_care_jitai"
+    migration_0039 = _migration(
+        VERSIONS / "0039_course_schedule_recurrence_strategy.py"
+    )
+    assert migration_0039.down_revision == "0038_course_schedule_import"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):

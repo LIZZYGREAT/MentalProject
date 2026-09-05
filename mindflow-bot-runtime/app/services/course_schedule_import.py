@@ -104,6 +104,17 @@ class CourseScheduleImportService:
                 all_dates.update(write.affected_dates)
         planned_writes = sum(len(writes) for writes in writes_by_item.values())
         if planned_writes > self.max_calendar_writes:
+            if strategy == PRESERVE_SCHEDULE_PATTERN:
+                limit_text = (
+                    f"按当前课表周期规则仍需要生成 {planned_writes} 个独立日程，"
+                    "超过当前一次导入上限。请取消后拆分课程表重新导入。"
+                )
+            else:
+                limit_text = (
+                    f"全部拆成单次日程会生成 {planned_writes} 个日程，"
+                    "超过当前一次导入上限。可以改用“按课表周期规则添加”，"
+                    "或取消并拆分课程表重新导入。"
+                )
             return {
                 "ok": False,
                 "error": "calendar_write_limit_exceeded",
@@ -111,11 +122,7 @@ class CourseScheduleImportService:
                 "import_id": draft["id"],
                 "recurrence_strategy": strategy,
                 "planned_writes": planned_writes,
-                "reply_text": (
-                    f"按“全部拆成单次日程”会生成 {planned_writes} 个日程，"
-                    "超过当前一次导入上限。可以改用“按课表周期规则添加”，"
-                    "或缩小导入范围。"
-                ),
+                "reply_text": limit_text,
             }
         claimed = await asyncio.to_thread(
             self.drafts.begin_confirmation, participant_id, import_id

@@ -33,6 +33,7 @@ class CalendarWrite:
     description: str
     write_kind: str
     recurrence: str | None
+    recurrence_interval: int | None
     occurrence_identity: str
     affected_dates: tuple[date, ...]
 
@@ -92,6 +93,7 @@ def plan_course_writes(
         description=description,
         write_kind=CalendarWriteKind.RECURRING,
         recurrence=recurrence,
+        recurrence_interval=interval,
         occurrence_identity=f"series-{weeks[0]}-{weeks[-1]}-interval-{interval}",
         affected_dates=dates,
     )]
@@ -99,8 +101,14 @@ def plan_course_writes(
 
 def describe_course_write_plan(writes: list[CalendarWrite]) -> str:
     if len(writes) == 1 and writes[0].write_kind == CalendarWriteKind.RECURRING:
-        recurrence = str(writes[0].recurrence or "")
-        return "每两周重复" if "INTERVAL=2" in recurrence else "每周重复"
+        interval = writes[0].recurrence_interval
+        if interval == 1:
+            return "每周重复"
+        if interval == 2:
+            return "每两周重复"
+        if isinstance(interval, int) and interval > 2:
+            return f"每{interval}周重复"
+        return "按固定周期间隔重复"
     if len(writes) == 1:
         return "仅一次"
     return "指定周次，将按单次日程添加"
@@ -153,6 +161,7 @@ def _single_writes(
             description=description,
             write_kind=CalendarWriteKind.SINGLE,
             recurrence=None,
+            recurrence_interval=None,
             occurrence_identity=f"week-{week}",
             affected_dates=(target,),
         )

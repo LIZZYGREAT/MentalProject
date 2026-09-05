@@ -317,6 +317,33 @@ def test_explicit_periodic_and_irregular_course_weeks_are_deterministic():
     ]
 
 
+@pytest.mark.parametrize(
+    ("weeks", "interval", "visible_label"),
+    [
+        ([1, 2, 3], 1, "每周重复"),
+        ([1, 3, 5], 2, "每两周重复"),
+        ([1, 4, 7], 3, "每3周重复"),
+    ],
+)
+def test_preview_uses_exact_planned_week_interval(weeks, interval, visible_label):
+    database = memory_database()
+    person = participant(database, f"PLAN-INTERVAL-{interval}")
+    _repo, draft = _draft(database, person.id, explicit_weeks=weeks)
+    writes = plan_course_writes(
+        draft, draft["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert writes[0].recurrence_interval == interval
+    assert f"INTERVAL={interval}" in str(writes[0].recurrence)
+    card = course_schedule_preview_card(draft)
+    visible_text = "\n".join(
+        element.get("content", "") for element in card["body"]["elements"]
+    )
+    assert f"重复方式：{visible_label}" in visible_text
+    if interval > 2:
+        assert "重复方式：每周重复" not in visible_text
+
+
 def test_expand_all_occurrences_creates_only_independent_events():
     database = memory_database()
     person = participant(database, "PLAN-EXPAND")
@@ -454,6 +481,44 @@ def test_calendar_write_cap_rejects_before_any_provider_or_item_mutation():
     assert persisted["status"] == "pending_confirmation"
     assert all(item["status"] == "pending" for item in persisted["items"])
     assert persisted["recurrence_strategy"] == EXPAND_ALL_OCCURRENCES
+    card_payload = json.dumps(course_schedule_result_card(
+        result["reply_text"], status=result["status"], import_id=result["import_id"],
+        error=result["error"], recurrence_strategy=result["recurrence_strategy"],
+    ), ensure_ascii=False)
+    assert "改用按课表周期规则添加" in card_payload
+    assert "course_schedule_import_cancel" in card_payload
+
+
+def test_preserve_write_cap_has_cancel_recovery_without_strategy_misdirection():
+    database = memory_database()
+    owner = participant(database, "PRESERVE-CAP")
+    repo, draft = _draft(
+        database, owner.id, explicit_weeks=[1, 2, 4, 7, 10]
+    )
+    calendar = Calendar()
+    service = CourseScheduleImportService(
+        repo, calendar, Tokens(), max_calendar_writes=4
+    )
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    persisted = repo.get(draft["id"])
+    assert result["error"] == "calendar_write_limit_exceeded"
+    assert result["planned_writes"] == 5
+    assert "改用“按课表周期规则添加”" not in result["reply_text"]
+    assert "取消后拆分课程表重新导入" in result["reply_text"]
+    assert calendar.calls == []
+    assert persisted["status"] == "pending_confirmation"
+    assert persisted["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert all(item["status"] == "pending" for item in persisted["items"])
+
+    card_payload = json.dumps(course_schedule_result_card(
+        result["reply_text"], status=result["status"], import_id=result["import_id"],
+        error=result["error"], recurrence_strategy=result["recurrence_strategy"],
+    ), ensure_ascii=False)
+    assert "course_schedule_import_cancel" in card_payload
+    assert "改用按课表周期规则添加" not in card_payload
+    assert EXPAND_ALL_OCCURRENCES not in card_payload
 
 
 def test_period_defaults_cover_one_to_fourteen_and_respect_priority():
@@ -603,6 +668,67 @@ def test_missing_context_card_has_no_confirm_and_context_can_be_completed():
     card_json = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
     assert "course_schedule_import_confirm" in card_json
     assert '"courses"' not in card_json
+
+
+def test_sequential_single_period_overrides_are_merged_durably_across_restart():
+    database = memory_database()
+    owner = participant(database, "PERIOD-MERGE")
+    repo, draft = _period_only_draft(database, owner.id, "period-merge")
+    first = repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(7, 50), time(8, 35))}
+    )
+    assert first["items"][0]["start_time"] == "07:50"
+    assert first["items"][0]["end_time"] == "09:40"
+
+    restarted = CourseScheduleImportRepository(database)
+    second = restarted.set_period_time_mapping(
+        owner.id, draft["id"], {2: (time(8, 45), time(9, 30))}
+    )
+    assert second["items"][0]["start_time"] == "07:50"
+    assert second["items"][0]["end_time"] == "09:30"
+    assert second["structured_result"]["_metadata"]["user_period_mapping"] == {
+        "1": ["07:50", "08:35"],
+        "2": ["08:45", "09:30"],
+    }
+
+
+def test_later_single_period_override_replaces_same_persisted_key():
+    database = memory_database()
+    owner = participant(database, "PERIOD-REPLACE")
+    repo, draft = _period_only_draft(database, owner.id, "period-replace")
+    repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(7, 50), time(8, 35))}
+    )
+    replaced = repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(8, 10), time(8, 55))}
+    )
+    assert replaced["items"][0]["start_time"] == "08:10"
+    assert replaced["items"][0]["end_time"] == "09:40"
+    assert replaced["structured_result"]["_metadata"]["user_period_mapping"] == {
+        "1": ["08:10", "08:55"]
+    }
+
+
+def test_legacy_draft_image_time_is_never_overwritten_by_user_period_mapping():
+    database = memory_database()
+    owner = participant(database, "PERIOD-IMAGE-PRIORITY")
+    repo, draft = _draft(database, owner.id)
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(draft["id"]))
+        structured = dict(row.structured_result)
+        structured.pop("_metadata", None)
+        row.structured_result = structured
+
+    updated = repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {(1, 2): (time(7, 40), time(9, 20))},
+    )
+    assert updated["items"][0]["start_time"] == "08:00"
+    assert updated["items"][0]["end_time"] == "09:35"
+    assert updated["structured_result"]["_metadata"]["course_time_sources"] == [
+        "image"
+    ]
 
 
 def test_image_workflow_does_not_write_before_card_confirmation():
@@ -1340,6 +1466,19 @@ def _draft_with_repo(repo, participant_id, source):
         source_image_hash="e" * 64,
         vision_model="vision-model",
         result=result,
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+
+def _period_only_draft(database, participant_id, source):
+    repo = CourseScheduleImportRepository(database)
+    return repo, repo.create_draft(
+        participant_id,
+        source_message_id=source,
+        source_image_hash="4" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload(actual_times=False)),
         timezone_name="Asia/Shanghai",
         semester_start_date=date(2026, 9, 7),
     )

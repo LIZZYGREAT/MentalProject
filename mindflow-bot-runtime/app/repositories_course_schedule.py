@@ -188,7 +188,7 @@ class CourseScheduleImportRepository:
     ) -> dict[str, Any]:
         if not mapping:
             raise ValueError("period time mapping is empty")
-        singles, ranges = split_period_mapping(mapping)
+        current_singles, current_ranges = split_period_mapping(mapping)
         with self.database.session() as session:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
@@ -200,8 +200,18 @@ class CourseScheduleImportRepository:
             structured = dict(row.structured_result or {})
             courses = [dict(value) for value in structured.get("courses") or []]
             metadata = dict(structured.get("_metadata") or {})
-            sources = list(metadata.get("course_time_sources") or [])
-            sources.extend([None] * (len(courses) - len(sources)))
+            singles = _load_period_mapping(metadata.get("user_period_mapping"))
+            ranges = _load_period_range_overrides(
+                metadata.get("user_period_range_overrides")
+            )
+            singles.update(current_singles)
+            ranges.update(current_ranges)
+            stored_sources = metadata.get("course_time_sources")
+            sources = list(stored_sources) if isinstance(stored_sources, list) else []
+            sources.extend(
+                "image" if course.get("start_time") and course.get("end_time") else None
+                for course in courses[len(sources):]
+            )
             items = self._items(session, row.id)
             for index, (course, item) in enumerate(zip(courses, items)):
                 if sources[index] == "image":
@@ -227,6 +237,16 @@ class CourseScheduleImportRepository:
             structured["courses"] = courses
             structured["missing_context"] = sorted(missing)
             metadata["course_time_sources"] = sources
+            metadata["user_period_mapping"] = {
+                str(period): [start.strftime("%H:%M"), end.strftime("%H:%M")]
+                for period, (start, end) in sorted(singles.items())
+            }
+            metadata["user_period_range_overrides"] = {
+                f"{first}-{last}": [
+                    start.strftime("%H:%M"), end.strftime("%H:%M")
+                ]
+                for (first, last), (start, end) in sorted(ranges.items())
+            }
             structured["_metadata"] = metadata
             row.structured_result = structured
             row.status = "pending_context" if missing else "pending_confirmation"
@@ -557,6 +577,48 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _load_period_mapping(value: Any) -> dict[int, tuple[time, time]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, tuple[time, time]] = {}
+    for raw_period, raw_clocks in value.items():
+        try:
+            period = int(raw_period)
+            start, end = _metadata_clocks(raw_clocks)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= period <= 30:
+            result[period] = (start, end)
+    return result
+
+
+def _load_period_range_overrides(
+    value: Any,
+) -> dict[tuple[int, int], tuple[time, time]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[tuple[int, int], tuple[time, time]] = {}
+    for raw_range, raw_clocks in value.items():
+        try:
+            first_text, last_text = str(raw_range).split("-", 1)
+            first, last = int(first_text), int(last_text)
+            start, end = _metadata_clocks(raw_clocks)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= first <= last <= 30:
+            result[(first, last)] = (start, end)
+    return result
+
+
+def _metadata_clocks(value: Any) -> tuple[time, time]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("persisted period mapping is invalid")
+    start, end = time.fromisoformat(str(value[0])), time.fromisoformat(str(value[1]))
+    if end <= start:
+        raise ValueError("persisted period mapping range is invalid")
+    return start, end
 
 
 def _prepare_structured_result(result: ScheduleVisionResult) -> dict[str, Any]:
