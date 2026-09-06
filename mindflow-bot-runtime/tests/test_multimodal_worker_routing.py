@@ -79,6 +79,23 @@ class CancellableRuntime(Runtime):
         return cancelled
 
 
+class StopGenerationRaceRuntime(Runtime):
+    def __init__(self):
+        super().__init__()
+        self.old_started = asyncio.Event()
+        self.release_old = asyncio.Event()
+
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.calls.append((ctx, turn_input))
+        if turn_input.text == "旧请求":
+            self.old_started.set()
+            await self.release_old.wait()
+        return RuntimeResponse(text=f"answer:{turn_input.text}")
+
+    async def interrupt(self, _participant_id):
+        return True
+
+
 class ProductionStyleClient:
     def __init__(self, binding, resume, factory):
         self.binding = binding
@@ -795,6 +812,53 @@ def _agent_run_states(worker):
             (row.status, row.finished_at)
             for row in session.query(AgentRun).order_by(AgentRun.started_at).all()
         ]
+
+
+def _run_new_request_after_stop_race():
+    runtime = StopGenerationRaceRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("old", "m-old", "text", text="旧请求")
+        )
+        old_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.old_started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("new", "m-new", "text", text="新请求")
+        )
+        await worker.process(await queue.get())
+        runtime.release_old.set()
+        await old_task
+
+    asyncio.run(scenario())
+    return worker, runtime, sender
+
+
+def test_new_request_after_stop_cannot_revive_old_agent_reply():
+    _worker, _runtime, sender = _run_new_request_after_stop_race()
+
+    assert "answer:旧请求" not in sender.texts
+    assert "answer:新请求" in sender.texts
+
+
+def test_new_request_after_stop_does_not_restore_second_interrupted_message():
+    _worker, _runtime, sender = _run_new_request_after_stop_race()
+
+    assert sender.texts == ["已请求停止当前处理。", "answer:新请求"]
+
+
+def test_old_run_stays_stopped_after_new_run_starts():
+    worker, _runtime, _sender = _run_new_request_after_stop_race()
+
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted",
+        "succeeded",
+    ]
 
 
 def test_cancelled_queued_agent_run_is_finished_as_interrupted():

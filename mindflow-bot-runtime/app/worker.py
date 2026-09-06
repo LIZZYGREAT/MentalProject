@@ -358,11 +358,17 @@ class BotWorker:
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
+        self._stop_generation: dict[object, int] = {}
         self._active_multimodal_tasks: dict[
             tuple[object, str],
             dict[str, tuple[PendingMultimodalTurn, asyncio.Task[None]]],
         ] = {}
-        self._cancelled_participants: set[object] = set()
+
+    def _current_stop_generation(self, participant_id) -> int:
+        return self._stop_generation.get(participant_id, 0)
+
+    def _run_was_stopped(self, participant_id, run_generation: int) -> bool:
+        return run_generation < self._current_stop_generation(participant_id)
 
     async def _record_incident(self, **values) -> None:
         if self.incidents is None:
@@ -494,7 +500,9 @@ class BotWorker:
                 await self._deliver(event, "当前飞书账号已经绑定。")
                 return
             if STOP_PATTERN.match(event.text):
-                self._cancelled_participants.add(participant.id)
+                self._stop_generation[participant.id] = (
+                    self._current_stop_generation(participant.id) + 1
+                )
                 active_event_id = self._active_event_by_participant.get(participant.id)
                 if active_event_id:
                     await asyncio.to_thread(
@@ -754,7 +762,7 @@ class BotWorker:
 
             elif long_task is None:
                 skill = self.skill_loader.current()
-                self._cancelled_participants.discard(participant.id)
+                run_generation = self._current_stop_generation(participant.id)
                 run_id = await asyncio.to_thread(
                     self.runs.start,
                     participant.id,
@@ -773,7 +781,9 @@ class BotWorker:
                 # Creating the task under the routing lock preserves arrival order;
                 # the lock is released before the long Agent turn so /stop can pass.
                 long_task = asyncio.create_task(
-                    self._run_agent(event, ctx, run_id),
+                    self._run_agent(
+                        event, ctx, run_id, run_generation=run_generation
+                    ),
                     name=f"agent-turn-{event.event_id}",
                 )
                 self._active_event_by_participant[participant.id] = event.event_id
@@ -1195,7 +1205,7 @@ class BotWorker:
         calendar_mutation_policy: CalendarMutationPolicy,
     ) -> None:
         skill = self.skill_loader.current()
-        self._cancelled_participants.discard(participant.id)
+        run_generation = self._current_stop_generation(participant.id)
         run_id = await asyncio.to_thread(
             self.runs.start,
             participant.id,
@@ -1213,7 +1223,13 @@ class BotWorker:
             calendar_mutation_policy=calendar_mutation_policy,
         )
         self._active_event_by_participant[participant.id] = event.event_id
-        await self._run_agent(event, ctx, run_id, turn_input=turn_input)
+        await self._run_agent(
+            event,
+            ctx,
+            run_id,
+            turn_input=turn_input,
+            run_generation=run_generation,
+        )
 
     async def _note_multimodal_route(self, event: BotEvent, route: str) -> None:
         await asyncio.to_thread(
@@ -1437,6 +1453,7 @@ class BotWorker:
         run_id,
         *,
         turn_input: AgentTurnInput | None = None,
+        run_generation: int,
     ) -> None:
         turn_input = turn_input or AgentTurnInput(text=event.text)
         started = time.monotonic()
@@ -1610,7 +1627,7 @@ class BotWorker:
                 (time.monotonic() - agent_started) * 1000, 1
             )
             await close_progress_before_final()
-            if ctx.participant_id in self._cancelled_participants:
+            if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
             cards = (
                 self.presentations.take_cards(run_id)
@@ -1621,6 +1638,8 @@ class BotWorker:
             delivered_cards: list[object] = []
             card_started = time.monotonic()
             for card in cards:
+                if self._run_was_stopped(ctx.participant_id, run_generation):
+                    raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
                 try:
                     if isinstance(card, PendingImageCard):
                         await self._send_image_card(event.chat_id, card)
@@ -1666,6 +1685,8 @@ class BotWorker:
                     response_kind=authoritative.response_kind,
                 )
             presentation_started = time.monotonic()
+            if self._run_was_stopped(ctx.participant_id, run_generation):
+                raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
             plan = await self.response_orchestrator.build_plan(
                 response,
                 cards=delivered_cards,
@@ -1688,6 +1709,8 @@ class BotWorker:
             metrics["presentation_cleanup_pending"] = (
                 plan.presentation_cleanup_pending
             )
+            if self._run_was_stopped(ctx.participant_id, run_generation):
+                raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
             await asyncio.to_thread(self.runs.finish, run_id, "succeeded")
             delivered = await self._deliver_plan(
                 event,
@@ -1695,6 +1718,7 @@ class BotWorker:
                 participant_id=ctx.participant_id,
                 metrics=metrics,
                 delivery_started_at=started,
+                run_generation=run_generation,
             )
             status = "completed" if delivered else "reply_pending"
         except asyncio.CancelledError:
@@ -1702,13 +1726,17 @@ class BotWorker:
             if self.presentations is not None:
                 self.presentations.discard(run_id)
             await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
+            if self._run_was_stopped(ctx.participant_id, run_generation):
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
             raise
         except ClaudeRuntimeInterrupted:
             await close_progress_before_final()
             if self.presentations is not None:
                 self.presentations.discard(run_id)
             await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
-            if ctx.participant_id in self._cancelled_participants:
+            if self._run_was_stopped(ctx.participant_id, run_generation):
                 await asyncio.to_thread(
                     self.events.cancel_reply_plan, event.event_id
                 )
@@ -1720,18 +1748,25 @@ class BotWorker:
             await close_progress_before_final()
             if self.presentations is not None:
                 self.presentations.discard(run_id)
-            logger.exception(
-                "bot_event_failed",
-                extra={
-                    "participant_id": str(ctx.participant_id),
-                    "event_id": event.event_id,
-                    "message_id": event.message_id,
-                    "agent_run_id": str(run_id),
-                },
-            )
-            await asyncio.to_thread(self.runs.finish, run_id, "failed")
-            delivered = await self._deliver(event, FALLBACK_TEMPORARY)
-            status = "failed_replied" if delivered else "reply_pending"
+            if self._run_was_stopped(ctx.participant_id, run_generation):
+                await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
+                status = "interrupted"
+            else:
+                logger.exception(
+                    "bot_event_failed",
+                    extra={
+                        "participant_id": str(ctx.participant_id),
+                        "event_id": event.event_id,
+                        "message_id": event.message_id,
+                        "agent_run_id": str(run_id),
+                    },
+                )
+                await asyncio.to_thread(self.runs.finish, run_id, "failed")
+                delivered = await self._deliver(event, FALLBACK_TEMPORARY)
+                status = "failed_replied" if delivered else "reply_pending"
         finally:
             generic_timer.cancel()
             timers = [generic_timer, *tool_timers]
@@ -1812,6 +1847,7 @@ class BotWorker:
         participant_id=None,
         metrics: dict[str, object] | None = None,
         delivery_started_at: float | None = None,
+        run_generation: int | None = None,
     ) -> bool:
         if not plan.segments:
             await asyncio.to_thread(
@@ -1835,6 +1871,7 @@ class BotWorker:
             participant_id=participant_id,
             metrics=metrics,
             delivery_started_at=delivery_started_at,
+            run_generation=run_generation,
         )
 
     async def _resume_delivery_plan(
@@ -1845,13 +1882,15 @@ class BotWorker:
         participant_id=None,
         metrics: dict[str, object] | None = None,
         delivery_started_at: float | None = None,
+        run_generation: int | None = None,
     ) -> bool:
         delivery_started = time.monotonic()
         first_final_recorded = False
         for index in range(pending_plan.next_segment, len(pending_plan.segments)):
             if (
                 participant_id is not None
-                and participant_id in self._cancelled_participants
+                and run_generation is not None
+                and self._run_was_stopped(participant_id, run_generation)
             ):
                 await asyncio.to_thread(
                     self.events.cancel_reply_plan, event.event_id
