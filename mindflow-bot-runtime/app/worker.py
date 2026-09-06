@@ -99,6 +99,15 @@ SCHEDULE_WRITE_NEGATION_PATTERN = re.compile(
     r"|(?:不要|不用|不想).{0,8}(?:导入|添加|加到|同步|放进|写进)"
     r"|暂时不导入|我?只想(?:看看|看一下|问|知道|了解)"
 )
+SCHEDULE_IMPORT_INFORMATIONAL_PATTERN = re.compile(
+    r"(?:怎么|如何|为什么|是什么|怎么操作|如何操作).{0,24}"
+    r"(?:导入|添加|加到|同步|放进|写进)"
+    r"|(?:导入|添加|加到|同步|放进|写进).{0,24}"
+    r"(?:怎么|如何|为什么|是什么|教程|说明|步骤|方法|怎么操作|如何操作)"
+)
+SCHEDULE_NON_CALENDAR_EDIT_PATTERN = re.compile(
+    r"(?:添加|加上|写入|写进).{0,10}(?:备注|说明|标注|注释)"
+)
 EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
     r"刚才|刚刚|那张图|这张图|图里|截图里"
 )
@@ -146,9 +155,19 @@ def is_strong_schedule_import_intent(
     value = str(text or "")
     if SCHEDULE_WRITE_NEGATION_PATTERN.search(value):
         return False
+    if (
+        SCHEDULE_IMPORT_INFORMATIONAL_PATTERN.search(value)
+        or SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
+    ):
+        return False
     if not SCHEDULE_WRITE_PATTERN.search(value):
         return False
     if SCHEDULE_NOUN_PATTERN.search(value):
+        only_generic_add = bool(re.search(r"添加", value)) and not bool(
+            re.search(r"导入|加到|同步|放进|写进", value)
+        )
+        if only_generic_add and not CALENDAR_TARGET_PATTERN.search(value):
+            return False
         return True
     return image_kind == "course_schedule" and bool(
         CALENDAR_TARGET_PATTERN.search(value)
@@ -169,6 +188,8 @@ def is_direct_image_calendar_request(text: str) -> bool:
         SCHEDULE_WRITE_PATTERN.search(value)
         and CALENDAR_TARGET_PATTERN.search(value)
         and not SCHEDULE_WRITE_NEGATION_PATTERN.search(value)
+        and not SCHEDULE_IMPORT_INFORMATIONAL_PATTERN.search(value)
+        and not SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
     )
 
 

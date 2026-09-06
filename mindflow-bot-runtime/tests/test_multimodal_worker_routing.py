@@ -241,7 +241,7 @@ def test_image_only_uses_read_only_agent_and_never_assumes_import():
     assert sender.texts == ["answer:image-only"]
 
 
-def test_explicit_schedule_import_is_fast_path_without_generic_vision_or_agent():
+def test_explicit_import_to_calendar_still_uses_fast_path():
     vision = Vision(failure=True)
     gateway, queue, worker, runtime, sender, _, _ = _system(vision=vision)
     strict_calls = []
@@ -941,6 +941,27 @@ def test_schedule_import_negation_precedes_keyword_fast_path():
         assert not is_strong_schedule_import_intent(
             text, image_kind="course_schedule"
         )
+
+
+def test_schedule_import_how_to_question_is_not_fast_path():
+    assert not is_strong_schedule_import_intent(
+        "这个课程表怎么导入到日历？",
+        image_kind="course_schedule",
+    )
+
+
+def test_add_note_to_schedule_is_not_calendar_import():
+    assert not is_strong_schedule_import_intent(
+        "帮我在这张课程表里添加备注",
+        image_kind="course_schedule",
+    )
+
+
+def test_schedule_import_explanation_is_not_fast_path():
+    assert not is_strong_schedule_import_intent(
+        "课程表添加说明应该写什么？",
+        image_kind="course_schedule",
+    )
 
 
 def test_course_word_alone_is_not_strong_schedule_noun():
