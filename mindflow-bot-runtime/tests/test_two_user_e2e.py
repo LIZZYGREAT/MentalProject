@@ -15,9 +15,9 @@ class FakeRuntime:
     def __init__(self):
         self.seen = []
 
-    async def handle_message(self, ctx, text, **_kwargs):
-        self.seen.append((ctx.participant_id, ctx.participant_code, text))
-        return f"{ctx.participant_code}:{text}"
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.seen.append((ctx.participant_id, ctx.participant_code, turn_input.text))
+        return f"{ctx.participant_code}:{turn_input.text}"
 
 
 class FakeSender:
@@ -182,15 +182,15 @@ def test_same_participant_messages_are_processed_serially():
             self.max_active = 0
             self.locks = {}
 
-        async def handle_message(self, ctx, text, **_kwargs):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
             lock = self.locks.setdefault(ctx.participant_id, asyncio.Lock())
             async with lock:
                 self.active += 1
                 self.max_active = max(self.max_active, self.active)
                 await asyncio.sleep(0.02)
-                self.seen.append((ctx.participant_id, ctx.participant_code, text))
+                self.seen.append((ctx.participant_id, ctx.participant_code, turn_input.text))
                 self.active -= 1
-                return text
+                return turn_input.text
 
     runtime = SerialRuntime()
     worker = BotWorker(

@@ -37,11 +37,11 @@ class FakeClient:
     async def connect(self):
         self.connected = True
 
-    async def run_turn(self, text):
+    async def run_turn(self, turn_input):
         ctx = self.binding.require()
         self.factory.active += 1
         self.factory.max_active = max(self.factory.max_active, self.factory.active)
-        self.factory.turns.append((ctx.participant_id, text))
+        self.factory.turns.append((ctx.participant_id, turn_input.text))
         try:
             await self.release.wait()
             if self.interrupted:
@@ -59,7 +59,7 @@ class FakeClient:
                 )
             )
             session_id = self.resume or f"session-{ctx.participant_id}"
-            return ClaudeTurnResult(f"answer:{text}", session_id)
+            return ClaudeTurnResult(f"answer:{turn_input.text}", session_id)
         finally:
             self.factory.active -= 1
 

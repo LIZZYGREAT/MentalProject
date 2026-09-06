@@ -19,6 +19,7 @@ from app.agent.claude_runtime import (
     ClaudeRuntimeInterrupted,
 )
 from app.agent.context import AgentContext
+from app.contracts.agent_input import AgentTurnInput
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
@@ -79,7 +80,7 @@ class AgentRuntimeProtocol(Protocol):
     async def handle_message(
         self,
         ctx: AgentContext,
-        text: str,
+        turn_input: AgentTurnInput,
         *,
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
@@ -746,7 +747,7 @@ class BotWorker:
             agent_started = time.monotonic()
             response = await self.runtime.handle_message(
                 ctx,
-                event.text,
+                AgentTurnInput(text=event.text),
                 chat_type=event.chat_type,
                 on_activity=on_activity,
             )

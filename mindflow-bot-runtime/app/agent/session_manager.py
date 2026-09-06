@@ -16,6 +16,7 @@ from app.agent.sdk_adapter import (
     ClaudeTurnResult,
 )
 from app.agent.sdk_mcp import TurnContextBinding
+from app.contracts.agent_input import AgentTurnInput, ensure_agent_turn_input
 from app.presentation.contracts import (
     AgentActivityCallback,
 )
@@ -29,7 +30,7 @@ class ParticipantQueueFull(ClaudeSDKInvocationError):
 @dataclass
 class TurnRequest:
     ctx: AgentContext
-    text: str
+    turn_input: AgentTurnInput
     on_activity: AgentActivityCallback | None
     future: asyncio.Future[ClaudeTurnResult]
 
@@ -71,7 +72,7 @@ class ParticipantSessionManager:
     async def submit(
         self,
         ctx: AgentContext,
-        text: str,
+        turn_input: AgentTurnInput | str,
         *,
         on_activity: AgentActivityCallback | None = None,
     ) -> ClaudeTurnResult:
@@ -88,7 +89,7 @@ class ParticipantSessionManager:
                 self._sessions[ctx.participant_id] = session
             request = TurnRequest(
                 ctx=ctx,
-                text=str(text),
+                turn_input=ensure_agent_turn_input(turn_input),
                 on_activity=on_activity,
                 future=loop.create_future(),
             )
@@ -146,7 +147,7 @@ class ParticipantSessionManager:
                         session.state = "running"
 
                     result = await asyncio.wait_for(
-                        client.run_turn(request.text),
+                        client.run_turn(request.turn_input),
                         timeout=self.turn_timeout_seconds,
                     )
                     await asyncio.to_thread(

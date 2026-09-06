@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from app.agent.context import AgentContext
+from app.contracts.agent_input import AgentTurnInput, ensure_agent_turn_input
 from app.agent.sdk_adapter import (
     ClaudeSDKInvocationError,
     ClaudeSDKTurnInterrupted,
@@ -40,19 +41,20 @@ class ClaudeAgentRuntime:
     async def handle_message(
         self,
         ctx: AgentContext,
-        text: str,
+        turn_input: AgentTurnInput | str,
         *,
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
     ) -> RuntimeResponse:
+        turn_input = ensure_agent_turn_input(turn_input)
         await asyncio.to_thread(
             self.conversations.add,
             ctx.participant_id,
             "user",
-            text,
+            turn_input.conversation_text,
             feishu_message_id=ctx.message_id,
         )
-        fixed = self.safety.precheck(text, chat_type=chat_type)
+        fixed = self.safety.precheck(turn_input.text, chat_type=chat_type)
         if fixed is not None:
             await self._save_answer(ctx, fixed)
             return RuntimeResponse(
@@ -62,7 +64,7 @@ class ClaudeAgentRuntime:
             )
         try:
             result = await self.sessions.submit(
-                ctx, text, on_activity=on_activity
+                ctx, turn_input, on_activity=on_activity
             )
         except ClaudeSDKTurnInterrupted as exc:
             await self._save_answer(ctx, FALLBACK_INTERRUPTED)

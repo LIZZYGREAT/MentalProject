@@ -30,3 +30,9 @@ class AgentTurnInput:
 
         text = self.text.strip()
         return f"[图片] {text}".strip() if self.images or self.trusted_image_context else text
+
+
+def ensure_agent_turn_input(value: AgentTurnInput | str) -> AgentTurnInput:
+    """Compatibility boundary for existing text-only callers and tests."""
+
+    return value if isinstance(value, AgentTurnInput) else AgentTurnInput(text=str(value))
