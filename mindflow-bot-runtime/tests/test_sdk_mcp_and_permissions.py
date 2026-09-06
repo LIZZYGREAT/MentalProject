@@ -172,7 +172,7 @@ def test_image_bound_context_blocks_calendar_mutation_at_backend_boundary():
     assert calls == []
 
 
-def test_direct_user_image_calendar_policy_allows_backend_mutation_tool():
+def test_direct_image_create_allows_create_only():
     calls = []
     registry = ToolRegistry()
 
@@ -193,11 +193,81 @@ def test_direct_user_image_calendar_policy_allows_backend_mutation_tool():
         "oc",
         "msg",
         uuid.uuid4(),
-        calendar_mutation_policy="calendar_direct_user_request",
+        calendar_mutation_policy="calendar_create_only",
     )
     result = asyncio.run(registry.execute(ctx, "calendar_create_event", {}))
     assert result.status == "succeeded"
     assert calls == [{}]
+
+
+def _assert_direct_image_create_blocks(tool_name):
+    calls = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, arguments):
+        calls.append(arguments)
+        return {"ok": True}
+
+    registry.register(
+        tool_name,
+        tool_name,
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+    )
+    ctx = AgentContext(
+        uuid.uuid4(),
+        "P001",
+        "ou",
+        "oc",
+        "msg",
+        uuid.uuid4(),
+        calendar_mutation_policy="calendar_create_only",
+    )
+
+    result = asyncio.run(registry.execute(ctx, tool_name, {}))
+
+    assert result.status == "calendar_mutation_not_authorized"
+    assert calls == []
+
+
+def test_direct_image_create_blocks_update():
+    _assert_direct_image_create_blocks("calendar_update_event")
+
+
+def test_direct_image_create_blocks_delete():
+    _assert_direct_image_create_blocks("calendar_delete_event")
+
+
+def test_image_prompt_injection_cannot_escalate_create_permission_to_delete():
+    calls = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, arguments):
+        calls.append(arguments)
+        return {"ok": True}
+
+    registry.register(
+        "calendar_delete_event",
+        "delete",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+    )
+    ctx = AgentContext(
+        uuid.uuid4(),
+        "P001",
+        "ou",
+        "oc",
+        "msg",
+        uuid.uuid4(),
+        calendar_mutation_policy="calendar_create_only",
+    )
+
+    result = asyncio.run(
+        registry.execute(ctx, "calendar_delete_event", {"event_id": "injected"})
+    )
+
+    assert result.status == "calendar_mutation_not_authorized"
+    assert calls == []
 
 
 def test_sdk_mcp_emits_one_real_start_and_success_lifecycle_event():

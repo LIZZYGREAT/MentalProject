@@ -725,7 +725,7 @@ def test_ordinary_image_direct_calendar_request_has_explicit_policy():
 
     asyncio.run(scenario())
     assert runtime.calls[0][0].calendar_mutation_policy == (
-        "calendar_direct_user_request"
+        "calendar_create_only"
     )
     assert runtime.calls[0][0].calendar_mutation_allowed is True
 

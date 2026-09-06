@@ -7,10 +7,24 @@ import uuid
 
 CalendarMutationPolicy = Literal[
     "read_only",
-    "calendar_direct_user_request",
+    "calendar_create_only",
+    "calendar_update_only",
+    "calendar_delete_only",
     "course_schedule_strict_only",
     "normal",
 ]
+CalendarMutationOperation = Literal["create", "update", "delete"]
+
+_CALENDAR_MUTATIONS_BY_POLICY: dict[
+    CalendarMutationPolicy, frozenset[CalendarMutationOperation]
+] = {
+    "read_only": frozenset(),
+    "calendar_create_only": frozenset({"create"}),
+    "calendar_update_only": frozenset({"update"}),
+    "calendar_delete_only": frozenset({"delete"}),
+    "course_schedule_strict_only": frozenset(),
+    "normal": frozenset({"create", "update", "delete"}),
+}
 
 
 @dataclass(frozen=True)
@@ -27,7 +41,13 @@ class AgentContext:
     def calendar_mutation_allowed(self) -> bool:
         """Compatibility view for callers that only need the hard gate."""
 
-        return self.calendar_mutation_policy in {
-            "normal",
-            "calendar_direct_user_request",
-        }
+        return bool(_CALENDAR_MUTATIONS_BY_POLICY[self.calendar_mutation_policy])
+
+    def allows_calendar_mutation(
+        self, operation: CalendarMutationOperation
+    ) -> bool:
+        """Authorize one explicit calendar operation at the backend boundary."""
+
+        return operation in _CALENDAR_MUTATIONS_BY_POLICY[
+            self.calendar_mutation_policy
+        ]

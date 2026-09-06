@@ -859,7 +859,7 @@ class BotWorker:
                         trusted_image_context=context.to_dict(),
                     ),
                     calendar_mutation_policy=(
-                        "calendar_direct_user_request"
+                        "calendar_create_only"
                         if is_direct_image_calendar_request(user_text)
                         and context.image_kind != "course_schedule"
                         else "read_only"
@@ -1095,7 +1095,7 @@ class BotWorker:
             calendar_mutation_policy=(
                 "course_schedule_strict_only"
                 if recent.image_kind == "course_schedule"
-                else "calendar_direct_user_request"
+                else "calendar_create_only"
                 if is_direct_image_calendar_request(event.text)
                 else "read_only"
             ),

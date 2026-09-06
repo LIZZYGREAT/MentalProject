@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from app.agent.context import AgentContext
+from app.agent.context import AgentContext, CalendarMutationOperation
 from app.repositories import AgentRunRepository
 
 
@@ -30,9 +30,11 @@ FORBIDDEN_FIELDS = {
 
 ToolHandler = Callable[[AgentContext, dict[str, Any]], Any | Awaitable[Any]]
 
-CALENDAR_MUTATION_TOOLS = frozenset(
-    {"calendar_create_event", "calendar_update_event", "calendar_delete_event"}
-)
+CALENDAR_MUTATION_TOOLS: dict[str, CalendarMutationOperation] = {
+    "calendar_create_event": "create",
+    "calendar_update_event": "update",
+    "calendar_delete_event": "delete",
+}
 
 
 @dataclass(frozen=True)
@@ -145,7 +147,11 @@ class ToolRegistry:
             result = {"ok": False, "error": "invalid_tool"}
             await self._log(ctx, name, None, result, "invalid_tool")
             return ToolExecution(result, "invalid_tool")
-        if name in CALENDAR_MUTATION_TOOLS and not ctx.calendar_mutation_allowed:
+        calendar_operation = CALENDAR_MUTATION_TOOLS.get(name)
+        if (
+            calendar_operation is not None
+            and not ctx.allows_calendar_mutation(calendar_operation)
+        ):
             result = {"ok": False, "error": "calendar_mutation_not_authorized"}
             await self._log(
                 ctx, name, None, result, "calendar_mutation_not_authorized"
