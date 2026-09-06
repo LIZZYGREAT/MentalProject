@@ -1,0 +1,192 @@
+"""Short-lived association state for Feishu image and nearby text events."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+COLLECTING = "collecting"
+PROCESSING = "processing"
+COMPLETED = "completed"
+CANCELLED = "cancelled"
+
+
+@dataclass
+class PendingMultimodalTurn:
+    turn_id: str
+    participant_id: Any
+    chat_id: str
+    primary_image_event: Any
+    attached_text_events: list[Any]
+    opened_at: float
+    debounce_deadline: float
+    association_deadline: float
+    state: str = COLLECTING
+
+
+@dataclass(frozen=True)
+class RecentImageContext:
+    participant_id: Any
+    chat_id: str
+    image_message_id: str
+    image_key: str | None
+    image_kind: str
+    structured_or_agent_summary: dict[str, Any]
+    created_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class OpenImageResult:
+    turn: PendingMultimodalTurn
+    displaced_turn: PendingMultimodalTurn | None = None
+
+
+class MultimodalTurnCoordinator:
+    """Coordinates ephemeral image turns without persisting raw media."""
+
+    def __init__(
+        self,
+        *,
+        debounce_seconds: float = 3.0,
+        association_seconds: float = 15.0,
+        recent_context_seconds: float = 120.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.debounce_seconds = max(0.0, float(debounce_seconds))
+        self.association_seconds = max(
+            self.debounce_seconds, float(association_seconds)
+        )
+        self.recent_context_seconds = max(0.0, float(recent_context_seconds))
+        self._clock = clock
+        self._pending: dict[tuple[Any, str], PendingMultimodalTurn] = {}
+        self._recent: dict[tuple[Any, str], RecentImageContext] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def key(participant_id: Any, chat_id: str) -> tuple[Any, str]:
+        return participant_id, str(chat_id)
+
+    async def open_image(
+        self, participant_id: Any, chat_id: str, image_event: Any
+    ) -> OpenImageResult:
+        now = self._clock()
+        key = self.key(participant_id, chat_id)
+        async with self._lock:
+            displaced = self._pending.get(key)
+            if displaced is not None and displaced.state in {COLLECTING, PROCESSING}:
+                displaced.state = CANCELLED
+            else:
+                displaced = None
+            turn = PendingMultimodalTurn(
+                turn_id=uuid.uuid4().hex,
+                participant_id=participant_id,
+                chat_id=str(chat_id),
+                primary_image_event=image_event,
+                attached_text_events=[],
+                opened_at=now,
+                debounce_deadline=now + self.debounce_seconds,
+                association_deadline=now + self.association_seconds,
+            )
+            self._pending[key] = turn
+            return OpenImageResult(turn=turn, displaced_turn=displaced)
+
+    async def attach_text(
+        self, participant_id: Any, chat_id: str, text_event: Any
+    ) -> PendingMultimodalTurn | None:
+        now = self._clock()
+        key = self.key(participant_id, chat_id)
+        async with self._lock:
+            turn = self._pending.get(key)
+            if (
+                turn is None
+                or turn.state not in {COLLECTING, PROCESSING}
+                or now > turn.association_deadline
+            ):
+                return None
+            turn.attached_text_events.append(text_event)
+            return turn
+
+    async def wait_for_debounce(
+        self, turn: PendingMultimodalTurn
+    ) -> PendingMultimodalTurn | None:
+        delay = max(0.0, turn.debounce_deadline - self._clock())
+        if delay:
+            await asyncio.sleep(delay)
+        key = self.key(turn.participant_id, turn.chat_id)
+        async with self._lock:
+            current = self._pending.get(key)
+            if current is not turn or turn.state != COLLECTING:
+                return None
+            turn.state = PROCESSING
+            return turn
+
+    async def attached_texts(self, turn: PendingMultimodalTurn) -> tuple[Any, ...]:
+        async with self._lock:
+            return tuple(turn.attached_text_events)
+
+    async def active_turn(
+        self, participant_id: Any, chat_id: str
+    ) -> PendingMultimodalTurn | None:
+        now = self._clock()
+        key = self.key(participant_id, chat_id)
+        async with self._lock:
+            turn = self._pending.get(key)
+            if turn is None or turn.state not in {COLLECTING, PROCESSING}:
+                return None
+            if now > turn.association_deadline:
+                return None
+            return turn
+
+    async def complete(
+        self,
+        turn: PendingMultimodalTurn,
+        *,
+        image_message_id: str,
+        image_key: str | None,
+        image_kind: str,
+        summary: dict[str, Any],
+    ) -> RecentImageContext:
+        now = self._clock()
+        recent = RecentImageContext(
+            participant_id=turn.participant_id,
+            chat_id=turn.chat_id,
+            image_message_id=str(image_message_id),
+            image_key=image_key,
+            image_kind=str(image_kind),
+            structured_or_agent_summary=dict(summary),
+            created_at=now,
+            expires_at=now + self.recent_context_seconds,
+        )
+        key = self.key(turn.participant_id, turn.chat_id)
+        async with self._lock:
+            turn.state = COMPLETED
+            if self._pending.get(key) is turn:
+                self._pending.pop(key, None)
+            self._recent[key] = recent
+        return recent
+
+    async def cancel(self, turn: PendingMultimodalTurn) -> None:
+        key = self.key(turn.participant_id, turn.chat_id)
+        async with self._lock:
+            turn.state = CANCELLED
+            if self._pending.get(key) is turn:
+                self._pending.pop(key, None)
+
+    async def recent_context(
+        self, participant_id: Any, chat_id: str
+    ) -> RecentImageContext | None:
+        now = self._clock()
+        key = self.key(participant_id, chat_id)
+        async with self._lock:
+            recent = self._recent.get(key)
+            if recent is None:
+                return None
+            if now > recent.expires_at:
+                self._recent.pop(key, None)
+                return None
+            return recent
