@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import json
 from types import SimpleNamespace
+import weakref
 
 from app.agent.skill_loader import SkillLoader
 from app.contracts.course_schedule import ScheduleVisionResult
@@ -239,6 +241,113 @@ def test_image_only_uses_read_only_agent_and_never_assumes_import():
     assert runtime.calls[0][1].text == ""
     assert runtime.calls[0][0].calendar_mutation_allowed is False
     assert sender.texts == ["answer:image-only"]
+
+
+def test_generic_image_bytes_are_released_before_main_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"large-image-bytes"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, vision=Vision(kind="photo"), debounce=0
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_false_positive_fallback_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"large-image-bytes"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return ScheduleVisionResult.from_dict({
+                "document_type": "not_course_schedule",
+                "semester_label": None,
+                "institution": None,
+                "courses": [],
+                "missing_context": [],
+                "warnings": [],
+            })
+
+    class Drafts:
+        def get_by_source(self, _participant_id, _message_id):
+            return None
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=Drafts()),
+        debounce=0.2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这个讲座添加到日历",
+            )
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
 
 
 def test_explicit_import_to_calendar_still_uses_fast_path():

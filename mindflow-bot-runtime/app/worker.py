@@ -806,6 +806,7 @@ class BotWorker:
                 dispatch_late = True
                 return
             downloaded_image = None
+            read_only = None
             if is_schedule_qa_intent(user_text):
                 read_only = await self._parse_schedule_read_only(event)
                 downloaded_image = read_only.downloaded_image
@@ -860,6 +861,9 @@ class BotWorker:
                     downloaded_image=image,
                     report_not_course_schedule=False,
                 )
+                read_only = None
+                downloaded_image = None
+                del image
                 if outcome.status in {"draft_created", "existing_draft"}:
                     recent = await self.multimodal_turns.complete(
                         turn,
@@ -899,6 +903,9 @@ class BotWorker:
                 else:
                     await self.multimodal_turns.cancel(turn)
             else:
+                read_only = None
+                downloaded_image = None
+                del image
                 await self._note_multimodal_route(event, route)
                 await self._run_agent_input(
                     event,
