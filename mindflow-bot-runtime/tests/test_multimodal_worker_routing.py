@@ -1154,6 +1154,166 @@ def test_strict_success_recent_followup_uses_authoritative_draft():
     )
 
 
+def test_recent_import_promotes_recent_context_to_authoritative_draft():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "promoted-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        person = worker.identity.resolve("app", "open")
+        return await worker.multimodal_turns.recent_context(person.id, "chat")
+
+    recent = asyncio.run(scenario())
+    assert recent.structured_or_agent_summary == {
+        "image_kind": "course_schedule",
+        "route": "recent_strict_schedule",
+        "draft_id": "promoted-draft",
+    }
+
+
+def test_followup_qa_after_recent_import_reads_authoritative_draft():
+    class Drafts:
+        def get(self, draft_id):
+            assert draft_id == "authoritative-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {
+                    "courses": [{"course_name": "用户修正后的课程", "weekday": 4}]
+                },
+                "items": [{"course_name": "用户修正后的课程"}],
+            }
+
+    class StrictVisionMustNotRun:
+        async def parse(self, *_args):
+            raise AssertionError("authoritative draft must bypass image reparse")
+
+    imports = SimpleNamespace(drafts=Drafts())
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVisionMustNotRun(),
+        schedule_imports=imports,
+        debounce=0,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "authoritative-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="那周四有什么课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    trusted = runtime.calls[-1][1].trusted_image_context
+    assert trusted["draft_id"] == "authoritative-draft"
+    assert trusted["schedule"]["courses"][0]["course_name"] == "用户修正后的课程"
+
+
+def test_two_late_followups_import_then_correction_apply_to_same_draft(monkeypatch):
+    monkeypatch.setattr(
+        "app.worker.course_schedule_preview_card",
+        lambda draft: {"draft_id": draft["id"]},
+    )
+    class BlockingRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            self.started.set()
+            await self.release.wait()
+            return RuntimeResponse(text="initial complete")
+
+    class Drafts:
+        def __init__(self):
+            self.corrections = []
+
+        def get(self, draft_id):
+            assert draft_id == "late-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {"courses": [{"course_name": "高数"}]},
+                "items": [{"course_name": "高数"}],
+            }
+
+        def apply_correction(self, participant_id, draft_id, **correction):
+            self.corrections.append((participant_id, draft_id, correction))
+            return self.get(draft_id)
+
+    runtime = BlockingRuntime()
+    drafts = Drafts()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule"),
+        schedule_imports=SimpleNamespace(drafts=drafts),
+        debounce=0,
+        association=1,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "late-draft"}, "course_schedule"
+        )
+
+    delivered_cards = []
+
+    async def deliver_card(_event, card):
+        delivered_cards.append(card)
+        return True
+
+    worker._handle_schedule_image = strict
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(
+            _payload("late-import", "m-late-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("late-correction", "m-late-correction", "text", text="高数其实是第3-4节")
+        )
+        await worker.process(await queue.get())
+        runtime.release.set()
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(drafts.corrections) == 1
+    assert drafts.corrections[0][1:] == (
+        "late-draft",
+        {"course_name": "高数", "period_start": 3, "period_end": 4},
+    )
+    assert len(delivered_cards) == 1
+
+
 def test_stop_after_two_consecutive_images_cancels_both_turns():
     vision = Vision(delay=1)
     gateway, queue, worker, runtime, sender, _, _ = _system(

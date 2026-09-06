@@ -151,6 +151,42 @@ def test_older_turn_completing_after_newer_turn_cannot_overwrite_recent():
     asyncio.run(scenario())
 
 
+def test_stale_old_image_recent_promotion_cannot_overwrite_new_image_global_recent():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        await coordinator.wait_for_debounce(first)
+        first_recent = await coordinator.complete(
+            first,
+            image_message_id="image-1",
+            image_key="key-1",
+            image_kind="course_schedule",
+            summary={"summary": "first"},
+        )
+        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+        await coordinator.wait_for_debounce(second)
+        second_recent = await coordinator.complete(
+            second,
+            image_message_id="image-2",
+            image_key="key-2",
+            image_kind="photo",
+            summary={"summary": "second"},
+        )
+
+        promoted = await coordinator.promote_recent_context(
+            first_recent,
+            image_kind="course_schedule",
+            summary={"draft_id": "old-draft"},
+        )
+
+        assert promoted.structured_or_agent_summary["draft_id"] == "old-draft"
+        assert await coordinator.recent_context(participant_id, "chat") is second_recent
+
+    asyncio.run(scenario())
+
+
 def test_frozen_input_routes_new_text_to_late_followups():
     coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
     participant_id = uuid.uuid4()

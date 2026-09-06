@@ -1041,11 +1041,12 @@ class BotWorker:
         participant,
         recent: RecentImageContext | None,
     ) -> None:
+        current_recent = recent
         for followup in await self.multimodal_turns.drain_late_followups(turn):
             try:
-                if recent is not None:
-                    await self._handle_recent_image_text(
-                        followup, participant, recent
+                if current_recent is not None:
+                    current_recent = await self._handle_recent_image_text(
+                        followup, participant, current_recent
                     )
                 else:
                     await self.process(followup)
@@ -1064,7 +1065,7 @@ class BotWorker:
 
     async def _handle_recent_image_text(
         self, event: BotEvent, participant, recent: RecentImageContext
-    ) -> None:
+    ) -> RecentImageContext:
         trusted_context = dict(recent.structured_or_agent_summary)
         draft_id = str(trusted_context.get("draft_id") or "").strip()
         strict_read_only_followup = False
@@ -1115,11 +1116,11 @@ class BotWorker:
                             event,
                             "我还不能确定你要改哪门课，请带上课程名或星期再说一次。",
                         )
-                        return
+                        return recent
                     await self._deliver_card(
                         event, course_schedule_preview_card(corrected)
                     )
-                    return
+                    return recent
                 trusted_context = {
                     "image_kind": "course_schedule",
                     "route": trusted_context.get("route"),
@@ -1143,10 +1144,20 @@ class BotWorker:
                 image_key=recent.image_key,
             )
             await self._note_multimodal_route(event, "recent_strict_schedule")
-            await self._handle_schedule_image(
+            outcome = await self._handle_schedule_image(
                 source_event, participant.id, delivery_event=event
             )
-            return
+            if outcome.status in {"draft_created", "existing_draft"}:
+                return await self.multimodal_turns.promote_recent_context(
+                    recent,
+                    image_kind="course_schedule",
+                    summary={
+                        "image_kind": "course_schedule",
+                        "route": "recent_strict_schedule",
+                        "draft_id": str((outcome.draft or {}).get("id") or ""),
+                    },
+                )
+            return recent
         await self._note_multimodal_route(
             event,
             "recent_strict_schedule_read_only"
@@ -1168,6 +1179,7 @@ class BotWorker:
                 else "read_only"
             ),
         )
+        return recent
 
     async def _run_agent_input(
         self,

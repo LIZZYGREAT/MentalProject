@@ -51,6 +51,7 @@ class RecentImageContext:
     created_at: float
     expires_at: float
     association_deadline: float
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,7 @@ class MultimodalTurnCoordinator:
             created_at=now,
             expires_at=now + self.recent_context_seconds,
             association_deadline=turn.association_deadline,
+            generation=turn.generation,
         )
         key = self.key(turn.participant_id, turn.chat_id)
         async with self._lock:
@@ -226,6 +228,33 @@ class MultimodalTurnCoordinator:
             if turn.generation == self._latest_generation.get(key):
                 self._recent[key] = recent
         return recent
+
+    async def promote_recent_context(
+        self,
+        recent: RecentImageContext,
+        *,
+        image_kind: str,
+        summary: dict[str, Any],
+    ) -> RecentImageContext:
+        """Upgrade one image context without reviving an older generation."""
+
+        promoted = RecentImageContext(
+            participant_id=recent.participant_id,
+            chat_id=recent.chat_id,
+            image_message_id=recent.image_message_id,
+            image_key=recent.image_key,
+            image_kind=str(image_kind),
+            structured_or_agent_summary=dict(summary),
+            created_at=recent.created_at,
+            expires_at=recent.expires_at,
+            association_deadline=recent.association_deadline,
+            generation=recent.generation,
+        )
+        key = self.key(recent.participant_id, recent.chat_id)
+        async with self._lock:
+            if recent.generation == self._latest_generation.get(key):
+                self._recent[key] = promoted
+        return promoted
 
     async def cancel(self, turn: PendingMultimodalTurn) -> None:
         key = self.key(turn.participant_id, turn.chat_id)
