@@ -780,6 +780,43 @@ def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft()
     assert ctx.calendar_mutation_allowed is False
 
 
+def test_read_only_schedule_context_never_reports_missing_time_after_backend_resolution():
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            payload = _strict_schedule_result().to_dict()
+            payload["missing_context"] = [
+                "actual_time",
+                "period_time_mapping",
+            ]
+            return ScheduleVisionResult.from_dict(payload)
+
+    gateway, queue, worker, runtime, _sender, _, _resources = _system(
+        vision=Vision(failure=True),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=object()),
+        debounce=0.2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    schedule = runtime.calls[0][1].trusted_image_context["schedule"]
+    assert schedule["missing_context"] == []
+
+
 def test_recent_course_schedule_qa_upgrades_generic_context_to_strict_parser():
     class StrictVision:
         model = "strict-vision"

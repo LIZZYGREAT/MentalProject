@@ -30,6 +30,7 @@ from app.repositories_course_schedule import (
     CourseScheduleImportRepository,
     UnfillableScheduleContextError,
     derive_required_context,
+    prepare_schedule_context,
 )
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
@@ -1289,6 +1290,21 @@ def test_backend_derives_required_context():
         "weekday",
         "week_rule",
     }
+
+
+def test_read_only_schedule_default_time_clears_stale_actual_time_missing_context():
+    payload = vision_payload(actual_times=False)
+    payload["missing_context"] = [
+        "semester_start_date",
+        "period_time_mapping",
+        "actual_time",
+    ]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["start_time"] == "08:00"
+    assert structured["courses"][0]["end_time"] == "09:40"
+    assert structured["missing_context"] == ["semester_start_date"]
 
 
 def test_complete_fields_ignore_stale_model_missing_context():
