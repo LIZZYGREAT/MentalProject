@@ -573,6 +573,61 @@ def test_strict_not_course_does_not_cache_course_schedule_kind():
     asyncio.run(scenario())
 
 
+def test_strict_success_recent_followup_uses_authoritative_draft():
+    class Drafts:
+        def get(self, draft_id):
+            assert draft_id == "authoritative-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {
+                    "courses": [{
+                        "course_name": "Repository 中的高等数学",
+                        "weekday": 3,
+                    }]
+                },
+                "items": [{"course_name": "Repository 中的高等数学"}],
+            }
+
+    imports = SimpleNamespace(drafts=Drafts())
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        schedule_imports=imports, debounce=0, recent=2
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_event = await queue.get()
+        person = worker.identity.resolve("app", "open")
+        turn = (
+            await worker.multimodal_turns.open_image(
+                person.id, image_event.chat_id, image_event
+            )
+        ).turn
+        await worker.multimodal_turns.wait_for_debounce(turn)
+        await worker.multimodal_turns.complete(
+            turn,
+            image_message_id=image_event.message_id,
+            image_key=image_event.image_key,
+            image_kind="course_schedule",
+            summary={
+                "route": "strict_schedule_fast_path",
+                "draft_id": "authoritative-draft",
+                "stale_summary": "不得用于回答",
+            },
+        )
+        assert gateway.accept_payload(
+            _payload("followup", "m-followup", "text", text="那周四呢？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    trusted = runtime.calls[0][1].trusted_image_context
+    assert trusted["draft_id"] == "authoritative-draft"
+    assert "stale_summary" not in trusted
+    assert trusted["schedule"]["courses"][0]["course_name"] == (
+        "Repository 中的高等数学"
+    )
+
+
 def test_stop_after_two_consecutive_images_cancels_both_turns():
     vision = Vision(delay=1)
     gateway, queue, worker, runtime, sender, _, _ = _system(
