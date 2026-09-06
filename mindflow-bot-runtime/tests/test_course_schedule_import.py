@@ -629,7 +629,7 @@ def test_bind_and_help_use_stable_copy_without_agent():
     assert sender.sent == [
         onboarding_text("P009"),
         help_text(),
-        "暂时不能帮你识别这张课程表图片，因为还没有记录外部模型处理授权。请先联系研究者。",
+        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
     ]
     assert runtime.calls == 0
     assert vision.calls == 0
@@ -775,6 +775,7 @@ def test_image_workflow_does_not_write_before_card_confirmation():
         queue, identity, events, AgentRunRepository(database), SkillLoader(skill_path()),
         Runtime(), sender, model="fake", schedule_vision=Vision(),
         schedule_imports=imports, message_resources=Resources(),
+        multimodal_debounce_seconds=0.05,
     )
 
     def text_payload(event_id, message_id, text):
@@ -793,7 +794,13 @@ def test_image_workflow_does_not_write_before_card_confirmation():
         assert gateway.accept_payload(text_payload("bind", "m-bind", f"/bind {code}"))
         await worker.process(await queue.get())
         assert gateway.accept_payload(image_event_payload())
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            text_payload("intent", "m-intent", "把这个课程表导入飞书日历")
+        )
         await worker.process(await queue.get())
+        await image_task
         assert calendar.calls == []
         assert gateway.accept_payload(text_payload("context", "m-context", "2026-09-07"))
         await worker.process(await queue.get())

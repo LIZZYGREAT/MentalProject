@@ -30,6 +30,10 @@ FORBIDDEN_FIELDS = {
 
 ToolHandler = Callable[[AgentContext, dict[str, Any]], Any | Awaitable[Any]]
 
+CALENDAR_MUTATION_TOOLS = frozenset(
+    {"calendar_create_event", "calendar_update_event", "calendar_delete_event"}
+)
+
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -141,6 +145,12 @@ class ToolRegistry:
             result = {"ok": False, "error": "invalid_tool"}
             await self._log(ctx, name, None, result, "invalid_tool")
             return ToolExecution(result, "invalid_tool")
+        if name in CALENDAR_MUTATION_TOOLS and not ctx.calendar_mutation_allowed:
+            result = {"ok": False, "error": "calendar_mutation_not_authorized"}
+            await self._log(
+                ctx, name, None, result, "calendar_mutation_not_authorized"
+            )
+            return ToolExecution(result, "calendar_mutation_not_authorized")
         if not isinstance(arguments, dict):
             result = {"ok": False, "error": "invalid_arguments"}
             await self._log(ctx, name, None, result, "invalid_arguments")

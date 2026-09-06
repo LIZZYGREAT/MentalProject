@@ -4320,12 +4320,15 @@ class BotEventRepository:
             "presentation_agent_outcome",
             "presentation_agent_latency_ms",
             "presentation_cleanup_pending",
+            "multimodal_primary_event_id",
+            "multimodal_attached_to_event_id",
+            "multimodal_route",
         }
         payload = {key: metrics[key] for key in allowed if key in metrics}
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is not None:
-                row.telemetry_json = payload
+                row.telemetry_json = {**(row.telemetry_json or {}), **payload}
 
 
 class RuntimeIncidentRepository:

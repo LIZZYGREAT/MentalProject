@@ -470,10 +470,14 @@ async def run() -> None:
         progress_max_messages=settings.progress_max_messages,
         incidents=incidents,
         schedule_vision=business.course_schedule_vision,
+        generic_image_vision=business.generic_image_vision,
         schedule_imports=business.course_schedule_imports,
         message_resources=message_resources,
         schedule_draft_ttl_minutes=settings.vision_import_draft_ttl_minutes,
         schedule_image_max_concurrency=settings.vision_max_concurrency,
+        multimodal_debounce_seconds=settings.multimodal_debounce_seconds,
+        multimodal_association_seconds=settings.multimodal_association_seconds,
+        multimodal_recent_context_seconds=settings.multimodal_recent_context_seconds,
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(

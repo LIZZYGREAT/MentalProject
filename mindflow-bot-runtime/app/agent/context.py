@@ -12,3 +12,4 @@ class AgentContext:
     chat_id: str
     message_id: str
     agent_run_id: uuid.UUID
+    calendar_mutation_allowed: bool = True

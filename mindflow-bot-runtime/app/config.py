@@ -126,12 +126,15 @@ class Settings:
     vision_api_enabled: bool = False
     vision_api_url: str = "https://api.deepseek.com/chat/completions"
     vision_api_model: str = "deepseek-v4-flash-vision-exp"
-    vision_api_timeout_seconds: float = 25.0
+    vision_api_timeout_seconds: float = 90.0
     vision_max_concurrency: int = 1
     vision_max_image_bytes: int = 8 * 1024 * 1024
     vision_import_draft_ttl_minutes: int = 60
     vision_schedule_max_items: int = 20
     vision_schedule_max_calendar_writes: int = 400
+    multimodal_debounce_seconds: float = 3.0
+    multimodal_association_seconds: float = 15.0
+    multimodal_recent_context_seconds: float = 120.0
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -387,7 +390,7 @@ class Settings:
                 "VISION_API_MODEL", "deepseek-v4-flash-vision-exp"
             ).strip(),
             vision_api_timeout_seconds=_float(
-                values, "VISION_API_TIMEOUT_SECONDS", 25.0, minimum=0.1
+                values, "VISION_API_TIMEOUT_SECONDS", 90.0, minimum=0.1
             ),
             vision_max_concurrency=_int(values, "VISION_MAX_CONCURRENCY", 1),
             vision_max_image_bytes=_int(
@@ -401,6 +404,15 @@ class Settings:
             ),
             vision_schedule_max_calendar_writes=_int(
                 values, "VISION_SCHEDULE_MAX_CALENDAR_WRITES", 400
+            ),
+            multimodal_debounce_seconds=_float(
+                values, "MULTIMODAL_DEBOUNCE_SECONDS", 3.0
+            ),
+            multimodal_association_seconds=_float(
+                values, "MULTIMODAL_ASSOCIATION_SECONDS", 15.0
+            ),
+            multimodal_recent_context_seconds=_float(
+                values, "MULTIMODAL_RECENT_CONTEXT_SECONDS", 120.0
             ),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
@@ -592,6 +604,10 @@ class Settings:
             raise ValueError("Vision API requires URL, model, and DEEPSEEK_API_KEY")
         if self.vision_schedule_max_items > 20:
             raise ValueError("VISION_SCHEDULE_MAX_ITEMS must be <= 20")
+        if self.multimodal_association_seconds < self.multimodal_debounce_seconds:
+            raise ValueError(
+                "MULTIMODAL_ASSOCIATION_SECONDS must be >= MULTIMODAL_DEBOUNCE_SECONDS"
+            )
         if self.response_max_segments > 3:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:

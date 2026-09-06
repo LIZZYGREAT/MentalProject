@@ -35,6 +35,7 @@ from app.repositories_calendar_mutation import (
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_vision import CourseScheduleVisionService
+from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
 from app.repositories_care import (
     CareInterventionRepository,
@@ -90,6 +91,7 @@ class BusinessServices:
     care_outcome_refresh: CareOutcomeRefreshService
     course_schedule_imports: CourseScheduleImportService
     course_schedule_vision: CourseScheduleVisionService
+    generic_image_vision: GenericImageVisionService
 
 
 def build_business_services(
@@ -218,6 +220,14 @@ def build_business_services(
         max_concurrency=settings.vision_max_concurrency,
         max_items=settings.vision_schedule_max_items,
     )
+    generic_image_vision = GenericImageVisionService(
+        settings.vision_api_url,
+        settings.deepseek_api_key,
+        settings.vision_api_model,
+        enabled=settings.vision_api_enabled,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
+    )
     card_actions = CardActionService(
         observations,
         calendar,
@@ -281,4 +291,5 @@ def build_business_services(
         care_outcome_refresh=care_outcome_refresh,
         course_schedule_imports=course_schedule_imports,
         course_schedule_vision=course_schedule_vision,
+        generic_image_vision=generic_image_vision,
     )

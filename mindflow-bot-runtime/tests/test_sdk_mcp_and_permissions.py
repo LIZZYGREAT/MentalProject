@@ -140,6 +140,38 @@ def test_sdk_mcp_uses_registry_schema_and_backend_context_only():
     assert not any(field in schema_text for field in FORBIDDEN_FIELDS)
 
 
+def test_image_bound_context_blocks_calendar_mutation_at_backend_boundary():
+    calls = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, arguments):
+        calls.append(arguments)
+        return {"ok": True}
+
+    registry.register(
+        "calendar_create_event",
+        "create",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+    )
+    ctx = AgentContext(
+        uuid.uuid4(),
+        "P001",
+        "ou",
+        "oc",
+        "msg",
+        uuid.uuid4(),
+        calendar_mutation_allowed=False,
+    )
+    result = asyncio.run(registry.execute(ctx, "calendar_create_event", {}))
+    assert result.status == "calendar_mutation_not_authorized"
+    assert result.result == {
+        "ok": False,
+        "error": "calendar_mutation_not_authorized",
+    }
+    assert calls == []
+
+
 def test_sdk_mcp_emits_one_real_start_and_success_lifecycle_event():
     activities = []
     registry = ToolRegistry()

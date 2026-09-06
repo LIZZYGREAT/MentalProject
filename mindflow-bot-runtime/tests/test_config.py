@@ -129,6 +129,24 @@ def test_vision_schedule_item_cap_cannot_exceed_visible_preview_limit():
     assert settings.vision_schedule_max_calendar_writes == 401
 
 
+def test_multimodal_windows_have_safe_defaults_and_valid_order():
+    settings = Settings.from_env(
+        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.vision_api_timeout_seconds == 90
+    assert settings.multimodal_debounce_seconds == 3
+    assert settings.multimodal_association_seconds == 15
+    assert settings.multimodal_recent_context_seconds == 120
+
+    environment = valid_environment()
+    environment["MULTIMODAL_DEBOUNCE_SECONDS"] = "5"
+    environment["MULTIMODAL_ASSOCIATION_SECONDS"] = "4"
+    with pytest.raises(ValueError, match="MULTIMODAL_ASSOCIATION_SECONDS"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
 def test_haiku_and_subagent_must_use_the_same_model():
     environment = valid_environment()
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = "wrong-model"
