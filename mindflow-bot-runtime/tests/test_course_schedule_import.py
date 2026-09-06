@@ -56,6 +56,7 @@ from app.domain.course_schedule_periods import (
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
     CourseScheduleVisionService,
+    SYSTEM_PROMPT,
 )
 from app.services.card_action_service import CardActionService
 from helpers import memory_database, participant, skill_path
@@ -208,9 +209,10 @@ def test_draft_persists_and_calendar_never_writes_before_confirm():
     assert restarted_repo.get(draft["id"])["items"][0]["status"] == "pending"
     card = course_schedule_preview_card(draft)
     payload = json.dumps(card, ensure_ascii=False)
-    assert "按课表周期规则添加" in payload
-    assert "全部拆成单次日程" in payload
-    assert "取消" in payload
+    assert "按课程规律添加（推荐）" in payload
+    assert "每次上课都单独添加" in payload
+    assert "暂不导入" in payload
+    assert "时间来源：课表图片中的实际时间" in payload
     assert PRESERVE_SCHEDULE_PATTERN in payload
     assert EXPAND_ALL_OCCURRENCES in payload
     visible_text = "\n".join(
@@ -1304,6 +1306,119 @@ def test_complete_fields_ignore_stale_model_missing_context():
     )
     assert draft["status"] == "pending_confirmation"
     assert draft["structured_result"]["missing_context"] == []
+
+
+def test_period_inference_metadata_is_validated_and_preserved_for_audit():
+    database = memory_database()
+    owner = participant(database, "PERIOD-AUDIT")
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_inference_source"] = "grid_position"
+    payload["courses"][0]["period_confidence"] = 0.88
+    result = ScheduleVisionResult.from_dict(payload)
+    draft = CourseScheduleImportRepository(database).create_draft(
+        owner.id,
+        source_message_id="period-audit",
+        source_image_hash="9" * 64,
+        vision_model="vision-model",
+        result=result,
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert draft["structured_result"]["_metadata"]["period_inference"] == [
+        {"source": "grid_position", "confidence": 0.88}
+    ]
+    assert draft["items"][0]["start_time"] == "08:00"
+    assert draft["items"][0]["end_time"] == "09:40"
+    assert "时间来源：学校默认作息" in json.dumps(
+        course_schedule_preview_card(draft), ensure_ascii=False
+    )
+
+
+def test_strict_schedule_prompt_uses_grid_rows_without_course_order_guessing():
+    assert "纵向网格绝对位置" in SYSTEM_PROMPT
+    assert "第几个识别到的课程" in SYSTEM_PROMPT
+    assert "Backend 有学校默认作息" in SYSTEM_PROMPT
+    assert "顶部被裁切" in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("period_start", "period_end", "expected_start", "expected_end"),
+    [
+        (1, 2, time(8, 0), time(9, 40)),
+        (7, 8, time(14, 0), time(15, 40)),
+        (13, 14, time(20, 30), time(22, 10)),
+    ],
+)
+def test_default_school_period_ranges_are_backend_authority(
+    period_start, period_end, expected_start, expected_end
+):
+    assert resolve_period_time(period_start, period_end) == (
+        expected_start,
+        expected_end,
+        "default",
+    )
+
+
+def test_grid_period_results_preserve_absolute_rows_and_cropped_grid_stays_null():
+    explicit = vision_payload(actual_times=False)
+    explicit["courses"][0].update({
+        "period_start": 1,
+        "period_end": 2,
+        "period_inference_source": "explicit_label",
+        "period_confidence": 1.0,
+    })
+    assert ScheduleVisionResult.from_dict(explicit).courses[0].period_start == 1
+
+    grid = vision_payload(actual_times=False)
+    grid["courses"][0].update({
+        "period_start": 3,
+        "period_end": 4,
+        "period_inference_source": "grid_position",
+        "period_confidence": 0.9,
+    })
+    parsed_grid = ScheduleVisionResult.from_dict(grid).courses[0]
+    assert (parsed_grid.period_start, parsed_grid.period_end) == (3, 4)
+
+    cropped = vision_payload(actual_times=False)
+    cropped["courses"][0].update({
+        "period_start": None,
+        "period_end": None,
+        "period_inference_source": "unknown",
+        "period_confidence": None,
+    })
+    parsed_cropped = ScheduleVisionResult.from_dict(cropped).courses[0]
+    assert parsed_cropped.period_start is None
+    assert parsed_cropped.period_end is None
+
+
+def test_natural_course_corrections_update_draft_without_schema_language():
+    database = memory_database()
+    owner = participant(database, "CORRECTION")
+    repo, draft = _draft(database, owner.id)
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+    course = corrected["structured_result"]["courses"][0]
+    assert (course["period_start"], course["period_end"]) == (3, 4)
+    assert corrected["items"][0]["start_time"] == "10:00"
+    assert corrected["items"][0]["end_time"] == "11:40"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "default"
+    ]
+
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], weekday=1, odd_even="odd"
+    )
+    assert corrected["items"][0]["week_rule"]["odd_even"] == "odd"
+
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], course_name="高等数学", location="逸夫楼"
+    )
+    assert corrected["items"][0]["location"] == "逸夫楼"
 
 
 def test_schedule_image_pipeline_respects_max_concurrency():

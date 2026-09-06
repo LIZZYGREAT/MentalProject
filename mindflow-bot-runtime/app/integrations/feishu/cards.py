@@ -20,6 +20,8 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     courses = list(structured.get("courses") or [])
     items = list(draft.get("items") or [])
     missing = set(structured.get("missing_context") or [])
+    metadata = dict(structured.get("_metadata") or {})
+    time_sources = list(metadata.get("course_time_sources") or [])
     lines = [f"识别到 **{len(courses)}** 门课"]
     uncertain: list[str] = []
     weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -46,6 +48,14 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
                 week_text += "双周"
         location = _safe_schedule_text(course.get("location") or "地点待确认")
         lines.extend(["", f"**{name}**", f"{day} {period} · {week_text} · {location}"])
+        source = time_sources[index] if index < len(time_sources) else None
+        source_text = {
+            "image": "课表图片中的实际时间",
+            "user": "你刚刚提供的作息",
+            "default": "学校默认作息",
+        }.get(source)
+        if source_text:
+            lines.append(f"时间来源：{source_text}")
         if not missing and index < len(items):
             writes = plan_course_writes(
                 draft,
@@ -63,22 +73,35 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     if uncertain or warnings:
         lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
     if "semester_start_date" in missing:
-        lines.extend(["", "这张课表里没有学期第一周日期。", "告诉我第一周周一是哪天就可以继续。"])
+        lines.extend([
+            "",
+            "还差一个信息：这学期第一周周一是哪天？例如 2026-09-07。",
+        ])
     if missing & {"period_time_mapping", "actual_time"}:
-        lines.extend(["", "这张课表只有“第1-2节”这类节次，没有具体上课时间。", "把学校作息时间告诉我后，我再生成日历。"])
+        lines.extend([
+            "",
+            "有课程的节次在图片里看不清，也没有实际时间。请告诉我是第几节到第几节。",
+        ])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     status = str(draft.get("status") or "")
     if not missing and len(courses) <= 20 and status == "pending_confirmation":
         elements.extend([
+            {
+                "tag": "markdown",
+                "content": (
+                    "按课程规律添加：例如“每周一第1-2节”，在日历里按周重复。\n"
+                    "每次单独添加：每一次上课都创建成独立日程。"
+                ),
+            },
             _schedule_action_button(
                 draft["id"],
-                "按课表周期规则添加",
+                "按课程规律添加（推荐）",
                 strategy=PRESERVE_SCHEDULE_PATTERN,
                 primary=True,
             ),
             _schedule_action_button(
                 draft["id"],
-                "全部拆成单次日程",
+                "每次上课都单独添加",
                 strategy=EXPAND_ALL_OCCURRENCES,
             ),
             _schedule_cancel_button(draft["id"]),
@@ -178,7 +201,7 @@ def _schedule_cancel_button(import_id: str) -> dict[str, Any]:
     return {
         "tag": "button",
         "type": "default",
-        "text": {"tag": "plain_text", "content": "取消"},
+        "text": {"tag": "plain_text", "content": "暂不导入"},
         "behaviors": [{"type": "callback", "value": {
             "mindflow_action": "course_schedule_import_cancel",
             "version": "2",

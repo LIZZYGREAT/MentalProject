@@ -9,7 +9,7 @@ from app.integrations.feishu.gateway import FeishuGateway
 from app.presentation.contracts import RuntimeResponse
 from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
 from app.services.generic_image_vision import GenericImageVisionUnavailable
-from app.worker import BotWorker
+from app.worker import BotWorker, parse_schedule_correction
 from helpers import memory_database, participant, skill_path
 
 
@@ -63,6 +63,19 @@ class Vision:
             summary="图片摘要",
             visible_text="可见文字",
         )
+
+
+def test_natural_schedule_correction_phrases_are_parsed_without_schema_terms():
+    assert parse_schedule_correction("高数其实是第3-4节") == {
+        "course_name": "高数",
+        "period_start": 3,
+        "period_end": 4,
+    }
+    assert parse_schedule_correction("周三那门课是单周") == {
+        "weekday": 3,
+        "odd_even": "odd",
+    }
+    assert parse_schedule_correction("这里是逸夫楼") == {"location": "逸夫楼"}
 
 
 def _payload(event_id, message_id, message_type, *, text=""):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
+from datetime import date
 from pathlib import Path
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -135,6 +136,7 @@ class Settings:
     multimodal_debounce_seconds: float = 3.0
     multimodal_association_seconds: float = 15.0
     multimodal_recent_context_seconds: float = 120.0
+    course_default_semester_start_date: str = ""
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -414,6 +416,9 @@ class Settings:
             multimodal_recent_context_seconds=_float(
                 values, "MULTIMODAL_RECENT_CONTEXT_SECONDS", 120.0
             ),
+            course_default_semester_start_date=values.get(
+                "COURSE_DEFAULT_SEMESTER_START_DATE", ""
+            ).strip(),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
                 values, "WARNING_POLL_INTERVAL_SECONDS", 15
@@ -608,6 +613,19 @@ class Settings:
             raise ValueError(
                 "MULTIMODAL_ASSOCIATION_SECONDS must be >= MULTIMODAL_DEBOUNCE_SECONDS"
             )
+        if self.course_default_semester_start_date:
+            try:
+                configured_semester_start = date.fromisoformat(
+                    self.course_default_semester_start_date
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "COURSE_DEFAULT_SEMESTER_START_DATE must be YYYY-MM-DD"
+                ) from exc
+            if configured_semester_start.weekday() != 0:
+                raise ValueError(
+                    "COURSE_DEFAULT_SEMESTER_START_DATE must be a Monday"
+                )
         if self.response_max_segments > 3:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:

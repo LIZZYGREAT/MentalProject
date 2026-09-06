@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Protocol
 
 from app.agent.claude_runtime import (
@@ -92,6 +92,19 @@ CALENDAR_TARGET_PATTERN = re.compile(r"日历|飞书|日程")
 RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
     r"刚才|刚刚|那张图|这张图|上面|图里|周[一二三四五六日天].*(?:呢|课|什么|几节)"
 )
+COURSE_PERIOD_CORRECTION_PATTERN = re.compile(
+    r"(?P<course>[\w\u4e00-\u9fff·（）() -]{1,40}?)(?:其实|实际|应该)?(?:是|为)?\s*"
+    r"第?\s*(?P<start>\d{1,2})\s*[-–—至到]\s*(?P<end>\d{1,2})\s*节"
+)
+WEEKDAY_ODD_EVEN_CORRECTION_PATTERN = re.compile(
+    r"周(?P<weekday>[一二三四五六日天])(?:那门课|的课|课程)?(?:其实|实际|应该)?(?:是|为)?\s*(?P<mode>单|双)周"
+)
+LOCATION_CORRECTION_PATTERN = re.compile(
+    r"(?:这里|地点|教室)(?:是|在|为)\s*(?P<location>[^，。！？\s]{1,50})"
+)
+WEEKDAY_NUMBER = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7,
+}
 
 
 def is_strong_schedule_import_intent(
@@ -105,6 +118,28 @@ def is_strong_schedule_import_intent(
     return image_kind == "course_schedule" and bool(
         CALENDAR_TARGET_PATTERN.search(value)
     )
+
+
+def parse_schedule_correction(text: str) -> dict[str, object] | None:
+    value = str(text or "").strip()
+    period = COURSE_PERIOD_CORRECTION_PATTERN.search(value)
+    if period:
+        course_name = period.group("course").strip(" ，。其实实际应该")
+        return {
+            "course_name": course_name,
+            "period_start": int(period.group("start")),
+            "period_end": int(period.group("end")),
+        }
+    odd_even = WEEKDAY_ODD_EVEN_CORRECTION_PATTERN.search(value)
+    if odd_even:
+        return {
+            "weekday": WEEKDAY_NUMBER[odd_even.group("weekday")],
+            "odd_even": "odd" if odd_even.group("mode") == "单" else "even",
+        }
+    location = LOCATION_CORRECTION_PATTERN.search(value)
+    if location:
+        return {"location": location.group("location")}
+    return None
 
 class AgentRuntimeProtocol(Protocol):
     async def handle_message(
@@ -203,6 +238,7 @@ class BotWorker:
         multimodal_debounce_seconds: float = 3.0,
         multimodal_association_seconds: float = 15.0,
         multimodal_recent_context_seconds: float = 120.0,
+        course_default_semester_start_date: str = "",
     ):
         self.queue = queue
         self.identity = identity
@@ -242,6 +278,9 @@ class BotWorker:
             association_seconds=multimodal_association_seconds,
             recent_context_seconds=multimodal_recent_context_seconds,
         )
+        self.course_default_semester_start_date = str(
+            course_default_semester_start_date or ""
+        ).strip()
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
@@ -469,6 +508,30 @@ class BotWorker:
                     )
 
             if long_task is None and event.message_type == "text":
+                correction = parse_schedule_correction(event.text)
+                if correction is not None and self.schedule_imports is not None:
+                    latest_draft = await asyncio.to_thread(
+                        self.schedule_imports.drafts.latest_pending_context,
+                        participant.id,
+                    )
+                    if latest_draft is not None:
+                        try:
+                            corrected = await asyncio.to_thread(
+                                self.schedule_imports.drafts.apply_correction,
+                                participant.id,
+                                latest_draft["id"],
+                                **correction,
+                            )
+                        except ValueError:
+                            await self._deliver(
+                                event,
+                                "我还不能确定你要改哪门课，请带上课程名或星期再说一次。",
+                            )
+                            return
+                        await self._deliver_card(
+                            event, course_schedule_preview_card(corrected)
+                        )
+                        return
                 context_match = (
                     SEMESTER_MONDAY_PATTERN.search(event.text)
                     or BARE_DATE_PATTERN.match(event.text)
@@ -827,6 +890,11 @@ class BotWorker:
                     result=result,
                     timezone_name=str(self.schedule_imports.timezone),
                     ttl_minutes=self.schedule_draft_ttl_minutes,
+                    semester_start_date=(
+                        date.fromisoformat(self.course_default_semester_start_date)
+                        if self.course_default_semester_start_date
+                        else None
+                    ),
                 )
                 del image
                 await self._deliver_card(

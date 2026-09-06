@@ -478,6 +478,7 @@ async def run() -> None:
         multimodal_debounce_seconds=settings.multimodal_debounce_seconds,
         multimodal_association_seconds=settings.multimodal_association_seconds,
         multimodal_recent_context_seconds=settings.multimodal_recent_context_seconds,
+        course_default_semester_start_date=settings.course_default_semester_start_date,
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(

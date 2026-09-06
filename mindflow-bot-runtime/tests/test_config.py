@@ -146,6 +146,19 @@ def test_multimodal_windows_have_safe_defaults_and_valid_order():
             environment, base_dir=Path(__file__).resolve().parents[1]
         )
 
+    environment = valid_environment()
+    environment["COURSE_DEFAULT_SEMESTER_START_DATE"] = "2026-09-07"
+    configured = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert configured.course_default_semester_start_date == "2026-09-07"
+
+    environment["COURSE_DEFAULT_SEMESTER_START_DATE"] = "2026-09-08"
+    with pytest.raises(ValueError, match="must be a Monday"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
 
 def test_haiku_and_subagent_must_use_the_same_model():
     environment = valid_environment()

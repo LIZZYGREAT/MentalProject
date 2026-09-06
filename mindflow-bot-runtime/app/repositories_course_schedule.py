@@ -253,6 +253,141 @@ class CourseScheduleImportRepository:
             session.flush()
             return self._view(session, row)
 
+    def apply_correction(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        course_name: str | None = None,
+        weekday: int | None = None,
+        period_start: int | None = None,
+        period_end: int | None = None,
+        odd_even: str | None = None,
+        location: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a natural-language correction to one unconfirmed course."""
+
+        if (period_start is None) != (period_end is None):
+            raise ValueError("corrected period range must be complete")
+        if period_start is not None and not 1 <= period_start <= period_end <= 30:
+            raise ValueError("corrected period range is invalid")
+        if odd_even is not None and odd_even not in {"odd", "even", "all"}:
+            raise ValueError("corrected odd/even rule is invalid")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session)
+            if row.status not in ACTIVE_DRAFT_STATUSES or row.recurrence_strategy:
+                raise ValueError("draft no longer accepts corrections")
+            structured = dict(row.structured_result or {})
+            courses = [dict(value) for value in structured.get("courses") or []]
+            candidates = list(range(len(courses)))
+            if course_name:
+                needle = str(course_name).strip().lower()
+                candidates = [
+                    index
+                    for index in candidates
+                    if needle in str(courses[index].get("course_name") or "").lower()
+                    or str(courses[index].get("course_name") or "").lower() in needle
+                ]
+            if weekday is not None:
+                candidates = [
+                    index for index in candidates
+                    if courses[index].get("weekday") == weekday
+                ]
+            if len(candidates) != 1:
+                raise ValueError("correction must identify exactly one course")
+            index = candidates[0]
+            course = courses[index]
+            items = self._items(session, row.id)
+            item = items[index]
+            metadata = dict(structured.get("_metadata") or {})
+            sources = list(metadata.get("course_time_sources") or [])
+            while len(sources) < len(courses):
+                sources.append(None)
+            corrected_fields: set[str] = set()
+            if period_start is not None and period_end is not None:
+                course["period_start"] = period_start
+                course["period_end"] = period_end
+                course["period_inference_source"] = "unknown"
+                course["period_confidence"] = None
+                resolved = resolve_period_time(period_start, period_end)
+                if resolved is None:
+                    course["start_time"] = None
+                    course["end_time"] = None
+                    item.start_time = None
+                    item.end_time = None
+                    sources[index] = None
+                else:
+                    start_clock, end_clock, source = resolved
+                    course["start_time"] = start_clock.strftime("%H:%M")
+                    course["end_time"] = end_clock.strftime("%H:%M")
+                    item.start_time = start_clock
+                    item.end_time = end_clock
+                    sources[index] = source
+                corrected_fields.update({"period_start", "period_end", "actual_time"})
+            if odd_even is not None:
+                rule = dict(course.get("week_rule") or {})
+                if not rule:
+                    raise ValueError("week range is required before odd/even correction")
+                rule["odd_even"] = odd_even
+                course["week_rule"] = rule
+                item.week_rule_json = rule
+                corrected_fields.add("week_rule")
+            if location is not None:
+                cleaned_location = str(location).strip()[:300]
+                if not cleaned_location:
+                    raise ValueError("corrected location is empty")
+                course["location"] = cleaned_location
+                item.location = cleaned_location
+                corrected_fields.add("location")
+            course["uncertain_fields"] = [
+                value for value in course.get("uncertain_fields") or []
+                if value not in corrected_fields
+            ]
+            courses[index] = course
+            structured["courses"] = courses
+            metadata["course_time_sources"] = sources
+            corrections = list(metadata.get("user_corrections") or [])
+            corrections.append({
+                "course_index": index,
+                "fields": sorted(corrected_fields),
+            })
+            metadata["user_corrections"] = corrections[-50:]
+            structured["_metadata"] = metadata
+            authoritative = ScheduleVisionResult.from_dict({
+                key: structured.get(key)
+                for key in (
+                    "document_type", "semester_label", "institution", "courses",
+                    "missing_context", "warnings",
+                )
+            })
+            missing = derive_required_context(
+                authoritative, semester_start_date=row.semester_start_date
+            )
+            structured["missing_context"] = sorted(missing)
+            row.structured_result = structured
+            row.status = "pending_context" if missing else "pending_confirmation"
+            key_payload = {
+                "index": index,
+                "course": course.get("course_name"),
+                "weekday": course.get("weekday"),
+                "period": [course.get("period_start"), course.get("period_end")],
+                "time": [course.get("start_time"), course.get("end_time")],
+                "location": course.get("location"),
+                "week_rule": course.get("week_rule"),
+            }
+            item.normalized_key = hashlib.sha256(
+                json.dumps(
+                    key_payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), default=list,
+                ).encode("utf-8")
+            ).hexdigest()
+            session.flush()
+            return self._view(session, row)
+
     def validate_for_confirmation(
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
     ) -> dict[str, Any]:
@@ -642,5 +777,12 @@ def _prepare_structured_result(result: ScheduleVisionResult) -> dict[str, Any]:
         "planner_version": COURSE_IMPORT_PLANNER_VERSION,
         "period_map_version": DEFAULT_PERIOD_MAP_VERSION,
         "course_time_sources": sources,
+        "period_inference": [
+            {
+                "source": course.period_inference_source or "unknown",
+                "confidence": course.period_confidence,
+            }
+            for course in result.courses
+        ],
     }
     return structured

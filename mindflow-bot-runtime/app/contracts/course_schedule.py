@@ -62,6 +62,8 @@ class CourseScheduleItem:
     location: str | None
     teacher: str | None
     week_rule: WeekRule | None
+    period_inference_source: str | None = None
+    period_confidence: float | None = None
     uncertain_fields: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
@@ -71,6 +73,7 @@ class CourseScheduleItem:
         allowed = {
             "course_name", "weekday", "period_start", "period_end", "start_time",
             "end_time", "location", "teacher", "week_rule", "uncertain_fields",
+            "period_inference_source", "period_confidence",
         }
         if set(value) - allowed:
             raise ScheduleVisionValidationError("course contains unknown fields")
@@ -93,6 +96,30 @@ class CourseScheduleItem:
         uncertain = value.get("uncertain_fields") or []
         if not isinstance(uncertain, list) or any(not isinstance(item, str) for item in uncertain):
             raise ScheduleVisionValidationError("uncertain_fields must be a string list")
+        inference_source = value.get("period_inference_source")
+        if inference_source is not None:
+            inference_source = str(inference_source).strip().lower()
+            if inference_source not in {
+                "explicit_label", "cell_text", "grid_position", "unknown"
+            }:
+                raise ScheduleVisionValidationError(
+                    "period_inference_source is invalid"
+                )
+        confidence_value = value.get("period_confidence")
+        period_confidence = None
+        if confidence_value is not None:
+            if isinstance(confidence_value, bool):
+                raise ScheduleVisionValidationError("period_confidence is invalid")
+            try:
+                period_confidence = float(confidence_value)
+            except (TypeError, ValueError) as exc:
+                raise ScheduleVisionValidationError(
+                    "period_confidence is invalid"
+                ) from exc
+            if not 0 <= period_confidence <= 1:
+                raise ScheduleVisionValidationError(
+                    "period_confidence is out of range"
+                )
         return cls(
             course_name=name,
             weekday=weekday,
@@ -107,6 +134,8 @@ class CourseScheduleItem:
                 if value.get("week_rule") is not None
                 else None
             ),
+            period_inference_source=inference_source,
+            period_confidence=period_confidence,
             uncertain_fields=tuple(str(item)[:64] for item in uncertain),
         )
 
