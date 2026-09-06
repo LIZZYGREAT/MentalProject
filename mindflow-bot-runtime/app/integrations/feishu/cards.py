@@ -13,6 +13,28 @@ from app.domain.course_schedule_recurrence import (
 )
 
 
+_UNCERTAIN_FIELD_LABELS = {
+    "weekday": "星期",
+    "period_start": "节次",
+    "period_end": "节次",
+    "start_time": "上课时间",
+    "end_time": "上课时间",
+    "actual_time": "上课时间",
+    "week_rule": "周次",
+    "location": "地点",
+    "teacher": "教师",
+}
+
+
+def _natural_uncertain_fields(fields: list[Any]) -> list[str]:
+    labels: list[str] = []
+    for field in fields:
+        label = _UNCERTAIN_FIELD_LABELS.get(str(field), "其他信息")
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     """Fixed schedule preview; callback carries only the opaque draft id."""
 
@@ -66,7 +88,9 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"重复方式：{describe_course_write_plan(writes)}")
         fields = list(course.get("uncertain_fields") or [])
         if fields:
-            uncertain.append(f"- {name}：{', '.join(_safe_schedule_text(v) for v in fields)}")
+            uncertain.append(
+                f"- {name}：{', '.join(_natural_uncertain_fields(fields))}"
+            )
     if len(courses) > 20:
         lines.extend(["", "课程数量超过 20 项，请拆分图片后重新导入。"])
     warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]

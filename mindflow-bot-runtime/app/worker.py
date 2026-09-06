@@ -11,14 +11,14 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.agent.claude_runtime import (
     FALLBACK_INTERRUPTED,
     FALLBACK_TEMPORARY,
     ClaudeRuntimeInterrupted,
 )
-from app.agent.context import AgentContext
+from app.agent.context import AgentContext, CalendarMutationPolicy
 from app.contracts.agent_input import AgentTurnInput
 from app.contracts.generic_image_context import GenericImageContext
 from app.agent.skill_loader import SkillLoader
@@ -37,7 +37,10 @@ from app.repositories import (
     BotEventRepository,
     RuntimeIncidentRepository,
 )
-from app.repositories_course_schedule import UnfillableScheduleContextError
+from app.repositories_course_schedule import (
+    UnfillableScheduleContextError,
+    prepare_schedule_context,
+)
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
@@ -62,6 +65,7 @@ from app.services.generic_image_vision import (
     GenericImageVisionValidationFailure,
 )
 from app.services.multimodal_turn_coordinator import (
+    MultimodalInputSnapshot,
     MultimodalTurnCoordinator,
     PendingMultimodalTurn,
     RecentImageContext,
@@ -86,11 +90,24 @@ PERIOD_MAPPING_PATTERN = re.compile(
     r"(?:是|为|:|：)?\s*(\d{1,2}:\d{2})\s*[-–—至到]\s*(\d{1,2}:\d{2})"
 )
 BARE_DATE_PATTERN = re.compile(r"^\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*$")
-SCHEDULE_NOUN_PATTERN = re.compile(r"课表|课程表|这学期(?:的)?课|课程")
+SCHEDULE_NOUN_PATTERN = re.compile(r"课表|课程表|这学期(?:的)?课表")
+WEAK_SCHEDULE_NOUN_PATTERN = re.compile(r"这些?课程|课程")
 SCHEDULE_WRITE_PATTERN = re.compile(r"导入|添加|加到|同步|放进|写进")
 CALENDAR_TARGET_PATTERN = re.compile(r"日历|飞书|日程")
-RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
-    r"刚才|刚刚|那张图|这张图|上面|图里|周[一二三四五六日天].*(?:呢|课|什么|几节)"
+SCHEDULE_WRITE_NEGATION_PATTERN = re.compile(
+    r"(?:先|暂时)?别.{0,6}(?:导入|添加|加到|同步|放进|写进)"
+    r"|(?:不要|不用|不想).{0,8}(?:导入|添加|加到|同步|放进|写进)"
+    r"|暂时不导入|我?只想(?:看看|看一下|问|知道|了解)"
+)
+EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
+    r"刚才|刚刚|那张图|这张图|图里|截图里"
+)
+SCHEDULE_RECENT_FOLLOWUP_PATTERN = re.compile(
+    r"(?:那)?周[一二三四五六日天].*(?:呢|课|什么|几节|几点|什么时候)"
+)
+SCHEDULE_QA_PATTERN = re.compile(
+    r"(?:周[一二三四五六日天].*(?:有什么课|上什么课|几节课|几点|什么时候)"
+    r"|(?:课表|课程表).*(?:有什么|哪些|几点|什么时候|怎么安排))"
 )
 COURSE_PERIOD_CORRECTION_PATTERN = re.compile(
     r"(?P<course>[\w\u4e00-\u9fff·（）() -]{1,40}?)(?:其实|实际|应该)?(?:是|为)?\s*"
@@ -107,16 +124,51 @@ WEEKDAY_NUMBER = {
 }
 
 
+@dataclass(frozen=True)
+class ScheduleImageOutcome:
+    status: Literal[
+        "draft_created", "existing_draft", "not_course_schedule", "failed"
+    ]
+    draft: dict | None
+    image_kind: str
+
+
+@dataclass(frozen=True)
+class ScheduleReadOnlyOutcome:
+    status: Literal["parsed", "not_course_schedule", "failed"]
+    context: dict | None
+    downloaded_image: object | None
+
+
 def is_strong_schedule_import_intent(
     text: str, *, image_kind: str | None = None
 ) -> bool:
     value = str(text or "")
+    if SCHEDULE_WRITE_NEGATION_PATTERN.search(value):
+        return False
     if not SCHEDULE_WRITE_PATTERN.search(value):
         return False
     if SCHEDULE_NOUN_PATTERN.search(value):
         return True
     return image_kind == "course_schedule" and bool(
         CALENDAR_TARGET_PATTERN.search(value)
+        or WEAK_SCHEDULE_NOUN_PATTERN.search(value)
+    )
+
+
+def is_schedule_qa_intent(text: str) -> bool:
+    value = str(text or "")
+    return bool(SCHEDULE_QA_PATTERN.search(value)) and not (
+        is_strong_schedule_import_intent(value)
+    )
+
+
+def is_direct_image_calendar_request(text: str) -> bool:
+    value = str(text or "")
+    return bool(
+        SCHEDULE_WRITE_PATTERN.search(value)
+        and CALENDAR_TARGET_PATTERN.search(value)
+        and not SCHEDULE_WRITE_NEGATION_PATTERN.search(value)
     )
 
 
@@ -284,7 +336,10 @@ class BotWorker:
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._active_event_by_participant: dict[object, str] = {}
-        self._active_multimodal_tasks: dict[object, asyncio.Task[None]] = {}
+        self._active_multimodal_tasks: dict[
+            tuple[object, str],
+            dict[str, tuple[PendingMultimodalTurn, asyncio.Task[None]]],
+        ] = {}
         self._cancelled_participants: set[object] = set()
 
     async def _record_incident(self, **values) -> None:
@@ -425,21 +480,25 @@ class BotWorker:
                     )
                 interrupt = getattr(self.runtime, "interrupt", None)
                 stopped = await interrupt(participant.id) if interrupt else False
-                image_task = self._active_multimodal_tasks.pop(
-                    participant.id, None
+                multimodal_key = (participant.id, str(event.chat_id))
+                image_tasks = self._active_multimodal_tasks.pop(
+                    multimodal_key, {}
                 )
-                if image_task is not None and not image_task.done():
-                    image_task.cancel()
-                    active_turn = await self.multimodal_turns.active_turn(
-                        participant.id, event.chat_id
+                for active_turn, image_task in image_tasks.values():
+                    if not image_task.done():
+                        image_task.cancel()
+                        stopped = True
+                    await self.multimodal_turns.cancel(active_turn)
+                    related_events = (
+                        [active_turn.primary_image_event]
+                        + list(active_turn.attached_text_events)
+                        + list(active_turn.late_followups)
                     )
-                    if active_turn is not None:
-                        await self.multimodal_turns.cancel(active_turn)
+                    for related_event in related_events:
                         await asyncio.to_thread(
                             self.events.cancel_reply_plan,
-                            active_turn.primary_image_event.event_id,
+                            related_event.event_id,
                         )
-                    stopped = True
                 await self._deliver(
                     event,
                     "已请求停止当前处理。" if stopped else "当前没有正在处理的任务。",
@@ -472,6 +531,9 @@ class BotWorker:
                     participant.id, event.chat_id, event
                 )
                 if attached is not None:
+                    is_late_followup = any(
+                        item is event for item in attached.late_followups
+                    )
                     await asyncio.to_thread(
                         self.events.save_telemetry,
                         event.event_id,
@@ -482,12 +544,16 @@ class BotWorker:
                             "multimodal_attached_to_event_id": (
                                 attached.primary_image_event.event_id
                             ),
-                            "multimodal_route": "attached_text",
+                            "multimodal_route": (
+                                "late_image_followup"
+                                if is_late_followup
+                                else "attached_text"
+                            ),
                         },
                     )
-                    await asyncio.to_thread(
-                        self.events.finish, event.event_id, status="completed"
-                    )
+                    # The primary image task owns completion. Normal attached
+                    # text is completed only after the frozen input has been
+                    # consumed; late text is reprocessed as its own follow-up.
                     return
 
             if long_task is None and event.message_type == "text":
@@ -583,10 +649,25 @@ class BotWorker:
                 recent = await self.multimodal_turns.recent_context(
                     participant.id, event.chat_id
                 )
-                if recent is not None and (
-                    time.monotonic() <= recent.association_deadline
-                    or RECENT_IMAGE_REFERENCE_PATTERN.search(event.text)
-                ):
+                within_association = bool(
+                    recent is not None
+                    and time.monotonic() <= recent.association_deadline
+                )
+                explicit_image_reference = bool(
+                    EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN.search(event.text)
+                )
+                schedule_followup = bool(
+                    SCHEDULE_RECENT_FOLLOWUP_PATTERN.search(event.text)
+                )
+                reuse_recent = bool(
+                    recent is not None
+                    and (
+                        explicit_image_reference
+                        or (schedule_followup and recent.image_kind == "course_schedule")
+                        or (within_association and not schedule_followup)
+                    )
+                )
+                if reuse_recent and recent is not None:
                     if participant.external_llm_consent_at is None:
                         await self._deliver(
                             event,
@@ -613,11 +694,21 @@ class BotWorker:
                     self._process_multimodal_image(opened.turn, participant),
                     name=f"multimodal-turn-{event.event_id}",
                 )
-                self._active_multimodal_tasks[participant.id] = long_task
+                multimodal_key = (participant.id, str(event.chat_id))
+                participant_tasks = self._active_multimodal_tasks.setdefault(
+                    multimodal_key, {}
+                )
+                participant_tasks[opened.turn.turn_id] = (opened.turn, long_task)
 
                 def clear_multimodal(done: asyncio.Task[None]) -> None:
-                    if self._active_multimodal_tasks.get(participant.id) is done:
-                        self._active_multimodal_tasks.pop(participant.id, None)
+                    current = self._active_multimodal_tasks.get(multimodal_key)
+                    if current is None:
+                        return
+                    registered = current.get(opened.turn.turn_id)
+                    if registered is not None and registered[1] is done:
+                        current.pop(opened.turn.turn_id, None)
+                    if not current:
+                        self._active_multimodal_tasks.pop(multimodal_key, None)
 
                 long_task.add_done_callback(clear_multimodal)
             elif participant.external_llm_consent_at is None:
@@ -663,50 +754,101 @@ class BotWorker:
         if active is None:
             return
         route = "generic_image_agent"
+        snapshot: MultimodalInputSnapshot | None = None
+        recent: RecentImageContext | None = None
+        consumption_finished = False
+        dispatch_late = False
         try:
-            attached = await self.multimodal_turns.attached_texts(turn)
+            snapshot = await self.multimodal_turns.freeze_or_snapshot_input(turn)
+            attached = snapshot.text_events
             user_text = "\n".join(
                 item.text.strip() for item in attached if item.text.strip()
             )
             if is_strong_schedule_import_intent(user_text):
                 route = "strict_schedule_fast_path"
                 await self._note_multimodal_route(event, route)
-                await self._handle_schedule_image(event, participant.id)
-                await self.multimodal_turns.complete(
-                    turn,
-                    image_message_id=event.message_id,
-                    image_key=event.image_key,
-                    image_kind="course_schedule",
-                    summary={"route": route},
-                )
+                outcome = await self._handle_schedule_image(event, participant.id)
+                if outcome.status in {"draft_created", "existing_draft"}:
+                    recent = await self.multimodal_turns.complete(
+                        turn,
+                        image_message_id=event.message_id,
+                        image_key=event.image_key,
+                        image_kind=outcome.image_kind,
+                        summary={
+                            "route": route,
+                            "draft_id": str((outcome.draft or {}).get("id") or ""),
+                        },
+                    )
+                else:
+                    await self.multimodal_turns.cancel(turn)
+                consumption_finished = True
+                dispatch_late = True
                 return
+            downloaded_image = None
+            if is_schedule_qa_intent(user_text):
+                read_only = await self._parse_schedule_read_only(event)
+                downloaded_image = read_only.downloaded_image
+                if read_only.status == "parsed" and read_only.context is not None:
+                    route = "strict_schedule_read_only"
+                    await self._note_multimodal_route(event, route)
+                    await self._run_agent_input(
+                        event,
+                        participant,
+                        AgentTurnInput(
+                            text=user_text,
+                            trusted_image_context=read_only.context,
+                        ),
+                        calendar_mutation_policy="course_schedule_strict_only",
+                    )
+                    recent = await self.multimodal_turns.complete(
+                        turn,
+                        image_message_id=event.message_id,
+                        image_key=event.image_key,
+                        image_kind="course_schedule",
+                        summary=read_only.context,
+                    )
+                    consumption_finished = True
+                    dispatch_late = True
+                    return
             if self.generic_image_vision is None or self.message_resources is None:
                 await self._deliver(
                     event,
                     "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
                 )
                 await self.multimodal_turns.cancel(turn)
+                consumption_finished = True
+                dispatch_late = True
                 return
             async with self._schedule_image_semaphore:
-                image = await self.message_resources.download_image(
-                    event.message_id, str(event.image_key or "")
-                )
+                image = downloaded_image
+                if image is None:
+                    image = await self.message_resources.download_image(
+                        event.message_id, str(event.image_key or "")
+                    )
                 context: GenericImageContext = await self.generic_image_vision.inspect(
                     image.data, image.mime_type, user_text=user_text
                 )
-            # Text arriving while Vision was running is still part of this turn.
-            attached = await self.multimodal_turns.attached_texts(turn)
-            user_text = "\n".join(
-                item.text.strip() for item in attached if item.text.strip()
-            )
             if is_strong_schedule_import_intent(
                 user_text, image_kind=context.image_kind
             ):
                 route = "strict_schedule_after_image_kind"
                 await self._note_multimodal_route(event, route)
-                await self._handle_schedule_image(
+                outcome = await self._handle_schedule_image(
                     event, participant.id, downloaded_image=image
                 )
+                if outcome.status in {"draft_created", "existing_draft"}:
+                    recent = await self.multimodal_turns.complete(
+                        turn,
+                        image_message_id=event.message_id,
+                        image_key=event.image_key,
+                        image_kind=outcome.image_kind,
+                        summary={
+                            "route": route,
+                            "draft_id": str((outcome.draft or {}).get("id") or ""),
+                        },
+                    )
+                else:
+                    await self.multimodal_turns.cancel(turn)
             else:
                 await self._note_multimodal_route(event, route)
                 await self._run_agent_input(
@@ -716,20 +858,29 @@ class BotWorker:
                         text=user_text,
                         trusted_image_context=context.to_dict(),
                     ),
-                    calendar_mutation_allowed=False,
+                    calendar_mutation_policy=(
+                        "calendar_direct_user_request"
+                        if is_direct_image_calendar_request(user_text)
+                        and context.image_kind != "course_schedule"
+                        else "read_only"
+                    ),
                 )
-            await self.multimodal_turns.complete(
-                turn,
-                image_message_id=event.message_id,
-                image_key=event.image_key,
-                image_kind=context.image_kind,
-                summary=context.to_dict(),
-            )
+                recent = await self.multimodal_turns.complete(
+                    turn,
+                    image_message_id=event.message_id,
+                    image_key=event.image_key,
+                    image_kind=context.image_kind,
+                    summary=context.to_dict(),
+                )
+            consumption_finished = True
+            dispatch_late = True
         except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError):
             await self._deliver(
                 event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
             )
             await self.multimodal_turns.cancel(turn)
+            consumption_finished = True
+            dispatch_late = True
         except (
             GenericImageVisionUnavailable,
             GenericImageVisionValidationFailure,
@@ -741,6 +892,8 @@ class BotWorker:
                 "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
             )
             await self.multimodal_turns.cancel(turn)
+            consumption_finished = True
+            dispatch_late = True
         except Exception as exc:
             logger.warning(
                 "generic_image_processing_failed event_id=%s message_id=%s error_class=%s",
@@ -753,10 +906,133 @@ class BotWorker:
                 "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
             )
             await self.multimodal_turns.cancel(turn)
+            consumption_finished = True
+            dispatch_late = True
+        finally:
+            if consumption_finished and snapshot is not None:
+                await self._finish_consumed_text_events(snapshot)
+            if dispatch_late:
+                await self._dispatch_late_followups(turn, participant, recent)
+
+    async def _finish_consumed_text_events(
+        self, snapshot: MultimodalInputSnapshot
+    ) -> None:
+        for attached_event in snapshot.text_events:
+            await asyncio.to_thread(
+                self.events.finish, attached_event.event_id, status="completed"
+            )
+
+    async def _parse_schedule_read_only(
+        self, event: BotEvent
+    ) -> ScheduleReadOnlyOutcome:
+        if self.schedule_vision is None or self.message_resources is None:
+            return ScheduleReadOnlyOutcome("failed", None, None)
+        image = None
+        try:
+            async with self._schedule_image_semaphore:
+                image = await self.message_resources.download_image(
+                    event.message_id, str(event.image_key or "")
+                )
+                result = await self.schedule_vision.parse(
+                    image.data, image.mime_type
+                )
+            if result.document_type != "course_schedule":
+                return ScheduleReadOnlyOutcome(
+                    "not_course_schedule", None, image
+                )
+            structured = prepare_schedule_context(result)
+            return ScheduleReadOnlyOutcome(
+                "parsed",
+                {
+                    "image_kind": "course_schedule",
+                    "route": "strict_schedule_read_only",
+                    "schedule": structured,
+                },
+                image,
+            )
+        except (
+            CourseScheduleVisionUnavailable,
+            CourseScheduleVisionValidationFailure,
+            CourseScheduleVisionError,
+            MessageResourceError,
+            MessageResourceTooLarge,
+            UnsupportedImageFormat,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "course_schedule_read_only_failed event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            return ScheduleReadOnlyOutcome("failed", None, image)
+
+    async def _dispatch_late_followups(
+        self,
+        turn: PendingMultimodalTurn,
+        participant,
+        recent: RecentImageContext | None,
+    ) -> None:
+        for followup in await self.multimodal_turns.drain_late_followups(turn):
+            try:
+                if recent is not None:
+                    await self._handle_recent_image_text(
+                        followup, participant, recent
+                    )
+                else:
+                    await self.process(followup)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "late_image_followup_failed event_id=%s error_class=%s",
+                    followup.event_id,
+                    type(exc).__name__,
+                )
+                await self._deliver(
+                    followup,
+                    "刚才补充的内容没有处理完整，请再发一次。",
+                )
 
     async def _handle_recent_image_text(
         self, event: BotEvent, participant, recent: RecentImageContext
     ) -> None:
+        trusted_context = dict(recent.structured_or_agent_summary)
+        draft_id = str(trusted_context.get("draft_id") or "").strip()
+        if draft_id and self.schedule_imports is not None:
+            get_draft = getattr(self.schedule_imports.drafts, "get", None)
+            draft = (
+                await asyncio.to_thread(get_draft, draft_id)
+                if callable(get_draft)
+                else None
+            )
+            if draft is not None:
+                correction = parse_schedule_correction(event.text)
+                if correction is not None:
+                    try:
+                        corrected = await asyncio.to_thread(
+                            self.schedule_imports.drafts.apply_correction,
+                            participant.id,
+                            draft_id,
+                            **correction,
+                        )
+                    except ValueError:
+                        await self._deliver(
+                            event,
+                            "我还不能确定你要改哪门课，请带上课程名或星期再说一次。",
+                        )
+                        return
+                    await self._deliver_card(
+                        event, course_schedule_preview_card(corrected)
+                    )
+                    return
+                trusted_context = {
+                    "image_kind": "course_schedule",
+                    "route": trusted_context.get("route"),
+                    "draft_id": draft_id,
+                    "schedule": draft.get("structured_result"),
+                    "items": draft.get("items"),
+                }
         if is_strong_schedule_import_intent(
             event.text, image_kind=recent.image_kind
         ):
@@ -783,9 +1059,15 @@ class BotWorker:
             participant,
             AgentTurnInput(
                 text=event.text,
-                trusted_image_context=recent.structured_or_agent_summary,
+                trusted_image_context=trusted_context,
             ),
-            calendar_mutation_allowed=False,
+            calendar_mutation_policy=(
+                "course_schedule_strict_only"
+                if recent.image_kind == "course_schedule"
+                else "calendar_direct_user_request"
+                if is_direct_image_calendar_request(event.text)
+                else "read_only"
+            ),
         )
 
     async def _run_agent_input(
@@ -794,7 +1076,7 @@ class BotWorker:
         participant,
         turn_input: AgentTurnInput,
         *,
-        calendar_mutation_allowed: bool,
+        calendar_mutation_policy: CalendarMutationPolicy,
     ) -> None:
         skill = self.skill_loader.current()
         self._cancelled_participants.discard(participant.id)
@@ -812,7 +1094,7 @@ class BotWorker:
             chat_id=event.chat_id,
             message_id=event.message_id,
             agent_run_id=run_id,
-            calendar_mutation_allowed=calendar_mutation_allowed,
+            calendar_mutation_policy=calendar_mutation_policy,
         )
         self._active_event_by_participant[participant.id] = event.event_id
         await self._run_agent(event, ctx, run_id, turn_input=turn_input)
@@ -834,7 +1116,7 @@ class BotWorker:
         *,
         delivery_event: BotEvent | None = None,
         downloaded_image=None,
-    ) -> None:
+    ) -> ScheduleImageOutcome:
         delivery_event = delivery_event or event
         if (
             self.schedule_vision is None
@@ -842,7 +1124,7 @@ class BotWorker:
             or (self.message_resources is None and downloaded_image is None)
         ):
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
-            return
+            return ScheduleImageOutcome("failed", None, "other")
         try:
             existing = await asyncio.to_thread(
                 self.schedule_imports.drafts.get_by_source,
@@ -853,7 +1135,9 @@ class BotWorker:
                 await self._deliver_card(
                     delivery_event, course_schedule_preview_card(existing)
                 )
-                return
+                return ScheduleImageOutcome(
+                    "existing_draft", existing, "course_schedule"
+                )
             async with self._schedule_image_semaphore:
                 # Recheck after waiting so two deliveries of the same provider
                 # event cannot both enter the expensive image pipeline.
@@ -866,7 +1150,9 @@ class BotWorker:
                     await self._deliver_card(
                         delivery_event, course_schedule_preview_card(existing)
                     )
-                    return
+                    return ScheduleImageOutcome(
+                        "existing_draft", existing, "course_schedule"
+                    )
                 image = downloaded_image
                 if image is None:
                     image = await self.message_resources.download_image(
@@ -880,7 +1166,9 @@ class BotWorker:
                         delivery_event,
                         "这张图看起来不像课程表。你如果想处理图里的其他内容，告诉我想做什么就行。",
                     )
-                    return
+                    return ScheduleImageOutcome(
+                        "not_course_schedule", None, "other"
+                    )
                 draft = await asyncio.to_thread(
                     self.schedule_imports.drafts.create_draft,
                     participant_id,
@@ -900,6 +1188,9 @@ class BotWorker:
                 await self._deliver_card(
                     delivery_event, course_schedule_preview_card(draft)
                 )
+                return ScheduleImageOutcome(
+                    "draft_created", draft, "course_schedule"
+                )
         except UnfillableScheduleContextError as exc:
             logger.info(
                 "course_schedule_context_unfillable event_id=%s missing=%s",
@@ -909,6 +1200,7 @@ class BotWorker:
             await self._deliver(
                 delivery_event, "这张课程表缺少星期、周次或可用时间，暂时无法可靠导入。请换一张信息更完整、清晰的图片。"
             )
+            return ScheduleImageOutcome("failed", None, "other")
         except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError) as exc:
             logger.warning(
                 "course_schedule_image_rejected event_id=%s message_id=%s error_class=%s",
@@ -919,6 +1211,7 @@ class BotWorker:
             await self._deliver(
                 delivery_event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
             )
+            return ScheduleImageOutcome("failed", None, "other")
         except CourseScheduleVisionValidationFailure as exc:
             logger.warning(
                 "course_schedule_vision_validation_failed event_id=%s message_id=%s",
@@ -928,6 +1221,7 @@ class BotWorker:
             await self._deliver(
                 delivery_event, "无法可靠读取这张课程表，请换一张更清晰、完整的图片。"
             )
+            return ScheduleImageOutcome("failed", None, "other")
         except (CourseScheduleVisionUnavailable, CourseScheduleVisionError, MessageResourceError) as exc:
             logger.warning(
                 "course_schedule_image_service_unavailable event_id=%s message_id=%s error_class=%s",
@@ -936,6 +1230,7 @@ class BotWorker:
                 type(exc).__name__,
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            return ScheduleImageOutcome("failed", None, "other")
         except Exception as exc:
             logger.warning(
                 "course_schedule_image_processing_failed event_id=%s message_id=%s error_class=%s",
@@ -944,6 +1239,7 @@ class BotWorker:
                 type(exc).__name__,
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            return ScheduleImageOutcome("failed", None, "other")
 
     async def _run_agent(
         self,
@@ -1516,8 +1812,13 @@ class BotWorker:
         )
 
     async def close(self) -> None:
+        multimodal_tasks = {
+            task
+            for turns in self._active_multimodal_tasks.values()
+            for _turn, task in turns.values()
+        }
         tasks = list(
-            { *self._background_tasks, *self._active_multimodal_tasks.values() }
+            {*self._background_tasks, *multimodal_tasks}
         )
         for task in tasks:
             task.cancel()

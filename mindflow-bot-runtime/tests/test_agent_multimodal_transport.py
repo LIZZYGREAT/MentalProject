@@ -12,6 +12,10 @@ from app.agent.sdk_adapter import (
     _text_transport_prompt,
 )
 from app.contracts.agent_input import AgentImageAttachment, AgentTurnInput
+from app.contracts.generic_image_context import (
+    GenericImageContext,
+    GenericImageContextValidationError,
+)
 from app.services.generic_image_vision import GenericImageVisionService
 
 
@@ -103,6 +107,28 @@ def test_generic_vision_makes_one_call_and_returns_compact_context():
     assert result.visible_text == "周一 高数"
     assert len(calls) == 1
     assert len(calls[0]["messages"]) == 2
+
+
+def test_generic_image_kind_is_a_strict_enum():
+    with pytest.raises(GenericImageContextValidationError, match="image_kind"):
+        GenericImageContext(
+            image_kind="schedule",
+            summary="课程表",
+            visible_text="周一 高数",
+        )
+    with pytest.raises(GenericImageContextValidationError, match="image_kind"):
+        GenericImageContext.from_dict({
+            "image_kind": "课程表",
+            "summary": "课程表",
+            "visible_text": "周一 高数",
+            "warnings": [],
+        })
+    assert GenericImageContext.from_dict({
+        "image_kind": "course_schedule",
+        "summary": "课程表",
+        "visible_text": "周一 高数",
+        "warnings": [],
+    }).image_kind == "course_schedule"
 
 
 def test_production_client_sends_rendered_context_as_text_only():

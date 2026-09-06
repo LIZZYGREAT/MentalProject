@@ -58,7 +58,7 @@ class CourseScheduleImportRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         created_at = _aware(now or datetime.now(timezone.utc))
-        structured = _prepare_structured_result(result)
+        structured = prepare_schedule_context(result)
         missing = derive_required_context(result, semester_start_date=semester_start_date)
         unsupported = missing - INTERACTIVE_CONTEXT_FIELDS
         if unsupported:
@@ -333,6 +333,21 @@ class CourseScheduleImportRepository:
                 if not rule:
                     raise ValueError("week range is required before odd/even correction")
                 rule["odd_even"] = odd_even
+                explicit_weeks = rule.get("explicit_weeks")
+                if explicit_weeks is not None and odd_even in {"odd", "even"}:
+                    parity = 1 if odd_even == "odd" else 0
+                    filtered_weeks = sorted(
+                        {
+                            int(week)
+                            for week in explicit_weeks
+                            if int(week) % 2 == parity
+                        }
+                    )
+                    if not filtered_weeks:
+                        raise ValueError(
+                            "odd/even correction removes every explicit week"
+                        )
+                    rule["explicit_weeks"] = filtered_weeks
                 course["week_rule"] = rule
                 item.week_rule_json = rule
                 corrected_fields.add("week_rule")
@@ -756,7 +771,9 @@ def _metadata_clocks(value: Any) -> tuple[time, time]:
     return start, end
 
 
-def _prepare_structured_result(result: ScheduleVisionResult) -> dict[str, Any]:
+def prepare_schedule_context(result: ScheduleVisionResult) -> dict[str, Any]:
+    """Resolve trusted, read-only schedule facts using backend period rules."""
+
     structured = result.to_dict()
     sources: list[str | None] = []
     for raw, course in zip(structured["courses"], result.courses):

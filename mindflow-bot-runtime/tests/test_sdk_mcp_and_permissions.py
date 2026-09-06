@@ -161,7 +161,7 @@ def test_image_bound_context_blocks_calendar_mutation_at_backend_boundary():
         "oc",
         "msg",
         uuid.uuid4(),
-        calendar_mutation_allowed=False,
+        calendar_mutation_policy="read_only",
     )
     result = asyncio.run(registry.execute(ctx, "calendar_create_event", {}))
     assert result.status == "calendar_mutation_not_authorized"
@@ -170,6 +170,34 @@ def test_image_bound_context_blocks_calendar_mutation_at_backend_boundary():
         "error": "calendar_mutation_not_authorized",
     }
     assert calls == []
+
+
+def test_direct_user_image_calendar_policy_allows_backend_mutation_tool():
+    calls = []
+    registry = ToolRegistry()
+
+    async def handler(_ctx, arguments):
+        calls.append(arguments)
+        return {"ok": True}
+
+    registry.register(
+        "calendar_create_event",
+        "create",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+    )
+    ctx = AgentContext(
+        uuid.uuid4(),
+        "P001",
+        "ou",
+        "oc",
+        "msg",
+        uuid.uuid4(),
+        calendar_mutation_policy="calendar_direct_user_request",
+    )
+    result = asyncio.run(registry.execute(ctx, "calendar_create_event", {}))
+    assert result.status == "succeeded"
+    assert calls == [{}]
 
 
 def test_sdk_mcp_emits_one_real_start_and_success_lifecycle_event():

@@ -7,6 +7,7 @@ from app.agent.claude_runtime import ClaudeAgentRuntime
 from app.agent.context import AgentContext
 from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
 from app.agent.session_manager import ParticipantSessionManager
+from app.contracts.agent_input import AgentTurnInput
 from app.presentation.contracts import AgentActivityEvent
 from app.repositories import ClaudeSessionRepository, ConversationRepository
 from app.services.safety_service import FIXED_HIGH_RISK_RESPONSE, SafetyService
@@ -213,3 +214,63 @@ def test_safety_precheck_never_submits_high_risk_text_to_sdk():
     assert result.response_kind == "fixed"
     saved = ConversationRepository(database).recent(p1.id, 10)
     assert [item["role"] for item in saved] == ["user", "assistant"]
+
+
+def test_multimodal_safety_precheck_handles_image_only_self_harm_content():
+    database = memory_database()
+    p1 = participant(database, "P-IMAGE-RISK")
+
+    class NoSessions:
+        async def submit(self, *_args, **_kwargs):
+            raise AssertionError("high-risk image context must not reach the SDK")
+
+    runtime = ClaudeAgentRuntime(
+        NoSessions(), ConversationRepository(database), SafetyService()
+    )
+    result = asyncio.run(runtime.handle_message(
+        context(p1.id, "image-risk"),
+        AgentTurnInput(
+            text="",
+            trusted_image_context={
+                "image_kind": "document",
+                "summary": "一张写着我不想活了的求助便签",
+                "visible_text": "我想结束生命",
+                "warnings": [],
+            },
+        ),
+    ))
+    assert result.text == FIXED_HIGH_RISK_RESPONSE
+    assert result.safety_locked is True
+
+
+def test_multimodal_safety_precheck_allows_third_party_news_summary():
+    database = memory_database()
+    p1 = participant(database, "P-IMAGE-NEWS")
+
+    class Sessions:
+        def __init__(self):
+            self.turns = []
+
+        async def submit(self, _ctx, turn_input, **_kwargs):
+            self.turns.append(turn_input)
+            return ClaudeTurnResult("这是对新闻内容的中性总结。", "session-news")
+
+    sessions = Sessions()
+    runtime = ClaudeAgentRuntime(
+        sessions, ConversationRepository(database), SafetyService()
+    )
+    result = asyncio.run(runtime.handle_message(
+        context(p1.id, "image-news"),
+        AgentTurnInput(
+            text="总结这篇新闻",
+            trusted_image_context={
+                "image_kind": "document",
+                "summary": "一篇关于自杀预防研究的新闻报道",
+                "visible_text": "研究人员讨论自杀预防",
+                "warnings": [],
+            },
+        ),
+    ))
+    assert result.text == "这是对新闻内容的中性总结。"
+    assert result.safety_locked is False
+    assert len(sessions.turns) == 1

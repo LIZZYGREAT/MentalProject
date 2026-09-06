@@ -47,6 +47,7 @@ from app.domain.course_schedule_recurrence import (
     EXPAND_ALL_OCCURRENCES,
     PRESERVE_SCHEDULE_PATTERN,
     CalendarWriteKind,
+    course_weeks,
     plan_course_writes,
 )
 from app.domain.course_schedule_periods import (
@@ -1419,6 +1420,70 @@ def test_natural_course_corrections_update_draft_without_schema_language():
         owner.id, draft["id"], course_name="高等数学", location="逸夫楼"
     )
     assert corrected["items"][0]["location"] == "逸夫楼"
+
+
+def test_odd_even_correction_filters_explicit_weeks_and_changes_occurrences():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-EXPLICIT-WEEKS")
+    payload = vision_payload(explicit_weeks=[1, 2, 3, 4, 5, 6])
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="explicit-week-correction",
+        source_image_hash="7" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    before = course_weeks(draft["items"][0]["week_rule"])
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], weekday=1, odd_even="odd"
+    )
+    corrected_rule = corrected["items"][0]["week_rule"]
+    assert before == [1, 2, 3, 4, 5, 6]
+    assert corrected_rule["explicit_weeks"] == [1, 3, 5]
+    assert course_weeks(corrected_rule) == [1, 3, 5]
+
+
+def test_schedule_preview_translates_and_combines_uncertain_schema_fields():
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_context",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": None,
+        "structured_result": {
+            "courses": [{
+                **vision_payload()["courses"][0],
+                "uncertain_fields": [
+                    "weekday",
+                    "period_start",
+                    "period_end",
+                    "start_time",
+                    "end_time",
+                    "week_rule",
+                    "location",
+                    "teacher",
+                ],
+            }],
+            "missing_context": ["semester_start_date"],
+            "warnings": [],
+        },
+        "items": [],
+    }
+    payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    for internal_name in (
+        "weekday",
+        "period_start",
+        "period_end",
+        "start_time",
+        "end_time",
+        "week_rule",
+    ):
+        assert internal_name not in payload
+    assert "星期, 节次, 上课时间, 周次, 地点, 教师" in payload
+    assert payload.count("节次") == 1
+    assert payload.count("上课时间") == 1
 
 
 def test_schedule_image_pipeline_respects_max_concurrency():

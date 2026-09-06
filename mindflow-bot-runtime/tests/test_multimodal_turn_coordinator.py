@@ -94,3 +94,31 @@ def test_recent_context_expires_and_never_contains_raw_image_data():
         assert await coordinator.recent_context(participant_id, "chat") is None
 
     asyncio.run(scenario())
+
+
+def test_frozen_input_routes_new_text_to_late_followups():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        turn = (
+            await coordinator.open_image(participant_id, "chat", object())
+        ).turn
+        await coordinator.attach_text(
+            participant_id, "chat", SimpleNamespace(text="first")
+        )
+        await coordinator.wait_for_debounce(turn)
+        snapshot = await coordinator.freeze_or_snapshot_input(turn)
+        assert [event.text for event in snapshot.text_events] == ["first"]
+        assert turn.input_frozen is True
+        assert turn.consumed_text_count == 1
+        await coordinator.attach_text(
+            participant_id, "chat", SimpleNamespace(text="late")
+        )
+        assert [event.text for event in turn.attached_text_events] == ["first"]
+        assert [event.text for event in turn.late_followups] == ["late"]
+        drained = await coordinator.drain_late_followups(turn)
+        assert [event.text for event in drained] == ["late"]
+        assert turn.late_followups == []
+
+    asyncio.run(scenario())

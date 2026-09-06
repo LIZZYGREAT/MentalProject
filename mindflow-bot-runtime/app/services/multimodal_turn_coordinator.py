@@ -26,7 +26,17 @@ class PendingMultimodalTurn:
     debounce_deadline: float
     association_deadline: float
     state: str = COLLECTING
+    consumed_text_count: int = 0
+    input_frozen: bool = False
+    late_followups: list[Any] = field(default_factory=list)
     debounce_wakeup: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+
+@dataclass(frozen=True)
+class MultimodalInputSnapshot:
+    """The exact nearby text committed to the next long model call."""
+
+    text_events: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -113,7 +123,10 @@ class MultimodalTurnCoordinator:
                 or now > turn.association_deadline
             ):
                 return None
-            turn.attached_text_events.append(text_event)
+            if turn.input_frozen:
+                turn.late_followups.append(text_event)
+            else:
+                turn.attached_text_events.append(text_event)
             return turn
 
     async def wait_for_debounce(
@@ -138,6 +151,32 @@ class MultimodalTurnCoordinator:
     async def attached_texts(self, turn: PendingMultimodalTurn) -> tuple[Any, ...]:
         async with self._lock:
             return tuple(turn.attached_text_events)
+
+    async def freeze_or_snapshot_input(
+        self, turn: PendingMultimodalTurn
+    ) -> MultimodalInputSnapshot:
+        """Freeze the text payload before a long call starts.
+
+        Text arriving after this point is deliberately queued as a follow-up
+        instead of being acknowledged as part of an input the model cannot see.
+        """
+
+        async with self._lock:
+            turn.input_frozen = True
+            turn.consumed_text_count = len(turn.attached_text_events)
+            return MultimodalInputSnapshot(
+                text_events=tuple(
+                    turn.attached_text_events[: turn.consumed_text_count]
+                )
+            )
+
+    async def drain_late_followups(
+        self, turn: PendingMultimodalTurn
+    ) -> tuple[Any, ...]:
+        async with self._lock:
+            events = tuple(turn.late_followups)
+            turn.late_followups.clear()
+            return events
 
     async def active_turn(
         self, participant_id: Any, chat_id: str

@@ -54,7 +54,7 @@ class ClaudeAgentRuntime:
             turn_input.conversation_text,
             feishu_message_id=ctx.message_id,
         )
-        fixed = self.safety.precheck(turn_input.text, chat_type=chat_type)
+        fixed = self.safety.precheck_turn(turn_input, chat_type=chat_type)
         if fixed is not None:
             await self._save_answer(ctx, fixed)
             return RuntimeResponse(
