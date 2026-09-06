@@ -406,6 +406,114 @@ def test_false_positive_fallback_releases_image_before_agent_wait():
     assert len(runtime.calls) == 1
 
 
+def test_strict_read_only_schedule_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"strict-read-only-image"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class StrictVision:
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(failure=True),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=object()),
+        debounce=0.2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_recent_strict_read_only_schedule_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self, marker):
+            self.data = marker.encode()
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        def __init__(self):
+            super().__init__()
+            self.payload_refs = []
+
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload(message_id)
+            self.payload_refs.append(weakref.ref(payload))
+            return payload
+
+    class StrictVision:
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_refs[-1]() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(resources.payload_refs) == 2
+    assert len(runtime.calls) == 2
+
+
 def test_explicit_import_to_calendar_still_uses_fast_path():
     vision = Vision(failure=True)
     gateway, queue, worker, runtime, sender, _, _ = _system(vision=vision)

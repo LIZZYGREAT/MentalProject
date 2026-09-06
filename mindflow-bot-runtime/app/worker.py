@@ -823,6 +823,9 @@ class BotWorker:
                 read_only = await self._parse_schedule_read_only(event)
                 downloaded_image = read_only.downloaded_image
                 if read_only.status == "parsed" and read_only.context is not None:
+                    schedule_context = read_only.context
+                    read_only = None
+                    downloaded_image = None
                     route = "strict_schedule_read_only"
                     await self._note_multimodal_route(event, route)
                     await self._run_agent_input(
@@ -830,7 +833,7 @@ class BotWorker:
                         participant,
                         AgentTurnInput(
                             text=user_text,
-                            trusted_image_context=read_only.context,
+                            trusted_image_context=schedule_context,
                         ),
                         calendar_mutation_policy="course_schedule_strict_only",
                     )
@@ -839,7 +842,7 @@ class BotWorker:
                         image_message_id=event.message_id,
                         image_key=event.image_key,
                         image_kind="course_schedule",
-                        summary=read_only.context,
+                        summary=schedule_context,
                     )
                     consumption_finished = True
                     dispatch_late = True
@@ -1094,6 +1097,7 @@ class BotWorker:
             ):
                 trusted_context = strict_context.context
                 strict_read_only_followup = True
+                strict_context = None
         if draft_id and self.schedule_imports is not None:
             get_draft = getattr(self.schedule_imports.drafts, "get", None)
             draft = (
