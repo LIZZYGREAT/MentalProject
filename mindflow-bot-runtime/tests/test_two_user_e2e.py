@@ -304,7 +304,8 @@ def test_stop_bypasses_running_turn_and_interrupts_runtime():
     asyncio.run(scenario())
     texts = [text for _chat, text in sender.sent]
     assert "已请求停止当前处理。" in texts
-    assert "当前处理已停止。" in texts
+    assert "当前处理已停止。" not in texts
+    assert texts.count("已请求停止当前处理。") == 1
 
 
 def test_fast_tool_reply_finishes_inside_grace_without_processing_message():
