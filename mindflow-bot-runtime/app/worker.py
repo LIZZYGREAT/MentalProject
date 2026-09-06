@@ -834,7 +834,10 @@ class BotWorker:
                 route = "strict_schedule_after_image_kind"
                 await self._note_multimodal_route(event, route)
                 outcome = await self._handle_schedule_image(
-                    event, participant.id, downloaded_image=image
+                    event,
+                    participant.id,
+                    downloaded_image=image,
+                    report_not_course_schedule=False,
                 )
                 if outcome.status in {"draft_created", "existing_draft"}:
                     recent = await self.multimodal_turns.complete(
@@ -846,6 +849,31 @@ class BotWorker:
                             "route": route,
                             "draft_id": str((outcome.draft or {}).get("id") or ""),
                         },
+                    )
+                elif outcome.status == "not_course_schedule":
+                    route = "generic_image_agent_after_strict_not_course_schedule"
+                    await self._note_multimodal_route(event, route)
+                    fallback_context = context.to_dict()
+                    fallback_context["image_kind"] = outcome.image_kind
+                    await self._run_agent_input(
+                        event,
+                        participant,
+                        AgentTurnInput(
+                            text=user_text,
+                            trusted_image_context=fallback_context,
+                        ),
+                        calendar_mutation_policy=(
+                            "calendar_create_only"
+                            if is_direct_image_calendar_request(user_text)
+                            else "read_only"
+                        ),
+                    )
+                    recent = await self.multimodal_turns.complete(
+                        turn,
+                        image_message_id=event.message_id,
+                        image_key=event.image_key,
+                        image_kind=outcome.image_kind,
+                        summary=fallback_context,
                     )
                 else:
                     await self.multimodal_turns.cancel(turn)
@@ -1147,6 +1175,7 @@ class BotWorker:
         *,
         delivery_event: BotEvent | None = None,
         downloaded_image=None,
+        report_not_course_schedule: bool = True,
     ) -> ScheduleImageOutcome:
         delivery_event = delivery_event or event
         if (
@@ -1193,10 +1222,11 @@ class BotWorker:
                     image.data, image.mime_type
                 )
                 if result.document_type != "course_schedule":
-                    await self._deliver(
-                        delivery_event,
-                        "这张图看起来不像课程表。你如果想处理图里的其他内容，告诉我想做什么就行。",
-                    )
+                    if report_not_course_schedule:
+                        await self._deliver(
+                            delivery_event,
+                            "这张图看起来不像课程表。你如果想处理图里的其他内容，告诉我想做什么就行。",
+                        )
                     return ScheduleImageOutcome(
                         "not_course_schedule", None, "other"
                     )

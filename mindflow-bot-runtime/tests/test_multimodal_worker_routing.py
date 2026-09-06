@@ -573,6 +573,66 @@ def test_strict_not_course_does_not_cache_course_schedule_kind():
     asyncio.run(scenario())
 
 
+def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent():
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return ScheduleVisionResult.from_dict({
+                "document_type": "not_course_schedule",
+                "semester_label": None,
+                "institution": None,
+                "courses": [],
+                "missing_context": [],
+                "warnings": [],
+            })
+
+    class Drafts:
+        def get_by_source(self, _participant_id, _message_id):
+            return None
+
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=Drafts()),
+        debounce=0.2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这个讲座添加到日历",
+            )
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert vision.calls == ["把这个讲座添加到日历"]
+    assert len(resources.calls) == 1
+    assert len(runtime.calls) == 1
+    ctx, turn_input = runtime.calls[0]
+    assert ctx.calendar_mutation_policy == "calendar_create_only"
+    assert ctx.allows_calendar_mutation("create") is True
+    assert ctx.allows_calendar_mutation("delete") is False
+    assert turn_input.trusted_image_context == {
+        "image_kind": "other",
+        "summary": "图片摘要",
+        "visible_text": "可见文字",
+        "warnings": [],
+    }
+    assert sender.texts == ["answer:把这个讲座添加到日历"]
+
+
 def test_strict_success_recent_followup_uses_authoritative_draft():
     class Drafts:
         def get(self, draft_id):
