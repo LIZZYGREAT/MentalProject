@@ -1270,13 +1270,35 @@ class BotWorker:
     ) -> None:
         skill = self.skill_loader.current()
         run_generation = self._current_stop_generation(participant.id)
-        run_id = await asyncio.to_thread(
-            self.runs.start,
-            participant.id,
-            event.message_id,
-            self.model,
-            skill.version,
+        start_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.runs.start,
+                participant.id,
+                event.message_id,
+                self.model,
+                skill.version,
+            ),
+            name=f"agent-run-start-{event.event_id}",
         )
+        try:
+            run_id = await asyncio.shield(start_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                run_id = await start_task
+            except Exception:
+                logger.warning(
+                    "agent_run_start_failed_after_cancellation event_id=%s",
+                    event.event_id,
+                    exc_info=True,
+                )
+            else:
+                await asyncio.to_thread(
+                    self.runs.finish, run_id, "interrupted"
+                )
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
+            raise cancellation
         ctx = AgentContext(
             participant_id=participant.id,
             participant_code=participant.participant_code,
@@ -1588,7 +1610,9 @@ class BotWorker:
             """Send while holding progress.lock so final cannot overtake it."""
 
             now = time.monotonic()
-            if progress.final_ready:
+            if progress.final_ready or self._run_was_stopped(
+                ctx.participant_id, run_generation
+            ):
                 return
             if progress.sent >= self.progress_max_messages:
                 return
@@ -1829,7 +1853,14 @@ class BotWorker:
                 delivery_started_at=started,
                 run_generation=run_generation,
             )
-            status = "completed" if delivered else "reply_pending"
+            if self._run_was_stopped(ctx.participant_id, run_generation):
+                await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
+                status = "interrupted"
+            else:
+                status = "completed" if delivered else "reply_pending"
         except asyncio.CancelledError:
             await close_progress_before_final()
             if self.presentations is not None:
@@ -1965,6 +1996,15 @@ class BotWorker:
         delivery_started_at: float | None = None,
         run_generation: int | None = None,
     ) -> bool:
+        if (
+            participant_id is not None
+            and run_generation is not None
+            and self._run_was_stopped(participant_id, run_generation)
+        ):
+            await asyncio.to_thread(
+                self.events.cancel_reply_plan, event.event_id
+            )
+            return False
         if not plan.segments:
             await asyncio.to_thread(
                 self.events.finish, event.event_id, status="completed"

@@ -1119,6 +1119,69 @@ def test_new_post_stop_text_request_is_not_marked_interrupted():
         assert new_event.error_code is None
 
 
+def test_interrupted_event_cannot_be_reopened_by_late_reply_plan():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+
+    assert gateway.accept_payload(
+        _payload("late-plan", "m-late-plan", "text", text="旧请求")
+    )
+    event = asyncio.run(queue.get())
+    worker.events.set_processing(event.event_id, None)
+    worker.events.cancel_reply_plan(event.event_id)
+    worker.events.stage_reply_plan(
+        event.event_id,
+        full_text="不得恢复",
+        segments=["不得恢复"],
+    )
+
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, event.event_id)
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+    assert worker.events.pending_reply_plan(event.event_id) is None
+
+
+def test_stop_during_multimodal_run_start_leaves_no_running_agent_run():
+    gateway, queue, worker, runtime, _sender, _, _ = _system(debounce=0)
+    delegate = worker.runs
+
+    class BlockingRunRepository:
+        database = delegate.database
+
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def start(self, *args, **kwargs):
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            return delegate.start(*args, **kwargs)
+
+        def finish(self, *args, **kwargs):
+            return delegate.finish(*args, **kwargs)
+
+    blocking_runs = BlockingRunRepository()
+    worker.runs = blocking_runs
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        assert await asyncio.to_thread(blocking_runs.started.wait, 1)
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        blocking_runs.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert runtime.calls == []
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted"
+    ]
+
+
 def test_cancelled_queued_agent_run_is_finished_as_interrupted():
     runtime = CancellableRuntime()
     gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)

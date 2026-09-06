@@ -4195,6 +4195,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
+            if row.status == "interrupted":
+                return
             if row.status == "reply_pending" and row.reply_segments_json:
                 return
             row.reply_text = str(full_text)
