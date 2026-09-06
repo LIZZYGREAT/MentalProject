@@ -500,7 +500,19 @@ class BotWorker:
                         self.events.cancel_reply_plan, active_event_id
                     )
                 interrupt = getattr(self.runtime, "interrupt", None)
-                stopped = await interrupt(participant.id) if interrupt else False
+                try:
+                    stopped = (
+                        await interrupt(participant.id) if interrupt else False
+                    )
+                except Exception as exc:
+                    stopped = True
+                    logger.warning(
+                        "agent_interrupt_failed participant_id=%s "
+                        "event_id=%s error_class=%s",
+                        participant.id,
+                        event.event_id,
+                        type(exc).__name__,
+                    )
                 multimodal_key = (participant.id, str(event.chat_id))
                 image_tasks = self._active_multimodal_tasks.pop(
                     multimodal_key, {}

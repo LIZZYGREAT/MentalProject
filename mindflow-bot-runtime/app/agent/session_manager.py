@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -21,6 +22,9 @@ from app.presentation.contracts import (
     AgentActivityCallback,
 )
 from app.repositories import ClaudeSessionRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 class ParticipantQueueFull(ClaudeSDKInvocationError):
@@ -133,7 +137,45 @@ class ParticipantSessionManager:
             if client is not None:
                 session.state = "interrupting"
         if client is not None:
-            await client.interrupt()
+            try:
+                await client.interrupt()
+            except Exception as exc:
+                logger.warning(
+                    "claude_client_interrupt_failed participant_id=%s "
+                    "error_class=%s",
+                    participant_id,
+                    type(exc).__name__,
+                )
+                async with self._lock:
+                    active_request = session.active_request
+                    if (
+                        active_request is not None
+                        and not active_request.future.done()
+                    ):
+                        active_request.future.cancel()
+                    processing_task = session.processing_task
+                    failed_client = session.client
+                    session.client = None
+                    session.state = "closed"
+                if failed_client is not None:
+                    try:
+                        await failed_client.disconnect()
+                    except Exception:
+                        logger.warning(
+                            "claude_client_disconnect_after_interrupt_failed "
+                            "participant_id=%s",
+                            participant_id,
+                            exc_info=True,
+                        )
+                if (
+                    processing_task is not None
+                    and processing_task is not asyncio.current_task()
+                    and not processing_task.done()
+                ):
+                    processing_task.cancel()
+                raise ClaudeSDKInvocationError(
+                    "Claude client interrupt failed"
+                ) from exc
         return active or cancelled_pending > 0
 
     async def _process_session(self, session: ParticipantAgentSession) -> None:

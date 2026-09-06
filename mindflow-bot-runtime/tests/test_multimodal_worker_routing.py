@@ -111,6 +111,18 @@ class ProductionStyleFactory:
         return ProductionStyleClient(binding, resume_session_id, self)
 
 
+class FailingInterruptProductionClient(ProductionStyleClient):
+    async def interrupt(self):
+        raise RuntimeError("interrupt transport failed")
+
+
+class FailingInterruptProductionFactory(ProductionStyleFactory):
+    def create(self, binding, *, resume_session_id):
+        return FailingInterruptProductionClient(
+            binding, resume_session_id, self
+        )
+
+
 class Resources:
     def __init__(self):
         self.calls = []
@@ -756,10 +768,10 @@ def test_stop_does_not_emit_duplicate_interrupted_reply():
     assert sender.texts == ["已请求停止当前处理。"]
 
 
-def _run_production_style_stop():
+def _run_production_style_stop(*, factory=None, message_type="text"):
     gateway, queue, worker, _runtime, sender, _, _ = _system()
     database = worker.runs.database
-    factory = ProductionStyleFactory()
+    factory = factory or ProductionStyleFactory()
     sessions = ParticipantSessionManager(
         factory,
         ClaudeSessionRepository(database),
@@ -772,8 +784,14 @@ def _run_production_style_stop():
     )
 
     async def scenario():
+        original_event_id = f"production-{message_type}"
         assert gateway.accept_payload(
-            _payload("production-text", "m-production-text", "text", text="长任务")
+            _payload(
+                original_event_id,
+                f"m-{original_event_id}",
+                message_type,
+                text="长任务" if message_type == "text" else "",
+            )
         )
         agent_task = asyncio.create_task(worker.process(await queue.get()))
         await factory.started.wait()
@@ -781,7 +799,7 @@ def _run_production_style_stop():
             _payload("production-stop", "m-production-stop", "text", text="/stop")
         )
         await worker.process(await queue.get())
-        await agent_task
+        await asyncio.gather(agent_task, return_exceptions=True)
         await worker.runtime.close()
 
     asyncio.run(scenario())
@@ -809,6 +827,35 @@ def test_production_style_stop_marks_original_bot_event_interrupted():
         event = session.get(StoredBotEvent, "production-text")
         assert event.status == "interrupted"
         assert event.error_code == "stopped"
+
+
+def test_stop_cleanup_continues_when_client_interrupt_raises():
+    worker, _sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory(),
+        message_type="image",
+    )
+
+    assert worker._active_multimodal_tasks == {}
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "production-image").status == "interrupted"
+
+
+def test_stop_reply_is_still_sent_when_sdk_interrupt_fails():
+    _worker, sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory()
+    )
+
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_interrupt_failure_does_not_leave_agent_run_running():
+    worker, _sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory()
+    )
+
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
 
 
 def test_attached_event_is_not_completed_before_consumption_is_guaranteed():

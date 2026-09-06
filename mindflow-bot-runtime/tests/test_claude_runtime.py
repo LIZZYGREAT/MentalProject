@@ -5,7 +5,11 @@ import pytest
 
 from app.agent.claude_runtime import ClaudeAgentRuntime
 from app.agent.context import AgentContext
-from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
+from app.agent.sdk_adapter import (
+    ClaudeSDKInvocationError,
+    ClaudeSDKTurnInterrupted,
+    ClaudeTurnResult,
+)
 from app.agent.session_manager import ParticipantSessionManager
 from app.contracts.agent_input import AgentTurnInput
 from app.presentation.contracts import AgentActivityEvent
@@ -92,6 +96,19 @@ class FakeFactory:
         return client
 
 
+class FailingInterruptClient(FakeClient):
+    async def interrupt(self):
+        raise RuntimeError("interrupt transport failed")
+
+
+class FailingInterruptFactory(FakeFactory):
+    def create(self, binding, *, resume_session_id):
+        client = FailingInterruptClient(binding, resume_session_id, self)
+        client.release.clear()
+        self.created.append(client)
+        return client
+
+
 def test_sessions_are_persistent_serial_and_participant_isolated():
     database = memory_database()
     p1 = participant(database, "P001")
@@ -148,6 +165,36 @@ def test_explicit_interrupt_reaches_running_client():
         assert await manager.interrupt(p1.id) is True
         with pytest.raises(ClaudeSDKTurnInterrupted):
             await turn
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_stop_interrupt_failure_does_not_leave_pending_queue():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    factory = FailingInterruptFactory()
+    manager = ParticipantSessionManager(factory, ClaudeSessionRepository(database))
+
+    async def scenario():
+        first = asyncio.create_task(manager.submit(context(p1.id, "first"), "first"))
+        for _ in range(100):
+            if factory.turns:
+                break
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            manager.submit(context(p1.id, "second"), "second")
+        )
+        await asyncio.sleep(0)
+
+        with pytest.raises(ClaudeSDKInvocationError, match="interrupt failed"):
+            await manager.interrupt(p1.id)
+
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert factory.turns == [(p1.id, "first")]
+        session = manager._sessions.get(p1.id)
+        assert session is None or session.queue.empty()
         await manager.close()
 
     asyncio.run(scenario())
