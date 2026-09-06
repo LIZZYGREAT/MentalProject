@@ -1569,6 +1569,12 @@ class BotWorker:
                 delivery_started_at=started,
             )
             status = "completed" if delivered else "reply_pending"
+        except asyncio.CancelledError:
+            await close_progress_before_final()
+            if self.presentations is not None:
+                self.presentations.discard(run_id)
+            await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
+            raise
         except ClaudeRuntimeInterrupted:
             await close_progress_before_final()
             if self.presentations is not None:

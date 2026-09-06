@@ -7,7 +7,7 @@ from app.contracts.course_schedule import ScheduleVisionResult
 from app.contracts.generic_image_context import GenericImageContext
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
-from app.models import BotEvent as StoredBotEvent
+from app.models import AgentRun, BotEvent as StoredBotEvent
 from app.presentation.contracts import RuntimeResponse
 from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
 from app.services.generic_image_vision import GenericImageVisionUnavailable
@@ -40,6 +40,29 @@ class Runtime:
 
     async def interrupt(self, _participant_id):
         return False
+
+
+class CancellableRuntime(Runtime):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.pending = []
+
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.calls.append((ctx, turn_input))
+        future = asyncio.get_running_loop().create_future()
+        self.pending.append(future)
+        self.started.set()
+        await future
+        raise AssertionError("cancelled runtime must not resume")
+
+    async def interrupt(self, _participant_id):
+        cancelled = False
+        for future in self.pending:
+            if not future.done():
+                future.cancel()
+                cancelled = True
+        return cancelled
 
 
 class Resources:
@@ -488,6 +511,95 @@ def test_stop_passes_routing_lock_and_cancels_long_image_turn():
 
     asyncio.run(scenario())
     assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def _agent_run_states(worker):
+    with worker.runs.database.session() as session:
+        return [
+            (row.status, row.finished_at)
+            for row in session.query(AgentRun).order_by(AgentRun.started_at).all()
+        ]
+
+
+def test_cancelled_queued_agent_run_is_finished_as_interrupted():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="排队请求")
+        )
+        agent_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(agent_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "text").status == "interrupted"
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_cancelled_active_multimodal_agent_run_is_finished_as_interrupted():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "image").status == "interrupted"
+
+
+def test_stop_does_not_leave_agent_run_running():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert all(status != "running" for status, _finished_at in _agent_run_states(worker))
+
+
+def test_stop_does_not_emit_duplicate_interrupted_reply():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
     assert sender.texts == ["已请求停止当前处理。"]
 
 
