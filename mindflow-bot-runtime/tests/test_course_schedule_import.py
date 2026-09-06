@@ -909,6 +909,10 @@ def test_sync_download_timeout_holds_real_concurrency_slot_until_thread_exits():
         with pytest.raises(MessageResourceError, match="timed out"):
             await downloader.download_image("first", "image-a")
         assert first_entered.is_set()
+        # The first request's 20 ms limit exercises timeout semantics. The
+        # second request verifies slot ownership, so do not make ordinary
+        # thread-pool scheduling under full-suite load part of that assertion.
+        downloader.timeout_seconds = 0.5
         second = asyncio.create_task(
             downloader.download_image("second", "image-b")
         )
