@@ -813,13 +813,18 @@ def prepare_schedule_context(result: ScheduleVisionResult) -> dict[str, Any]:
         raw["start_time"] = start_clock.strftime("%H:%M")
         raw["end_time"] = end_clock.strftime("%H:%M")
         sources.append(source)
-    if structured["courses"] and all(
-        course.get("start_time") and course.get("end_time")
-        for course in structured["courses"]
-    ):
+    if structured["courses"]:
         missing = set(structured.get("missing_context") or [])
-        missing.discard("actual_time")
-        missing.discard("period_time_mapping")
+        if all(course.get("weekday") is not None for course in structured["courses"]):
+            missing.discard("weekday")
+        if all(course.get("week_rule") is not None for course in structured["courses"]):
+            missing.discard("week_rule")
+        if all(
+            course.get("start_time") and course.get("end_time")
+            for course in structured["courses"]
+        ):
+            missing.discard("actual_time")
+            missing.discard("period_time_mapping")
         structured["missing_context"] = sorted(missing)
     structured["_metadata"] = {
         "planner_version": COURSE_IMPORT_PLANNER_VERSION,

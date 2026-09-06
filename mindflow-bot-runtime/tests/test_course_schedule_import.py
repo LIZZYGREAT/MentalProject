@@ -1307,6 +1307,26 @@ def test_read_only_schedule_default_time_clears_stale_actual_time_missing_contex
     assert structured["missing_context"] == ["semester_start_date"]
 
 
+def test_read_only_context_clears_stale_weekday_missing_flag():
+    payload = vision_payload()
+    payload["missing_context"] = ["semester_start_date", "weekday"]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["weekday"] == 1
+    assert structured["missing_context"] == ["semester_start_date"]
+
+
+def test_read_only_context_clears_stale_week_rule_missing_flag():
+    payload = vision_payload()
+    payload["missing_context"] = ["semester_start_date", "week_rule"]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["week_rule"] is not None
+    assert structured["missing_context"] == ["semester_start_date"]
+
+
 def test_complete_fields_ignore_stale_model_missing_context():
     database = memory_database()
     owner = participant(database, "P108")
