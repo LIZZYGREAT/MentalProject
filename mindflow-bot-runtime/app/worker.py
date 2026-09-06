@@ -38,6 +38,7 @@ from app.repositories import (
     RuntimeIncidentRepository,
 )
 from app.repositories_course_schedule import (
+    CreateDraftOutcome,
     UnfillableScheduleContextError,
     prepare_schedule_context,
 )
@@ -1286,27 +1287,79 @@ class BotWorker:
                     return ScheduleImageOutcome(
                         "not_course_schedule", None, "other"
                     )
-                draft = await asyncio.to_thread(
-                    self.schedule_imports.drafts.create_draft,
-                    participant_id,
-                    source_message_id=event.message_id,
-                    source_image_hash=hashlib.sha256(image.data).hexdigest(),
-                    vision_model=self.schedule_vision.model,
-                    result=result,
-                    timezone_name=str(self.schedule_imports.timezone),
-                    ttl_minutes=self.schedule_draft_ttl_minutes,
-                    semester_start_date=(
-                        date.fromisoformat(self.course_default_semester_start_date)
-                        if self.course_default_semester_start_date
-                        else None
+                create_outcome = getattr(
+                    self.schedule_imports.drafts,
+                    "create_draft_outcome",
+                    None,
+                )
+                create_method = (
+                    create_outcome
+                    if callable(create_outcome)
+                    else self.schedule_imports.drafts.create_draft
+                )
+                creation_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        create_method,
+                        participant_id,
+                        source_message_id=event.message_id,
+                        source_image_hash=hashlib.sha256(image.data).hexdigest(),
+                        vision_model=self.schedule_vision.model,
+                        result=result,
+                        timezone_name=str(self.schedule_imports.timezone),
+                        ttl_minutes=self.schedule_draft_ttl_minutes,
+                        semester_start_date=(
+                            date.fromisoformat(
+                                self.course_default_semester_start_date
+                            )
+                            if self.course_default_semester_start_date
+                            else None
+                        ),
                     ),
+                    name=f"course-draft-create-{event.event_id}",
                 )
+                try:
+                    created = await asyncio.shield(creation_task)
+                except asyncio.CancelledError as cancellation:
+                    try:
+                        created = await creation_task
+                    except Exception:
+                        logger.warning(
+                            "course_draft_create_failed_after_stop "
+                            "participant_id=%s event_id=%s",
+                            participant_id,
+                            event.event_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if (
+                            isinstance(created, CreateDraftOutcome)
+                            and created.created_new
+                        ):
+                            await self._cancel_hidden_schedule_draft(
+                                participant_id, created.draft
+                            )
+                    raise cancellation
+                if isinstance(created, CreateDraftOutcome):
+                    draft = created.draft
+                    created_new = created.created_new
+                else:
+                    draft = created
+                    created_new = True
                 del image
-                await self._deliver_card(
-                    delivery_event, course_schedule_preview_card(draft)
-                )
+                try:
+                    await self._deliver_card(
+                        delivery_event, course_schedule_preview_card(draft)
+                    )
+                except asyncio.CancelledError:
+                    if created_new:
+                        await self._cancel_hidden_schedule_draft(
+                            participant_id, draft
+                        )
+                    raise
                 return ScheduleImageOutcome(
-                    "draft_created", draft, "course_schedule"
+                    "draft_created" if created_new else "existing_draft",
+                    draft,
+                    "course_schedule",
                 )
         except UnfillableScheduleContextError as exc:
             logger.info(
@@ -1318,6 +1371,7 @@ class BotWorker:
                 delivery_event, "这张课程表缺少星期、周次或可用时间，暂时无法可靠导入。请换一张信息更完整、清晰的图片。"
             )
             return ScheduleImageOutcome("failed", None, "other")
+
         except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError) as exc:
             logger.warning(
                 "course_schedule_image_rejected event_id=%s message_id=%s error_class=%s",
@@ -1357,6 +1411,24 @@ class BotWorker:
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
             return ScheduleImageOutcome("failed", None, "other")
+
+    async def _cancel_hidden_schedule_draft(
+        self, participant_id, draft: dict
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self.schedule_imports.drafts.cancel,
+                participant_id,
+                draft["id"],
+            )
+        except Exception:
+            logger.warning(
+                "hidden_schedule_draft_cancel_failed participant_id=%s "
+                "draft_id=%s",
+                participant_id,
+                draft.get("id"),
+                exc_info=True,
+            )
 
     async def _run_agent(
         self,

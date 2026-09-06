@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import threading
 from types import SimpleNamespace
 import weakref
 
@@ -21,6 +22,7 @@ from app.repositories import (
     ClaudeSessionRepository,
     ConversationRepository,
 )
+from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.services.safety_service import SafetyService
 from app.services.generic_image_vision import GenericImageVisionUnavailable
 from app.worker import (
@@ -1145,6 +1147,127 @@ def test_strict_not_course_does_not_cache_course_schedule_kind():
         assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
 
     asyncio.run(scenario())
+
+
+def test_stop_during_create_draft_does_not_leave_hidden_new_draft():
+    class BlockingDrafts:
+        def __init__(self, repository):
+            self.repository = repository
+            self.created = threading.Event()
+            self.release = threading.Event()
+            self.outcome = None
+
+        def get_by_source(self, participant_id, source_message_id):
+            return self.repository.get_by_source(participant_id, source_message_id)
+
+        def create_draft_outcome(self, participant_id, **kwargs):
+            self.outcome = self.repository.create_draft_outcome(
+                participant_id, **kwargs
+            )
+            self.created.set()
+            assert self.release.wait(timeout=5)
+            return self.outcome
+
+        def cancel(self, participant_id, import_id):
+            return self.repository.cancel(participant_id, import_id)
+
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        schedule_vision=SimpleNamespace(
+            model="strict-vision",
+            parse=lambda *_args: None,
+        ),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    drafts = BlockingDrafts(repository)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=drafts, timezone="Asia/Shanghai"
+    )
+
+    async def parse(_data, _mime):
+        return _strict_schedule_result()
+
+    worker.schedule_vision.parse = parse
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="导入这张课程表到日历")
+        )
+        await worker.process(await queue.get())
+        for _ in range(500):
+            if drafts.created.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert drafts.created.is_set()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        drafts.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert drafts.outcome.created_new is True
+    assert repository.get(drafts.outcome.draft["id"])["status"] == "cancelled"
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_does_not_cancel_preexisting_idempotent_draft():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        schedule_vision=SimpleNamespace(model="strict-vision"),
+        schedule_imports=SimpleNamespace(
+            drafts=None, timezone="Asia/Shanghai"
+        ),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    person = worker.identity.resolve("app", "open")
+    existing = repository.create_draft(
+        person.id,
+        source_message_id="m-image",
+        source_image_hash="9" * 64,
+        vision_model="strict-vision",
+        result=_strict_schedule_result(),
+        timezone_name="Asia/Shanghai",
+    )
+    preview_started = asyncio.Event()
+
+    async def blocked_preview(_event, _card):
+        preview_started.set()
+        await asyncio.Event().wait()
+
+    worker._deliver_card = blocked_preview
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="导入这张课程表到日历")
+        )
+        await worker.process(await queue.get())
+        await preview_started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert repository.get(existing["id"])["status"] in {
+        "pending_context",
+        "pending_confirmation",
+    }
+    assert sender.texts == ["已请求停止当前处理。"]
 
 
 def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent():

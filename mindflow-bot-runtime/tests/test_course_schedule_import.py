@@ -227,6 +227,27 @@ def test_draft_persists_and_calendar_never_writes_before_confirm():
     )
 
 
+def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():
+    database = memory_database()
+    owner = participant(database, "CREATE-OUTCOME")
+    repository = CourseScheduleImportRepository(database)
+    arguments = {
+        "source_message_id": "create-outcome-source",
+        "source_image_hash": "a" * 64,
+        "vision_model": "vision-model",
+        "result": ScheduleVisionResult.from_dict(vision_payload()),
+        "timezone_name": "Asia/Shanghai",
+        "semester_start_date": date(2026, 9, 7),
+    }
+
+    created = repository.create_draft_outcome(owner.id, **arguments)
+    existing = repository.create_draft_outcome(owner.id, **arguments)
+
+    assert created.created_new is True
+    assert existing.created_new is False
+    assert existing.draft["id"] == created.draft["id"]
+
+
 def test_weekly_odd_even_and_explicit_week_normalization():
     database = memory_database()
     person = participant(database, "P001")

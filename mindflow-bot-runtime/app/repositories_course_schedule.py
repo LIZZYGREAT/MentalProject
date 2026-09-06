@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
@@ -37,6 +38,12 @@ class UnfillableScheduleContextError(ValueError):
         super().__init__("schedule contains context that cannot be completed in V1")
 
 
+@dataclass(frozen=True)
+class CreateDraftOutcome:
+    draft: dict[str, Any]
+    created_new: bool
+
+
 class CourseScheduleImportRepository:
     def __init__(
         self, database: Database, *, run_lease_seconds: int = DEFAULT_RUN_LEASE_SECONDS
@@ -57,6 +64,31 @@ class CourseScheduleImportRepository:
         semester_start_date: date | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        return self.create_draft_outcome(
+            participant_id,
+            source_message_id=source_message_id,
+            source_image_hash=source_image_hash,
+            vision_model=vision_model,
+            result=result,
+            timezone_name=timezone_name,
+            ttl_minutes=ttl_minutes,
+            semester_start_date=semester_start_date,
+            now=now,
+        ).draft
+
+    def create_draft_outcome(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        source_message_id: str,
+        source_image_hash: str,
+        vision_model: str,
+        result: ScheduleVisionResult,
+        timezone_name: str,
+        ttl_minutes: int = 60,
+        semester_start_date: date | None = None,
+        now: datetime | None = None,
+    ) -> CreateDraftOutcome:
         created_at = _aware(now or datetime.now(timezone.utc))
         structured = prepare_schedule_context(result)
         missing = derive_required_context(result, semester_start_date=semester_start_date)
@@ -120,12 +152,12 @@ class CourseScheduleImportRepository:
                         )
                     )
                 session.flush()
-                return self._view(session, row)
+                return CreateDraftOutcome(self._view(session, row), True)
         except IntegrityError:
             existing = self.get_by_source(participant_id, source_message_id)
             if existing is None:
                 raise
-            return existing
+            return CreateDraftOutcome(existing, False)
 
     def get(self, import_id: uuid.UUID | str) -> dict[str, Any] | None:
         with self.database.session() as session:
