@@ -146,7 +146,11 @@ SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN = re.compile(
 @dataclass(frozen=True)
 class ScheduleImageOutcome:
     status: Literal[
-        "draft_created", "existing_draft", "not_course_schedule", "failed"
+        "draft_created",
+        "existing_draft",
+        "preview_delivery_failed",
+        "not_course_schedule",
+        "failed",
     ]
     draft: dict | None
     image_kind: str
@@ -1331,9 +1335,18 @@ class BotWorker:
                 event.message_id,
             )
             if existing is not None:
-                await self._deliver_card(
+                delivered = await self._deliver_card(
                     delivery_event, course_schedule_preview_card(existing)
                 )
+                if not delivered:
+                    await self._report_schedule_preview_delivery_failure(
+                        delivery_event
+                    )
+                    return ScheduleImageOutcome(
+                        "preview_delivery_failed",
+                        existing,
+                        "course_schedule",
+                    )
                 return ScheduleImageOutcome(
                     "existing_draft", existing, "course_schedule"
                 )
@@ -1346,9 +1359,18 @@ class BotWorker:
                     event.message_id,
                 )
                 if existing is not None:
-                    await self._deliver_card(
+                    delivered = await self._deliver_card(
                         delivery_event, course_schedule_preview_card(existing)
                     )
+                    if not delivered:
+                        await self._report_schedule_preview_delivery_failure(
+                            delivery_event
+                        )
+                        return ScheduleImageOutcome(
+                            "preview_delivery_failed",
+                            existing,
+                            "course_schedule",
+                        )
                     return ScheduleImageOutcome(
                         "existing_draft", existing, "course_schedule"
                     )
@@ -1429,7 +1451,7 @@ class BotWorker:
                     created_new = True
                 del image
                 try:
-                    await self._deliver_card(
+                    delivered = await self._deliver_card(
                         delivery_event, course_schedule_preview_card(draft)
                     )
                 except asyncio.CancelledError:
@@ -1438,6 +1460,19 @@ class BotWorker:
                             participant_id, draft
                         )
                     raise
+                if not delivered:
+                    if created_new:
+                        await self._cancel_hidden_schedule_draft(
+                            participant_id, draft
+                        )
+                    await self._report_schedule_preview_delivery_failure(
+                        delivery_event
+                    )
+                    return ScheduleImageOutcome(
+                        "preview_delivery_failed",
+                        draft,
+                        "course_schedule",
+                    )
                 return ScheduleImageOutcome(
                     "draft_created" if created_new else "existing_draft",
                     draft,
@@ -1493,6 +1528,14 @@ class BotWorker:
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
             return ScheduleImageOutcome("failed", None, "other")
+
+    async def _report_schedule_preview_delivery_failure(
+        self, delivery_event: BotEvent
+    ) -> None:
+        await self._deliver(
+            delivery_event,
+            "课程表已经识别出来了，但预览卡刚才没发成功。请稍后重新发送这张课程表。",
+        )
 
     async def _cancel_hidden_schedule_draft(
         self, participant_id, draft: dict

@@ -1933,7 +1933,7 @@ def _pipeline_worker(resources, tracker):
     )
 
     async def deliver_card(*_args):
-        return None
+        return True
 
     worker._deliver_card = deliver_card
     return worker

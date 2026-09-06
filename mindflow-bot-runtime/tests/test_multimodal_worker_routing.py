@@ -13,6 +13,7 @@ from app.contracts.course_schedule import ScheduleVisionResult
 from app.contracts.generic_image_context import GenericImageContext
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
+from app.integrations.feishu.client import FeishuSendError
 from app.models import AgentRun, BotEvent as StoredBotEvent
 from app.presentation.contracts import RuntimeResponse
 from app.repositories import (
@@ -43,6 +44,11 @@ class Sender:
     def send_text(self, _chat_id, text, **_kwargs):
         self.texts.append(text)
         return f"reply-{len(self.texts)}"
+
+
+class FailingCardSender(Sender):
+    def send_card(self, _chat_id, _card, **_kwargs):
+        raise FeishuSendError("preview failed", retryable=False)
 
 
 class Runtime:
@@ -383,6 +389,85 @@ def _strict_schedule_result():
         "missing_context": [],
         "warnings": [],
     })
+
+
+def _run_preview_delivery_failure(*, existing_draft=False):
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    gateway, queue, worker, _runtime, _sender, _vision, _resources = _system(
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(
+            drafts=None, timezone="Asia/Shanghai"
+        ),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    worker.sender = FailingCardSender()
+    person = worker.identity.resolve("app", "open")
+    original = None
+    if existing_draft:
+        original = repository.create_draft(
+            person.id,
+            source_message_id="m-image",
+            source_image_hash="7" * 64,
+            vision_model="strict-vision",
+            result=_strict_schedule_result(),
+            timezone_name="Asia/Shanghai",
+        )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        event = await queue.get()
+        await asyncio.to_thread(
+            worker.events.set_processing, event.event_id, person.id
+        )
+        return await worker._handle_schedule_image(event, person.id)
+
+    outcome = asyncio.run(scenario())
+    return worker, repository, outcome, original
+
+
+def test_new_draft_is_cancelled_when_preview_card_send_fails():
+    _worker, repository, outcome, _original = _run_preview_delivery_failure()
+
+    assert repository.get(outcome.draft["id"])["status"] == "cancelled"
+
+
+def test_preview_card_failure_does_not_leave_hidden_pending_draft():
+    worker, repository, outcome, _original = _run_preview_delivery_failure()
+
+    person = worker.identity.resolve("app", "open")
+    assert repository.latest_pending_context(person.id) is None
+    assert outcome.status == "preview_delivery_failed"
+
+
+def test_existing_draft_is_not_cancelled_when_preview_resend_fails():
+    _worker, repository, outcome, original = _run_preview_delivery_failure(
+        existing_draft=True
+    )
+
+    assert repository.get(original["id"])["status"] in {
+        "pending_context",
+        "pending_confirmation",
+    }
+    assert outcome.draft["id"] == original["id"]
+
+
+def test_preview_card_failure_returns_non_success_outcome():
+    worker, _repository, outcome, _original = _run_preview_delivery_failure()
+
+    assert outcome.status == "preview_delivery_failed"
+    assert outcome.status not in {"draft_created", "existing_draft"}
+    assert worker.sender.texts == [
+        "课程表已经识别出来了，但预览卡刚才没发成功。请稍后重新发送这张课程表。"
+    ]
 
 
 def test_image_plus_nearby_text_is_one_turn_and_one_final_reply():
