@@ -272,6 +272,50 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
     assert len(sender.texts) == 2
 
 
+def test_six_second_style_supplement_reuses_image_even_after_fast_completion():
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=1.0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("supplement", "m-supplement", "text", text="按默认学校作息")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 1
+    assert len(resources.calls) == 1
+    assert [call[1].text for call in runtime.calls] == ["", "按默认学校作息"]
+    assert all(call[0].calendar_mutation_allowed is False for call in runtime.calls)
+    assert len(sender.texts) == 2
+
+
+def test_two_images_are_two_image_only_turns_not_one_aggregate():
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        debounce=0.2, association=1.0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        first = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        second = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 2
+    assert len(resources.calls) == 2
+    assert len(runtime.calls) == 2
+    assert len(sender.texts) == 2
+
+
 def test_stop_passes_routing_lock_and_cancels_long_image_turn():
     vision = Vision(delay=1.0)
     gateway, queue, worker, runtime, sender, _, _ = _system(

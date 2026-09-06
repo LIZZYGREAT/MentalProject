@@ -26,6 +26,7 @@ class PendingMultimodalTurn:
     debounce_deadline: float
     association_deadline: float
     state: str = COLLECTING
+    debounce_wakeup: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class RecentImageContext:
     structured_or_agent_summary: dict[str, Any]
     created_at: float
     expires_at: float
+    association_deadline: float
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,10 @@ class MultimodalTurnCoordinator:
         async with self._lock:
             displaced = self._pending.get(key)
             if displaced is not None and displaced.state in {COLLECTING, PROCESSING}:
-                displaced.state = CANCELLED
+                # A second image is a new turn. Wake the first as image-only
+                # instead of silently dropping it or aggregating both images.
+                displaced.state = PROCESSING
+                displaced.debounce_wakeup.set()
             else:
                 displaced = None
             turn = PendingMultimodalTurn(
@@ -116,11 +121,16 @@ class MultimodalTurnCoordinator:
     ) -> PendingMultimodalTurn | None:
         delay = max(0.0, turn.debounce_deadline - self._clock())
         if delay:
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(turn.debounce_wakeup.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
         key = self.key(turn.participant_id, turn.chat_id)
         async with self._lock:
             current = self._pending.get(key)
-            if current is not turn or turn.state != COLLECTING:
+            if current is not turn:
+                return turn if turn.state == PROCESSING else None
+            if turn.state != COLLECTING:
                 return None
             turn.state = PROCESSING
             return turn
@@ -161,6 +171,7 @@ class MultimodalTurnCoordinator:
             structured_or_agent_summary=dict(summary),
             created_at=now,
             expires_at=now + self.recent_context_seconds,
+            association_deadline=turn.association_deadline,
         )
         key = self.key(turn.participant_id, turn.chat_id)
         async with self._lock:

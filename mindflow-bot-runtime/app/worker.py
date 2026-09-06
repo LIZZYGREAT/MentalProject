@@ -490,23 +490,6 @@ class BotWorker:
                     )
                     return
 
-                recent = await self.multimodal_turns.recent_context(
-                    participant.id, event.chat_id
-                )
-                if recent is not None and RECENT_IMAGE_REFERENCE_PATTERN.search(
-                    event.text
-                ):
-                    if participant.external_llm_consent_at is None:
-                        await self._deliver(
-                            event,
-                            "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
-                        )
-                        return
-                    long_task = asyncio.create_task(
-                        self._handle_recent_image_text(event, participant, recent),
-                        name=f"recent-image-turn-{event.event_id}",
-                    )
-
             if long_task is None and event.message_type == "text":
                 correction = parse_schedule_correction(event.text)
                 if correction is not None and self.schedule_imports is not None:
@@ -549,7 +532,7 @@ class BotWorker:
                 if latest_context is not None and (
                     context_match is not None or period_matches
                 ):
-                    from datetime import date, time
+                    from datetime import time as clock_time
 
                     draft = latest_context
                     if context_match is not None:
@@ -578,8 +561,8 @@ class BotWorker:
                                     (int(start_period), int(end_period))
                                     if end_period else int(start_period)
                                 ): (
-                                    time.fromisoformat(start_clock),
-                                    time.fromisoformat(end_clock),
+                                    clock_time.fromisoformat(start_clock),
+                                    clock_time.fromisoformat(end_clock),
                                 )
                                 for start_period, end_period, start_clock, end_clock
                                 in period_matches
@@ -597,6 +580,23 @@ class BotWorker:
                         event, course_schedule_preview_card(draft)
                     )
                     return
+                recent = await self.multimodal_turns.recent_context(
+                    participant.id, event.chat_id
+                )
+                if recent is not None and (
+                    time.monotonic() <= recent.association_deadline
+                    or RECENT_IMAGE_REFERENCE_PATTERN.search(event.text)
+                ):
+                    if participant.external_llm_consent_at is None:
+                        await self._deliver(
+                            event,
+                            "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
+                        )
+                        return
+                    long_task = asyncio.create_task(
+                        self._handle_recent_image_text(event, participant, recent),
+                        name=f"recent-image-turn-{event.event_id}",
+                    )
             if long_task is not None:
                 pass
             elif event.message_type == "image":

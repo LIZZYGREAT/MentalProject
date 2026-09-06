@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import uuid
 
 from app.services.multimodal_turn_coordinator import (
-    CANCELLED,
     COMPLETED,
     PROCESSING,
     MultimodalTurnCoordinator,
@@ -56,7 +55,7 @@ def test_debounce_moves_current_turn_to_processing_without_holding_lock():
     asyncio.run(scenario())
 
 
-def test_second_image_cancels_collecting_turn_and_starts_a_new_turn():
+def test_second_image_wakes_first_as_image_only_and_starts_a_new_turn():
     coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
     participant_id = uuid.uuid4()
 
@@ -64,8 +63,8 @@ def test_second_image_cancels_collecting_turn_and_starts_a_new_turn():
         first = (await coordinator.open_image(participant_id, "chat", "first")).turn
         result = await coordinator.open_image(participant_id, "chat", "second")
         assert result.displaced_turn is first
-        assert first.state == CANCELLED
-        assert await coordinator.wait_for_debounce(first) is None
+        assert first.state == PROCESSING
+        assert await coordinator.wait_for_debounce(first) is first
         assert await coordinator.wait_for_debounce(result.turn) is result.turn
 
     asyncio.run(scenario())
