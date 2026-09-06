@@ -999,6 +999,32 @@ class BotWorker:
     ) -> None:
         trusted_context = dict(recent.structured_or_agent_summary)
         draft_id = str(trusted_context.get("draft_id") or "").strip()
+        strict_read_only_followup = False
+        if (
+            recent.image_kind == "course_schedule"
+            and is_schedule_qa_intent(event.text)
+            and not draft_id
+            and trusted_context.get("route") != "strict_schedule_read_only"
+        ):
+            source_event = BotEvent(
+                event_id=event.event_id,
+                message_id=recent.image_message_id,
+                app_id=event.app_id,
+                open_id=event.open_id,
+                chat_id=event.chat_id,
+                text=event.text,
+                create_time=event.create_time,
+                chat_type=event.chat_type,
+                message_type="image",
+                image_key=recent.image_key,
+            )
+            strict_context = await self._parse_schedule_read_only(source_event)
+            if (
+                strict_context.status == "parsed"
+                and strict_context.context is not None
+            ):
+                trusted_context = strict_context.context
+                strict_read_only_followup = True
         if draft_id and self.schedule_imports is not None:
             get_draft = getattr(self.schedule_imports.drafts, "get", None)
             draft = (
@@ -1053,7 +1079,12 @@ class BotWorker:
                 source_event, participant.id, delivery_event=event
             )
             return
-        await self._note_multimodal_route(event, "recent_image_agent")
+        await self._note_multimodal_route(
+            event,
+            "recent_strict_schedule_read_only"
+            if strict_read_only_followup
+            else "recent_image_agent",
+        )
         await self._run_agent_input(
             event,
             participant,

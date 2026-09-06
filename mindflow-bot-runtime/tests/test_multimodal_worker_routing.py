@@ -723,3 +723,45 @@ def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft()
     assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
     assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
     assert ctx.calendar_mutation_allowed is False
+
+
+def test_recent_course_schedule_qa_upgrades_generic_context_to_strict_parser():
+    class StrictVision:
+        model = "strict-vision"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, _data, _mime):
+            self.calls += 1
+            return _strict_schedule_result()
+
+    strict = StrictVision()
+    generic = Vision(kind="course_schedule")
+    gateway, queue, worker, runtime, _sender, _, resources = _system(
+        vision=generic,
+        schedule_vision=strict,
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert generic.calls == [""]
+    assert strict.calls == 1
+    assert len(resources.calls) == 2
+    assert len(runtime.calls) == 2
+    followup_context = runtime.calls[1][1].trusted_image_context
+    assert followup_context["route"] == "strict_schedule_read_only"
+    course = followup_context["schedule"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
+    assert runtime.calls[1][0].calendar_mutation_allowed is False
