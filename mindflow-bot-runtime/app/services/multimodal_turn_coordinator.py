@@ -25,6 +25,7 @@ class PendingMultimodalTurn:
     opened_at: float
     debounce_deadline: float
     association_deadline: float
+    generation: int
     state: str = COLLECTING
     consumed_text_count: int = 0
     input_frozen: bool = False
@@ -77,6 +78,7 @@ class MultimodalTurnCoordinator:
         self._clock = clock
         self._pending: dict[tuple[Any, str], PendingMultimodalTurn] = {}
         self._recent: dict[tuple[Any, str], RecentImageContext] = {}
+        self._latest_generation: dict[tuple[Any, str], int] = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -89,6 +91,9 @@ class MultimodalTurnCoordinator:
         now = self._clock()
         key = self.key(participant_id, chat_id)
         async with self._lock:
+            generation = self._latest_generation.get(key, 0) + 1
+            self._latest_generation[key] = generation
+            self._recent.pop(key, None)
             displaced = self._pending.get(key)
             if displaced is not None and displaced.state in {COLLECTING, PROCESSING}:
                 # A second image is a new turn. Wake the first as image-only
@@ -106,6 +111,7 @@ class MultimodalTurnCoordinator:
                 opened_at=now,
                 debounce_deadline=now + self.debounce_seconds,
                 association_deadline=now + self.association_seconds,
+                generation=generation,
             )
             self._pending[key] = turn
             return OpenImageResult(turn=turn, displaced_turn=displaced)
@@ -217,7 +223,8 @@ class MultimodalTurnCoordinator:
             turn.state = COMPLETED
             if self._pending.get(key) is turn:
                 self._pending.pop(key, None)
-            self._recent[key] = recent
+            if turn.generation == self._latest_generation.get(key):
+                self._recent[key] = recent
         return recent
 
     async def cancel(self, turn: PendingMultimodalTurn) -> None:

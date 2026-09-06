@@ -324,6 +324,105 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
     assert len(sender.texts) == 2
 
 
+def test_explicit_reference_after_new_image_association_timeout_never_reuses_old_image():
+    class SecondImageBlocks(Vision):
+        def __init__(self):
+            super().__init__(kind="photo")
+            self.second_started = asyncio.Event()
+            self.release_second = asyncio.Event()
+
+        async def inspect(self, data, mime, *, user_text=""):
+            self.calls.append(user_text)
+            if len(self.calls) == 2:
+                self.second_started.set()
+                await self.release_second.wait()
+            return GenericImageContext(
+                image_kind="photo",
+                summary="图片摘要",
+                visible_text="可见文字",
+            )
+
+    vision = SecondImageBlocks()
+    gateway, queue, worker, runtime, _sender, _, _resources = _system(
+        vision=vision, debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        second = asyncio.create_task(worker.process(await queue.get()))
+        await vision.second_started.wait()
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="这张图怎么看？")
+        )
+        await worker.process(await queue.get())
+        vision.release_second.set()
+        await second
+
+    asyncio.run(scenario())
+    question_call = next(call for call in runtime.calls if call[1].text == "这张图怎么看？")
+    assert question_call[1].trusted_image_context is None
+
+
+def test_slow_first_image_fast_second_image_followup_uses_second_image():
+    class MessageAwareResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            return SimpleNamespace(
+                data=message_id.encode(), mime_type="image/png"
+            )
+
+    class MessageAwareVision(Vision):
+        async def inspect(self, data, _mime, *, user_text=""):
+            message_id = data.decode()
+            self.calls.append(message_id)
+            return GenericImageContext(
+                image_kind="photo",
+                summary=message_id,
+                visible_text="",
+            )
+
+    class SlowFirstRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            trusted = turn_input.trusted_image_context or {}
+            if trusted.get("summary") == "m-image-1":
+                self.first_started.set()
+                await self.release_first.wait()
+            return RuntimeResponse(text=f"answer:{turn_input.text or 'image-only'}")
+
+    runtime = SlowFirstRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, vision=MessageAwareVision(), debounce=0, association=0.01
+    )
+    worker.message_resources = MessageAwareResources()
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        first = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.first_started.wait()
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        await worker.process(await queue.get())
+        runtime.release_first.set()
+        await first
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("followup", "m-followup", "text", text="这张图怎么看？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    followup = next(call for call in runtime.calls if call[1].text == "这张图怎么看？")
+    assert followup[1].trusted_image_context["summary"] == "m-image-2"
+
+
 def test_six_second_style_supplement_reuses_image_even_after_fast_completion():
     gateway, queue, worker, runtime, sender, vision, resources = _system(
         vision=Vision(kind="course_schedule"), debounce=0, association=1.0

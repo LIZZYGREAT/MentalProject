@@ -96,6 +96,61 @@ def test_recent_context_expires_and_never_contains_raw_image_data():
     asyncio.run(scenario())
 
 
+def test_opening_new_image_invalidates_previous_recent_context():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        await coordinator.wait_for_debounce(first)
+        await coordinator.complete(
+            first,
+            image_message_id="image-1",
+            image_key="key-1",
+            image_kind="photo",
+            summary={"summary": "first"},
+        )
+        assert await coordinator.recent_context(participant_id, "chat") is not None
+
+        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+
+        assert second.generation > first.generation
+        assert await coordinator.recent_context(participant_id, "chat") is None
+
+    asyncio.run(scenario())
+
+
+def test_older_turn_completing_after_newer_turn_cannot_overwrite_recent():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        await coordinator.wait_for_debounce(first)
+        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+        await coordinator.wait_for_debounce(second)
+        second_recent = await coordinator.complete(
+            second,
+            image_message_id="image-2",
+            image_key="key-2",
+            image_kind="document",
+            summary={"summary": "second"},
+        )
+
+        first_recent = await coordinator.complete(
+            first,
+            image_message_id="image-1",
+            image_key="key-1",
+            image_kind="photo",
+            summary={"summary": "first"},
+        )
+
+        assert first_recent.image_message_id == "image-1"
+        assert await coordinator.recent_context(participant_id, "chat") is second_recent
+
+    asyncio.run(scenario())
+
+
 def test_frozen_input_routes_new_text_to_late_followups():
     coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
     participant_id = uuid.uuid4()
