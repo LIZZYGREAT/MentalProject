@@ -15,7 +15,11 @@ from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
 from app.integrations.feishu.client import FeishuSendError
 from app.models import AgentRun, BotEvent as StoredBotEvent
-from app.presentation.contracts import RuntimeResponse
+from app.presentation.contracts import (
+    ResponsePlan,
+    ResponseSegment,
+    RuntimeResponse,
+)
 from app.repositories import (
     AgentRunRepository,
     BindingRepository,
@@ -294,6 +298,79 @@ def test_schedule_import_question_remains_an_action_request():
     assert not is_schedule_context_mutation_statement("能不能帮我导入？")
     assert is_strong_schedule_import_intent(
         "能不能帮我导入这张课程表？", image_kind="course_schedule"
+    )
+
+
+def test_should_be_period_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text("高数应该是第3-4节吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_should_be_odd_even_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text("周三应该是单周吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_should_be_semester_date_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text(
+        "第一周周一应该是2026-09-07吗？"
+    )
+
+    assert drafts.semester_dates == []
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_imperative_period_change_still_mutates():
+    assert is_schedule_context_mutation_statement(
+        "请帮我把高数改成第3-4节好吗？"
+    )
+
+    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
+    assert len(drafts.corrections) == 1
+    assert runtime.calls == []
+
+
+def test_plain_correction_statement_still_mutates():
+    drafts, runtime = _run_pending_schedule_text("高数其实是第3-4节")
+
+    assert len(drafts.corrections) == 1
+    assert runtime.calls == []
+
+
+def test_schedule_already_imported_question_is_not_import_intent():
+    assert not is_strong_schedule_import_intent(
+        "这张课程表已经导入日历了吗？", image_kind="course_schedule"
+    )
+
+
+def test_schedule_has_it_been_synced_question_is_read_only():
+    assert not is_strong_schedule_import_intent(
+        "这个课表是否已经同步到飞书？", image_kind="course_schedule"
+    )
+
+
+def test_image_event_already_added_question_does_not_grant_calendar_create():
+    assert not is_direct_image_calendar_request(
+        "这个讲座已经添加到日历了吗？"
+    )
+
+
+def test_polite_schedule_import_request_still_routes_to_import():
+    assert is_strong_schedule_import_intent(
+        "能不能帮我导入这张课程表？", image_kind="course_schedule"
+    )
+    assert is_strong_schedule_import_intent(
+        "麻烦把课表同步到飞书。", image_kind="course_schedule"
+    )
+
+
+def test_polite_image_calendar_create_request_still_allows_create_only():
+    assert is_direct_image_calendar_request(
+        "可以帮我把这个讲座加到日历吗？"
     )
 
 
@@ -2180,3 +2257,228 @@ def test_recent_course_schedule_qa_upgrades_generic_context_to_strict_parser():
     course = followup_context["schedule"]["courses"][0]
     assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
     assert runtime.calls[1][0].calendar_mutation_allowed is False
+
+
+class CancellationResistantStrictVision:
+    model = "strict-vision"
+
+    def __init__(self):
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def parse(self, _data, _mime):
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.release.wait()
+        return _strict_schedule_result()
+
+
+def _run_stopped_recent_schedule_qa():
+    strict = CancellationResistantStrictVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=strict,
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+    observed = {}
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="那周三几点上课？")
+        )
+        question_task = asyncio.create_task(worker.process(await queue.get()))
+        await strict.started.wait()
+        person = worker.identity.resolve("app", "open")
+        handles = worker._active_recent_image_tasks[(person.id, "chat")]
+        observed["task_generation"] = handles["question"].stop_generation
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        observed["stop_generation"] = worker._current_stop_generation(person.id)
+        strict.release.set()
+        await asyncio.gather(question_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    return worker, runtime, sender, strict, observed
+
+
+def test_stop_cancels_recent_schedule_qa_during_strict_vision():
+    worker, _runtime, _sender, strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert strict.cancelled.is_set()
+    assert worker._active_recent_image_tasks == {}
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "question").status == "interrupted"
+
+
+def test_recent_schedule_qa_does_not_start_agent_after_stop():
+    _worker, runtime, sender, _strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert [call[1].text for call in runtime.calls] == [""]
+    assert sender.texts == ["answer:image-only", "已请求停止当前处理。"]
+
+
+def test_stop_reports_active_for_recent_image_followup():
+    _worker, _runtime, sender, _strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert sender.texts[-1] == "已请求停止当前处理。"
+
+
+def test_recent_followup_inherits_original_stop_generation():
+    _worker, _runtime, _sender, _strict, observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert observed == {"task_generation": 0, "stop_generation": 1}
+
+
+def _run_stopped_recent_schedule_import():
+    strict = CancellationResistantStrictVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=strict,
+        schedule_imports=SimpleNamespace(
+            drafts=None,
+            timezone="Asia/Shanghai",
+        ),
+        debounce=0,
+        association=1,
+        recent=2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository,
+        timezone="Asia/Shanghai",
+    )
+    previews = []
+
+    async def deliver_card(_event, card):
+        previews.append(card)
+        return True
+
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        import_task = asyncio.create_task(worker.process(await queue.get()))
+        await strict.started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        strict.release.set()
+        await asyncio.gather(import_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    return worker, runtime, sender, strict, repository, person, previews
+
+
+def test_stop_cancels_recent_schedule_import_during_strict_vision():
+    worker, _runtime, _sender, strict, repository, person, _previews = (
+        _run_stopped_recent_schedule_import()
+    )
+
+    assert strict.cancelled.is_set()
+    assert worker._active_recent_image_tasks == {}
+    assert repository.latest_pending_context(person.id) is None
+
+
+def test_recent_schedule_import_does_not_send_preview_after_stop():
+    worker, runtime, sender, _strict, repository, person, previews = (
+        _run_stopped_recent_schedule_import()
+    )
+
+    assert previews == []
+    assert repository.latest_pending_context(person.id) is None
+    assert [call[1].text for call in runtime.calls] == [""]
+    assert sender.texts == ["answer:image-only", "已请求停止当前处理。"]
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "import").status == "interrupted"
+
+
+def test_stop_during_provider_final_send_keeps_durable_interrupted_state():
+    class BlockingFirstSegmentSender(Sender):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def send_text(self, chat_id, text, **kwargs):
+            if text == "first segment":
+                self.started.set()
+                assert self.release.wait(timeout=5)
+            return super().send_text(chat_id, text, **kwargs)
+
+    class TwoSegmentOrchestrator:
+        async def build_plan(self, _response, **_kwargs):
+            return ResponsePlan(
+                kind="analysis",
+                full_text="first segment\n\nsecond segment",
+                segments=(
+                    ResponseSegment(0, "first segment"),
+                    ResponseSegment(1, "second segment"),
+                ),
+                use_cards=False,
+            )
+
+        async def close(self):
+            return None
+
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+    sender = BlockingFirstSegmentSender()
+    worker.sender = sender
+    worker.response_orchestrator = TwoSegmentOrchestrator()
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("provider-race", "m-provider-race", "text", text="长回复")
+        )
+        request_task = asyncio.create_task(worker.process(await queue.get()))
+        assert await asyncio.to_thread(sender.started.wait, 2)
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        with worker.events.database.session() as session:
+            assert (
+                session.get(StoredBotEvent, "provider-race").status
+                == "interrupted"
+            )
+        sender.release.set()
+        await request_task
+
+    asyncio.run(scenario())
+
+    assert "first segment" in sender.texts
+    assert "second segment" not in sender.texts
+    assert "已请求停止当前处理。" in sender.texts
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, "provider-race")
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted"
+    ]
