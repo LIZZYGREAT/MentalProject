@@ -861,6 +861,74 @@ def test_old_run_stays_stopped_after_new_run_starts():
     ]
 
 
+def _run_three_text_stop_scenario():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        for index in range(1, 4):
+            assert gateway.accept_payload(
+                _payload(
+                    f"text-{index}",
+                    f"m-text-{index}",
+                    "text",
+                    text=f"排队请求 {index}",
+                )
+            )
+        tasks = [
+            asyncio.create_task(worker.process(await queue.get()))
+            for _index in range(3)
+        ]
+        for _ in range(200):
+            if len(runtime.pending) == 3:
+                break
+            await asyncio.sleep(0.001)
+        assert len(runtime.pending) == 3
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+    return worker, sender
+
+
+def test_stop_marks_all_queued_text_bot_events_interrupted():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    with worker.events.database.session() as session:
+        assert [
+            session.get(StoredBotEvent, f"text-{index}").status
+            for index in range(1, 4)
+        ] == ["interrupted", "interrupted", "interrupted"]
+
+
+def test_stop_three_text_requests_leaves_no_processing_bot_event():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    with worker.events.database.session() as session:
+        statuses = [row.status for row in session.query(StoredBotEvent).all()]
+    assert "processing" not in statuses
+
+
+def test_stop_three_text_requests_leaves_no_running_agent_run():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    assert all(
+        status != "running" for status, _finished_at in _agent_run_states(worker)
+    )
+
+
+def test_new_post_stop_text_request_is_not_marked_interrupted():
+    worker, _runtime, _sender = _run_new_request_after_stop_race()
+
+    with worker.events.database.session() as session:
+        new_event = session.get(StoredBotEvent, "new")
+        assert new_event.status == "completed"
+        assert new_event.error_code is None
+
+
 def test_cancelled_queued_agent_run_is_finished_as_interrupted():
     runtime = CancellableRuntime()
     gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)

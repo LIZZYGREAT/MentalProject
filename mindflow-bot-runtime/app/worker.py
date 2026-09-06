@@ -150,6 +150,13 @@ class ScheduleReadOnlyOutcome:
     downloaded_image: object | None
 
 
+@dataclass(frozen=True)
+class AgentRunHandle:
+    event_id: str
+    run_id: object
+    run_generation: int
+
+
 def is_strong_schedule_import_intent(
     text: str, *, image_kind: str | None = None
 ) -> bool:
@@ -357,7 +364,9 @@ class BotWorker:
         ).strip()
         self._routing_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._active_event_by_participant: dict[object, str] = {}
+        self._active_agent_events: dict[
+            object, dict[str, AgentRunHandle]
+        ] = {}
         self._stop_generation: dict[object, int] = {}
         self._active_multimodal_tasks: dict[
             tuple[object, str],
@@ -500,19 +509,27 @@ class BotWorker:
                 await self._deliver(event, "当前飞书账号已经绑定。")
                 return
             if STOP_PATTERN.match(event.text):
-                self._stop_generation[participant.id] = (
+                stop_generation = (
                     self._current_stop_generation(participant.id) + 1
                 )
-                active_event_id = self._active_event_by_participant.get(participant.id)
-                if active_event_id:
+                self._stop_generation[participant.id] = stop_generation
+                stopped_handles = [
+                    handle
+                    for handle in self._active_agent_events.get(
+                        participant.id, {}
+                    ).values()
+                    if handle.run_generation < stop_generation
+                ]
+                for handle in stopped_handles:
                     await asyncio.to_thread(
-                        self.events.cancel_reply_plan, active_event_id
+                        self.events.cancel_reply_plan, handle.event_id
                     )
                 interrupt = getattr(self.runtime, "interrupt", None)
                 try:
-                    stopped = (
+                    runtime_stopped = (
                         await interrupt(participant.id) if interrupt else False
                     )
+                    stopped = bool(stopped_handles) or runtime_stopped
                 except Exception as exc:
                     stopped = True
                     logger.warning(
@@ -786,7 +803,13 @@ class BotWorker:
                     ),
                     name=f"agent-turn-{event.event_id}",
                 )
-                self._active_event_by_participant[participant.id] = event.event_id
+                self._active_agent_events.setdefault(participant.id, {})[
+                    event.event_id
+                ] = AgentRunHandle(
+                    event_id=event.event_id,
+                    run_id=run_id,
+                    run_generation=run_generation,
+                )
         if long_task is not None:
             await long_task
 
@@ -1222,7 +1245,13 @@ class BotWorker:
             agent_run_id=run_id,
             calendar_mutation_policy=calendar_mutation_policy,
         )
-        self._active_event_by_participant[participant.id] = event.event_id
+        self._active_agent_events.setdefault(participant.id, {})[
+            event.event_id
+        ] = AgentRunHandle(
+            event_id=event.event_id,
+            run_id=run_id,
+            run_generation=run_generation,
+        )
         await self._run_agent(
             event,
             ctx,
@@ -1773,8 +1802,15 @@ class BotWorker:
             for pending_timer in tool_timers:
                 pending_timer.cancel()
             await asyncio.gather(*timers, return_exceptions=True)
-            if self._active_event_by_participant.get(ctx.participant_id) == event.event_id:
-                self._active_event_by_participant.pop(ctx.participant_id, None)
+            participant_events = self._active_agent_events.get(
+                ctx.participant_id
+            )
+            if participant_events is not None:
+                handle = participant_events.get(event.event_id)
+                if handle is not None and handle.run_id == run_id:
+                    participant_events.pop(event.event_id, None)
+                if not participant_events:
+                    self._active_agent_events.pop(ctx.participant_id, None)
         if progress.first_activity_at is not None:
             metrics["agent_start_to_first_activity_ms"] = round(
                 (progress.first_activity_at - started) * 1000, 1
