@@ -33,6 +33,7 @@ class TurnRequest:
     turn_input: AgentTurnInput
     on_activity: AgentActivityCallback | None
     future: asyncio.Future[ClaudeTurnResult]
+    cancellation_generation: int
 
 
 @dataclass
@@ -45,6 +46,7 @@ class ParticipantAgentSession:
     active_request: TurnRequest | None = None
     state: str = "idle"
     last_active_at: float = field(default_factory=time.monotonic)
+    cancellation_generation: int = 0
 
 
 class ParticipantSessionManager:
@@ -92,6 +94,7 @@ class ParticipantSessionManager:
                 turn_input=ensure_agent_turn_input(turn_input),
                 on_activity=on_activity,
                 future=loop.create_future(),
+                cancellation_generation=session.cancellation_generation,
             )
             try:
                 session.queue.put_nowait(request)
@@ -107,17 +110,31 @@ class ParticipantSessionManager:
     async def interrupt(self, participant_id: uuid.UUID) -> bool:
         async with self._lock:
             session = self._sessions.get(participant_id)
-            if (
-                session is None
-                or session.client is None
-                or session.active_request is None
-                or session.state not in {"running", "interrupting"}
-            ):
+            if session is None:
                 return False
-            session.state = "interrupting"
-            client = session.client
-        await client.interrupt()
-        return True
+            session.cancellation_generation += 1
+            cancelled_pending = 0
+            while True:
+                try:
+                    pending = session.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not pending.future.done():
+                    pending.future.cancel()
+                    cancelled_pending += 1
+                session.queue.task_done()
+            active = session.active_request is not None
+            client = (
+                session.client
+                if active
+                and session.state in {"running", "interrupting"}
+                else None
+            )
+            if client is not None:
+                session.state = "interrupting"
+        if client is not None:
+            await client.interrupt()
+        return active or cancelled_pending > 0
 
     async def _process_session(self, session: ParticipantAgentSession) -> None:
         try:
@@ -138,13 +155,36 @@ class ParticipantSessionManager:
                             self._sessions.pop(session.participant_id, None)
                         session.state = "closed"
                     break
-                session.active_request = request
+                async with self._lock:
+                    cancelled_before_start = (
+                        request.future.cancelled()
+                        or request.cancellation_generation
+                        < session.cancellation_generation
+                    )
+                    if not cancelled_before_start:
+                        session.active_request = request
+                if cancelled_before_start:
+                    if not request.future.done():
+                        request.future.cancel()
+                    session.queue.task_done()
+                    continue
                 try:
                     client = await self._ensure_client(session)
-                    session.binding.current = request.ctx
-                    session.binding.activity_callback = request.on_activity
                     async with self._lock:
-                        session.state = "running"
+                        cancelled_before_run = (
+                            request.future.cancelled()
+                            or request.cancellation_generation
+                            < session.cancellation_generation
+                        )
+                        if not cancelled_before_run:
+                            session.binding.current = request.ctx
+                            session.binding.activity_callback = request.on_activity
+                            session.state = "running"
+
+                    if cancelled_before_run:
+                        if not request.future.done():
+                            request.future.cancel()
+                        continue
 
                     result = await asyncio.wait_for(
                         client.run_turn(request.turn_input),

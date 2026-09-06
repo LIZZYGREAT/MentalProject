@@ -153,6 +153,110 @@ def test_explicit_interrupt_reaches_running_client():
     asyncio.run(scenario())
 
 
+def test_stop_skips_cancelled_queued_agent_request():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    factory = FakeFactory()
+    factory.block_next = True
+    manager = ParticipantSessionManager(factory, ClaudeSessionRepository(database))
+
+    async def scenario():
+        first = asyncio.create_task(manager.submit(context(p1.id, "first"), "first"))
+        for _ in range(100):
+            if factory.turns:
+                break
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            manager.submit(context(p1.id, "second"), "second")
+        )
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        factory.created[0].release.set()
+        await first
+        await manager.close()
+
+    asyncio.run(scenario())
+    assert [text for _participant_id, text in factory.turns] == ["first"]
+
+
+def test_stop_after_two_images_when_second_is_agent_queued_runs_no_second_sdk_turn():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    factory = FakeFactory()
+    factory.block_next = True
+    manager = ParticipantSessionManager(factory, ClaudeSessionRepository(database))
+
+    async def scenario():
+        first = asyncio.create_task(
+            manager.submit(
+                context(p1.id, "image-1"),
+                AgentTurnInput(text="", trusted_image_context={"image": "one"}),
+            )
+        )
+        for _ in range(100):
+            if factory.turns:
+                break
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            manager.submit(
+                context(p1.id, "image-2"),
+                AgentTurnInput(text="", trusted_image_context={"image": "two"}),
+            )
+        )
+        await asyncio.sleep(0)
+        assert await manager.interrupt(p1.id) is True
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert isinstance(results[0], ClaudeSDKTurnInterrupted)
+        assert isinstance(results[1], asyncio.CancelledError)
+        await manager.close()
+
+    asyncio.run(scenario())
+    assert len(factory.turns) == 1
+
+
+def test_stop_prevents_queued_image_calendar_mutation():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    factory = FakeFactory()
+    factory.block_next = True
+    manager = ParticipantSessionManager(factory, ClaudeSessionRepository(database))
+    queued_context = context(p1.id, "calendar-image")
+    queued_context = AgentContext(
+        queued_context.participant_id,
+        queued_context.participant_code,
+        queued_context.open_id,
+        queued_context.chat_id,
+        queued_context.message_id,
+        queued_context.agent_run_id,
+        calendar_mutation_policy="calendar_create_only",
+    )
+
+    async def scenario():
+        first = asyncio.create_task(manager.submit(context(p1.id, "active"), "active"))
+        for _ in range(100):
+            if factory.turns:
+                break
+            await asyncio.sleep(0.001)
+        queued = asyncio.create_task(
+            manager.submit(
+                queued_context,
+                AgentTurnInput(
+                    text="把这个讲座添加到日历",
+                    trusted_image_context={"image_kind": "poster"},
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        assert await manager.interrupt(p1.id) is True
+        await asyncio.gather(first, queued, return_exceptions=True)
+        await manager.close()
+
+    asyncio.run(scenario())
+    assert [text for _participant_id, text in factory.turns] == ["active"]
+
+
 def test_activity_callbacks_are_isolated_by_participant_and_cleared_after_turn():
     database = memory_database()
     p1 = participant(database, "P001")
