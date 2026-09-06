@@ -15,7 +15,6 @@ from app.domain.course_schedule_recurrence import (
     PRESERVE_SCHEDULE_PATTERN,
     CalendarWrite,
     CalendarWriteKind,
-    course_weeks,
     plan_course_writes,
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
@@ -443,18 +442,3 @@ class CourseScheduleImportService:
             f"schedule:{draft['id']}:{strategy}:{item['normalized_key']}:"
             f"{write.occurrence_identity}"
         )
-
-
-def normalize_import_item(
-    draft: dict[str, Any], item: dict[str, Any], *, timezone: ZoneInfo
-) -> list[CalendarWrite]:
-    return plan_course_writes(
-        draft,
-        item,
-        strategy=PRESERVE_SCHEDULE_PATTERN,
-        timezone=timezone,
-    )
-
-
-def _weeks(rule: dict[str, Any]) -> list[int]:
-    return course_weeks(rule)

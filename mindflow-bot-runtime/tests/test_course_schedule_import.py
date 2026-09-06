@@ -40,10 +40,7 @@ from app.repositories import (
     AgentRunRepository, BindingRepository, BotEventRepository, ParticipantRepository,
 )
 from app.worker import BotWorker
-from app.services.course_schedule_import import (
-    CourseScheduleImportService,
-    normalize_import_item,
-)
+from app.services.course_schedule_import import CourseScheduleImportService
 from app.domain.course_schedule_recurrence import (
     EXPAND_ALL_OCCURRENCES,
     PRESERVE_SCHEDULE_PATTERN,
@@ -252,7 +249,12 @@ def test_weekly_odd_even_and_explicit_week_normalization():
     database = memory_database()
     person = participant(database, "P001")
     _repo, odd = _draft(database, person.id, odd_even="odd")
-    write = normalize_import_item(odd, odd["items"][0], timezone=ZoneInfo("Asia/Shanghai"))[0]
+    write = plan_course_writes(
+        odd,
+        odd["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )[0]
     assert "INTERVAL=2" in write.recurrence
     assert "COUNT=8" in write.recurrence
     assert write.start_time.date() == date(2026, 9, 7)
@@ -260,8 +262,11 @@ def test_weekly_odd_even_and_explicit_week_normalization():
     database_even = memory_database()
     person_even = participant(database_even, "P008")
     _repo, even = _draft(database_even, person_even.id, odd_even="even")
-    even_write = normalize_import_item(
-        even, even["items"][0], timezone=ZoneInfo("Asia/Shanghai")
+    even_write = plan_course_writes(
+        even,
+        even["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
     )[0]
     assert "INTERVAL=2" in even_write.recurrence
     assert even_write.start_time.date() == date(2026, 9, 14)
@@ -269,8 +274,11 @@ def test_weekly_odd_even_and_explicit_week_normalization():
     database2 = memory_database()
     person2 = participant(database2, "P002")
     _repo, explicit = _draft(database2, person2.id, explicit_weeks=[1, 2, 4, 7, 10])
-    writes = normalize_import_item(
-        explicit, explicit["items"][0], timezone=ZoneInfo("Asia/Shanghai")
+    writes = plan_course_writes(
+        explicit,
+        explicit["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
     )
     assert len(writes) == 5
     assert all(write.recurrence is None for write in writes)
@@ -1076,8 +1084,11 @@ def test_restart_after_remote_create_does_not_duplicate_calendar_event():
     claimed = repo.begin_confirmation(owner.id, draft["id"])
     item = claimed["items"][0]
     assert repo.claim_item(draft["id"], item["id"])
-    write = normalize_import_item(
-        claimed, item, timezone=ZoneInfo("Asia/Shanghai")
+    write = plan_course_writes(
+        claimed,
+        item,
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
     )[0]
     source_id = (
         f"schedule:{draft['id']}:{PRESERVE_SCHEDULE_PATTERN}:"

@@ -862,13 +862,13 @@ class BotWorker:
                         "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
                     )
                     return
-                opened = await self.multimodal_turns.open_image(
+                opened_turn = await self.multimodal_turns.open_image(
                     participant.id, event.chat_id, event
                 )
                 task_generation = self._current_stop_generation(participant.id)
                 long_task = asyncio.create_task(
                     self._process_multimodal_image(
-                        opened.turn,
+                        opened_turn,
                         participant,
                         task_generation=task_generation,
                     ),
@@ -878,15 +878,15 @@ class BotWorker:
                 participant_tasks = self._active_multimodal_tasks.setdefault(
                     multimodal_key, {}
                 )
-                participant_tasks[opened.turn.turn_id] = (opened.turn, long_task)
+                participant_tasks[opened_turn.turn_id] = (opened_turn, long_task)
 
                 def clear_multimodal(done: asyncio.Task[None]) -> None:
                     current = self._active_multimodal_tasks.get(multimodal_key)
                     if current is None:
                         return
-                    registered = current.get(opened.turn.turn_id)
+                    registered = current.get(opened_turn.turn_id)
                     if registered is not None and registered[1] is done:
-                        current.pop(opened.turn.turn_id, None)
+                        current.pop(opened_turn.turn_id, None)
                     if not current:
                         self._active_multimodal_tasks.pop(multimodal_key, None)
 

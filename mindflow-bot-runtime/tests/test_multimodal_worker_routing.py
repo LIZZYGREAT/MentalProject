@@ -1816,11 +1816,9 @@ def test_strict_success_recent_followup_uses_authoritative_draft():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
         image_event = await queue.get()
         person = worker.identity.resolve("app", "open")
-        turn = (
-            await worker.multimodal_turns.open_image(
-                person.id, image_event.chat_id, image_event
-            )
-        ).turn
+        turn = await worker.multimodal_turns.open_image(
+            person.id, image_event.chat_id, image_event
+        )
         await worker.multimodal_turns.wait_for_debounce(turn)
         await worker.multimodal_turns.complete(
             turn,

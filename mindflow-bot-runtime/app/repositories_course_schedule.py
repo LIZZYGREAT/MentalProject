@@ -766,14 +766,6 @@ def derive_required_context(
     return missing
 
 
-def required_context(
-    result: ScheduleVisionResult, *, semester_start_date: date | None = None
-) -> set[str]:
-    """Backward-compatible alias for the backend-derived authority."""
-
-    return derive_required_context(result, semester_start_date=semester_start_date)
-
-
 def _parse_time(value: str | None) -> time | None:
     return time.fromisoformat(value) if value else None
 

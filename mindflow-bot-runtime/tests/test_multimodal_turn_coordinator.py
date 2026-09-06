@@ -16,12 +16,16 @@ def test_nearby_text_attaches_by_participant_and_chat():
     bob = uuid.uuid4()
 
     async def scenario():
-        opened = await coordinator.open_image(alice, "chat-a", SimpleNamespace(message_id="img"))
+        turn = await coordinator.open_image(
+            alice, "chat-a", SimpleNamespace(message_id="img")
+        )
         now[0] = 101.0
-        assert await coordinator.attach_text(alice, "chat-a", SimpleNamespace(text="看看")) is opened.turn
+        assert await coordinator.attach_text(
+            alice, "chat-a", SimpleNamespace(text="看看")
+        ) is turn
         assert await coordinator.attach_text(bob, "chat-a", SimpleNamespace(text="不要串线")) is None
         assert await coordinator.attach_text(alice, "chat-b", SimpleNamespace(text="不要串群")) is None
-        return opened.turn
+        return turn
 
     turn = asyncio.run(scenario())
     assert [event.text for event in turn.attached_text_events] == ["看看"]
@@ -33,7 +37,7 @@ def test_six_second_text_associates_but_text_after_fifteen_seconds_does_not():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        turn = (await coordinator.open_image(participant_id, "chat", object())).turn
+        turn = await coordinator.open_image(participant_id, "chat", object())
         now[0] = 6.0
         assert await coordinator.attach_text(participant_id, "chat", "默认作息") is turn
         now[0] = 15.01
@@ -47,7 +51,7 @@ def test_debounce_moves_current_turn_to_processing_without_holding_lock():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        turn = (await coordinator.open_image(participant_id, "chat", object())).turn
+        turn = await coordinator.open_image(participant_id, "chat", object())
         assert await coordinator.wait_for_debounce(turn) is turn
         assert turn.state == PROCESSING
         return turn
@@ -60,12 +64,11 @@ def test_second_image_wakes_first_as_image_only_and_starts_a_new_turn():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
-        result = await coordinator.open_image(participant_id, "chat", "second")
-        assert result.displaced_turn is first
+        first = await coordinator.open_image(participant_id, "chat", "first")
+        second = await coordinator.open_image(participant_id, "chat", "second")
         assert first.state == PROCESSING
         assert await coordinator.wait_for_debounce(first) is first
-        assert await coordinator.wait_for_debounce(result.turn) is result.turn
+        assert await coordinator.wait_for_debounce(second) is second
 
     asyncio.run(scenario())
 
@@ -78,7 +81,7 @@ def test_recent_context_expires_and_never_contains_raw_image_data():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        turn = (await coordinator.open_image(participant_id, "chat", object())).turn
+        turn = await coordinator.open_image(participant_id, "chat", object())
         await coordinator.wait_for_debounce(turn)
         recent = await coordinator.complete(
             turn,
@@ -101,7 +104,7 @@ def test_opening_new_image_invalidates_previous_recent_context():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        first = await coordinator.open_image(participant_id, "chat", "first")
         await coordinator.wait_for_debounce(first)
         await coordinator.complete(
             first,
@@ -112,7 +115,7 @@ def test_opening_new_image_invalidates_previous_recent_context():
         )
         assert await coordinator.recent_context(participant_id, "chat") is not None
 
-        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+        second = await coordinator.open_image(participant_id, "chat", "second")
 
         assert second.generation > first.generation
         assert await coordinator.recent_context(participant_id, "chat") is None
@@ -125,9 +128,9 @@ def test_older_turn_completing_after_newer_turn_cannot_overwrite_recent():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        first = await coordinator.open_image(participant_id, "chat", "first")
         await coordinator.wait_for_debounce(first)
-        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+        second = await coordinator.open_image(participant_id, "chat", "second")
         await coordinator.wait_for_debounce(second)
         second_recent = await coordinator.complete(
             second,
@@ -156,7 +159,7 @@ def test_stale_old_image_recent_promotion_cannot_overwrite_new_image_global_rece
     participant_id = uuid.uuid4()
 
     async def scenario():
-        first = (await coordinator.open_image(participant_id, "chat", "first")).turn
+        first = await coordinator.open_image(participant_id, "chat", "first")
         await coordinator.wait_for_debounce(first)
         first_recent = await coordinator.complete(
             first,
@@ -165,7 +168,7 @@ def test_stale_old_image_recent_promotion_cannot_overwrite_new_image_global_rece
             image_kind="course_schedule",
             summary={"summary": "first"},
         )
-        second = (await coordinator.open_image(participant_id, "chat", "second")).turn
+        second = await coordinator.open_image(participant_id, "chat", "second")
         await coordinator.wait_for_debounce(second)
         second_recent = await coordinator.complete(
             second,
@@ -192,9 +195,7 @@ def test_frozen_input_routes_new_text_to_late_followups():
     participant_id = uuid.uuid4()
 
     async def scenario():
-        turn = (
-            await coordinator.open_image(participant_id, "chat", object())
-        ).turn
+        turn = await coordinator.open_image(participant_id, "chat", object())
         await coordinator.attach_text(
             participant_id, "chat", SimpleNamespace(text="first")
         )

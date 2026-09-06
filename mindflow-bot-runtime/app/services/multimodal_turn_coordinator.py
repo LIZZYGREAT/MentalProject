@@ -54,12 +54,6 @@ class RecentImageContext:
     generation: int
 
 
-@dataclass(frozen=True)
-class OpenImageResult:
-    turn: PendingMultimodalTurn
-    displaced_turn: PendingMultimodalTurn | None = None
-
-
 class MultimodalTurnCoordinator:
     """Coordinates ephemeral image turns without persisting raw media."""
 
@@ -88,7 +82,7 @@ class MultimodalTurnCoordinator:
 
     async def open_image(
         self, participant_id: Any, chat_id: str, image_event: Any
-    ) -> OpenImageResult:
+    ) -> PendingMultimodalTurn:
         now = self._clock()
         key = self.key(participant_id, chat_id)
         async with self._lock:
@@ -101,8 +95,6 @@ class MultimodalTurnCoordinator:
                 # instead of silently dropping it or aggregating both images.
                 displaced.state = PROCESSING
                 displaced.debounce_wakeup.set()
-            else:
-                displaced = None
             turn = PendingMultimodalTurn(
                 turn_id=uuid.uuid4().hex,
                 participant_id=participant_id,
@@ -115,7 +107,7 @@ class MultimodalTurnCoordinator:
                 generation=generation,
             )
             self._pending[key] = turn
-            return OpenImageResult(turn=turn, displaced_turn=displaced)
+            return turn
 
     async def attach_text(
         self, participant_id: Any, chat_id: str, text_event: Any
@@ -155,10 +147,6 @@ class MultimodalTurnCoordinator:
             turn.state = PROCESSING
             return turn
 
-    async def attached_texts(self, turn: PendingMultimodalTurn) -> tuple[Any, ...]:
-        async with self._lock:
-            return tuple(turn.attached_text_events)
-
     async def freeze_or_snapshot_input(
         self, turn: PendingMultimodalTurn
     ) -> MultimodalInputSnapshot:
@@ -184,19 +172,6 @@ class MultimodalTurnCoordinator:
             events = tuple(turn.late_followups)
             turn.late_followups.clear()
             return events
-
-    async def active_turn(
-        self, participant_id: Any, chat_id: str
-    ) -> PendingMultimodalTurn | None:
-        now = self._clock()
-        key = self.key(participant_id, chat_id)
-        async with self._lock:
-            turn = self._pending.get(key)
-            if turn is None or turn.state not in {COLLECTING, PROCESSING}:
-                return None
-            if now > turn.association_deadline:
-                return None
-            return turn
 
     async def complete(
         self,
