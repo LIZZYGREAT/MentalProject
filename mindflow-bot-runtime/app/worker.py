@@ -1608,8 +1608,14 @@ class BotWorker:
             if self.presentations is not None:
                 self.presentations.discard(run_id)
             await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
-            delivered = await self._deliver(event, FALLBACK_INTERRUPTED)
-            status = "interrupted" if delivered else "reply_pending"
+            if ctx.participant_id in self._cancelled_participants:
+                await asyncio.to_thread(
+                    self.events.cancel_reply_plan, event.event_id
+                )
+                status = "interrupted"
+            else:
+                delivered = await self._deliver(event, FALLBACK_INTERRUPTED)
+                status = "interrupted" if delivered else "reply_pending"
         except Exception:
             await close_progress_before_final()
             if self.presentations is not None:

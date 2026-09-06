@@ -5,13 +5,23 @@ from types import SimpleNamespace
 import weakref
 
 from app.agent.skill_loader import SkillLoader
+from app.agent.claude_runtime import ClaudeAgentRuntime
+from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
+from app.agent.session_manager import ParticipantSessionManager
 from app.contracts.course_schedule import ScheduleVisionResult
 from app.contracts.generic_image_context import GenericImageContext
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
 from app.models import AgentRun, BotEvent as StoredBotEvent
 from app.presentation.contracts import RuntimeResponse
-from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
+from app.repositories import (
+    AgentRunRepository,
+    BindingRepository,
+    BotEventRepository,
+    ClaudeSessionRepository,
+    ConversationRepository,
+)
+from app.services.safety_service import SafetyService
 from app.services.generic_image_vision import GenericImageVisionUnavailable
 from app.worker import (
     BotWorker,
@@ -65,6 +75,40 @@ class CancellableRuntime(Runtime):
                 future.cancel()
                 cancelled = True
         return cancelled
+
+
+class ProductionStyleClient:
+    def __init__(self, binding, resume, factory):
+        self.binding = binding
+        self.resume = resume
+        self.factory = factory
+        self.release = asyncio.Event()
+        self.interrupted = False
+
+    async def connect(self):
+        return None
+
+    async def run_turn(self, turn_input):
+        self.factory.started.set()
+        await self.release.wait()
+        if self.interrupted:
+            raise ClaudeSDKTurnInterrupted("interrupted")
+        return ClaudeTurnResult(f"answer:{turn_input.text}", "session")
+
+    async def interrupt(self):
+        self.interrupted = True
+        self.release.set()
+
+    async def disconnect(self):
+        return None
+
+
+class ProductionStyleFactory:
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    def create(self, binding, *, resume_session_id):
+        return ProductionStyleClient(binding, resume_session_id, self)
 
 
 class Resources:
@@ -710,6 +754,61 @@ def test_stop_does_not_emit_duplicate_interrupted_reply():
 
     asyncio.run(scenario())
     assert sender.texts == ["已请求停止当前处理。"]
+
+
+def _run_production_style_stop():
+    gateway, queue, worker, _runtime, sender, _, _ = _system()
+    database = worker.runs.database
+    factory = ProductionStyleFactory()
+    sessions = ParticipantSessionManager(
+        factory,
+        ClaudeSessionRepository(database),
+        idle_timeout_seconds=60,
+    )
+    worker.runtime = ClaudeAgentRuntime(
+        sessions,
+        ConversationRepository(database),
+        SafetyService(),
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("production-text", "m-production-text", "text", text="长任务")
+        )
+        agent_task = asyncio.create_task(worker.process(await queue.get()))
+        await factory.started.wait()
+        assert gateway.accept_payload(
+            _payload("production-stop", "m-production-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await agent_task
+        await worker.runtime.close()
+
+    asyncio.run(scenario())
+    return worker, sender
+
+
+def test_production_style_stop_emits_exactly_one_user_visible_stop_reply():
+    _worker, sender = _run_production_style_stop()
+
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_production_style_stop_finishes_agent_run_as_interrupted():
+    worker, _sender = _run_production_style_stop()
+
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+
+
+def test_production_style_stop_marks_original_bot_event_interrupted():
+    worker, _sender = _run_production_style_stop()
+
+    with worker.events.database.session() as session:
+        event = session.get(StoredBotEvent, "production-text")
+        assert event.status == "interrupted"
+        assert event.error_code == "stopped"
 
 
 def test_attached_event_is_not_completed_before_consumption_is_guaranteed():
