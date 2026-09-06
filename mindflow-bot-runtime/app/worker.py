@@ -120,11 +120,14 @@ SCHEDULE_QA_PATTERN = re.compile(
     r"|(?:课表|课程表).*(?:有什么|哪些|几点|什么时候|怎么安排))"
 )
 COURSE_PERIOD_CORRECTION_PATTERN = re.compile(
-    r"(?P<course>[\w\u4e00-\u9fff·（）() -]{1,40}?)(?:其实|实际|应该)?(?:是|为)?\s*"
+    r"(?P<course>[\w\u4e00-\u9fff·（）() -]{1,40}?)"
+    r"(?:(?:其实|实际|应该)(?:是|为)?|改成|改为|更正为|我确认是|就是|设为|按|是|为)?\s*"
     r"第?\s*(?P<start>\d{1,2})\s*[-–—至到]\s*(?P<end>\d{1,2})\s*节"
 )
 WEEKDAY_ODD_EVEN_CORRECTION_PATTERN = re.compile(
-    r"周(?P<weekday>[一二三四五六日天])(?:那门课|的课|课程)?(?:其实|实际|应该)?(?:是|为)?\s*(?P<mode>单|双)周"
+    r"周(?P<weekday>[一二三四五六日天])(?:那门课|的课|课程)?"
+    r"(?:(?:其实|实际|应该)(?:是|为)?|改成|改为|更正为|我确认是|就是|设为|按|是|为)?\s*"
+    r"(?P<mode>单|双)周"
 )
 LOCATION_CORRECTION_PATTERN = re.compile(
     r"(?:这里|地点|教室)(?:是|在|为)\s*(?P<location>[^，。！？\s]{1,50})"
@@ -132,6 +135,12 @@ LOCATION_CORRECTION_PATTERN = re.compile(
 WEEKDAY_NUMBER = {
     "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7,
 }
+SCHEDULE_CONTEXT_MUTATION_CUE_PATTERN = re.compile(
+    r"其实是|实际是|应该是|改成|改为|更正为|我确认是|就是|设为|按.{0,40}算"
+)
+SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN = re.compile(
+    r"是不是|是否|对吗|有没有|会不会|吗|么|[？?]"
+)
 
 
 @dataclass(frozen=True)
@@ -199,6 +208,15 @@ def is_direct_image_calendar_request(text: str) -> bool:
         and not SCHEDULE_IMPORT_INFORMATIONAL_PATTERN.search(value)
         and not SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
     )
+
+
+def is_schedule_context_mutation_statement(text: str) -> bool:
+    """Keep schedule questions read-only unless they explicitly request a change."""
+
+    value = str(text or "").strip()
+    if SCHEDULE_CONTEXT_MUTATION_CUE_PATTERN.search(value):
+        return True
+    return not bool(SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN.search(value))
 
 
 def parse_schedule_correction(text: str) -> dict[str, object] | None:
@@ -616,7 +634,14 @@ class BotWorker:
                     return
 
             if long_task is None and event.message_type == "text":
-                correction = parse_schedule_correction(event.text)
+                mutation_statement = is_schedule_context_mutation_statement(
+                    event.text
+                )
+                correction = (
+                    parse_schedule_correction(event.text)
+                    if mutation_statement
+                    else None
+                )
                 if correction is not None and self.schedule_imports is not None:
                     latest_draft = await asyncio.to_thread(
                         self.schedule_imports.drafts.latest_pending_context,
@@ -641,10 +666,18 @@ class BotWorker:
                         )
                         return
                 context_match = (
-                    SEMESTER_MONDAY_PATTERN.search(event.text)
-                    or BARE_DATE_PATTERN.match(event.text)
+                    (
+                        SEMESTER_MONDAY_PATTERN.search(event.text)
+                        or BARE_DATE_PATTERN.match(event.text)
+                    )
+                    if mutation_statement
+                    else None
                 )
-                period_matches = PERIOD_MAPPING_PATTERN.findall(event.text)
+                period_matches = (
+                    PERIOD_MAPPING_PATTERN.findall(event.text)
+                    if mutation_statement
+                    else []
+                )
                 latest_context = (
                     await asyncio.to_thread(
                         self.schedule_imports.drafts.latest_pending_context,
@@ -1140,7 +1173,11 @@ class BotWorker:
                 else None
             )
             if draft is not None:
-                correction = parse_schedule_correction(event.text)
+                correction = (
+                    parse_schedule_correction(event.text)
+                    if is_schedule_context_mutation_statement(event.text)
+                    else None
+                )
                 if correction is not None:
                     try:
                         corrected = await asyncio.to_thread(

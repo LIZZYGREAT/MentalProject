@@ -29,6 +29,7 @@ from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
     is_direct_image_calendar_request,
+    is_schedule_context_mutation_statement,
     is_strong_schedule_import_intent,
     parse_schedule_correction,
 )
@@ -184,6 +185,110 @@ def test_natural_schedule_correction_phrases_are_parsed_without_schema_terms():
         "odd_even": "odd",
     }
     assert parse_schedule_correction("这里是逸夫楼") == {"location": "逸夫楼"}
+
+
+class RecordingScheduleMutationDrafts:
+    def __init__(self):
+        self.corrections = []
+        self.semester_dates = []
+        self.period_mappings = []
+
+    def latest_pending_context(self, _participant_id):
+        return {"id": "pending-draft", "items": []}
+
+    def apply_correction(self, participant_id, draft_id, **correction):
+        self.corrections.append((participant_id, draft_id, correction))
+        return {"id": draft_id, "items": []}
+
+    def set_semester_start_date(
+        self, participant_id, draft_id, semester_start_date
+    ):
+        self.semester_dates.append(
+            (participant_id, draft_id, semester_start_date)
+        )
+        return {"id": draft_id, "items": []}
+
+    def set_period_time_mapping(self, participant_id, draft_id, mapping):
+        self.period_mappings.append((participant_id, draft_id, mapping))
+        return {"id": draft_id, "items": []}
+
+
+def _run_pending_schedule_text(text):
+    drafts = RecordingScheduleMutationDrafts()
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        schedule_imports=SimpleNamespace(drafts=drafts)
+    )
+
+    async def deliver_card(_event, _card):
+        return True
+
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("schedule-text", "m-schedule-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    return drafts, runtime
+
+
+def test_period_question_does_not_mutate_pending_draft():
+    drafts, runtime = _run_pending_schedule_text("高数第3-4节有冲突吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_odd_even_question_does_not_mutate_pending_draft():
+    drafts, runtime = _run_pending_schedule_text("周三的课单周吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_semester_date_question_does_not_set_semester_start():
+    drafts, runtime = _run_pending_schedule_text(
+        "第一周周一是2026-09-07吗？"
+    )
+
+    assert drafts.semester_dates == []
+    assert len(runtime.calls) == 1
+
+
+def test_period_mapping_question_does_not_override_schedule():
+    drafts, runtime = _run_pending_schedule_text(
+        "第1-2节是08:00-09:40吗？"
+    )
+
+    assert drafts.period_mappings == []
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_period_correction_statement_still_updates_draft():
+    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
+
+    assert drafts.corrections[0][2] == {
+        "course_name": "高数",
+        "period_start": 3,
+        "period_end": 4,
+    }
+    assert runtime.calls == []
+
+
+def test_explicit_odd_even_correction_statement_still_updates_draft():
+    drafts, runtime = _run_pending_schedule_text("周三的课改为单周")
+
+    assert drafts.corrections[0][2] == {"weekday": 3, "odd_even": "odd"}
+    assert runtime.calls == []
+
+
+def test_schedule_import_question_remains_an_action_request():
+    assert not is_schedule_context_mutation_statement("能不能帮我导入？")
+    assert is_strong_schedule_import_intent(
+        "能不能帮我导入这张课程表？", image_kind="course_schedule"
+    )
 
 
 def _payload(event_id, message_id, message_type, *, text=""):
