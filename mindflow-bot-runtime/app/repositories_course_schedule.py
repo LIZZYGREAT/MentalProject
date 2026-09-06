@@ -306,27 +306,50 @@ class CourseScheduleImportRepository:
             metadata = dict(structured.get("_metadata") or {})
             sources = list(metadata.get("course_time_sources") or [])
             while len(sources) < len(courses):
-                sources.append(None)
+                legacy_course = courses[len(sources)]
+                sources.append(
+                    "image"
+                    if legacy_course.get("start_time")
+                    and legacy_course.get("end_time")
+                    else None
+                )
             corrected_fields: set[str] = set()
             if period_start is not None and period_end is not None:
                 course["period_start"] = period_start
                 course["period_end"] = period_end
                 course["period_inference_source"] = "unknown"
                 course["period_confidence"] = None
-                resolved = resolve_period_time(period_start, period_end)
-                if resolved is None:
-                    course["start_time"] = None
-                    course["end_time"] = None
-                    item.start_time = None
-                    item.end_time = None
-                    sources[index] = None
-                else:
-                    start_clock, end_clock, source = resolved
-                    course["start_time"] = start_clock.strftime("%H:%M")
-                    course["end_time"] = end_clock.strftime("%H:%M")
-                    item.start_time = start_clock
-                    item.end_time = end_clock
-                    sources[index] = source
+                preserve_image_time = bool(
+                    sources[index] == "image"
+                    and course.get("start_time")
+                    and course.get("end_time")
+                )
+                if not preserve_image_time:
+                    singles = _load_period_mapping(
+                        metadata.get("user_period_mapping")
+                    )
+                    ranges = _load_period_range_overrides(
+                        metadata.get("user_period_range_overrides")
+                    )
+                    resolved = resolve_period_time(
+                        period_start,
+                        period_end,
+                        period_mapping=singles,
+                        range_overrides=ranges,
+                    )
+                    if resolved is None:
+                        course["start_time"] = None
+                        course["end_time"] = None
+                        item.start_time = None
+                        item.end_time = None
+                        sources[index] = None
+                    else:
+                        start_clock, end_clock, source = resolved
+                        course["start_time"] = start_clock.strftime("%H:%M")
+                        course["end_time"] = end_clock.strftime("%H:%M")
+                        item.start_time = start_clock
+                        item.end_time = end_clock
+                        sources[index] = source
                 corrected_fields.update({"period_start", "period_end", "actual_time"})
             if odd_even is not None:
                 rule = dict(course.get("week_rule") or {})

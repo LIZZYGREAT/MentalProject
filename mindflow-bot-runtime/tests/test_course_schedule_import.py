@@ -1425,10 +1425,10 @@ def test_natural_course_corrections_update_draft_without_schema_language():
     )
     course = corrected["structured_result"]["courses"][0]
     assert (course["period_start"], course["period_end"]) == (3, 4)
-    assert corrected["items"][0]["start_time"] == "10:00"
-    assert corrected["items"][0]["end_time"] == "11:40"
+    assert corrected["items"][0]["start_time"] == "08:00"
+    assert corrected["items"][0]["end_time"] == "09:35"
     assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
-        "default"
+        "image"
     ]
 
     corrected = repo.apply_correction(
@@ -1440,6 +1440,111 @@ def test_natural_course_corrections_update_draft_without_schema_language():
         owner.id, draft["id"], course_name="高等数学", location="逸夫楼"
     )
     assert corrected["items"][0]["location"] == "逸夫楼"
+
+
+def test_period_correction_preserves_existing_user_single_period_mapping():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-SINGLE")
+    repo, draft = _period_only_draft(database, owner.id, "correction-user-single")
+    repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {
+            1: (time(8, 10), time(8, 55)),
+            2: (time(9, 5), time(9, 50)),
+        },
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=1,
+        period_end=2,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:10"
+    assert corrected["items"][0]["end_time"] == "09:50"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user"
+    ]
+
+
+def test_period_correction_preserves_existing_user_range_override():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-RANGE")
+    repo, draft = _period_only_draft(database, owner.id, "correction-user-range")
+    repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {(1, 2): (time(8, 10), time(9, 50))},
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=1,
+        period_end=2,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:10"
+    assert corrected["items"][0]["end_time"] == "09:50"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user"
+    ]
+
+
+def test_period_only_correction_preserves_image_explicit_actual_time():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-IMAGE-TIME")
+    payload = vision_payload()
+    payload["courses"][0]["start_time"] = "08:20"
+    payload["courses"][0]["end_time"] = "09:55"
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="correction-image-time",
+        source_image_hash="8" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:20"
+    assert corrected["items"][0]["end_time"] == "09:55"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "image"
+    ]
+
+
+def test_period_correction_uses_default_only_without_image_or_user_override():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-DEFAULT-TIME")
+    repo, draft = _period_only_draft(database, owner.id, "correction-default-time")
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert corrected["items"][0]["start_time"] == "10:00"
+    assert corrected["items"][0]["end_time"] == "11:40"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "default"
+    ]
 
 
 def test_odd_even_correction_filters_explicit_weeks_and_changes_occurrences():
