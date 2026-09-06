@@ -109,6 +109,31 @@ class FailingInterruptFactory(FakeFactory):
         return client
 
 
+class DelayedFailingInterruptClient(FakeClient):
+    async def interrupt(self):
+        self.factory.interrupt_started.set()
+        await self.factory.release_interrupt.wait()
+        raise RuntimeError("interrupt transport failed")
+
+
+class RecoveringAfterInterruptFailureFactory(FakeFactory):
+    def __init__(self):
+        super().__init__()
+        self.interrupt_started = asyncio.Event()
+        self.release_interrupt = asyncio.Event()
+
+    def create(self, binding, *, resume_session_id):
+        if not self.created:
+            client = DelayedFailingInterruptClient(
+                binding, resume_session_id, self
+            )
+            client.release.clear()
+        else:
+            client = FakeClient(binding, resume_session_id, self)
+        self.created.append(client)
+        return client
+
+
 def test_sessions_are_persistent_serial_and_participant_isolated():
     database = memory_database()
     p1 = participant(database, "P001")
@@ -198,6 +223,42 @@ def test_stop_interrupt_failure_does_not_leave_pending_queue():
         await manager.close()
 
     asyncio.run(scenario())
+
+
+def test_request_arriving_during_interrupt_failure_cannot_be_stranded():
+    database = memory_database()
+    p1 = participant(database, "P001")
+    factory = RecoveringAfterInterruptFailureFactory()
+    manager = ParticipantSessionManager(factory, ClaudeSessionRepository(database))
+
+    async def scenario():
+        first = asyncio.create_task(manager.submit(context(p1.id, "first"), "first"))
+        for _ in range(100):
+            if factory.turns:
+                break
+            await asyncio.sleep(0.001)
+        interrupt = asyncio.create_task(manager.interrupt(p1.id))
+        await factory.interrupt_started.wait()
+        raced = asyncio.create_task(
+            manager.submit(context(p1.id, "raced"), "raced")
+        )
+        await asyncio.sleep(0)
+        factory.release_interrupt.set()
+
+        with pytest.raises(ClaudeSDKInvocationError, match="interrupt failed"):
+            await interrupt
+        stopped = await asyncio.gather(first, raced, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in stopped)
+
+        recovered = await manager.submit(context(p1.id, "recovered"), "recovered")
+        assert recovered.text == "answer:recovered"
+        await manager.close()
+
+    asyncio.run(scenario())
+    assert [text for _participant_id, text in factory.turns] == [
+        "first",
+        "recovered",
+    ]
 
 
 def test_stop_skips_cancelled_queued_agent_request():

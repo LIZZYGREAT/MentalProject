@@ -153,10 +153,20 @@ class ParticipantSessionManager:
                         and not active_request.future.done()
                     ):
                         active_request.future.cancel()
+                    while True:
+                        try:
+                            pending = session.queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if not pending.future.done():
+                            pending.future.cancel()
+                        session.queue.task_done()
                     processing_task = session.processing_task
                     failed_client = session.client
                     session.client = None
                     session.state = "closed"
+                    if self._sessions.get(participant_id) is session:
+                        self._sessions.pop(participant_id, None)
                 if failed_client is not None:
                     try:
                         await failed_client.disconnect()
