@@ -24,6 +24,11 @@ class AgentTurnInput:
     images: tuple[AgentImageAttachment, ...] = ()
     trusted_image_context: Mapping[str, Any] | None = None
 
+    def __str__(self) -> str:
+        """Preserve text behavior at legacy adapter/test-double boundaries."""
+
+        return self.text
+
     @property
     def conversation_text(self) -> str:
         """Safe text stored in conversation history (never image bytes/OCR)."""
