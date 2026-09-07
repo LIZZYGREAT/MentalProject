@@ -2,7 +2,10 @@ import asyncio
 from types import SimpleNamespace
 import uuid
 
+import pytest
+
 from app.services.multimodal_turn_coordinator import (
+    CANCELLED,
     COMPLETED,
     PROCESSING,
     MultimodalTurnCoordinator,
@@ -118,6 +121,53 @@ def test_opening_new_image_invalidates_previous_recent_context():
         second = await coordinator.open_image(participant_id, "chat", "second")
 
         assert second.generation > first.generation
+        assert await coordinator.recent_context(participant_id, "chat") is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_completed_turn_removes_its_recent_context():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        turn = await coordinator.open_image(participant_id, "chat", "image")
+        await coordinator.wait_for_debounce(turn)
+        await coordinator.complete(
+            turn,
+            image_message_id="image-1",
+            image_key="key-1",
+            image_kind="photo",
+            summary={"summary": "image"},
+        )
+        assert await coordinator.recent_context(participant_id, "chat") is not None
+
+        await coordinator.cancel(turn)
+
+        assert turn.state == CANCELLED
+        assert await coordinator.recent_context(participant_id, "chat") is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_turn_cannot_be_completed_or_restore_recent_context():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        turn = await coordinator.open_image(participant_id, "chat", "image")
+        await coordinator.wait_for_debounce(turn)
+        await coordinator.cancel(turn)
+
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator.complete(
+                turn,
+                image_message_id="image-1",
+                image_key="key-1",
+                image_kind="photo",
+                summary={"summary": "image"},
+            )
+
         assert await coordinator.recent_context(participant_id, "chat") is None
 
     asyncio.run(scenario())

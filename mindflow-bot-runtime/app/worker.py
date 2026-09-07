@@ -106,13 +106,23 @@ SCHEDULE_IMPORT_INFORMATIONAL_PATTERN = re.compile(
     r"|(?:导入|添加|加到|同步|放进|写进).{0,24}"
     r"(?:怎么|如何|为什么|是什么|教程|说明|步骤|方法|怎么操作|如何操作)"
 )
-SCHEDULE_WRITE_STATUS_QUESTION_PATTERN = re.compile(
-    r"(?:是否|是不是)\s*已经"
-    r"|有没有.{0,24}(?:导入|添加|加到|同步|放进|写进)"
-    r"|已经.{0,24}(?:导入|添加|加到|同步|放进|写进|成功|完成)"
-    r".{0,12}(?:了吗|了么|吗|么|[？?])"
+SCHEDULE_WRITE_COMPLETION_QUESTION_PATTERN = re.compile(
+    r"有没有.{0,24}(?:导入|添加|加到|同步|放进|写进)"
     r"|(?:导入|添加|加到|同步|放进|写进|成功|完成)"
-    r".{0,12}(?:了吗|了么)"
+    r".{0,12}(?:了吗|了么|了没(?:有)?)"
+)
+SCHEDULE_WRITE_STATUS_QUESTION_PATTERN = re.compile(
+    r"(?:已经|已).{0,24}(?:导入|添加|加到|同步|放进|写进|成功|完成)"
+    r".{0,12}(?:了吗|了么|吗|么|[？?])"
+)
+SCHEDULE_WRITE_STATUS_PREFIX_PATTERN = re.compile(
+    r"(?:是否|是不是).{0,24}"
+    r"(?:导入|添加|加到|同步|放进|写进|成功|完成)"
+)
+SCHEDULE_WRITE_ACTION_REQUEST_PATTERN = re.compile(
+    r"(?:帮|替|给)我"
+    r"|(?:麻烦|拜托|请).{0,8}(?:帮|替|把|将)"
+    r"|能不能|可不可以|可以.{0,8}(?:帮|替|给)"
 )
 SCHEDULE_NON_CALENDAR_EDIT_PATTERN = re.compile(
     r"(?:添加|加上|写入|写进).{0,10}(?:备注|说明|标注|注释)"
@@ -149,6 +159,10 @@ SCHEDULE_CONTEXT_IMPERATIVE_MUTATION_PATTERN = re.compile(
 SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN = re.compile(
     r"是不是|是否|对吗|有没有|会不会|吗|么|[？?]"
 )
+SCHEDULE_CONTEXT_MUTATION_STATUS_PATTERN = re.compile(
+    r"(?:是不是|是否).{0,20}(?:改成|改为|更正为|设为)"
+    r"|(?:改成|改为|更正为|设为).{0,20}(?:了吗|了么|了没(?:有)?|对吗)"
+)
 
 
 @dataclass(frozen=True)
@@ -181,15 +195,27 @@ class AgentRunHandle:
 @dataclass(frozen=True)
 class RecentImageTaskHandle:
     event_id: str
-    task: asyncio.Task[RecentImageContext]
+    task: asyncio.Task
     stop_generation: int
+
+
+def is_schedule_write_status_question(text: str) -> bool:
+    value = str(text or "")
+    if SCHEDULE_WRITE_COMPLETION_QUESTION_PATTERN.search(value):
+        return True
+    if SCHEDULE_WRITE_ACTION_REQUEST_PATTERN.search(value):
+        return False
+    return bool(
+        SCHEDULE_WRITE_STATUS_QUESTION_PATTERN.search(value)
+        or SCHEDULE_WRITE_STATUS_PREFIX_PATTERN.search(value)
+    )
 
 
 def is_strong_schedule_import_intent(
     text: str, *, image_kind: str | None = None
 ) -> bool:
     value = str(text or "")
-    if SCHEDULE_WRITE_STATUS_QUESTION_PATTERN.search(value):
+    if is_schedule_write_status_question(value):
         return False
     if SCHEDULE_WRITE_NEGATION_PATTERN.search(value):
         return False
@@ -222,7 +248,7 @@ def is_schedule_qa_intent(text: str) -> bool:
 
 def is_direct_image_calendar_request(text: str) -> bool:
     value = str(text or "")
-    if SCHEDULE_WRITE_STATUS_QUESTION_PATTERN.search(value):
+    if is_schedule_write_status_question(value):
         return False
     return bool(
         SCHEDULE_WRITE_PATTERN.search(value)
@@ -237,6 +263,8 @@ def is_schedule_context_mutation_statement(text: str) -> bool:
     """Keep schedule questions read-only unless they explicitly request a change."""
 
     value = str(text or "").strip()
+    if SCHEDULE_CONTEXT_MUTATION_STATUS_PATTERN.search(value):
+        return False
     if SCHEDULE_CONTEXT_IMPERATIVE_MUTATION_PATTERN.search(value):
         return True
     if SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN.search(value):
@@ -425,6 +453,38 @@ class BotWorker:
     def _run_was_stopped(self, participant_id, run_generation: int) -> bool:
         return run_generation < self._current_stop_generation(participant_id)
 
+    def _register_recent_image_task(
+        self,
+        participant_id,
+        chat_id: str,
+        event_id: str,
+        task: asyncio.Task,
+        stop_generation: int,
+    ) -> tuple[object, str]:
+        key = (participant_id, str(chat_id))
+        handle = RecentImageTaskHandle(
+            event_id=event_id,
+            task=task,
+            stop_generation=stop_generation,
+        )
+        self._active_recent_image_tasks.setdefault(key, {})[event_id] = handle
+        return key
+
+    def _unregister_recent_image_task(
+        self,
+        key: tuple[object, str],
+        event_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        current = self._active_recent_image_tasks.get(key)
+        if current is None:
+            return
+        registered = current.get(event_id)
+        if registered is not None and registered.task is task:
+            current.pop(event_id, None)
+        if not current:
+            self._active_recent_image_tasks.pop(key, None)
+
     async def _ensure_task_not_stopped(
         self,
         participant_id,
@@ -600,6 +660,9 @@ class BotWorker:
                 image_tasks = self._active_multimodal_tasks.pop(
                     multimodal_key, {}
                 )
+                recent_image_tasks = self._active_recent_image_tasks.pop(
+                    multimodal_key, {}
+                )
                 for active_turn, image_task in image_tasks.values():
                     if not image_task.done():
                         image_task.cancel()
@@ -615,9 +678,6 @@ class BotWorker:
                             self.events.cancel_reply_plan,
                             related_event.event_id,
                         )
-                recent_image_tasks = self._active_recent_image_tasks.pop(
-                    multimodal_key, {}
-                )
                 for handle in recent_image_tasks.values():
                     if handle.stop_generation >= stop_generation:
                         continue
@@ -830,27 +890,20 @@ class BotWorker:
                         name=f"recent-image-turn-{event.event_id}",
                     )
                     long_task = recent_task
-                    recent_key = (participant.id, str(event.chat_id))
-                    participant_tasks = self._active_recent_image_tasks.setdefault(
-                        recent_key, {}
-                    )
-                    participant_tasks[event.event_id] = RecentImageTaskHandle(
-                        event_id=event.event_id,
-                        task=recent_task,
-                        stop_generation=task_generation,
+                    recent_key = self._register_recent_image_task(
+                        participant.id,
+                        event.chat_id,
+                        event.event_id,
+                        recent_task,
+                        task_generation,
                     )
 
                     def clear_recent_image(
                         done: asyncio.Task[RecentImageContext],
                     ) -> None:
-                        current = self._active_recent_image_tasks.get(recent_key)
-                        if current is None:
-                            return
-                        registered = current.get(event.event_id)
-                        if registered is not None and registered.task is done:
-                            current.pop(event.event_id, None)
-                        if not current:
-                            self._active_recent_image_tasks.pop(recent_key, None)
+                        self._unregister_recent_image_task(
+                            recent_key, event.event_id, done
+                        )
 
                     recent_task.add_done_callback(clear_recent_image)
             if long_task is not None:
@@ -1219,29 +1272,49 @@ class BotWorker:
         task_generation: int,
     ) -> None:
         current_recent = recent
-        for followup in await self.multimodal_turns.drain_late_followups(turn):
-            try:
-                if current_recent is not None:
-                    current_recent = await self._handle_recent_image_text(
-                        followup,
-                        participant,
-                        current_recent,
-                        task_generation=task_generation,
-                    )
-                else:
-                    await self.process(followup)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "late_image_followup_failed event_id=%s error_class=%s",
+        followups = await self.multimodal_turns.drain_late_followups(turn)
+        current_task = asyncio.current_task()
+        registrations: list[tuple[tuple[object, str], str]] = []
+        if current_task is not None:
+            for followup in followups:
+                recent_key = self._register_recent_image_task(
+                    participant.id,
+                    followup.chat_id,
                     followup.event_id,
-                    type(exc).__name__,
+                    current_task,
+                    task_generation,
                 )
-                await self._deliver(
-                    followup,
-                    "刚才补充的内容没有处理完整，请再发一次。",
-                )
+                registrations.append((recent_key, followup.event_id))
+        try:
+            for followup in followups:
+                try:
+                    if current_recent is not None:
+                        current_recent = await self._handle_recent_image_text(
+                            followup,
+                            participant,
+                            current_recent,
+                            task_generation=task_generation,
+                        )
+                    else:
+                        await self.process(followup)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "late_image_followup_failed event_id=%s error_class=%s",
+                        followup.event_id,
+                        type(exc).__name__,
+                    )
+                    await self._deliver(
+                        followup,
+                        "刚才补充的内容没有处理完整，请再发一次。",
+                    )
+        finally:
+            if current_task is not None:
+                for recent_key, event_id in registrations:
+                    self._unregister_recent_image_task(
+                        recent_key, event_id, current_task
+                    )
 
     async def _handle_recent_image_text(
         self,

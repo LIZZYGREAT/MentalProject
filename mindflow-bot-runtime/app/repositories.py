@@ -4240,6 +4240,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
+            if row.status == "interrupted":
+                return
             segments = row.reply_segments_json or (
                 [row.reply_text] if row.reply_text else []
             )
@@ -4263,7 +4265,7 @@ class BotEventRepository:
     def note_reply_failure(self, event_id: str) -> None:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
-            if row is not None:
+            if row is not None and row.status != "interrupted":
                 row.status = "reply_pending"
                 row.error_code = "send_failed"
 
@@ -4271,6 +4273,8 @@ class BotEventRepository:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
+                return
+            if row.status == "interrupted":
                 return
             row.participant_id = participant_id
             row.status = "processing"
@@ -4293,6 +4297,8 @@ class BotEventRepository:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
+                return
+            if row.status == "interrupted":
                 return
             row.status = status
             row.error_code = str(error_code)[:64] if error_code else None

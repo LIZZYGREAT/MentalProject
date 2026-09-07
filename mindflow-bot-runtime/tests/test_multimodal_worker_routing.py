@@ -374,6 +374,40 @@ def test_polite_image_calendar_create_request_still_allows_create_only():
     )
 
 
+def test_schedule_sync_success_question_is_not_import_intent():
+    assert not is_strong_schedule_import_intent(
+        "这张课程表是否同步成功？", image_kind="course_schedule"
+    )
+
+
+def test_schedule_import_done_or_not_question_is_read_only():
+    assert not is_strong_schedule_import_intent(
+        "这张课程表导入日历了没有？", image_kind="course_schedule"
+    )
+
+
+def test_image_event_added_or_not_question_does_not_grant_calendar_create():
+    assert not is_direct_image_calendar_request(
+        "这个讲座加到日历了没？"
+    )
+
+
+def test_polite_is_it_possible_import_request_remains_an_action():
+    assert is_strong_schedule_import_intent(
+        "是不是可以帮我导入这张课程表？", image_kind="course_schedule"
+    )
+    assert is_strong_schedule_import_intent(
+        "我已经准备好了，可以帮我导入这张课程表吗？",
+        image_kind="course_schedule",
+    )
+
+
+def test_schedule_change_status_question_does_not_mutate():
+    assert not is_schedule_context_mutation_statement(
+        "高数改成第3-4节了吗？"
+    )
+
+
 def _payload(event_id, message_id, message_type, *, text=""):
     content = {"text": text} if message_type == "text" else {"image_key": "img-key"}
     return {
@@ -1218,6 +1252,37 @@ def test_interrupted_event_cannot_be_reopened_by_late_reply_plan():
     assert worker.events.pending_reply_plan(event.event_id) is None
 
 
+def test_interrupted_event_is_terminal_for_late_lifecycle_writes():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+
+    assert gateway.accept_payload(
+        _payload("terminal-event", "m-terminal-event", "text", text="旧请求")
+    )
+    event = asyncio.run(queue.get())
+    worker.events.set_processing(event.event_id, None)
+    worker.events.stage_reply_plan(
+        event.event_id,
+        full_text="已发送内容",
+        segments=["已发送内容"],
+    )
+    worker.events.mark_reply_segment_sent(
+        event.event_id,
+        segment_index=0,
+        message_id="om-reply",
+    )
+    worker.events.cancel_reply_plan(event.event_id)
+
+    worker.events.finish_reply_plan(event.event_id)
+    worker.events.note_reply_failure(event.event_id)
+    worker.events.set_processing(event.event_id, None)
+    worker.events.finish(event.event_id, status="completed")
+
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, event.event_id)
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+
+
 def test_stop_during_multimodal_run_start_leaves_no_running_agent_run():
     gateway, queue, worker, runtime, _sender, _, _ = _system(debounce=0)
     delegate = worker.runs
@@ -1549,6 +1614,91 @@ def test_text_arriving_during_strict_extractor_is_not_lost():
         "course_name"
     ] == "高等数学"
     assert sender.texts == ["strict-preview", "answer:那周四呢？"]
+
+
+def test_stop_marks_drained_late_schedule_correction_interrupted():
+    strict_started = asyncio.Event()
+    strict_release = asyncio.Event()
+    correction_preview_started = asyncio.Event()
+
+    class Drafts(RecordingScheduleMutationDrafts):
+        def get(self, draft_id):
+            return {
+                "id": draft_id,
+                "structured_result": {"courses": []},
+                "items": [],
+            }
+
+    drafts = Drafts()
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        schedule_imports=SimpleNamespace(drafts=drafts),
+        debounce=0.2,
+        association=1,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        strict_started.set()
+        await strict_release.wait()
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "draft-1"}, "course_schedule"
+        )
+
+    async def blocked_correction_preview(event, _card):
+        assert event.event_id == "late-correction"
+        correction_preview_started.set()
+        await asyncio.Event().wait()
+
+    worker._handle_schedule_image = strict
+    worker._deliver_card = blocked_correction_preview
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="导入这张课程表")
+        )
+        await worker.process(await queue.get())
+        await strict_started.wait()
+        assert gateway.accept_payload(
+            _payload(
+                "late-correction",
+                "m-late-correction",
+                "text",
+                text="高数其实是第3-4节",
+            )
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload(
+                "queued-late-correction",
+                "m-queued-late-correction",
+                "text",
+                text="周三其实是单周",
+            )
+        )
+        await worker.process(await queue.get())
+        strict_release.set()
+        await correction_preview_started.wait()
+
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    with worker.events.database.session() as session:
+        for event_id in ("late-correction", "queued-late-correction"):
+            stored = session.get(StoredBotEvent, event_id)
+            assert stored.status == "interrupted"
+            assert stored.error_code == "stopped"
+    assert worker._active_recent_image_tasks == {}
+    assert sender.texts == ["已请求停止当前处理。"]
 
 
 def test_strict_failure_does_not_create_false_recent_context():

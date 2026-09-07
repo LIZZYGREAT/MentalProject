@@ -197,6 +197,8 @@ class MultimodalTurnCoordinator:
         )
         key = self.key(turn.participant_id, turn.chat_id)
         async with self._lock:
+            if turn.state == CANCELLED:
+                raise asyncio.CancelledError
             turn.state = COMPLETED
             if self._pending.get(key) is turn:
                 self._pending.pop(key, None)
@@ -237,6 +239,9 @@ class MultimodalTurnCoordinator:
             turn.state = CANCELLED
             if self._pending.get(key) is turn:
                 self._pending.pop(key, None)
+            recent = self._recent.get(key)
+            if recent is not None and recent.generation == turn.generation:
+                self._recent.pop(key, None)
 
     async def recent_context(
         self, participant_id: Any, chat_id: str
