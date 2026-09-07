@@ -25,6 +25,7 @@ SourceKind = Literal[
     "course_schedule_strict",
     "card_action",
 ]
+AuthorizationSemanticRole = Literal["user", "assistant"]
 
 _CALENDAR_MUTATIONS_BY_POLICY: dict[
     CalendarMutationPolicy, frozenset[CalendarMutationOperation]
@@ -39,6 +40,14 @@ _CALENDAR_MUTATIONS_BY_POLICY: dict[
 
 
 @dataclass(frozen=True)
+class AuthorizationSemanticTurn:
+    """One backend-supplied conversation turn used only for mutation review."""
+
+    role: AuthorizationSemanticRole
+    text: str
+
+
+@dataclass(frozen=True)
 class AgentContext:
     participant_id: uuid.UUID
     participant_code: str
@@ -50,6 +59,7 @@ class AgentContext:
     turn_effect_policy: TurnEffectPolicy = "verify_on_demand"
     user_request_text: str = ""
     source_kind: SourceKind = "text"
+    authorization_semantic_context: tuple[AuthorizationSemanticTurn, ...] = ()
 
     @property
     def calendar_mutation_allowed(self) -> bool:

@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from app.agent.context import AgentContext
+from app.agent.context import AgentContext, AuthorizationSemanticTurn
 from app.agent.tool_registry import (
     AuthorizationContextResolutionError,
     ToolRegistry,
@@ -57,6 +57,7 @@ def context(
     turn_effect_policy="verify_on_demand",
     calendar_mutation_policy="normal",
     source_kind="text",
+    semantic_turns=(),
 ):
     return AgentContext(
         participant_id=uuid.uuid4(),
@@ -69,6 +70,7 @@ def context(
         turn_effect_policy=turn_effect_policy,
         user_request_text=text,
         source_kind=source_kind,
+        authorization_semantic_context=tuple(semantic_turns),
     )
 
 
@@ -404,7 +406,18 @@ def test_delete_uses_backend_verification_and_never_sends_event_id_or_identity()
 
     result = asyncio.run(
         registry.execute(
-            context("把这个活动删掉"),
+            context(
+                "删掉吧",
+                semantic_turns=(
+                    AuthorizationSemanticTurn(
+                        "user", "明天下午那个项目组会是几点？"
+                    ),
+                    AuthorizationSemanticTurn(
+                        "assistant", "项目组会是15:00到16:00。"
+                    ),
+                    AuthorizationSemanticTurn("user", "删掉吧"),
+                ),
+            ),
             "calendar_delete_event",
             {"event_id": "provider-event-secret"},
         )
@@ -421,6 +434,11 @@ def test_delete_uses_backend_verification_and_never_sends_event_id_or_identity()
         "end_time": "2026-09-08T16:00:00+08:00",
         "recurrence": "FREQ=WEEKLY",
     }
+    assert proposal["semantic_turn_context"] == (
+        {"role": "user", "text": "明天下午那个项目组会是几点？"},
+        {"role": "assistant", "text": "项目组会是15:00到16:00。"},
+        {"role": "user", "text": "删掉吧"},
+    )
     assert "event_id" not in serialized
     assert "calendar_id" not in serialized
     assert "provider_id" not in serialized
@@ -459,7 +477,18 @@ def test_delete_target_mismatch_is_denied_before_handler():
 
     result = asyncio.run(
         registry.execute(
-            context("删除明天下午的组会"),
+            context(
+                "删掉吧",
+                semantic_turns=(
+                    AuthorizationSemanticTurn(
+                        "user", "明天下午那个项目组会是几点？"
+                    ),
+                    AuthorizationSemanticTurn(
+                        "assistant", "项目组会是15:00到16:00。"
+                    ),
+                    AuthorizationSemanticTurn("user", "删掉吧"),
+                ),
+            ),
             "calendar_delete_event",
             {"event_id": "wrong-provider-event"},
         )
@@ -468,6 +497,60 @@ def test_delete_target_mismatch_is_denied_before_handler():
     assert result.status == "tool_effect_not_authorized"
     assert result.result["reason_code"] == "target_mismatch"
     assert verifier.calls[0]["proposal_summary"]["target"]["summary"] == "牙医预约"
+    assert deleted == []
+
+
+def test_multiturn_delete_with_two_possible_targets_needs_clarification():
+    verifier = StaticVerifier(
+        MutationIntentDecision(
+            "needs_clarification", "ambiguous", "multiple_targets"
+        )
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    deleted = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "项目组会",
+                "start_time": "2026-09-08T15:00:00+08:00",
+                "end_time": "2026-09-08T16:00:00+08:00",
+                "recurrence": "",
+            }
+        }
+
+    register(
+        registry,
+        "calendar_delete_event",
+        lambda _ctx, args: deleted.append(args) or {"ok": True},
+        effect="destructive_external_write",
+        authorization_requirement="explicit_destructive_request",
+        schema=EVENT_SCHEMA,
+        authorization_context_resolver=resolve_target,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context(
+                "删掉吧",
+                semantic_turns=(
+                    AuthorizationSemanticTurn(
+                        "user", "明天下午两个组会分别几点？"
+                    ),
+                    AuthorizationSemanticTurn(
+                        "assistant", "项目组会15点，导师组会16点。"
+                    ),
+                    AuthorizationSemanticTurn("user", "删掉吧"),
+                ),
+            ),
+            "calendar_delete_event",
+            {"event_id": "one-of-two-events"},
+        )
+    )
+
+    assert result.status == "mutation_needs_clarification"
+    assert result.result["reason_code"] == "multiple_targets"
+    assert len(verifier.calls[0]["semantic_turn_context"]) == 3
     assert deleted == []
 
 
@@ -509,7 +592,16 @@ def test_update_verifier_receives_backend_bound_target_and_requested_change():
 
     result = asyncio.run(
         registry.execute(
-            context("把项目组会改到三点"),
+            context(
+                "改到三点",
+                semantic_turns=(
+                    AuthorizationSemanticTurn(
+                        "user", "明天下午的项目组会是几点？"
+                    ),
+                    AuthorizationSemanticTurn("assistant", "项目组会是14:00。"),
+                    AuthorizationSemanticTurn("user", "改到三点"),
+                ),
+            ),
             "calendar_update_event",
             {
                 "event_id": "provider-event-secret",
@@ -523,6 +615,10 @@ def test_update_verifier_receives_backend_bound_target_and_requested_change():
     assert proposal["target"]["summary"] == "项目组会"
     assert proposal["requested_values"] == {
         "start_time": "2026-09-08T15:00:00+08:00"
+    }
+    assert verifier.calls[0]["semantic_turn_context"][-1] == {
+        "role": "user",
+        "text": "改到三点",
     }
     assert updated == [
         {
@@ -542,8 +638,8 @@ def test_calendar_authorization_resolver_reads_participant_bound_target():
             return {
                 "id": event_id,
                 "summary": "项目组会",
-                "start_time": "2026-09-08T14:00:00+08:00",
-                "end_time": "2026-09-08T15:00:00+08:00",
+                "start_time": "2026-09-08T07:00:00+00:00",
+                "end_time": "2026-09-08T08:00:00+00:00",
                 "recurrence": "FREQ=WEEKLY",
                 "calendar_id": "private-calendar",
                 "recurring_event_id": "private-series",
@@ -563,9 +659,10 @@ def test_calendar_authorization_resolver_reads_participant_bound_target():
     assert resolved == {
         "target": {
             "summary": "项目组会",
-            "start_time": "2026-09-08T14:00:00+08:00",
-            "end_time": "2026-09-08T15:00:00+08:00",
+            "start_time": "2026-09-08T15:00:00+08:00",
+            "end_time": "2026-09-08T16:00:00+08:00",
             "recurrence": "FREQ=WEEKLY",
+            "timezone": "Asia/Shanghai",
         }
     }
     serialized = json.dumps(resolved, ensure_ascii=False)
@@ -820,6 +917,23 @@ def test_verifier_redacts_secrets_and_identifiers_from_provider_payload():
                 "description": "access_token=provider-token",
             },
             source_kind="text",
+            semantic_turn_context=(
+                {
+                    "role": "user",
+                    "text": (
+                        "participant_id=participant-secret "
+                        "participant_code=code-secret open_id=open-secret "
+                        "chat_id=chat-secret event_id=event-secret"
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "text": (
+                        "calendar_id=calendar-secret token=turn-token "
+                        "学号=20261234 provider id=provider-secret"
+                    ),
+                },
+            ),
         )
     )
 
@@ -828,6 +942,15 @@ def test_verifier_redacts_secrets_and_identifiers_from_provider_payload():
     assert "20260001" not in serialized
     assert "provider-event-secret" not in serialized
     assert "provider-token" not in serialized
+    assert "participant-secret" not in serialized
+    assert "code-secret" not in serialized
+    assert "open-secret" not in serialized
+    assert "chat-secret" not in serialized
+    assert "event-secret" not in serialized
+    assert "calendar-secret" not in serialized
+    assert "turn-token" not in serialized
+    assert "20261234" not in serialized
+    assert "provider-secret" not in serialized
 
 
 def test_verifier_rejects_invalid_or_mismatched_provider_output():

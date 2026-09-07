@@ -1431,12 +1431,22 @@ class CareTools:
                 return None
             return str(value)[:max_length]
 
+        def local_time(field: str) -> str | None:
+            value = optional_text(field, 64)
+            if not value or (len(value) == 10 and value.count("-") == 2):
+                return value
+            try:
+                return _parse_datetime(value, self.timezone).isoformat()
+            except ValueError:
+                return value
+
         return {
             "target": {
                 "summary": str(event.get("summary") or "")[:200],
-                "start_time": optional_text("start_time", 64),
-                "end_time": optional_text("end_time", 64),
+                "start_time": local_time("start_time"),
+                "end_time": local_time("end_time"),
                 "recurrence": optional_text("recurrence", 500),
+                "timezone": str(self.timezone),
             }
         }
 

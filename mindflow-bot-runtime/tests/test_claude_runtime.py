@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import uuid
 
 import pytest
@@ -13,7 +14,11 @@ from app.agent.sdk_adapter import (
 from app.agent.session_manager import ParticipantSessionManager
 from app.contracts.agent_input import AgentTurnInput
 from app.presentation.contracts import AgentActivityEvent
-from app.repositories import ClaudeSessionRepository, ConversationRepository
+from app.repositories import (
+    BotEventRepository,
+    ClaudeSessionRepository,
+    ConversationRepository,
+)
 from app.services.safety_service import FIXED_HIGH_RISK_RESPONSE, SafetyService
 from helpers import memory_database, participant
 
@@ -486,3 +491,90 @@ def test_multimodal_safety_precheck_allows_third_party_news_summary():
     assert result.text == "这是对新闻内容的中性总结。"
     assert result.safety_locked is False
     assert len(sessions.turns) == 1
+
+
+def test_runtime_supplies_backend_owned_recent_turns_to_agent_context():
+    class Conversations:
+        def __init__(self):
+            self.recent_calls = []
+
+        def add(self, *_args, **_kwargs):
+            return uuid.uuid4()
+
+        def recent(self, participant_id, limit, **kwargs):
+            self.recent_calls.append((participant_id, limit, kwargs))
+            return [
+                {"role": "user", "content": "明天下午项目组会几点？"},
+                {"role": "assistant", "content": "15:00到16:00。"},
+            ]
+
+    class Sessions:
+        def __init__(self):
+            self.contexts = []
+
+        async def submit(self, ctx, _turn_input, **_kwargs):
+            self.contexts.append(ctx)
+            return ClaudeTurnResult("好的", "session-context")
+
+    conversations = Conversations()
+    sessions = Sessions()
+    runtime = ClaudeAgentRuntime(sessions, conversations, SafetyService())
+    original = context(uuid.uuid4(), "semantic-context")
+
+    asyncio.run(runtime.handle_message(original, "删掉吧"))
+
+    supplied = sessions.contexts[0]
+    assert supplied is not original
+    assert [
+        (turn.role, turn.text)
+        for turn in supplied.authorization_semantic_context
+    ] == [
+        ("user", "明天下午项目组会几点？"),
+        ("assistant", "15:00到16:00。"),
+        ("user", "删掉吧"),
+    ]
+    assert conversations.recent_calls == [
+        (
+            original.participant_id,
+            3,
+            {
+                "exclude_feishu_message_id": original.message_id,
+                "chat_id": original.chat_id,
+            },
+        )
+    ]
+
+
+def test_conversation_authorization_history_is_chat_scoped():
+    database = memory_database()
+    person = participant(database, "P-CONTEXT-CHAT")
+    events = BotEventRepository(database)
+    conversations = ConversationRepository(database)
+    now = datetime.now(timezone.utc)
+
+    for marker, chat_id, text in (
+        ("a", "chat-a", "项目组会是15点"),
+        ("b", "chat-b", "不应跨会话出现"),
+    ):
+        message_id = f"message-{marker}"
+        assert events.accept(
+            f"event-{marker}",
+            message_id,
+            person.id,
+            app_id="app",
+            open_id="open",
+            chat_id=chat_id,
+            chat_type="p2p",
+            text=text,
+            create_time=now,
+        )
+        conversations.add(
+            person.id,
+            "assistant",
+            text,
+            feishu_message_id=message_id,
+        )
+
+    recent = conversations.recent(person.id, 4, chat_id="chat-a")
+
+    assert recent == [{"role": "assistant", "content": "项目组会是15点"}]

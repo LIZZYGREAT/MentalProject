@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, desc, or_, select
+from sqlalchemy import case, desc, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -3991,11 +3991,21 @@ class ConversationRepository:
         limit: int,
         *,
         exclude_feishu_message_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> list[dict[str, str]]:
         with self.database.session() as session:
             query = select(ConversationMessage).where(
                 ConversationMessage.participant_id == participant_id
             )
+            if chat_id:
+                query = query.where(
+                    exists().where(
+                        BotEvent.participant_id == participant_id,
+                        BotEvent.message_id
+                        == ConversationMessage.feishu_message_id,
+                        BotEvent.chat_id == str(chat_id),
+                    )
+                )
             if exclude_feishu_message_id:
                 query = query.where(
                     or_(

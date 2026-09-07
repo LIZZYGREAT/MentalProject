@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -177,6 +177,19 @@ def _verifier_proposal_summary(name: str, arguments: dict[str, Any]) -> dict[str
     if semantic_arguments:
         summary["requested_values"] = semantic_arguments
     return summary
+
+
+def _verifier_semantic_turns(ctx: AgentContext) -> tuple[dict[str, str], ...]:
+    turns: list[dict[str, str]] = []
+    for item in ctx.authorization_semantic_context[-4:]:
+        if isinstance(item, Mapping):
+            role = item.get("role")
+            value = item.get("text")
+        else:
+            role = getattr(item, "role", "")
+            value = getattr(item, "text", "")
+        turns.append({"role": str(role), "text": str(value)})
+    return tuple(turns)
 
 
 class ToolRegistry:
@@ -443,6 +456,7 @@ class ToolRegistry:
                     authorization_requirement=spec.authorization_requirement,
                     proposal_summary=proposal_summary,
                     source_kind=ctx.source_kind,
+                    semantic_turn_context=_verifier_semantic_turns(ctx),
                 )
             except asyncio.CancelledError:
                 raise
