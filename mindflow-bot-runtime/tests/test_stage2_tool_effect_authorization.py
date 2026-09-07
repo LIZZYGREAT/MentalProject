@@ -663,12 +663,215 @@ def test_calendar_authorization_resolver_reads_participant_bound_target():
             "end_time": "2026-09-08T16:00:00+08:00",
             "recurrence": "FREQ=WEEKLY",
             "timezone": "Asia/Shanghai",
+            "scope_kind": "recurring_occurrence",
         }
     }
     serialized = json.dumps(resolved, ensure_ascii=False)
     assert "provider-event-secret" not in serialized
     assert "private-calendar" not in serialized
     assert "private-series" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("event_scope_fields", "expected_scope"),
+    (
+        (
+            {"recurrence": "", "recurring_event_id": "", "is_exception": False},
+            "single_event",
+        ),
+        (
+            {
+                "recurrence": "FREQ=WEEKLY;INTERVAL=1",
+                "recurring_event_id": "",
+                "is_exception": False,
+            },
+            "recurring_series",
+        ),
+        (
+            {
+                "recurrence": "",
+                "recurring_event_id": "private-series-id",
+                "is_exception": False,
+            },
+            "recurring_occurrence",
+        ),
+        (
+            {
+                "recurrence": "",
+                "recurring_event_id": "private-series-id",
+                "is_exception": True,
+            },
+            "recurring_exception_occurrence",
+        ),
+    ),
+)
+def test_calendar_authorization_scope_is_backend_derived(
+    event_scope_fields, expected_scope
+):
+    class Calendar:
+        async def get_event(self, _participant_id, event_id):
+            return {
+                "id": event_id,
+                "summary": "项目组会",
+                "start_time": "2026-09-09T07:00:00+00:00",
+                "end_time": "2026-09-09T08:00:00+00:00",
+                **event_scope_fields,
+            }
+
+    tools = CareTools(None, None, Calendar(), None, "Asia/Shanghai", None)
+    verifier = StaticVerifier(
+        MutationIntentDecision(
+            "allow", "destructive_action", "explicit_destructive_request"
+        )
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    register(
+        registry,
+        "calendar_delete_event",
+        lambda _ctx, _args: {"ok": True},
+        effect="destructive_external_write",
+        authorization_requirement="explicit_destructive_request",
+        schema=EVENT_SCHEMA,
+        authorization_context_resolver=(
+            tools.resolve_calendar_event_authorization_context
+        ),
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context("删除这个日程"),
+            "calendar_delete_event",
+            {"event_id": "private-event-id"},
+        )
+    )
+
+    assert result.status == "succeeded"
+    proposal = verifier.calls[0]["proposal_summary"]
+    assert proposal["target"]["scope_kind"] == expected_scope
+    serialized = json.dumps(verifier.calls[0], ensure_ascii=False)
+    assert "private-event-id" not in serialized
+    assert "private-series-id" not in serialized
+    assert "recurring_event_id" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("user_text", "scope_kind"),
+    (
+        ("只删掉这周三这一场", "recurring_series"),
+        ("以后每周这个组会都删掉", "recurring_occurrence"),
+    ),
+)
+def test_delete_recurrence_scope_mismatch_never_executes(
+    user_text, scope_kind
+):
+    verifier = StaticVerifier(
+        MutationIntentDecision(
+            "needs_clarification", "ambiguous", "recurrence_scope_mismatch"
+        )
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    deleted = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "项目组会",
+                "start_time": "2026-09-09T15:00:00+08:00",
+                "end_time": "2026-09-09T16:00:00+08:00",
+                "recurrence": "FREQ=WEEKLY;INTERVAL=1",
+                "timezone": "Asia/Shanghai",
+                "scope_kind": scope_kind,
+            }
+        }
+
+    register(
+        registry,
+        "calendar_delete_event",
+        lambda _ctx, args: deleted.append(args) or {"ok": True},
+        effect="destructive_external_write",
+        authorization_requirement="explicit_destructive_request",
+        schema=EVENT_SCHEMA,
+        authorization_context_resolver=resolve_target,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context(user_text),
+            "calendar_delete_event",
+            {"event_id": "private-event-id"},
+        )
+    )
+
+    assert result.status == "mutation_needs_clarification"
+    assert result.result["reason_code"] == "recurrence_scope_mismatch"
+    proposal = verifier.calls[0]["proposal_summary"]
+    assert proposal["target"]["scope_kind"] == scope_kind
+    assert "private-event-id" not in json.dumps(proposal, ensure_ascii=False)
+    assert deleted == []
+
+
+def test_update_recurrence_scope_mismatch_never_executes():
+    verifier = StaticVerifier(
+        MutationIntentDecision(
+            "needs_clarification", "ambiguous", "recurrence_scope_mismatch"
+        )
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    updated = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "项目组会",
+                "start_time": "2026-09-09T15:00:00+08:00",
+                "end_time": "2026-09-09T16:00:00+08:00",
+                "recurrence": "FREQ=WEEKLY;INTERVAL=1",
+                "timezone": "Asia/Shanghai",
+                "scope_kind": "recurring_series",
+            }
+        }
+
+    update_schema = {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "minLength": 1},
+            "start_time": {"type": "string"},
+            "end_time": {"type": "string"},
+        },
+        "required": ["event_id", "start_time", "end_time"],
+        "additionalProperties": False,
+    }
+    register(
+        registry,
+        "calendar_update_event",
+        lambda _ctx, args: updated.append(args) or {"ok": True},
+        effect="external_write",
+        authorization_requirement="direct_request",
+        schema=update_schema,
+        authorization_context_resolver=resolve_target,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context("只把本周这一场改到四点"),
+            "calendar_update_event",
+            {
+                "event_id": "private-event-id",
+                "start_time": "2026-09-09T16:00:00+08:00",
+                "end_time": "2026-09-09T17:00:00+08:00",
+            },
+        )
+    )
+
+    assert result.status == "mutation_needs_clarification"
+    assert result.result["reason_code"] == "recurrence_scope_mismatch"
+    proposal = verifier.calls[0]["proposal_summary"]
+    assert proposal["target"]["scope_kind"] == "recurring_series"
+    assert proposal["requested_values"] == {
+        "start_time": "2026-09-09T16:00:00+08:00",
+        "end_time": "2026-09-09T17:00:00+08:00",
+    }
+    assert updated == []
 
 
 @pytest.mark.parametrize(

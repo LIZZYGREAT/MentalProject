@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
-from typing import Any
+from typing import Any, Literal
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -48,6 +48,27 @@ from app.services.token_service import TokenRepository
 
 
 logger = logging.getLogger(__name__)
+
+
+CalendarTargetScope = Literal[
+    "single_event",
+    "recurring_series",
+    "recurring_occurrence",
+    "recurring_exception_occurrence",
+]
+
+
+def _calendar_target_scope(event: dict[str, Any]) -> CalendarTargetScope:
+    has_parent_series = bool(str(event.get("recurring_event_id") or "").strip())
+    is_exception = bool(event.get("is_exception"))
+    has_recurrence_rule = bool(str(event.get("recurrence") or "").strip())
+    if has_parent_series and is_exception:
+        return "recurring_exception_occurrence"
+    if has_parent_series:
+        return "recurring_occurrence"
+    if has_recurrence_rule:
+        return "recurring_series"
+    return "single_event"
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -1447,6 +1468,7 @@ class CareTools:
                 "end_time": local_time("end_time"),
                 "recurrence": optional_text("recurrence", 500),
                 "timezone": str(self.timezone),
+                "scope_kind": _calendar_target_scope(event),
             }
         }
 
