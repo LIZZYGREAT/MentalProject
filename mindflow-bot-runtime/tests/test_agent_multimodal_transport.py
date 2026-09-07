@@ -84,6 +84,7 @@ def test_generic_vision_makes_one_call_and_returns_compact_context():
                                     "summary": "一张课程表",
                                     "visible_text": "周一 高数",
                                     "warnings": [],
+                                    "interaction_hint": "question",
                                 },
                                 ensure_ascii=False,
                             )
@@ -105,6 +106,7 @@ def test_generic_vision_makes_one_call_and_returns_compact_context():
     )
     assert result.image_kind == "course_schedule"
     assert result.visible_text == "周一 高数"
+    assert result.interaction_hint == "question"
     assert len(calls) == 1
     assert len(calls[0]["messages"]) == 2
 
@@ -129,6 +131,14 @@ def test_generic_image_kind_is_a_strict_enum():
         "visible_text": "周一 高数",
         "warnings": [],
     }).image_kind == "course_schedule"
+    with pytest.raises(GenericImageContextValidationError, match="interaction_hint"):
+        GenericImageContext.from_dict({
+            "image_kind": "course_schedule",
+            "summary": "课程表",
+            "visible_text": "周一 高数",
+            "warnings": [],
+            "interaction_hint": "write_now",
+        })
 
 
 def test_production_client_sends_rendered_context_as_text_only():

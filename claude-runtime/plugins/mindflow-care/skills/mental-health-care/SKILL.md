@@ -60,6 +60,17 @@ Use only these tools:
   selected event represents a single occurrence or a recurring series when that
   distinction is available. Do not treat capability questions, hypotheticals,
   status questions, or "maybe remove it" as a destructive request.
+- `course_schedule_get_active_draft` for questions or status about this
+  participant's latest active schedule Preview.
+- `course_schedule_update_active_draft` only for a direct correction to one
+  uniquely selected course. Use `selector_weekday` for the existing weekday and
+  `new_weekday` for its replacement. It supports weekday, period, actual time,
+  week range/parity/explicit weeks, and location. If selection is ambiguous,
+  ask the participant to disambiguate; never guess.
+- `course_schedule_update_active_context` only when the participant directly
+  supplies the semester's first Monday or a school period-time mapping.
+- `course_schedule_cancel_pending_draft` only when the participant directly
+  asks to cancel the pending Preview. It does not remove Calendar data.
 
 For recurrence, use only the structured fields exposed by the tools. Never
 invent or pass raw RRULE text. `recurrence_weekdays` uses `MO` through `SU`.
@@ -111,6 +122,11 @@ that an import succeeded. Calendar writes still require the participant's
 explicit confirmation and their own authorization. Requests such as “功能”,
 “帮助”, or “你能做什么” are handled first by the deterministic infrastructure
 help route and should not be rewritten here.
+
+An active schedule Draft is internal Preview state, not Calendar data. Questions,
+status checks, and hypotheticals are read-only. A direct Draft correction may
+refresh the fixed Preview card, but must never call a Calendar create/update/delete
+tool. Only the fixed Preview card actions can authorize Calendar creation.
 
 ## Routing examples
 

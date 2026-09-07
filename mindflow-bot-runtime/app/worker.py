@@ -88,14 +88,6 @@ HELP_PATTERN = re.compile(
     r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
     re.IGNORECASE,
 )
-SEMESTER_MONDAY_PATTERN = re.compile(
-    r"(?:第一周周一|首周周一|学期第一周)[^0-9]*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?"
-)
-PERIOD_MAPPING_PATTERN = re.compile(
-    r"第?\s*(\d{1,2})(?:\s*[-–—至到]\s*(\d{1,2}))?\s*节?\s*"
-    r"(?:是|为|:|：)?\s*(\d{1,2}:\d{2})\s*[-–—至到]\s*(\d{1,2}:\d{2})"
-)
-BARE_DATE_PATTERN = re.compile(r"^\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*$")
 SCHEDULE_NOUN_PATTERN = re.compile(r"课表|课程表|这学期(?:的)?课表")
 WEAK_SCHEDULE_NOUN_PATTERN = re.compile(r"这些?课程|课程")
 SCHEDULE_WRITE_PATTERN = re.compile(r"导入|添加|加到|同步|放进|写进")
@@ -167,35 +159,19 @@ SCHEDULE_RECENT_FOLLOWUP_PATTERN = re.compile(
     r"|什么时候(?:上课)?\s*[？?]?"
     r")\s*$"
 )
+SCHEDULE_RECENT_IMPORT_FOLLOWUPS = frozenset(
+    {
+        "帮我导入这个",
+        "帮我导入一下",
+        "帮我加进去",
+        "加进去吧",
+        "同步一下",
+        "放进去",
+    }
+)
 SCHEDULE_QA_PATTERN = re.compile(
     r"(?:周[一二三四五六日天].*(?:有什么课|上什么课|几节课|几点|什么时候)"
     r"|(?:课表|课程表).*(?:有什么|哪些|几点|什么时候|怎么安排))"
-)
-COURSE_PERIOD_CORRECTION_PATTERN = re.compile(
-    r"(?P<course>[\w\u4e00-\u9fff·（）() -]{1,40}?)"
-    r"(?:(?:其实|实际|应该)(?:是|为)?|改成|改为|更正为|我确认是|就是|设为|按|是|为)?\s*"
-    r"第?\s*(?P<start>\d{1,2})\s*[-–—至到]\s*(?P<end>\d{1,2})\s*节"
-)
-WEEKDAY_ODD_EVEN_CORRECTION_PATTERN = re.compile(
-    r"周(?P<weekday>[一二三四五六日天])(?:那门课|的课|课程)?"
-    r"(?:(?:其实|实际|应该)(?:是|为)?|改成|改为|更正为|我确认是|就是|设为|按|是|为)?\s*"
-    r"(?P<mode>单|双)周"
-)
-LOCATION_CORRECTION_PATTERN = re.compile(
-    r"(?:这里|地点|教室)(?:是|在|为)\s*(?P<location>[^，。！？\s]{1,50})"
-)
-WEEKDAY_NUMBER = {
-    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7,
-}
-SCHEDULE_CONTEXT_IMPERATIVE_MUTATION_PATTERN = re.compile(
-    r"改成|改为|更正为|设为"
-)
-SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN = re.compile(
-    r"是不是|是否|对吗|有没有|会不会|吗|么|[？?]"
-)
-SCHEDULE_CONTEXT_MUTATION_STATUS_PATTERN = re.compile(
-    r"(?:是不是|是否).{0,20}(?:改成|改为|更正为|设为)"
-    r"|(?:改成|改为|更正为|设为).{0,20}(?:了吗|了么|了没(?:有)?|对吗)"
 )
 
 
@@ -280,6 +256,11 @@ def is_schedule_qa_intent(text: str) -> bool:
     )
 
 
+def is_schedule_recent_import_request(text: str) -> bool:
+    value = str(text or "").strip().rstrip("。！!")
+    return value in SCHEDULE_RECENT_IMPORT_FOLLOWUPS
+
+
 def is_direct_image_calendar_request(text: str) -> bool:
     value = str(text or "")
     if is_schedule_write_status_question(value):
@@ -292,40 +273,6 @@ def is_direct_image_calendar_request(text: str) -> bool:
         and not SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
     )
 
-
-def is_schedule_context_mutation_statement(text: str) -> bool:
-    """Keep schedule questions read-only unless they explicitly request a change."""
-
-    value = str(text or "").strip()
-    if SCHEDULE_CONTEXT_MUTATION_STATUS_PATTERN.search(value):
-        return False
-    if SCHEDULE_CONTEXT_IMPERATIVE_MUTATION_PATTERN.search(value):
-        return True
-    if SCHEDULE_CONTEXT_QUESTION_CUE_PATTERN.search(value):
-        return False
-    return True
-
-
-def parse_schedule_correction(text: str) -> dict[str, object] | None:
-    value = str(text or "").strip()
-    period = COURSE_PERIOD_CORRECTION_PATTERN.search(value)
-    if period:
-        course_name = period.group("course").strip(" ，。其实实际应该")
-        return {
-            "course_name": course_name,
-            "period_start": int(period.group("start")),
-            "period_end": int(period.group("end")),
-        }
-    odd_even = WEEKDAY_ODD_EVEN_CORRECTION_PATTERN.search(value)
-    if odd_even:
-        return {
-            "weekday": WEEKDAY_NUMBER[odd_even.group("weekday")],
-            "odd_even": "odd" if odd_even.group("mode") == "单" else "even",
-        }
-    location = LOCATION_CORRECTION_PATTERN.search(value)
-    if location:
-        return {"location": location.group("location")}
-    return None
 
 class AgentRuntimeProtocol(Protocol):
     async def handle_message(
@@ -779,110 +726,6 @@ class BotWorker:
                     return
 
             if long_task is None and event.message_type == "text":
-                mutation_statement = is_schedule_context_mutation_statement(
-                    event.text
-                )
-                correction = (
-                    parse_schedule_correction(event.text)
-                    if mutation_statement
-                    else None
-                )
-                if correction is not None and self.schedule_imports is not None:
-                    latest_draft = await asyncio.to_thread(
-                        self.schedule_imports.drafts.latest_pending_context,
-                        participant.id,
-                    )
-                    if latest_draft is not None:
-                        try:
-                            corrected = await asyncio.to_thread(
-                                self.schedule_imports.drafts.apply_correction,
-                                participant.id,
-                                latest_draft["id"],
-                                **correction,
-                            )
-                        except ValueError:
-                            await self._deliver(
-                                event,
-                                "我还不能确定你要改哪门课，请带上课程名或星期再说一次。",
-                            )
-                            return
-                        await self._deliver_card(
-                            event, course_schedule_preview_card(corrected)
-                        )
-                        return
-                context_match = (
-                    (
-                        SEMESTER_MONDAY_PATTERN.search(event.text)
-                        or BARE_DATE_PATTERN.match(event.text)
-                    )
-                    if mutation_statement
-                    else None
-                )
-                period_matches = (
-                    PERIOD_MAPPING_PATTERN.findall(event.text)
-                    if mutation_statement
-                    else []
-                )
-                latest_context = (
-                    await asyncio.to_thread(
-                        self.schedule_imports.drafts.latest_pending_context,
-                        participant.id,
-                    )
-                    if (context_match is not None or period_matches)
-                    and self.schedule_imports is not None
-                    else None
-                )
-                if latest_context is not None and (
-                    context_match is not None or period_matches
-                ):
-                    from datetime import time as clock_time
-
-                    draft = latest_context
-                    if context_match is not None:
-                        try:
-                            semester_monday = date(
-                                int(context_match.group(1)),
-                                int(context_match.group(2)),
-                                int(context_match.group(3)),
-                            )
-                        except ValueError:
-                            await self._deliver(event, "这个日期格式或数值不正确，请重新告诉我第一周周一日期。")
-                            return
-                        if semester_monday.weekday() != 0:
-                            await self._deliver(event, "请提供第一周周一的日期；这个日期不是周一。")
-                            return
-                        draft = await asyncio.to_thread(
-                            self.schedule_imports.drafts.set_semester_start_date,
-                            participant.id,
-                            latest_context["id"],
-                            semester_monday,
-                        )
-                    if period_matches:
-                        try:
-                            mapping = {
-                                (
-                                    (int(start_period), int(end_period))
-                                    if end_period else int(start_period)
-                                ): (
-                                    clock_time.fromisoformat(start_clock),
-                                    clock_time.fromisoformat(end_clock),
-                                )
-                                for start_period, end_period, start_clock, end_clock
-                                in period_matches
-                            }
-                        except ValueError:
-                            await self._deliver(event, "作息时间格式不正确，请使用“第1-2节 08:00-09:35”。")
-                            return
-                        draft = await asyncio.to_thread(
-                            self.schedule_imports.drafts.set_period_time_mapping,
-                            participant.id,
-                            latest_context["id"],
-                            mapping,
-                        )
-                    await self._deliver_card(
-                        event, course_schedule_preview_card(draft)
-                    )
-                    return
                 recent = await self.multimodal_turns.recent_context(
                     participant.id, event.chat_id
                 )
@@ -892,11 +735,18 @@ class BotWorker:
                 schedule_followup = bool(
                     SCHEDULE_RECENT_FOLLOWUP_PATTERN.search(event.text)
                 )
+                schedule_import_followup = is_schedule_recent_import_request(
+                    event.text
+                )
                 reuse_recent = bool(
                     recent is not None
                     and (
                         explicit_image_reference
                         or (schedule_followup and recent.image_kind == "course_schedule")
+                        or (
+                            schedule_import_followup
+                            and recent.image_kind == "course_schedule"
+                        )
                     )
                 )
                 if reuse_recent and recent is not None:
@@ -1125,7 +975,10 @@ class BotWorker:
             await self._ensure_task_not_stopped(
                 participant.id, event.event_id, task_generation
             )
-            if is_strong_schedule_import_intent(
+            if (
+                context.image_kind == "course_schedule"
+                and context.interaction_hint == "course_import_request"
+            ) or is_strong_schedule_import_intent(
                 user_text, image_kind=context.image_kind
             ):
                 route = "strict_schedule_after_image_kind"
@@ -1454,38 +1307,6 @@ class BotWorker:
                 participant.id, event.event_id, task_generation
             )
             if draft is not None:
-                correction = (
-                    parse_schedule_correction(event.text)
-                    if is_schedule_context_mutation_statement(event.text)
-                    else None
-                )
-                if correction is not None:
-                    await self._ensure_task_not_stopped(
-                        participant.id, event.event_id, task_generation
-                    )
-                    try:
-                        corrected = await asyncio.to_thread(
-                            self.schedule_imports.drafts.apply_correction,
-                            participant.id,
-                            draft_id,
-                            **correction,
-                        )
-                    except ValueError:
-                        await self._deliver(
-                            event,
-                            "我还不能确定你要改哪门课，请带上课程名或星期再说一次。",
-                        )
-                        return recent
-                    await self._ensure_task_not_stopped(
-                        participant.id, event.event_id, task_generation
-                    )
-                    await self._deliver_card(
-                        event, course_schedule_preview_card(corrected)
-                    )
-                    await self._ensure_task_not_stopped(
-                        participant.id, event.event_id, task_generation
-                    )
-                    return recent
                 trusted_context = {
                     "image_kind": "course_schedule",
                     "route": trusted_context.get("route"),
@@ -1493,7 +1314,7 @@ class BotWorker:
                     "schedule": draft.get("structured_result"),
                     "items": draft.get("items"),
                 }
-        if is_strong_schedule_import_intent(
+        if is_schedule_recent_import_request(event.text) or is_strong_schedule_import_intent(
             event.text, image_kind=recent.image_kind
         ):
             await self._ensure_task_not_stopped(
@@ -1564,7 +1385,9 @@ class BotWorker:
                 else "normal"
             ),
             turn_effect_policy=(
-                "read_compute_only"
+                "verify_on_demand"
+                if draft_id
+                else "read_compute_only"
                 if recent.image_kind == "course_schedule"
                 else "verify_on_demand"
             ),

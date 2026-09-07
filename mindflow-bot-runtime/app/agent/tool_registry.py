@@ -119,7 +119,7 @@ def _schema_fields(value: Any) -> set[str]:
 
 
 def _safe_summary(value: Any, depth: int = 0) -> Any:
-    if depth > 3:
+    if depth > 5:
         return "[truncated]"
     if isinstance(value, dict):
         return {

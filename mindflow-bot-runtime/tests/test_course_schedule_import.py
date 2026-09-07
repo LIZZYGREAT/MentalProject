@@ -777,8 +777,12 @@ def test_image_workflow_does_not_write_before_card_confirmation():
     imports = CourseScheduleImportService(drafts, calendar, Tokens())
 
     class Runtime:
+        def __init__(self):
+            self.calls = 0
+
         async def handle_message(self, *_args, **_kwargs):
-            raise AssertionError("image workflow must not call the Agent")
+            self.calls += 1
+            return "context accepted"
 
     class Sender:
         def __init__(self):
@@ -804,9 +808,10 @@ def test_image_workflow_does_not_write_before_card_confirmation():
             return ScheduleVisionResult.from_dict(vision_payload())
 
     sender = Sender()
+    runtime = Runtime()
     worker = BotWorker(
         queue, identity, events, AgentRunRepository(database), SkillLoader(skill_path()),
-        Runtime(), sender, model="fake", schedule_vision=Vision(),
+        runtime, sender, model="fake", schedule_vision=Vision(),
         schedule_imports=imports, message_resources=Resources(),
         multimodal_debounce_seconds=0.05,
     )
@@ -839,8 +844,8 @@ def test_image_workflow_does_not_write_before_card_confirmation():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert len(sender.cards) == 2
-    assert "course_schedule_import_confirm" in json.dumps(sender.cards[-1])
+    assert len(sender.cards) == 1
+    assert runtime.calls == 1
     assert calendar.calls == []
 
 

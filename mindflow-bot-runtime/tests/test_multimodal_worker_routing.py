@@ -36,9 +36,7 @@ from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
     is_direct_image_calendar_request,
-    is_schedule_context_mutation_statement,
     is_strong_schedule_import_intent,
-    parse_schedule_correction,
 )
 from helpers import memory_database, participant, skill_path
 
@@ -167,10 +165,18 @@ class Resources:
 class Vision:
     model = "generic-vision"
 
-    def __init__(self, kind="code_or_error_screenshot", *, delay=0, failure=False):
+    def __init__(
+        self,
+        kind="code_or_error_screenshot",
+        *,
+        delay=0,
+        failure=False,
+        interaction_hint="unknown",
+    ):
         self.kind = kind
         self.delay = delay
         self.failure = failure
+        self.interaction_hint = interaction_hint
         self.calls = []
 
     async def inspect(self, _data, _mime, *, user_text=""):
@@ -183,20 +189,8 @@ class Vision:
             image_kind=self.kind,
             summary="图片摘要",
             visible_text="可见文字",
+            interaction_hint=self.interaction_hint,
         )
-
-
-def test_natural_schedule_correction_phrases_are_parsed_without_schema_terms():
-    assert parse_schedule_correction("高数其实是第3-4节") == {
-        "course_name": "高数",
-        "period_start": 3,
-        "period_end": 4,
-    }
-    assert parse_schedule_correction("周三那门课是单周") == {
-        "weekday": 3,
-        "odd_even": "odd",
-    }
-    assert parse_schedule_correction("这里是逸夫楼") == {"location": "逸夫楼"}
 
 
 class RecordingScheduleMutationDrafts:
@@ -278,26 +272,21 @@ def test_period_mapping_question_does_not_override_schedule():
     assert len(runtime.calls) == 1
 
 
-def test_explicit_period_correction_statement_still_updates_draft():
+def test_explicit_period_correction_statement_is_delegated_to_agent_tools():
     drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
 
-    assert drafts.corrections[0][2] == {
-        "course_name": "高数",
-        "period_start": 3,
-        "period_end": 4,
-    }
-    assert runtime.calls == []
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
 
 
-def test_explicit_odd_even_correction_statement_still_updates_draft():
+def test_explicit_odd_even_correction_statement_is_delegated_to_agent_tools():
     drafts, runtime = _run_pending_schedule_text("周三的课改为单周")
 
-    assert drafts.corrections[0][2] == {"weekday": 3, "odd_even": "odd"}
-    assert runtime.calls == []
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
 
 
 def test_schedule_import_question_remains_an_action_request():
-    assert not is_schedule_context_mutation_statement("能不能帮我导入？")
     assert is_strong_schedule_import_intent(
         "能不能帮我导入这张课程表？", image_kind="course_schedule"
     )
@@ -326,21 +315,17 @@ def test_should_be_semester_date_question_does_not_mutate():
     assert len(runtime.calls) == 1
 
 
-def test_explicit_imperative_period_change_still_mutates():
-    assert is_schedule_context_mutation_statement(
-        "请帮我把高数改成第3-4节好吗？"
-    )
-
+def test_explicit_imperative_period_change_reaches_agent_semantics():
     drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
-    assert len(drafts.corrections) == 1
-    assert runtime.calls == []
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
 
 
-def test_plain_correction_statement_still_mutates():
+def test_plain_correction_statement_reaches_agent_semantics():
     drafts, runtime = _run_pending_schedule_text("高数其实是第3-4节")
 
-    assert len(drafts.corrections) == 1
-    assert runtime.calls == []
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
 
 
 def test_schedule_already_imported_question_is_not_import_intent():
@@ -401,12 +386,6 @@ def test_polite_is_it_possible_import_request_remains_an_action():
     assert is_strong_schedule_import_intent(
         "我已经准备好了，可以帮我导入这张课程表吗？",
         image_kind="course_schedule",
-    )
-
-
-def test_schedule_change_status_question_does_not_mutate():
-    assert not is_schedule_context_mutation_statement(
-        "高数改成第3-4节了吗？"
     )
 
 
@@ -874,6 +853,64 @@ def test_explicit_import_to_calendar_still_uses_fast_path():
     assert vision.calls == []
     assert runtime.calls == []
     assert sender.texts == ["strict-preview"]
+
+
+def test_generic_vision_interaction_hint_routes_natural_import_to_preview():
+    vision = Vision(
+        kind="course_schedule", interaction_hint="course_import_request"
+    )
+    gateway, queue, worker, runtime, _sender, _, _ = _system(vision=vision)
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "hint-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.005)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="帮我导入一下")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 1
+    assert len(strict_calls) == 1
+    assert runtime.calls == []
+
+
+def test_completed_course_image_accepts_natural_omitted_import_followup():
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0
+    )
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "recent-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="帮我导入这个")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+    assert len(strict_calls) == 1
 
 
 def test_course_schedule_question_is_read_only_and_recent_followup_reuses_context():
@@ -1876,7 +1913,13 @@ def test_text_arriving_during_strict_extractor_is_not_lost():
 def test_stop_marks_drained_late_schedule_correction_interrupted():
     strict_started = asyncio.Event()
     strict_release = asyncio.Event()
-    correction_preview_started = asyncio.Event()
+    correction_agent_started = asyncio.Event()
+
+    class BlockingCorrectionRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            correction_agent_started.set()
+            await asyncio.Event().wait()
 
     class Drafts(RecordingScheduleMutationDrafts):
         def get(self, draft_id):
@@ -1888,6 +1931,7 @@ def test_stop_marks_drained_late_schedule_correction_interrupted():
 
     drafts = Drafts()
     gateway, queue, worker, _runtime, sender, _, _ = _system(
+        runtime=BlockingCorrectionRuntime(),
         schedule_imports=SimpleNamespace(drafts=drafts),
         debounce=0.2,
         association=1,
@@ -1900,13 +1944,7 @@ def test_stop_marks_drained_late_schedule_correction_interrupted():
             "draft_created", {"id": "draft-1"}, "course_schedule"
         )
 
-    async def blocked_correction_preview(event, _card):
-        assert event.event_id == "late-correction"
-        correction_preview_started.set()
-        await asyncio.Event().wait()
-
     worker._handle_schedule_image = strict
-    worker._deliver_card = blocked_correction_preview
 
     async def scenario():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
@@ -1939,7 +1977,7 @@ def test_stop_marks_drained_late_schedule_correction_interrupted():
         )
         await worker.process(await queue.get())
         strict_release.set()
-        await correction_preview_started.wait()
+        await correction_agent_started.wait()
 
         assert gateway.accept_payload(
             _payload("stop", "m-stop", "text", text="/stop")
@@ -2198,6 +2236,7 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
         "summary": "图片摘要",
         "visible_text": "可见文字",
         "warnings": [],
+        "interaction_hint": "unknown",
     }
     assert sender.texts == ["answer:把这个讲座添加到日历"]
 
@@ -2334,7 +2373,7 @@ def test_followup_qa_after_recent_import_reads_authoritative_draft():
     assert trusted["schedule"]["courses"][0]["course_name"] == "用户修正后的课程"
 
 
-def test_two_late_followups_import_then_correction_apply_to_same_draft(monkeypatch):
+def test_two_late_followups_import_then_correction_use_same_draft_context(monkeypatch):
     monkeypatch.setattr(
         "app.worker.course_schedule_preview_card",
         lambda draft: {"draft_id": draft["id"]},
@@ -2407,12 +2446,10 @@ def test_two_late_followups_import_then_correction_apply_to_same_draft(monkeypat
         await image_task
 
     asyncio.run(scenario())
-    assert len(drafts.corrections) == 1
-    assert drafts.corrections[0][1:] == (
-        "late-draft",
-        {"course_name": "高数", "period_start": 3, "period_end": 4},
-    )
-    assert len(delivered_cards) == 1
+    assert drafts.corrections == []
+    assert runtime.calls[-1][1].text == "高数其实是第3-4节"
+    assert runtime.calls[-1][1].trusted_image_context["draft_id"] == "late-draft"
+    assert delivered_cards == []
 
 
 def test_stop_after_two_consecutive_images_cancels_both_turns():

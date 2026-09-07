@@ -54,11 +54,11 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         start = course.get("start_time")
         end = course.get("end_time")
         period = (
-            f"{start}–{end}" if start and end
-            else f"第{course.get('period_start')}–{course.get('period_end')}节"
+            f"第{course.get('period_start')}–{course.get('period_end')}节"
             if course.get("period_start") and course.get("period_end")
-            else "时间待确认"
+            else "节次待确认"
         )
+        actual_time = f"{start}–{end}" if start and end else "时间待确认"
         rule = dict(course.get("week_rule") or {})
         if rule.get("explicit_weeks"):
             week_text = ",".join(str(value) for value in rule["explicit_weeks"]) + "周"
@@ -69,11 +69,16 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             elif rule.get("odd_even") == "even":
                 week_text += "双周"
         location = _safe_schedule_text(course.get("location") or "地点待确认")
-        lines.extend(["", f"**{name}**", f"{day} {period} · {week_text} · {location}"])
+        lines.extend([
+            "",
+            f"**{name}**",
+            f"{day} · {period} · {actual_time} · {week_text} · {location}",
+        ])
         source = time_sources[index] if index < len(time_sources) else None
         source_text = {
             "image": "课表图片中的实际时间",
             "user": "你刚刚提供的作息",
+            "user_actual": "你刚刚提供的实际时间",
             "default": "学校默认作息",
         }.get(source)
         if source_text:

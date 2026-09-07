@@ -38,6 +38,14 @@ class UnfillableScheduleContextError(ValueError):
         super().__init__("schedule contains context that cannot be completed in V1")
 
 
+class CourseCorrectionAmbiguityError(ValueError):
+    """A participant-owned draft selector did not resolve to exactly one course."""
+
+    def __init__(self, candidates: list[dict[str, Any]]):
+        self.candidates = tuple(dict(value) for value in candidates[:10])
+        super().__init__("correction must identify exactly one course")
+
+
 @dataclass(frozen=True)
 class CreateDraftOutcome:
     draft: dict[str, Any]
@@ -291,20 +299,71 @@ class CourseScheduleImportRepository:
         import_id: uuid.UUID | str,
         *,
         course_name: str | None = None,
+        selector_weekday: int | None = None,
+        new_weekday: int | None = None,
+        # Kept as a compatibility alias for callers created before the selector
+        # and update weekday fields were separated.
         weekday: int | None = None,
         period_start: int | None = None,
         period_end: int | None = None,
+        start_time: str | time | None = None,
+        end_time: str | time | None = None,
+        week_start: int | None = None,
+        week_end: int | None = None,
         odd_even: str | None = None,
+        explicit_weeks: list[int] | tuple[int, ...] | None = None,
         location: str | None = None,
     ) -> dict[str, Any]:
-        """Apply a natural-language correction to one unconfirmed course."""
+        """Apply one structured correction to one participant-owned draft course."""
 
+        if selector_weekday is not None and weekday is not None:
+            raise ValueError("selector weekday was provided more than once")
+        selector_weekday = selector_weekday if selector_weekday is not None else weekday
+        for value, label in (
+            (selector_weekday, "selector weekday"),
+            (new_weekday, "corrected weekday"),
+        ):
+            if value is not None and not 1 <= value <= 7:
+                raise ValueError(f"{label} is invalid")
         if (period_start is None) != (period_end is None):
             raise ValueError("corrected period range must be complete")
         if period_start is not None and not 1 <= period_start <= period_end <= 30:
             raise ValueError("corrected period range is invalid")
+        if (start_time is None) != (end_time is None):
+            raise ValueError("corrected actual time range must be complete")
+        parsed_start = (
+            start_time if isinstance(start_time, time) else _parse_time(start_time)
+        )
+        parsed_end = end_time if isinstance(end_time, time) else _parse_time(end_time)
+        if parsed_start is not None and parsed_end <= parsed_start:
+            raise ValueError("corrected actual time range is invalid")
+        if (week_start is None) != (week_end is None):
+            raise ValueError("corrected week range must be complete")
+        if week_start is not None and not 1 <= week_start <= week_end <= 60:
+            raise ValueError("corrected week range is invalid")
+        if explicit_weeks is not None:
+            normalized_weeks = sorted({int(value) for value in explicit_weeks})
+            if not normalized_weeks or any(value < 1 or value > 60 for value in normalized_weeks):
+                raise ValueError("corrected explicit weeks are invalid")
+            if week_start is not None:
+                raise ValueError("week range and explicit weeks are mutually exclusive")
+        else:
+            normalized_weeks = None
         if odd_even is not None and odd_even not in {"odd", "even", "all"}:
             raise ValueError("corrected odd/even rule is invalid")
+        if not any(
+            value is not None
+            for value in (
+                new_weekday,
+                period_start,
+                parsed_start,
+                week_start,
+                normalized_weeks,
+                odd_even,
+                location,
+            )
+        ):
+            raise ValueError("correction contains no updates")
         with self.database.session() as session:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
@@ -324,13 +383,19 @@ class CourseScheduleImportRepository:
                     if needle in str(courses[index].get("course_name") or "").lower()
                     or str(courses[index].get("course_name") or "").lower() in needle
                 ]
-            if weekday is not None:
+            if selector_weekday is not None:
                 candidates = [
                     index for index in candidates
-                    if courses[index].get("weekday") == weekday
+                    if courses[index].get("weekday") == selector_weekday
                 ]
             if len(candidates) != 1:
-                raise ValueError("correction must identify exactly one course")
+                raise CourseCorrectionAmbiguityError([
+                    {
+                        "course_name": courses[index].get("course_name"),
+                        "weekday": courses[index].get("weekday"),
+                    }
+                    for index in candidates
+                ])
             index = candidates[0]
             course = courses[index]
             items = self._items(session, row.id)
@@ -346,6 +411,10 @@ class CourseScheduleImportRepository:
                     else None
                 )
             corrected_fields: set[str] = set()
+            if new_weekday is not None:
+                course["weekday"] = new_weekday
+                item.weekday = new_weekday
+                corrected_fields.add("weekday")
             if period_start is not None and period_end is not None:
                 course["period_start"] = period_start
                 course["period_end"] = period_end
@@ -383,6 +452,35 @@ class CourseScheduleImportRepository:
                         item.end_time = end_clock
                         sources[index] = source
                 corrected_fields.update({"period_start", "period_end", "actual_time"})
+            if parsed_start is not None and parsed_end is not None:
+                course["start_time"] = parsed_start.strftime("%H:%M")
+                course["end_time"] = parsed_end.strftime("%H:%M")
+                item.start_time = parsed_start
+                item.end_time = parsed_end
+                sources[index] = "user_actual"
+                corrected_fields.update({"start_time", "end_time", "actual_time"})
+            if week_start is not None and week_end is not None:
+                rule = dict(course.get("week_rule") or {})
+                rule.update({
+                    "start_week": week_start,
+                    "end_week": week_end,
+                    "explicit_weeks": None,
+                    "odd_even": rule.get("odd_even") or "all",
+                })
+                course["week_rule"] = rule
+                item.week_rule_json = rule
+                corrected_fields.add("week_rule")
+            if normalized_weeks is not None:
+                rule = dict(course.get("week_rule") or {})
+                rule.update({
+                    "start_week": normalized_weeks[0],
+                    "end_week": normalized_weeks[-1],
+                    "explicit_weeks": normalized_weeks,
+                    "odd_even": rule.get("odd_even") or "all",
+                })
+                course["week_rule"] = rule
+                item.week_rule_json = rule
+                corrected_fields.add("week_rule")
             if odd_even is not None:
                 rule = dict(course.get("week_rule") or {})
                 if not rule:

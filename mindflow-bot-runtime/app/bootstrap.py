@@ -61,6 +61,7 @@ from app.services.token_service import (
     TokenRepository,
 )
 from app.tools.care import CareTools
+from app.tools.course_schedule import CourseScheduleTools
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -279,6 +280,7 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
     ).register(registry)
+    CourseScheduleTools(course_schedule_imports, presentations).register(registry)
     return BusinessServices(
         profiles=profiles,
         observations=observations,
