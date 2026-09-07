@@ -124,6 +124,11 @@ class Settings:
     semantic_api_timeout_seconds: float = 8.0
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    mutation_intent_api_enabled: bool = True
+    mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
+    mutation_intent_api_model: str = "deepseek-v4-flash"
+    mutation_intent_api_timeout_seconds: float = 8.0
+    mutation_intent_max_concurrency: int = 2
     vision_api_enabled: bool = False
     vision_api_url: str = "https://api.deepseek.com/chat/completions"
     vision_api_model: str = "deepseek-v4-flash-vision-exp"
@@ -384,6 +389,22 @@ class Settings:
             semantic_materiality_threshold=_float(
                 values, "SEMANTIC_MATERIALITY_THRESHOLD", 0.03
             ),
+            mutation_intent_api_enabled=_bool(
+                values, "MUTATION_INTENT_API_ENABLED", True
+            ),
+            mutation_intent_api_url=values.get(
+                "MUTATION_INTENT_API_URL",
+                "https://api.deepseek.com/chat/completions",
+            ).strip(),
+            mutation_intent_api_model=values.get(
+                "MUTATION_INTENT_API_MODEL", "deepseek-v4-flash"
+            ).strip(),
+            mutation_intent_api_timeout_seconds=_float(
+                values, "MUTATION_INTENT_API_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            ),
+            mutation_intent_max_concurrency=_int(
+                values, "MUTATION_INTENT_MAX_CONCURRENCY", 2
+            ),
             vision_api_enabled=_bool(values, "VISION_API_ENABLED", False),
             vision_api_url=values.get(
                 "VISION_API_URL", "https://api.deepseek.com/chat/completions"
@@ -508,6 +529,13 @@ class Settings:
         if self.claude_code_subagent_model != self.claude_default_haiku_model:
             raise ValueError(
                 "CLAUDE_CODE_SUBAGENT_MODEL must match CLAUDE_DEFAULT_HAIKU_MODEL"
+            )
+        if self.mutation_intent_api_enabled and (
+            not self.mutation_intent_api_url or not self.mutation_intent_api_model
+        ):
+            raise ValueError(
+                "MUTATION_INTENT_API_URL and MUTATION_INTENT_API_MODEL are required "
+                "when mutation intent verification is enabled"
             )
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")

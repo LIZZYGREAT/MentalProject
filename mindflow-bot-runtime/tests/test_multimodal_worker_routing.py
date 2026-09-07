@@ -603,7 +603,10 @@ def test_image_plus_nearby_text_is_one_turn_and_one_final_reply():
     assert vision.calls == ["看看是什么问题"]
     assert len(runtime.calls) == 1
     assert runtime.calls[0][1].text == "看看是什么问题"
-    assert runtime.calls[0][0].calendar_mutation_allowed is False
+    context = runtime.calls[0][0]
+    assert context.turn_effect_policy == "verify_on_demand"
+    assert context.source_kind == "generic_image"
+    assert context.user_request_text == "看看是什么问题"
     assert sender.texts == ["answer:看看是什么问题"]
 
 
@@ -617,7 +620,10 @@ def test_image_only_uses_read_only_agent_and_never_assumes_import():
     asyncio.run(scenario())
     assert len(runtime.calls) == 1
     assert runtime.calls[0][1].text == ""
-    assert runtime.calls[0][0].calendar_mutation_allowed is False
+    context = runtime.calls[0][0]
+    assert context.turn_effect_policy == "verify_on_demand"
+    assert context.source_kind == "generic_image"
+    assert context.user_request_text == ""
     assert sender.texts == ["answer:image-only"]
 
 
@@ -937,7 +943,8 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
 
     asyncio.run(scenario())
     assert len(runtime.calls) == 2
-    assert runtime.calls[0][0].calendar_mutation_allowed is False
+    assert runtime.calls[0][0].turn_effect_policy == "verify_on_demand"
+    assert runtime.calls[0][0].source_kind == "generic_image"
     assert runtime.calls[1][0].calendar_mutation_allowed is True
     assert len(sender.texts) == 2
 
@@ -2180,9 +2187,12 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     assert len(resources.calls) == 1
     assert len(runtime.calls) == 1
     ctx, turn_input = runtime.calls[0]
-    assert ctx.calendar_mutation_policy == "calendar_create_only"
+    assert ctx.calendar_mutation_policy == "normal"
     assert ctx.allows_calendar_mutation("create") is True
-    assert ctx.allows_calendar_mutation("delete") is False
+    assert ctx.allows_calendar_mutation("delete") is True
+    assert ctx.turn_effect_policy == "verify_on_demand"
+    assert ctx.source_kind == "generic_image"
+    assert ctx.user_request_text == "把这个讲座添加到日历"
     assert turn_input.trusted_image_context == {
         "image_kind": "other",
         "summary": "图片摘要",
@@ -2522,10 +2532,10 @@ def test_ordinary_image_direct_calendar_request_has_explicit_policy():
         await image_task
 
     asyncio.run(scenario())
-    assert runtime.calls[0][0].calendar_mutation_policy == (
-        "calendar_create_only"
-    )
+    assert runtime.calls[0][0].calendar_mutation_policy == "normal"
     assert runtime.calls[0][0].calendar_mutation_allowed is True
+    assert runtime.calls[0][0].turn_effect_policy == "verify_on_demand"
+    assert runtime.calls[0][0].source_kind == "generic_image"
 
 
 def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft():
@@ -2576,6 +2586,8 @@ def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft()
     assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
     assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
     assert ctx.calendar_mutation_allowed is False
+    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.source_kind == "course_schedule_strict"
 
 
 def test_read_only_schedule_context_never_reports_missing_time_after_backend_resolution():

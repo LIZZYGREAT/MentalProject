@@ -18,7 +18,12 @@ from app.agent.claude_runtime import (
     FALLBACK_TEMPORARY,
     ClaudeRuntimeInterrupted,
 )
-from app.agent.context import AgentContext, CalendarMutationPolicy
+from app.agent.context import (
+    AgentContext,
+    CalendarMutationPolicy,
+    SourceKind,
+    TurnEffectPolicy,
+)
 from app.contracts.agent_input import AgentTurnInput
 from app.contracts.generic_image_context import GenericImageContext
 from app.agent.skill_loader import SkillLoader
@@ -992,6 +997,9 @@ class BotWorker:
                     chat_id=event.chat_id,
                     message_id=event.message_id,
                     agent_run_id=run_id,
+                    turn_effect_policy="verify_on_demand",
+                    user_request_text=event.text,
+                    source_kind="text",
                 )
                 # Creating the task under the routing lock preserves arrival order;
                 # the lock is released before the long Agent turn so /stop can pass.
@@ -1079,6 +1087,8 @@ class BotWorker:
                             trusted_image_context=schedule_context,
                         ),
                         calendar_mutation_policy="course_schedule_strict_only",
+                        turn_effect_policy="read_compute_only",
+                        source_kind="course_schedule_strict",
                         run_generation=task_generation,
                     )
                     await self._ensure_task_not_stopped(
@@ -1156,11 +1166,9 @@ class BotWorker:
                             text=user_text,
                             trusted_image_context=fallback_context,
                         ),
-                        calendar_mutation_policy=(
-                            "calendar_create_only"
-                            if is_direct_image_calendar_request(user_text)
-                            else "read_only"
-                        ),
+                        calendar_mutation_policy="normal",
+                        turn_effect_policy="verify_on_demand",
+                        source_kind="generic_image",
                         run_generation=task_generation,
                     )
                     await self._ensure_task_not_stopped(
@@ -1188,10 +1196,19 @@ class BotWorker:
                         trusted_image_context=context.to_dict(),
                     ),
                     calendar_mutation_policy=(
-                        "calendar_create_only"
-                        if is_direct_image_calendar_request(user_text)
-                        and context.image_kind != "course_schedule"
-                        else "read_only"
+                        "course_schedule_strict_only"
+                        if context.image_kind == "course_schedule"
+                        else "normal"
+                    ),
+                    turn_effect_policy=(
+                        "read_compute_only"
+                        if context.image_kind == "course_schedule"
+                        else "verify_on_demand"
+                    ),
+                    source_kind=(
+                        "course_schedule_strict"
+                        if context.image_kind == "course_schedule"
+                        else "generic_image"
                     ),
                     run_generation=task_generation,
                 )
@@ -1544,9 +1561,17 @@ class BotWorker:
             calendar_mutation_policy=(
                 "course_schedule_strict_only"
                 if recent.image_kind == "course_schedule"
-                else "calendar_create_only"
-                if is_direct_image_calendar_request(event.text)
-                else "read_only"
+                else "normal"
+            ),
+            turn_effect_policy=(
+                "read_compute_only"
+                if recent.image_kind == "course_schedule"
+                else "verify_on_demand"
+            ),
+            source_kind=(
+                "course_schedule_strict"
+                if recent.image_kind == "course_schedule"
+                else "generic_image"
             ),
             run_generation=task_generation,
         )
@@ -1562,6 +1587,8 @@ class BotWorker:
         turn_input: AgentTurnInput,
         *,
         calendar_mutation_policy: CalendarMutationPolicy,
+        turn_effect_policy: TurnEffectPolicy,
+        source_kind: SourceKind,
         run_generation: int | None = None,
     ) -> None:
         if run_generation is None:
@@ -1615,6 +1642,9 @@ class BotWorker:
             message_id=event.message_id,
             agent_run_id=run_id,
             calendar_mutation_policy=calendar_mutation_policy,
+            turn_effect_policy=turn_effect_policy,
+            user_request_text=turn_input.text,
+            source_kind=source_kind,
         )
         self._active_agent_events.setdefault(participant.id, {})[
             event.event_id

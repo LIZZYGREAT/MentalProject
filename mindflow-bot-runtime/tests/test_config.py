@@ -38,6 +38,30 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_mutation_intent_verifier_has_independent_on_demand_configuration():
+    settings = Settings.from_env(
+        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.mutation_intent_api_enabled is True
+    assert settings.mutation_intent_api_url.endswith("/chat/completions")
+    assert settings.mutation_intent_api_model == "deepseek-v4-flash"
+    assert settings.mutation_intent_api_timeout_seconds == 8
+    assert settings.mutation_intent_max_concurrency == 2
+
+    environment = valid_environment()
+    environment.update(
+        {
+            "MUTATION_INTENT_API_ENABLED": "false",
+            "MUTATION_INTENT_API_URL": "",
+            "MUTATION_INTENT_API_MODEL": "",
+        }
+    )
+    disabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert disabled.mutation_intent_api_enabled is False
+
+
 def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
     base = valid_environment()
     settings = Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])

@@ -14,6 +14,17 @@ CalendarMutationPolicy = Literal[
     "normal",
 ]
 CalendarMutationOperation = Literal["create", "update", "delete"]
+TurnEffectPolicy = Literal[
+    "verify_on_demand",
+    "read_compute_only",
+    "deterministic_backend_action",
+]
+SourceKind = Literal[
+    "text",
+    "generic_image",
+    "course_schedule_strict",
+    "card_action",
+]
 
 _CALENDAR_MUTATIONS_BY_POLICY: dict[
     CalendarMutationPolicy, frozenset[CalendarMutationOperation]
@@ -36,6 +47,9 @@ class AgentContext:
     message_id: str
     agent_run_id: uuid.UUID
     calendar_mutation_policy: CalendarMutationPolicy = "normal"
+    turn_effect_policy: TurnEffectPolicy = "verify_on_demand"
+    user_request_text: str = ""
+    source_kind: SourceKind = "text"
 
     @property
     def calendar_mutation_allowed(self) -> bool:

@@ -51,6 +51,10 @@ from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from app.services.hierarchical_personalization import ParameterLearningService
+from app.services.mutation_intent_verifier import (
+    MutationIntentVerifier,
+    OpenAICompatibleMutationIntentClient,
+)
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
@@ -242,8 +246,21 @@ def build_business_services(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
     )
+    mutation_verifier = None
+    if settings.mutation_intent_api_enabled:
+        mutation_verifier = MutationIntentVerifier(
+            OpenAICompatibleMutationIntentClient(
+                settings.mutation_intent_api_url,
+                settings.deepseek_api_key,
+                settings.mutation_intent_api_model,
+                timeout=settings.mutation_intent_api_timeout_seconds,
+            ),
+            max_concurrency=settings.mutation_intent_max_concurrency,
+        )
     registry = ToolRegistry(
-        runs, sync_max_concurrency=settings.tool_sync_max_concurrency
+        runs,
+        mutation_verifier=mutation_verifier,
+        sync_max_concurrency=settings.tool_sync_max_concurrency,
     )
     CareTools(
         profiles,

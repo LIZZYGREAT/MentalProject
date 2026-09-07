@@ -240,6 +240,8 @@ class CareTools:
             "Return this participant's current profile, recent check-in, and latest forecast.",
             _empty_schema(),
             self.get_today_context,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "care_record_checkin",
@@ -269,6 +271,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.record_checkin,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_get_recent_state",
@@ -281,12 +285,16 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_recent_state,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "care_run_today_assessment",
             "Run today's reviewed MindFlow model using its active versioned state definition.",
             _empty_schema(),
             self.run_assessment,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_get_support",
@@ -299,6 +307,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_support,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_update_preferences",
@@ -370,6 +380,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_care_preferences,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_respond_to_latest_intervention",
@@ -396,6 +408,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.respond_to_latest_care,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_get_pressure_curve",
@@ -412,6 +426,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_pressure_curve,
+            effect="ui_effect",
+            authorization_requirement="none",
         )
         registry.register(
             "care_simulate_schedule_change",
@@ -428,24 +444,32 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.simulate_schedule_change,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_get_checkin_card",
             "Queue the reviewed Feishu daily-state questionnaire card for this participant.",
             _empty_schema(),
             self.get_checkin_card,
+            effect="ui_effect",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_connection_status",
             "Return whether this participant has a usable Feishu calendar authorization.",
             _empty_schema(),
             self.calendar_connection_status,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_list_calendars",
             "List calendars visible to this participant without exposing calendar identifiers.",
             _empty_schema(),
             self.list_calendars,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_list_events",
@@ -468,6 +492,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.list_calendar_events,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_create_event",
@@ -504,10 +530,12 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.create_calendar_event,
+            effect="external_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "calendar_update_event",
-            "Update one exact event in this participant's primary calendar after confirmation.",
+            "Update one exact event in this participant's primary calendar after a direct user request authorized by the backend.",
             {
                 "type": "object",
                 "properties": {
@@ -528,20 +556,23 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_event,
+            effect="external_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "calendar_delete_event",
-            "Delete one exact event from this participant's primary calendar after explicit confirmation.",
+            "Delete one exact event from this participant's primary calendar after an explicit destructive request authorized by the backend.",
             {
                 "type": "object",
                 "properties": {
                     "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "confirmed": {"type": "boolean", "const": True},
                 },
-                "required": ["event_id", "confirmed"],
+                "required": ["event_id"],
                 "additionalProperties": False,
             },
             self.delete_calendar_event,
+            effect="destructive_external_write",
+            authorization_requirement="explicit_destructive_request",
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -1489,8 +1520,6 @@ class CareTools:
     async def delete_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        if args.get("confirmed") is not True:
-            return {"ok": False, "error": "explicit_confirmation_required"}
         try:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])

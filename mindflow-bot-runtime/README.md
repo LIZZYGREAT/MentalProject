@@ -82,7 +82,7 @@ LLM，而由固定后端 action allowlist 处理。
 
 只有当业务域和 Tool 数量继续显著扩大，并且线上审计数据证明单 Agent 路由出现稳定、
 可复现的误调用时，才考虑增加轻量意图分类层。该分类层只能提供路由建议，不能获得
-日历写权限，也不能替代各写 Tool 自身的确认、校验与幂等边界。
+日历写权限，也不能替代 Backend 对每次写 Tool proposal 的语义授权、schema 校验与幂等边界。
 
 ## 配置
 
@@ -94,6 +94,7 @@ LLM，而由固定后端 action allowlist 处理。
 - CardAction 默认设置 `FEISHU_CARD_ACTION_TRANSPORT=ws`，在飞书开放平台用 WebSocket/长连接接收 `card.action.trigger`；此模式不需要公网 HTTPS、Verification Token 或 Encrypt Key，并保持 `FEISHU_CARD_CALLBACK_ENABLED=false`。
 - HTTP fallback 使用 `FEISHU_CARD_ACTION_TRANSPORT=http` 和 `FEISHU_CARD_CALLBACK_ENABLED=true`，同时配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。同一 CardAction 不得同时启用 WS 与 HTTP ingress。
 - `DEEPSEEK_API_KEY`
+- `MUTATION_INTENT_API_ENABLED`、`MUTATION_INTENT_API_URL`、`MUTATION_INTENT_API_MODEL`、`MUTATION_INTENT_API_TIMEOUT_SECONDS`、`MUTATION_INTENT_MAX_CONCURRENCY`：仅在 Agent 提议内部或外部写操作时调用的 Backend 授权校验；不可用或响应非法时写操作 fail closed，read/compute/UI 不受影响。
 - `VISION_API_ENABLED`、`VISION_API_URL`、`VISION_API_MODEL`、`VISION_API_TIMEOUT_SECONDS`：独立课程表 Vision 开关与 endpoint/model/timeout。
 - `VISION_MAX_CONCURRENCY`、`VISION_MAX_IMAGE_BYTES`、`VISION_IMPORT_DRAFT_TTL_MINUTES`、`VISION_SCHEDULE_MAX_ITEMS`、`VISION_SCHEDULE_MAX_CALENDAR_WRITES`：完整图片流水线并发、图片、待确认 Draft、条目和日历写入上限；生产并发默认 `1`，V1 条目上限默认 `20`，单次导入写入上限默认 `400`。
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
