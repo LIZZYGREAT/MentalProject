@@ -951,6 +951,7 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
         "我刚才睡了一会儿",
         "这个图书馆在哪？",
         "那张图书是谁写的？",
+        "地图里哪个地方比较好？",
     ),
 )
 def test_completed_image_does_not_capture_immediate_unrelated_text(text):
@@ -1004,7 +1005,9 @@ def test_completed_course_schedule_does_not_capture_ordinary_weekday_text(text):
     (
         "刚才那张图里的报错怎么修？",
         "这张图是什么意思？",
+        "那张图片帮我再看一下",
         "那个截图里写了什么？",
+        "刚刚那个截图是什么意思？",
     ),
 )
 def test_completed_image_keeps_explicit_reference_followups(text):
@@ -1030,6 +1033,8 @@ def test_completed_image_keeps_explicit_reference_followups(text):
         "那周四呢",
         "周三有什么课",
         "周三几点",
+        "这张课表帮我再看一下",
+        "刚才那张课表里的周三呢",
     ),
 )
 def test_completed_course_schedule_keeps_explicit_schedule_followups(text):

@@ -127,22 +127,31 @@ SCHEDULE_WRITE_ACTION_REQUEST_PATTERN = re.compile(
 SCHEDULE_NON_CALENDAR_EDIT_PATTERN = re.compile(
     r"(?:添加|加上|写入|写进).{0,10}(?:备注|说明|标注|注释)"
 )
+# This completed-image gate is intentionally precision-first. Ambiguous
+# references belong to downstream Agent semantics, not broader regex coverage.
+_EXPLICIT_RECENT_BARE_IMAGE_FOLLOWER = (
+    r"(?=$|[\s，。！？,.!?；;：:]"
+    r"|里|中|上|下|的|是|有|帮|请|再|看|怎|如|写|显|说|意|内|报|按)"
+)
+_EXPLICIT_RECENT_BARE_IMAGE_OBJECT = (
+    r"(?:这|那)(?:张|幅)图" + _EXPLICIT_RECENT_BARE_IMAGE_FOLLOWER
+)
+_EXPLICIT_RECENT_NAMED_IMAGE_OBJECT = (
+    r"(?:这|那)(?:个|张)图片"
+    r"|(?:这|那)(?:个|张)截图"
+    r"|(?:这|那)(?:个|份|张)课表"
+    r"|(?:这|那)(?:个|份|张)课程表"
+)
 EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
-    r"(?:"
-    r"(?:这|那)(?:张|幅)图(?!书)"
-    r"|(?:这|那)(?:个|张)?图片"
-    r"|(?:这|那)(?:个|张)?截图"
-    r"|(?:这|那)(?:个|份)?课表"
-    r"|(?:这|那)(?:个|份|张)?课程表"
-    r"|(?:刚才|刚刚)(?:的)?(?:"
-    r"(?:这|那)?(?:张|幅)图(?!书)"
-    r"|(?:这|那)?(?:个|张)?图片"
-    r"|(?:这|那)?(?:个|张)?截图"
-    r"|(?:这|那)?(?:个|份)?课表"
-    r"|(?:这|那)?(?:个|份|张)?课程表"
-    r")"
-    r"|(?:图|图片|截图)(?:里|中|上)"
-    r")"
+    rf"(?:"
+    rf"{_EXPLICIT_RECENT_BARE_IMAGE_OBJECT}"
+    rf"|{_EXPLICIT_RECENT_NAMED_IMAGE_OBJECT}"
+    rf"|(?:刚才|刚刚)(?:"
+    rf"{_EXPLICIT_RECENT_BARE_IMAGE_OBJECT}"
+    rf"|{_EXPLICIT_RECENT_NAMED_IMAGE_OBJECT}"
+    rf"|的(?:图{_EXPLICIT_RECENT_BARE_IMAGE_FOLLOWER}|图片|截图|课表|课程表)"
+    rf")"
+    rf")"
 )
 SCHEDULE_RECENT_FOLLOWUP_PATTERN = re.compile(
     r"^\s*(?:那)?周[一二三四五六日天]\s*(?:"
