@@ -5,6 +5,8 @@ import threading
 from types import SimpleNamespace
 import weakref
 
+import pytest
+
 from app.agent.skill_loader import SkillLoader
 from app.agent.claude_runtime import ClaudeAgentRuntime
 from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
@@ -940,7 +942,16 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
     assert len(sender.texts) == 2
 
 
-def test_completed_image_does_not_capture_immediate_unrelated_text():
+@pytest.mark.parametrize(
+    "text",
+    (
+        "今天压力怎么样？",
+        "我刚才压力很大",
+        "刚刚老师又布置作业了",
+        "我刚才睡了一会儿",
+    ),
+)
+def test_completed_image_does_not_capture_immediate_unrelated_text(text):
     gateway, queue, worker, runtime, sender, _, _ = _system(
         debounce=0, association=1
     )
@@ -949,7 +960,7 @@ def test_completed_image_does_not_capture_immediate_unrelated_text():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
         await worker.process(await queue.get())
         assert gateway.accept_payload(
-            _payload("text", "m-text", "text", text="今天压力怎么样？")
+            _payload("text", "m-text", "text", text=text)
         )
         await worker.process(await queue.get())
 
@@ -958,6 +969,82 @@ def test_completed_image_does_not_capture_immediate_unrelated_text():
     assert runtime.calls[1][1].trusted_image_context is None
     assert runtime.calls[1][0].calendar_mutation_policy == "normal"
     assert len(sender.texts) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "周三我压力很大呢",
+        "周四我有点累呢",
+        "周五心情不太好呢",
+    ),
+)
+def test_completed_course_schedule_does_not_capture_ordinary_weekday_text(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is None
+    assert runtime.calls[-1][0].calendar_mutation_policy == "normal"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "刚才那张图里的报错怎么修？",
+        "这张图是什么意思？",
+        "那个截图里写了什么？",
+    ),
+)
+def test_completed_image_keeps_explicit_reference_followups(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="photo"), debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "那周四呢",
+        "周三有什么课",
+        "周三几点",
+    ),
+)
+def test_completed_course_schedule_keeps_explicit_schedule_followups(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is not None
 
 
 def test_explicit_reference_after_new_image_association_timeout_never_reuses_old_image():
