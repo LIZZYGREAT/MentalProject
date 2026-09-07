@@ -204,6 +204,30 @@ def test_older_turn_completing_after_newer_turn_cannot_overwrite_recent():
     asyncio.run(scenario())
 
 
+def test_cancelling_latest_image_never_restores_older_recent_context():
+    coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        first = await coordinator.open_image(participant_id, "chat", "first")
+        await coordinator.wait_for_debounce(first)
+        await coordinator.complete(
+            first,
+            image_message_id="image-1",
+            image_key="key-1",
+            image_kind="photo",
+            summary={"summary": "first"},
+        )
+        second = await coordinator.open_image(participant_id, "chat", "second")
+        await coordinator.wait_for_debounce(second)
+
+        await coordinator.cancel(second)
+
+        assert await coordinator.recent_context(participant_id, "chat") is None
+
+    asyncio.run(scenario())
+
+
 def test_stale_old_image_recent_promotion_cannot_overwrite_new_image_global_recent():
     coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
     participant_id = uuid.uuid4()

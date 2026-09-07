@@ -940,6 +940,26 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
     assert len(sender.texts) == 2
 
 
+def test_completed_image_does_not_capture_immediate_unrelated_text():
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="今天压力怎么样？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 2
+    assert runtime.calls[1][1].trusted_image_context is None
+    assert runtime.calls[1][0].calendar_mutation_policy == "normal"
+    assert len(sender.texts) == 2
+
+
 def test_explicit_reference_after_new_image_association_timeout_never_reuses_old_image():
     class SecondImageBlocks(Vision):
         def __init__(self):
@@ -1039,7 +1059,7 @@ def test_slow_first_image_fast_second_image_followup_uses_second_image():
     assert followup[1].trusted_image_context["summary"] == "m-image-2"
 
 
-def test_six_second_style_supplement_reuses_image_even_after_fast_completion():
+def test_explicit_image_supplement_reuses_image_after_fast_completion():
     gateway, queue, worker, runtime, sender, vision, resources = _system(
         vision=Vision(kind="course_schedule"), debounce=0, association=1.0
     )
@@ -1048,14 +1068,22 @@ def test_six_second_style_supplement_reuses_image_even_after_fast_completion():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
         await worker.process(await queue.get())
         assert gateway.accept_payload(
-            _payload("supplement", "m-supplement", "text", text="按默认学校作息")
+            _payload(
+                "supplement",
+                "m-supplement",
+                "text",
+                text="这张图按默认学校作息",
+            )
         )
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
     assert len(vision.calls) == 1
     assert len(resources.calls) == 1
-    assert [call[1].text for call in runtime.calls] == ["", "按默认学校作息"]
+    assert [call[1].text for call in runtime.calls] == [
+        "",
+        "这张图按默认学校作息",
+    ]
     assert all(call[0].calendar_mutation_allowed is False for call in runtime.calls)
     assert len(sender.texts) == 2
 
@@ -1104,6 +1132,134 @@ def test_stop_passes_routing_lock_and_cancels_long_image_turn():
 
     asyncio.run(scenario())
     assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_generation_blocks_recent_publish_after_generic_vision_returns():
+    class CancellationResistantVision(Vision):
+        def __init__(self):
+            super().__init__(kind="photo")
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def inspect(self, _data, _mime, *, user_text=""):
+            self.calls.append(user_text)
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+            return GenericImageContext(image_kind="photo", summary="late result")
+
+    vision = CancellationResistantVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=vision, debounce=0.05, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("attached", "m-attached", "text", text="看看图片")
+        )
+        await worker.process(await queue.get())
+        await vision.started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        vision.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "image").status == "interrupted"
+        assert session.get(StoredBotEvent, "attached").status == "interrupted"
+
+
+def test_stop_generation_blocks_recent_publish_after_generic_agent_returns():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(debounce=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_agent(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    worker._run_agent_input = cancellation_resistant_agent
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_generation_blocks_recent_publish_after_strict_import_returns():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(debounce=0.05)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_import(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "late-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = cancellation_resistant_import
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="帮我导入这张课程表",
+            )
+        )
+        await worker.process(await queue.get())
+        await started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
     assert sender.texts == ["已请求停止当前处理。"]
 
 

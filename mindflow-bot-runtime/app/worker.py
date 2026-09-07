@@ -129,6 +129,7 @@ SCHEDULE_NON_CALENDAR_EDIT_PATTERN = re.compile(
 )
 EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN = re.compile(
     r"刚才|刚刚|那张图|这张图|图里|截图里"
+    r"|(?:这|那)(?:个|份|张)?(?:课表|课程表|图片|截图)"
 )
 SCHEDULE_RECENT_FOLLOWUP_PATTERN = re.compile(
     r"(?:那)?周[一二三四五六日天].*(?:呢|课|什么|几节|几点|什么时候)"
@@ -852,10 +853,6 @@ class BotWorker:
                 recent = await self.multimodal_turns.recent_context(
                     participant.id, event.chat_id
                 )
-                within_association = bool(
-                    recent is not None
-                    and time.monotonic() <= recent.association_deadline
-                )
                 explicit_image_reference = bool(
                     EXPLICIT_RECENT_IMAGE_REFERENCE_PATTERN.search(event.text)
                 )
@@ -867,7 +864,6 @@ class BotWorker:
                     and (
                         explicit_image_reference
                         or (schedule_followup and recent.image_kind == "course_schedule")
-                        or (within_association and not schedule_followup)
                     )
                 )
                 if reuse_recent and recent is not None:
@@ -1017,6 +1013,9 @@ class BotWorker:
                     participant.id,
                     task_generation=task_generation,
                 )
+                await self._ensure_task_not_stopped(
+                    participant.id, event.event_id, task_generation
+                )
                 if outcome.status in {"draft_created", "existing_draft"}:
                     recent = await self.multimodal_turns.complete(
                         turn,
@@ -1054,6 +1053,9 @@ class BotWorker:
                         calendar_mutation_policy="course_schedule_strict_only",
                         run_generation=task_generation,
                     )
+                    await self._ensure_task_not_stopped(
+                        participant.id, event.event_id, task_generation
+                    )
                     recent = await self.multimodal_turns.complete(
                         turn,
                         image_message_id=event.message_id,
@@ -1082,6 +1084,9 @@ class BotWorker:
                 context: GenericImageContext = await self.generic_image_vision.inspect(
                     image.data, image.mime_type, user_text=user_text
                 )
+            await self._ensure_task_not_stopped(
+                participant.id, event.event_id, task_generation
+            )
             if is_strong_schedule_import_intent(
                 user_text, image_kind=context.image_kind
             ):
@@ -1093,6 +1098,9 @@ class BotWorker:
                     downloaded_image=image,
                     report_not_course_schedule=False,
                     task_generation=task_generation,
+                )
+                await self._ensure_task_not_stopped(
+                    participant.id, event.event_id, task_generation
                 )
                 read_only = None
                 downloaded_image = None
@@ -1127,6 +1135,9 @@ class BotWorker:
                         ),
                         run_generation=task_generation,
                     )
+                    await self._ensure_task_not_stopped(
+                        participant.id, event.event_id, task_generation
+                    )
                     recent = await self.multimodal_turns.complete(
                         turn,
                         image_message_id=event.message_id,
@@ -1156,6 +1167,9 @@ class BotWorker:
                     ),
                     run_generation=task_generation,
                 )
+                await self._ensure_task_not_stopped(
+                    participant.id, event.event_id, task_generation
+                )
                 recent = await self.multimodal_turns.complete(
                     turn,
                     image_message_id=event.message_id,
@@ -1166,6 +1180,9 @@ class BotWorker:
             consumption_finished = True
             dispatch_late = True
         except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError):
+            await self._ensure_task_not_stopped(
+                participant.id, event.event_id, task_generation
+            )
             await self._deliver(
                 event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
             )
@@ -1178,6 +1195,9 @@ class BotWorker:
             GenericImageVisionError,
             MessageResourceError,
         ):
+            await self._ensure_task_not_stopped(
+                participant.id, event.event_id, task_generation
+            )
             await self._deliver(
                 event,
                 "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
@@ -1186,6 +1206,9 @@ class BotWorker:
             consumption_finished = True
             dispatch_late = True
         except Exception as exc:
+            await self._ensure_task_not_stopped(
+                participant.id, event.event_id, task_generation
+            )
             logger.warning(
                 "generic_image_processing_failed event_id=%s message_id=%s error_class=%s",
                 event.event_id,
@@ -1201,7 +1224,11 @@ class BotWorker:
             dispatch_late = True
         finally:
             if consumption_finished and snapshot is not None:
-                await self._finish_consumed_text_events(snapshot)
+                await self._finish_consumed_text_events(
+                    snapshot,
+                    participant_id=participant.id,
+                    task_generation=task_generation,
+                )
             if dispatch_late:
                 await self._dispatch_late_followups(
                     turn,
@@ -1211,9 +1238,15 @@ class BotWorker:
                 )
 
     async def _finish_consumed_text_events(
-        self, snapshot: MultimodalInputSnapshot
+        self,
+        snapshot: MultimodalInputSnapshot,
+        *,
+        participant_id,
+        task_generation: int,
     ) -> None:
         for attached_event in snapshot.text_events:
+            if self._run_was_stopped(participant_id, task_generation):
+                return
             await asyncio.to_thread(
                 self.events.finish, attached_event.event_id, status="completed"
             )
