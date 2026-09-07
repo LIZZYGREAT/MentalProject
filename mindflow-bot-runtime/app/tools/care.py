@@ -11,7 +11,10 @@ from zoneinfo import ZoneInfo
 
 
 from app.agent.context import AgentContext
-from app.agent.tool_registry import ToolRegistry
+from app.agent.tool_registry import (
+    AuthorizationContextResolutionError,
+    ToolRegistry,
+)
 from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
 from app.integrations.feishu.calendar import (
     CalendarMutationOutcomeUnknown,
@@ -558,6 +561,7 @@ class CareTools:
             self.update_calendar_event,
             effect="external_write",
             authorization_requirement="direct_request",
+            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
         )
         registry.register(
             "calendar_delete_event",
@@ -573,6 +577,7 @@ class CareTools:
             self.delete_calendar_event,
             effect="destructive_external_write",
             authorization_requirement="explicit_destructive_request",
+            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -1393,6 +1398,47 @@ class CareTools:
             ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
+
+    async def resolve_calendar_event_authorization_context(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve one participant-bound event without exposing provider identity."""
+
+        try:
+            event = await self.calendar.get_event(
+                ctx.participant_id, str(args["event_id"])
+            )
+        except PermissionError as exc:
+            raise AuthorizationContextResolutionError(
+                "calendar_not_connected"
+            ) from exc
+        except CalendarMutationRejected as exc:
+            reason_code = (
+                "authorization_target_not_found"
+                if exc.status_code == 404
+                else "authorization_context_failure"
+            )
+            raise AuthorizationContextResolutionError(reason_code) from exc
+
+        if not isinstance(event, dict) or not str(event.get("id") or "").strip():
+            raise AuthorizationContextResolutionError(
+                "authorization_target_not_found"
+            )
+
+        def optional_text(field: str, max_length: int) -> str | None:
+            value = event.get(field)
+            if value is None:
+                return None
+            return str(value)[:max_length]
+
+        return {
+            "target": {
+                "summary": str(event.get("summary") or "")[:200],
+                "start_time": optional_text("start_time", 64),
+                "end_time": optional_text("end_time", 64),
+                "recurrence": optional_text("recurrence", 500),
+            }
+        }
 
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]

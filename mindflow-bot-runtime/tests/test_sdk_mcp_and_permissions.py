@@ -460,13 +460,19 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
     )
     assert delete_spec.parameters["required"] == ["event_id"]
     assert "confirmed" not in delete_spec.parameters["properties"]
+    assert delete_spec.authorization_context_resolver is not None
     update_spec = next(
         spec for spec in registry.specs if spec.name == "calendar_update_event"
     )
+    assert update_spec.authorization_context_resolver is not None
     assert update_spec.parameters["dependentRequired"] == {
         "start_time": ["end_time"],
         "end_time": ["start_time"],
     }
+    create_spec = next(
+        spec for spec in registry.specs if spec.name == "calendar_create_event"
+    )
+    assert create_spec.authorization_context_resolver is None
 
 
 def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):

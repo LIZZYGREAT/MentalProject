@@ -5,12 +5,16 @@ import uuid
 import pytest
 
 from app.agent.context import AgentContext
-from app.agent.tool_registry import ToolRegistry
+from app.agent.tool_registry import (
+    AuthorizationContextResolutionError,
+    ToolRegistry,
+)
 from app.services.mutation_intent_verifier import (
     MutationIntentDecision,
     MutationIntentVerificationError,
     MutationIntentVerifier,
 )
+from app.tools.care import CareTools
 
 
 EMPTY_SCHEMA = {
@@ -76,6 +80,7 @@ def register(
     effect="read",
     authorization_requirement="none",
     schema=EMPTY_SCHEMA,
+    authorization_context_resolver=None,
 ):
     registry.register(
         name,
@@ -84,6 +89,7 @@ def register(
         handler,
         effect=effect,
         authorization_requirement=authorization_requirement,
+        authorization_context_resolver=authorization_context_resolver,
     )
 
 
@@ -110,6 +116,74 @@ def test_read_compute_and_ui_effects_never_call_mutation_verifier():
     results = asyncio.run(scenario())
     assert all(result.status == "succeeded" for result in results)
     assert calls == ["read_tool", "compute_tool", "ui_tool"]
+    assert verifier.calls == []
+
+
+@pytest.mark.parametrize(
+    ("turn_effect_policy", "effect", "allowed"),
+    (
+        ("read_compute_only", "read", True),
+        ("read_compute_only", "compute", True),
+        ("read_compute_only", "ui_effect", False),
+        ("read_compute_only", "internal_write", False),
+        ("read_compute_only", "external_write", False),
+        ("read_compute_only", "destructive_external_write", False),
+        ("deterministic_backend_action", "read", False),
+        ("deterministic_backend_action", "compute", False),
+        ("deterministic_backend_action", "ui_effect", False),
+        ("deterministic_backend_action", "internal_write", False),
+        ("deterministic_backend_action", "external_write", False),
+        (
+            "deterministic_backend_action",
+            "destructive_external_write",
+            False,
+        ),
+    ),
+)
+def test_turn_effect_policy_matrix(turn_effect_policy, effect, allowed):
+    verifier = StaticVerifier(error=AssertionError("verifier must not run"))
+    registry = ToolRegistry(mutation_verifier=verifier)
+    handled = []
+    resolved = []
+    authorization_requirement = (
+        "explicit_destructive_request"
+        if effect == "destructive_external_write"
+        else "direct_request"
+        if effect in {"internal_write", "external_write"}
+        else "none"
+    )
+
+    def resolve_target(_ctx, _args):
+        resolved.append(True)
+        return {"target": {"summary": "must not resolve"}}
+
+    register(
+        registry,
+        f"{effect}_tool",
+        lambda _ctx, args: handled.append(args) or {"ok": True},
+        effect=effect,
+        authorization_requirement=authorization_requirement,
+        authorization_context_resolver=(
+            resolve_target
+            if effect
+            in {"internal_write", "external_write", "destructive_external_write"}
+            else None
+        ),
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context(turn_effect_policy=turn_effect_policy),
+            f"{effect}_tool",
+            {},
+        )
+    )
+
+    assert result.status == (
+        "succeeded" if allowed else "tool_effect_not_authorized"
+    )
+    assert handled == ([{}] if allowed else [])
+    assert resolved == []
     assert verifier.calls == []
 
 
@@ -305,6 +379,19 @@ def test_delete_uses_backend_verification_and_never_sends_event_id_or_identity()
     )
     registry = ToolRegistry(mutation_verifier=verifier)
     deleted = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "项目组会",
+                "start_time": "2026-09-08T15:00:00+08:00",
+                "end_time": "2026-09-08T16:00:00+08:00",
+                "recurrence": "FREQ=WEEKLY",
+                "provider_id": "must-not-leave-backend",
+            },
+            "calendar_id": "must-not-leave-backend",
+        }
+
     register(
         registry,
         "calendar_delete_event",
@@ -312,6 +399,7 @@ def test_delete_uses_backend_verification_and_never_sends_event_id_or_identity()
         effect="destructive_external_write",
         authorization_requirement="explicit_destructive_request",
         schema=EVENT_SCHEMA,
+        authorization_context_resolver=resolve_target,
     )
 
     result = asyncio.run(
@@ -327,11 +415,215 @@ def test_delete_uses_backend_verification_and_never_sends_event_id_or_identity()
     proposal = verifier.calls[0]
     serialized = json.dumps(proposal, ensure_ascii=False)
     assert proposal["proposal_summary"]["exact_target_supplied"] is True
+    assert proposal["proposal_summary"]["target"] == {
+        "summary": "项目组会",
+        "start_time": "2026-09-08T15:00:00+08:00",
+        "end_time": "2026-09-08T16:00:00+08:00",
+        "recurrence": "FREQ=WEEKLY",
+    }
     assert "event_id" not in serialized
+    assert "calendar_id" not in serialized
+    assert "provider_id" not in serialized
     assert "provider-event-secret" not in serialized
     assert "open-sensitive" not in serialized
     assert "chat-sensitive" not in serialized
     assert "P-SENSITIVE" not in serialized
+
+
+def test_delete_target_mismatch_is_denied_before_handler():
+    verifier = StaticVerifier(
+        MutationIntentDecision("deny", "ambiguous", "target_mismatch")
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    deleted = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "牙医预约",
+                "start_time": "2026-09-08T15:00:00+08:00",
+                "end_time": "2026-09-08T16:00:00+08:00",
+                "recurrence": "",
+            }
+        }
+
+    register(
+        registry,
+        "calendar_delete_event",
+        lambda _ctx, args: deleted.append(args) or {"ok": True},
+        effect="destructive_external_write",
+        authorization_requirement="explicit_destructive_request",
+        schema=EVENT_SCHEMA,
+        authorization_context_resolver=resolve_target,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context("删除明天下午的组会"),
+            "calendar_delete_event",
+            {"event_id": "wrong-provider-event"},
+        )
+    )
+
+    assert result.status == "tool_effect_not_authorized"
+    assert result.result["reason_code"] == "target_mismatch"
+    assert verifier.calls[0]["proposal_summary"]["target"]["summary"] == "牙医预约"
+    assert deleted == []
+
+
+def test_update_verifier_receives_backend_bound_target_and_requested_change():
+    verifier = StaticVerifier(
+        MutationIntentDecision("allow", "direct_action", "direct_request")
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    updated = []
+
+    async def resolve_target(_ctx, _args):
+        return {
+            "target": {
+                "summary": "项目组会",
+                "start_time": "2026-09-08T14:00:00+08:00",
+                "end_time": "2026-09-08T15:00:00+08:00",
+                "recurrence": "FREQ=WEEKLY",
+            }
+        }
+
+    update_schema = {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "minLength": 1},
+            "start_time": {"type": "string"},
+        },
+        "required": ["event_id", "start_time"],
+        "additionalProperties": False,
+    }
+    register(
+        registry,
+        "calendar_update_event",
+        lambda _ctx, args: updated.append(args) or {"ok": True},
+        effect="external_write",
+        authorization_requirement="direct_request",
+        schema=update_schema,
+        authorization_context_resolver=resolve_target,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context("把项目组会改到三点"),
+            "calendar_update_event",
+            {
+                "event_id": "provider-event-secret",
+                "start_time": "2026-09-08T15:00:00+08:00",
+            },
+        )
+    )
+
+    proposal = verifier.calls[0]["proposal_summary"]
+    assert result.status == "succeeded"
+    assert proposal["target"]["summary"] == "项目组会"
+    assert proposal["requested_values"] == {
+        "start_time": "2026-09-08T15:00:00+08:00"
+    }
+    assert updated == [
+        {
+            "event_id": "provider-event-secret",
+            "start_time": "2026-09-08T15:00:00+08:00",
+        }
+    ]
+
+
+def test_calendar_authorization_resolver_reads_participant_bound_target():
+    class Calendar:
+        def __init__(self):
+            self.calls = []
+
+        async def get_event(self, participant_id, event_id):
+            self.calls.append((participant_id, event_id))
+            return {
+                "id": event_id,
+                "summary": "项目组会",
+                "start_time": "2026-09-08T14:00:00+08:00",
+                "end_time": "2026-09-08T15:00:00+08:00",
+                "recurrence": "FREQ=WEEKLY",
+                "calendar_id": "private-calendar",
+                "recurring_event_id": "private-series",
+            }
+
+    calendar = Calendar()
+    tools = CareTools(None, None, calendar, None, "Asia/Shanghai", None)
+    ctx = context("把项目组会改到三点")
+
+    resolved = asyncio.run(
+        tools.resolve_calendar_event_authorization_context(
+            ctx, {"event_id": "provider-event-secret"}
+        )
+    )
+
+    assert calendar.calls == [(ctx.participant_id, "provider-event-secret")]
+    assert resolved == {
+        "target": {
+            "summary": "项目组会",
+            "start_time": "2026-09-08T14:00:00+08:00",
+            "end_time": "2026-09-08T15:00:00+08:00",
+            "recurrence": "FREQ=WEEKLY",
+        }
+    }
+    serialized = json.dumps(resolved, ensure_ascii=False)
+    assert "provider-event-secret" not in serialized
+    assert "private-calendar" not in serialized
+    assert "private-series" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("resolver_error", "reason_code"),
+    (
+        (
+            AuthorizationContextResolutionError("authorization_target_not_found"),
+            "authorization_target_not_found",
+        ),
+        (
+            AuthorizationContextResolutionError("calendar_not_connected"),
+            "calendar_not_connected",
+        ),
+        (RuntimeError("backend read failed"), "authorization_context_failure"),
+    ),
+)
+def test_authorization_context_resolution_failure_fails_closed(
+    resolver_error, reason_code
+):
+    verifier = StaticVerifier(error=AssertionError("verifier must not run"))
+    registry = ToolRegistry(mutation_verifier=verifier)
+    handled = []
+
+    async def failed_resolver(_ctx, _args):
+        raise resolver_error
+
+    register(
+        registry,
+        "calendar_delete_event",
+        lambda _ctx, args: handled.append(args) or {"ok": True},
+        effect="destructive_external_write",
+        authorization_requirement="explicit_destructive_request",
+        schema=EVENT_SCHEMA,
+        authorization_context_resolver=failed_resolver,
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            context("删除项目组会"),
+            "calendar_delete_event",
+            {"event_id": "provider-event"},
+        )
+    )
+
+    assert result.status == "authorization_unavailable"
+    assert result.result == {
+        "ok": False,
+        "error": "mutation_authorization_unavailable",
+        "reason_code": reason_code,
+    }
+    assert verifier.calls == []
+    assert handled == []
 
 
 def test_generic_image_evidence_does_not_bypass_semantic_authorization():
