@@ -949,6 +949,8 @@ def test_unrelated_text_after_association_window_is_a_new_agent_turn():
         "我刚才压力很大",
         "刚刚老师又布置作业了",
         "我刚才睡了一会儿",
+        "这个图书馆在哪？",
+        "那张图书是谁写的？",
     ),
 )
 def test_completed_image_does_not_capture_immediate_unrelated_text(text):
