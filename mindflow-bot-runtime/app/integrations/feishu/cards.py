@@ -144,7 +144,7 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             strategy=str(draft["recurrence_strategy"]),
             primary=True,
         ))
-    elif status == "running":
+    elif status in {"queued", "running"}:
         lines.append("\n正在添加到日历，请稍候。")
         elements[0]["content"] = "\n".join(lines)
     elif status == "succeeded":

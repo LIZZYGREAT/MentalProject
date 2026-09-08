@@ -198,6 +198,7 @@ def _build_card_action_handler(
             result = card_actions.handle(
                 participant.id,
                 message_id=event.message_id,
+                chat_id=event.chat_id,
                 callback_event_id=event.event_id,
                 action_value=event.action_value,
                 form_value=event.form_value,
@@ -427,6 +428,8 @@ async def run() -> None:
     sender = FeishuClient(
         settings.feishu_bot_app_id, settings.feishu_bot_app_secret
     )
+    business.course_schedule_import_runner.sender = sender
+    business.course_schedule_import_runner.start()
     from app.integrations.feishu.message_resources import (
         FeishuMessageResourceDownloader,
     )
@@ -595,20 +598,23 @@ async def run() -> None:
                 await worker.close()
             finally:
                 try:
-                    await business.mutation_refresh.close()
+                    await business.course_schedule_import_runner.close()
                 finally:
                     try:
-                        await business.observation_refresh.close()
+                        await business.mutation_refresh.close()
                     finally:
                         try:
-                            await business.dependency_refresh.close()
+                            await business.observation_refresh.close()
                         finally:
                             try:
-                                await business.semantic_preprocessor.close(
-                                    settings.semantic_api_timeout_seconds + 2
-                                )
+                                await business.dependency_refresh.close()
                             finally:
-                                await runtime.close()
+                                try:
+                                    await business.semantic_preprocessor.close(
+                                        settings.semantic_api_timeout_seconds + 2
+                                    )
+                                finally:
+                                    await runtime.close()
 
 
 def main() -> None:

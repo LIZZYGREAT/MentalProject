@@ -93,6 +93,7 @@ class CardActionService:
         participant_id: uuid.UUID,
         *,
         message_id: str,
+        chat_id: str | None = None,
         callback_event_id: str | None = None,
         action_value: dict[str, Any] | None,
         form_value: dict[str, Any] | None,
@@ -128,6 +129,8 @@ class CardActionService:
                         participant_id,
                         import_id,
                         recurrence_strategy=recurrence_strategy,
+                        status_card_message_id=message_id,
+                        status_card_chat_id=chat_id,
                     )
                 )
             reply_text = str(result.get("reply_text") or "课程表操作已处理。")

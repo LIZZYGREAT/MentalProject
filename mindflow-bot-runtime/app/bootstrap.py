@@ -34,6 +34,7 @@ from app.repositories_calendar_mutation import (
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.services.course_schedule_import import CourseScheduleImportService
+from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from app.services.course_schedule_vision import CourseScheduleVisionService
 from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
@@ -95,6 +96,7 @@ class BusinessServices:
     care_interventions: CareInterventionRepository
     care_outcome_refresh: CareOutcomeRefreshService
     course_schedule_imports: CourseScheduleImportService
+    course_schedule_import_runner: CourseScheduleImportRunner
     course_schedule_vision: CourseScheduleVisionService
     generic_image_vision: GenericImageVisionService
 
@@ -216,6 +218,11 @@ def build_business_services(
         mutation_refresh=mutation_refresh,
         max_calendar_writes=settings.vision_schedule_max_calendar_writes,
     )
+    course_schedule_import_runner = CourseScheduleImportRunner(
+        course_schedule_imports,
+        max_concurrency=1,
+    )
+    course_schedule_imports.queue_notifier = course_schedule_import_runner.wake
     course_schedule_vision = CourseScheduleVisionService(
         settings.vision_api_url,
         settings.deepseek_api_key,
@@ -309,6 +316,7 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
         course_schedule_imports=course_schedule_imports,
+        course_schedule_import_runner=course_schedule_import_runner,
         course_schedule_vision=course_schedule_vision,
         generic_image_vision=generic_image_vision,
     )

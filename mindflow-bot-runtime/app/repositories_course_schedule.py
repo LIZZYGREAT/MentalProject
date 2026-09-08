@@ -9,7 +9,7 @@ import json
 from typing import Any
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.contracts.course_schedule import ScheduleVisionResult
@@ -23,10 +23,15 @@ from app.domain.course_schedule_recurrence import (
     COURSE_IMPORT_PLANNER_VERSION,
     RECURRENCE_STRATEGIES,
 )
-from app.models import CourseScheduleImport, CourseScheduleImportItem
+from app.models import (
+    CourseScheduleImport,
+    CourseScheduleImportItem,
+    CourseScheduleImportWrite,
+)
 
 
 ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
+QUEUEABLE_STATUSES = {"pending_confirmation", "partial_failed"}
 EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
 INTERACTIVE_CONTEXT_FIELDS = {"semester_start_date", "period_time_mapping"}
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
@@ -692,6 +697,292 @@ class CourseScheduleImportRepository:
             session.flush()
             return self._view(session, row)
 
+    def queue_import(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        recurrence_strategy: str,
+        writes: list[dict[str, Any]],
+        status_card_message_id: str | None = None,
+        status_card_chat_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically materialize the write ledger and enqueue the durable job."""
+
+        queued_at = _aware(now or datetime.now(timezone.utc))
+        normalized_strategy = str(recurrence_strategy).strip()
+        if normalized_strategy not in RECURRENCE_STRATEGIES:
+            raise ValueError("unsupported course recurrence strategy")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=queued_at)
+            if row.status == "succeeded":
+                return {**self._view(session, row), "queued": False}
+            if row.status in {"queued", "running"}:
+                if status_card_message_id:
+                    row.status_card_message_id = str(status_card_message_id)[:128]
+                if status_card_chat_id:
+                    row.status_card_chat_id = str(status_card_chat_id)[:128]
+                session.flush()
+                return {**self._view(session, row), "queued": False}
+            if row.status not in QUEUEABLE_STATUSES:
+                raise ValueError("draft is not queueable")
+            if row.recurrence_strategy not in {None, normalized_strategy}:
+                raise ValueError("course recurrence strategy is immutable")
+            row.recurrence_strategy = normalized_strategy
+            row.recurrence_confirmed_at = row.recurrence_confirmed_at or queued_at
+            row.status = "queued"
+            row.confirmed_at = row.confirmed_at or queued_at
+            row.run_requested_at = queued_at
+            row.last_progress_at = queued_at
+            if status_card_message_id:
+                row.status_card_message_id = str(status_card_message_id)[:128]
+            if status_card_chat_id:
+                row.status_card_chat_id = str(status_card_chat_id)[:128]
+            existing = {
+                (str(write.item_id), write.occurrence_identity): write
+                for write in session.execute(
+                    select(CourseScheduleImportWrite).where(
+                        CourseScheduleImportWrite.import_id == row.id
+                    )
+                ).scalars()
+            }
+            for payload in writes:
+                item_id = uuid.UUID(str(payload["item_id"]))
+                occurrence_identity = str(payload["occurrence_identity"])[:128]
+                ledger = existing.get((str(item_id), occurrence_identity))
+                if ledger is None:
+                    ledger = CourseScheduleImportWrite(
+                        import_id=row.id,
+                        item_id=item_id,
+                        occurrence_identity=occurrence_identity,
+                        source_identity=str(payload["source_identity"])[:512],
+                        write_kind=str(payload["write_kind"])[:32],
+                        summary=str(payload["summary"])[:200],
+                        description=str(payload.get("description") or ""),
+                        start_time=payload["start_time"],
+                        end_time=payload["end_time"],
+                        recurrence=(
+                            str(payload["recurrence"])[:1024]
+                            if payload.get("recurrence") else None
+                        ),
+                        affected_dates_json=[
+                            value.isoformat() for value in payload["affected_dates"]
+                        ],
+                        status="planned",
+                    )
+                    session.add(ledger)
+                elif ledger.status != "created":
+                    ledger.status = "planned"
+                    ledger.provider_event_id = None
+                    ledger.error_code = None
+                    ledger.updated_at = queued_at
+            self._refresh_item_statuses(session, row.id)
+            session.flush()
+            return {**self._view(session, row), "queued": True}
+
+    def claim_next_import(self, *, now: datetime | None = None) -> dict[str, Any] | None:
+        """Claim one queued job, reclaiming an expired running lease after restart."""
+
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.execute(
+                select(CourseScheduleImport)
+                .where(
+                    or_(
+                        CourseScheduleImport.status == "queued",
+                        (
+                            (CourseScheduleImport.status == "running")
+                            & (
+                                CourseScheduleImport.run_claim_expires_at.is_(None)
+                                | (CourseScheduleImport.run_claim_expires_at <= claimed_at)
+                            )
+                        ),
+                    )
+                )
+                .order_by(CourseScheduleImport.created_at, CourseScheduleImport.id)
+                .with_for_update()
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            for write in session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == row.id,
+                    CourseScheduleImportWrite.status == "creating",
+                )
+            ).scalars():
+                # The provider may have committed before the process died.  The
+                # stable source identity makes this retry safe at the provider.
+                write.status = "planned"
+                write.error_code = None
+                write.updated_at = claimed_at
+            row.status = "running"
+            self._set_run_lease(row, claimed_at)
+            row.last_progress_at = claimed_at
+            self._refresh_item_statuses(session, row.id)
+            session.flush()
+            return self._view(session, row)
+
+    def claim_write(
+        self,
+        import_id: uuid.UUID | str,
+        write_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            draft = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if draft is None or draft.status != "running":
+                return None
+            if draft.run_claim_expires_at is not None and _aware(
+                draft.run_claim_expires_at
+            ) <= claimed_at:
+                return None
+            row = session.get(
+                CourseScheduleImportWrite, uuid.UUID(str(write_id)), with_for_update=True
+            )
+            if row is None or row.import_id != draft.id:
+                return None
+            if row.status not in {"planned", "create_outcome_unknown"}:
+                return None
+            row.status = "creating"
+            row.error_code = None
+            row.updated_at = claimed_at
+            row.created_at = _aware(row.created_at)
+            self._set_run_lease(draft, claimed_at)
+            draft.last_progress_at = claimed_at
+            session.flush()
+            return self._write_view(row)
+
+    def record_write_created(
+        self,
+        import_id: uuid.UUID | str,
+        write_id: uuid.UUID | str,
+        provider_event_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        updated_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            draft = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            row = session.get(
+                CourseScheduleImportWrite, uuid.UUID(str(write_id)), with_for_update=True
+            )
+            if draft is None or row is None or row.import_id != draft.id:
+                return
+            row.status = "created"
+            row.provider_event_id = str(provider_event_id)[:256] or None
+            row.error_code = None
+            row.updated_at = updated_at
+            draft.last_progress_at = updated_at
+            self._refresh_item_statuses(session, draft.id)
+
+    def record_write_failure(
+        self,
+        import_id: uuid.UUID | str,
+        write_id: uuid.UUID | str,
+        *,
+        error_code: str,
+        outcome_unknown: bool = False,
+        now: datetime | None = None,
+    ) -> None:
+        updated_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            draft = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            row = session.get(
+                CourseScheduleImportWrite, uuid.UUID(str(write_id)), with_for_update=True
+            )
+            if draft is None or row is None or row.import_id != draft.id:
+                return
+            row.status = "create_outcome_unknown" if outcome_unknown else "create_failed"
+            row.error_code = str(error_code)[:128]
+            row.updated_at = updated_at
+            draft.last_progress_at = updated_at
+            self._refresh_item_statuses(session, draft.id)
+
+    def finalize_queued_import(
+        self, import_id: uuid.UUID | str, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        completed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None:
+                raise LookupError("draft not found")
+            self._refresh_item_statuses(session, row.id)
+            items = self._items(session, row.id)
+            writes = list(
+                session.execute(
+                    select(CourseScheduleImportWrite).where(
+                        CourseScheduleImportWrite.import_id == row.id
+                    )
+                ).scalars()
+            )
+            if writes and all(write.status == "created" for write in writes):
+                row.status = "succeeded"
+                row.completed_at = completed_at
+            elif not writes and items and all(item.status == "succeeded" for item in items):
+                # Compatibility for imports created before the ledger migration.
+                row.status = "succeeded"
+                row.completed_at = completed_at
+            elif any(
+                write.status in {"create_failed", "create_outcome_unknown"}
+                for write in writes
+            ):
+                row.status = "partial_failed"
+            else:
+                # A runner should never finalize an incomplete job. Keep it
+                # queued so a later scan can safely continue it.
+                row.status = "queued"
+            row.last_progress_at = completed_at
+            self._clear_run_lease(row)
+            session.flush()
+            return self._view(session, row)
+
+    def created_write_dates(self, import_id: uuid.UUID | str) -> set[date]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == uuid.UUID(str(import_id)),
+                    CourseScheduleImportWrite.status == "created",
+                )
+            ).scalars()
+            dates: set[date] = set()
+            for row in rows:
+                dates.update(
+                    date.fromisoformat(str(value))
+                    for value in (row.affected_dates_json or [])
+                )
+            return dates
+
+    def writes_for_import(
+        self, import_id: uuid.UUID | str, *, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            query = select(CourseScheduleImportWrite).where(
+                CourseScheduleImportWrite.import_id == uuid.UUID(str(import_id))
+            ).order_by(
+                CourseScheduleImportWrite.created_at,
+                CourseScheduleImportWrite.id,
+            )
+            if statuses:
+                query = query.where(CourseScheduleImportWrite.status.in_(statuses))
+            rows = list(session.execute(query).scalars())
+            return [self._write_view(row) for row in rows]
+
     def begin_confirmation(
         self,
         participant_id: uuid.UUID,
@@ -875,8 +1166,96 @@ class CourseScheduleImportRepository:
             ).scalars()
         )
 
+    @staticmethod
+    def _refresh_item_statuses(session: Any, import_id: uuid.UUID) -> None:
+        items = CourseScheduleImportRepository._items(session, import_id)
+        writes = list(
+            session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == import_id
+                )
+            ).scalars()
+        )
+        by_item: dict[uuid.UUID, list[CourseScheduleImportWrite]] = {}
+        for write in writes:
+            by_item.setdefault(write.item_id, []).append(write)
+        for item in items:
+            item_writes = by_item.get(item.id, [])
+            if not item_writes:
+                # Keep legacy item state intact until a future migration can
+                # backfill historical imports into the write ledger.
+                continue
+            statuses = {write.status for write in item_writes}
+            if item_writes and statuses == {"created"}:
+                item.status = "succeeded"
+                item.error_code = None
+                provider_ids = [
+                    str(write.provider_event_id)
+                    for write in item_writes
+                    if write.provider_event_id
+                ]
+                if provider_ids:
+                    # Compatibility-only summary; the ledger is authoritative.
+                    item.calendar_event_id = provider_ids[-1][:256]
+            elif statuses & {"creating", "create_outcome_unknown"}:
+                item.status = "running"
+                unknown = next(
+                    (
+                        write.error_code
+                        for write in item_writes
+                        if write.status == "create_outcome_unknown"
+                    ),
+                    None,
+                )
+                item.error_code = unknown
+            elif "create_failed" in statuses:
+                item.status = "failed"
+                item.error_code = next(
+                    (
+                        write.error_code
+                        for write in item_writes
+                        if write.status == "create_failed"
+                    ),
+                    "calendar_write_failed",
+                )
+            else:
+                item.status = "pending"
+                item.error_code = None
+
+    @staticmethod
+    def _write_view(row: CourseScheduleImportWrite) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "import_id": str(row.import_id),
+            "item_id": str(row.item_id),
+            "occurrence_identity": row.occurrence_identity,
+            "source_identity": row.source_identity,
+            "write_kind": row.write_kind,
+            "summary": row.summary,
+            "description": row.description,
+            "start_time": _aware(row.start_time).isoformat(),
+            "end_time": _aware(row.end_time).isoformat(),
+            "recurrence": row.recurrence,
+            "affected_dates": [str(value) for value in (row.affected_dates_json or [])],
+            "status": row.status,
+            "provider_event_id": row.provider_event_id,
+            "error_code": row.error_code,
+            "created_at": _aware(row.created_at).isoformat(),
+            "updated_at": _aware(row.updated_at).isoformat(),
+        }
+
     def _view(self, session: Any, row: CourseScheduleImport) -> dict[str, Any]:
         items = self._items(session, row.id)
+        writes = list(
+            session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == row.id
+                ).order_by(
+                    CourseScheduleImportWrite.created_at,
+                    CourseScheduleImportWrite.id,
+                )
+            ).scalars()
+        )
         return {
             "id": str(row.id),
             "participant_id": str(row.participant_id),
@@ -897,6 +1276,14 @@ class CourseScheduleImportRepository:
             "created_at": _aware(row.created_at).isoformat(),
             "expires_at": _aware(row.expires_at).isoformat(),
             "confirmed_at": _aware(row.confirmed_at).isoformat() if row.confirmed_at else None,
+            "run_requested_at": (
+                _aware(row.run_requested_at).isoformat() if row.run_requested_at else None
+            ),
+            "status_card_message_id": row.status_card_message_id,
+            "status_card_chat_id": row.status_card_chat_id,
+            "last_progress_at": (
+                _aware(row.last_progress_at).isoformat() if row.last_progress_at else None
+            ),
             "run_claimed_at": (
                 _aware(row.run_claimed_at).isoformat() if row.run_claimed_at else None
             ),
@@ -922,6 +1309,7 @@ class CourseScheduleImportRepository:
                 }
                 for item in items
             ],
+            "writes": [self._write_view(write) for write in writes],
         }
 
     def _set_run_lease(self, row: CourseScheduleImport, claimed_at: datetime) -> None:

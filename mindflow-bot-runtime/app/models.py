@@ -435,7 +435,7 @@ class CourseScheduleImport(Base):
         ),
         CheckConstraint(
             "status IN ('pending_context','pending_confirmation','running','succeeded',"
-            "'partial_failed','cancelled','expired')",
+            "'queued','partial_failed','cancelled','expired')",
             name="ck_course_schedule_import_status",
         ),
         CheckConstraint(
@@ -478,6 +478,16 @@ class CourseScheduleImport(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status_card_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    status_card_chat_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     run_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     run_claim_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -523,6 +533,65 @@ class CourseScheduleImportItem(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     calendar_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class CourseScheduleImportWrite(Base):
+    """One durable Calendar provider mutation planned for an import."""
+
+    __tablename__ = "course_schedule_import_writes"
+    __table_args__ = (
+        UniqueConstraint(
+            "import_id", "item_id", "occurrence_identity",
+            name="uq_course_schedule_write_occurrence",
+        ),
+        UniqueConstraint("source_identity", name="uq_course_schedule_write_source"),
+        CheckConstraint(
+            "status IN ('planned','creating','created','create_failed',"
+            "'create_outcome_unknown','delete_pending','deleting','deleted',"
+            "'delete_failed','delete_outcome_unknown')",
+            name="ck_course_schedule_write_status",
+        ),
+        Index(
+            "ix_course_schedule_write_import_status",
+            "import_id", "status", "created_at",
+        ),
+        Index(
+            "ix_course_schedule_write_item_status",
+            "item_id", "status", "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    import_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_imports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_import_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    occurrence_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_identity: Mapped[str] = mapped_column(String(512), nullable=False)
+    write_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recurrence: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    affected_dates_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    provider_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
 
 class AgentRun(Base):

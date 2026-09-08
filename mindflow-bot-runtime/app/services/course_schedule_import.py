@@ -14,7 +14,6 @@ from app.domain.course_schedule_recurrence import (
     COURSE_IMPORT_PLANNER_VERSION,
     PRESERVE_SCHEDULE_PATTERN,
     CalendarWrite,
-    CalendarWriteKind,
     plan_course_writes,
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
@@ -35,6 +34,7 @@ class CourseScheduleImportService:
         forecast_snapshots: Any = None,
         mutation_refresh: Any = None,
         max_calendar_writes: int = 400,
+        queue_notifier: Any = None,
     ) -> None:
         self.drafts = drafts
         self.calendar = calendar
@@ -44,6 +44,7 @@ class CourseScheduleImportService:
         self.forecast_snapshots = forecast_snapshots
         self.mutation_refresh = mutation_refresh
         self.max_calendar_writes = max(1, int(max_calendar_writes))
+        self.queue_notifier = queue_notifier
 
     async def confirm(
         self,
@@ -51,12 +52,23 @@ class CourseScheduleImportService:
         import_id: uuid.UUID | str,
         *,
         recurrence_strategy: str | None = None,
+        status_card_message_id: str | None = None,
+        status_card_chat_id: str | None = None,
     ) -> dict[str, Any]:
+        """Validate, plan, and durably queue an import.
+
+        Provider mutations intentionally do not happen here.  This method is on
+        the CardAction/HTTP callback path, so all Calendar writes belong to the
+        durable background runner below.
+        """
+
         draft = await asyncio.to_thread(
             self.drafts.validate_for_confirmation, participant_id, import_id
         )
         if draft["status"] == "succeeded":
             return self._result(draft, already_completed=True)
+        if draft["status"] in {"queued", "running"}:
+            return self._queued_result(draft)
         if recurrence_strategy is not None:
             draft = await asyncio.to_thread(
                 self.drafts.set_recurrence_strategy,
@@ -87,7 +99,6 @@ class CourseScheduleImportService:
             }
 
         writes_by_item: dict[str, list[CalendarWrite]] = {}
-        all_dates: set[date] = set()
         draft_timezone = ZoneInfo(str(draft.get("timezone") or self.timezone.key))
         for item in draft["items"]:
             if item["status"] == "succeeded":
@@ -99,8 +110,6 @@ class CourseScheduleImportService:
                 timezone=draft_timezone,
             )
             writes_by_item[item["id"]] = writes
-            for write in writes:
-                all_dates.update(write.affected_dates)
         planned_writes = sum(len(writes) for writes in writes_by_item.values())
         if planned_writes > self.max_calendar_writes:
             if strategy == PRESERVE_SCHEDULE_PATTERN:
@@ -123,99 +132,52 @@ class CourseScheduleImportService:
                 "planned_writes": planned_writes,
                 "reply_text": limit_text,
             }
-        claimed = await asyncio.to_thread(
-            self.drafts.begin_confirmation, participant_id, import_id
+        ledger_payloads = [
+            {
+                "item_id": item_id,
+                "occurrence_identity": write.occurrence_identity,
+                "source_identity": self._source_identity(
+                    draft,
+                    next(item for item in draft["items"] if item["id"] == item_id),
+                    write,
+                    strategy,
+                ),
+                "write_kind": write.write_kind,
+                "summary": write.summary,
+                "description": write.description,
+                "start_time": write.start_time,
+                "end_time": write.end_time,
+                "recurrence": write.recurrence,
+                "affected_dates": write.affected_dates,
+            }
+            for item_id, writes in writes_by_item.items()
+            for write in writes
+        ]
+        queued = await asyncio.to_thread(
+            self.drafts.queue_import,
+            participant_id,
+            import_id,
+            recurrence_strategy=strategy,
+            writes=ledger_payloads,
+            status_card_message_id=status_card_message_id,
+            status_card_chat_id=status_card_chat_id,
         )
-        if not claimed.get("claimed"):
-            if claimed["status"] == "running":
-                return {
-                    "ok": True,
-                    "status": "running",
-                    "import_id": claimed["id"],
-                    "recurrence_strategy": strategy,
-                    "succeeded": sum(
-                        item["status"] == "succeeded" for item in claimed["items"]
-                    ),
-                    "failed": 0,
-                    "reply_text": "这份课程表正在添加，请不要重复操作。",
-                }
-            return self._result(claimed, already_completed=claimed["status"] == "succeeded")
-
-        reconciliation = await self._prepare_reconciliation(
-            participant_id, claimed, all_dates, writes_by_item
-        )
-        any_success = False
-        outcome_unknown = False
-        for item in claimed["items"]:
-            if item["status"] == "succeeded":
-                continue
-            if not await asyncio.to_thread(
-                self.drafts.claim_item, import_id, item["id"]
-            ):
-                continue
-            last_event_id: str | None = None
+        if queued.get("status") == "succeeded":
+            return self._result(queued, already_completed=True)
+        if not queued.get("queued") and queued.get("status") == "running":
+            return self._queued_result(queued)
+        if not queued.get("queued") and queued.get("status") == "queued":
+            return self._queued_result(queued)
+        if not ledger_payloads:
+            final = await asyncio.to_thread(self.drafts.finalize_queued_import, import_id)
+            return self._result(final)
+        notifier = self.queue_notifier
+        if callable(notifier):
             try:
-                for write in writes_by_item[item["id"]]:
-                    await asyncio.to_thread(
-                        self.drafts.renew_run_lease, import_id
-                    )
-                    create = (
-                        self.calendar.create_recurring_event
-                        if write.write_kind == CalendarWriteKind.RECURRING
-                        else self.calendar.create_single_event
-                    )
-                    create_args = {
-                        "summary": write.summary,
-                        "start_time": write.start_time,
-                        "end_time": write.end_time,
-                        "description": write.description,
-                        "source_message_id": self._source_identity(
-                            claimed, item, write, strategy
-                        ),
-                    }
-                    if write.write_kind == CalendarWriteKind.RECURRING:
-                        create_args["recurrence"] = write.recurrence
-                    created = await create(participant_id, **create_args)
-                    last_event_id = str((created or {}).get("id") or "") or last_event_id
-                    any_success = True
-            except PermissionError:
-                await asyncio.to_thread(
-                    self.drafts.finish_item,
-                    import_id,
-                    item["id"],
-                    error_code="calendar_not_connected",
-                )
-            except Exception as exc:
-                outcome_unknown = outcome_unknown or type(exc).__name__.endswith(
-                    "OutcomeUnknown"
-                )
-                await asyncio.to_thread(
-                    self.drafts.finish_item,
-                    import_id,
-                    item["id"],
-                    error_code=type(exc).__name__,
-                )
-                logger.warning(
-                    "course_schedule_calendar_item_failed import_id=%s item_index=%s error_class=%s",
-                    claimed["id"], item["item_index"], type(exc).__name__,
-                )
-            else:
-                await asyncio.to_thread(
-                    self.drafts.finish_item,
-                    import_id,
-                    item["id"],
-                    calendar_event_id=last_event_id,
-                )
-
-        await self._finish_reconciliation(
-            reconciliation, any_success=any_success, outcome_unknown=outcome_unknown
-        )
-        final = await asyncio.to_thread(self.drafts.finalize, import_id)
-        if any_success or outcome_unknown:
-            await self._reconcile_forecasts(
-                participant_id, all_dates, reconciliation=reconciliation
-            )
-        return self._result(final)
+                notifier()
+            except Exception:
+                logger.exception("course_schedule_import_runner_wakeup_failed")
+        return self._queued_result(queued, planned_writes=planned_writes)
 
     def cancel(
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
@@ -390,9 +352,27 @@ class CourseScheduleImportService:
             raise PermissionError("draft belongs to another participant")
 
     @staticmethod
+    def _queued_result(
+        draft: dict[str, Any], *, planned_writes: int | None = None
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": draft["status"],
+            "import_id": draft["id"],
+            "recurrence_strategy": draft.get("recurrence_strategy"),
+            "succeeded": sum(item["status"] == "succeeded" for item in draft["items"]),
+            "failed": sum(item["status"] == "failed" for item in draft["items"]),
+            "planned_writes": planned_writes,
+            "reply_text": "正在添加课程…",
+        }
+
+    @staticmethod
     def _result(draft: dict[str, Any], *, already_completed: bool = False) -> dict[str, Any]:
         succeeded = sum(item["status"] == "succeeded" for item in draft["items"])
-        failed = sum(item["status"] == "failed" for item in draft["items"])
+        failed = sum(
+            item["status"] in {"failed", "running"}
+            for item in draft["items"]
+        )
         strategy_label = (
             "按课表周期规则"
             if draft.get("recurrence_strategy") == PRESERVE_SCHEDULE_PATTERN
