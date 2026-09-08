@@ -843,7 +843,6 @@ class BotWorker:
                 return
             downloaded_image = None
             read_only = None
-            strict_schedule_qa = False
             if self.generic_image_vision is None or self.message_resources is None:
                 await self._deliver(
                     event,
@@ -874,7 +873,6 @@ class BotWorker:
                 )
                 if read_only.status == "parsed" and read_only.context is not None:
                     schedule_context = read_only.context
-                    strict_schedule_qa = True
                     route = "strict_schedule_read_only_after_generic"
                     await self._note_multimodal_route(event, route)
                     # Do not retain raw image bytes while the text-only Agent runs.
@@ -968,6 +966,7 @@ class BotWorker:
                 read_only = None
                 downloaded_image = None
                 del image
+                is_course_schedule_context = context.image_kind == "course_schedule"
                 await self._note_multimodal_route(event, route)
                 await self._run_agent_input(
                     event,
@@ -978,19 +977,15 @@ class BotWorker:
                     ),
                     calendar_mutation_policy=(
                         "course_schedule_strict_only"
-                        if strict_schedule_qa
+                        if is_course_schedule_context
                         else "normal"
                     ),
                     turn_effect_policy=(
                         "read_compute_only"
-                        if strict_schedule_qa
+                        if is_course_schedule_context
                         else "verify_on_demand"
                     ),
-                    source_kind=(
-                        "course_schedule_strict"
-                        if strict_schedule_qa
-                        else "generic_image"
-                    ),
+                    source_kind="generic_image",
                     run_generation=task_generation,
                 )
                 await self._ensure_task_not_stopped(

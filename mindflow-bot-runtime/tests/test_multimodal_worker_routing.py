@@ -2161,10 +2161,10 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     assert len(resources.calls) == 1
     assert len(runtime.calls) == 1
     ctx, turn_input = runtime.calls[0]
-    assert ctx.calendar_mutation_policy == "normal"
-    assert ctx.allows_calendar_mutation("create") is True
-    assert ctx.allows_calendar_mutation("delete") is True
-    assert ctx.turn_effect_policy == "verify_on_demand"
+    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
+    assert ctx.allows_calendar_mutation("create") is False
+    assert ctx.allows_calendar_mutation("delete") is False
+    assert ctx.turn_effect_policy == "read_compute_only"
     assert ctx.source_kind == "generic_image"
     assert ctx.user_request_text == "把这个讲座添加到日历"
     assert turn_input.trusted_image_context == {
@@ -2175,6 +2175,61 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
         "interaction_hint": "unknown",
     }
     assert sender.texts == ["answer:把这个讲座添加到日历"]
+
+
+@pytest.mark.parametrize(
+    "interaction_hint",
+    ("describe_only", "calendar_event_request"),
+)
+def test_course_schedule_non_question_hints_have_no_calendar_mutation_authority(
+    interaction_hint,
+):
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint=interaction_hint),
+        debounce=0,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+    ctx, _turn_input = runtime.calls[0]
+    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
+    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.allows_calendar_mutation("create") is False
+    assert ctx.allows_calendar_mutation("update") is False
+    assert ctx.allows_calendar_mutation("delete") is False
+
+
+def test_course_schedule_question_strict_failure_keeps_read_only_boundary():
+    class FailingStrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            from app.services.course_schedule_vision import CourseScheduleVisionError
+
+            raise CourseScheduleVisionError("strict parser failed")
+
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
+        schedule_vision=FailingStrictVision(),
+        debounce=0,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+    ctx, turn_input = runtime.calls[0]
+    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
+    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.source_kind == "generic_image"
+    assert turn_input.trusted_image_context["image_kind"] == "course_schedule"
+    assert ctx.allows_calendar_mutation("create") is False
 
 
 def test_strict_success_recent_followup_uses_authoritative_draft():
