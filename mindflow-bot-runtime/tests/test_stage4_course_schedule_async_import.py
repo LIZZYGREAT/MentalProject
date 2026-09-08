@@ -9,7 +9,11 @@ from app.domain.course_schedule_recurrence import (
     EXPAND_ALL_OCCURRENCES,
     PRESERVE_SCHEDULE_PATTERN,
 )
-from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.repositories_course_schedule import (
+    CourseScheduleImportRepository,
+    CourseScheduleProviderIdentityConflict,
+)
+from app.integrations.feishu.cards import course_schedule_result_card
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from helpers import memory_database, participant
@@ -202,12 +206,162 @@ def test_created_write_is_monotonic_and_requires_stable_provider_identity():
     )
     repository.record_write_created(draft["id"], write["id"], "provider-1")
 
-    with pytest.raises(ValueError, match="provider event identity conflict"):
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
         repository.record_write_created(draft["id"], write["id"], "provider-2")
 
     persisted = repository.writes_for_import(draft["id"])[0]
-    assert persisted["status"] == "created"
+    assert persisted["status"] == "create_identity_conflict"
     assert persisted["provider_event_id"] == "provider-1"
+    assert persisted["provider_conflict_event_id"] == "provider-2"
+
+
+def test_identity_conflict_is_durable_and_cannot_finalize_as_success():
+    database = memory_database()
+    owner = participant(database, "STAGE4-CONFLICT")
+    repository, draft = _draft(database, owner.id)
+    service = CourseScheduleImportService(repository, RecordingCalendar(), Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+    repository.record_write_created(draft["id"], write["id"], "provider-1")
+
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
+        repository.record_write_created(draft["id"], write["id"], "provider-2")
+
+    final = repository.finalize_queued_import(draft["id"])
+    persisted = final["writes"][0]
+    assert final["status"] == "partial_failed"
+    assert final["items"][0]["status"] == "failed"
+    assert final["items"][0]["error_code"] == "provider_event_identity_conflict"
+    assert persisted["status"] == "create_identity_conflict"
+    assert persisted["provider_event_id"] == "provider-1"
+    assert persisted["provider_conflict_event_id"] == "provider-2"
+
+    result = service._result(final)
+    assert result["ok"] is False
+    assert result["error"] == "provider_event_identity_conflict"
+    assert "暂时不要重复导入" in result["reply_text"]
+
+
+def test_identity_conflict_cannot_be_blind_retried_from_confirm_card():
+    database = memory_database()
+    owner = participant(database, "STAGE4-CONFLICT-RETRY")
+    repository, draft = _draft(database, owner.id)
+    calendar = RecordingCalendar()
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+    repository.record_write_created(draft["id"], write["id"], "provider-1")
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
+        repository.record_write_created(draft["id"], write["id"], "provider-2")
+    repository.finalize_queued_import(draft["id"])
+
+    result = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert result["error"] == "provider_event_identity_conflict"
+    assert result["status"] == "partial_failed"
+    assert calendar.calls == []
+    card = course_schedule_result_card(
+        result["reply_text"],
+        status=result["status"],
+        import_id=result["import_id"],
+        error=result["error"],
+        recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+    )
+    assert "course_schedule_import_confirm" not in str(card)
+
+
+def test_runner_does_not_swallow_identity_conflict():
+    database = memory_database()
+    owner = participant(database, "STAGE4-RUNNER-CONFLICT")
+    repository, draft = _draft(database, owner.id)
+    calendar = RecordingCalendar()
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+    runner = _runner(service)
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    original_claim_write = repository.claim_write
+    original_record_created = repository.record_write_created
+    claim_count = 0
+    record_count = 0
+
+    def claim_write_for_duplicate(import_id, write_id):
+        nonlocal claim_count
+        claim_count += 1
+        claimed_write = original_claim_write(import_id, write_id)
+        if claimed_write is not None:
+            return claimed_write
+        return repository.writes_for_import(import_id)[0]
+
+    def record_two_provider_ids(import_id, write_id, provider_event_id):
+        nonlocal record_count
+        record_count += 1
+        return original_record_created(
+            import_id,
+            write_id,
+            "provider-1" if record_count == 1 else "provider-2",
+        )
+
+    repository.claim_write = claim_write_for_duplicate
+    repository.record_write_created = record_two_provider_ids
+    duplicate_draft = dict(claimed)
+    duplicate_draft["writes"] = [claimed["writes"][0], claimed["writes"][0]]
+
+    asyncio.run(runner._run_import(duplicate_draft))
+
+    final = repository.get(draft["id"])
+    write = repository.writes_for_import(draft["id"])[0]
+    assert claim_count == 2
+    assert record_count == 2
+    assert len(calendar.calls) == 2
+    assert final["status"] == "partial_failed"
+    assert write["status"] == "create_identity_conflict"
+    assert write["provider_event_id"] == "provider-1"
+    assert write["provider_conflict_event_id"] == "provider-2"
+
+
+def test_provider_event_id_overflow_fails_closed_without_truncation():
+    database = memory_database()
+    owner = participant(database, "STAGE4-ID-LENGTH")
+    repository, draft = _draft(database, owner.id)
+    service = CourseScheduleImportService(repository, RecordingCalendar(), Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+
+    with pytest.raises(ValueError, match="exceeds supported length"):
+        repository.record_write_created(draft["id"], write["id"], "x" * 257)
+
+    persisted = repository.writes_for_import(draft["id"])[0]
+    assert persisted["status"] == "creating"
+    assert persisted["provider_event_id"] is None
 
 
 def test_completion_card_failure_does_not_demote_durable_import():

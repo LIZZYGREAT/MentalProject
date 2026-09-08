@@ -181,7 +181,12 @@ def course_schedule_result_card(
         ))
         if status != "partial_failed":
             elements.append(_schedule_cancel_button(import_id))
-    elif status == "partial_failed" and import_id and recurrence_strategy:
+    elif (
+        error != "provider_event_identity_conflict"
+        and status == "partial_failed"
+        and import_id
+        and recurrence_strategy
+    ):
         elements.append(_schedule_action_button(
             import_id,
             "重试失败项",

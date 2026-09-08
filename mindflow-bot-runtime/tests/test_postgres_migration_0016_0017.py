@@ -1652,3 +1652,191 @@ def test_real_postgres_upgrade_0016_to_head_preserves_and_backfills():
         with engine.begin() as connection:
             connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         engine.dispose()
+
+
+def test_real_postgres_upgrade_0040_to_0041_repairs_legacy_course_schedule_writes():
+    try:
+        raw_url = optional_test_postgres_url()
+    except ValueError as exc:
+        pytest.fail(str(exc))
+    if raw_url is None:
+        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
+
+    schema = f"mindflow_course_schedule_migration_{uuid.uuid4().hex}"
+    participant_id = uuid.uuid4()
+    invalid_import_id = uuid.uuid4()
+    invalid_item_id = uuid.uuid4()
+    invalid_write_id = uuid.uuid4()
+    valid_import_id = uuid.uuid4()
+    valid_item_id = uuid.uuid4()
+    valid_write_id = uuid.uuid4()
+    now = datetime(2030, 1, 15, 2, 0, tzinfo=timezone.utc)
+    engine = build_engine(
+        raw_url,
+        connect_timeout_seconds=get_test_postgres_connect_timeout_seconds(),
+    )
+    config = Config(str(RUNTIME_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(RUNTIME_ROOT / "migrations"))
+
+    def insert_import(connection, import_id, source_message_id, completed_at):
+        connection.execute(
+            text(
+                """
+                INSERT INTO course_schedule_imports (
+                    id, participant_id, source_message_id, source_image_hash,
+                    status, semester_start_date, timezone, vision_model,
+                    structured_result, created_at, expires_at, confirmed_at,
+                    recurrence_strategy, recurrence_confirmed_at,
+                    completed_at, last_progress_at
+                ) VALUES (
+                    :id, :participant_id, :source_message_id, :source_image_hash,
+                    'succeeded', '2030-01-14', 'Asia/Shanghai', 'vision-model',
+                    '{}'::jsonb, :created_at, :expires_at, :confirmed_at,
+                    'preserve_schedule_pattern', :confirmed_at,
+                    :completed_at, :last_progress_at
+                )
+                """
+            ),
+            {
+                "id": import_id,
+                "participant_id": participant_id,
+                "source_message_id": source_message_id,
+                "source_image_hash": uuid.uuid4().hex * 2,
+                "created_at": now,
+                "expires_at": now + timedelta(days=1),
+                "confirmed_at": now,
+                "completed_at": completed_at,
+                "last_progress_at": completed_at,
+            },
+        )
+
+    def insert_item_and_write(
+        connection, import_id, item_id, write_id, source_identity, provider_event_id
+    ):
+        connection.execute(
+            text(
+                """
+                INSERT INTO course_schedule_import_items (
+                    id, import_id, item_index, course_name, weekday,
+                    start_time, end_time, location, week_rule_json,
+                    normalized_key, status
+                ) VALUES (
+                    :id, :import_id, 0, '迁移测试课程', 1,
+                    TIME '08:00', TIME '09:35', 'A101',
+                    '{}'::jsonb, :normalized_key, 'succeeded'
+                )
+                """
+            ),
+            {
+                "id": item_id,
+                "import_id": import_id,
+                "normalized_key": f"course-{item_id}",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO course_schedule_import_writes (
+                    id, import_id, item_id, occurrence_identity,
+                    source_identity, write_kind, summary, description,
+                    start_time, end_time, affected_dates_json, status,
+                    provider_event_id, error_code, created_at, updated_at
+                ) VALUES (
+                    :id, :import_id, :item_id, 'week-1', :source_identity,
+                    'single', '迁移测试课程', '', :created_at, :end_time,
+                    '[\"2030-01-14\"]'::jsonb, 'created',
+                    :provider_event_id, NULL, :created_at, :created_at
+                )
+                """
+            ),
+            {
+                "id": write_id,
+                "import_id": import_id,
+                "item_id": item_id,
+                "source_identity": source_identity,
+                "created_at": now,
+                "end_time": now + timedelta(hours=1),
+                "provider_event_id": provider_event_id,
+            },
+        )
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0040_course_schedule_import_ledger")
+            connection.execute(
+                text(
+                    "INSERT INTO participants (id, participant_code) "
+                    "VALUES (:id, 'COURSE-SCHEDULE-MIGRATION')"
+                ),
+                {"id": participant_id},
+            )
+            insert_import(connection, invalid_import_id, "legacy-invalid", now)
+            insert_item_and_write(
+                connection,
+                invalid_import_id,
+                invalid_item_id,
+                invalid_write_id,
+                "legacy-invalid-source",
+                None,
+            )
+            insert_import(connection, valid_import_id, "legacy-valid", now)
+            insert_item_and_write(
+                connection,
+                valid_import_id,
+                valid_item_id,
+                valid_write_id,
+                "legacy-valid-source",
+                "evt-valid",
+            )
+
+            command.upgrade(config, "0041_course_schedule_created_provider_id_guard")
+
+            invalid_write = connection.execute(
+                text(
+                    "SELECT status, provider_event_id, error_code "
+                    "FROM course_schedule_import_writes WHERE id = :id"
+                ),
+                {"id": invalid_write_id},
+            ).one()
+            assert invalid_write == (
+                "create_outcome_unknown",
+                None,
+                "legacy_missing_provider_event_id",
+            )
+            invalid_import = connection.execute(
+                text(
+                    "SELECT status, completed_at FROM course_schedule_imports "
+                    "WHERE id = :id"
+                ),
+                {"id": invalid_import_id},
+            ).one()
+            assert invalid_import.status == "partial_failed"
+            assert invalid_import.completed_at is None
+
+            valid_write = connection.execute(
+                text(
+                    "SELECT status, provider_event_id "
+                    "FROM course_schedule_import_writes WHERE id = :id"
+                ),
+                {"id": valid_write_id},
+            ).one()
+            assert valid_write == ("created", "evt-valid")
+
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        text(
+                            "UPDATE course_schedule_import_writes "
+                            "SET status = 'created', provider_event_id = NULL "
+                            "WHERE id = :id"
+                        ),
+                        {"id": invalid_write_id},
+                    )
+    finally:
+        config.attributes.pop("connection", None)
+        with engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()

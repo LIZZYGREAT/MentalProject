@@ -56,6 +56,24 @@ class CourseCorrectionAmbiguityError(ValueError):
         super().__init__("correction must identify exactly one course")
 
 
+class CourseScheduleProviderIdentityConflict(RuntimeError):
+    """Two provider identities were returned for one durable source identity."""
+
+    code = "provider_event_identity_conflict"
+
+    def __init__(
+        self,
+        existing_provider_event_id: str,
+        incoming_provider_event_id: str,
+    ) -> None:
+        self.existing_provider_event_id = existing_provider_event_id
+        self.incoming_provider_event_id = incoming_provider_event_id
+        super().__init__(
+            "provider identity conflict: "
+            f"{existing_provider_event_id} != {incoming_provider_event_id}"
+        )
+
+
 @dataclass(frozen=True)
 class CreateDraftOutcome:
     draft: dict[str, Any]
@@ -731,6 +749,22 @@ class CourseScheduleImportRepository:
                 return {**self._view(session, row), "queued": False}
             if row.status not in QUEUEABLE_STATUSES:
                 raise ValueError("draft is not queueable")
+            identity_conflict = session.execute(
+                select(CourseScheduleImportWrite)
+                .where(
+                    CourseScheduleImportWrite.import_id == row.id,
+                    CourseScheduleImportWrite.status == "create_identity_conflict",
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if identity_conflict is not None:
+                self._refresh_item_statuses(session, row.id)
+                session.flush()
+                return {
+                    **self._view(session, row),
+                    "queued": False,
+                    "identity_conflict": True,
+                }
             if row.recurrence_strategy not in {None, normalized_strategy}:
                 raise ValueError("course recurrence strategy is immutable")
             row.recurrence_strategy = normalized_strategy
@@ -910,6 +944,12 @@ class CourseScheduleImportRepository:
         now: datetime | None = None,
     ) -> None:
         updated_at = _aware(now or datetime.now(timezone.utc))
+        normalized_provider_id = str(provider_event_id or "").strip()
+        if not normalized_provider_id:
+            raise ValueError("created calendar write requires provider event id")
+        if len(normalized_provider_id) > 256:
+            raise ValueError("calendar provider event id exceeds supported length")
+        conflict: CourseScheduleProviderIdentityConflict | None = None
         with self.database.session() as session:
             draft = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
@@ -919,19 +959,37 @@ class CourseScheduleImportRepository:
             )
             if draft is None or row is None or row.import_id != draft.id:
                 return
-            normalized_provider_id = str(provider_event_id or "").strip()
-            if not normalized_provider_id:
-                raise ValueError("created calendar write requires provider event id")
             if row.status == "created":
                 if row.provider_event_id == normalized_provider_id:
                     return
-                raise ValueError("provider event identity conflict")
-            row.status = "created"
-            row.provider_event_id = normalized_provider_id[:256]
-            row.error_code = None
-            row.updated_at = updated_at
-            draft.last_progress_at = updated_at
-            self._refresh_item_statuses(session, draft.id)
+                row.status = "create_identity_conflict"
+                row.provider_conflict_event_id = normalized_provider_id
+                row.error_code = CourseScheduleProviderIdentityConflict.code
+                row.updated_at = updated_at
+                draft.last_progress_at = updated_at
+                self._refresh_item_statuses(session, draft.id)
+                conflict = CourseScheduleProviderIdentityConflict(
+                    str(row.provider_event_id or ""), normalized_provider_id
+                )
+            elif row.status == "create_identity_conflict":
+                if normalized_provider_id in {
+                    row.provider_event_id,
+                    row.provider_conflict_event_id,
+                }:
+                    return
+                conflict = CourseScheduleProviderIdentityConflict(
+                    str(row.provider_event_id or ""), normalized_provider_id
+                )
+            else:
+                row.status = "created"
+                row.provider_event_id = normalized_provider_id
+                row.provider_conflict_event_id = None
+                row.error_code = None
+                row.updated_at = updated_at
+                draft.last_progress_at = updated_at
+                self._refresh_item_statuses(session, draft.id)
+        if conflict is not None:
+            raise conflict
 
     def record_write_failure(
         self,
@@ -952,7 +1010,7 @@ class CourseScheduleImportRepository:
             )
             if draft is None or row is None or row.import_id != draft.id:
                 return
-            if row.status == "created":
+            if row.status in {"created", "create_identity_conflict"}:
                 # A late failure from an older attempt cannot demote the
                 # authoritative provider identity already persisted locally.
                 return
@@ -993,7 +1051,11 @@ class CourseScheduleImportRepository:
                 row.status = "succeeded"
                 row.completed_at = completed_at
             elif any(
-                write.status in {"create_failed", "create_outcome_unknown"}
+                write.status in {
+                    "create_failed",
+                    "create_outcome_unknown",
+                    "create_identity_conflict",
+                }
                 for write in writes
             ):
                 row.status = "partial_failed"
@@ -1011,7 +1073,9 @@ class CourseScheduleImportRepository:
             rows = session.execute(
                 select(CourseScheduleImportWrite).where(
                     CourseScheduleImportWrite.import_id == uuid.UUID(str(import_id)),
-                    CourseScheduleImportWrite.status == "created",
+                    CourseScheduleImportWrite.status.in_(
+                        {"created", "create_identity_conflict"}
+                    ),
                 )
             ).scalars()
             dates: set[date] = set()
@@ -1251,6 +1315,9 @@ class CourseScheduleImportRepository:
                 if provider_ids:
                     # Compatibility-only summary; the ledger is authoritative.
                     item.calendar_event_id = provider_ids[-1][:256]
+            elif "create_identity_conflict" in statuses:
+                item.status = "failed"
+                item.error_code = "provider_event_identity_conflict"
             elif statuses & {"creating", "create_outcome_unknown"}:
                 item.status = "running"
                 unknown = next(
@@ -1293,6 +1360,7 @@ class CourseScheduleImportRepository:
             "affected_dates": [str(value) for value in (row.affected_dates_json or [])],
             "status": row.status,
             "provider_event_id": row.provider_event_id,
+            "provider_conflict_event_id": row.provider_conflict_event_id,
             "error_code": row.error_code,
             "created_at": _aware(row.created_at).isoformat(),
             "updated_at": _aware(row.updated_at).isoformat(),

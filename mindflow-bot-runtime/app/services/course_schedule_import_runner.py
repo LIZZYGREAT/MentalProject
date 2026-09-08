@@ -13,6 +13,7 @@ from app.integrations.feishu.calendar import (
     CalendarMutationOutcomeUnknown,
 )
 from app.integrations.feishu.cards import course_schedule_result_card
+from app.repositories_course_schedule import CourseScheduleProviderIdentityConflict
 
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,15 @@ class CourseScheduleImportRunner:
                     claimed["id"],
                     provider_event_id,
                 )
+            except CourseScheduleProviderIdentityConflict as exc:
+                logger.error(
+                    "course_schedule_calendar_write_provider_identity_conflict "
+                    "import_id=%s write_id=%s existing=%s incoming=%s",
+                    import_id,
+                    claimed["id"],
+                    exc.existing_provider_event_id,
+                    exc.incoming_provider_event_id,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -237,11 +247,20 @@ class CourseScheduleImportRunner:
         outcome_unknown = any(
             row.get("status") == "create_outcome_unknown" for row in final_writes
         )
+        identity_conflict = any(
+            row.get("status") == "create_identity_conflict"
+            for row in final_writes
+        )
         try:
             await self.imports._finish_reconciliation(
                 reconciliation,
                 any_success=bool(created_dates),
-                outcome_unknown=outcome_unknown,
+                outcome_unknown=outcome_unknown or identity_conflict,
+                outcome_unknown_error=(
+                    "CourseScheduleProviderIdentityConflict"
+                    if identity_conflict
+                    else "CourseScheduleBatchOutcomeUnknown"
+                ),
             )
             if created_dates:
                 await self.imports._reconcile_forecasts(

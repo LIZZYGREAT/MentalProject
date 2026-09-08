@@ -177,6 +177,10 @@ def test_course_schedule_import_migration_extends_stage6_head():
         VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
     )
     assert migration_0041.down_revision == "0040_course_schedule_import_ledger"
+    migration_0042 = _migration(
+        VERSIONS / "0042_course_schedule_provider_identity_conflict.py"
+    )
+    assert migration_0042.down_revision == "0041_course_schedule_created_provider_id_guard"
 
 
 def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
@@ -184,14 +188,20 @@ def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
         VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
     )
     checks = []
+    statements = []
     monkeypatch.setattr(
         migration.op,
         "create_check_constraint",
         lambda name, table, condition: checks.append((name, table, condition)),
     )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
 
     migration.upgrade()
 
+    assert len(statements) == 2
+    assert "legacy_missing_provider_event_id" in statements[0]
+    assert "create_outcome_unknown" in statements[0]
+    assert "status = 'partial_failed'" in statements[1]
     assert checks == [
         (
             "ck_course_schedule_write_created_provider_id",
@@ -200,6 +210,37 @@ def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
             "AND trim(provider_event_id) <> '')",
         )
     ]
+
+
+def test_0042_adds_provider_identity_conflict_ledger(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0042_course_schedule_provider_identity_conflict.py"
+    )
+    columns = []
+    checks = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_constraint",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+
+    migration.upgrade()
+
+    assert columns == [
+        ("course_schedule_import_writes", "provider_conflict_event_id")
+    ]
+    assert "'create_identity_conflict'" in checks[0][2]
+    assert checks[1][0] == "ck_course_schedule_write_conflict_provider_ids"
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):

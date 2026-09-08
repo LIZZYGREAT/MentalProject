@@ -547,7 +547,8 @@ class CourseScheduleImportWrite(Base):
         UniqueConstraint("source_identity", name="uq_course_schedule_write_source"),
         CheckConstraint(
             "status IN ('planned','creating','created','create_failed',"
-            "'create_outcome_unknown','delete_pending','deleting','deleted',"
+            "'create_outcome_unknown','create_identity_conflict',"
+            "'delete_pending','deleting','deleted',"
             "'delete_failed','delete_outcome_unknown')",
             name="ck_course_schedule_write_status",
         ),
@@ -555,6 +556,13 @@ class CourseScheduleImportWrite(Base):
             "status <> 'created' OR (provider_event_id IS NOT NULL "
             "AND trim(provider_event_id) <> '')",
             name="ck_course_schedule_write_created_provider_id",
+        ),
+        CheckConstraint(
+            "status <> 'create_identity_conflict' OR ("
+            "provider_event_id IS NOT NULL AND trim(provider_event_id) <> '' "
+            "AND provider_conflict_event_id IS NOT NULL "
+            "AND trim(provider_conflict_event_id) <> '')",
+            name="ck_course_schedule_write_conflict_provider_ids",
         ),
         Index(
             "ix_course_schedule_write_import_status",
@@ -590,6 +598,9 @@ class CourseScheduleImportWrite(Base):
     affected_dates_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
     provider_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_conflict_event_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

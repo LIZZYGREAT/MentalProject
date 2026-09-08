@@ -162,6 +162,8 @@ class CourseScheduleImportService:
             status_card_message_id=status_card_message_id,
             status_card_chat_id=status_card_chat_id,
         )
+        if queued.get("identity_conflict"):
+            return self._result(queued)
         if queued.get("status") == "succeeded":
             return self._result(queued, already_completed=True)
         if not queued.get("queued") and queued.get("status") == "running":
@@ -258,6 +260,7 @@ class CourseScheduleImportService:
         *,
         any_success: bool,
         outcome_unknown: bool,
+        outcome_unknown_error: str = "CourseScheduleBatchOutcomeUnknown",
     ) -> None:
         if reconciliation is None:
             return
@@ -265,7 +268,7 @@ class CourseScheduleImportService:
         if outcome_unknown:
             method = repository.mark_remote_outcome_unknown
             await asyncio.to_thread(
-                method, reconciliation["id"], error_class="CourseScheduleBatchOutcomeUnknown"
+                method, reconciliation["id"], error_class=outcome_unknown_error
             )
         elif any_success:
             await asyncio.to_thread(
@@ -384,8 +387,17 @@ class CourseScheduleImportService:
             and item.get("error_code") == "calendar_not_connected"
             for item in draft["items"]
         )
+        identity_conflict = any(
+            item.get("error_code") == "provider_event_identity_conflict"
+            for item in draft["items"]
+        )
         if already_completed:
             text = "这份课程表已经添加过了，无需重复操作。"
+        elif identity_conflict:
+            text = (
+                "部分日程状态需要核对，请暂时不要重复导入。"
+                + strategy_text
+            )
         elif authorization_lost:
             text = (
                 "部分课程已经添加。\n剩余课程需要重新完成 /calendar 授权；"
@@ -407,7 +419,13 @@ class CourseScheduleImportService:
             "recurrence_strategy": draft.get("recurrence_strategy"),
             "succeeded": succeeded,
             "failed": failed,
-            **({"error": "calendar_not_connected"} if authorization_lost else {}),
+            **(
+                {"error": "provider_event_identity_conflict"}
+                if identity_conflict
+                else {"error": "calendar_not_connected"}
+                if authorization_lost
+                else {}
+            ),
             "reply_text": text,
         }
 
