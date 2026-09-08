@@ -518,12 +518,12 @@ class CourseScheduleImportRepository:
                 course["period_end"] = period_end
                 course["period_inference_source"] = "unknown"
                 course["period_confidence"] = None
-                preserve_image_time = bool(
-                    sources[index] == "image"
+                preserve_explicit_time = bool(
+                    _preserve_explicit_actual_time(sources[index])
                     and course.get("start_time")
                     and course.get("end_time")
                 )
-                if not preserve_image_time:
+                if not preserve_explicit_time:
                     singles = _load_period_mapping(
                         metadata.get("user_period_mapping")
                     )
@@ -828,6 +828,45 @@ class CourseScheduleImportRepository:
             session.flush()
             return self._view(session, row)
 
+    def requeue_startup_recoverables(
+        self, *, now: datetime | None = None
+    ) -> int:
+        """Requeue outcome-unknown imports once during process startup.
+
+        This is deliberately separate from the normal polling claim query. A
+        terminal ``partial_failed`` result remains user-retryable during the
+        current process, while an actual process restart gets one automatic
+        recovery attempt without creating a tight retry loop.
+        """
+
+        recovered_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(
+                        CourseScheduleImport.status == "partial_failed",
+                        select(CourseScheduleImportWrite.id)
+                        .where(
+                            CourseScheduleImportWrite.import_id
+                            == CourseScheduleImport.id,
+                            CourseScheduleImportWrite.status
+                            == "create_outcome_unknown",
+                        )
+                        .exists(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            for row in rows:
+                row.status = "queued"
+                row.completed_at = None
+                row.run_requested_at = recovered_at
+                row.last_progress_at = recovered_at
+                self._clear_run_lease(row)
+            session.flush()
+            return len(rows)
+
     def claim_write(
         self,
         import_id: uuid.UUID | str,
@@ -880,8 +919,15 @@ class CourseScheduleImportRepository:
             )
             if draft is None or row is None or row.import_id != draft.id:
                 return
+            normalized_provider_id = str(provider_event_id or "").strip()
+            if not normalized_provider_id:
+                raise ValueError("created calendar write requires provider event id")
+            if row.status == "created":
+                if row.provider_event_id == normalized_provider_id:
+                    return
+                raise ValueError("provider event identity conflict")
             row.status = "created"
-            row.provider_event_id = str(provider_event_id)[:256] or None
+            row.provider_event_id = normalized_provider_id[:256]
             row.error_code = None
             row.updated_at = updated_at
             draft.last_progress_at = updated_at
@@ -905,6 +951,14 @@ class CourseScheduleImportRepository:
                 CourseScheduleImportWrite, uuid.UUID(str(write_id)), with_for_update=True
             )
             if draft is None or row is None or row.import_id != draft.id:
+                return
+            if row.status == "created":
+                # A late failure from an older attempt cannot demote the
+                # authoritative provider identity already persisted locally.
+                return
+            if row.status in {"create_failed", "create_outcome_unknown"}:
+                # Terminal failure facts are also monotone until an explicit
+                # retry claims the write and moves it back to creating.
                 return
             row.status = "create_outcome_unknown" if outcome_unknown else "create_failed"
             row.error_code = str(error_code)[:128]

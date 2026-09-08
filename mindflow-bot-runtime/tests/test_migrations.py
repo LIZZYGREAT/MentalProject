@@ -169,6 +169,37 @@ def test_course_schedule_import_migration_extends_stage6_head():
         VERSIONS / "0039_course_schedule_recurrence_strategy.py"
     )
     assert migration_0039.down_revision == "0038_course_schedule_import"
+    migration_0040 = _migration(
+        VERSIONS / "0040_course_schedule_import_ledger.py"
+    )
+    assert migration_0040.down_revision == "0039_course_schedule_recurrence_strategy"
+    migration_0041 = _migration(
+        VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
+    )
+    assert migration_0041.down_revision == "0040_course_schedule_import_ledger"
+
+
+def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
+    )
+    checks = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+
+    migration.upgrade()
+
+    assert checks == [
+        (
+            "ck_course_schedule_write_created_provider_id",
+            "course_schedule_import_writes",
+            "status <> 'created' OR (provider_event_id IS NOT NULL "
+            "AND trim(provider_event_id) <> '')",
+        )
+    ]
 
 
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):

@@ -41,6 +41,7 @@ class CourseScheduleImportRunner:
         self._wake_event: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        self._startup_recovery_done = False
 
     def start(self) -> None:
         if self._closed:
@@ -88,6 +89,7 @@ class CourseScheduleImportRunner:
     async def recover_startup(self) -> int:
         """Resume queued jobs and expired running leases after process start."""
 
+        await self._run_startup_recovery()
         return await self.run_once()
 
     async def run_forever(self) -> None:
@@ -99,6 +101,8 @@ class CourseScheduleImportRunner:
             while not self._closed:
                 event.clear()
                 try:
+                    if not self._startup_recovery_done:
+                        await self._run_startup_recovery()
                     await self.run_once()
                 except asyncio.CancelledError:
                     raise
@@ -112,6 +116,17 @@ class CourseScheduleImportRunner:
                     pass
         except asyncio.CancelledError:
             raise
+
+    async def _run_startup_recovery(self) -> int:
+        if self._startup_recovery_done:
+            return 0
+        recovered = await asyncio.to_thread(
+            self.drafts.requeue_startup_recoverables
+        )
+        self._startup_recovery_done = True
+        if recovered:
+            self.wake()
+        return recovered
 
     async def _run_import(self, draft: dict[str, Any]) -> None:
         import_id = draft["id"]
@@ -164,6 +179,21 @@ class CourseScheduleImportRunner:
                     create_args["recurrence"] = claimed.get("recurrence")
                 created = await create(participant_id, **create_args)
                 provider_event_id = str((created or {}).get("id") or "")
+                if not provider_event_id.strip():
+                    await asyncio.to_thread(
+                        self.drafts.record_write_failure,
+                        import_id,
+                        claimed["id"],
+                        error_code="provider_event_id_missing",
+                        outcome_unknown=True,
+                    )
+                    logger.warning(
+                        "course_schedule_calendar_write_provider_id_missing "
+                        "import_id=%s write_id=%s",
+                        import_id,
+                        claimed["id"],
+                    )
+                    continue
                 await asyncio.to_thread(
                     self.drafts.record_write_created,
                     import_id,

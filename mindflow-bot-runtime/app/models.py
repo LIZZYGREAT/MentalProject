@@ -551,6 +551,11 @@ class CourseScheduleImportWrite(Base):
             "'delete_failed','delete_outcome_unknown')",
             name="ck_course_schedule_write_status",
         ),
+        CheckConstraint(
+            "status <> 'created' OR (provider_event_id IS NOT NULL "
+            "AND trim(provider_event_id) <> '')",
+            name="ck_course_schedule_write_created_provider_id",
+        ),
         Index(
             "ix_course_schedule_write_import_status",
             "import_id", "status", "created_at",

@@ -41,6 +41,7 @@ from app.repositories import (
 )
 from app.worker import BotWorker
 from app.services.course_schedule_import import CourseScheduleImportService
+from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from app.domain.course_schedule_recurrence import (
     EXPAND_ALL_OCCURRENCES,
     PRESERVE_SCHEDULE_PATTERN,
@@ -422,6 +423,12 @@ class Calendar:
         return await self.create_single_event(participant_id, **kwargs)
 
 
+def _runner(service):
+    runner = CourseScheduleImportRunner(service)
+    service.queue_notifier = runner.wake
+    return runner
+
+
 def test_confirm_owner_idempotency_cancel_and_partial_retry():
     database = memory_database()
     owner = participant(database, "P001")
@@ -431,10 +438,15 @@ def test_confirm_owner_idempotency_cancel_and_partial_retry():
     service = CourseScheduleImportService(repo, calendar, Tokens())
     with pytest.raises(PermissionError):
         asyncio.run(service.confirm(other.id, draft["id"]))
+    runner = _runner(service)
     result = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
-    assert result["succeeded"] == 1
+    assert result["status"] == "queued"
+    assert result["succeeded"] == 0
+    assert calendar.calls == []
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
     assert len(calendar.calls) == 1
     repeated = asyncio.run(service.confirm(owner.id, draft["id"]))
     assert "已经添加过" in repeated["reply_text"]
@@ -445,13 +457,19 @@ def test_confirm_owner_idempotency_cancel_and_partial_retry():
     repo2, draft2 = _draft(database2, owner2.id)
     failing = Calendar(fail=True)
     service2 = CourseScheduleImportService(repo2, failing, Tokens())
+    runner2 = _runner(service2)
     partial = asyncio.run(service2.confirm(
         owner2.id, draft2["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
-    assert partial["failed"] == 1
+    assert partial["status"] == "queued"
+    assert failing.calls == []
+    asyncio.run(runner2.run_once())
+    assert repo2.get(draft2["id"])["status"] == "partial_failed"
     failing.fail = False
     retried = asyncio.run(service2.confirm(owner2.id, draft2["id"]))
-    assert retried["succeeded"] == 1
+    assert retried["status"] == "queued"
+    asyncio.run(runner2.run_once())
+    assert repo2.get(draft2["id"])["status"] == "succeeded"
     assert len(failing.calls) == 2
 
     database3 = memory_database()
@@ -912,14 +930,19 @@ def test_partial_failed_import_remains_retryable_after_original_ttl():
     repo, draft = _draft(database, owner.id)
     calendar = Calendar(fail=True)
     service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
     first = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
-    assert first["status"] == "partial_failed"
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "partial_failed"
     _expire_draft_ttl(database, draft["id"])
     calendar.fail = False
     retried = asyncio.run(service.confirm(owner.id, draft["id"]))
-    assert retried["status"] == "succeeded"
+    assert retried["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
 
 
 def test_sync_download_timeout_holds_real_concurrency_slot_until_thread_exits():
@@ -996,10 +1019,13 @@ def test_batch_calendar_mutation_invalidates_and_enqueues_forecast_once():
         forecast_snapshots=forecasts,
         mutation_refresh=refresh,
     )
+    runner = _runner(service)
     result = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
-    assert result["succeeded"] == 1
+    assert result["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
     assert len(forecasts.calls) == 1
     assert len(refresh.calls) == 1
     assert forecasts.calls[0][3] == "course_schedule_import"
@@ -1085,40 +1111,31 @@ def test_restart_after_remote_create_does_not_duplicate_calendar_event():
     database = memory_database()
     owner = participant(database, "P104")
     repo, draft = _draft(database, owner.id)
-    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
-    claimed = repo.begin_confirmation(owner.id, draft["id"])
-    item = claimed["items"][0]
-    assert repo.claim_item(draft["id"], item["id"])
-    write = plan_course_writes(
-        claimed,
-        item,
-        strategy=PRESERVE_SCHEDULE_PATTERN,
-        timezone=ZoneInfo("Asia/Shanghai"),
-    )[0]
-    source_id = (
-        f"schedule:{draft['id']}:{PRESERVE_SCHEDULE_PATTERN}:"
-        f"{item['normalized_key']}:"
-        f"{write.occurrence_identity}"
-    )
     calendar = IdempotentCalendar()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    queued = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert queued["status"] == "queued"
+    claimed = repo.claim_next_import()
+    row = repo.claim_write(draft["id"], claimed["writes"][0]["id"])
+    source_id = row["source_identity"]
     asyncio.run(calendar.create_event(
         owner.id,
-        summary=write.summary,
-        start_time=write.start_time,
-        end_time=write.end_time,
-        description=write.description,
-        recurrence=write.recurrence,
+        summary=row["summary"],
+        start_time=datetime.fromisoformat(row["start_time"]),
+        end_time=datetime.fromisoformat(row["end_time"]),
+        description=row["description"],
+        recurrence=row["recurrence"],
         source_message_id=source_id,
     ))
     _expire_run_lease(database, draft["id"])
 
     restarted = CourseScheduleImportRepository(database)
-    result = asyncio.run(
-        CourseScheduleImportService(restarted, calendar, Tokens()).confirm(
-            owner.id, draft["id"]
-        )
-    )
-    assert result["status"] == "succeeded"
+    restarted_service = CourseScheduleImportService(restarted, calendar, Tokens())
+    restarted_runner = _runner(restarted_service)
+    assert asyncio.run(restarted_runner.recover_startup()) == 1
+    assert restarted.get(draft["id"])["status"] == "succeeded"
     assert len(calendar.events) == 1
     assert calendar.attempts == [source_id, source_id]
 
@@ -1127,22 +1144,29 @@ def test_partial_success_then_crash_can_resume_and_finalize():
     database = memory_database()
     owner = participant(database, "P105")
     repo, draft = _two_course_draft(database, owner.id, "partial-crash")
-    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
-    claimed = repo.begin_confirmation(owner.id, draft["id"])
-    first, second = claimed["items"]
-    assert repo.claim_item(draft["id"], first["id"])
-    repo.finish_item(draft["id"], first["id"], calendar_event_id="event-first")
-    assert repo.claim_item(draft["id"], second["id"])
+    calendar = Calendar()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    queued = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert queued["status"] == "queued"
+    claimed = repo.claim_next_import()
+    first = next(
+        write for write in claimed["writes"] if write["summary"] == "高等数学A"
+    )
+    second = next(
+        write for write in claimed["writes"] if write["summary"] == "线性代数"
+    )
+    assert repo.claim_write(draft["id"], first["id"])
+    repo.record_write_created(draft["id"], first["id"], "event-first")
+    assert repo.claim_write(draft["id"], second["id"])
     _expire_run_lease(database, draft["id"])
 
-    calendar = Calendar()
-    result = asyncio.run(
-        CourseScheduleImportService(
-            CourseScheduleImportRepository(database), calendar, Tokens()
-        ).confirm(owner.id, draft["id"])
-    )
-    assert result["status"] == "succeeded"
-    assert result["succeeded"] == 2
+    restarted = CourseScheduleImportRepository(database)
+    restarted_service = CourseScheduleImportService(restarted, calendar, Tokens())
+    restarted_runner = _runner(restarted_service)
+    assert asyncio.run(restarted_runner.recover_startup()) == 1
+    assert restarted.get(draft["id"])["status"] == "succeeded"
     assert [call["summary"] for call in calendar.calls] == ["线性代数"]
 
 
@@ -1196,6 +1220,7 @@ def test_calendar_authorize_then_same_draft_confirm_succeeds():
 
     tokens = ToggleTokens()
     service = CourseScheduleImportService(repo, calendar, tokens)
+    runner = _runner(service)
     first = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
@@ -1203,7 +1228,9 @@ def test_calendar_authorize_then_same_draft_confirm_succeeds():
     assert first["import_id"] == draft["id"]
     tokens.connected = True
     second = asyncio.run(service.confirm(owner.id, draft["id"]))
-    assert second["status"] == "succeeded"
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
     assert len(calendar.calls) == 1
 
 
@@ -1239,12 +1266,17 @@ def test_retry_failed_items_does_not_recreate_succeeded_items():
 
     calendar = FailSecondOnce()
     service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
     first = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
-    assert first["status"] == "partial_failed"
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "partial_failed"
     second = asyncio.run(service.confirm(owner.id, draft["id"]))
-    assert second["status"] == "succeeded"
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
     summaries = [call["summary"] for call in calendar.calls]
     assert summaries.count("高等数学A") == 1
     assert summaries.count("线性代数") == 2
@@ -1267,9 +1299,13 @@ def test_mid_batch_calendar_authorization_loss_preserves_strategy_and_resumes():
 
     calendar = LoseAuthorizationOnce()
     service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
     first = asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    first = service._result(repo.get(draft["id"]))
     assert first["status"] == "partial_failed"
     assert first["error"] == "calendar_not_connected"
     assert first["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
@@ -1278,7 +1314,9 @@ def test_mid_batch_calendar_authorization_loss_preserves_strategy_and_resumes():
     assert repo.get(draft["id"])["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
 
     second = asyncio.run(service.confirm(owner.id, draft["id"]))
-    assert second["status"] == "succeeded"
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
     summaries = [call["summary"] for call in calendar.calls]
     assert summaries.count("高等数学A") == 1
     assert summaries.count("线性代数") == 2
@@ -1584,6 +1622,36 @@ def test_period_only_correction_preserves_image_explicit_actual_time():
     ]
 
 
+def test_period_only_correction_preserves_user_explicit_actual_time():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-ACTUAL-TIME")
+    repo, draft = _draft(database, owner.id)
+
+    user_time = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        start_time="07:50",
+        end_time="09:25",
+    )
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert user_time["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user_actual"
+    ]
+    assert corrected["items"][0]["start_time"] == "07:50"
+    assert corrected["items"][0]["end_time"] == "09:25"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user_actual"
+    ]
+
+
 def test_period_correction_uses_default_only_without_image_or_user_override():
     database = memory_database()
     owner = participant(database, "CORRECTION-DEFAULT-TIME")
@@ -1804,9 +1872,11 @@ def test_cancel_reply_matches_persisted_terminal_status():
     owner = participant(database, "P110")
     repo, draft = _draft(database, owner.id)
     service = CourseScheduleImportService(repo, Calendar(), Tokens())
+    runner = _runner(service)
     asyncio.run(service.confirm(
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
+    asyncio.run(runner.run_once())
     succeeded = service.cancel(owner.id, draft["id"])
     assert succeeded["status"] == "succeeded"
     assert "不能再取消" in succeeded["reply_text"]
