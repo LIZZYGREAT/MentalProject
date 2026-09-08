@@ -30,6 +30,11 @@ ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
 EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
 INTERACTIVE_CONTEXT_FIELDS = {"semester_start_date", "period_time_mapping"}
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
+_EXPLICIT_ACTUAL_TIME_SOURCES = frozenset({"image", "user_actual"})
+
+
+def _preserve_explicit_actual_time(source: str | None) -> bool:
+    return source in _EXPLICIT_ACTUAL_TIME_SOURCES
 
 
 class UnfillableScheduleContextError(ValueError):
@@ -254,7 +259,7 @@ class CourseScheduleImportRepository:
             )
             items = self._items(session, row.id)
             for index, (course, item) in enumerate(zip(courses, items)):
-                if sources[index] == "image":
+                if _preserve_explicit_actual_time(sources[index]):
                     continue
                 resolved = resolve_period_time(
                     course.get("period_start"),
@@ -336,7 +341,7 @@ class CourseScheduleImportRepository:
             )
             items = self._items(session, row.id)
             for index, (course, item) in enumerate(zip(courses, items)):
-                if sources[index] == "image":
+                if _preserve_explicit_actual_time(sources[index]):
                     continue
                 resolved = resolve_period_time(
                     course.get("period_start"),

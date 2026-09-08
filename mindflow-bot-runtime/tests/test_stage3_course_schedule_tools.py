@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date
+from datetime import date, time
 import uuid
 
 from app.agent.context import AgentContext
@@ -284,3 +284,87 @@ def test_context_tool_is_atomic_when_mapping_validation_fails():
     assert unchanged["structured_result"]["_metadata"].get(
         "user_period_mapping"
     ) in (None, {})
+
+
+def _period_mapping(start="08:10", end="09:50"):
+    return {(1, 2): (time.fromisoformat(start), time.fromisoformat(end))}
+
+
+def test_user_actual_time_survives_semester_only_context_update():
+    database = memory_database()
+    owner = participant(database, "STAGE3-ACTUAL-SEMESTER")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id, actual_times=False)
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        start_time="08:20",
+        end_time="09:55",
+    )
+
+    updated = repo.apply_context_update(
+        owner.id, corrected["id"], semester_start_date=date(2026, 9, 7)
+    )
+    course = updated["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:20", "09:55")
+    assert updated["structured_result"]["_metadata"]["course_time_sources"][0] == (
+        "user_actual"
+    )
+
+
+def test_user_actual_time_survives_later_period_mapping():
+    database = memory_database()
+    owner = participant(database, "STAGE3-ACTUAL-MAPPING")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id, actual_times=False)
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        start_time="08:20",
+        end_time="09:55",
+    )
+
+    updated = repo.apply_context_update(
+        owner.id,
+        corrected["id"],
+        period_time_mapping=_period_mapping(),
+    )
+    course = updated["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:20", "09:55")
+    assert updated["structured_result"]["_metadata"]["course_time_sources"][0] == (
+        "user_actual"
+    )
+
+
+def test_default_time_can_be_overridden_by_user_period_mapping():
+    database = memory_database()
+    owner = participant(database, "STAGE3-DEFAULT-MAPPING")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id, actual_times=False)
+
+    updated = repo.apply_context_update(
+        owner.id, draft["id"], period_time_mapping=_period_mapping()
+    )
+    course = updated["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:10", "09:50")
+    assert updated["structured_result"]["_metadata"]["course_time_sources"][0] == (
+        "user"
+    )
+
+
+def test_image_actual_time_remains_authoritative_over_period_mapping():
+    database = memory_database()
+    owner = participant(database, "STAGE3-IMAGE-MAPPING")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id, actual_times=True)
+
+    updated = repo.apply_context_update(
+        owner.id, draft["id"], period_time_mapping=_period_mapping()
+    )
+    course = updated["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:00", "09:35")
+    assert updated["structured_result"]["_metadata"]["course_time_sources"][0] == (
+        "image"
+    )
