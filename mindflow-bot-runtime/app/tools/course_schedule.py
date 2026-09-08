@@ -232,16 +232,14 @@ class CourseScheduleTools:
             return {"ok": False, "error": "active_draft_not_found"}
         try:
             semester_value = arguments.get("semester_start_date")
-            if semester_value is not None:
-                semester_monday = date.fromisoformat(str(semester_value))
-                if semester_monday.weekday() != 0:
-                    return {"ok": False, "error": "semester_start_must_be_monday"}
-                draft = self.imports.drafts.set_semester_start_date(
-                    ctx.participant_id, draft["id"], semester_monday
-                )
+            semester_monday = (
+                date.fromisoformat(str(semester_value))
+                if semester_value is not None
+                else None
+            )
             entries = list(arguments.get("period_time_mapping") or [])
+            mapping: dict[int | tuple[int, int], tuple[time, time]] = {}
             if entries:
-                mapping: dict[int | tuple[int, int], tuple[time, time]] = {}
                 for entry in entries:
                     first = int(entry["period_start"])
                     last = int(entry["period_end"])
@@ -253,9 +251,12 @@ class CourseScheduleTools:
                     if end_clock <= start_clock:
                         raise ValueError("period mapping time range is invalid")
                     mapping[key] = (start_clock, end_clock)
-                draft = self.imports.drafts.set_period_time_mapping(
-                    ctx.participant_id, draft["id"], mapping
-                )
+            draft = self.imports.drafts.apply_context_update(
+                ctx.participant_id,
+                draft["id"],
+                semester_start_date=semester_monday,
+                period_time_mapping=mapping or None,
+            )
         except ValueError as exc:
             return {
                 "ok": False,

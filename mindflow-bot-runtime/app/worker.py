@@ -88,44 +88,24 @@ HELP_PATTERN = re.compile(
     r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
     re.IGNORECASE,
 )
-SCHEDULE_NOUN_PATTERN = re.compile(r"课表|课程表|这学期(?:的)?课表")
-WEAK_SCHEDULE_NOUN_PATTERN = re.compile(r"这些?课程|课程")
-SCHEDULE_WRITE_PATTERN = re.compile(r"导入|添加|加到|同步|放进|写进")
-CALENDAR_TARGET_PATTERN = re.compile(r"日历|飞书|日程")
-SCHEDULE_WRITE_NEGATION_PATTERN = re.compile(
-    r"(?:先|暂时)?别.{0,6}(?:导入|添加|加到|同步|放进|写进)"
-    r"|(?:不要|不用|不想).{0,8}(?:导入|添加|加到|同步|放进|写进)"
-    r"|暂时不导入|我?只想(?:看看|看一下|问|知道|了解)"
+# These are infrastructure gates only. Natural-language intent is delegated to
+# Generic Vision/Main Agent; this whitelist intentionally prefers precision.
+EXPLICIT_SCHEDULE_IMPORT_FAST_PATHS = frozenset(
+    {
+        "把这张课表导入",
+        "把这张课程表导入",
+        "把这个课表导入",
+        "把这个课程表导入",
+        "把这张课表导入日历",
+        "把这张课程表导入日历",
+        "把这张课表导入飞书日历",
+        "把这张课程表导入飞书日历",
+        "把这个课表导入日历",
+        "把这个课程表导入日历",
+        "把这个课表导入飞书日历",
+        "把这个课程表导入飞书日历",
+    }
 )
-SCHEDULE_IMPORT_INFORMATIONAL_PATTERN = re.compile(
-    r"(?:怎么|如何|为什么|是什么|怎么操作|如何操作).{0,24}"
-    r"(?:导入|添加|加到|同步|放进|写进)"
-    r"|(?:导入|添加|加到|同步|放进|写进).{0,24}"
-    r"(?:怎么|如何|为什么|是什么|教程|说明|步骤|方法|怎么操作|如何操作)"
-)
-SCHEDULE_WRITE_COMPLETION_QUESTION_PATTERN = re.compile(
-    r"有没有.{0,24}(?:导入|添加|加到|同步|放进|写进)"
-    r"|(?:导入|添加|加到|同步|放进|写进|成功|完成)"
-    r".{0,12}(?:了吗|了么|了没(?:有)?)"
-)
-SCHEDULE_WRITE_STATUS_QUESTION_PATTERN = re.compile(
-    r"(?:已经|已).{0,24}(?:导入|添加|加到|同步|放进|写进|成功|完成)"
-    r".{0,12}(?:了吗|了么|吗|么|[？?])"
-)
-SCHEDULE_WRITE_STATUS_PREFIX_PATTERN = re.compile(
-    r"(?:是否|是不是).{0,24}"
-    r"(?:导入|添加|加到|同步|放进|写进|成功|完成)"
-)
-SCHEDULE_WRITE_ACTION_REQUEST_PATTERN = re.compile(
-    r"(?:帮|替|给)我"
-    r"|(?:麻烦|拜托|请).{0,8}(?:帮|替|把|将)"
-    r"|能不能|可不可以|可以.{0,8}(?:帮|替|给)"
-)
-SCHEDULE_NON_CALENDAR_EDIT_PATTERN = re.compile(
-    r"(?:添加|加上|写入|写进).{0,10}(?:备注|说明|标注|注释)"
-)
-# This completed-image gate is intentionally precision-first. Ambiguous
-# references belong to downstream Agent semantics, not broader regex coverage.
 _EXPLICIT_RECENT_BARE_IMAGE_FOLLOWER = (
     r"(?=$|[\s，。！？,.!?；;：:]"
     r"|里|中|上|下|的|是|有|帮|请|再|看|怎|如|写|显|说|意|内|报|按)"
@@ -162,16 +142,14 @@ SCHEDULE_RECENT_FOLLOWUP_PATTERN = re.compile(
 SCHEDULE_RECENT_IMPORT_FOLLOWUPS = frozenset(
     {
         "帮我导入这个",
+        "帮我导入这个课表",
+        "帮我导入这个课程表",
         "帮我导入一下",
         "帮我加进去",
         "加进去吧",
         "同步一下",
         "放进去",
     }
-)
-SCHEDULE_QA_PATTERN = re.compile(
-    r"(?:周[一二三四五六日天].*(?:有什么课|上什么课|几节课|几点|什么时候)"
-    r"|(?:课表|课程表).*(?:有什么|哪些|几点|什么时候|怎么安排))"
 )
 
 
@@ -209,69 +187,14 @@ class RecentImageTaskHandle:
     stop_generation: int
 
 
-def is_schedule_write_status_question(text: str) -> bool:
-    value = str(text or "")
-    if SCHEDULE_WRITE_COMPLETION_QUESTION_PATTERN.search(value):
-        return True
-    if SCHEDULE_WRITE_ACTION_REQUEST_PATTERN.search(value):
-        return False
-    return bool(
-        SCHEDULE_WRITE_STATUS_QUESTION_PATTERN.search(value)
-        or SCHEDULE_WRITE_STATUS_PREFIX_PATTERN.search(value)
-    )
-
-
-def is_strong_schedule_import_intent(
-    text: str, *, image_kind: str | None = None
-) -> bool:
-    value = str(text or "")
-    if is_schedule_write_status_question(value):
-        return False
-    if SCHEDULE_WRITE_NEGATION_PATTERN.search(value):
-        return False
-    if (
-        SCHEDULE_IMPORT_INFORMATIONAL_PATTERN.search(value)
-        or SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
-    ):
-        return False
-    if not SCHEDULE_WRITE_PATTERN.search(value):
-        return False
-    if SCHEDULE_NOUN_PATTERN.search(value):
-        only_generic_add = bool(re.search(r"添加", value)) and not bool(
-            re.search(r"导入|加到|同步|放进|写进", value)
-        )
-        if only_generic_add and not CALENDAR_TARGET_PATTERN.search(value):
-            return False
-        return True
-    return image_kind == "course_schedule" and bool(
-        CALENDAR_TARGET_PATTERN.search(value)
-        or WEAK_SCHEDULE_NOUN_PATTERN.search(value)
-    )
-
-
-def is_schedule_qa_intent(text: str) -> bool:
-    value = str(text or "")
-    return bool(SCHEDULE_QA_PATTERN.search(value)) and not (
-        is_strong_schedule_import_intent(value)
-    )
+def is_explicit_schedule_import_fast_path(text: str) -> bool:
+    value = "".join(str(text or "").strip().split()).rstrip("。！？?!")
+    return value in EXPLICIT_SCHEDULE_IMPORT_FAST_PATHS
 
 
 def is_schedule_recent_import_request(text: str) -> bool:
     value = str(text or "").strip().rstrip("。！!")
     return value in SCHEDULE_RECENT_IMPORT_FOLLOWUPS
-
-
-def is_direct_image_calendar_request(text: str) -> bool:
-    value = str(text or "")
-    if is_schedule_write_status_question(value):
-        return False
-    return bool(
-        SCHEDULE_WRITE_PATTERN.search(value)
-        and CALENDAR_TARGET_PATTERN.search(value)
-        and not SCHEDULE_WRITE_NEGATION_PATTERN.search(value)
-        and not SCHEDULE_IMPORT_INFORMATIONAL_PATTERN.search(value)
-        and not SCHEDULE_NON_CALENDAR_EDIT_PATTERN.search(value)
-    )
 
 
 class AgentRuntimeProtocol(Protocol):
@@ -891,7 +814,7 @@ class BotWorker:
             user_text = "\n".join(
                 item.text.strip() for item in attached if item.text.strip()
             )
-            if is_strong_schedule_import_intent(user_text):
+            if is_explicit_schedule_import_fast_path(user_text):
                 route = "strict_schedule_fast_path"
                 await self._note_multimodal_route(event, route)
                 outcome = await self._handle_schedule_image(
@@ -920,15 +843,43 @@ class BotWorker:
                 return
             downloaded_image = None
             read_only = None
-            if is_schedule_qa_intent(user_text):
-                read_only = await self._parse_schedule_read_only(event)
-                downloaded_image = read_only.downloaded_image
+            strict_schedule_qa = False
+            if self.generic_image_vision is None or self.message_resources is None:
+                await self._deliver(
+                    event,
+                    "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
+                )
+                await self.multimodal_turns.cancel(turn)
+                consumption_finished = True
+                dispatch_late = True
+                return
+            async with self._schedule_image_semaphore:
+                image = downloaded_image
+                if image is None:
+                    image = await self.message_resources.download_image(
+                        event.message_id, str(event.image_key or "")
+                    )
+                context: GenericImageContext = await self.generic_image_vision.inspect(
+                    image.data, image.mime_type, user_text=user_text
+                )
+            await self._ensure_task_not_stopped(
+                participant.id, event.event_id, task_generation
+            )
+            if (
+                context.image_kind == "course_schedule"
+                and context.interaction_hint == "question"
+            ):
+                read_only = await self._parse_schedule_read_only(
+                    event, downloaded_image=image
+                )
                 if read_only.status == "parsed" and read_only.context is not None:
                     schedule_context = read_only.context
-                    read_only = None
-                    downloaded_image = None
-                    route = "strict_schedule_read_only"
+                    strict_schedule_qa = True
+                    route = "strict_schedule_read_only_after_generic"
                     await self._note_multimodal_route(event, route)
+                    # Do not retain raw image bytes while the text-only Agent runs.
+                    del read_only
+                    del image
                     await self._run_agent_input(
                         event,
                         participant,
@@ -954,32 +905,9 @@ class BotWorker:
                     consumption_finished = True
                     dispatch_late = True
                     return
-            if self.generic_image_vision is None or self.message_resources is None:
-                await self._deliver(
-                    event,
-                    "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
-                )
-                await self.multimodal_turns.cancel(turn)
-                consumption_finished = True
-                dispatch_late = True
-                return
-            async with self._schedule_image_semaphore:
-                image = downloaded_image
-                if image is None:
-                    image = await self.message_resources.download_image(
-                        event.message_id, str(event.image_key or "")
-                    )
-                context: GenericImageContext = await self.generic_image_vision.inspect(
-                    image.data, image.mime_type, user_text=user_text
-                )
-            await self._ensure_task_not_stopped(
-                participant.id, event.event_id, task_generation
-            )
             if (
                 context.image_kind == "course_schedule"
                 and context.interaction_hint == "course_import_request"
-            ) or is_strong_schedule_import_intent(
-                user_text, image_kind=context.image_kind
             ):
                 route = "strict_schedule_after_image_kind"
                 await self._note_multimodal_route(event, route)
@@ -1050,17 +978,17 @@ class BotWorker:
                     ),
                     calendar_mutation_policy=(
                         "course_schedule_strict_only"
-                        if context.image_kind == "course_schedule"
+                        if strict_schedule_qa
                         else "normal"
                     ),
                     turn_effect_policy=(
                         "read_compute_only"
-                        if context.image_kind == "course_schedule"
+                        if strict_schedule_qa
                         else "verify_on_demand"
                     ),
                     source_kind=(
                         "course_schedule_strict"
-                        if context.image_kind == "course_schedule"
+                        if strict_schedule_qa
                         else "generic_image"
                     ),
                     run_generation=task_generation,
@@ -1150,14 +1078,14 @@ class BotWorker:
             )
 
     async def _parse_schedule_read_only(
-        self, event: BotEvent
+        self, event: BotEvent, *, downloaded_image: object | None = None
     ) -> ScheduleReadOnlyOutcome:
         if self.schedule_vision is None or self.message_resources is None:
             return ScheduleReadOnlyOutcome("failed", None, None)
         image = None
         try:
             async with self._schedule_image_semaphore:
-                image = await self.message_resources.download_image(
+                image = downloaded_image or await self.message_resources.download_image(
                     event.message_id, str(event.image_key or "")
                 )
                 result = await self.schedule_vision.parse(
@@ -1263,7 +1191,7 @@ class BotWorker:
         strict_read_only_followup = False
         if (
             recent.image_kind == "course_schedule"
-            and is_schedule_qa_intent(event.text)
+            and bool(SCHEDULE_RECENT_FOLLOWUP_PATTERN.search(event.text))
             and not draft_id
             and trusted_context.get("route") != "strict_schedule_read_only"
         ):
@@ -1314,9 +1242,7 @@ class BotWorker:
                     "schedule": draft.get("structured_result"),
                     "items": draft.get("items"),
                 }
-        if is_schedule_recent_import_request(event.text) or is_strong_schedule_import_intent(
-            event.text, image_kind=recent.image_kind
-        ):
+        if is_schedule_recent_import_request(event.text):
             await self._ensure_task_not_stopped(
                 participant.id, event.event_id, task_generation
             )

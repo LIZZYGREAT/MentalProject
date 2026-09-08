@@ -293,6 +293,94 @@ class CourseScheduleImportRepository:
             session.flush()
             return self._view(session, row)
 
+    def apply_context_update(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        semester_start_date: date | None = None,
+        period_time_mapping: dict[int | tuple[int, int], tuple[time, time]] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically apply all missing schedule context in one transaction."""
+
+        if semester_start_date is None and not period_time_mapping:
+            raise ValueError("schedule context update is empty")
+        if semester_start_date is not None and semester_start_date.weekday() != 0:
+            raise ValueError("semester start date must be a Monday")
+        if period_time_mapping:
+            current_singles, current_ranges = split_period_mapping(period_time_mapping)
+        else:
+            current_singles, current_ranges = {}, {}
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session)
+            if row.status not in ACTIVE_DRAFT_STATUSES or row.recurrence_strategy:
+                raise ValueError("draft no longer accepts context")
+            structured = dict(row.structured_result or {})
+            courses = [dict(value) for value in structured.get("courses") or []]
+            metadata = dict(structured.get("_metadata") or {})
+            singles = _load_period_mapping(metadata.get("user_period_mapping"))
+            ranges = _load_period_range_overrides(
+                metadata.get("user_period_range_overrides")
+            )
+            singles.update(current_singles)
+            ranges.update(current_ranges)
+            stored_sources = metadata.get("course_time_sources")
+            sources = list(stored_sources) if isinstance(stored_sources, list) else []
+            sources.extend(
+                "image" if course.get("start_time") and course.get("end_time") else None
+                for course in courses[len(sources):]
+            )
+            items = self._items(session, row.id)
+            for index, (course, item) in enumerate(zip(courses, items)):
+                if sources[index] == "image":
+                    continue
+                resolved = resolve_period_time(
+                    course.get("period_start"),
+                    course.get("period_end"),
+                    period_mapping=singles,
+                    range_overrides=ranges,
+                )
+                if resolved is None:
+                    continue
+                start_clock, end_clock, source = resolved
+                course["start_time"] = start_clock.strftime("%H:%M")
+                course["end_time"] = end_clock.strftime("%H:%M")
+                item.start_time = start_clock
+                item.end_time = end_clock
+                sources[index] = source
+            if semester_start_date is not None:
+                row.semester_start_date = semester_start_date
+            structured["courses"] = courses
+            authoritative = ScheduleVisionResult.from_dict({
+                key: structured.get(key)
+                for key in (
+                    "document_type", "semester_label", "institution", "courses",
+                    "missing_context", "warnings",
+                )
+            })
+            missing = derive_required_context(
+                authoritative, semester_start_date=row.semester_start_date
+            )
+            structured["missing_context"] = sorted(missing)
+            metadata["course_time_sources"] = sources
+            metadata["user_period_mapping"] = {
+                str(period): [start.strftime("%H:%M"), end.strftime("%H:%M")]
+                for period, (start, end) in sorted(singles.items())
+            }
+            metadata["user_period_range_overrides"] = {
+                f"{first}-{last}": [start.strftime("%H:%M"), end.strftime("%H:%M")]
+                for (first, last), (start, end) in sorted(ranges.items())
+            }
+            structured["_metadata"] = metadata
+            row.structured_result = structured
+            row.status = "pending_context" if missing else "pending_confirmation"
+            session.flush()
+            return self._view(session, row)
+
     def apply_correction(
         self,
         participant_id: uuid.UUID,

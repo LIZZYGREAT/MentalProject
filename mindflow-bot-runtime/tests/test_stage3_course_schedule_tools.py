@@ -239,9 +239,48 @@ def test_context_tool_applies_user_period_mapping_and_semester_monday():
     )
 
     assert result.result["ok"] is True
+    assert result.result["draft"]["status"] == "pending_confirmation"
     course = result.result["draft"]["courses"][0]
     assert (course["start_time"], course["end_time"], course["time_source"]) == (
         "08:10",
         "09:50",
         "user",
     )
+
+
+def test_context_tool_is_atomic_when_mapping_validation_fails():
+    database = memory_database()
+    owner = participant(database, "STAGE3-ATOMIC")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id, actual_times=False)
+    verifier = _Verifier(
+        MutationIntentDecision("allow", "direct_action", "direct_request")
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    CourseScheduleTools(_Imports(repo), PresentationOutbox()).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "补充课表作息")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "course_schedule_update_active_context",
+            {
+                "semester_start_date": "2026-09-14",
+                "period_time_mapping": [
+                    {
+                        "period_start": 1,
+                        "period_end": 2,
+                        "start_time": "10:00",
+                        "end_time": "09:00",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert result.result["ok"] is False
+    unchanged = repo.get(draft["id"])
+    assert unchanged["semester_start_date"] == "2026-09-07"
+    assert unchanged["structured_result"]["_metadata"].get(
+        "user_period_mapping"
+    ) in (None, {})

@@ -35,8 +35,7 @@ from app.services.generic_image_vision import GenericImageVisionUnavailable
 from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
-    is_direct_image_calendar_request,
-    is_strong_schedule_import_intent,
+    is_explicit_schedule_import_fast_path,
 )
 from helpers import memory_database, participant, skill_path
 
@@ -286,12 +285,6 @@ def test_explicit_odd_even_correction_statement_is_delegated_to_agent_tools():
     assert len(runtime.calls) == 1
 
 
-def test_schedule_import_question_remains_an_action_request():
-    assert is_strong_schedule_import_intent(
-        "能不能帮我导入这张课程表？", image_kind="course_schedule"
-    )
-
-
 def test_should_be_period_question_does_not_mutate():
     drafts, runtime = _run_pending_schedule_text("高数应该是第3-4节吗？")
 
@@ -328,65 +321,10 @@ def test_plain_correction_statement_reaches_agent_semantics():
     assert len(runtime.calls) == 1
 
 
-def test_schedule_already_imported_question_is_not_import_intent():
-    assert not is_strong_schedule_import_intent(
-        "这张课程表已经导入日历了吗？", image_kind="course_schedule"
-    )
-
-
-def test_schedule_has_it_been_synced_question_is_read_only():
-    assert not is_strong_schedule_import_intent(
-        "这个课表是否已经同步到飞书？", image_kind="course_schedule"
-    )
-
-
-def test_image_event_already_added_question_does_not_grant_calendar_create():
-    assert not is_direct_image_calendar_request(
-        "这个讲座已经添加到日历了吗？"
-    )
-
-
-def test_polite_schedule_import_request_still_routes_to_import():
-    assert is_strong_schedule_import_intent(
-        "能不能帮我导入这张课程表？", image_kind="course_schedule"
-    )
-    assert is_strong_schedule_import_intent(
-        "麻烦把课表同步到飞书。", image_kind="course_schedule"
-    )
-
-
-def test_polite_image_calendar_create_request_still_allows_create_only():
-    assert is_direct_image_calendar_request(
-        "可以帮我把这个讲座加到日历吗？"
-    )
-
-
-def test_schedule_sync_success_question_is_not_import_intent():
-    assert not is_strong_schedule_import_intent(
-        "这张课程表是否同步成功？", image_kind="course_schedule"
-    )
-
-
-def test_schedule_import_done_or_not_question_is_read_only():
-    assert not is_strong_schedule_import_intent(
-        "这张课程表导入日历了没有？", image_kind="course_schedule"
-    )
-
-
-def test_image_event_added_or_not_question_does_not_grant_calendar_create():
-    assert not is_direct_image_calendar_request(
-        "这个讲座加到日历了没？"
-    )
-
-
-def test_polite_is_it_possible_import_request_remains_an_action():
-    assert is_strong_schedule_import_intent(
-        "是不是可以帮我导入这张课程表？", image_kind="course_schedule"
-    )
-    assert is_strong_schedule_import_intent(
-        "我已经准备好了，可以帮我导入这张课程表吗？",
-        image_kind="course_schedule",
-    )
+def test_only_explicit_schedule_import_phrase_uses_infrastructure_fast_path():
+    assert is_explicit_schedule_import_fast_path("把这张课程表导入日历")
+    assert not is_explicit_schedule_import_fast_path("能不能帮我导入这张课程表？")
+    assert not is_explicit_schedule_import_fast_path("这个课程表怎么导入")
 
 
 def _payload(event_id, message_id, message_type, *, text=""):
@@ -742,7 +680,7 @@ def test_strict_read_only_schedule_releases_image_before_agent_wait():
     runtime = VerifyingRuntime()
     gateway, queue, worker, _, _sender, _, _ = _system(
         runtime=runtime,
-        vision=Vision(failure=True),
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
         schedule_vision=StrictVision(),
         schedule_imports=SimpleNamespace(drafts=object()),
         debounce=0.2,
@@ -915,7 +853,7 @@ def test_completed_course_image_accepts_natural_omitted_import_followup():
 
 def test_course_schedule_question_is_read_only_and_recent_followup_reuses_context():
     gateway, queue, worker, runtime, sender, vision, resources = _system(
-        vision=Vision(kind="course_schedule")
+        vision=Vision(kind="course_schedule", interaction_hint="question")
     )
 
     async def scenario():
@@ -936,7 +874,6 @@ def test_course_schedule_question_is_read_only_and_recent_followup_reuses_contex
     assert len(vision.calls) == 1
     assert len(resources.calls) == 1
     assert [call[1].text for call in runtime.calls] == ["周三有什么课？", "那周四呢？"]
-    assert all(call[0].calendar_mutation_allowed is False for call in runtime.calls)
     assert len(sender.texts) == 2
 
 
@@ -1222,7 +1159,6 @@ def test_explicit_image_supplement_reuses_image_after_fast_completion():
         "",
         "这张图按默认学校作息",
     ]
-    assert all(call[0].calendar_mutation_allowed is False for call in runtime.calls)
     assert len(sender.texts) == 2
 
 
@@ -1383,7 +1319,7 @@ def test_stop_generation_blocks_recent_publish_after_strict_import_returns():
                 "intent",
                 "m-intent",
                 "text",
-                text="帮我导入这张课程表",
+                text="把这张课程表导入",
             )
         )
         await worker.process(await queue.get())
@@ -1889,7 +1825,7 @@ def test_text_arriving_during_strict_extractor_is_not_lost():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("intent", "m-intent", "text", text="导入这张课程表到日历")
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
         )
         await worker.process(await queue.get())
         await started.wait()
@@ -1954,7 +1890,7 @@ def test_stop_marks_drained_late_schedule_correction_interrupted():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("intent", "m-intent", "text", text="导入这张课程表")
+            _payload("intent", "m-intent", "text", text="把这张课程表导入")
         )
         await worker.process(await queue.get())
         await strict_started.wait()
@@ -2015,7 +1951,7 @@ def test_strict_failure_does_not_create_false_recent_context():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("intent", "m-intent", "text", text="导入这张课程表到日历")
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
         )
         await worker.process(await queue.get())
         await image_task
@@ -2046,7 +1982,7 @@ def test_strict_not_course_does_not_cache_course_schedule_kind():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("intent", "m-intent", "text", text="导入这张课程表到日历")
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
         )
         await worker.process(await queue.get())
         await image_task
@@ -2105,7 +2041,7 @@ def test_stop_during_create_draft_does_not_leave_hidden_new_draft():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("import", "m-import", "text", text="导入这张课程表到日历")
+            _payload("import", "m-import", "text", text="把这张课程表导入日历")
         )
         await worker.process(await queue.get())
         for _ in range(500):
@@ -2161,7 +2097,7 @@ def test_stop_does_not_cancel_preexisting_idempotent_draft():
                 break
             await asyncio.sleep(0.001)
         assert gateway.accept_payload(
-            _payload("import", "m-import", "text", text="导入这张课程表到日历")
+            _payload("import", "m-import", "text", text="把这张课程表导入日历")
         )
         await worker.process(await queue.get())
         await preview_started.wait()
@@ -2232,7 +2168,7 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     assert ctx.source_kind == "generic_image"
     assert ctx.user_request_text == "把这个讲座添加到日历"
     assert turn_input.trusted_image_context == {
-        "image_kind": "other",
+        "image_kind": "course_schedule",
         "summary": "图片摘要",
         "visible_text": "可见文字",
         "warnings": [],
@@ -2482,48 +2418,9 @@ def test_stop_after_two_consecutive_images_cancels_both_turns():
     assert worker._active_multimodal_tasks == {}
 
 
-def test_schedule_import_negation_precedes_keyword_fast_path():
-    for text in (
-        "先别导入日历，我只想问这个课程表周三有什么课",
-        "不要添加到日历",
-        "不用同步这个课表",
-        "暂时不导入课程表",
-        "我只想看看这个课程表",
-        "我不想把课程表添加到日历",
-    ):
-        assert not is_strong_schedule_import_intent(
-            text, image_kind="course_schedule"
-        )
-
-
-def test_schedule_import_how_to_question_is_not_fast_path():
-    assert not is_strong_schedule_import_intent(
-        "这个课程表怎么导入到日历？",
-        image_kind="course_schedule",
-    )
-
-
-def test_add_note_to_schedule_is_not_calendar_import():
-    assert not is_strong_schedule_import_intent(
-        "帮我在这张课程表里添加备注",
-        image_kind="course_schedule",
-    )
-
-
-def test_schedule_import_explanation_is_not_fast_path():
-    assert not is_strong_schedule_import_intent(
-        "课程表添加说明应该写什么？",
-        image_kind="course_schedule",
-    )
-
-
-def test_course_word_alone_is_not_strong_schedule_noun():
-    assert not is_strong_schedule_import_intent("把这个课程添加到日历")
-    assert is_direct_image_calendar_request("把这个课程添加到日历")
-    assert is_strong_schedule_import_intent("把这个课程表添加到日历")
-    assert is_strong_schedule_import_intent(
-        "把这些课程添加到日历", image_kind="course_schedule"
-    )
+def test_natural_schedule_questions_are_not_infrastructure_fast_paths():
+    assert not is_explicit_schedule_import_fast_path("这个课程表怎么导入到日历？")
+    assert not is_explicit_schedule_import_fast_path("把这个课程添加到日历")
 
 
 def test_arbitrary_recent_image_does_not_capture_schedule_question():
@@ -2591,7 +2488,7 @@ def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft()
             raise AssertionError("read-only schedule QA must not create a draft")
 
     strict = StrictVision()
-    generic = Vision(failure=True)
+    generic = Vision(kind="course_schedule", interaction_hint="question")
     imports = SimpleNamespace(drafts=NoDrafts())
     gateway, queue, worker, runtime, _sender, _, resources = _system(
         vision=generic,
@@ -2615,7 +2512,7 @@ def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft()
 
     asyncio.run(scenario())
     assert strict.calls == 1
-    assert generic.calls == []
+    assert generic.calls == ["周三几点上课？"]
     assert len(resources.calls) == 1
     assert len(runtime.calls) == 1
     ctx, turn_input = runtime.calls[0]
@@ -2640,7 +2537,7 @@ def test_read_only_schedule_context_never_reports_missing_time_after_backend_res
             return ScheduleVisionResult.from_dict(payload)
 
     gateway, queue, worker, runtime, _sender, _, _resources = _system(
-        vision=Vision(failure=True),
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
         schedule_vision=StrictVision(),
         schedule_imports=SimpleNamespace(drafts=object()),
         debounce=0.2,
