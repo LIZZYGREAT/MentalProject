@@ -1874,9 +1874,12 @@ def test_real_postgres_upgrade_0043_to_0045_backfills_compensation_refresh_outbo
             connection.execute(
                 text(
                     "INSERT INTO participants (id, participant_code) "
-                    "VALUES (:id, 'COURSE-SCHEDULE-REFRESH-MIGRATION')"
+                    "VALUES (:id, :participant_code)"
                 ),
-                {"id": participant_id},
+                {
+                    "id": participant_id,
+                    "participant_code": "COURSE-REFRESH-MIGRATION",
+                },
             )
             connection.execute(
                 text(
