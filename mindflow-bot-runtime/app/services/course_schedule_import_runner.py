@@ -121,6 +121,7 @@ class CourseScheduleImportRunner:
     async def _run_startup_recovery(self) -> int:
         if self._startup_recovery_done:
             return 0
+        await asyncio.to_thread(self.drafts.normalize_identity_conflicts)
         recovered = await asyncio.to_thread(
             self.drafts.requeue_startup_recoverables
         )

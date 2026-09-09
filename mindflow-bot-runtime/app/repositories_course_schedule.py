@@ -675,12 +675,15 @@ class CourseScheduleImportRepository:
     def validate_for_confirmation(
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
     ) -> dict[str, Any]:
+        checked_at = datetime.now(timezone.utc)
         with self.database.session() as session:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
             self._require_owner(row, participant_id)
-            self._expire_if_needed(row, session)
+            self._expire_if_needed(row, session, now=checked_at)
+            if self._has_identity_conflict(session, row.id):
+                self._normalize_identity_conflict_row(session, row, checked_at)
             return self._view(session, row)
 
     def set_recurrence_strategy(
@@ -738,6 +741,21 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             self._expire_if_needed(row, session, now=queued_at)
+            identity_conflict = session.execute(
+                select(CourseScheduleImportWrite)
+                .where(
+                    CourseScheduleImportWrite.import_id == row.id,
+                    CourseScheduleImportWrite.status == "create_identity_conflict",
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if identity_conflict is not None:
+                self._normalize_identity_conflict_row(session, row, queued_at)
+                return {
+                    **self._view(session, row),
+                    "queued": False,
+                    "identity_conflict": True,
+                }
             if row.status == "succeeded":
                 return {**self._view(session, row), "queued": False}
             if row.status in {"queued", "running"}:
@@ -749,22 +767,6 @@ class CourseScheduleImportRepository:
                 return {**self._view(session, row), "queued": False}
             if row.status not in QUEUEABLE_STATUSES:
                 raise ValueError("draft is not queueable")
-            identity_conflict = session.execute(
-                select(CourseScheduleImportWrite)
-                .where(
-                    CourseScheduleImportWrite.import_id == row.id,
-                    CourseScheduleImportWrite.status == "create_identity_conflict",
-                )
-                .limit(1)
-            ).scalar_one_or_none()
-            if identity_conflict is not None:
-                self._refresh_item_statuses(session, row.id)
-                session.flush()
-                return {
-                    **self._view(session, row),
-                    "queued": False,
-                    "identity_conflict": True,
-                }
             if row.recurrence_strategy not in {None, normalized_strategy}:
                 raise ValueError("course recurrence strategy is immutable")
             row.recurrence_strategy = normalized_strategy
@@ -875,19 +877,29 @@ class CourseScheduleImportRepository:
 
         recovered_at = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
+            unknown_exists = (
+                select(CourseScheduleImportWrite.id)
+                .where(
+                    CourseScheduleImportWrite.import_id == CourseScheduleImport.id,
+                    CourseScheduleImportWrite.status == "create_outcome_unknown",
+                )
+                .exists()
+            )
+            conflict_exists = (
+                select(CourseScheduleImportWrite.id)
+                .where(
+                    CourseScheduleImportWrite.import_id == CourseScheduleImport.id,
+                    CourseScheduleImportWrite.status == "create_identity_conflict",
+                )
+                .exists()
+            )
             rows = list(
                 session.execute(
                     select(CourseScheduleImport)
                     .where(
                         CourseScheduleImport.status == "partial_failed",
-                        select(CourseScheduleImportWrite.id)
-                        .where(
-                            CourseScheduleImportWrite.import_id
-                            == CourseScheduleImport.id,
-                            CourseScheduleImportWrite.status
-                            == "create_outcome_unknown",
-                        )
-                        .exists(),
+                        unknown_exists,
+                        ~conflict_exists,
                     )
                     .with_for_update()
                 ).scalars()
@@ -900,6 +912,37 @@ class CourseScheduleImportRepository:
                 self._clear_run_lease(row)
             session.flush()
             return len(rows)
+
+    def normalize_identity_conflicts(
+        self, *, now: datetime | None = None
+    ) -> int:
+        """Repair parent imports that predate atomic conflict aggregation."""
+
+        normalized_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            conflict_exists = (
+                select(CourseScheduleImportWrite.id)
+                .where(
+                    CourseScheduleImportWrite.import_id == CourseScheduleImport.id,
+                    CourseScheduleImportWrite.status == "create_identity_conflict",
+                )
+                .exists()
+            )
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(conflict_exists)
+                    .with_for_update()
+                ).scalars()
+            )
+            normalized = 0
+            for row in rows:
+                if self._normalize_identity_conflict_row(
+                    session, row, normalized_at
+                ):
+                    normalized += 1
+            session.flush()
+            return normalized
 
     def claim_write(
         self,
@@ -966,7 +1009,10 @@ class CourseScheduleImportRepository:
                 row.provider_conflict_event_id = normalized_provider_id
                 row.error_code = CourseScheduleProviderIdentityConflict.code
                 row.updated_at = updated_at
+                draft.status = "partial_failed"
+                draft.completed_at = None
                 draft.last_progress_at = updated_at
+                self._clear_run_lease(draft)
                 self._refresh_item_statuses(session, draft.id)
                 conflict = CourseScheduleProviderIdentityConflict(
                     str(row.provider_event_id or ""), normalized_provider_id
@@ -1283,6 +1329,39 @@ class CourseScheduleImportRepository:
                 .order_by(CourseScheduleImportItem.item_index)
             ).scalars()
         )
+
+    @staticmethod
+    def _has_identity_conflict(session: Any, import_id: uuid.UUID) -> bool:
+        return (
+            session.execute(
+                select(CourseScheduleImportWrite.id)
+                .where(
+                    CourseScheduleImportWrite.import_id == import_id,
+                    CourseScheduleImportWrite.status == "create_identity_conflict",
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+
+    @staticmethod
+    def _normalize_identity_conflict_row(
+        session: Any,
+        row: CourseScheduleImport,
+        normalized_at: datetime,
+    ) -> bool:
+        changed = bool(
+            row.status != "partial_failed"
+            or row.completed_at is not None
+            or row.run_claimed_at is not None
+            or row.run_claim_expires_at is not None
+        )
+        row.status = "partial_failed"
+        row.completed_at = None
+        row.last_progress_at = normalized_at
+        CourseScheduleImportRepository._clear_run_lease(row)
+        CourseScheduleImportRepository._refresh_item_statuses(session, row.id)
+        return changed
 
     @staticmethod
     def _refresh_item_statuses(session: Any, import_id: uuid.UUID) -> None:

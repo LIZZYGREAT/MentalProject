@@ -14,6 +14,7 @@ from app.repositories_course_schedule import (
     CourseScheduleProviderIdentityConflict,
 )
 from app.integrations.feishu.cards import course_schedule_result_card
+from app.models import CourseScheduleImport
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from helpers import memory_database, participant
@@ -235,6 +236,10 @@ def test_identity_conflict_is_durable_and_cannot_finalize_as_success():
     with pytest.raises(CourseScheduleProviderIdentityConflict):
         repository.record_write_created(draft["id"], write["id"], "provider-2")
 
+    immediate = repository.get(draft["id"])
+    assert immediate["status"] == "partial_failed"
+    assert immediate["completed_at"] is None
+    assert immediate["items"][0]["status"] == "failed"
     final = repository.finalize_queued_import(draft["id"])
     persisted = final["writes"][0]
     assert final["status"] == "partial_failed"
@@ -248,6 +253,96 @@ def test_identity_conflict_is_durable_and_cannot_finalize_as_success():
     assert result["ok"] is False
     assert result["error"] == "provider_event_identity_conflict"
     assert "暂时不要重复导入" in result["reply_text"]
+
+
+def test_identity_conflict_after_successful_finalize_repairs_parent_atomically():
+    database = memory_database()
+    owner = participant(database, "STAGE4-CONFLICT-CRASH")
+    repository, draft = _draft(database, owner.id)
+    service = CourseScheduleImportService(repository, RecordingCalendar(), Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+    repository.record_write_created(draft["id"], write["id"], "provider-1")
+    assert repository.finalize_queued_import(draft["id"])["status"] == "succeeded"
+
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
+        repository.record_write_created(draft["id"], write["id"], "provider-2")
+
+    restarted = CourseScheduleImportRepository(database)
+    restored = restarted.get(draft["id"])
+    assert restored["status"] == "partial_failed"
+    assert restored["completed_at"] is None
+    assert restored["writes"][0]["status"] == "create_identity_conflict"
+
+
+def test_confirm_repairs_stale_succeeded_parent_before_returning_result():
+    database = memory_database()
+    owner = participant(database, "STAGE4-CONFLICT-STALE-CONFIRM")
+    repository, draft = _draft(database, owner.id)
+    calendar = RecordingCalendar()
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+    repository.record_write_created(draft["id"], write["id"], "provider-1")
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
+        repository.record_write_created(draft["id"], write["id"], "provider-2")
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(draft["id"]))
+        row.status = "succeeded"
+        row.completed_at = row.last_progress_at
+
+    result = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert result["status"] == "partial_failed"
+    assert result["error"] == "provider_event_identity_conflict"
+    assert "已经添加过" not in result["reply_text"]
+    assert calendar.calls == []
+    assert repository.get(draft["id"])["status"] == "partial_failed"
+
+
+def test_startup_normalizes_stale_succeeded_parent_without_retrying_conflict():
+    database = memory_database()
+    owner = participant(database, "STAGE4-CONFLICT-STARTUP")
+    repository, draft = _draft(database, owner.id)
+    calendar = RecordingCalendar()
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    claimed = repository.claim_next_import()
+    write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+    repository.record_write_created(draft["id"], write["id"], "provider-1")
+    with pytest.raises(CourseScheduleProviderIdentityConflict):
+        repository.record_write_created(draft["id"], write["id"], "provider-2")
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(draft["id"]))
+        row.status = "succeeded"
+        row.completed_at = row.last_progress_at
+
+    runner = _runner(service)
+    assert asyncio.run(runner.recover_startup()) == 0
+    assert repository.get(draft["id"])["status"] == "partial_failed"
+    assert calendar.calls == []
 
 
 def test_identity_conflict_cannot_be_blind_retried_from_confirm_card():
