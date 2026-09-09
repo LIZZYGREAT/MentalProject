@@ -7,6 +7,7 @@ from concurrent.futures import CancelledError, TimeoutError as FutureTimeoutErro
 from importlib.metadata import PackageNotFoundError, version
 import logging
 import threading
+import types
 from typing import Any
 
 
@@ -21,6 +22,60 @@ class DeviceFlowCloseError(RuntimeError):
 
 class SdkBackgroundShutdownError(RuntimeError):
     """The SDK background event loop did not finish a clean shutdown."""
+
+
+@types.coroutine
+def _noop_device_flow_close_coroutine() -> Any:
+    """Return a coroutine without native-coroutine finalizer warnings.
+
+    SDK 1.2.0 constructs the coroutine before calling
+    ``run_coroutine_threadsafe``.  A generator-based coroutine is still
+    accepted by asyncio, but if the SDK loses the loop-close race before it
+    can schedule it, garbage collection can close it without emitting
+    ``coroutine was never awaited``.
+    """
+
+    if False:
+        yield None
+    return None
+
+
+class _DeviceFlowCloseNoopAdapter:
+    """Preserve the DeviceFlow shape while making SDK's second close inert."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def close(self) -> Any:
+        return _noop_device_flow_close_coroutine()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def _install_device_flow_close_noop(channel: Any, device_flow: Any) -> None:
+    """Make the SDK-owned second DeviceFlow close a safe no-op.
+
+    This is intentionally called only after the compatibility pre-close has
+    been scheduled, so the original client remains the sole resource-close
+    owner.  The stopped channel is not reused, so restoring the private field
+    would only reopen the duplicate-close race.
+    """
+
+    adapter = _DeviceFlowCloseNoopAdapter(device_flow)
+    try:
+        channel._device_flow = adapter
+        return
+    except BaseException:
+        # A compatible test double/build may expose the channel field as
+        # read-only while still allowing instance method replacement.
+        try:
+            device_flow.close = adapter.close
+            return
+        except BaseException:
+            raise DeviceFlowCloseError(
+                "Feishu DeviceFlow close owner could not be installed"
+            )
 
 
 def _installed_sdk_version() -> str | None:
@@ -242,6 +297,22 @@ def stop_feishu_channel_cleanly(
             )
             if shutdown_error is not exc:
                 shutdown_error.__cause__ = exc
+
+
+    # SDK 1.2.0's public stop() unconditionally schedules another
+    # ``self._device_flow.close()`` while the background loop is still alive.
+    # The compatibility close above is the sole real close owner; make that
+    # second SDK call inert before invoking the public API.  Install the
+    # adapter even when the first schedule lost a loop-close race, so the SDK
+    # cannot create an unowned native coroutine during its own stop path.
+    try:
+        _install_device_flow_close_noop(channel, device_flow)
+    except BaseException as exc:
+        if shutdown_error is None:
+            shutdown_error = DeviceFlowCloseError(
+                "Feishu DeviceFlow close owner could not be installed"
+            )
+            shutdown_error.__cause__ = exc
 
     try:
         channel.stop()

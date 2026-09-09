@@ -204,6 +204,26 @@ class ControlledDeviceFlow:
             self.unblock_start.set()
 
 
+class CountingDeviceFlow(ControlledDeviceFlow):
+    def __init__(
+        self,
+        close_started,
+        close_allowed,
+        close_finished,
+        unblock_start,
+        close_call_count,
+    ):
+        super().__init__(
+            close_started, close_allowed, close_finished, unblock_start
+        )
+        self.close_call_count = close_call_count
+
+    async def close(self):
+        with self.close_call_count.get_lock():
+            self.close_call_count.value += 1
+        await super().close()
+
+
 class DeviceFlowFakeChannel:
     """Model the SDK background loop and its private DeviceFlow client."""
 
@@ -245,6 +265,65 @@ class DeviceFlowFakeChannel:
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
         self._bg_thread.join(2.0)
         self._bg_loop.close()
+
+
+class SdkLikeDeviceFlowFakeChannel(DeviceFlowFakeChannel):
+    """Model SDK 1.2.0 public stop(), including its second DeviceFlow close."""
+
+    def __init__(
+        self,
+        close_started,
+        close_allowed,
+        close_finished,
+        public_stop_called,
+        close_call_count,
+        public_stop_call_count,
+        bg_thread_stopped,
+        bg_loop_closed,
+        **kwargs,
+    ):
+        super().__init__(
+            close_started,
+            close_allowed,
+            close_finished,
+            public_stop_called,
+            **kwargs,
+        )
+        self._device_flow = CountingDeviceFlow(
+            close_started,
+            close_allowed,
+            close_finished,
+            self._start_unblocked,
+            close_call_count,
+        )
+        self.public_stop_call_count = public_stop_call_count
+        self.bg_thread_stopped = bg_thread_stopped
+        self.bg_loop_closed = bg_loop_closed
+
+    def stop(self):
+        with self.public_stop_call_count.get_lock():
+            self.public_stop_call_count.value += 1
+        self.public_stop_called.set()
+        self._start_unblocked.set()
+        try:
+            if self._bg_loop.is_running():
+                # This intentionally mirrors lark-channel-sdk==1.2.0. The
+                # production compatibility layer must make this second call
+                # a no-op after it has already closed the real DeviceFlow.
+                close_future = asyncio.run_coroutine_threadsafe(
+                    self._device_flow.close(), self._bg_loop
+                )
+                try:
+                    close_future.result(timeout=1.0)
+                except Exception:
+                    close_future.exception()
+        finally:
+            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+            self._bg_thread.join(2.0)
+            if not self._bg_thread.is_alive():
+                self.bg_thread_stopped.set()
+            self._bg_loop.close()
+            self.bg_loop_closed.set()
 
 
 class PendingBackgroundTaskFakeChannel(DeviceFlowFakeChannel):
@@ -489,6 +568,10 @@ def test_gateway_precloses_sdk_device_flow_before_public_stop():
     close_allowed = context.Event()
     close_finished = context.Event()
     public_stop_called = context.Event()
+    close_call_count = context.Value("i", 0)
+    public_stop_call_count = context.Value("i", 0)
+    bg_thread_stopped = context.Event()
+    bg_loop_closed = context.Event()
     database = memory_database()
     gateway = FeishuGateway(
         "cli_test",
@@ -497,11 +580,15 @@ def test_gateway_precloses_sdk_device_flow_before_public_stop():
         BotEventRepository(database),
         asyncio.Queue(maxsize=2),
         channel_factory=partial(
-            DeviceFlowFakeChannel,
+            SdkLikeDeviceFlowFakeChannel,
             close_started,
             close_allowed,
             close_finished,
             public_stop_called,
+            close_call_count,
+            public_stop_call_count,
+            bg_thread_stopped,
+            bg_loop_closed,
         ),
         process_context=context,
         start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
@@ -519,6 +606,10 @@ def test_gateway_precloses_sdk_device_flow_before_public_stop():
         await stop_task
         assert close_finished.is_set()
         assert public_stop_called.is_set()
+        assert close_call_count.value == 1
+        assert public_stop_call_count.value == 1
+        assert bg_thread_stopped.is_set()
+        assert bg_loop_closed.is_set()
         assert not gateway.is_running
 
     asyncio.run(scenario())
@@ -575,6 +666,10 @@ def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
     close_allowed = context.Event()
     close_finished = context.Event()
     public_stop_called = context.Event()
+    close_call_count = context.Value("i", 0)
+    public_stop_call_count = context.Value("i", 0)
+    bg_thread_stopped = context.Event()
+    bg_loop_closed = context.Event()
     database = memory_database()
     gateway = FeishuGateway(
         "cli_test",
@@ -583,11 +678,15 @@ def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
         BotEventRepository(database),
         asyncio.Queue(maxsize=2),
         channel_factory=partial(
-            DeviceFlowFakeChannel,
+            SdkLikeDeviceFlowFakeChannel,
             close_started,
             close_allowed,
             close_finished,
             public_stop_called,
+            close_call_count,
+            public_stop_call_count,
+            bg_thread_stopped,
+            bg_loop_closed,
         ),
         process_context=context,
         start_timeout_seconds=SPAWN_START_TIMEOUT_SECONDS,
@@ -608,6 +707,10 @@ def test_gateway_reports_device_flow_close_timeout_as_shutdown_error():
             assert close_started.is_set()
             assert close_finished.is_set()
             assert public_stop_called.is_set()
+            assert close_call_count.value == 1
+            assert public_stop_call_count.value == 1
+            assert bg_thread_stopped.is_set()
+            assert bg_loop_closed.is_set()
             assert not gateway.is_running
             await asyncio.sleep(0)
             assert not any(
