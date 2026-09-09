@@ -795,3 +795,99 @@ def test_course_schedule_identity_conflict_uses_effect_dates_once():
     assert {
         target for _participant_id, target, *_rest in coordinator.refreshes
     } == expected_direct
+
+
+def test_course_schedule_live_lease_blocks_recovery_before_forecast_invalidation():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-LIVE-LEASE")
+        repository, draft = _draft(database, owner.id, source="live-lease")
+        calendar = RecordingCalendar()
+        reconciliations, coordinator, refresh, service, _runner_instance = (
+            _forecast_import_stack(database, owner, repository, calendar)
+        )
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        claimed = repository.claim_next_import()
+        effect_dates = {
+            date.fromisoformat(value)
+            for write in claimed["writes"]
+            for value in write["affected_dates"]
+        }
+        reconciliation = await service._prepare_reconciliation(
+            owner.id, claimed, effect_dates, {}
+        )
+        claim_token = uuid.uuid4()
+        live = reconciliations.claim_processing(
+            reconciliation["id"], claim_token=claim_token
+        )
+
+        refresh.start()
+        bound = await service._finish_reconciliation(
+            live,
+            effect_dates=effect_dates,
+            outcome_unknown=False,
+            claim_token=claim_token,
+        )
+        recovered = await refresh.recover_now()
+        await service._reconcile_forecasts(
+            owner.id, effect_dates, reconciliation=bound
+        )
+        await refresh.wait_idle()
+        await refresh.close()
+        return recovered, coordinator, service._mutation_work(effect_dates)[1]
+
+    recovered, coordinator, expected_direct = asyncio.run(scenario())
+
+    invalidated = set().union(
+        *(targets for _participant_id, targets, _reason in coordinator.forecasts.invalidations)
+    )
+    assert recovered == 0
+    assert invalidated == expected_direct
+    assert len(coordinator.forecasts.invalidations) == 1
+
+
+def test_course_schedule_recovery_owner_rejects_live_bind():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-RECOVERY-OWNER")
+        repository, draft = _draft(database, owner.id, source="recovery-owner")
+        calendar = RecordingCalendar()
+        reconciliations, coordinator, refresh, service, _runner_instance = (
+            _forecast_import_stack(database, owner, repository, calendar)
+        )
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        claimed = repository.claim_next_import()
+        effect_dates = {
+            date.fromisoformat(value)
+            for write in claimed["writes"]
+            for value in write["affected_dates"]
+        }
+        reconciliation = await service._prepare_reconciliation(
+            owner.id, claimed, effect_dates, {}
+        )
+        recovery_token = uuid.uuid4()
+        recovery_claim = reconciliations.claim_processing(
+            reconciliation["id"], claim_token=recovery_token
+        )
+        live_result = await service._finish_reconciliation(
+            reconciliation,
+            effect_dates=effect_dates,
+            outcome_unknown=False,
+            claim_token=uuid.uuid4(),
+        )
+        await refresh.close()
+        return recovery_claim, live_result, coordinator
+
+    recovery_claim, live_result, coordinator = asyncio.run(scenario())
+
+    assert recovery_claim is not None
+    assert live_result is None
+    assert coordinator.forecasts.invalidations == []

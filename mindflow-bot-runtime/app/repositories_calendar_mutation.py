@@ -101,6 +101,7 @@ class CalendarMutationReconciliationRepository:
         effect_dates: set[date],
         outcome_unknown: bool,
         outcome_unknown_error: str = "CourseScheduleBatchOutcomeUnknown",
+        claim_token: uuid.UUID | str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         """Bind course reconciliation work to confirmed Calendar effects.
@@ -128,6 +129,27 @@ class CalendarMutationReconciliationRepository:
                 return None
 
             work = dict(row.work_json or {})
+            current_token = str(work.get("processing_claim_token") or "")
+            current_until = None
+            raw_until = work.get("processing_claim_until")
+            try:
+                current_until = _aware(datetime.fromisoformat(str(raw_until)))
+            except (TypeError, ValueError):
+                pass
+            if claim_token is not None:
+                # A live course runner may only bind the effects while its
+                # durable owner lease is still current.  If recovery won the
+                # row, the live path must leave downstream work to recovery.
+                if (
+                    current_token != str(claim_token)
+                    or current_until is None
+                    or current_until <= changed_at
+                ):
+                    return None
+            elif current_token and current_until and current_until > changed_at:
+                # A caller without an owner token must not mutate a row held
+                # by another live/recovery owner.
+                return None
             planned_targets = list(work.get("targets") or [])
             bound_targets: list[dict[str, Any]] = []
             for item in planned_targets:
@@ -165,7 +187,9 @@ class CalendarMutationReconciliationRepository:
                 # crash between these two steps must remain recoverable.
                 work.pop("fenced_at", None)
                 row.status = "remote_committed"
-                row.next_attempt_at = changed_at
+                row.next_attempt_at = (
+                    current_until if current_until and current_until > changed_at else changed_at
+                )
                 row.last_error_class = (
                     str(outcome_unknown_error)[:128]
                     if outcome_unknown
@@ -181,7 +205,9 @@ class CalendarMutationReconciliationRepository:
                 work.pop("processing_claim_token", None)
                 work.pop("processing_claim_until", None)
                 row.status = "remote_outcome_unknown"
-                row.next_attempt_at = changed_at
+                row.next_attempt_at = (
+                    current_until if current_until and current_until > changed_at else changed_at
+                )
                 row.last_error_class = str(outcome_unknown_error)[:128]
                 row.resolved_at = None
             else:

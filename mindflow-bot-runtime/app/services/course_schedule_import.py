@@ -300,23 +300,40 @@ class CourseScheduleImportService:
         effect_dates: set[date],
         outcome_unknown: bool,
         outcome_unknown_error: str = "CourseScheduleBatchOutcomeUnknown",
-    ) -> None:
+        claim_token: uuid.UUID | str | None = None,
+    ) -> dict[str, Any] | None:
         if reconciliation is None:
-            return
+            return None
         repository = self.mutation_refresh.reconciliations
+        claim = getattr(repository, "claim_processing", None)
+        if claim_token is None and callable(claim):
+            # Direct callers of this helper still get the same durable owner
+            # protocol as the background runner.  This also closes the window
+            # between binding the effects and a concurrent recovery scan.
+            claim_token = uuid.uuid4()
+            claimed = await asyncio.to_thread(
+                claim,
+                reconciliation["id"],
+                claim_token=claim_token,
+            )
+            if claimed is None:
+                return None
+            reconciliation = claimed
         binder = getattr(repository, "bind_course_schedule_effect_dates", None)
         if not callable(binder):
             # Compatibility for injected repositories from older callers. The
             # production repository always has the atomic binding method.
             await asyncio.to_thread(repository.mark_fenced, reconciliation["id"])
-            return
-        await asyncio.to_thread(
+            return reconciliation
+        bound = await asyncio.to_thread(
             binder,
             reconciliation["id"],
             effect_dates=set(effect_dates),
             outcome_unknown=bool(outcome_unknown),
             outcome_unknown_error=outcome_unknown_error,
+            claim_token=claim_token,
         )
+        return bound
 
     async def _reconcile_forecasts(
         self,

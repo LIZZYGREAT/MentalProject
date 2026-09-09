@@ -413,6 +413,43 @@ def test_startup_barrier_ignores_old_process_grace_but_not_live_request_grace():
     asyncio.run(scenario())
 
 
+def test_startup_recovery_respects_an_unexpired_processing_lease():
+    async def scenario():
+        database = memory_database()
+        person = participant(database, "CALENDAR-STARTUP-LEASE")
+        reconciliations = CalendarMutationReconciliationRepository(database)
+        process_started_at = datetime.now(timezone.utc)
+        target = date(2030, 2, 4)
+        intent = reconciliations.create(
+            person.id,
+            mutation_kind="calendar_create_event",
+            direct_dates={target},
+            refresh_targets={target: True},
+            dependency_sources={},
+            now=process_started_at - timedelta(seconds=1),
+        )
+        claim_token = uuid.uuid4()
+        claimed = reconciliations.claim_processing(
+            intent["id"], claim_token=claim_token
+        )
+        queue = ForecastMutationRefreshQueue(
+            Coordinator(),
+            reconciliations=reconciliations,
+            recovery_poll_seconds=3600,
+        )
+        queue.start()
+        recovered = await queue.recover_startup_fences(process_started_at)
+        current = reconciliations.get(intent["id"])
+        await queue.close()
+        return recovered, current
+
+    recovered, current = asyncio.run(scenario())
+
+    assert recovered == 0
+    assert current["status"] == "prepared"
+    assert current["work"]["processing_claim_token"]
+
+
 def test_timeout_after_mutation_request_stays_recoverable_and_is_fenced():
     async def scenario():
         database = memory_database()

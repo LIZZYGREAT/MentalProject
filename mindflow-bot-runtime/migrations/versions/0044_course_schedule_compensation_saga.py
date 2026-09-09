@@ -135,6 +135,11 @@ def upgrade() -> None:
         "(:id, :import_id, :write_id, :participant_id, :provider_event_id, "
         ":provider_identity_kind, :affected_dates_json, :status, :error_code, "
         "0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+    ).bindparams(
+        sa.bindparam(
+            "affected_dates_json",
+            type_=postgresql.JSONB(),
+        )
     )
     for legacy in legacy_rows:
         for kind, provider_id in (

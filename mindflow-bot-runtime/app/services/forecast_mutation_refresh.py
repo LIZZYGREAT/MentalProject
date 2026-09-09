@@ -199,7 +199,9 @@ class ForecastMutationRefreshQueue:
             return rows
         normalized: list[dict] = []
         for row in rows:
-            if row.get("status") == "prepared":
+            if row.get("status") == "prepared" and not self._has_active_processing_lease(
+                row
+            ):
                 await asyncio.to_thread(
                     self.reconciliations.mark_remote_outcome_unknown,
                     row["id"],
@@ -212,6 +214,23 @@ class ForecastMutationRefreshQueue:
                     row = refreshed
             normalized.append(row)
         return normalized
+
+    @staticmethod
+    def _has_active_processing_lease(
+        row: dict, *, now: datetime | None = None
+    ) -> bool:
+        work = dict(row.get("work") or {})
+        if not work.get("processing_claim_token"):
+            return False
+        try:
+            until = datetime.fromisoformat(
+                str(work.get("processing_claim_until"))
+            )
+        except (TypeError, ValueError):
+            return False
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return until > (now or datetime.now(timezone.utc))
 
     async def _fence_recovery_rows(
         self, rows: list[dict], *, force_claim: bool = False
@@ -570,7 +589,9 @@ class ForecastMutationRefreshQueue:
             )
             rows = await self._normalize_abandoned_prepared(rows)
             rows = await self._bind_completed_course_schedule_effects(rows)
-            rows = await self._fence_recovery_rows(rows, force_claim=True)
+            # Startup recovery may inspect older rows, but it must still
+            # respect an unexpired live/recovery processing lease.
+            rows = await self._fence_recovery_rows(rows)
             rows = await self._reconcile_remote_outcomes(rows)
             recovered = self._enqueue_recovery_rows(rows, require_fencing=False)
             await self.wait_idle()

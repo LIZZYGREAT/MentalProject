@@ -189,11 +189,40 @@ class CourseScheduleImportRunner:
             for target in write.affected_dates
         }
         reconciliation = None
+        reconciliation_claim_token: uuid.UUID | None = None
+        reconciliation_owner_active = True
         try:
             reconciliation = await self.imports._prepare_reconciliation(
                 participant_id, draft, all_dates, writes_by_item
             )
+            if reconciliation is not None:
+                reconciliation_claim_token = uuid.uuid4()
+                repository = self.imports.mutation_refresh.reconciliations
+                claim = getattr(repository, "claim_processing", None)
+                if callable(claim):
+                    claimed_reconciliation = await asyncio.to_thread(
+                        claim,
+                        reconciliation["id"],
+                        claim_token=reconciliation_claim_token,
+                    )
+                    if claimed_reconciliation is None:
+                        # Another durable owner already took this row. The
+                        # provider write runner may finish its own ledger
+                        # work, but it must not perform downstream work.
+                        reconciliation_claim_token = None
+                        reconciliation_owner_active = False
+                    else:
+                        reconciliation = claimed_reconciliation
+                else:
+                    # Compatibility for injected repositories from before
+                    # processing leases existed.
+                    reconciliation_claim_token = None
         except Exception:
+            if reconciliation is not None and reconciliation_claim_token is not None:
+                # The claim outcome is unknown; do not guess that this runner
+                # owns the reconciliation during the final hand-off.
+                reconciliation_owner_active = False
+                reconciliation_claim_token = None
             # Calendar writes remain durable even if the optional forecast
             # reconciliation record cannot be prepared.
             logger.exception(
@@ -296,21 +325,26 @@ class CourseScheduleImportRunner:
             for row in final_writes
         )
         try:
-            await self.imports._finish_reconciliation(
-                reconciliation,
-                effect_dates=created_dates,
-                outcome_unknown=outcome_unknown,
-                outcome_unknown_error=(
-                    "CourseScheduleProviderIdentityConflict"
-                    if identity_conflict
-                    else "CourseScheduleBatchOutcomeUnknown"
-                ),
-            )
-            if created_dates:
+            bound_reconciliation = None
+            if reconciliation_owner_active:
+                bound_reconciliation = await self.imports._finish_reconciliation(
+                    reconciliation,
+                    effect_dates=created_dates,
+                    outcome_unknown=outcome_unknown,
+                    outcome_unknown_error=(
+                        "CourseScheduleProviderIdentityConflict"
+                        if identity_conflict
+                        else "CourseScheduleBatchOutcomeUnknown"
+                    ),
+                    claim_token=reconciliation_claim_token,
+                )
+            if created_dates and (
+                reconciliation is None or bound_reconciliation is not None
+            ):
                 await self.imports._reconcile_forecasts(
                     participant_id,
                     created_dates,
-                    reconciliation=reconciliation,
+                    reconciliation=bound_reconciliation,
                 )
         except Exception:
             # Provider and import state are already durable; reconciliation can
