@@ -65,6 +65,8 @@ class CourseScheduleImportService:
         draft = await asyncio.to_thread(
             self.drafts.validate_for_confirmation, participant_id, import_id
         )
+        if draft["status"] in {"cancelled", "cancelling", "cleanup_failed"}:
+            return self._result(draft)
         if draft["status"] == "succeeded":
             return self._result(draft, already_completed=True)
         if draft["status"] in {"queued", "running"}:
@@ -184,36 +186,70 @@ class CourseScheduleImportService:
     def cancel(
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
     ) -> dict[str, Any]:
-        draft = self.drafts.cancel(participant_id, import_id)
-        status = draft["status"]
-        if draft.get("cancel_requires_compensation"):
-            if status == "succeeded":
-                reply_text = (
-                    "这份课程表已经添加到日历，不能再取消导入。"
-                    "如需移除，请等撤销流程接管。"
-                )
-            else:
-                reply_text = (
-                    "这次导入已经产生或可能产生日历日程，暂不能直接取消。"
-                    "请等当前导入结束后，再使用撤销操作。"
-                )
-            return {
-                "ok": False,
-                "error": "cancel_requires_compensation",
-                "status": status,
-                "import_id": draft["id"],
-                "reply_text": reply_text,
-            }
-        reply = {
-            "cancelled": "已取消这次课程表导入。",
-            "succeeded": "这份课程表已经添加到日历，不能再取消导入。",
-            "expired": "这份课程表导入已过期，请重新发送图片。",
-        }.get(status, "课程表导入状态没有改变。")
+        draft = self.drafts.request_cancel(participant_id, import_id)
+        self._wake_runner()
+        return self._cancel_result(draft)
+
+    def cancel_or_revert(
+        self,
+        participant_id: uuid.UUID,
+        selector: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve a participant-bound selector and install the Saga fence."""
+
+        candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
+        result = self.drafts.request_cancel(participant_id, candidate["id"])
+        self._wake_runner()
+        return {**self._cancel_result(result), "selector": dict(selector)}
+
+    cancel_or_revert_import = cancel_or_revert
+
+    def _wake_runner(self) -> None:
+        notifier = self.queue_notifier
+        if callable(notifier):
+            try:
+                notifier()
+            except Exception:
+                logger.exception("course_schedule_import_runner_wakeup_failed")
+
+    def resume_cleanup_for_participant(
+        self, participant_id: uuid.UUID
+    ) -> int:
+        resumed = self.drafts.resume_cleanup_for_participant(participant_id)
+        if resumed:
+            self._wake_runner()
+        return resumed
+
+    @staticmethod
+    def _cancel_result(draft: dict[str, Any]) -> dict[str, Any]:
+        status = str(draft.get("status") or "")
+        mode = str(draft.get("cancel_mode") or "")
+        if status == "cancelled":
+            reply_text = (
+                "这次课程表导入已撤销，相关日程已清理。"
+                if mode != "before_write"
+                else "已取消这次课程表导入。"
+            )
+        elif status == "cancelling":
+            reply_text = "正在停止导入，并清理已经添加的课程…"
+        elif status == "cleanup_failed":
+            suffix = (
+                "完成 /calendar 授权后继续。"
+                if draft.get("cleanup_error_code") == "calendar_not_connected"
+                else "请稍后重试清理。"
+            )
+            reply_text = "导入已停止，但还有部分日程尚未清理完成。" + suffix
+        elif status == "expired":
+            reply_text = "这份课程表导入已过期，请重新发送图片。"
+        else:
+            reply_text = "课程表导入状态没有改变。"
         return {
-            "ok": status == "cancelled",
+            "ok": status in {"cancelled", "cancelling", "cleanup_failed"},
             "status": status,
-            "import_id": draft["id"],
-            "reply_text": reply,
+            "import_id": draft.get("id"),
+            "cancel_mode": mode or None,
+            "already_cancelled": bool(draft.get("already_cancelled")),
+            "reply_text": reply_text,
         }
 
     def _calendar_write_enabled(self, participant_id: uuid.UUID) -> bool:
@@ -288,6 +324,7 @@ class CourseScheduleImportService:
         dates: set[date],
         *,
         reconciliation: dict[str, Any] | None,
+        reason: str = "course_schedule_import",
     ) -> None:
         if self.forecast_coordinator is None or self.forecast_snapshots is None:
             return
@@ -300,7 +337,7 @@ class CourseScheduleImportService:
                     self.forecast_coordinator.warnings,
                     participant_id,
                     direct,
-                    reason="course_schedule_import",
+                    reason=reason,
                 )
             except Exception:
                 logger.exception("course_schedule_batch_forecast_invalidation_failed")
@@ -319,7 +356,7 @@ class CourseScheduleImportService:
                 errors.add(target)
         if self.mutation_refresh is not None:
             kwargs: dict[str, Any] = {
-                "reason": "course_schedule_import",
+                "reason": reason,
                 "invalidation_dates": errors & direct,
                 "dependency_invalidation_sources": {
                     target: source for target, source in dependencies.items() if target in errors
@@ -328,6 +365,20 @@ class CourseScheduleImportService:
             if reconciliation is not None:
                 kwargs["reconciliation_id"] = reconciliation["id"]
             self.mutation_refresh.enqueue(participant_id, refresh, **kwargs)
+
+    async def reconcile_deleted_dates(
+        self,
+        participant_id: uuid.UUID,
+        dates: set[date],
+    ) -> None:
+        """Refresh only dates whose provider effect is confirmed deleted/404."""
+
+        await self._reconcile_forecasts(
+            participant_id,
+            set(dates),
+            reconciliation=None,
+            reason="course_schedule_import_rollback",
+        )
 
     def _mutation_work(
         self, dates: set[date]
@@ -397,7 +448,19 @@ class CourseScheduleImportService:
             item.get("error_code") == "provider_event_identity_conflict"
             for item in draft["items"]
         )
-        if already_completed:
+        if draft.get("status") == "cancelled":
+            text = (
+                "已取消这次课程表导入。"
+                if draft.get("cancel_mode") == "before_write"
+                else "这次课程表导入已撤销，相关日程已清理。"
+            )
+        elif draft.get("status") == "cancelling":
+            text = "正在停止导入，并清理已经添加的课程…"
+        elif draft.get("status") == "cleanup_failed":
+            text = "导入已停止，但还有部分日程尚未清理完成。"
+            if draft.get("cleanup_error_code") == "calendar_not_connected":
+                text += "完成 /calendar 授权后继续。"
+        elif already_completed:
             text = "这份课程表已经添加过了，无需重复操作。"
         elif identity_conflict:
             text = (
@@ -429,7 +492,9 @@ class CourseScheduleImportService:
         else:
             text = f"已添加 {succeeded} 项课程到日历。"
         return {
-            "ok": failed == 0,
+            "ok": failed == 0 and draft.get("status") not in {
+                "cancelling", "cleanup_failed"
+            },
             "status": draft["status"],
             "import_id": draft["id"],
             "recurrence_strategy": draft.get("recurrence_strategy"),
@@ -443,6 +508,9 @@ class CourseScheduleImportService:
             **(
                 {"error": "provider_event_identity_conflict"}
                 if identity_conflict
+                else {"error": "calendar_not_connected"}
+                if draft.get("status") == "cleanup_failed"
+                and draft.get("cleanup_error_code") == "calendar_not_connected"
                 else {"error": "calendar_not_connected"}
                 if authorization_lost
                 else {}

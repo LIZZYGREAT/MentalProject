@@ -220,6 +220,7 @@ def build_business_services(
         mutation_refresh=mutation_refresh,
         max_calendar_writes=settings.vision_schedule_max_calendar_writes,
     )
+    device_flows.cleanup_resumer = course_schedule_imports.resume_cleanup_for_participant
     course_schedule_import_runner = CourseScheduleImportRunner(
         course_schedule_imports,
         max_concurrency=1,

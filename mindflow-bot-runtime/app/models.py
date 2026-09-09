@@ -435,8 +435,13 @@ class CourseScheduleImport(Base):
         ),
         CheckConstraint(
             "status IN ('pending_context','pending_confirmation','running','succeeded',"
-            "'queued','partial_failed','cancelled','expired')",
+            "'queued','partial_failed','cancelling','cleanup_failed','cancelled','expired')",
             name="ck_course_schedule_import_status",
+        ),
+        CheckConstraint(
+            "cancel_mode IS NULL OR cancel_mode IN "
+            "('before_write','running_cancel','revert')",
+            name="ck_course_schedule_import_cancel_mode",
         ),
         CheckConstraint(
             "recurrence_strategy IS NULL OR recurrence_strategy IN "
@@ -444,7 +449,7 @@ class CourseScheduleImport(Base):
             name="ck_course_schedule_import_recurrence_strategy",
         ),
         CheckConstraint(
-            "status NOT IN ('running','partial_failed','succeeded') "
+            "status NOT IN ('running','partial_failed','succeeded','cancelling','cleanup_failed') "
             "OR recurrence_strategy IS NOT NULL",
             name="ck_course_schedule_import_strategy_required_after_start",
         ),
@@ -493,6 +498,16 @@ class CourseScheduleImport(Base):
     )
     completion_presentation_error: Mapped[str | None] = mapped_column(
         String(256), nullable=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cleanup_error_code: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
     )
     run_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     run_claim_expires_at: Mapped[datetime | None] = mapped_column(
@@ -553,9 +568,7 @@ class CourseScheduleImportWrite(Base):
         UniqueConstraint("source_identity", name="uq_course_schedule_write_source"),
         CheckConstraint(
             "status IN ('planned','creating','created','create_failed',"
-            "'create_outcome_unknown','create_identity_conflict',"
-            "'delete_pending','deleting','deleted',"
-            "'delete_failed','delete_outcome_unknown')",
+            "'create_outcome_unknown','create_identity_conflict','create_cancelled')",
             name="ck_course_schedule_write_status",
         ),
         CheckConstraint(
@@ -613,6 +626,75 @@ class CourseScheduleImportWrite(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class CourseScheduleImportCompensation(Base):
+    """One durable delete target for a provider effect created by an import."""
+
+    __tablename__ = "course_schedule_import_compensations"
+    __table_args__ = (
+        UniqueConstraint(
+            "write_id", "provider_event_id",
+            name="uq_course_schedule_compensation_write_provider",
+        ),
+        CheckConstraint(
+            "provider_identity_kind IN ('primary','conflict')",
+            name="ck_course_schedule_compensation_identity_kind",
+        ),
+        CheckConstraint(
+            "status IN ('delete_pending','deleting','deleted','delete_failed',"
+            "'delete_outcome_unknown')",
+            name="ck_course_schedule_compensation_status",
+        ),
+        Index(
+            "ix_course_schedule_compensation_import_status",
+            "import_id", "status", "updated_at",
+        ),
+        Index(
+            "ix_course_schedule_compensation_participant_status",
+            "participant_id", "status", "updated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    import_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_imports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    write_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_import_writes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider_event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider_identity_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    affected_dates_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="delete_pending")
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    delete_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delete_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

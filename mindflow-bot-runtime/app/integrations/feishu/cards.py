@@ -156,9 +156,16 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             strategy=str(draft["recurrence_strategy"]),
             primary=True,
         ))
-    elif status in {"queued", "running"}:
-        lines.append("\n正在添加到日历，请稍候。")
+    elif status in {"queued", "running", "cancelling", "cleanup_failed"}:
+        if status == "cancelling":
+            lines.append("\n正在停止导入，并清理已经添加的课程…")
+        elif status == "cleanup_failed":
+            lines.append("\n导入已停止，但还有部分日程尚未清理完成。")
+        else:
+            lines.append("\n正在添加到日历，请稍候。")
         elements[0]["content"] = "\n".join(lines)
+        if status in {"queued", "running"}:
+            elements.append(_schedule_cancel_button(draft["id"], "取消并撤销"))
     elif status == "succeeded":
         lines.append("\n这份课程表已经添加到日历。")
         elements[0]["content"] = "\n".join(lines)
@@ -184,7 +191,12 @@ def course_schedule_result_card(
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": _safe_schedule_text(message)}
     ]
-    if error == "calendar_not_connected" and import_id and recurrence_strategy:
+    if (
+        error == "calendar_not_connected"
+        and import_id
+        and recurrence_strategy
+        and status != "cleanup_failed"
+    ):
         elements.append(_schedule_action_button(
             import_id,
             "重试失败项" if status == "partial_failed" else "继续按已选择策略添加",
@@ -243,11 +255,13 @@ def _schedule_action_button(
     }
 
 
-def _schedule_cancel_button(import_id: str) -> dict[str, Any]:
+def _schedule_cancel_button(
+    import_id: str, text: str = "暂不导入"
+) -> dict[str, Any]:
     return {
         "tag": "button",
         "type": "default",
-        "text": {"tag": "plain_text", "content": "暂不导入"},
+        "text": {"tag": "plain_text", "content": text},
         "behaviors": [{"type": "callback", "value": {
             "mindflow_action": "course_schedule_import_cancel",
             "version": "2",

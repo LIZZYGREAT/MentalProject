@@ -479,16 +479,20 @@ class CalendarService:
             headers, calendar_id = await self._mutation_preflight(
                 participant_id, client
             )
-            await self._dispatch_mutation(
-                "delete_event",
-                lambda: client.delete(
-                    "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
-                    + quote(calendar_id, safe="")
-                    + "/events/"
-                    + quote(normalized_event_id, safe=""),
-                    headers=headers,
-                ),
-            )
+            try:
+                await self._dispatch_mutation(
+                    "delete_event",
+                    lambda: client.delete(
+                        "https://open.feishu.cn/open-apis/calendar/v4/calendars/"
+                        + quote(calendar_id, safe="")
+                        + "/events/"
+                        + quote(normalized_event_id, safe=""),
+                        headers=headers,
+                    ),
+                )
+            except CalendarMutationRejected as exc:
+                if exc.status_code != 404:
+                    raise
         return {"id": normalized_event_id, "deleted": True}
 
     async def _mutation_preflight(

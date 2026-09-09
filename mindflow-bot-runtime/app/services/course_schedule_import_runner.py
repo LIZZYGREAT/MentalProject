@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 import logging
 from typing import Any
 import uuid
 
 from app.domain.course_schedule_recurrence import CalendarWrite, CalendarWriteKind
 from app.integrations.feishu.calendar import (
+    CalendarProviderUnavailable,
+    CalendarMutationRejected,
     CalendarMutationOutcomeUnknown,
 )
 from app.integrations.feishu.cards import course_schedule_result_card
@@ -76,6 +78,27 @@ class CourseScheduleImportRunner:
     async def run_once(self) -> int:
         """Drain the currently claimable durable imports once."""
 
+        reconciliation_write = await asyncio.to_thread(
+            self.drafts.claim_next_cancellation_reconciliation
+        )
+        if reconciliation_write is not None:
+            await self._run_create_reconciliation(reconciliation_write)
+            first_compensation = await asyncio.to_thread(
+                self.drafts.claim_next_compensation
+            )
+            if first_compensation is not None:
+                await self._run_compensations(first_compensation)
+            return 1
+
+        # Cleanup is deliberately first priority. A cancellation fence must
+        # converge provider state before another import is allowed to run.
+        first_compensation = await asyncio.to_thread(
+            self.drafts.claim_next_compensation
+        )
+        if first_compensation is not None:
+            await self._run_compensations(first_compensation)
+            return 1
+
         claimed: list[dict[str, Any]] = []
         for _ in range(self.max_concurrency):
             draft = await asyncio.to_thread(self.drafts.claim_next_import)
@@ -125,15 +148,18 @@ class CourseScheduleImportRunner:
         recovered = await asyncio.to_thread(
             self.drafts.requeue_startup_recoverables
         )
+        cancellation_recovered = await asyncio.to_thread(
+            self.drafts.recover_stale_cancellation_work
+        )
         pending_presentations = await asyncio.to_thread(
             self.drafts.pending_completion_presentations
         )
         for draft in pending_presentations:
             await self._present_completion(draft)
         self._startup_recovery_done = True
-        if recovered:
+        if recovered or cancellation_recovered:
             self.wake()
-        return recovered
+        return recovered + cancellation_recovered
 
     async def _run_import(self, draft: dict[str, Any]) -> None:
         import_id = draft["id"]
@@ -281,12 +307,188 @@ class CourseScheduleImportRunner:
                 "course_schedule_import_reconciliation_failed import_id=%s",
                 import_id,
             )
-        await self._present_completion(final)
+        if final.get("status") in {
+            "succeeded", "partial_failed", "cancelled", "cleanup_failed"
+        }:
+            await self._present_completion(final)
+
+    async def _run_create_reconciliation(self, write: dict[str, Any]) -> None:
+        """Replay one already-dispatched create using its original identity."""
+
+        import_id = str(write["import_id"])
+        participant_id = uuid.UUID(str(write["participant_id"]))
+        try:
+            create = (
+                self.calendar.create_recurring_event
+                if write["write_kind"] == CalendarWriteKind.RECURRING
+                else self.calendar.create_single_event
+            )
+            args: dict[str, Any] = {
+                "summary": write["summary"],
+                "start_time": datetime.fromisoformat(write["start_time"]),
+                "end_time": datetime.fromisoformat(write["end_time"]),
+                "description": write.get("description") or "",
+                "source_message_id": write["source_identity"],
+            }
+            if write["write_kind"] == CalendarWriteKind.RECURRING:
+                args["recurrence"] = write.get("recurrence")
+            created = await create(participant_id, **args)
+            provider_event_id = str((created or {}).get("id") or "").strip()
+            if not provider_event_id:
+                await asyncio.to_thread(
+                    self.drafts.record_write_failure,
+                    import_id,
+                    write["id"],
+                    error_code="provider_event_id_missing",
+                    outcome_unknown=True,
+                )
+            else:
+                await asyncio.to_thread(
+                    self.drafts.record_write_created,
+                    import_id,
+                    write["id"],
+                    provider_event_id,
+                )
+        except CourseScheduleProviderIdentityConflict:
+            logger.error(
+                "course_schedule_cancellation_replay_identity_conflict "
+                "import_id=%s write_id=%s",
+                import_id,
+                write["id"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(
+                self.drafts.record_write_failure,
+                import_id,
+                write["id"],
+                error_code=(
+                    "calendar_not_connected"
+                    if isinstance(exc, PermissionError)
+                    else type(exc).__name__
+                ),
+                outcome_unknown=self._outcome_unknown(exc),
+            )
+            logger.warning(
+                "course_schedule_cancellation_replay_failed import_id=%s "
+                "write_id=%s outcome_unknown=%s",
+                import_id,
+                write["id"],
+                self._outcome_unknown(exc),
+            )
+        finally:
+            await asyncio.to_thread(self.drafts.renew_run_lease, import_id)
+        final = await asyncio.to_thread(
+            self.drafts.finalize_cancellation, import_id
+        )
+        if final.get("status") in {"cancelled", "cleanup_failed"}:
+            await self._present_completion(final)
+
+    async def _run_compensations(self, first: dict[str, Any]) -> None:
+        """Delete every currently claimable target for one import in order."""
+
+        target: dict[str, Any] | None = first
+        while target is not None:
+            completed = await self._run_compensation(target)
+            if not completed:
+                # In particular, do not hot-loop on a transport outcome that
+                # remains unknown. Restart/read-back will own the next try.
+                break
+            target = await asyncio.to_thread(self.drafts.claim_next_compensation)
+
+    async def _run_compensation(self, target: dict[str, Any]) -> bool:
+        participant_id = uuid.UUID(str(target["participant_id"]))
+        event_id = str(target["provider_event_id"])
+        deleted = False
+        try:
+            if target.get("status") == "delete_outcome_unknown":
+                try:
+                    await self.calendar.get_event(participant_id, event_id)
+                except CalendarMutationRejected as exc:
+                    if exc.status_code == 404:
+                        deleted = True
+                    else:
+                        raise
+                if not deleted:
+                    await self.calendar.delete_event(participant_id, event_id)
+                    deleted = True
+            else:
+                await self.calendar.delete_event(participant_id, event_id)
+                deleted = True
+        except CalendarMutationRejected as exc:
+            if exc.status_code == 404:
+                deleted = True
+            else:
+                await asyncio.to_thread(
+                    self.drafts.record_delete_failure,
+                    target["id"],
+                    error_code=(
+                        "calendar_not_connected"
+                        if exc.status_code in {401, 403}
+                        else type(exc).__name__
+                    ),
+                )
+        except PermissionError:
+            await asyncio.to_thread(
+                self.drafts.record_delete_failure,
+                target["id"],
+                error_code="calendar_not_connected",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(
+                self.drafts.record_delete_failure,
+                target["id"],
+                error_code=type(exc).__name__,
+                outcome_unknown=self._outcome_unknown(exc),
+            )
+
+        if not deleted:
+            current = await asyncio.to_thread(
+                self.drafts.compensations_for_import, target["import_id"]
+            )
+            current_target = next(
+                (item for item in current if item["id"] == target["id"]), target
+            )
+            return current_target.get("status") == "deleted"
+
+        result = await asyncio.to_thread(
+            self.drafts.record_delete_success, target["id"]
+        )
+        if result is None:
+            return False
+        deleted_dates = {
+            datetime.fromisoformat(str(value)).date()
+            if "T" in str(value)
+            else date.fromisoformat(str(value))
+            for value in result.get("affected_dates") or []
+        }
+        if deleted_dates:
+            try:
+                await self.imports.reconcile_deleted_dates(
+                    participant_id, deleted_dates
+                )
+            except Exception:
+                logger.exception(
+                    "course_schedule_import_rollback_forecast_refresh_failed "
+                    "import_id=%s target_id=%s",
+                    target["import_id"],
+                    target["id"],
+                )
+        final = await asyncio.to_thread(
+            self.drafts.finalize_cancellation, target["import_id"]
+        )
+        if final.get("status") in {"cancelled", "cleanup_failed"}:
+            await self._present_completion(final)
+        return True
 
     @staticmethod
     def _outcome_unknown(exc: Exception) -> bool:
-        return isinstance(exc, CalendarMutationOutcomeUnknown) or type(exc).__name__.endswith(
-            "OutcomeUnknown"
+        return (
+            isinstance(exc, (CalendarMutationOutcomeUnknown, CalendarProviderUnavailable))
+            or type(exc).__name__.endswith("OutcomeUnknown")
         )
 
     @staticmethod

@@ -8,7 +8,10 @@ from typing import Any
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.cards import course_schedule_preview_card
-from app.repositories_course_schedule import CourseCorrectionAmbiguityError
+from app.repositories_course_schedule import (
+    CourseCorrectionAmbiguityError,
+    CourseScheduleImportAmbiguityError,
+)
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -53,6 +56,20 @@ def _updates_schema() -> dict[str, Any]:
             "location": {"type": "string", "minLength": 1, "maxLength": 300},
         },
         "minProperties": 1,
+        "additionalProperties": False,
+    }
+
+
+def _cancel_selector_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "latest": {"type": "boolean"},
+            "course_name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "created_date": {"type": "string", "format": "date"},
+        },
+        "minProperties": 1,
+        "maxProperties": 1,
         "additionalProperties": False,
     }
 
@@ -123,6 +140,27 @@ class CourseScheduleTools:
             "Cancel this participant's latest pending course-schedule draft. Use only when the user directly asks to cancel the pending import. This does not delete Calendar data.",
             _empty_schema(),
             self.cancel_pending_draft,
+            effect="internal_write",
+            authorization_requirement="direct_request",
+        )
+        registry.register(
+            "course_schedule_get_recent_imports",
+            "Read this participant's recent course-schedule imports and their safe cancellation status. It never mutates Calendar data and never accepts an import id.",
+            _empty_schema(),
+            self.get_recent_imports,
+            effect="read",
+            authorization_requirement="none",
+        )
+        registry.register(
+            "course_schedule_cancel_or_revert_import",
+            "Cancel a pending/running course-schedule import or revert one completed/partially completed import. Resolve exactly one participant-owned import using latest, course_name, or created_date. This starts a durable cleanup Saga and never accepts a raw import id.",
+            {
+                "type": "object",
+                "properties": {"selector": _cancel_selector_schema()},
+                "required": ["selector"],
+                "additionalProperties": False,
+            },
+            self.cancel_or_revert_import,
             effect="internal_write",
             authorization_requirement="direct_request",
         )
@@ -221,6 +259,65 @@ class CourseScheduleTools:
         return {
             "ok": bool(result.get("ok")),
             "status": result.get("status"),
+            "reply_text": result.get("reply_text"),
+        }
+
+    def get_recent_imports(
+        self, ctx: AgentContext, _arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        candidates = self.imports.drafts.recent_cancel_candidates(
+            ctx.participant_id
+        )
+        return {
+            "ok": True,
+            "imports": [
+                {
+                    "status": candidate.get("status"),
+                    "created_at": candidate.get("created_at"),
+                    "course_names": list(candidate.get("course_names") or []),
+                    "has_provider_effect": bool(
+                        candidate.get("has_provider_effect")
+                    ),
+                }
+                for candidate in candidates
+            ],
+        }
+
+    def cancel_or_revert_import(
+        self, ctx: AgentContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        selector = dict(arguments.get("selector") or {})
+        try:
+            result = self.imports.cancel_or_revert(ctx.participant_id, selector)
+        except CourseScheduleImportAmbiguityError as exc:
+            return {
+                "ok": False,
+                "error": "ambiguous_import",
+                "candidates": [
+                    {
+                        "status": candidate.get("status"),
+                        "created_at": candidate.get("created_at"),
+                        "course_names": list(candidate.get("course_names") or []),
+                        "has_provider_effect": bool(
+                            candidate.get("has_provider_effect")
+                        ),
+                    }
+                    for candidate in exc.candidates
+                ],
+            }
+        except LookupError:
+            return {"ok": False, "error": "import_not_found"}
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": "invalid_import_selector",
+                "detail": str(exc)[:200],
+            }
+        return {
+            "ok": bool(result.get("ok")),
+            "status": result.get("status"),
+            "cancel_mode": result.get("cancel_mode"),
+            "already_cancelled": bool(result.get("already_cancelled")),
             "reply_text": result.get("reply_text"),
         }
 

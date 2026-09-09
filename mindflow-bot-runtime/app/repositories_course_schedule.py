@@ -24,6 +24,7 @@ from app.domain.course_schedule_recurrence import (
     RECURRENCE_STRATEGIES,
 )
 from app.models import (
+    CourseScheduleImportCompensation,
     CourseScheduleImport,
     CourseScheduleImportItem,
     CourseScheduleImportWrite,
@@ -48,10 +49,8 @@ PROVIDER_EFFECT_STATUSES = frozenset({
     "created",
     "create_outcome_unknown",
     "create_identity_conflict",
-    "delete_pending",
-    "deleting",
-    "delete_outcome_unknown",
 })
+COMPENSATION_PARENT_STATUSES = frozenset({"cancelling", "cleanup_failed"})
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
 _EXPLICIT_ACTUAL_TIME_SOURCES = frozenset({"image", "user_actual"})
 
@@ -72,6 +71,14 @@ class CourseCorrectionAmbiguityError(ValueError):
     def __init__(self, candidates: list[dict[str, Any]]):
         self.candidates = tuple(dict(value) for value in candidates[:10])
         super().__init__("correction must identify exactly one course")
+
+
+class CourseScheduleImportAmbiguityError(ValueError):
+    """A participant-bound import selector matched more than one import."""
+
+    def __init__(self, candidates: list[dict[str, Any]]):
+        self.candidates = tuple(dict(value) for value in candidates[:10])
+        super().__init__("course schedule import selector is ambiguous")
 
 
 class CourseScheduleProviderIdentityConflict(RuntimeError):
@@ -1081,10 +1088,11 @@ class CourseScheduleImportRepository:
                 row.provider_conflict_event_id = normalized_provider_id
                 row.error_code = CourseScheduleProviderIdentityConflict.code
                 row.updated_at = updated_at
-                draft.status = "partial_failed"
                 draft.completed_at = None
                 draft.last_progress_at = updated_at
-                self._clear_run_lease(draft)
+                if draft.status not in COMPENSATION_PARENT_STATUSES:
+                    draft.status = "partial_failed"
+                    self._clear_run_lease(draft)
                 self._refresh_item_statuses(session, draft.id)
                 conflict = CourseScheduleProviderIdentityConflict(
                     str(row.provider_event_id or ""), normalized_provider_id
@@ -1106,6 +1114,9 @@ class CourseScheduleImportRepository:
                 row.updated_at = updated_at
                 draft.last_progress_at = updated_at
                 self._refresh_item_statuses(session, draft.id)
+            if draft.status in COMPENSATION_PARENT_STATUSES:
+                self._materialize_compensation_targets(session, draft, updated_at)
+                self._finalize_cancellation_locked(session, draft, updated_at)
         if conflict is not None:
             raise conflict
 
@@ -1141,6 +1152,9 @@ class CourseScheduleImportRepository:
             row.updated_at = updated_at
             draft.last_progress_at = updated_at
             self._refresh_item_statuses(session, draft.id)
+            if draft.status in COMPENSATION_PARENT_STATUSES:
+                self._materialize_compensation_targets(session, draft, updated_at)
+                self._finalize_cancellation_locked(session, draft, updated_at)
 
     def finalize_queued_import(
         self, import_id: uuid.UUID | str, *, now: datetime | None = None
@@ -1152,6 +1166,11 @@ class CourseScheduleImportRepository:
             )
             if row is None:
                 raise LookupError("draft not found")
+            if row.status in COMPENSATION_PARENT_STATUSES:
+                self._materialize_compensation_targets(session, row, completed_at)
+                self._finalize_cancellation_locked(session, row, completed_at)
+                session.flush()
+                return self._view(session, row)
             self._refresh_item_statuses(session, row.id)
             items = self._items(session, row.id)
             writes = list(
@@ -1219,6 +1238,519 @@ class CourseScheduleImportRepository:
             rows = list(session.execute(query).scalars())
             return [self._write_view(row) for row in rows]
 
+    def compensations_for_import(
+        self,
+        import_id: uuid.UUID | str,
+        *,
+        statuses: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            query = select(CourseScheduleImportCompensation).where(
+                CourseScheduleImportCompensation.import_id == uuid.UUID(str(import_id))
+            ).order_by(
+                CourseScheduleImportCompensation.created_at,
+                CourseScheduleImportCompensation.id,
+            )
+            if statuses:
+                query = query.where(CourseScheduleImportCompensation.status.in_(statuses))
+            rows = list(session.execute(query).scalars())
+            return [self._compensation_view(row) for row in rows]
+
+    def request_cancel(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        mode: str | None = None,
+        cancel_mode: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Install the durable cancellation fence and materialize delete targets."""
+
+        requested_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            assert row is not None
+            if (
+                row.status in EXPIRABLE_STATUSES
+                and _aware(row.expires_at) <= requested_at
+            ):
+                row.status = "expired"
+                self._clear_run_lease(row)
+                session.flush()
+                return {**self._view(session, row), "already_expired": True}
+            if row.status == "cancelled":
+                return {**self._view(session, row), "already_cancelled": True}
+            if row.status == "expired":
+                return {**self._view(session, row), "already_expired": True}
+
+            writes = list(
+                session.execute(
+                    select(CourseScheduleImportWrite).where(
+                        CourseScheduleImportWrite.import_id == row.id
+                    )
+                ).scalars()
+            )
+            if mode is not None and cancel_mode is not None and mode != cancel_mode:
+                raise ValueError("cancel mode was provided more than once")
+            requested_mode = mode if mode is not None else cancel_mode
+            if requested_mode is not None and requested_mode not in {
+                "before_write", "running_cancel", "revert"
+            }:
+                raise ValueError("unsupported course schedule cancel mode")
+            if row.status in ACTIVE_DRAFT_STATUSES and not writes:
+                selected_mode = "before_write"
+            elif requested_mode in {"before_write", "running_cancel", "revert"}:
+                selected_mode = str(requested_mode)
+            elif row.status in {"succeeded", "partial_failed"}:
+                selected_mode = "revert"
+            else:
+                selected_mode = "running_cancel"
+
+            if row.status in ACTIVE_DRAFT_STATUSES and not writes:
+                row.status = "cancelled"
+                row.cancel_mode = "before_write"
+                row.cancel_requested_at = requested_at
+                row.cancelled_at = requested_at
+                row.completed_at = row.completed_at or requested_at
+                row.cleanup_error_code = None
+                self._clear_run_lease(row)
+            else:
+                was_cleanup_failed = row.status == "cleanup_failed"
+                row.status = "cancelling"
+                row.cancel_mode = selected_mode
+                row.cancel_requested_at = row.cancel_requested_at or requested_at
+                row.cancelled_at = None
+                row.cleanup_error_code = None
+                row.completion_presented_at = None
+                row.completion_presentation_error = None
+                # A planned row has not crossed the provider boundary and is
+                # therefore safe to close without inventing a delete target.
+                for write in writes:
+                    if write.status == "planned":
+                        write.status = "create_cancelled"
+                        write.error_code = "cancelled_before_dispatch"
+                        write.updated_at = requested_at
+                if was_cleanup_failed:
+                    for target in session.execute(
+                        select(CourseScheduleImportCompensation).where(
+                            CourseScheduleImportCompensation.import_id == row.id,
+                            CourseScheduleImportCompensation.status == "delete_failed",
+                        )
+                    ).scalars():
+                        target.status = "delete_pending"
+                        target.error_code = None
+                        target.updated_at = requested_at
+                self._materialize_compensation_targets(session, row, requested_at)
+                self._finalize_cancellation_locked(session, row, requested_at)
+            row.last_progress_at = requested_at
+            session.flush()
+            result = self._view(session, row)
+            result["cancel_started"] = result.get("status") in {
+                "cancelling", "cleanup_failed"
+            }
+            result["already_cancelled"] = False
+            return result
+
+    def mark_create_cancelled(
+        self,
+        import_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        cancelled_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None:
+                return 0
+            changed = 0
+            for write in session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == row.id,
+                    CourseScheduleImportWrite.status == "planned",
+                )
+            ).scalars():
+                write.status = "create_cancelled"
+                write.error_code = "cancelled_before_dispatch"
+                write.updated_at = cancelled_at
+                changed += 1
+            self._finalize_cancellation_locked(session, row, cancelled_at)
+            session.flush()
+            return changed
+
+    def materialize_compensation_targets(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        materialized_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            assert row is not None
+            targets = self._materialize_compensation_targets(
+                session, row, materialized_at
+            )
+            self._finalize_cancellation_locked(session, row, materialized_at)
+            session.flush()
+            return [self._compensation_view(target) for target in targets]
+
+    def claim_next_compensation(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """Claim one delete target without competing with an active create attempt."""
+
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            self._recover_stale_cancellation_rows(session, claimed_at)
+            candidates = list(
+                session.execute(
+                    select(CourseScheduleImportCompensation)
+                    .where(
+                        CourseScheduleImportCompensation.status.in_(
+                            {"delete_pending", "delete_outcome_unknown"}
+                        )
+                    )
+                    .order_by(
+                        CourseScheduleImportCompensation.created_at,
+                        CourseScheduleImportCompensation.id,
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            for target in candidates:
+                parent = session.get(
+                    CourseScheduleImport, target.import_id, with_for_update=True
+                )
+                if parent is None or parent.status not in COMPENSATION_PARENT_STATUSES:
+                    continue
+                if self._has_active_create_attempt(session, parent, claimed_at):
+                    continue
+                target.delete_started_at = target.delete_started_at or claimed_at
+                target.delete_claim_expires_at = claimed_at + timedelta(
+                    seconds=self.run_lease_seconds
+                )
+                target.attempt_count = int(target.attempt_count or 0) + 1
+                target.updated_at = claimed_at
+                if target.status == "delete_pending":
+                    target.status = "deleting"
+                    target.error_code = None
+                session.flush()
+                return self._compensation_view(target)
+            return None
+
+    def claim_next_cancellation_reconciliation(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """Claim an outcome-unknown create for same-identity replay only."""
+
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            parents = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(CourseScheduleImport.status.in_(COMPENSATION_PARENT_STATUSES))
+                    .order_by(CourseScheduleImport.created_at, CourseScheduleImport.id)
+                    .with_for_update()
+                ).scalars()
+            )
+            for parent in parents:
+                if self._has_active_create_attempt(session, parent, claimed_at):
+                    continue
+                write = session.execute(
+                    select(CourseScheduleImportWrite)
+                    .where(
+                        CourseScheduleImportWrite.import_id == parent.id,
+                        CourseScheduleImportWrite.status == "create_outcome_unknown",
+                    )
+                    .order_by(
+                        CourseScheduleImportWrite.created_at,
+                        CourseScheduleImportWrite.id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                ).scalar_one_or_none()
+                if write is None:
+                    continue
+                write.status = "creating"
+                write.error_code = None
+                write.updated_at = claimed_at
+                self._set_run_lease(parent, claimed_at)
+                parent.last_progress_at = claimed_at
+                session.flush()
+                return {
+                    **self._write_view(write),
+                    "participant_id": str(parent.participant_id),
+                    "import_status": parent.status,
+                }
+            return None
+
+    def claim_compensation_target(
+        self,
+        target_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            target = session.get(
+                CourseScheduleImportCompensation,
+                uuid.UUID(str(target_id)),
+                with_for_update=True,
+            )
+            if target is None or target.status not in {
+                "delete_pending", "delete_outcome_unknown"
+            }:
+                return None
+            parent = session.get(
+                CourseScheduleImport, target.import_id, with_for_update=True
+            )
+            if parent is None or parent.status not in COMPENSATION_PARENT_STATUSES:
+                return None
+            if self._has_active_create_attempt(session, parent, claimed_at):
+                return None
+            target.delete_started_at = target.delete_started_at or claimed_at
+            target.delete_claim_expires_at = claimed_at + timedelta(
+                seconds=self.run_lease_seconds
+            )
+            target.attempt_count = int(target.attempt_count or 0) + 1
+            target.updated_at = claimed_at
+            if target.status == "delete_pending":
+                target.status = "deleting"
+                target.error_code = None
+            session.flush()
+            return self._compensation_view(target)
+
+    def record_delete_success(
+        self,
+        target_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        deleted_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            target = session.get(
+                CourseScheduleImportCompensation,
+                uuid.UUID(str(target_id)),
+                with_for_update=True,
+            )
+            if target is None:
+                return None
+            target.status = "deleted"
+            target.error_code = None
+            target.deleted_at = target.deleted_at or deleted_at
+            target.updated_at = deleted_at
+            target.delete_claim_expires_at = None
+            parent = session.get(
+                CourseScheduleImport, target.import_id, with_for_update=True
+            )
+            if parent is not None:
+                self._finalize_cancellation_locked(session, parent, deleted_at)
+            session.flush()
+            result = self._compensation_view(target)
+            result["finalized"] = bool(parent and parent.status == "cancelled")
+            return result
+
+    def record_delete_failure(
+        self,
+        target_id: uuid.UUID | str,
+        *,
+        error_code: str,
+        outcome_unknown: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        failed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            target = session.get(
+                CourseScheduleImportCompensation,
+                uuid.UUID(str(target_id)),
+                with_for_update=True,
+            )
+            if target is None:
+                return None
+            if target.status == "deleted":
+                return self._compensation_view(target)
+            target.status = "delete_outcome_unknown" if outcome_unknown else "delete_failed"
+            target.error_code = str(error_code)[:128]
+            target.updated_at = failed_at
+            target.delete_claim_expires_at = None
+            parent = session.get(
+                CourseScheduleImport, target.import_id, with_for_update=True
+            )
+            if parent is not None:
+                self._finalize_cancellation_locked(session, parent, failed_at)
+            session.flush()
+            return self._compensation_view(target)
+
+    def finalize_cancellation(
+        self,
+        import_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        finalized_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None:
+                raise LookupError("draft not found")
+            self._materialize_compensation_targets(session, row, finalized_at)
+            self._finalize_cancellation_locked(session, row, finalized_at)
+            session.flush()
+            return self._view(session, row)
+
+    def recover_stale_cancellation_work(
+        self, *, now: datetime | None = None
+    ) -> int:
+        recovered_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            count = self._recover_stale_cancellation_rows(session, recovered_at)
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(CourseScheduleImport.status.in_(COMPENSATION_PARENT_STATUSES))
+                    .with_for_update()
+                ).scalars()
+            )
+            for row in rows:
+                self._materialize_compensation_targets(session, row, recovered_at)
+                self._finalize_cancellation_locked(session, row, recovered_at)
+            session.flush()
+            return count
+
+    def resume_cleanup_for_participant(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        resumed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(
+                        CourseScheduleImport.participant_id == participant_id,
+                        CourseScheduleImport.status == "cleanup_failed",
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            for row in rows:
+                row.status = "cancelling"
+                row.cleanup_error_code = None
+                row.last_progress_at = resumed_at
+                for target in session.execute(
+                    select(CourseScheduleImportCompensation).where(
+                        CourseScheduleImportCompensation.import_id == row.id,
+                        CourseScheduleImportCompensation.status == "delete_failed",
+                    )
+                ).scalars():
+                    target.status = "delete_pending"
+                    target.error_code = None
+                    target.updated_at = resumed_at
+                self._materialize_compensation_targets(session, row, resumed_at)
+            session.flush()
+            return len(rows)
+
+    # Compatibility spelling for the OAuth completion callback.
+    resume_cleanup = resume_cleanup_for_participant
+
+    def recent_cancel_candidates(
+        self, participant_id: uuid.UUID, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        statuses = {
+            "pending_context", "pending_confirmation", "queued", "running",
+            "cancelling", "succeeded", "partial_failed", "cleanup_failed",
+            "cancelled",
+        }
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImport)
+                    .where(
+                        CourseScheduleImport.participant_id == participant_id,
+                        CourseScheduleImport.status.in_(statuses),
+                    )
+                    .order_by(
+                        CourseScheduleImport.created_at.desc(),
+                        CourseScheduleImport.id.desc(),
+                    )
+                    .limit(max(1, min(int(limit), 50)))
+                ).scalars()
+            )
+            output = []
+            for row in rows:
+                writes = list(
+                    session.execute(
+                        select(CourseScheduleImportWrite).where(
+                            CourseScheduleImportWrite.import_id == row.id
+                        )
+                    ).scalars()
+                )
+                courses = list((row.structured_result or {}).get("courses") or [])
+                names = [str(course.get("course_name") or "") for course in courses]
+                if not names:
+                    names = [
+                        str(item.course_name)
+                        for item in self._items(session, row.id)
+                    ]
+                output.append({
+                    "id": str(row.id),
+                    "participant_id": str(row.participant_id),
+                    "status": row.status,
+                    "created_at": _aware(row.created_at).isoformat(),
+                    "source_image_hash": row.source_image_hash,
+                    "course_names": [name[:80] for name in names[:10]],
+                    "has_provider_effect": any(
+                        write.status in PROVIDER_EFFECT_STATUSES
+                        or bool(write.provider_event_id)
+                        or bool(write.provider_conflict_event_id)
+                        for write in writes
+                    ),
+                })
+            return output
+
+    def resolve_cancel_selector(
+        self, participant_id: uuid.UUID, selector: dict[str, Any]
+    ) -> dict[str, Any]:
+        selector = dict(selector or {})
+        candidates = self.recent_cancel_candidates(participant_id, limit=50)
+        if selector.get("latest") is True:
+            matches = candidates[:1]
+        elif selector.get("course_name"):
+            needle = str(selector["course_name"]).strip().lower()
+            matches = [
+                candidate for candidate in candidates
+                if any(
+                    needle in name.lower() or name.lower() in needle
+                    for name in candidate.get("course_names") or []
+                )
+            ]
+        elif selector.get("created_date"):
+            value = str(selector["created_date"])
+            matches = [
+                candidate for candidate in candidates
+                if str(candidate.get("created_at") or "")[:10] == value
+            ]
+        else:
+            raise ValueError("cancel selector is required")
+        if not matches:
+            raise LookupError("course schedule import not found")
+        if len(matches) != 1:
+            raise CourseScheduleImportAmbiguityError(matches)
+        return matches[0]
+
     def begin_confirmation(
         self,
         participant_id: uuid.UUID,
@@ -1233,6 +1765,10 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             self._expire_if_needed(row, session, now=claimed_at)
+            if row.status in COMPENSATION_PARENT_STATUSES:
+                # Cancellation owns the import until every provider effect is
+                # compensated; a late confirmation must not reopen creation.
+                return {**self._view(session, row), "claimed": False}
             if row.status == "succeeded":
                 return {**self._view(session, row), "claimed": False}
             if row.status == "running":
@@ -1347,40 +1883,191 @@ class CourseScheduleImportRepository:
     def cancel(
         self, participant_id: uuid.UUID, import_id: uuid.UUID | str
     ) -> dict[str, Any]:
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
-            )
-            self._require_owner(row, participant_id)
-            expires = _aware(row.expires_at)
-            if expires <= datetime.now(timezone.utc) and row.status in EXPIRABLE_STATUSES:
-                row.status = "expired"
-                self._clear_run_lease(row)
-            if row.status == "expired":
-                session.flush()
-                return self._view(session, row)
-            writes = list(
-                session.execute(
-                    select(CourseScheduleImportWrite).where(
-                        CourseScheduleImportWrite.import_id == row.id
-                    )
-                ).scalars()
-            )
-            surviving_effects = [
-                write for write in writes if write.status in PROVIDER_EFFECT_STATUSES
+        return self.request_cancel(participant_id, import_id)
+
+    def _materialize_compensation_targets(
+        self,
+        session: Any,
+        row: CourseScheduleImport,
+        materialized_at: datetime,
+    ) -> list[CourseScheduleImportCompensation]:
+        existing = {
+            (target.write_id, target.provider_event_id): target
+            for target in session.execute(
+                select(CourseScheduleImportCompensation).where(
+                    CourseScheduleImportCompensation.import_id == row.id
+                )
+            ).scalars()
+        }
+        writes = list(
+            session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == row.id,
+                    CourseScheduleImportWrite.status.in_(
+                        {"created", "create_identity_conflict"}
+                    ),
+                )
+            ).scalars()
+        )
+        result = list(existing.values())
+        for write in writes:
+            identities = [
+                ("primary", write.provider_event_id),
+                ("conflict", write.provider_conflict_event_id),
             ]
-            if row.status == "running" or surviving_effects:
-                return {
-                    **self._view(session, row),
-                    "cancel_requires_compensation": True,
-                    "cancel_effect_count": len(surviving_effects),
-                }
-            if row.status not in {"succeeded", "expired"}:
-                row.status = "cancelled"
-                row.completed_at = datetime.now(timezone.utc)
-                self._clear_run_lease(row)
-            session.flush()
-            return self._view(session, row)
+            for identity_kind, provider_id in identities:
+                normalized = str(provider_id or "").strip()
+                if not normalized:
+                    continue
+                key = (write.id, normalized)
+                if key in existing:
+                    continue
+                target = CourseScheduleImportCompensation(
+                    import_id=row.id,
+                    write_id=write.id,
+                    participant_id=row.participant_id,
+                    provider_event_id=normalized,
+                    provider_identity_kind=identity_kind,
+                    affected_dates_json=list(write.affected_dates_json or []),
+                    status="delete_pending",
+                    attempt_count=0,
+                    created_at=materialized_at,
+                    updated_at=materialized_at,
+                )
+                session.add(target)
+                session.flush()
+                existing[key] = target
+                result.append(target)
+        return result
+
+    def _recover_stale_cancellation_rows(
+        self, session: Any, recovered_at: datetime
+    ) -> int:
+        recovered = 0
+        parents = list(
+            session.execute(
+                select(CourseScheduleImport)
+                .where(CourseScheduleImport.status.in_(COMPENSATION_PARENT_STATUSES))
+                .with_for_update()
+            ).scalars()
+        )
+        for parent in parents:
+            run_expired = (
+                parent.run_claim_expires_at is None
+                or _aware(parent.run_claim_expires_at) <= recovered_at
+            )
+            if run_expired:
+                for write in session.execute(
+                    select(CourseScheduleImportWrite).where(
+                        CourseScheduleImportWrite.import_id == parent.id,
+                        CourseScheduleImportWrite.status == "creating",
+                    )
+                ).scalars():
+                    write.status = "create_outcome_unknown"
+                    write.error_code = "course_schedule_create_interrupted"
+                    write.updated_at = recovered_at
+                    recovered += 1
+                self._clear_run_lease(parent)
+            for target in session.execute(
+                select(CourseScheduleImportCompensation).where(
+                    CourseScheduleImportCompensation.import_id == parent.id,
+                    CourseScheduleImportCompensation.status == "deleting",
+                )
+            ).scalars():
+                deadline = target.delete_claim_expires_at
+                if deadline is None or _aware(deadline) <= recovered_at:
+                    target.status = "delete_outcome_unknown"
+                    target.error_code = "course_schedule_delete_interrupted"
+                    target.updated_at = recovered_at
+                    target.delete_claim_expires_at = None
+                    recovered += 1
+        return recovered
+
+    def _has_active_create_attempt(
+        self,
+        session: Any,
+        parent: CourseScheduleImport,
+        at: datetime,
+    ) -> bool:
+        creating = list(
+            session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == parent.id,
+                    CourseScheduleImportWrite.status == "creating",
+                )
+            ).scalars()
+        )
+        for write in creating:
+            if parent.run_claim_expires_at is not None and _aware(
+                parent.run_claim_expires_at
+            ) > at:
+                return True
+            write.status = "create_outcome_unknown"
+            write.error_code = "course_schedule_create_interrupted"
+            write.updated_at = at
+        return False
+
+    def _finalize_cancellation_locked(
+        self,
+        session: Any,
+        row: CourseScheduleImport,
+        finalized_at: datetime,
+    ) -> bool:
+        if row.status not in COMPENSATION_PARENT_STATUSES:
+            return row.status == "cancelled"
+        writes = list(
+            session.execute(
+                select(CourseScheduleImportWrite).where(
+                    CourseScheduleImportWrite.import_id == row.id
+                )
+            ).scalars()
+        )
+        targets = list(
+            session.execute(
+                select(CourseScheduleImportCompensation).where(
+                    CourseScheduleImportCompensation.import_id == row.id
+                )
+            ).scalars()
+        )
+        identities = {
+            (write.id, str(provider_id).strip())
+            for write in writes
+            for provider_id in (
+                write.provider_event_id,
+                write.provider_conflict_event_id,
+            )
+            if write.status in {"created", "create_identity_conflict"}
+            and str(provider_id or "").strip()
+        }
+        target_keys = {(target.write_id, target.provider_event_id) for target in targets}
+        create_pending = any(
+            write.status in {"planned", "creating", "create_outcome_unknown"}
+            for write in writes
+        )
+        if any(target.status == "delete_failed" for target in targets):
+            row.status = "cleanup_failed"
+            row.cleanup_error_code = next(
+                (target.error_code for target in targets if target.status == "delete_failed"),
+                "calendar_delete_failed",
+            )
+            row.last_progress_at = finalized_at
+            return False
+        clean = (
+            not create_pending
+            and identities.issubset(target_keys)
+            and all(target.status == "deleted" for target in targets)
+        )
+        if clean:
+            row.status = "cancelled"
+            row.cancelled_at = row.cancelled_at or finalized_at
+            row.completed_at = row.completed_at or finalized_at
+            row.cleanup_error_code = None
+            self._clear_run_lease(row)
+            row.last_progress_at = finalized_at
+            return True
+        row.status = "cancelling"
+        row.last_progress_at = finalized_at
+        return False
 
     @staticmethod
     def _require_owner(row: CourseScheduleImport | None, participant_id: uuid.UUID) -> None:
@@ -1436,18 +2123,21 @@ class CourseScheduleImportRepository:
         row: CourseScheduleImport,
         normalized_at: datetime,
     ) -> bool:
+        cancellation_active = row.status in COMPENSATION_PARENT_STATUSES
         changed = bool(
-            row.status != "partial_failed"
+            (not cancellation_active and row.status != "partial_failed")
             or row.completed_at is not None
-            or row.run_claimed_at is not None
-            or row.run_claim_expires_at is not None
+            or (not cancellation_active and row.run_claimed_at is not None)
+            or (not cancellation_active and row.run_claim_expires_at is not None)
         )
-        row.status = "partial_failed"
+        if not cancellation_active:
+            row.status = "partial_failed"
         row.completed_at = None
         row.completion_presented_at = None
         row.completion_presentation_error = None
         row.last_progress_at = normalized_at
-        CourseScheduleImportRepository._clear_run_lease(row)
+        if not cancellation_active:
+            CourseScheduleImportRepository._clear_run_lease(row)
         CourseScheduleImportRepository._refresh_item_statuses(session, row.id)
         return changed
 
@@ -1533,6 +2223,36 @@ class CourseScheduleImportRepository:
             "updated_at": _aware(row.updated_at).isoformat(),
         }
 
+    @staticmethod
+    def _compensation_view(row: CourseScheduleImportCompensation) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "import_id": str(row.import_id),
+            "write_id": str(row.write_id),
+            "participant_id": str(row.participant_id),
+            "provider_event_id": row.provider_event_id,
+            "provider_identity_kind": row.provider_identity_kind,
+            "affected_dates": [
+                str(value) for value in (row.affected_dates_json or [])
+            ],
+            "status": row.status,
+            "error_code": row.error_code,
+            "attempt_count": int(row.attempt_count or 0),
+            "created_at": _aware(row.created_at).isoformat(),
+            "updated_at": _aware(row.updated_at).isoformat(),
+            "delete_started_at": (
+                _aware(row.delete_started_at).isoformat()
+                if row.delete_started_at else None
+            ),
+            "deleted_at": (
+                _aware(row.deleted_at).isoformat() if row.deleted_at else None
+            ),
+            "delete_claim_expires_at": (
+                _aware(row.delete_claim_expires_at).isoformat()
+                if row.delete_claim_expires_at else None
+            ),
+        }
+
     def _view(self, session: Any, row: CourseScheduleImport) -> dict[str, Any]:
         items = self._items(session, row.id)
         writes = list(
@@ -1578,6 +2298,15 @@ class CourseScheduleImportRepository:
                 if row.completion_presented_at else None
             ),
             "completion_presentation_error": row.completion_presentation_error,
+            "cancel_requested_at": (
+                _aware(row.cancel_requested_at).isoformat()
+                if row.cancel_requested_at else None
+            ),
+            "cancel_mode": row.cancel_mode,
+            "cancelled_at": (
+                _aware(row.cancelled_at).isoformat() if row.cancelled_at else None
+            ),
+            "cleanup_error_code": row.cleanup_error_code,
             "run_claimed_at": (
                 _aware(row.run_claimed_at).isoformat() if row.run_claimed_at else None
             ),
@@ -1604,6 +2333,17 @@ class CourseScheduleImportRepository:
                 for item in items
             ],
             "writes": [self._write_view(write) for write in writes],
+            "compensations": [
+                self._compensation_view(compensation)
+                for compensation in session.execute(
+                    select(CourseScheduleImportCompensation).where(
+                        CourseScheduleImportCompensation.import_id == row.id
+                    ).order_by(
+                        CourseScheduleImportCompensation.created_at,
+                        CourseScheduleImportCompensation.id,
+                    )
+                ).scalars()
+            ],
         }
 
     def _set_run_lease(self, row: CourseScheduleImport, claimed_at: datetime) -> None:

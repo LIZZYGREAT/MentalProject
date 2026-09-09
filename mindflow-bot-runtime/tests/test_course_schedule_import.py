@@ -1887,7 +1887,7 @@ def test_defensive_preview_never_offers_calendar_actions_above_twenty_items():
     assert "按课表周期规则添加" not in payload
 
 
-def test_cancel_reply_matches_persisted_terminal_status():
+def test_cancel_reply_starts_revert_for_persisted_completed_import():
     database = memory_database()
     owner = participant(database, "P110")
     repo, draft = _draft(database, owner.id)
@@ -1897,9 +1897,10 @@ def test_cancel_reply_matches_persisted_terminal_status():
         owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
     ))
     asyncio.run(runner.run_once())
-    succeeded = service.cancel(owner.id, draft["id"])
-    assert succeeded["status"] == "succeeded"
-    assert "不能再取消" in succeeded["reply_text"]
+    cancelling = service.cancel(owner.id, draft["id"])
+    assert cancelling["status"] == "cancelling"
+    assert cancelling["cancel_mode"] == "revert"
+    assert "正在停止导入" in cancelling["reply_text"]
 
     expired = repo.create_draft(
         owner.id,
