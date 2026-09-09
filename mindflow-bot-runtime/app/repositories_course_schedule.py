@@ -8,6 +8,7 @@ import hashlib
 import json
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -51,6 +52,13 @@ PROVIDER_EFFECT_STATUSES = frozenset({
     "create_identity_conflict",
 })
 COMPENSATION_PARENT_STATUSES = frozenset({"cancelling", "cleanup_failed"})
+FINAL_PRESENTATION_STATUSES = frozenset({
+    "succeeded",
+    "partial_failed",
+    "cancelled",
+    "cleanup_failed",
+})
+DEFAULT_IMPORT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
 _EXPLICIT_ACTUAL_TIME_SOURCES = frozenset({"image", "user_actual"})
 
@@ -951,7 +959,7 @@ class CourseScheduleImportRepository:
             rows = session.execute(
                 select(CourseScheduleImport)
                 .where(
-                    CourseScheduleImport.status.in_({"succeeded", "partial_failed"}),
+                    CourseScheduleImport.status.in_(FINAL_PRESENTATION_STATUSES),
                     CourseScheduleImport.completion_presented_at.is_(None),
                 )
                 .order_by(CourseScheduleImport.completed_at, CourseScheduleImport.created_at)
@@ -967,7 +975,7 @@ class CourseScheduleImportRepository:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
-            if row is None or row.status not in {"succeeded", "partial_failed"}:
+            if row is None or row.status not in FINAL_PRESENTATION_STATUSES:
                 return False
             row.completion_presented_at = presented_at
             row.completion_presentation_error = None
@@ -985,7 +993,7 @@ class CourseScheduleImportRepository:
             row = session.get(
                 CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
             )
-            if row is None or row.status not in {"succeeded", "partial_failed"}:
+            if row is None or row.status not in FINAL_PRESENTATION_STATUSES:
                 return False
             row.completion_presented_at = None
             row.completion_presentation_error = str(error_code)[:256]
@@ -1550,6 +1558,16 @@ class CourseScheduleImportRepository:
             target.deleted_at = target.deleted_at or deleted_at
             target.updated_at = deleted_at
             target.delete_claim_expires_at = None
+            # The provider fact and the downstream rollback obligation must
+            # commit together. A duplicate delete-success notification may
+            # refresh an incomplete obligation, but never re-open completed
+            # downstream work.
+            if target.rollback_refresh_status != "completed":
+                target.rollback_refresh_status = "pending"
+                target.rollback_refresh_next_attempt_at = deleted_at
+                target.rollback_refresh_claim_expires_at = None
+                target.rollback_refresh_completed_at = None
+                target.rollback_refresh_error_code = None
             parent = session.get(
                 CourseScheduleImport, target.import_id, with_for_update=True
             )
@@ -1588,6 +1606,106 @@ class CourseScheduleImportRepository:
             )
             if parent is not None:
                 self._finalize_cancellation_locked(session, parent, failed_at)
+            session.flush()
+            return self._compensation_view(target)
+
+    def claim_next_rollback_refresh(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """Claim one durable Forecast/Warning rollback obligation."""
+
+        claimed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(CourseScheduleImportCompensation)
+                    .where(
+                        CourseScheduleImportCompensation.status == "deleted",
+                        CourseScheduleImportCompensation.rollback_refresh_status.in_(
+                            {"pending", "processing"}
+                        ),
+                        or_(
+                            CourseScheduleImportCompensation.rollback_refresh_next_attempt_at.is_(None),
+                            CourseScheduleImportCompensation.rollback_refresh_next_attempt_at
+                            <= claimed_at,
+                        ),
+                    )
+                    .order_by(
+                        CourseScheduleImportCompensation.rollback_refresh_next_attempt_at,
+                        CourseScheduleImportCompensation.updated_at,
+                        CourseScheduleImportCompensation.id,
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            for target in rows:
+                if target.rollback_refresh_status == "processing":
+                    lease_expires = target.rollback_refresh_claim_expires_at
+                    if lease_expires is not None and _aware(lease_expires) > claimed_at:
+                        continue
+                target.rollback_refresh_status = "processing"
+                target.rollback_refresh_attempt_count = int(
+                    target.rollback_refresh_attempt_count or 0
+                ) + 1
+                target.rollback_refresh_claim_expires_at = claimed_at + timedelta(
+                    seconds=self.run_lease_seconds
+                )
+                target.updated_at = claimed_at
+                session.flush()
+                return self._compensation_view(target)
+            return None
+
+    def mark_rollback_refresh_completed(
+        self,
+        target_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        completed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            target = session.get(
+                CourseScheduleImportCompensation,
+                uuid.UUID(str(target_id)),
+                with_for_update=True,
+            )
+            if target is None or target.status != "deleted":
+                return None
+            target.rollback_refresh_status = "completed"
+            target.rollback_refresh_claim_expires_at = None
+            target.rollback_refresh_next_attempt_at = None
+            target.rollback_refresh_completed_at = (
+                target.rollback_refresh_completed_at or completed_at
+            )
+            target.rollback_refresh_error_code = None
+            target.updated_at = completed_at
+            session.flush()
+            return self._compensation_view(target)
+
+    def mark_rollback_refresh_retry(
+        self,
+        target_id: uuid.UUID | str,
+        *,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        failed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            target = session.get(
+                CourseScheduleImportCompensation,
+                uuid.UUID(str(target_id)),
+                with_for_update=True,
+            )
+            if target is None or target.status != "deleted":
+                return None
+            attempt = max(1, int(target.rollback_refresh_attempt_count or 0))
+            delay_seconds = (30, 120, 600, 1800)[min(attempt - 1, 3)]
+            target.rollback_refresh_status = "pending"
+            target.rollback_refresh_next_attempt_at = failed_at + timedelta(
+                seconds=delay_seconds
+            )
+            target.rollback_refresh_claim_expires_at = None
+            target.rollback_refresh_error_code = str(error_code)[:128]
+            target.updated_at = failed_at
             session.flush()
             return self._compensation_view(target)
 
@@ -1649,6 +1767,10 @@ class CourseScheduleImportRepository:
             for row in rows:
                 row.status = "cancelling"
                 row.cleanup_error_code = None
+                # A previously presented cleanup_failed card is not the final
+                # cancelled result. Re-open durable presentation recovery.
+                row.completion_presented_at = None
+                row.completion_presentation_error = None
                 row.last_progress_at = resumed_at
                 for target in session.execute(
                     select(CourseScheduleImportCompensation).where(
@@ -1705,11 +1827,24 @@ class CourseScheduleImportRepository:
                         str(item.course_name)
                         for item in self._items(session, row.id)
                     ]
+                try:
+                    import_timezone = ZoneInfo(
+                        str(row.timezone or DEFAULT_IMPORT_TIMEZONE)
+                    )
+                except Exception:
+                    import_timezone = ZoneInfo(DEFAULT_IMPORT_TIMEZONE)
+                created_local_date = (
+                    _aware(row.created_at)
+                    .astimezone(import_timezone)
+                    .date()
+                    .isoformat()
+                )
                 output.append({
                     "id": str(row.id),
                     "participant_id": str(row.participant_id),
                     "status": row.status,
                     "created_at": _aware(row.created_at).isoformat(),
+                    "created_local_date": created_local_date,
                     "source_image_hash": row.source_image_hash,
                     "course_names": [name[:80] for name in names[:10]],
                     "has_provider_effect": any(
@@ -1741,7 +1876,7 @@ class CourseScheduleImportRepository:
             value = str(selector["created_date"])
             matches = [
                 candidate for candidate in candidates
-                if str(candidate.get("created_at") or "")[:10] == value
+                if str(candidate.get("created_local_date") or "") == value
             ]
         else:
             raise ValueError("cancel selector is required")
@@ -2045,6 +2180,9 @@ class CourseScheduleImportRepository:
             for write in writes
         )
         if any(target.status == "delete_failed" for target in targets):
+            if row.status != "cleanup_failed":
+                row.completion_presented_at = None
+                row.completion_presentation_error = None
             row.status = "cleanup_failed"
             row.cleanup_error_code = next(
                 (target.error_code for target in targets if target.status == "delete_failed"),
@@ -2251,6 +2389,23 @@ class CourseScheduleImportRepository:
                 _aware(row.delete_claim_expires_at).isoformat()
                 if row.delete_claim_expires_at else None
             ),
+            "rollback_refresh_status": row.rollback_refresh_status,
+            "rollback_refresh_attempt_count": int(
+                row.rollback_refresh_attempt_count or 0
+            ),
+            "rollback_refresh_next_attempt_at": (
+                _aware(row.rollback_refresh_next_attempt_at).isoformat()
+                if row.rollback_refresh_next_attempt_at else None
+            ),
+            "rollback_refresh_claim_expires_at": (
+                _aware(row.rollback_refresh_claim_expires_at).isoformat()
+                if row.rollback_refresh_claim_expires_at else None
+            ),
+            "rollback_refresh_completed_at": (
+                _aware(row.rollback_refresh_completed_at).isoformat()
+                if row.rollback_refresh_completed_at else None
+            ),
+            "rollback_refresh_error_code": row.rollback_refresh_error_code,
         }
 
     def _view(self, session: Any, row: CourseScheduleImport) -> dict[str, Any]:

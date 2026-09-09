@@ -183,6 +183,61 @@ def test_course_schedule_import_migration_extends_stage6_head():
     assert migration_0042.down_revision == "0041_course_schedule_created_provider_id_guard"
 
 
+def test_0045_adds_durable_course_schedule_rollback_refresh_outbox(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0045_course_schedule_compensation_refresh_outbox.py"
+    )
+    columns = []
+    checks = []
+    indexes = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    assert migration.down_revision == "0044_course_schedule_compensation_saga"
+    migration.upgrade()
+
+    assert [name for _table, name in columns] == [
+        "rollback_refresh_status",
+        "rollback_refresh_attempt_count",
+        "rollback_refresh_next_attempt_at",
+        "rollback_refresh_claim_expires_at",
+        "rollback_refresh_completed_at",
+        "rollback_refresh_error_code",
+    ]
+    assert checks[0][0] == "ck_course_schedule_compensation_refresh_status"
+    assert checks[1][0] == "ck_course_schedule_compensation_deleted_refresh"
+    assert indexes == [
+        (
+            "ix_course_schedule_compensation_refresh_due",
+            "course_schedule_import_compensations",
+            (
+                "status",
+                "rollback_refresh_status",
+                "rollback_refresh_next_attempt_at",
+                "rollback_refresh_claim_expires_at",
+            ),
+        )
+    ]
+    assert "rollback_refresh_status = 'pending'" in statements[0]
+
+
 def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
     migration = _migration(
         VERSIONS / "0041_course_schedule_created_provider_id_guard.py"

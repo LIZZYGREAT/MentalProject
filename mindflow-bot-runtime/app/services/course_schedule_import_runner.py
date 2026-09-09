@@ -88,6 +88,11 @@ class CourseScheduleImportRunner:
             )
             if first_compensation is not None:
                 await self._run_compensations(first_compensation)
+            rollback_refresh = await asyncio.to_thread(
+                self.drafts.claim_next_rollback_refresh
+            )
+            if rollback_refresh is not None:
+                await self._run_rollback_refresh(rollback_refresh)
             return 1
 
         # Cleanup is deliberately first priority. A cancellation fence must
@@ -97,6 +102,13 @@ class CourseScheduleImportRunner:
         )
         if first_compensation is not None:
             await self._run_compensations(first_compensation)
+            return 1
+
+        rollback_refresh = await asyncio.to_thread(
+            self.drafts.claim_next_rollback_refresh
+        )
+        if rollback_refresh is not None:
+            await self._run_rollback_refresh(rollback_refresh)
             return 1
 
         claimed: list[dict[str, Any]] = []
@@ -459,24 +471,47 @@ class CourseScheduleImportRunner:
         )
         if result is None:
             return False
+        final = await asyncio.to_thread(
+            self.drafts.finalize_cancellation, target["import_id"]
+        )
+        if final.get("status") in {"cancelled", "cleanup_failed"}:
+            await self._present_completion(final)
+        return True
+
+    async def _run_rollback_refresh(self, target: dict[str, Any]) -> bool:
+        participant_id = uuid.UUID(str(target["participant_id"]))
         deleted_dates = {
             datetime.fromisoformat(str(value)).date()
             if "T" in str(value)
             else date.fromisoformat(str(value))
-            for value in result.get("affected_dates") or []
+            for value in target.get("affected_dates") or []
         }
-        if deleted_dates:
-            try:
+        try:
+            if deleted_dates:
                 await self.imports.reconcile_deleted_dates(
                     participant_id, deleted_dates
                 )
-            except Exception:
-                logger.exception(
-                    "course_schedule_import_rollback_forecast_refresh_failed "
-                    "import_id=%s target_id=%s",
-                    target["import_id"],
-                    target["id"],
-                )
+            completed = await asyncio.to_thread(
+                self.drafts.mark_rollback_refresh_completed,
+                target["id"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await asyncio.to_thread(
+                self.drafts.mark_rollback_refresh_retry,
+                target["id"],
+                error_code=type(exc).__name__,
+            )
+            logger.exception(
+                "course_schedule_import_rollback_forecast_refresh_failed "
+                "import_id=%s target_id=%s",
+                target["import_id"],
+                target["id"],
+            )
+            return False
+        if completed is None:
+            return False
         final = await asyncio.to_thread(
             self.drafts.finalize_cancellation, target["import_id"]
         )

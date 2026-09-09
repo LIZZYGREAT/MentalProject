@@ -1840,3 +1840,204 @@ def test_real_postgres_upgrade_0040_to_0041_repairs_legacy_course_schedule_write
         with engine.begin() as connection:
             connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         engine.dispose()
+
+
+def test_real_postgres_upgrade_0043_to_0045_backfills_compensation_refresh_outbox():
+    try:
+        raw_url = optional_test_postgres_url()
+    except ValueError as exc:
+        pytest.fail(str(exc))
+    if raw_url is None:
+        pytest.skip("MINDFLOW_TEST_POSTGRES_URL is not configured")
+
+    schema = f"mindflow_course_schedule_refresh_{uuid.uuid4().hex}"
+    participant_id = uuid.uuid4()
+    import_id = uuid.uuid4()
+    item_a = uuid.uuid4()
+    item_b = uuid.uuid4()
+    write_a = uuid.uuid4()
+    write_b = uuid.uuid4()
+    now = datetime(2030, 1, 15, 2, 0, tzinfo=timezone.utc)
+    engine = build_engine(
+        raw_url,
+        connect_timeout_seconds=get_test_postgres_connect_timeout_seconds(),
+    )
+    config = Config(str(RUNTIME_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(RUNTIME_ROOT / "migrations"))
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0043_course_schedule_completion_presentation")
+            connection.execute(
+                text(
+                    "INSERT INTO participants (id, participant_code) "
+                    "VALUES (:id, 'COURSE-SCHEDULE-REFRESH-MIGRATION')"
+                ),
+                {"id": participant_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO course_schedule_imports (
+                        id, participant_id, source_message_id, source_image_hash,
+                        status, semester_start_date, timezone, vision_model,
+                        structured_result, created_at, expires_at, confirmed_at,
+                        recurrence_strategy, recurrence_confirmed_at,
+                        completed_at, last_progress_at
+                    ) VALUES (
+                        :id, :participant_id, 'refresh-migration', :source_hash,
+                        'succeeded', '2030-01-14', 'Asia/Shanghai', 'vision-model',
+                        '{}'::jsonb, :created_at, :expires_at, :confirmed_at,
+                        'preserve_schedule_pattern', :confirmed_at,
+                        :completed_at, :last_progress_at
+                    )
+                    """
+                ),
+                {
+                    "id": import_id,
+                    "participant_id": participant_id,
+                    "source_hash": uuid.uuid4().hex * 2,
+                    "created_at": now,
+                    "expires_at": now + timedelta(days=1),
+                    "confirmed_at": now,
+                    "completed_at": now,
+                    "last_progress_at": now,
+                },
+            )
+            for item_id, index, normalized_key in (
+                (item_a, 0, "refresh-course-a"),
+                (item_b, 1, "refresh-course-b"),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO course_schedule_import_items (
+                            id, import_id, item_index, course_name, weekday,
+                            start_time, end_time, location, week_rule_json,
+                            normalized_key, status
+                        ) VALUES (
+                            :id, :import_id, :item_index, '迁移课程', 1,
+                            TIME '08:00', TIME '09:35', 'A101',
+                            '{}'::jsonb, :normalized_key, 'succeeded'
+                        )
+                        """
+                    ),
+                    {
+                        "id": item_id,
+                        "import_id": import_id,
+                        "item_index": index,
+                        "normalized_key": normalized_key,
+                    },
+                )
+            for write_id, item_id, occurrence, source, status, primary, conflict in (
+                (
+                    write_a,
+                    item_a,
+                    "week-1-a",
+                    "refresh-source-a",
+                    "delete_failed",
+                    "evt-a",
+                    "evt-b",
+                ),
+                (
+                    write_b,
+                    item_b,
+                    "week-1-b",
+                    "refresh-source-b",
+                    "deleted",
+                    "evt-c",
+                    None,
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO course_schedule_import_writes (
+                            id, import_id, item_id, occurrence_identity,
+                            source_identity, write_kind, summary, description,
+                            start_time, end_time, affected_dates_json, status,
+                            provider_event_id, provider_conflict_event_id,
+                            error_code, created_at, updated_at
+                        ) VALUES (
+                            :id, :import_id, :item_id, :occurrence,
+                            :source, 'single', '迁移课程', '', :start_time,
+                            :end_time, '["2030-01-14"]'::jsonb, :status,
+                            :primary, :conflict, NULL, :start_time, :start_time
+                        )
+                        """
+                    ),
+                    {
+                        "id": write_id,
+                        "import_id": import_id,
+                        "item_id": item_id,
+                        "occurrence": occurrence,
+                        "source": source,
+                        "status": status,
+                        "primary": primary,
+                        "conflict": conflict,
+                        "start_time": now,
+                        "end_time": now + timedelta(hours=1),
+                    },
+                )
+
+            command.upgrade(config, "0045_course_schedule_compensation_refresh_outbox")
+            rows = connection.execute(
+                text(
+                    "SELECT provider_event_id, provider_identity_kind, status, "
+                    "rollback_refresh_status FROM course_schedule_import_compensations "
+                    "WHERE import_id = :import_id ORDER BY provider_event_id"
+                ),
+                {"import_id": import_id},
+            ).all()
+            assert rows == [
+                ("evt-a", "primary", "delete_failed", None),
+                ("evt-b", "conflict", "delete_failed", None),
+                ("evt-c", "primary", "deleted", "pending"),
+            ]
+            assert connection.scalar(
+                text(
+                    "SELECT status FROM course_schedule_imports WHERE id = :id"
+                ),
+                {"id": import_id},
+            ) == "cleanup_failed"
+            assert connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM course_schedule_import_writes "
+                    "WHERE import_id = :id AND status = 'created'"
+                ),
+                {"id": import_id},
+            ) == 2
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO course_schedule_import_compensations (
+                                id, import_id, write_id, participant_id,
+                                provider_event_id, provider_identity_kind,
+                                affected_dates_json, status, attempt_count,
+                                created_at, updated_at
+                            ) VALUES (
+                                :id, :import_id, :write_id, :participant_id,
+                                'evt-c', 'primary', '[]'::jsonb, 'deleted', 0,
+                                :created_at, :updated_at
+                            )
+                            """
+                        ),
+                        {
+                            "id": uuid.uuid4(),
+                            "import_id": import_id,
+                            "write_id": write_b,
+                            "participant_id": participant_id,
+                            "created_at": now,
+                            "updated_at": now,
+                        },
+                    )
+    finally:
+        config.attributes.pop("connection", None)
+        with engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()

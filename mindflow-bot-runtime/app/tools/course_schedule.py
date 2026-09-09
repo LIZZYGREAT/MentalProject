@@ -274,6 +274,7 @@ class CourseScheduleTools:
                 {
                     "status": candidate.get("status"),
                     "created_at": candidate.get("created_at"),
+                    "created_local_date": candidate.get("created_local_date"),
                     "course_names": list(candidate.get("course_names") or []),
                     "has_provider_effect": bool(
                         candidate.get("has_provider_effect")
@@ -297,6 +298,7 @@ class CourseScheduleTools:
                     {
                         "status": candidate.get("status"),
                         "created_at": candidate.get("created_at"),
+                        "created_local_date": candidate.get("created_local_date"),
                         "course_names": list(candidate.get("course_names") or []),
                         "has_provider_effect": bool(
                             candidate.get("has_provider_effect")

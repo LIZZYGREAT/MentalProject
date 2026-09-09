@@ -647,6 +647,15 @@ class CourseScheduleImportCompensation(Base):
             "'delete_outcome_unknown')",
             name="ck_course_schedule_compensation_status",
         ),
+        CheckConstraint(
+            "status <> 'deleted' OR rollback_refresh_status IS NOT NULL",
+            name="ck_course_schedule_compensation_deleted_refresh",
+        ),
+        CheckConstraint(
+            "rollback_refresh_status IS NULL OR rollback_refresh_status IN "
+            "('pending','processing','completed')",
+            name="ck_course_schedule_compensation_refresh_status",
+        ),
         Index(
             "ix_course_schedule_compensation_import_status",
             "import_id", "status", "updated_at",
@@ -695,6 +704,24 @@ class CourseScheduleImportCompensation(Base):
     )
     delete_claim_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    rollback_refresh_status: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    rollback_refresh_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    rollback_refresh_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rollback_refresh_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rollback_refresh_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rollback_refresh_error_code: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
     )
 
 
