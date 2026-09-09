@@ -1335,23 +1335,43 @@ def test_succeeded_card_is_terminal():
     assert "mindflow_action" not in json.dumps(card, ensure_ascii=False)
 
 
-def test_missing_weekday_is_unfillable_v1_context():
+def test_missing_weekday_enters_draft_correction_loop():
     payload = vision_payload()
     payload["courses"][0]["weekday"] = None
-    _assert_unfillable(payload, "weekday")
+    repo, owner, draft = _assert_draft_fillable(payload, "weekday")
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], course_name="高等数学A", new_weekday=4
+    )
+    assert corrected["status"] == "pending_confirmation"
 
 
-def test_missing_week_rule_is_unfillable_v1_context():
+def test_missing_week_rule_enters_draft_correction_loop():
     payload = vision_payload()
     payload["courses"][0]["week_rule"] = None
-    _assert_unfillable(payload, "week_rule")
+    repo, owner, draft = _assert_draft_fillable(payload, "week_rule")
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学A",
+        week_start=1,
+        week_end=16,
+    )
+    assert corrected["status"] == "pending_confirmation"
 
 
-def test_missing_actual_time_without_period_is_unfillable():
+def test_missing_actual_time_without_period_enters_draft_correction_loop():
     payload = vision_payload(actual_times=False)
     payload["courses"][0]["period_start"] = None
     payload["courses"][0]["period_end"] = None
-    _assert_unfillable(payload, "actual_time")
+    repo, owner, draft = _assert_draft_fillable(payload, "actual_time")
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学A",
+        start_time="08:20",
+        end_time="09:55",
+    )
+    assert corrected["status"] == "pending_confirmation"
 
 
 def test_backend_derives_required_context():
@@ -1953,22 +1973,22 @@ def _expire_draft_ttl(database, import_id):
         row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
 
 
-def _assert_unfillable(payload, expected):
+def _assert_draft_fillable(payload, expected):
     database = memory_database()
     owner = participant(database, f"PX-{expected}")
     repo = CourseScheduleImportRepository(database)
-    with pytest.raises(UnfillableScheduleContextError) as captured:
-        repo.create_draft(
-            owner.id,
-            source_message_id=f"unfillable-{expected}",
-            source_image_hash="0" * 64,
-            vision_model="vision-model",
-            result=ScheduleVisionResult.from_dict(payload),
-            timezone_name="Asia/Shanghai",
-            semester_start_date=date(2026, 9, 7),
-        )
-    assert expected in captured.value.missing
-    assert repo.get_by_source(owner.id, f"unfillable-{expected}") is None
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id=f"fillable-{expected}",
+        source_image_hash="0" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert draft["status"] == "pending_context"
+    assert expected in draft["structured_result"]["missing_context"]
+    return repo, owner, draft
 
 
 def _image_event(event_id, message_id):

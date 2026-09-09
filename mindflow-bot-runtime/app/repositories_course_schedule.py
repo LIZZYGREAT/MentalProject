@@ -33,7 +33,25 @@ from app.models import (
 ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
 QUEUEABLE_STATUSES = {"pending_confirmation", "partial_failed"}
 EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
-INTERACTIVE_CONTEXT_FIELDS = {"semester_start_date", "period_time_mapping"}
+DRAFT_FILLABLE_CONTEXT_FIELDS = {
+    "semester_start_date",
+    "period_time_mapping",
+    "weekday",
+    "week_rule",
+    "actual_time",
+}
+# Kept as a compatibility alias for callers that imported the old name. These
+# fields are all draft-fillable; none of them authorizes a Calendar mutation.
+INTERACTIVE_CONTEXT_FIELDS = DRAFT_FILLABLE_CONTEXT_FIELDS
+PROVIDER_EFFECT_STATUSES = frozenset({
+    "creating",
+    "created",
+    "create_outcome_unknown",
+    "create_identity_conflict",
+    "delete_pending",
+    "deleting",
+    "delete_outcome_unknown",
+})
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
 _EXPLICIT_ACTUAL_TIME_SOURCES = frozenset({"image", "user_actual"})
 
@@ -128,7 +146,7 @@ class CourseScheduleImportRepository:
         created_at = _aware(now or datetime.now(timezone.utc))
         structured = prepare_schedule_context(result)
         missing = derive_required_context(result, semester_start_date=semester_start_date)
-        unsupported = missing - INTERACTIVE_CONTEXT_FIELDS
+        unsupported = missing - DRAFT_FILLABLE_CONTEXT_FIELDS
         if unsupported:
             raise UnfillableScheduleContextError(unsupported)
         structured["missing_context"] = sorted(missing)
@@ -160,12 +178,16 @@ class CourseScheduleImportRepository:
                             persisted_course.get("end_time"),
                         ],
                         "location": course.location,
-                        "week_rule": {
-                            "start_week": course.week_rule.start_week,
-                            "end_week": course.week_rule.end_week,
-                            "odd_even": course.week_rule.odd_even,
-                            "explicit_weeks": course.week_rule.explicit_weeks,
-                        },
+                        "week_rule": (
+                            {
+                                "start_week": course.week_rule.start_week,
+                                "end_week": course.week_rule.end_week,
+                                "odd_even": course.week_rule.odd_even,
+                                "explicit_weeks": course.week_rule.explicit_weeks,
+                            }
+                            if course.week_rule is not None
+                            else {}
+                        ),
                     }
                     normalized_key = hashlib.sha256(
                         json.dumps(
@@ -775,6 +797,8 @@ class CourseScheduleImportRepository:
             row.confirmed_at = row.confirmed_at or queued_at
             row.run_requested_at = queued_at
             row.last_progress_at = queued_at
+            row.completion_presented_at = None
+            row.completion_presentation_error = None
             if status_card_message_id:
                 row.status_card_message_id = str(status_card_message_id)[:128]
             if status_card_chat_id:
@@ -912,6 +936,54 @@ class CourseScheduleImportRepository:
                 self._clear_run_lease(row)
             session.flush()
             return len(rows)
+
+    def pending_completion_presentations(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return terminal imports whose final user-facing result is not durable yet."""
+
+        with self.database.session() as session:
+            rows = session.execute(
+                select(CourseScheduleImport)
+                .where(
+                    CourseScheduleImport.status.in_({"succeeded", "partial_failed"}),
+                    CourseScheduleImport.completion_presented_at.is_(None),
+                )
+                .order_by(CourseScheduleImport.completed_at, CourseScheduleImport.created_at)
+                .limit(max(1, min(int(limit), 500)))
+            ).scalars().all()
+            return [self._view(session, row) for row in rows]
+
+    def mark_completion_presented(
+        self, import_id: uuid.UUID | str, *, now: datetime | None = None
+    ) -> bool:
+        presented_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None or row.status not in {"succeeded", "partial_failed"}:
+                return False
+            row.completion_presented_at = presented_at
+            row.completion_presentation_error = None
+            return True
+
+    def mark_completion_presentation_failed(
+        self,
+        import_id: uuid.UUID | str,
+        *,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> bool:
+        failed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            if row is None or row.status not in {"succeeded", "partial_failed"}:
+                return False
+            row.completion_presented_at = None
+            row.completion_presentation_error = str(error_code)[:256]
+            row.last_progress_at = failed_at
+            return True
 
     def normalize_identity_conflicts(
         self, *, now: datetime | None = None
@@ -1287,8 +1359,22 @@ class CourseScheduleImportRepository:
             if row.status == "expired":
                 session.flush()
                 return self._view(session, row)
-            if row.status == "running":
-                raise ValueError("running draft cannot be cancelled")
+            writes = list(
+                session.execute(
+                    select(CourseScheduleImportWrite).where(
+                        CourseScheduleImportWrite.import_id == row.id
+                    )
+                ).scalars()
+            )
+            surviving_effects = [
+                write for write in writes if write.status in PROVIDER_EFFECT_STATUSES
+            ]
+            if row.status == "running" or surviving_effects:
+                return {
+                    **self._view(session, row),
+                    "cancel_requires_compensation": True,
+                    "cancel_effect_count": len(surviving_effects),
+                }
             if row.status not in {"succeeded", "expired"}:
                 row.status = "cancelled"
                 row.completed_at = datetime.now(timezone.utc)
@@ -1358,6 +1444,8 @@ class CourseScheduleImportRepository:
         )
         row.status = "partial_failed"
         row.completed_at = None
+        row.completion_presented_at = None
+        row.completion_presentation_error = None
         row.last_progress_at = normalized_at
         CourseScheduleImportRepository._clear_run_lease(row)
         CourseScheduleImportRepository._refresh_item_statuses(session, row.id)
@@ -1485,6 +1573,11 @@ class CourseScheduleImportRepository:
             "last_progress_at": (
                 _aware(row.last_progress_at).isoformat() if row.last_progress_at else None
             ),
+            "completion_presented_at": (
+                _aware(row.completion_presented_at).isoformat()
+                if row.completion_presented_at else None
+            ),
+            "completion_presentation_error": row.completion_presentation_error,
             "run_claimed_at": (
                 _aware(row.run_claimed_at).isoformat() if row.run_claimed_at else None
             ),

@@ -62,12 +62,14 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         rule = dict(course.get("week_rule") or {})
         if rule.get("explicit_weeks"):
             week_text = ",".join(str(value) for value in rule["explicit_weeks"]) + "周"
-        else:
+        elif rule.get("start_week") and rule.get("end_week"):
             week_text = f"{rule.get('start_week')}–{rule.get('end_week')}周"
             if rule.get("odd_even") == "odd":
                 week_text += "单周"
             elif rule.get("odd_even") == "even":
                 week_text += "双周"
+        else:
+            week_text = "周次待确认"
         location = _safe_schedule_text(course.get("location") or "地点待确认")
         lines.extend([
             "",
@@ -106,10 +108,20 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             "",
             "还差一个信息：这学期第一周周一是哪天？例如 2026-09-07。",
         ])
+    if "weekday" in missing:
+        lines.extend([
+            "",
+            "有课程的星期还不确定，请告诉我对应课程是周几。",
+        ])
+    if "week_rule" in missing:
+        lines.extend([
+            "",
+            "有课程的周次还不确定，请告诉我起止周，或说明单周/双周。",
+        ])
     if missing & {"period_time_mapping", "actual_time"}:
         lines.extend([
             "",
-            "有课程的节次在图片里看不清，也没有实际时间。请告诉我是第几节到第几节。",
+            "有课程的节次或实际时间还不确定，请告诉我是第几节到第几节，或直接提供起止时间。",
         ])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     status = str(draft.get("status") or "")

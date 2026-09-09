@@ -125,6 +125,11 @@ class CourseScheduleImportRunner:
         recovered = await asyncio.to_thread(
             self.drafts.requeue_startup_recoverables
         )
+        pending_presentations = await asyncio.to_thread(
+            self.drafts.pending_completion_presentations
+        )
+        for draft in pending_presentations:
+            await self._present_completion(draft)
         self._startup_recovery_done = True
         if recovered:
             self.wake()
@@ -312,27 +317,57 @@ class CourseScheduleImportRunner:
             recurrence_strategy=draft.get("recurrence_strategy"),
         )
         sender = self.sender
+        import_id = draft.get("id")
+        mark_failed = getattr(self.drafts, "mark_completion_presentation_failed", None)
+        mark_presented = getattr(self.drafts, "mark_completion_presented", None)
+
+        async def fail(error_code: str) -> None:
+            if callable(mark_failed) and import_id:
+                await asyncio.to_thread(
+                    mark_failed, import_id, error_code=error_code
+                )
+
+        async def succeed() -> None:
+            if callable(mark_presented) and import_id:
+                await asyncio.to_thread(mark_presented, import_id)
+
         if sender is None:
+            await fail("sender_unavailable")
             return
         message_id = draft.get("status_card_message_id")
-        if not message_id:
+        chat_id = draft.get("status_card_chat_id")
+        if not message_id and not chat_id:
+            await fail("presentation_target_missing")
             return
+        card_error: Exception | None = None
+        presented = False
         try:
-            await asyncio.to_thread(sender.update_card, message_id, card)
-        except Exception:
+            if message_id:
+                await asyncio.to_thread(sender.update_card, message_id, card)
+                presented = True
+        except Exception as exc:
+            card_error = exc
             logger.exception(
                 "course_schedule_import_completion_card_update_failed import_id=%s",
                 draft.get("id"),
             )
-            chat_id = draft.get("status_card_chat_id")
-            if chat_id:
-                try:
-                    await asyncio.to_thread(sender.send_text, chat_id, message["reply_text"])
-                except Exception:
-                    logger.exception(
-                        "course_schedule_import_completion_text_notice_failed import_id=%s",
-                        draft.get("id"),
-                    )
+        if not presented and chat_id:
+            try:
+                await asyncio.to_thread(sender.send_text, chat_id, message["reply_text"])
+                presented = True
+            except Exception:
+                logger.exception(
+                    "course_schedule_import_completion_text_notice_failed import_id=%s",
+                    draft.get("id"),
+                )
+        if presented:
+            await succeed()
+        else:
+            await fail(
+                "completion_card_update_failed"
+                if card_error is not None
+                else "completion_text_notice_failed"
+            )
 
     async def close(self) -> None:
         self._closed = True

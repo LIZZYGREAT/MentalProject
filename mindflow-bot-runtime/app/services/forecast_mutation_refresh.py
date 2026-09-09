@@ -349,25 +349,21 @@ class ForecastMutationRefreshQueue:
 
         participant_id = uuid.UUID(row["participant_id"])
         operation_type = str(operation.get("operation_type") or "")
-        if operation_type == "course_schedule_batch_create":
-            create_event = getattr(calendar, "create_event", None)
-            requested_items = operation.get("requested")
-            if not callable(create_event) or not isinstance(requested_items, list):
-                return None
-            results = []
-            for item in requested_items:
-                if not isinstance(item, dict) or not item.get("source_message_id"):
-                    return None
-                results.append(await create_event(
-                    participant_id,
-                    summary=str(item["summary"]),
-                    description=str(item.get("description") or ""),
-                    start_time=datetime.fromisoformat(str(item["start_time"])),
-                    end_time=datetime.fromisoformat(str(item["end_time"])),
-                    recurrence=str(item.get("recurrence") or "") or None,
-                    source_message_id=str(item["source_message_id"]),
-                ))
-            return {"events": results, "replayed": True}
+        if operation_type in {
+            # The legacy name is retained as a recovery guard for rows written
+            # before Stage4 ownership was corrected.
+            "course_schedule_batch_create",
+            "course_schedule_import_forecast_refresh",
+        }:
+            # CourseScheduleImportRunner is the only owner allowed to call the
+            # Calendar provider for course writes. Generic forecast recovery
+            # may fence/refresh downstream state, but must never replay a
+            # course batch or mutate the course write ledger indirectly.
+            return {
+                "provider_recovery_delegated": True,
+                "owner": "course_schedule_import_runner",
+                "import_id": operation.get("import_id"),
+            }
         requested = dict(operation.get("requested") or {})
         if operation_type == "create":
             create_event = getattr(calendar, "create_event", None)

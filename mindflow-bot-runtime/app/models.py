@@ -488,6 +488,12 @@ class CourseScheduleImport(Base):
     last_progress_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    completion_presented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completion_presentation_error: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
     run_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     run_claim_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

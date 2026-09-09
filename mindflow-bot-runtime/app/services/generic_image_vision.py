@@ -25,6 +25,7 @@ SYSTEM_PROMPT = """你只负责读取用户提供的图片，并返回紧凑 JSO
 image_kind 必须且只能是以下枚举之一：course_schedule、calendar_screenshot、code_or_error_screenshot、document、chart、photo、other。
 summary 客观描述与用户可能关心的关键内容；visible_text 记录回答问题所需的可见文字，看不清时不要猜；warnings 是字符串数组。
 interaction_hint 只概括用户文字与图片的交互目的，必须且只能是 question、course_import_request、calendar_event_request、describe_only、unknown 之一。它只是路由提示，不代表用户已经授权写入日历。能力询问、状态询问和假设问题不能标为写入请求。
+如果 image_kind=course_schedule，且用户要求把整张课表或其中的课程导入、添加、同步到日历，必须标为 course_import_request；calendar_event_request 只用于普通单个事件或非课程表图片。不要因为出现“日历”二字就把课程表整表请求标为 calendar_event_request。
 只能返回 JSON，不要返回 Markdown 或额外解释。"""
 
 

@@ -347,6 +347,14 @@ async def run() -> None:
     incidents = RuntimeIncidentRepository(database)
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
+    # Start the course import owner before generic Calendar mutation recovery.
+    # Forecast recovery is downstream-only and must not get a chance to replay
+    # a course provider write first.
+    sender = FeishuClient(
+        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+    )
+    business.course_schedule_import_runner.sender = sender
+    business.course_schedule_import_runner.start()
     business.dependency_refresh.start()
     business.mutation_refresh.start()
     await business.mutation_refresh.recover_startup_fences(process_started_at)
@@ -425,11 +433,6 @@ async def run() -> None:
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(
         maxsize=settings.queue_max_size
     )
-    sender = FeishuClient(
-        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
-    )
-    business.course_schedule_import_runner.sender = sender
-    business.course_schedule_import_runner.start()
     from app.integrations.feishu.message_resources import (
         FeishuMessageResourceDownloader,
     )

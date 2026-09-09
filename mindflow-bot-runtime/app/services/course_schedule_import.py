@@ -186,6 +186,24 @@ class CourseScheduleImportService:
     ) -> dict[str, Any]:
         draft = self.drafts.cancel(participant_id, import_id)
         status = draft["status"]
+        if draft.get("cancel_requires_compensation"):
+            if status == "succeeded":
+                reply_text = (
+                    "这份课程表已经添加到日历，不能再取消导入。"
+                    "如需移除，请等撤销流程接管。"
+                )
+            else:
+                reply_text = (
+                    "这次导入已经产生或可能产生日历日程，暂不能直接取消。"
+                    "请等当前导入结束后，再使用撤销操作。"
+                )
+            return {
+                "ok": False,
+                "error": "cancel_requires_compensation",
+                "status": status,
+                "import_id": draft["id"],
+                "reply_text": reply_text,
+            }
         reply = {
             "cancelled": "已取消这次课程表导入。",
             "succeeded": "这份课程表已经添加到日历，不能再取消导入。",
@@ -227,30 +245,15 @@ class CourseScheduleImportService:
             refresh_targets=refresh,
             dependency_sources=dependencies,
             operation={
-                "operation_type": "course_schedule_batch_create",
+                # This reconciliation is downstream forecast work only. The
+                # course import write ledger and runner are the sole owners of
+                # Calendar provider create/recovery.
+                "operation_type": "course_schedule_import_forecast_refresh",
                 "import_id": draft["id"],
                 "source_message_id": draft["source_message_id"],
                 "planner_version": COURSE_IMPORT_PLANNER_VERSION,
                 "period_map_version": DEFAULT_PERIOD_MAP_VERSION,
                 "recurrence_strategy": draft["recurrence_strategy"],
-                "requested": [
-                    {
-                        "summary": write.summary,
-                        "description": write.description,
-                        "start_time": write.start_time.isoformat(),
-                        "end_time": write.end_time.isoformat(),
-                        "recurrence": write.recurrence or "",
-                        "write_kind": write.write_kind,
-                        "source_message_id": self._source_identity(
-                            draft,
-                            item,
-                            write,
-                            draft["recurrence_strategy"],
-                        ),
-                    }
-                    for item in draft["items"]
-                    for write in writes_by_item.get(item["id"], [])
-                ],
             },
         )
 
@@ -265,23 +268,10 @@ class CourseScheduleImportService:
         if reconciliation is None:
             return
         repository = self.mutation_refresh.reconciliations
-        if outcome_unknown:
-            method = repository.mark_remote_outcome_unknown
-            await asyncio.to_thread(
-                method, reconciliation["id"], error_class=outcome_unknown_error
-            )
-        elif any_success:
-            await asyncio.to_thread(
-                repository.mark_remote_committed,
-                reconciliation["id"],
-                provider_result={"import_id": reconciliation["work"]["operation"]["import_id"]},
-            )
-        else:
-            await asyncio.to_thread(
-                repository.mark_remote_failed,
-                reconciliation["id"],
-                error_class="CourseScheduleBatchFailed",
-            )
+        # Provider outcome is represented by course_schedule_import_writes.
+        # Marking this downstream work fenced prevents the generic queue from
+        # treating a course import as a provider mutation to replay.
+        await asyncio.to_thread(repository.mark_fenced, reconciliation["id"])
 
     async def _reconcile_forecasts(
         self,
@@ -376,6 +366,16 @@ class CourseScheduleImportService:
             item["status"] in {"failed", "running"}
             for item in draft["items"]
         )
+        writes = list(draft.get("writes") or [])
+        write_statuses = [str(write.get("status") or "") for write in writes]
+        created_write_count = write_statuses.count("created")
+        failed_write_count = write_statuses.count("create_failed")
+        unknown_write_count = write_statuses.count("create_outcome_unknown")
+        conflict_write_count = write_statuses.count("create_identity_conflict")
+        partial_course_count = sum(
+            item["status"] in {"failed", "running"}
+            for item in draft["items"]
+        )
         strategy_label = (
             "按课表周期规则"
             if draft.get("recurrence_strategy") == PRESERVE_SCHEDULE_PATTERN
@@ -405,11 +405,21 @@ class CourseScheduleImportService:
                 + strategy_text
             )
         elif failed:
-            text = (
-                f"已添加 {succeeded} 项，有 {failed} 项没能添加。\n"
-                "你可以稍后只重试失败的内容。"
-                + strategy_text
-            )
+            if writes:
+                unresolved = failed_write_count + unknown_write_count + conflict_write_count
+                text = (
+                    f"已确认创建 {created_write_count} 个日程；"
+                    f"还有 {unresolved} 个日程未能确认，"
+                    f"涉及 {partial_course_count} 门课程未完整导入。\n"
+                    "你可以稍后只重试失败的内容。"
+                    + strategy_text
+                )
+            else:
+                text = (
+                    f"已添加 {succeeded} 项，有 {failed} 项没能添加。\n"
+                    "你可以稍后只重试失败的内容。"
+                    + strategy_text
+                )
         else:
             text = f"已添加 {succeeded} 项课程到日历。"
         return {
@@ -419,6 +429,11 @@ class CourseScheduleImportService:
             "recurrence_strategy": draft.get("recurrence_strategy"),
             "succeeded": succeeded,
             "failed": failed,
+            "created_write_count": created_write_count,
+            "failed_write_count": failed_write_count,
+            "unknown_write_count": unknown_write_count,
+            "conflict_write_count": conflict_write_count,
+            "partial_course_count": partial_course_count,
             **(
                 {"error": "provider_event_identity_conflict"}
                 if identity_conflict
