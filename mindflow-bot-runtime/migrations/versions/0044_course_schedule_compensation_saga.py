@@ -172,16 +172,16 @@ def upgrade() -> None:
         "course_schedule_import_writes",
         type_="check",
     )
+    op.execute(
+        "UPDATE course_schedule_import_writes SET status = 'created' "
+        "WHERE status IN ('delete_pending','deleting','deleted','delete_failed',"
+        "'delete_outcome_unknown')"
+    )
     op.create_check_constraint(
         "ck_course_schedule_write_status",
         "course_schedule_import_writes",
         "status IN ('planned','creating','created','create_failed',"
         "'create_outcome_unknown','create_identity_conflict','create_cancelled')",
-    )
-    op.execute(
-        "UPDATE course_schedule_import_writes SET status = 'created' "
-        "WHERE status IN ('delete_pending','deleting','deleted','delete_failed',"
-        "'delete_outcome_unknown')"
     )
     op.execute(
         "UPDATE course_schedule_imports AS i SET status = 'cleanup_failed', "
