@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timezone
 import logging
-from typing import Iterable, Mapping, TYPE_CHECKING
+from typing import Any, Iterable, Mapping, TYPE_CHECKING
 import uuid
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ class ForecastMutationRefreshQueue:
         max_concurrency: int = 2,
         invalidation_retry_delays: tuple[float, ...] = (0.05, 0.2),
         reconciliations: "CalendarMutationReconciliationRepository | None" = None,
+        course_schedule_imports: Any = None,
         recovery_poll_seconds: float = 30.0,
     ) -> None:
         if max_concurrency < 1:
@@ -36,6 +37,10 @@ class ForecastMutationRefreshQueue:
         self.max_concurrency = max_concurrency
         self.invalidation_retry_delays = invalidation_retry_delays
         self.reconciliations = reconciliations
+        # Read-only ledger access is used only to bind a crashed course
+        # import's downstream targets. This queue never calls the provider or
+        # replays course Calendar writes.
+        self.course_schedule_imports = course_schedule_imports
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
         self._loop: asyncio.AbstractEventLoop | None = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -180,6 +185,7 @@ class ForecastMutationRefreshQueue:
                 self.reconciliations.due, datetime.now(timezone.utc)
             )
             rows = await self._normalize_abandoned_prepared(rows)
+            rows = await self._bind_completed_course_schedule_effects(rows)
             rows = await self._fence_recovery_rows(rows)
             rows = await self._reconcile_remote_outcomes(rows)
             return self._enqueue_recovery_rows(rows, require_fencing=False)
@@ -226,6 +232,16 @@ class ForecastMutationRefreshQueue:
             if claimed is None:
                 continue
             row = claimed
+            if self._is_unbound_course_schedule_reconciliation(row):
+                # The course import ledger, not this generic queue, owns the
+                # provider outcome. Never fence or refresh the planner's
+                # dates before the runner binds confirmed created effects.
+                await asyncio.to_thread(
+                    self.reconciliations.release_processing,
+                    row["id"],
+                    claim_token=claim_token,
+                )
+                continue
             if row.get("work", {}).get("fenced_at"):
                 fenced_rows.append(row)
                 continue
@@ -289,6 +305,8 @@ class ForecastMutationRefreshQueue:
         calendar = getattr(self.coordinator, "calendar", None)
         output: list[dict] = []
         for row in rows:
+            if self._is_unbound_course_schedule_reconciliation(row):
+                continue
             operation = dict(row.get("work", {}).get("operation") or {})
             if (
                 row.get("status") != "remote_outcome_unknown"
@@ -483,6 +501,8 @@ class ForecastMutationRefreshQueue:
     ) -> int:
         recovered = 0
         for row in rows:
+            if self._is_unbound_course_schedule_reconciliation(row):
+                continue
             reconciliation_id = uuid.UUID(row["id"])
             if reconciliation_id in self._active_reconciliation_ids:
                 continue
@@ -525,6 +545,17 @@ class ForecastMutationRefreshQueue:
                 recovered += 1
         return recovered
 
+    @staticmethod
+    def _is_unbound_course_schedule_reconciliation(row: dict) -> bool:
+        operation = dict(row.get("work", {}).get("operation") or {})
+        operation_type = str(operation.get("operation_type") or "")
+        if operation_type not in {
+            "course_schedule_batch_create",
+            "course_schedule_import_forecast_refresh",
+        }:
+            return False
+        return not bool(row.get("work", {}).get("effect_dates_bound"))
+
     async def recover_startup_fences(self, process_started_at: datetime) -> int:
         """Fence work left by an older process before schedulers can run."""
 
@@ -538,6 +569,7 @@ class ForecastMutationRefreshQueue:
                 self.reconciliations.recoverable_before, process_started_at
             )
             rows = await self._normalize_abandoned_prepared(rows)
+            rows = await self._bind_completed_course_schedule_effects(rows)
             rows = await self._fence_recovery_rows(rows, force_claim=True)
             rows = await self._reconcile_remote_outcomes(rows)
             recovered = self._enqueue_recovery_rows(rows, require_fencing=False)
@@ -562,6 +594,60 @@ class ForecastMutationRefreshQueue:
                     + ",".join(unresolved)
                 )
             return recovered
+
+    async def _bind_completed_course_schedule_effects(
+        self, rows: list[dict]
+    ) -> list[dict]:
+        """Bind crashed course imports from their durable write ledger."""
+
+        if self.reconciliations is None or self.course_schedule_imports is None:
+            return rows
+        bound_rows: list[dict] = []
+        for row in rows:
+            if not self._is_unbound_course_schedule_reconciliation(row):
+                bound_rows.append(row)
+                continue
+            operation = dict(row.get("work", {}).get("operation") or {})
+            import_id = str(operation.get("import_id") or "")
+            if not import_id:
+                continue
+            draft = await asyncio.to_thread(
+                self.course_schedule_imports.get, import_id
+            )
+            if draft is None or draft.get("status") in {
+                "queued",
+                "running",
+                "pending_context",
+                "pending_confirmation",
+            }:
+                # The runner still owns an active provider attempt, or this
+                # row is stale before the import was confirmed.
+                continue
+            writes = list(draft.get("writes") or [])
+            effect_dates = {
+                date.fromisoformat(str(value))
+                for write in writes
+                if write.get("status") in {"created", "create_identity_conflict"}
+                for value in write.get("affected_dates") or []
+            }
+            outcome_unknown = any(
+                write.get("status") in {"creating", "create_outcome_unknown"}
+                for write in writes
+            )
+            rebound = await asyncio.to_thread(
+                self.reconciliations.bind_course_schedule_effect_dates,
+                row["id"],
+                effect_dates=effect_dates,
+                outcome_unknown=outcome_unknown,
+                outcome_unknown_error=(
+                    "CourseScheduleBatchOutcomeUnknown"
+                    if outcome_unknown
+                    else "CourseScheduleImportRecovery"
+                ),
+            )
+            if rebound is not None and rebound.get("status") != "no_effect":
+                bound_rows.append(rebound)
+        return bound_rows
 
     async def _recovery_loop(self) -> None:
         try:

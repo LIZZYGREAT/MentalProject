@@ -260,8 +260,8 @@ class CourseScheduleImportRunner:
         try:
             await self.imports._finish_reconciliation(
                 reconciliation,
-                any_success=bool(created_dates),
-                outcome_unknown=outcome_unknown or identity_conflict,
+                effect_dates=created_dates,
+                outcome_unknown=outcome_unknown,
                 outcome_unknown_error=(
                     "CourseScheduleProviderIdentityConflict"
                     if identity_conflict

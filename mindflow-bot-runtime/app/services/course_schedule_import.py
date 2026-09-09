@@ -261,17 +261,26 @@ class CourseScheduleImportService:
         self,
         reconciliation: dict[str, Any] | None,
         *,
-        any_success: bool,
+        effect_dates: set[date],
         outcome_unknown: bool,
         outcome_unknown_error: str = "CourseScheduleBatchOutcomeUnknown",
     ) -> None:
         if reconciliation is None:
             return
         repository = self.mutation_refresh.reconciliations
-        # Provider outcome is represented by course_schedule_import_writes.
-        # Marking this downstream work fenced prevents the generic queue from
-        # treating a course import as a provider mutation to replay.
-        await asyncio.to_thread(repository.mark_fenced, reconciliation["id"])
+        binder = getattr(repository, "bind_course_schedule_effect_dates", None)
+        if not callable(binder):
+            # Compatibility for injected repositories from older callers. The
+            # production repository always has the atomic binding method.
+            await asyncio.to_thread(repository.mark_fenced, reconciliation["id"])
+            return
+        await asyncio.to_thread(
+            binder,
+            reconciliation["id"],
+            effect_dates=set(effect_dates),
+            outcome_unknown=bool(outcome_unknown),
+            outcome_unknown_error=outcome_unknown_error,
+        )
 
     async def _reconcile_forecasts(
         self,
@@ -308,9 +317,6 @@ class CourseScheduleImportService:
                     )
             except Exception:
                 errors.add(target)
-        repository = getattr(self.mutation_refresh, "reconciliations", None)
-        if reconciliation is not None and repository is not None and not errors:
-            await asyncio.to_thread(repository.mark_fenced, reconciliation["id"])
         if self.mutation_refresh is not None:
             kwargs: dict[str, Any] = {
                 "reason": "course_schedule_import",

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime, timezone
 import uuid
 
 import pytest
@@ -13,10 +13,14 @@ from app.repositories_course_schedule import (
     CourseScheduleImportRepository,
     CourseScheduleProviderIdentityConflict,
 )
+from app.repositories_calendar_mutation import (
+    CalendarMutationReconciliationRepository,
+)
 from app.integrations.feishu.cards import course_schedule_result_card
-from app.models import CourseScheduleImport
+from app.models import CalendarMutationReconciliation, CourseScheduleImport
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
+from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from helpers import memory_database, participant
 
 
@@ -484,3 +488,310 @@ def test_completion_card_failure_does_not_demote_durable_import():
 
     assert repository.get(draft["id"])["status"] == "succeeded"
     assert repository.writes_for_import(draft["id"])[0]["status"] == "created"
+
+
+class _ForecastSnapshotSpy:
+    def __init__(self):
+        self.invalidations = []
+
+    def invalidate_for_calendar_mutation_dates(
+        self, _warnings, participant_id, targets, *, reason
+    ):
+        self.invalidations.append((participant_id, set(targets), reason))
+
+
+class _ForecastCoordinatorSpy:
+    def __init__(self):
+        self.forecasts = _ForecastSnapshotSpy()
+        self.warnings = object()
+        self.dependency_refresh = None
+        self.refreshes = []
+
+    async def ensure_forecast(
+        self,
+        participant_id,
+        target,
+        reason,
+        *,
+        refresh_calendar,
+        force_followup,
+    ):
+        self.refreshes.append(
+            (participant_id, target, reason, refresh_calendar, force_followup)
+        )
+
+
+def _two_occurrence_draft(database, participant_id):
+    payload = _payload()
+    payload["courses"][0]["week_rule"]["explicit_weeks"] = [1, 2]
+    repository = CourseScheduleImportRepository(database)
+    draft = repository.create_draft(
+        participant_id,
+        source_message_id="stage4-reconciliation",
+        source_image_hash=uuid.uuid4().hex,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    return repository, draft
+
+
+def _forecast_import_stack(database, owner, repository, calendar):
+    reconciliations = CalendarMutationReconciliationRepository(database)
+    coordinator = _ForecastCoordinatorSpy()
+    refresh = ForecastMutationRefreshQueue(
+        coordinator,
+        reconciliations=reconciliations,
+        course_schedule_imports=repository,
+        recovery_poll_seconds=3600,
+    )
+    service = CourseScheduleImportService(
+        repository,
+        calendar,
+        Tokens(),
+        forecast_coordinator=coordinator,
+        forecast_snapshots=coordinator.forecasts,
+        mutation_refresh=refresh,
+    )
+    runner = _runner(service)
+    return reconciliations, coordinator, refresh, service, runner
+
+
+def test_course_schedule_all_definite_failures_bind_no_effect_and_skip_forecast():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-NO-EFFECT")
+        repository, draft = _draft(database, owner.id, source="no-effect")
+
+        class AllFailedCalendar(RecordingCalendar):
+            async def _create(self, _participant_id, **kwargs):
+                self.calls.append(kwargs)
+                raise RuntimeError("definite provider failure")
+
+        calendar = AllFailedCalendar()
+        reconciliations, coordinator, refresh, service, runner = _forecast_import_stack(
+            database, owner, repository, calendar
+        )
+        refresh.start()
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        await runner.run_once()
+        await refresh.wait_idle()
+        with database.session() as session:
+            reconciliation_id = session.query(CalendarMutationReconciliation).one().id
+        row = reconciliations.get(reconciliation_id)
+        await refresh.close()
+        return row, coordinator
+
+    row, coordinator = asyncio.run(scenario())
+
+    assert row["status"] == "no_effect"
+    assert row["work"]["targets"] == []
+    assert coordinator.forecasts.invalidations == []
+    assert coordinator.refreshes == []
+
+
+def test_course_schedule_partial_success_refreshes_only_created_dates():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-PARTIAL-EFFECT")
+        repository, draft = _two_occurrence_draft(database, owner.id)
+
+        class FailSecondCalendar(RecordingCalendar):
+            async def _create(self, _participant_id, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 2:
+                    raise RuntimeError("one write failed")
+                return {"id": f"event-{len(self.calls)}"}
+
+        calendar = FailSecondCalendar()
+        reconciliations, coordinator, refresh, service, runner = _forecast_import_stack(
+            database, owner, repository, calendar
+        )
+        refresh.start()
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=EXPAND_ALL_OCCURRENCES,
+        )
+        await runner.run_once()
+        await refresh.wait_idle()
+        created_dates = repository.created_write_dates(draft["id"])
+        expected_direct = service._mutation_work(created_dates)[1]
+        failed_date = calendar.calls[1]["start_time"].date()
+        with database.session() as session:
+            reconciliation_id = session.query(CalendarMutationReconciliation).one().id
+        row = reconciliations.get(reconciliation_id)
+        await refresh.close()
+        return row, coordinator, expected_direct, failed_date
+
+    row, coordinator, expected_direct, failed_date = asyncio.run(scenario())
+
+    invalidated = set().union(
+        *(targets for _participant_id, targets, _reason in coordinator.forecasts.invalidations)
+    )
+    refreshed = {target for _participant_id, target, *_rest in coordinator.refreshes}
+    bound_dates = {
+        item["local_date"] for item in row["work"]["targets"]
+        if item.get("requires_invalidation")
+    }
+    assert invalidated == expected_direct
+    assert refreshed == set(row_date for row_date in expected_direct)
+    assert failed_date.isoformat() not in bound_dates
+
+
+def test_course_schedule_unknown_does_not_refresh_until_runner_recovery_confirms_created():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-UNKNOWN-EFFECT")
+        repository, draft = _draft(database, owner.id, source="unknown-effect")
+        calendar = RecordingCalendar(missing_first=True)
+        reconciliations, coordinator, refresh, service, runner = _forecast_import_stack(
+            database, owner, repository, calendar
+        )
+
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        await runner.run_once()
+        first_row = reconciliations.due(datetime.max.replace(tzinfo=timezone.utc))[0]
+        assert coordinator.forecasts.invalidations == []
+        assert coordinator.refreshes == []
+
+        refresh.start()
+        await runner.recover_startup()
+        await refresh.wait_idle()
+        created_dates = repository.created_write_dates(draft["id"])
+        expected_direct = service._mutation_work(created_dates)[1]
+        await refresh.close()
+        return first_row, coordinator, expected_direct
+
+    first_row, coordinator, expected_direct = asyncio.run(scenario())
+
+    assert first_row["status"] == "remote_outcome_unknown"
+    assert first_row["work"]["effect_dates"] == []
+    assert first_row["work"]["targets"] == []
+    invalidated = set().union(
+        *(targets for _participant_id, targets, _reason in coordinator.forecasts.invalidations)
+    )
+    assert invalidated == expected_direct
+    assert coordinator.refreshes
+
+
+def test_course_schedule_recovery_binds_completed_ledger_after_runner_crash():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-CRASH-BIND")
+        repository, draft = _draft(database, owner.id, source="crash-bind")
+        calendar = RecordingCalendar()
+        reconciliations, coordinator, refresh, service, _runner_instance = (
+            _forecast_import_stack(database, owner, repository, calendar)
+        )
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        claimed = repository.claim_next_import()
+        all_dates = {
+            date.fromisoformat(value)
+            for write in claimed["writes"]
+            for value in write["affected_dates"]
+        }
+        reconciliation = await service._prepare_reconciliation(
+            owner.id, claimed, all_dates, {}
+        )
+        write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+        calendar_result = await calendar.create_recurring_event(
+            owner.id,
+            summary=write["summary"],
+            start_time=datetime.fromisoformat(write["start_time"]),
+            end_time=datetime.fromisoformat(write["end_time"]),
+            description=write["description"],
+            recurrence=write["recurrence"],
+            source_message_id=write["source_identity"],
+        )
+        repository.record_write_created(
+            draft["id"], write["id"], calendar_result["id"]
+        )
+        assert repository.finalize_queued_import(draft["id"])["status"] == "succeeded"
+        with database.session() as session:
+            session.get(
+                CalendarMutationReconciliation,
+                uuid.UUID(reconciliation["id"]),
+            ).next_attempt_at = datetime.now(timezone.utc)
+
+        refresh.start()
+        await refresh.recover_now()
+        await refresh.wait_idle()
+        created_dates = repository.created_write_dates(draft["id"])
+        expected_direct = service._mutation_work(created_dates)[1]
+        recovered = reconciliations.get(reconciliation["id"])
+        await refresh.close()
+        return recovered, coordinator, expected_direct
+
+    recovered, coordinator, expected_direct = asyncio.run(scenario())
+
+    invalidated = set().union(
+        *(targets for _participant_id, targets, _reason in coordinator.forecasts.invalidations)
+    )
+    assert recovered["status"] == "resolved"
+    assert invalidated == expected_direct
+
+
+def test_course_schedule_identity_conflict_uses_effect_dates_once():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-CONFLICT-EFFECT")
+        repository, draft = _draft(database, owner.id, source="conflict-effect")
+        calendar = RecordingCalendar()
+        reconciliations, coordinator, refresh, service, _runner_instance = (
+            _forecast_import_stack(database, owner, repository, calendar)
+        )
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        claimed = repository.claim_next_import()
+        write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+        all_dates = {
+            date.fromisoformat(value) for value in write["affected_dates"]
+        }
+        reconciliation = await service._prepare_reconciliation(
+            owner.id, repository.get(draft["id"]), all_dates, {}
+        )
+        repository.record_write_created(draft["id"], write["id"], "provider-a")
+        with pytest.raises(CourseScheduleProviderIdentityConflict):
+            repository.record_write_created(draft["id"], write["id"], "provider-b")
+
+        refresh.start()
+        effect_dates = repository.created_write_dates(draft["id"])
+        await service._finish_reconciliation(
+            reconciliation,
+            effect_dates=effect_dates,
+            outcome_unknown=False,
+        )
+        await service._reconcile_forecasts(
+            owner.id, effect_dates, reconciliation=reconciliation
+        )
+        await refresh.wait_idle()
+        await refresh.close()
+        return coordinator, service._mutation_work(effect_dates)[1]
+
+    coordinator, expected_direct = asyncio.run(scenario())
+
+    invalidated = set().union(
+        *(targets for _participant_id, targets, _reason in coordinator.forecasts.invalidations)
+    )
+    assert invalidated == expected_direct
+    assert len(coordinator.forecasts.invalidations) == 1
+    assert {
+        target for _participant_id, target, *_rest in coordinator.refreshes
+    } == expected_direct

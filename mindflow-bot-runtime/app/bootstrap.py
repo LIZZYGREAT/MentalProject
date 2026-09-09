@@ -196,9 +196,11 @@ def build_business_services(
     )
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
+    course_schedule_import_repository = CourseScheduleImportRepository(database)
     mutation_refresh = ForecastMutationRefreshQueue(
         forecast_coordinator,
         reconciliations=CalendarMutationReconciliationRepository(database),
+        course_schedule_imports=course_schedule_import_repository,
     )
     observation_refresh = ObservationForecastRefreshService(
         forecast_snapshots,
@@ -209,7 +211,7 @@ def build_business_services(
     )
     care_outcome_refresh = CareOutcomeRefreshService(database)
     course_schedule_imports = CourseScheduleImportService(
-        CourseScheduleImportRepository(database),
+        course_schedule_import_repository,
         calendar,
         token_repository,
         timezone_name=settings.timezone_name,
