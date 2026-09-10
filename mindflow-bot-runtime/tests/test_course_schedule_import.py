@@ -180,10 +180,13 @@ def test_vision_valid_json_and_malformed_json_rejected():
 
 def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
     calls = 0
+    retry_prompts = []
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
+        body = json.loads(request.content)
+        retry_prompts.append(body["messages"][1]["content"][0]["text"])
         payload = vision_payload()
         if calls == 1:
             payload["unexpected_key"] = "schema mistake"
@@ -200,6 +203,7 @@ def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
 
     assert result.document_type == "course_schedule"
     assert calls == 2
+    assert "vision result fields do not match schema" in retry_prompts[1]
 
 
 def test_vision_schema_never_accepts_guessed_or_partial_times():

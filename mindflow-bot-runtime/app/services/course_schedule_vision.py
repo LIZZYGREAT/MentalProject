@@ -88,6 +88,7 @@ class CourseScheduleVisionService:
                 # with the same image.  No Calendar operation is reachable
                 # from this service, and the second response is validated in
                 # exactly the same way before a draft may be created.
+                retry_detail = ""
                 for attempt in range(2):
                     request = {
                         "model": self.model,
@@ -104,9 +105,10 @@ class CourseScheduleVisionService:
                                             "读取这张课程表，按规定 JSON 返回。"
                                             if attempt == 0
                                             else (
-                                                "请重新读取同一张课程表。上一次输出未通过"
-                                                "字段校验；所有规定字段都必须出现，"
-                                                "看不清的值用 null。只返回 JSON。"
+                                                "请重新读取同一张课程表。上一次输出在以下"
+                                                f"校验项失败：{retry_detail}。请修正该问题；"
+                                                "所有规定字段都必须出现，看不清的值用 null。"
+                                                "只返回 JSON。"
                                             )
                                         ),
                                     },
@@ -149,6 +151,7 @@ class CourseScheduleVisionService:
                         ScheduleVisionValidationError,
                     ) as exc:
                         if attempt == 0:
+                            retry_detail = str(exc).strip()[:300] or type(exc).__name__
                             logger.info(
                                 "course_schedule_vision_validation_retry "
                                 "model=%s error_class=%s detail=%s",
