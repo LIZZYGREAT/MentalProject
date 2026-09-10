@@ -47,6 +47,9 @@ from app.repositories_course_schedule import (
     UnfillableScheduleContextError,
     prepare_schedule_context,
 )
+from app.repositories_course_schedule_image import (
+    CourseScheduleImageSessionRepository,
+)
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
@@ -314,6 +317,7 @@ class BotWorker:
         schedule_vision: object | None = None,
         generic_image_vision: object | None = None,
         schedule_imports: object | None = None,
+        schedule_image_sessions: object | None = None,
         message_resources: object | None = None,
         schedule_draft_ttl_minutes: int = 60,
         schedule_image_max_concurrency: int = 1,
@@ -350,6 +354,12 @@ class BotWorker:
         self.schedule_vision = schedule_vision
         self.generic_image_vision = generic_image_vision
         self.schedule_imports = schedule_imports
+        database = getattr(events, "database", None)
+        self.schedule_image_sessions = schedule_image_sessions or (
+            CourseScheduleImageSessionRepository(database)
+            if database is not None
+            else None
+        )
         self.message_resources = message_resources
         self.schedule_draft_ttl_minutes = max(1, int(schedule_draft_ttl_minutes))
         self._schedule_image_semaphore = asyncio.Semaphore(
@@ -896,6 +906,12 @@ class BotWorker:
                 participant.id, event.event_id, task_generation
             )
             schedule_result = getattr(context, "schedule_result", None)
+            if context.image_kind == "course_schedule":
+                await self._start_schedule_image_session(
+                    event,
+                    participant.id,
+                    vision_model=getattr(self.generic_image_vision, "model", None),
+                )
             schedule_question = context.image_kind == "course_schedule" and (
                 is_schedule_image_question(user_text)
                 or context.interaction_hint == "question"
@@ -916,6 +932,11 @@ class BotWorker:
                         event, downloaded_image=image
                     )
                 if read_only.status == "parsed" and read_only.context is not None:
+                    await self._mark_schedule_image_ready(
+                        event,
+                        participant.id,
+                        result=schedule_result,
+                    )
                     schedule_context = read_only.context
                     route = "strict_schedule_read_only_after_generic"
                     await self._note_multimodal_route(event, route)
@@ -947,6 +968,11 @@ class BotWorker:
                     consumption_finished = True
                     dispatch_late = True
                     return
+                await self._mark_schedule_image_failed(
+                    event,
+                    participant.id,
+                    error_code="schedule_read_only_parse_failed",
+                )
             if context.image_kind == "course_schedule" and not schedule_question:
                 route = "schedule_preview_after_image_kind"
                 await self._note_multimodal_route(event, route)
@@ -1077,7 +1103,7 @@ class BotWorker:
             GenericImageVisionValidationFailure,
             GenericImageVisionError,
             MessageResourceError,
-        ):
+        ) as exc:
             await self._ensure_task_not_stopped(
                 participant.id, event.event_id, task_generation
             )
@@ -1085,6 +1111,19 @@ class BotWorker:
                 event,
                 "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
             )
+            if getattr(exc, "image_kind", None) == "course_schedule":
+                await self._start_schedule_image_session(
+                    event,
+                    participant.id,
+                    vision_model=getattr(self.generic_image_vision, "model", None),
+                )
+                await self._mark_schedule_image_failed(
+                    event,
+                    participant.id,
+                    error_code="schedule_validation_failed",
+                    detail=getattr(exc, "detail", str(exc)),
+                    parse_report=getattr(exc, "parse_report", None),
+                )
             await self.multimodal_turns.cancel(turn)
             consumption_finished = True
             dispatch_late = True
@@ -1477,6 +1516,106 @@ class BotWorker:
             },
         )
 
+    async def _start_schedule_image_session(
+        self,
+        event: BotEvent,
+        participant_id,
+        *,
+        vision_model: str | None = None,
+    ) -> None:
+        if self.schedule_image_sessions is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self.schedule_image_sessions.start,
+                participant_id,
+                chat_id=event.chat_id,
+                image_message_id=event.message_id,
+                image_key=str(event.image_key or ""),
+                vision_model=vision_model,
+            )
+        except Exception:
+            logger.exception(
+                "course_schedule_image_session_start_failed event_id=%s",
+                event.event_id,
+            )
+
+    async def _mark_schedule_image_ready(
+        self,
+        event: BotEvent,
+        participant_id,
+        *,
+        draft: dict | None = None,
+        result=None,
+    ) -> None:
+        if self.schedule_image_sessions is None:
+            return
+        structured = dict((draft or {}).get("structured_result") or {})
+        metadata = dict(structured.get("_metadata") or {})
+        parse_report = (
+            metadata.get("parse_report")
+            or getattr(result, "parse_report", None)
+            or None
+        )
+        missing = list(structured.get("missing_context") or [])
+        try:
+            await asyncio.to_thread(
+                self.schedule_image_sessions.mark_ready,
+                participant_id,
+                event.message_id,
+                import_id=(draft or {}).get("id"),
+                needs_information=bool(missing),
+                parse_report=parse_report,
+            )
+        except Exception:
+            logger.exception(
+                "course_schedule_image_session_ready_failed event_id=%s",
+                event.event_id,
+            )
+
+    async def _mark_schedule_image_failed(
+        self,
+        event: BotEvent,
+        participant_id,
+        *,
+        error_code: str,
+        detail: str = "",
+        parse_report: dict | None = None,
+    ) -> None:
+        telemetry = {
+            "stage": "schedule_image_parse",
+            "error_code": str(error_code)[:128],
+            "validator_detail": str(detail)[:500],
+            "model": str(
+                getattr(self.generic_image_vision, "model", None)
+                or getattr(self.schedule_vision, "model", "")
+            )[:128],
+            "attempt": 2 if error_code == "schedule_validation_failed" else 1,
+        }
+        if parse_report:
+            telemetry["parse_report"] = dict(parse_report)
+        await asyncio.to_thread(
+            self.events.save_telemetry,
+            event.event_id,
+            {"course_schedule_failure": telemetry},
+        )
+        if self.schedule_image_sessions is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self.schedule_image_sessions.mark_failed,
+                participant_id,
+                event.message_id,
+                error_code=error_code,
+                error_detail=detail,
+                parse_report=parse_report,
+            )
+        except Exception:
+            logger.exception(
+                "course_schedule_image_session_failure_record_failed event_id=%s",
+                event.event_id,
+            )
+
     async def _handle_schedule_image(
         self,
         event: BotEvent,
@@ -1495,6 +1634,15 @@ class BotWorker:
         await self._ensure_task_not_stopped(
             participant_id, delivery_event.event_id, task_generation
         )
+        await self._start_schedule_image_session(
+            event,
+            participant_id,
+            vision_model=(
+                vision_model
+                or getattr(self.schedule_vision, "model", None)
+                or getattr(self.generic_image_vision, "model", None)
+            ),
+        )
         if (
             (self.schedule_vision is None and parsed_result is None)
             or self.schedule_imports is None
@@ -1504,6 +1652,11 @@ class BotWorker:
                 participant_id, delivery_event.event_id, task_generation
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_service_unavailable",
+            )
             return ScheduleImageOutcome("failed", None, "other")
         try:
             await self._ensure_task_not_stopped(
@@ -1518,6 +1671,9 @@ class BotWorker:
                 participant_id, delivery_event.event_id, task_generation
             )
             if existing is not None:
+                await self._mark_schedule_image_ready(
+                    event, participant_id, draft=existing
+                )
                 delivered = await self._deliver_card(
                     delivery_event, course_schedule_preview_card(existing)
                 )
@@ -1551,6 +1707,9 @@ class BotWorker:
                     participant_id, delivery_event.event_id, task_generation
                 )
                 if existing is not None:
+                    await self._mark_schedule_image_ready(
+                        event, participant_id, draft=existing
+                    )
                     delivered = await self._deliver_card(
                         delivery_event, course_schedule_preview_card(existing)
                     )
@@ -1586,6 +1745,12 @@ class BotWorker:
                     participant_id, delivery_event.event_id, task_generation
                 )
                 if result.document_type != "course_schedule":
+                    if self.schedule_image_sessions is not None:
+                        await asyncio.to_thread(
+                            self.schedule_image_sessions.archive,
+                            participant_id,
+                            event.message_id,
+                        )
                     if report_not_course_schedule:
                         await self._deliver(
                             delivery_event,
@@ -1695,6 +1860,9 @@ class BotWorker:
                         draft,
                         "course_schedule",
                     )
+                await self._mark_schedule_image_ready(
+                    event, participant_id, draft=draft, result=result
+                )
                 return ScheduleImageOutcome(
                     "draft_created" if created_new else "existing_draft",
                     draft,
@@ -1712,6 +1880,12 @@ class BotWorker:
             await self._deliver(
                 delivery_event, "这张课程表缺少星期、周次或可用时间，暂时无法可靠导入。请换一张信息更完整、清晰的图片。"
             )
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_context_unfillable",
+                detail=str(exc),
+            )
             return ScheduleImageOutcome("failed", None, "other")
 
         except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError) as exc:
@@ -1726,6 +1900,12 @@ class BotWorker:
             )
             await self._deliver(
                 delivery_event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
+            )
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_image_rejected",
+                detail=str(exc),
             )
             return ScheduleImageOutcome("failed", None, "other")
         except CourseScheduleVisionValidationFailure as exc:
@@ -1744,6 +1924,13 @@ class BotWorker:
                 "所以还没有写入日历。请直接再试一次“导入这张课表”；"
                 "如果仍失败，管理员可依据日志中的校验项定位问题。",
             )
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_validation_failed",
+                detail=getattr(exc, "detail", str(exc)),
+                parse_report=getattr(exc, "parse_report", None),
+            )
             return ScheduleImageOutcome("failed", None, "other")
         except (CourseScheduleVisionUnavailable, CourseScheduleVisionError, MessageResourceError) as exc:
             await self._ensure_task_not_stopped(
@@ -1756,6 +1943,12 @@ class BotWorker:
                 type(exc).__name__,
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_vision_unavailable",
+                detail=str(exc),
+            )
             return ScheduleImageOutcome("failed", None, "other")
         except Exception as exc:
             await self._ensure_task_not_stopped(
@@ -1768,6 +1961,12 @@ class BotWorker:
                 type(exc).__name__,
             )
             await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_processing_failed",
+                detail=str(exc),
+            )
             return ScheduleImageOutcome("failed", None, "other")
 
     async def _report_schedule_preview_delivery_failure(

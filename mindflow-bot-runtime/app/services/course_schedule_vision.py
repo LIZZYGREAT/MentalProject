@@ -47,7 +47,20 @@ class CourseScheduleVisionUnavailable(CourseScheduleVisionError):
 
 
 class CourseScheduleVisionValidationFailure(CourseScheduleVisionError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: str = "",
+        model: str = "",
+        attempt: int = 2,
+        parse_report: dict | None = None,
+    ) -> None:
+        self.detail = str(detail)[:500]
+        self.model = str(model)[:128]
+        self.attempt = int(attempt)
+        self.parse_report = dict(parse_report or {})
+        super().__init__(message)
 
 
 class CourseScheduleVisionService:
@@ -176,7 +189,15 @@ class CourseScheduleVisionService:
         ) as exc:
             self._log_failure(started, exc)
             raise CourseScheduleVisionValidationFailure(
-                "vision response failed strict validation"
+                "vision response failed strict validation",
+                detail=str(exc),
+                model=self.model,
+                attempt=2,
+                parse_report=(
+                    exc.report.to_dict()
+                    if hasattr(exc, "report")
+                    else None
+                ),
             ) from exc
         finally:
             encoded = ""

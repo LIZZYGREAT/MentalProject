@@ -426,6 +426,59 @@ class BotEvent(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CourseScheduleImageSession(Base):
+    __tablename__ = "course_schedule_image_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id",
+            "image_message_id",
+            name="uq_course_schedule_image_session_message",
+        ),
+        CheckConstraint(
+            "status IN ('parsing','needs_information','needs_retry','ready',"
+            "'imported','archived')",
+            name="ck_course_schedule_image_session_status",
+        ),
+        Index(
+            "ix_course_schedule_image_session_participant_chat",
+            "participant_id",
+            "chat_id",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    import_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("course_schedule_imports.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    chat_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    image_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    image_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    parse_report_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    vision_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class CourseScheduleImport(Base):
     __tablename__ = "course_schedule_imports"
     __table_args__ = (

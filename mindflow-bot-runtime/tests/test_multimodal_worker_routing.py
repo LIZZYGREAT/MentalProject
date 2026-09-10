@@ -35,6 +35,9 @@ from app.services.generic_image_vision import (
     GenericImageInspection,
     GenericImageVisionUnavailable,
 )
+from app.services.course_schedule_vision import (
+    CourseScheduleVisionValidationFailure,
+)
 from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
@@ -896,6 +899,66 @@ def test_unified_course_schedule_vision_creates_preview_without_second_model_cal
     assert draft["vision_model"] == "unified-vision"
     assert len(previews) == 1
     assert runtime.calls == []
+    image_session = worker.schedule_image_sessions.latest(
+        person.id, chat_id="chat"
+    )
+    assert image_session["status"] == "needs_information"
+    assert image_session["import_id"] == draft["id"]
+
+
+def test_strict_schedule_failure_persists_diagnostic_and_event_telemetry():
+    class FailingStrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            raise CourseScheduleVisionValidationFailure(
+                "invalid schedule",
+                detail="course_name is missing",
+                model=self.model,
+                parse_report={
+                    "quarantined": [{"path": "courses[2]", "reason": "missing_name"}]
+                },
+            )
+
+    gateway, queue, worker, _runtime, _sender, _, _ = _system(
+        schedule_vision=FailingStrictVision(),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    failure = worker.schedule_image_sessions.last_failure(
+        person.id, chat_id="chat"
+    )
+    assert failure["last_error_code"] == "schedule_validation_failed"
+    assert failure["error_detail"] == "course_name is missing"
+    assert failure["parse_report"]["quarantined"][0]["path"] == "courses[2]"
+    with worker.events.database.session() as session:
+        telemetry = session.get(StoredBotEvent, "image").telemetry_json
+    assert telemetry["course_schedule_failure"]["error_code"] == (
+        "schedule_validation_failed"
+    )
+    assert telemetry["course_schedule_failure"]["validator_detail"] == (
+        "course_name is missing"
+    )
 
 
 def test_completed_course_image_accepts_natural_omitted_import_followup():

@@ -46,7 +46,18 @@ class GenericImageVisionUnavailable(GenericImageVisionError):
 
 
 class GenericImageVisionValidationFailure(GenericImageVisionError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        image_kind: str | None = None,
+        detail: str = "",
+        parse_report: dict | None = None,
+    ) -> None:
+        self.image_kind = image_kind
+        self.detail = str(detail)[:500]
+        self.parse_report = dict(parse_report or {})
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -91,6 +102,7 @@ class GenericImageVisionService:
         if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
             raise ValueError("unsupported image MIME type")
         encoded = ""
+        detected_kind = None
         started = time.monotonic()
         try:
             async with self._semaphore:
@@ -141,6 +153,7 @@ class GenericImageVisionService:
                     raise GenericImageContextValidationError("result must be an object")
                 schedule_payload = decoded.pop("schedule", None)
                 context = GenericImageContext.from_dict(decoded)
+                detected_kind = context.image_kind
                 schedule_result = None
                 if context.image_kind == "course_schedule":
                     if not isinstance(schedule_payload, dict):
@@ -162,7 +175,14 @@ class GenericImageVisionService:
         ) as exc:
             self._log_failure(started, exc)
             raise GenericImageVisionValidationFailure(
-                "generic image response failed validation"
+                "generic image response failed validation",
+                image_kind=detected_kind,
+                detail=str(exc),
+                parse_report=(
+                    exc.report.to_dict()
+                    if hasattr(exc, "report")
+                    else None
+                ),
             ) from exc
         finally:
             encoded = ""

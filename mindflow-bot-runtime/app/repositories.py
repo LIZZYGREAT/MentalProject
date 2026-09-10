@@ -4341,6 +4341,7 @@ class BotEventRepository:
             "multimodal_primary_event_id",
             "multimodal_attached_to_event_id",
             "multimodal_route",
+            "course_schedule_failure",
         }
         payload = {key: metrics[key] for key in allowed if key in metrics}
         with self.database.session() as session:
