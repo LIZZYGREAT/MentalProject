@@ -144,9 +144,10 @@ def receiver_process_main(
             try:
                 event = adapter.adapt(message)
             except InvalidBotEvent as exc:
-                logger.debug(
-                    "feishu_receiver_message_ignored reason=%s",
+                logger.info(
+                    "feishu_receiver_message_ignored reason=%s content_type=%s",
                     str(exc) or type(exc).__name__,
+                    str(getattr(message, "raw_content_type", ""))[:32],
                 )
                 return
             logger.info(

@@ -877,6 +877,35 @@ def test_course_schedule_question_is_read_only_and_recent_followup_reuses_contex
     assert len(sender.texts) == 2
 
 
+def test_rich_text_image_caption_is_passed_to_generic_vision_and_agent():
+    gateway, queue, worker, runtime, _sender, vision, _resources = _system(
+        vision=Vision(kind="photo"), debounce=0
+    )
+    event = _payload("captioned-image", "m-captioned-image", "image")
+    event["event"]["message"].update(
+        message_type="post",
+        content=json.dumps(
+            {
+                "zh_cn": {
+                    "content": [[
+                        {"tag": "text", "text": "这张图片里是什么？"},
+                        {"tag": "img", "image_key": "img-key"},
+                    ]]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(event)
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert vision.calls == ["这张图片里是什么？"]
+    assert runtime.calls[0][1].text == "这张图片里是什么？"
+
+
 def test_text_arriving_during_vision_failure_is_not_silently_lost():
     vision = Vision(delay=0.04, failure=True)
     gateway, queue, worker, runtime, sender, _, _ = _system(

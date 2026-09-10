@@ -10,7 +10,7 @@ import json
 import logging
 import multiprocessing
 from queue import Empty
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from app.identity.service import IdentityService
 from app.repositories import BotEventRepository
@@ -21,6 +21,50 @@ logger = logging.getLogger(__name__)
 
 class InvalidBotEvent(ValueError):
     pass
+
+
+def _message_content(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise InvalidBotEvent("invalid message content") from exc
+    if not isinstance(value, Mapping):
+        raise InvalidBotEvent("message content must be an object")
+    return value
+
+
+def _post_image_and_text(content: Mapping[str, Any]) -> tuple[str, str]:
+    """Extract the first image and visible text from a Feishu rich-text post."""
+
+    blocks: list[Any] = []
+    direct_blocks = content.get("content")
+    if isinstance(direct_blocks, list):
+        blocks.append(direct_blocks)
+    for localized in content.values():
+        if not isinstance(localized, Mapping):
+            continue
+        localized_blocks = localized.get("content")
+        if isinstance(localized_blocks, list):
+            blocks.append(localized_blocks)
+
+    text_parts: list[str] = []
+    image_key = ""
+    for rows in blocks:
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            for element in row:
+                if not isinstance(element, Mapping):
+                    continue
+                tag = str(element.get("tag") or "").strip().lower()
+                if tag == "text":
+                    text = str(element.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+                elif tag == "img" and not image_key:
+                    image_key = str(element.get("image_key") or "").strip()
+    return "\n".join(text_parts)[:4000], image_key
 
 
 class FeishuReceiverError(RuntimeError):
@@ -253,17 +297,17 @@ class FeishuEventParser:
         event_id = header.get("event_id") or payload.get("event_id") or message_id
         if not all((event_id, message_id, open_id, chat_id)):
             raise InvalidBotEvent("message event is missing routing fields")
-        message_type = str(message.get("message_type") or "")
-        if message_type not in {"text", "image"}:
+        raw_message_type = str(message.get("message_type") or "")
+        if raw_message_type not in {"text", "image", "post"}:
             raise InvalidBotEvent("unsupported message type")
-        content = message.get("content") or "{}"
-        if isinstance(content, str):
-            try:
-                content = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise InvalidBotEvent("invalid text message content") from exc
-        text = str((content or {}).get("text") or "").strip()
-        image_key = str((content or {}).get("image_key") or "").strip()
+        content = _message_content(message.get("content") or "{}")
+        if raw_message_type == "post":
+            text, image_key = _post_image_and_text(content)
+            message_type = "image"
+        else:
+            message_type = raw_message_type
+            text = str(content.get("text") or "").strip()
+            image_key = str(content.get("image_key") or "").strip()
         if message_type == "text" and not text:
             raise InvalidBotEvent("empty text message")
         if message_type == "image" and not image_key:
@@ -303,8 +347,8 @@ class FeishuChannelMessageAdapter:
             raise InvalidBotEvent("channel message is missing routing objects")
         if bool(getattr(sender, "is_bot", False)):
             raise InvalidBotEvent("bot self-message")
-        message_type = str(getattr(message, "raw_content_type", ""))
-        if message_type not in {"text", "image"}:
+        raw_message_type = str(getattr(message, "raw_content_type", ""))
+        if raw_message_type not in {"text", "image", "post"}:
             raise InvalidBotEvent("unsupported message type")
         message_id = str(getattr(message, "id", "") or "").strip()
         open_id = str(getattr(sender, "open_id", "") or "").strip()
@@ -323,7 +367,7 @@ class FeishuChannelMessageAdapter:
         text = str(getattr(message, "content_text", "") or "").strip()
         resources = list(getattr(message, "resources", None) or [])
         image_key = ""
-        if message_type == "image":
+        if raw_message_type in {"image", "post"}:
             image_key = next(
                 (
                     str(getattr(resource, "file_key", "") or "").strip()
@@ -332,9 +376,23 @@ class FeishuChannelMessageAdapter:
                 ),
                 "",
             )
-            if not image_key:
+            if not image_key and raw_message_type == "image":
                 content = getattr(message, "content", None)
                 image_key = str(getattr(content, "image_key", "") or "").strip()
+        if raw_message_type == "post":
+            raw_content = raw.get("content")
+            raw_message = raw.get("message")
+            if raw_content is None and isinstance(raw_message, Mapping):
+                raw_content = raw_message.get("content")
+            if raw_content is not None:
+                post_text, post_image_key = _post_image_and_text(
+                    _message_content(raw_content)
+                )
+                text = post_text or text
+                image_key = image_key or post_image_key
+            message_type = "image"
+        else:
+            message_type = raw_message_type
         if message_type == "text" and not text:
             raise InvalidBotEvent("empty text message")
         if message_type == "image" and not image_key:
@@ -356,7 +414,7 @@ class FeishuChannelMessageAdapter:
             create_time=created,
             chat_type=str(getattr(conversation, "chat_type", "p2p") or "p2p"),
             message_type=message_type,
-            text=text[:4000] if message_type == "text" else "",
+            text=text[:4000],
             image_key=image_key or None,
         )
 

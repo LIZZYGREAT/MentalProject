@@ -812,7 +812,12 @@ class BotWorker:
             snapshot = await self.multimodal_turns.freeze_or_snapshot_input(turn)
             attached = snapshot.text_events
             user_text = "\n".join(
-                item.text.strip() for item in attached if item.text.strip()
+                item
+                for item in (
+                    [event.text.strip()]
+                    + [item.text.strip() for item in attached]
+                )
+                if item
             )
             if is_explicit_schedule_import_fast_path(user_text):
                 route = "strict_schedule_fast_path"

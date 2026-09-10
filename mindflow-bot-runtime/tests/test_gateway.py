@@ -1,6 +1,7 @@
 import asyncio
 from functools import partial
 import inspect
+import json
 import multiprocessing
 import queue as sync_queue
 import threading
@@ -372,6 +373,37 @@ def test_channel_adapter_keeps_stable_fields_and_filters_unsupported_messages():
     ):
         with __import__("pytest").raises(InvalidBotEvent):
             adapter.adapt(message)
+
+
+def test_rich_text_post_with_image_is_normalized_to_a_captioned_image_event():
+    post = {
+        "zh_cn": {
+            "content": [[
+                {"tag": "text", "text": "告诉我周三有哪些课"},
+                {"tag": "img", "image_key": "img-post-opaque"},
+            ]]
+        }
+    }
+    source = channel_message(message_id="msg-post", content_type="post")
+    channel_event = FeishuChannelMessageAdapter("cli_test").adapt(
+        SimpleNamespace(
+            **{
+                **source.__dict__,
+                "raw": {"message_id": "msg-post", "content": json.dumps(post)},
+                "content_text": "",
+            }
+        )
+    )
+    payload_event = payload("evt-post")
+    payload_event["event"]["message"].update(
+        message_type="post", content=json.dumps(post)
+    )
+    parsed_event = FeishuEventParser("cli_test").parse(payload_event)
+
+    for event in (channel_event, parsed_event):
+        assert event.message_type == "image"
+        assert event.image_key == "img-post-opaque"
+        assert event.text == "告诉我周三有哪些课"
 
 
 def test_gateway_preserves_card_action_identity():
