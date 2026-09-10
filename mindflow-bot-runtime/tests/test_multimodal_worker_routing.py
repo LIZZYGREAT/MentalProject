@@ -31,7 +31,10 @@ from app.repositories import (
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.services.safety_service import SafetyService
-from app.services.generic_image_vision import GenericImageVisionUnavailable
+from app.services.generic_image_vision import (
+    GenericImageInspection,
+    GenericImageVisionUnavailable,
+)
 from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
@@ -770,7 +773,7 @@ def test_recent_strict_read_only_schedule_releases_image_before_agent_wait():
 
     asyncio.run(scenario())
     assert len(resources.payload_refs) == 2
-    assert len(runtime.calls) == 2
+    assert len(runtime.calls) == 1
 
 
 def test_explicit_import_to_calendar_still_uses_fast_path():
@@ -838,6 +841,63 @@ def test_generic_vision_interaction_hint_routes_natural_import_to_preview():
     assert runtime.calls == []
 
 
+def test_unified_course_schedule_vision_creates_preview_without_second_model_call():
+    class UnifiedVision:
+        model = "unified-vision"
+
+        def __init__(self):
+            self.calls = []
+
+        async def inspect(self, _data, _mime, *, user_text=""):
+            self.calls.append(user_text)
+            return GenericImageInspection(
+                GenericImageContext(
+                    image_kind="course_schedule",
+                    summary="一张课程表",
+                    interaction_hint="unknown",
+                ),
+                _strict_schedule_result(),
+            )
+
+    class StrictVisionMustNotRun:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            raise AssertionError("unified extraction must avoid a second model call")
+
+    unified = UnifiedVision()
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=unified,
+        schedule_vision=StrictVisionMustNotRun(),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    previews = []
+
+    async def deliver_card(_event, card):
+        previews.append(card)
+        return True
+
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    draft = repository.get_by_source(person.id, "m-image")
+    assert unified.calls == [""]
+    assert draft is not None
+    assert draft["vision_model"] == "unified-vision"
+    assert len(previews) == 1
+    assert runtime.calls == []
+
+
 def test_completed_course_image_accepts_natural_omitted_import_followup():
     gateway, queue, worker, runtime, _sender, _, _ = _system(
         vision=Vision(kind="course_schedule"), debounce=0
@@ -861,8 +921,8 @@ def test_completed_course_image_accepts_natural_omitted_import_followup():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert len(runtime.calls) == 1
-    assert len(strict_calls) == 1
+    assert runtime.calls == []
+    assert len(strict_calls) == 2
 
 
 def test_failed_strict_import_retries_the_same_recent_image_not_an_old_draft():
@@ -1239,10 +1299,7 @@ def test_explicit_image_supplement_reuses_image_after_fast_completion():
     asyncio.run(scenario())
     assert len(vision.calls) == 1
     assert len(resources.calls) == 1
-    assert [call[1].text for call in runtime.calls] == [
-        "",
-        "这张图按默认学校作息",
-    ]
+    assert [call[1].text for call in runtime.calls] == ["这张图按默认学校作息"]
     assert len(sender.texts) == 2
 
 
@@ -2245,14 +2302,14 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     assert len(resources.calls) == 1
     assert len(runtime.calls) == 1
     ctx, turn_input = runtime.calls[0]
-    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
-    assert ctx.allows_calendar_mutation("create") is False
-    assert ctx.allows_calendar_mutation("delete") is False
-    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.calendar_mutation_policy == "normal"
+    assert ctx.allows_calendar_mutation("create") is True
+    assert ctx.allows_calendar_mutation("delete") is True
+    assert ctx.turn_effect_policy == "verify_on_demand"
     assert ctx.source_kind == "generic_image"
     assert ctx.user_request_text == "把这个讲座添加到日历"
     assert turn_input.trusted_image_context == {
-        "image_kind": "course_schedule",
+        "image_kind": "other",
         "summary": "图片摘要",
         "visible_text": "可见文字",
         "warnings": [],
@@ -2265,26 +2322,30 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     "interaction_hint",
     ("describe_only", "calendar_event_request"),
 )
-def test_course_schedule_non_question_hints_have_no_calendar_mutation_authority(
+def test_course_schedule_non_question_hints_default_to_preview_workflow(
     interaction_hint,
 ):
     gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
         vision=Vision(kind="course_schedule", interaction_hint=interaction_hint),
         debounce=0,
     )
+    preview_calls = []
+
+    async def preview(event, participant_id, **kwargs):
+        preview_calls.append((event.message_id, participant_id, kwargs))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "default-preview"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = preview
 
     async def scenario():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert len(runtime.calls) == 1
-    ctx, _turn_input = runtime.calls[0]
-    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
-    assert ctx.turn_effect_policy == "read_compute_only"
-    assert ctx.allows_calendar_mutation("create") is False
-    assert ctx.allows_calendar_mutation("update") is False
-    assert ctx.allows_calendar_mutation("delete") is False
+    assert runtime.calls == []
+    assert len(preview_calls) == 1
 
 
 def test_course_schedule_question_strict_failure_keeps_read_only_boundary():
@@ -2485,7 +2546,7 @@ def test_two_late_followups_import_then_correction_use_same_draft_context(monkey
     drafts = Drafts()
     gateway, queue, worker, _, _sender, _, _ = _system(
         runtime=runtime,
-        vision=Vision(kind="course_schedule"),
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
         schedule_imports=SimpleNamespace(drafts=drafts),
         debounce=0,
         association=1,
@@ -2734,12 +2795,12 @@ def test_recent_course_schedule_qa_upgrades_generic_context_to_strict_parser():
     assert generic.calls == [""]
     assert strict.calls == 1
     assert len(resources.calls) == 2
-    assert len(runtime.calls) == 2
-    followup_context = runtime.calls[1][1].trusted_image_context
+    assert len(runtime.calls) == 1
+    followup_context = runtime.calls[0][1].trusted_image_context
     assert followup_context["route"] == "strict_schedule_read_only"
     course = followup_context["schedule"]["courses"][0]
     assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
-    assert runtime.calls[1][0].calendar_mutation_allowed is False
+    assert runtime.calls[0][0].calendar_mutation_allowed is False
 
 
 class CancellationResistantStrictVision:
@@ -2813,8 +2874,11 @@ def test_recent_schedule_qa_does_not_start_agent_after_stop():
         _run_stopped_recent_schedule_qa()
     )
 
-    assert [call[1].text for call in runtime.calls] == [""]
-    assert sender.texts == ["answer:image-only", "已请求停止当前处理。"]
+    assert runtime.calls == []
+    assert sender.texts == [
+        "这张课表刚才没有读完整，你可以直接重试一次。",
+        "已请求停止当前处理。",
+    ]
 
 
 def test_stop_reports_active_for_recent_image_followup():
@@ -2858,6 +2922,14 @@ def _run_stopped_recent_schedule_import():
         return True
 
     worker._deliver_card = deliver_card
+    original_handle_schedule = worker._handle_schedule_image
+
+    async def defer_initial_parse(event, participant_id, **kwargs):
+        if event.event_id == "image":
+            return ScheduleImageOutcome("failed", None, "course_schedule")
+        return await original_handle_schedule(event, participant_id, **kwargs)
+
+    worker._handle_schedule_image = defer_initial_parse
 
     async def scenario():
         assert gateway.accept_payload(_payload("image", "m-image", "image"))
@@ -2896,8 +2968,8 @@ def test_recent_schedule_import_does_not_send_preview_after_stop():
 
     assert previews == []
     assert repository.latest_pending_context(person.id) is None
-    assert [call[1].text for call in runtime.calls] == [""]
-    assert sender.texts == ["answer:image-only", "已请求停止当前处理。"]
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
     with worker.events.database.session() as session:
         assert session.get(StoredBotEvent, "import").status == "interrupted"
 

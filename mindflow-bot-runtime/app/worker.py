@@ -199,6 +199,15 @@ def is_explicit_schedule_import_fast_path(text: str) -> bool:
     return value in EXPLICIT_SCHEDULE_IMPORT_FAST_PATHS
 
 
+def is_schedule_image_question(text: str) -> bool:
+    value = str(text or "").strip()
+    return bool(value) and (
+        "?" in value
+        or "？" in value
+        or bool(re.search(r"(?:吗|呢|什么|哪些|几(?:点|节|门)?|是否|有没有)", value))
+    )
+
+
 def is_schedule_recent_import_request(text: str) -> bool:
     value = "".join(str(text or "").strip().split()).rstrip("。！？?!")
     if value in SCHEDULE_RECENT_IMPORT_FOLLOWUPS:
@@ -886,13 +895,26 @@ class BotWorker:
             await self._ensure_task_not_stopped(
                 participant.id, event.event_id, task_generation
             )
-            if (
-                context.image_kind == "course_schedule"
-                and context.interaction_hint == "question"
-            ):
-                read_only = await self._parse_schedule_read_only(
-                    event, downloaded_image=image
-                )
+            schedule_result = getattr(context, "schedule_result", None)
+            schedule_question = context.image_kind == "course_schedule" and (
+                is_schedule_image_question(user_text)
+                or context.interaction_hint == "question"
+            )
+            if schedule_question:
+                if schedule_result is not None:
+                    read_only = ScheduleReadOnlyOutcome(
+                        "parsed",
+                        {
+                            "image_kind": "course_schedule",
+                            "route": "unified_schedule_read_only",
+                            "schedule": prepare_schedule_context(schedule_result),
+                        },
+                        image,
+                    )
+                else:
+                    read_only = await self._parse_schedule_read_only(
+                        event, downloaded_image=image
+                    )
                 if read_only.status == "parsed" and read_only.context is not None:
                     schedule_context = read_only.context
                     route = "strict_schedule_read_only_after_generic"
@@ -925,16 +947,15 @@ class BotWorker:
                     consumption_finished = True
                     dispatch_late = True
                     return
-            if (
-                context.image_kind == "course_schedule"
-                and context.interaction_hint == "course_import_request"
-            ):
-                route = "strict_schedule_after_image_kind"
+            if context.image_kind == "course_schedule" and not schedule_question:
+                route = "schedule_preview_after_image_kind"
                 await self._note_multimodal_route(event, route)
                 outcome = await self._handle_schedule_image(
                     event,
                     participant.id,
                     downloaded_image=image,
+                    parsed_result=schedule_result,
+                    vision_model=getattr(self.generic_image_vision, "model", None),
                     report_not_course_schedule=False,
                     task_generation=task_generation,
                 )
@@ -1463,6 +1484,8 @@ class BotWorker:
         *,
         delivery_event: BotEvent | None = None,
         downloaded_image=None,
+        parsed_result=None,
+        vision_model: str | None = None,
         report_not_course_schedule: bool = True,
         task_generation: int | None = None,
     ) -> ScheduleImageOutcome:
@@ -1473,7 +1496,7 @@ class BotWorker:
             participant_id, delivery_event.event_id, task_generation
         )
         if (
-            self.schedule_vision is None
+            (self.schedule_vision is None and parsed_result is None)
             or self.schedule_imports is None
             or (self.message_resources is None and downloaded_image is None)
         ):
@@ -1554,9 +1577,11 @@ class BotWorker:
                 await self._ensure_task_not_stopped(
                     participant_id, delivery_event.event_id, task_generation
                 )
-                result = await self.schedule_vision.parse(
-                    image.data, image.mime_type
-                )
+                result = parsed_result
+                if result is None:
+                    result = await self.schedule_vision.parse(
+                        image.data, image.mime_type
+                    )
                 await self._ensure_task_not_stopped(
                     participant_id, delivery_event.event_id, task_generation
                 )
@@ -1588,7 +1613,10 @@ class BotWorker:
                         participant_id,
                         source_message_id=event.message_id,
                         source_image_hash=hashlib.sha256(image.data).hexdigest(),
-                        vision_model=self.schedule_vision.model,
+                        vision_model=(
+                            vision_model
+                            or getattr(self.schedule_vision, "model", "unknown")
+                        ),
                         result=result,
                         timezone_name=str(self.schedule_imports.timezone),
                         ttl_minutes=self.schedule_draft_ttl_minutes,

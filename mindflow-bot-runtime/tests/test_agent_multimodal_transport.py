@@ -85,6 +85,32 @@ def test_generic_vision_makes_one_call_and_returns_compact_context():
                                     "visible_text": "周一 高数",
                                     "warnings": [],
                                     "interaction_hint": "question",
+                                    "schedule": {
+                                        "document_type": "course_schedule",
+                                        "semester_label": None,
+                                        "institution": None,
+                                        "courses": [{
+                                            "course_name": "高等数学",
+                                            "weekday": "周一",
+                                            "period_start": "1",
+                                            "period_end": "2",
+                                            "start_time": None,
+                                            "end_time": None,
+                                            "location": "A101",
+                                            "teacher": None,
+                                            "week_rule": {
+                                                "start_week": 1,
+                                                "end_week": 16,
+                                                "odd_even": "all",
+                                                "explicit_weeks": None,
+                                            },
+                                            "period_inference_source": "cell_text",
+                                            "period_confidence": 0.9,
+                                            "uncertain_fields": [],
+                                        }],
+                                        "missing_context": ["semester_start_date"],
+                                        "warnings": [],
+                                    },
                                 },
                                 ensure_ascii=False,
                             )
@@ -107,6 +133,7 @@ def test_generic_vision_makes_one_call_and_returns_compact_context():
     assert result.image_kind == "course_schedule"
     assert result.visible_text == "周一 高数"
     assert result.interaction_hint == "question"
+    assert result.schedule_result.courses[0].weekday == 1
     assert len(calls) == 1
     assert len(calls[0]["messages"]) == 2
 
