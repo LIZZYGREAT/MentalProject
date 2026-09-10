@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
 ARG BUILD_REVISION=development
 ARG INSTALL_DEV_DEPS=0
@@ -30,13 +31,13 @@ RUN for source_file in \
       fonts-noto-cjk \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
-RUN if [ "$INSTALL_DEV_DEPS" = "1" ]; then \
+RUN --mount=type=cache,id=mindflow-pip-cache,target=/home/mindflow/.cache/pip,sharing=locked \
+    if [ "$INSTALL_DEV_DEPS" = "1" ]; then \
       REQUIREMENTS_FILE=requirements-dev.txt; \
     else \
       REQUIREMENTS_FILE=requirements.txt; \
     fi \
  && pip install \
-      --no-cache-dir \
       --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
       --trusted-host pypi.tuna.tsinghua.edu.cn \
       -r "$REQUIREMENTS_FILE"
