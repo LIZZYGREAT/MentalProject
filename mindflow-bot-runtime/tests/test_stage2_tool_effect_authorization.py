@@ -1224,3 +1224,37 @@ def test_verifier_rejects_invalid_or_mismatched_provider_output():
         asyncio.run(invalid.verify(**kwargs))
     with pytest.raises(MutationIntentVerificationError):
         asyncio.run(mismatched.verify(**kwargs))
+
+
+def test_verifier_normalizes_observed_calendar_create_intent_alias():
+    verifier = MutationIntentVerifier(
+        RawClient(
+            {
+                "decision": "allow",
+                "intent": "create_calendar_event",
+                "reason_code": "direct_request_exact_target",
+            }
+        )
+    )
+
+    decision = asyncio.run(
+        verifier.verify(
+            user_request_text="请在 9 月 11 日创建日程",
+            tool_name="calendar_create_event",
+            tool_effect="external_write",
+            authorization_requirement="direct_request",
+            proposal_summary={"operation_type": "create"},
+            source_kind="text",
+        )
+    )
+
+    assert decision.decision == "allow"
+    assert decision.intent == "direct_action"
+    assert decision.reason_code == "direct_request_exact_target"
+
+
+def test_verifier_prompt_requires_canonical_intent_labels():
+    prompt = mutation_intent_verifier_module.OpenAICompatibleMutationIntentClient.SYSTEM_PROMPT
+
+    assert "The intent value must be exactly one of" in prompt
+    assert "Never use a tool name or operation-specific value" in prompt

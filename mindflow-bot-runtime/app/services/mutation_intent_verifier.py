@@ -35,6 +35,12 @@ _INTENTS = frozenset(
         "cancel_or_revert",
     }
 )
+# Compatibility for the provider value observed in the deployed authorization
+# diagnostic.  Keep this mapping intentionally narrow: every other unknown
+# provider label must still fail closed below.
+_INTENT_ALIASES: dict[str, MutationIntent] = {
+    "create_calendar_event": "direct_action",
+}
 _FORBIDDEN_CONTEXT_FIELDS = frozenset(
     {
         "participant_id",
@@ -125,7 +131,8 @@ def _parse_decision(value: Any) -> MutationIntentDecision:
     if not isinstance(value, Mapping):
         raise MutationIntentVerificationError("verifier response must be an object")
     decision = str(value.get("decision") or "").strip().lower()
-    intent = str(value.get("intent") or "").strip().lower()
+    raw_intent = str(value.get("intent") or "").strip().lower()
+    intent = _INTENT_ALIASES.get(raw_intent, raw_intent)
     reason_code = str(value.get("reason_code") or "").strip().lower()
     if decision not in _DECISIONS:
         raise MutationIntentVerificationError("verifier decision is invalid")
@@ -164,7 +171,10 @@ The backend-resolved target scope is authoritative. For recurring calendar mutat
 If the user requests one occurrence but the proposed target is a series, or requests the series but the proposed target is only one occurrence, deny or request clarification. Never guess the intended recurrence scope.
 If the user requests an action but the target or requested change is ambiguous, return needs_clarification.
 Do not modify the proposal, select identities or targets, or expand its scope.
-Return only JSON with decision, intent, and a short reason_code. Do not return reasoning."""
+Return only JSON with decision, intent, and a short reason_code. Do not return reasoning.
+The intent value must be exactly one of: direct_action, destructive_action, status_query, capability_question, hypothetical, ambiguous, cancel_or_revert.
+For an allowed direct_request, use direct_action. For an allowed explicit_destructive_request, use destructive_action.
+Never use a tool name or operation-specific value (for example, create_calendar_event) as intent."""
 
     def __init__(
         self,
