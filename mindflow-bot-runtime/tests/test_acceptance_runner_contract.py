@@ -135,7 +135,6 @@ def test_full_runner_never_builds_and_restores_after_running_acceptance():
 def test_dockerfile_reuses_pip_downloads_through_buildkit_cache_mount():
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
-    assert dockerfile.startswith("# syntax=docker/dockerfile:1.7\n")
     assert (
         "--mount=type=cache,id=mindflow-pip-cache,"
         "target=/home/mindflow/.cache/pip,sharing=locked"

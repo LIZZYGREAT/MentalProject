@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
 ARG BUILD_REVISION=development
 ARG INSTALL_DEV_DEPS=0
