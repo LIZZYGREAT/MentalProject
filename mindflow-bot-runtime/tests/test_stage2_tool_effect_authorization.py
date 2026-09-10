@@ -1131,6 +1131,7 @@ def test_openai_compatible_verifier_uses_configured_completion_budget(monkeypatc
 
     assert result["decision"] == "allow"
     assert captured["url"] == "https://provider.example/v1/chat/completions"
+    assert captured["json"]["thinking"] == {"type": "disabled"}
     assert captured["json"]["max_tokens"] == 1024
 
 

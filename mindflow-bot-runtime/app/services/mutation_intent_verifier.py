@@ -188,6 +188,7 @@ Return only JSON with decision, intent, and a short reason_code. Do not return r
             "model": self.model,
             "temperature": 0,
             "stream": False,
+            "thinking": {"type": "disabled"},
             "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
