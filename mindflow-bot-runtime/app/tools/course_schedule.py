@@ -109,9 +109,18 @@ def _public_draft(draft: dict[str, Any]) -> dict[str, Any]:
 class CourseScheduleTools:
     """Expose active drafts without ever accepting participant or import identity."""
 
-    def __init__(self, imports: Any, presentations: Any = None) -> None:
+    def __init__(
+        self,
+        imports: Any,
+        presentations: Any = None,
+        *,
+        image_sessions: Any = None,
+        recent_image_importer: Any = None,
+    ) -> None:
         self.imports = imports
         self.presentations = presentations
+        self.image_sessions = image_sessions
+        self.recent_image_importer = recent_image_importer
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -121,6 +130,25 @@ class CourseScheduleTools:
             self.get_active_draft,
             effect="read",
             authorization_requirement="none",
+        )
+        registry.register(
+            "course_schedule_get_last_failure",
+            "Read the latest retained course-schedule image failure for this participant and chat, including its stable error code and safe parse-report summary.",
+            _empty_schema(),
+            self.get_last_failure,
+            effect="read",
+            authorization_requirement="none",
+        )
+        registry.register(
+            "course_schedule_import_from_recent_image",
+            "Retry the latest retained participant-owned course-schedule image and create or resend its reviewed Preview. This never writes Calendar data.",
+            _empty_schema(),
+            self.import_from_recent_image,
+            effect="internal_write",
+            authorization_requirement="direct_request",
+            authorization_context_resolver=(
+                self.resolve_recent_image_import_authorization_context
+            ),
         )
         registry.register(
             "course_schedule_update_active_draft",
@@ -222,7 +250,90 @@ class CourseScheduleTools:
         draft = self.imports.drafts.latest_pending_context(ctx.participant_id)
         if draft is None:
             return {"ok": False, "error": "active_draft_not_found"}
-        return {"ok": True, "draft": _public_draft(draft)}
+        result = {"ok": True, "draft": _public_draft(draft)}
+        image_session = self._latest_image_session(ctx)
+        if image_session is not None:
+            result["image_session"] = self._public_image_session(image_session)
+        return result
+
+    def get_last_failure(
+        self, ctx: AgentContext, _arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.image_sessions is None:
+            return {"ok": False, "error": "image_session_unavailable"}
+        failure = self.image_sessions.last_failure(
+            ctx.participant_id, chat_id=ctx.chat_id
+        )
+        if failure is None:
+            return {"ok": False, "error": "schedule_image_failure_not_found"}
+        return {"ok": True, "image_session": self._public_image_session(failure)}
+
+    async def import_from_recent_image(
+        self, ctx: AgentContext, _arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        image_session = self._latest_image_session(ctx)
+        if image_session is None:
+            return {"ok": False, "error": "recent_schedule_image_not_found"}
+        if not callable(self.recent_image_importer):
+            return {"ok": False, "error": "schedule_image_import_unavailable"}
+        result = self.recent_image_importer(ctx, image_session)
+        if hasattr(result, "__await__"):
+            result = await result
+        return dict(result or {})
+
+    def resolve_recent_image_import_authorization_context(
+        self, ctx: AgentContext, _arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        image_session = self._latest_image_session(ctx)
+        if image_session is None:
+            raise AuthorizationContextResolutionError(
+                "authorization_target_not_found"
+            )
+        return {
+            "server_bound_participant_target": True,
+            "operation_intent": "schedule_image_import",
+            "has_provider_effect": False,
+            "target": {
+                "status": image_session.get("status"),
+                "created_at": image_session.get("created_at"),
+                "last_error_code": image_session.get("last_error_code"),
+            },
+        }
+
+    def _latest_image_session(self, ctx: AgentContext) -> dict[str, Any] | None:
+        if self.image_sessions is None:
+            return None
+        return self.image_sessions.latest(
+            ctx.participant_id, chat_id=ctx.chat_id
+        )
+
+    @staticmethod
+    def _public_image_session(value: dict[str, Any]) -> dict[str, Any]:
+        report = dict(value.get("parse_report") or {})
+        quarantined = []
+        for item in list(report.get("quarantined") or [])[:10]:
+            if isinstance(item, dict):
+                quarantined.append(
+                    {
+                        "course_name": item.get("course_name"),
+                        "reason": item.get("reason"),
+                    }
+                )
+            else:
+                quarantined.append({"course_name": None, "reason": str(item)})
+        return {
+            "status": value.get("status"),
+            "created_at": value.get("created_at"),
+            "updated_at": value.get("updated_at"),
+            "last_error_code": value.get("last_error_code"),
+            "error_detail": value.get("error_detail"),
+            "parse_report": {
+                "fixed_count": len(report.get("fixed") or []),
+                "dropped_count": len(report.get("dropped") or []),
+                "quarantined": quarantined,
+                "missing": list(report.get("missing") or []),
+            },
+        }
 
     def update_active_draft(
         self, ctx: AgentContext, arguments: dict[str, Any]

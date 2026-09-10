@@ -33,6 +33,9 @@ from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.repositories_course_schedule_image import (
+    CourseScheduleImageSessionRepository,
+)
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from app.services.course_schedule_vision import CourseScheduleVisionService
@@ -99,6 +102,8 @@ class BusinessServices:
     course_schedule_import_runner: CourseScheduleImportRunner
     course_schedule_vision: CourseScheduleVisionService
     generic_image_vision: GenericImageVisionService
+    course_schedule_image_sessions: CourseScheduleImageSessionRepository
+    course_schedule_tools: CourseScheduleTools
 
 
 def build_business_services(
@@ -197,6 +202,7 @@ def build_business_services(
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
     course_schedule_import_repository = CourseScheduleImportRepository(database)
+    course_schedule_image_sessions = CourseScheduleImageSessionRepository(database)
     mutation_refresh = ForecastMutationRefreshQueue(
         forecast_coordinator,
         reconciliations=CalendarMutationReconciliationRepository(database),
@@ -291,7 +297,12 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
     ).register(registry)
-    CourseScheduleTools(course_schedule_imports, presentations).register(registry)
+    course_schedule_tools = CourseScheduleTools(
+        course_schedule_imports,
+        presentations,
+        image_sessions=course_schedule_image_sessions,
+    )
+    course_schedule_tools.register(registry)
     return BusinessServices(
         profiles=profiles,
         observations=observations,
@@ -323,4 +334,6 @@ def build_business_services(
         course_schedule_import_runner=course_schedule_import_runner,
         course_schedule_vision=course_schedule_vision,
         generic_image_vision=generic_image_vision,
+        course_schedule_image_sessions=course_schedule_image_sessions,
+        course_schedule_tools=course_schedule_tools,
     )

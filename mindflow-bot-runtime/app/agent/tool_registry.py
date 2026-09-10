@@ -54,12 +54,11 @@ AuthorizationRequirement = Literal[
 STATE_CHANGING_EFFECTS = frozenset(
     {"internal_write", "external_write", "destructive_external_write"}
 )
-_SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS = frozenset(
-    {
-        "course_schedule_cancel_pending_draft",
-        "course_schedule_cancel_or_revert_import",
-    }
-)
+_SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS = {
+    "course_schedule_cancel_pending_draft": "cancel_or_revert",
+    "course_schedule_cancel_or_revert_import": "cancel_or_revert",
+    "course_schedule_import_from_recent_image": "schedule_image_import",
+}
 
 _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
     TurnEffectPolicy, frozenset[ToolEffect]
@@ -207,7 +206,8 @@ def _is_server_bound_no_provider_effect(
         name in _SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS
         and isinstance(authorization_context, dict)
         and authorization_context.get("server_bound_participant_target") is True
-        and authorization_context.get("operation_intent") == "cancel_or_revert"
+        and authorization_context.get("operation_intent")
+        == _SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS[name]
         and authorization_context.get("has_provider_effect") is False
         and isinstance(authorization_context.get("target"), dict)
         and bool(authorization_context["target"])

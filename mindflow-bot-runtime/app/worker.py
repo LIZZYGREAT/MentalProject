@@ -387,6 +387,59 @@ class BotWorker:
             tuple[object, str], dict[str, RecentImageTaskHandle]
         ] = {}
 
+    async def import_recent_schedule_image(
+        self, ctx: AgentContext, image_session: dict
+    ) -> dict:
+        """Retry one backend-bound retained image without granting Calendar writes."""
+
+        created_at = datetime.now(timezone.utc)
+        source_event = BotEvent(
+            event_id=ctx.message_id,
+            message_id=str(image_session.get("image_message_id") or ""),
+            app_id="",
+            open_id=ctx.open_id,
+            chat_id=ctx.chat_id,
+            text=ctx.user_request_text,
+            create_time=created_at,
+            chat_type="p2p",
+            message_type="image",
+            image_key=str(image_session.get("image_key") or ""),
+        )
+        delivery_event = BotEvent(
+            event_id=ctx.message_id,
+            message_id=ctx.message_id,
+            app_id="",
+            open_id=ctx.open_id,
+            chat_id=ctx.chat_id,
+            text=ctx.user_request_text,
+            create_time=created_at,
+            chat_type="p2p",
+            message_type="text",
+        )
+        outcome = await self._handle_schedule_image(
+            source_event,
+            ctx.participant_id,
+            delivery_event=delivery_event,
+            task_generation=self._current_stop_generation(ctx.participant_id),
+        )
+        return {
+            "ok": outcome.status in {"draft_created", "existing_draft"},
+            "status": outcome.status,
+            "preview_sent": outcome.status in {"draft_created", "existing_draft"},
+            "draft": (
+                {
+                    "status": (outcome.draft or {}).get("status"),
+                    "missing_context": list(
+                        ((outcome.draft or {}).get("structured_result") or {}).get(
+                            "missing_context"
+                        )
+                        or []
+                    ),
+                }
+                if outcome.draft
+                else None
+            ),
+        }
     def _current_stop_generation(self, participant_id) -> int:
         return self._stop_generation.get(participant_id, 0)
 

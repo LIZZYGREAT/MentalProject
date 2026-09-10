@@ -7,6 +7,9 @@ from app.agent.tool_registry import ToolRegistry
 from app.contracts.course_schedule import ScheduleVisionResult
 from app.services.presentation_service import PresentationOutbox
 from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.repositories_course_schedule_image import (
+    CourseScheduleImageSessionRepository,
+)
 from app.services.mutation_intent_verifier import MutationIntentDecision
 from app.tools.course_schedule import CourseScheduleTools
 from helpers import memory_database, participant
@@ -217,6 +220,117 @@ def test_hypothetical_correction_is_denied_before_draft_mutation():
     unchanged = repo.get(original["id"])["structured_result"]["courses"][0]
     assert (unchanged["period_start"], unchanged["period_end"]) == (1, 2)
     assert presentations.take_cards(ctx.agent_run_id) == []
+
+
+def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
+    database = memory_database()
+    owner = participant(database, "STAGE3-IMAGE-RETRY")
+    drafts = CourseScheduleImportRepository(database)
+    image_sessions = CourseScheduleImageSessionRepository(database)
+    image_sessions.start(
+        owner.id,
+        chat_id="chat",
+        image_message_id="image-message",
+        image_key="image-key",
+    )
+    image_sessions.mark_failed(
+        owner.id,
+        "image-message",
+        error_code="schedule_validation_failed",
+        error_detail="week range is missing",
+        parse_report={
+            "fixed": [{"path": "courses[0].weekday"}],
+            "quarantined": [
+                {"path": "courses[2]", "reason": "missing_course_name"}
+            ],
+            "missing": ["week_rule"],
+        },
+    )
+    imported = []
+
+    async def retry(ctx, image_session):
+        imported.append((ctx.participant_id, image_session))
+        return {"ok": True, "status": "draft_created", "preview_sent": True}
+
+    verifier = _Verifier(None)
+    registry = ToolRegistry(mutation_verifier=verifier)
+    CourseScheduleTools(
+        _Imports(drafts),
+        PresentationOutbox(),
+        image_sessions=image_sessions,
+        recent_image_importer=retry,
+    ).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "重新导入刚才那张课表")
+
+    async def scenario():
+        failure = await registry.execute(
+            ctx, "course_schedule_get_last_failure", {}
+        )
+        retried = await registry.execute(
+            ctx, "course_schedule_import_from_recent_image", {}
+        )
+        return failure, retried
+
+    failure, retried = asyncio.run(scenario())
+    assert failure.result["image_session"] == {
+        "status": "needs_retry",
+        "created_at": failure.result["image_session"]["created_at"],
+        "updated_at": failure.result["image_session"]["updated_at"],
+        "last_error_code": "schedule_validation_failed",
+        "error_detail": "week range is missing",
+        "parse_report": {
+            "fixed_count": 1,
+            "dropped_count": 0,
+            "quarantined": [
+                {"course_name": None, "reason": "missing_course_name"}
+            ],
+            "missing": ["week_rule"],
+        },
+    }
+    assert retried.result["ok"] is True
+    assert imported[0][0] == owner.id
+    assert imported[0][1]["image_message_id"] == "image-message"
+    assert imported[0][1]["image_key"] == "image-key"
+    assert verifier.calls == []
+
+
+def test_active_draft_includes_bound_image_session_status():
+    database = memory_database()
+    owner = participant(database, "STAGE3-DRAFT-IMAGE")
+    drafts = CourseScheduleImportRepository(database)
+    draft = _draft(drafts, owner.id)
+    image_sessions = CourseScheduleImageSessionRepository(database)
+    image_sessions.start(
+        owner.id,
+        chat_id="chat",
+        image_message_id="image-message",
+        image_key="image-key",
+    )
+    image_sessions.mark_ready(
+        owner.id,
+        "image-message",
+        import_id=draft["id"],
+        needs_information=True,
+        parse_report={"missing": ["semester_start_date"]},
+    )
+    registry = ToolRegistry()
+    CourseScheduleTools(
+        _Imports(drafts), image_sessions=image_sessions
+    ).register(registry)
+
+    result = asyncio.run(
+        registry.execute(
+            _context(owner.id, uuid.uuid4(), "课表处理到哪了"),
+            "course_schedule_get_active_draft",
+            {},
+        )
+    )
+
+    assert result.result["ok"] is True
+    assert result.result["image_session"]["status"] == "needs_information"
+    assert result.result["image_session"]["parse_report"]["missing"] == [
+        "semester_start_date"
+    ]
 
 
 def test_participant_bound_pending_cancel_without_provider_effect_skips_verifier():

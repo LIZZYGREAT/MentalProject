@@ -478,6 +478,7 @@ async def run() -> None:
         schedule_vision=business.course_schedule_vision,
         generic_image_vision=business.generic_image_vision,
         schedule_imports=business.course_schedule_imports,
+        schedule_image_sessions=business.course_schedule_image_sessions,
         message_resources=message_resources,
         schedule_draft_ttl_minutes=settings.vision_import_draft_ttl_minutes,
         schedule_image_max_concurrency=settings.vision_max_concurrency,
@@ -485,6 +486,9 @@ async def run() -> None:
         multimodal_association_seconds=settings.multimodal_association_seconds,
         multimodal_recent_context_seconds=settings.multimodal_recent_context_seconds,
         course_default_semester_start_date=settings.course_default_semester_start_date,
+    )
+    business.course_schedule_tools.recent_image_importer = (
+        worker.import_recent_schedule_image
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(
