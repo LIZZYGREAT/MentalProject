@@ -265,6 +265,7 @@ def build_business_services(
                 settings.deepseek_api_key,
                 settings.mutation_intent_api_model,
                 timeout=settings.mutation_intent_api_timeout_seconds,
+                max_tokens=settings.mutation_intent_api_max_tokens,
             ),
             max_concurrency=settings.mutation_intent_max_concurrency,
         )

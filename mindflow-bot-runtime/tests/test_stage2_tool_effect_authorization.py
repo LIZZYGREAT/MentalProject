@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 
+import app.services.mutation_intent_verifier as mutation_intent_verifier_module
 from app.agent.context import AgentContext, AuthorizationSemanticTurn
 from app.agent.tool_registry import (
     AuthorizationContextResolutionError,
@@ -1097,6 +1098,40 @@ class CapturingClient(RawClient):
     def infer(self, payload):
         self.payloads.append(payload)
         return self.value
+
+
+def test_openai_compatible_verifier_uses_configured_completion_budget(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "decision": "allow",
+                "intent": "direct_action",
+                "reason_code": "direct_request",
+            }
+
+    def post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(mutation_intent_verifier_module.requests, "post", post)
+    client = mutation_intent_verifier_module.OpenAICompatibleMutationIntentClient(
+        "https://provider.example/v1/chat/completions",
+        "test-key",
+        "test-model",
+        max_tokens=1024,
+    )
+
+    result = client.infer({"user_request_text": "请创建日程"})
+
+    assert result["decision"] == "allow"
+    assert captured["url"] == "https://provider.example/v1/chat/completions"
+    assert captured["json"]["max_tokens"] == 1024
 
 
 def test_verifier_redacts_secrets_and_identifiers_from_provider_payload():

@@ -173,11 +173,13 @@ Return only JSON with decision, intent, and a short reason_code. Do not return r
         model: str,
         *,
         timeout: float = 8.0,
+        max_tokens: int = 1024,
     ):
         self.url = str(url).strip()
         self.api_key = str(api_key).strip()
         self.model = str(model).strip()
         self.timeout = max(1.0, min(30.0, float(timeout)))
+        self.max_tokens = max(256, int(max_tokens))
 
     def infer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         if not self.url or not self.api_key or not self.model:
@@ -186,7 +188,7 @@ Return only JSON with decision, intent, and a short reason_code. Do not return r
             "model": self.model,
             "temperature": 0,
             "stream": False,
-            "max_tokens": 200,
+            "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {

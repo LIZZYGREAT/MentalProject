@@ -46,7 +46,15 @@ def test_mutation_intent_verifier_has_independent_on_demand_configuration():
     assert settings.mutation_intent_api_url.endswith("/chat/completions")
     assert settings.mutation_intent_api_model == "deepseek-v4-flash"
     assert settings.mutation_intent_api_timeout_seconds == 8
+    assert settings.mutation_intent_api_max_tokens == 1024
     assert settings.mutation_intent_max_concurrency == 2
+
+    environment = valid_environment()
+    environment["MUTATION_INTENT_API_MAX_TOKENS"] = "1536"
+    configured = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert configured.mutation_intent_api_max_tokens == 1536
 
     environment = valid_environment()
     environment.update(

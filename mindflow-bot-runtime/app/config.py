@@ -128,6 +128,7 @@ class Settings:
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
     mutation_intent_api_timeout_seconds: float = 8.0
+    mutation_intent_api_max_tokens: int = 1024
     mutation_intent_max_concurrency: int = 2
     vision_api_enabled: bool = False
     vision_api_url: str = "https://api.deepseek.com/chat/completions"
@@ -401,6 +402,9 @@ class Settings:
             ).strip(),
             mutation_intent_api_timeout_seconds=_float(
                 values, "MUTATION_INTENT_API_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            ),
+            mutation_intent_api_max_tokens=_int(
+                values, "MUTATION_INTENT_API_MAX_TOKENS", 1024, minimum=256
             ),
             mutation_intent_max_concurrency=_int(
                 values, "MUTATION_INTENT_MAX_CONCURRENCY", 2
