@@ -252,6 +252,9 @@ class CourseScheduleImportRepository:
     def latest_pending_context(self, participant_id: uuid.UUID) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
         with self.database.session() as session:
+            self._expire_participant_drafts(
+                session, participant_id, now=now
+            )
             row = session.execute(
                 select(CourseScheduleImport).where(
                     CourseScheduleImport.participant_id == participant_id,
@@ -1797,6 +1800,9 @@ class CourseScheduleImportRepository:
             "cancelled",
         }
         with self.database.session() as session:
+            self._expire_participant_drafts(
+                session, participant_id, now=datetime.now(timezone.utc)
+            )
             rows = list(
                 session.execute(
                     select(CourseScheduleImport)
@@ -1855,6 +1861,33 @@ class CourseScheduleImportRepository:
                     ),
                 })
             return output
+
+    @staticmethod
+    def _expire_participant_drafts(
+        session: Any,
+        participant_id: uuid.UUID,
+        *,
+        now: datetime,
+    ) -> int:
+        """Archive stale active drafts before exposing participant-facing views."""
+
+        rows = list(
+            session.execute(
+                select(CourseScheduleImport)
+                .where(
+                    CourseScheduleImport.participant_id == participant_id,
+                    CourseScheduleImport.status.in_(EXPIRABLE_STATUSES),
+                    CourseScheduleImport.expires_at <= _aware(now),
+                )
+                .with_for_update()
+            ).scalars()
+        )
+        for row in rows:
+            row.status = "expired"
+            CourseScheduleImportRepository._clear_run_lease(row)
+        if rows:
+            session.flush()
+        return len(rows)
 
     def resolve_cancel_selector(
         self, participant_id: uuid.UUID, selector: dict[str, Any]

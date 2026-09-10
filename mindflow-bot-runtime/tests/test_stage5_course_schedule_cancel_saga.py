@@ -16,7 +16,7 @@ from app.services.course_schedule_import_runner import CourseScheduleImportRunne
 from helpers import memory_database, participant
 
 
-def _draft(repository, participant_id, source=None, now=None):
+def _draft(repository, participant_id, source=None, now=None, ttl_minutes=60):
     result = ScheduleVisionResult.from_dict({
         "document_type": "course_schedule",
         "semester_label": "2026-2027-1",
@@ -48,6 +48,7 @@ def _draft(repository, participant_id, source=None, now=None):
         result=result,
         timezone_name="Asia/Shanghai",
         semester_start_date=date(2026, 9, 7),
+        ttl_minutes=ttl_minutes,
         now=now,
     )
 
@@ -357,7 +358,9 @@ def test_cancel_created_date_selector_uses_import_timezone():
     owner = participant(database, "STAGE5-LOCAL-DATE")
     repository = CourseScheduleImportRepository(database)
     created_at = datetime(2026, 9, 8, 16, 30, tzinfo=timezone.utc)
-    draft = _draft(repository, owner.id, now=created_at)
+    draft = _draft(
+        repository, owner.id, now=created_at, ttl_minutes=3 * 24 * 60
+    )
 
     candidates = repository.recent_cancel_candidates(owner.id)
     assert candidates[0]["created_local_date"] == "2026-09-09"
@@ -366,6 +369,24 @@ def test_cancel_created_date_selector_uses_import_timezone():
     )["id"] == draft["id"]
     with pytest.raises(LookupError):
         repository.resolve_cancel_selector(owner.id, {"created_date": "2026-09-08"})
+
+
+def test_expired_draft_is_archived_and_omitted_from_current_cancel_candidates():
+    database = memory_database()
+    owner = participant(database, "STAGE5-EXPIRED-CANDIDATE")
+    repository = CourseScheduleImportRepository(database)
+    now = datetime.now(timezone.utc)
+    expired = _draft(repository, owner.id, now=now - timedelta(hours=2))
+    current = _draft(repository, owner.id, now=now - timedelta(minutes=10))
+
+    candidates = repository.recent_cancel_candidates(owner.id)
+
+    assert [candidate["id"] for candidate in candidates] == [current["id"]]
+    assert repository.resolve_cancel_selector(owner.id, {"latest": True})["id"] == (
+        current["id"]
+    )
+    assert repository.get(expired["id"])["status"] == "expired"
+    assert repository.latest_pending_context(owner.id)["id"] == current["id"]
 
 
 def test_cancelled_completion_is_restart_recoverable():
