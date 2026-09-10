@@ -178,6 +178,30 @@ def test_vision_valid_json_and_malformed_json_rejected():
         asyncio.run(malformed.parse(b"x", "image/png"))
 
 
+def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = vision_payload()
+        if calls == 1:
+            payload["unexpected_key"] = "schema mistake"
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(payload)}}]
+        })
+
+    service = CourseScheduleVisionService(
+        "https://vision.invalid/chat", "secret", "vision-model", enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = asyncio.run(service.parse(b"\x89PNG\r\n\x1a\n", "image/png"))
+
+    assert result.document_type == "course_schedule"
+    assert calls == 2
+
+
 def test_vision_schema_never_accepts_guessed_or_partial_times():
     payload = vision_payload()
     payload["courses"][0]["end_time"] = None

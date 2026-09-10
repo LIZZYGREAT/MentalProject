@@ -1686,12 +1686,16 @@ class BotWorker:
                 participant_id, delivery_event.event_id, task_generation
             )
             logger.warning(
-                "course_schedule_vision_validation_failed event_id=%s message_id=%s",
+                "course_schedule_vision_validation_failed event_id=%s message_id=%s detail=%s",
                 event.event_id,
                 event.message_id,
+                str(exc)[:160],
             )
             await self._deliver(
-                delivery_event, "无法可靠读取这张课程表，请换一张更清晰、完整的图片。"
+                delivery_event,
+                "这张图已识别为课程表，但导入所需的结构化信息没有通过校验，"
+                "所以还没有写入日历。请直接再试一次“导入这张课表”；"
+                "如果仍失败，管理员可依据日志中的校验项定位问题。",
             )
             return ScheduleImageOutcome("failed", None, "other")
         except (CourseScheduleVisionUnavailable, CourseScheduleVisionError, MessageResourceError) as exc:

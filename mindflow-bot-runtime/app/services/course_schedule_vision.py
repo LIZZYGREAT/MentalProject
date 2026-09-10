@@ -83,46 +83,81 @@ class CourseScheduleVisionService:
         try:
             async with self._semaphore:
                 encoded = base64.b64encode(bytes(image_bytes)).decode("ascii")
-                request = {
-                    "model": self.model,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "读取这张课程表，按规定 JSON 返回。"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{mime_type};base64,{encoded}"
+                # A response can contain useful reading but still omit one
+                # required JSON field.  Retry that schema-only failure once
+                # with the same image.  No Calendar operation is reachable
+                # from this service, and the second response is validated in
+                # exactly the same way before a draft may be created.
+                for attempt in range(2):
+                    request = {
+                        "model": self.model,
+                        "temperature": 0,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "读取这张课程表，按规定 JSON 返回。"
+                                            if attempt == 0
+                                            else (
+                                                "请重新读取同一张课程表。上一次输出未通过"
+                                                "字段校验；所有规定字段都必须出现，"
+                                                "看不清的值用 null。只返回 JSON。"
+                                            )
+                                        ),
                                     },
-                                },
-                            ],
-                        },
-                    ],
-                }
-                async with httpx.AsyncClient(
-                    timeout=self.timeout_seconds, transport=self._transport
-                ) as client:
-                    response = await client.post(
-                        self.api_url,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        json=request,
-                    )
-                response.raise_for_status()
-                payload = response.json()
-                content = payload["choices"][0]["message"]["content"]
-                if isinstance(content, list):
-                    content = "".join(
-                        str(item.get("text") or "")
-                        for item in content if isinstance(item, dict)
-                    )
-                decoded = json.loads(str(content))
-                return ScheduleVisionResult.from_dict(
-                    decoded, max_items=self.max_items
-                )
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{mime_type};base64,{encoded}"
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=self.timeout_seconds, transport=self._transport
+                        ) as client:
+                            response = await client.post(
+                                self.api_url,
+                                headers={"Authorization": f"Bearer {self.api_key}"},
+                                json=request,
+                            )
+                        response.raise_for_status()
+                        payload = response.json()
+                        content = payload["choices"][0]["message"]["content"]
+                        if isinstance(content, list):
+                            content = "".join(
+                                str(item.get("text") or "")
+                                for item in content if isinstance(item, dict)
+                            )
+                        decoded = json.loads(str(content))
+                        return ScheduleVisionResult.from_dict(
+                            decoded, max_items=self.max_items
+                        )
+                    except (
+                        KeyError,
+                        IndexError,
+                        TypeError,
+                        json.JSONDecodeError,
+                        ScheduleVisionValidationError,
+                    ) as exc:
+                        if attempt == 0:
+                            logger.info(
+                                "course_schedule_vision_validation_retry "
+                                "model=%s error_class=%s detail=%s",
+                                self.model,
+                                type(exc).__name__,
+                                str(exc)[:160],
+                            )
+                            continue
+                        raise
         except httpx.HTTPError as exc:
             self._log_failure(started, exc)
             raise CourseScheduleVisionUnavailable(
@@ -146,13 +181,13 @@ class CourseScheduleVisionService:
         cause = exc.__cause__
         response = getattr(exc, "response", None)
         logger.warning(
-            "vision_request_failed",
-            extra={
-                "purpose": "course_schedule_extract",
-                "model": self.model,
-                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
-                "error_class": type(exc).__name__,
-                "cause_error_class": type(cause).__name__ if cause else None,
-                "http_status": getattr(response, "status_code", None),
-            },
+            "vision_request_failed purpose=course_schedule_extract model=%s "
+            "elapsed_ms=%s error_class=%s detail=%s cause_error_class=%s "
+            "http_status=%s",
+            self.model,
+            round((time.monotonic() - started) * 1000, 1),
+            type(exc).__name__,
+            str(exc)[:160],
+            type(cause).__name__ if cause else None,
+            getattr(response, "status_code", None),
         )
