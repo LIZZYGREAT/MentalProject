@@ -865,6 +865,47 @@ def test_completed_course_image_accepts_natural_omitted_import_followup():
     assert len(strict_calls) == 1
 
 
+def test_failed_strict_import_retries_the_same_recent_image_not_an_old_draft():
+    vision = Vision(
+        kind="course_schedule", interaction_hint="course_import_request"
+    )
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=vision, debounce=0
+    )
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        if len(strict_calls) == 1:
+            return ScheduleImageOutcome("failed", None, "other")
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "retried-current-image"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("retry", "m-retry", "text", text="导入这张课表")
+        )
+        await worker.process(await queue.get())
+        person = worker.identity.resolve("app", "open")
+        return await worker.multimodal_turns.recent_context(person.id, "chat")
+
+    recent = asyncio.run(scenario())
+    assert [message_id for message_id, _person_id in strict_calls] == [
+        "m-image", "m-image"
+    ]
+    assert runtime.calls == []
+    assert recent.structured_or_agent_summary == {
+        "image_kind": "course_schedule",
+        "route": "recent_strict_schedule",
+        "draft_id": "retried-current-image",
+    }
+
+
 def test_course_schedule_question_is_read_only_and_recent_followup_reuses_context():
     gateway, queue, worker, runtime, sender, vision, resources = _system(
         vision=Vision(kind="course_schedule", interaction_hint="question")

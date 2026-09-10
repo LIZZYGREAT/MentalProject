@@ -983,7 +983,26 @@ class BotWorker:
                         summary=fallback_context,
                     )
                 else:
-                    await self.multimodal_turns.cancel(turn)
+                    # The generic classifier has already established that this
+                    # is a course schedule and the user asked to import it.
+                    # If the strict extractor rejects its own response, keep a
+                    # short-lived binding to *this exact image*.  A later
+                    # “导入这张课表” retries the reviewed extraction path with
+                    # the original message/image identifiers; it must not fall
+                    # through to an unrelated older pending draft.
+                    route = "strict_schedule_import_retryable"
+                    await self._note_multimodal_route(event, route)
+                    recent = await self.multimodal_turns.complete(
+                        turn,
+                        image_message_id=event.message_id,
+                        image_key=event.image_key,
+                        image_kind="course_schedule",
+                        summary={
+                            "image_kind": "course_schedule",
+                            "route": route,
+                            "schedule_import_retryable": True,
+                        },
+                    )
             else:
                 read_only = None
                 downloaded_image = None
