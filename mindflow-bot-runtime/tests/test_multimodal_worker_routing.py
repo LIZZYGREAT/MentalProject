@@ -36,8 +36,22 @@ from app.worker import (
     BotWorker,
     ScheduleImageOutcome,
     is_explicit_schedule_import_fast_path,
+    is_schedule_recent_import_request,
 )
 from helpers import memory_database, participant, skill_path
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("帮我导入这个课表", True),
+        ("课程没问题，从 9 月 7 日开始，帮我加入上述的课程，是重复性日程。", True),
+        ("不要把上述课程加入日历", False),
+        ("上述课程有哪些？", False),
+    ],
+)
+def test_recent_schedule_import_intent_accepts_normal_direct_request(text, expected):
+    assert is_schedule_recent_import_request(text) is expected
 
 
 class Sender:

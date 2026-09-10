@@ -16,6 +16,7 @@ from app.contracts.course_schedule import (
 )
 from app.integrations.feishu.gateway import BotEvent, FeishuEventParser, InvalidBotEvent
 from app.integrations.feishu.cards import (
+    course_schedule_context_card,
     course_schedule_preview_card,
     course_schedule_result_card,
 )
@@ -223,6 +224,86 @@ def test_draft_persists_and_calendar_never_writes_before_confirm():
         token in visible_text
         for token in ("RRULE", "FREQ", "recurrence_strategy", "planner_version")
     )
+
+
+def test_pending_context_card_opens_fixed_context_form_before_calendar_preview():
+    database = memory_database()
+    person = participant(database, "CONTEXT-CARD")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-context-card",
+        source_image_hash="c" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+    )
+
+    preview_payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    context_payload = json.dumps(course_schedule_context_card(draft), ensure_ascii=False)
+
+    assert "补充信息并生成预览" in preview_payload
+    assert "course_schedule_import_context_open" in preview_payload
+    assert "course_schedule_import_confirm" not in preview_payload
+    assert "第一周周一" in context_payload
+    assert "节次时间对照" in context_payload
+    assert "course_schedule_import_context_submit" in context_payload
+
+
+def test_context_card_submission_completes_draft_without_calendar_write():
+    database = memory_database()
+    person = participant(database, "CONTEXT-SUBMIT")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-context-submit",
+        source_image_hash="d" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+    )
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+
+    opened = handler.handle(
+        person.id,
+        message_id="om-card",
+        action_value={
+            "mindflow_action": "course_schedule_import_context_open",
+            "version": "3",
+            "import_id": draft["id"],
+        },
+        form_value={},
+    )
+    submitted = handler.handle(
+        person.id,
+        message_id="om-card",
+        action_value={
+            "mindflow_action": "course_schedule_import_context_submit",
+            "version": "3",
+            "import_id": draft["id"],
+        },
+        form_value={
+            "semester_start_date": "2026-09-07",
+            "period_time_mapping": "15-16=08:00-09:35",
+        },
+    )
+
+    assert "mindflow_course_schedule_context" in json.dumps(opened["card"])
+    assert submitted["status"] == "pending_confirmation"
+    payload = json.dumps(submitted["card"], ensure_ascii=False)
+    assert "按课程规律添加（推荐）" in payload
+    assert "course_schedule_import_confirm" in payload
+    assert repository.get(draft["id"])["status"] == "pending_confirmation"
 
 
 def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():

@@ -151,6 +151,13 @@ SCHEDULE_RECENT_IMPORT_FOLLOWUPS = frozenset(
         "放进去",
     }
 )
+SCHEDULE_RECENT_IMPORT_INTENT_PATTERN = re.compile(
+    r"(?:导入|添加|加入|加进|同步).{0,20}(?:课表|课程|日程)"
+    r"|(?:课表|课程).{0,20}(?:导入|添加|加入|加进|同步)"
+)
+SCHEDULE_RECENT_IMPORT_NEGATION_PATTERN = re.compile(
+    r"(?:不|先别|不要|无需|不用|取消).{0,8}(?:导入|添加|加入|加进|同步)"
+)
 
 
 @dataclass(frozen=True)
@@ -193,8 +200,18 @@ def is_explicit_schedule_import_fast_path(text: str) -> bool:
 
 
 def is_schedule_recent_import_request(text: str) -> bool:
-    value = str(text or "").strip().rstrip("。！!")
-    return value in SCHEDULE_RECENT_IMPORT_FOLLOWUPS
+    value = "".join(str(text or "").strip().split()).rstrip("。！？?!")
+    if value in SCHEDULE_RECENT_IMPORT_FOLLOWUPS:
+        return True
+    # This route is reachable only for the sender's recent course-schedule
+    # image.  It creates a reviewable draft, never a Calendar event.  Accept
+    # normal direct requests such as “帮我加入上述课程，是重复性日程”, while
+    # refusing any expressed negation.
+    return bool(
+        value
+        and not SCHEDULE_RECENT_IMPORT_NEGATION_PATTERN.search(value)
+        and SCHEDULE_RECENT_IMPORT_INTENT_PATTERN.search(value)
+    )
 
 
 class AgentRuntimeProtocol(Protocol):

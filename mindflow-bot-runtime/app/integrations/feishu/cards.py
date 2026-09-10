@@ -125,7 +125,14 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         ])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     status = str(draft.get("status") or "")
-    if not missing and len(courses) <= 20 and status == "pending_confirmation":
+    if missing and status == "pending_context":
+        lines.append("\n填写关键信息后，我会先给出完整预览；确认前不会添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+        elements.extend([
+            _schedule_context_button(draft["id"]),
+            _schedule_cancel_button(draft["id"]),
+        ])
+    elif not missing and len(courses) <= 20 and status == "pending_confirmation":
         elements.extend([
             {
                 "tag": "markdown",
@@ -267,6 +274,125 @@ def _schedule_cancel_button(
             "version": "2",
             "import_id": str(import_id),
         }}],
+    }
+
+
+def _schedule_context_button(import_id: str) -> dict[str, Any]:
+    """Open the fixed, non-LLM context form for an incomplete draft."""
+
+    return {
+        "tag": "button",
+        "type": "primary",
+        "text": {"tag": "plain_text", "content": "补充信息并生成预览"},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_context_open",
+            "version": "3",
+            "import_id": str(import_id),
+        }}],
+    }
+
+
+def course_schedule_context_card(draft: dict[str, Any]) -> dict[str, Any]:
+    """Collect the two common import prerequisites without invoking an LLM.
+
+    This card only updates the participant-owned draft.  It never queues or
+    writes Calendar events; the existing preview card remains the sole place
+    where the participant chooses a recurrence strategy and confirms import.
+    """
+
+    structured = dict(draft.get("structured_result") or {})
+    missing = set(structured.get("missing_context") or [])
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                "先补齐课表的关键信息。提交后会显示完整预览，"
+                "由你选择重复方式；这一步不会添加日历。"
+            ),
+        }
+    ]
+    if "semester_start_date" in missing:
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": "**第一周周一**（必填）",
+            },
+            {
+                "tag": "input",
+                "name": "semester_start_date",
+                "required": True,
+                "max_length": 10,
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "例如 2026-09-07",
+                },
+                "label": {"tag": "plain_text", "content": "第一周周一"},
+            },
+        ])
+    if missing & {"period_time_mapping", "actual_time"}:
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": (
+                    "**节次时间对照**（必填）\n"
+                    "每行一条，例如：`1-2=08:00-09:35`\n"
+                    "可继续填写：`3-4=10:00-11:35`"
+                ),
+            },
+            {
+                "tag": "input",
+                "name": "period_time_mapping",
+                "required": True,
+                "input_type": "multiline_text",
+                "rows": 4,
+                "max_length": 1200,
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "1-2=08:00-09:35\n3-4=10:00-11:35",
+                },
+                "label": {"tag": "plain_text", "content": "节次时间对照"},
+            },
+        ])
+    other_missing = missing - {
+        "semester_start_date", "period_time_mapping", "actual_time"
+    }
+    if other_missing:
+        labels = {
+            "weekday": "上课星期",
+            "week_rule": "起止周或单、双周规则",
+        }
+        detail = "、".join(labels.get(value, "课程详情") for value in sorted(other_missing))
+        elements.append({
+            "tag": "markdown",
+            "content": f"这张图还有无法可靠识别的{detail}，请先用文字补充后再继续。",
+        })
+    elements.append({
+        "tag": "button",
+        "name": "course_schedule_import_context_submit",
+        "type": "primary",
+        "text": {"tag": "plain_text", "content": "生成导入预览"},
+        "form_action_type": "submit",
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_context_submit",
+            "version": "3",
+            "import_id": str(draft["id"]),
+        }}],
+    })
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "补充课表导入信息"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [{
+                "tag": "form",
+                "name": "mindflow_course_schedule_context",
+                "elements": elements,
+            }],
+        },
     }
 
 
