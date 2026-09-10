@@ -101,6 +101,13 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     if len(courses) > 20:
         lines.extend(["", "课程数量超过 20 项，请拆分图片后重新导入。"])
     warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]
+    parse_report = dict(metadata.get("parse_report") or {})
+    quarantined = list(parse_report.get("quarantined") or [])
+    if quarantined:
+        lines.extend(["", f"另有 {len(quarantined)} 门课需要补充后再并入："])
+        for item in quarantined[:10]:
+            name = _safe_schedule_text(item.get("course_name") or "未命名课程")
+            lines.append(f"- {name}（识别格式待确认）")
     if uncertain or warnings:
         lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
     if "semester_start_date" in missing:

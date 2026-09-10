@@ -148,6 +148,9 @@ class ScheduleVisionResult:
     courses: tuple[CourseScheduleItem, ...]
     missing_context: tuple[str, ...]
     warnings: tuple[str, ...]
+    parse_report: dict[str, Any] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     @classmethod
     def from_dict(cls, value: Any, *, max_items: int = 20) -> "ScheduleVisionResult":
@@ -192,6 +195,7 @@ class ScheduleVisionResult:
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        parse_report = result.pop("parse_report", None)
         result["courses"] = [
             {
                 **asdict(course),
@@ -212,6 +216,8 @@ class ScheduleVisionResult:
         ]
         result["missing_context"] = list(self.missing_context)
         result["warnings"] = list(self.warnings)
+        if parse_report:
+            result["_parse_report"] = parse_report
         return result
 
 

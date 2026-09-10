@@ -2623,6 +2623,7 @@ def prepare_schedule_context(result: ScheduleVisionResult) -> dict[str, Any]:
     """Resolve trusted, read-only schedule facts using backend period rules."""
 
     structured = result.to_dict()
+    parse_report = structured.pop("_parse_report", None)
     sources: list[str | None] = []
     for raw, course in zip(structured["courses"], result.courses):
         resolved = resolve_period_time(
@@ -2663,4 +2664,6 @@ def prepare_schedule_context(result: ScheduleVisionResult) -> dict[str, Any]:
             for course in result.courses
         ],
     }
+    if parse_report:
+        structured["_metadata"]["parse_report"] = parse_report
     return structured

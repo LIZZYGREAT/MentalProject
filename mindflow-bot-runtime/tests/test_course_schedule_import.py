@@ -189,7 +189,7 @@ def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
         retry_prompts.append(body["messages"][1]["content"][0]["text"])
         payload = vision_payload()
         if calls == 1:
-            payload["unexpected_key"] = "schema mistake"
+            payload["courses"] = "schema mistake"
         return httpx.Response(200, json={
             "choices": [{"message": {"content": json.dumps(payload)}}]
         })
@@ -203,7 +203,7 @@ def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
 
     assert result.document_type == "course_schedule"
     assert calls == 2
-    assert "vision result fields do not match schema" in retry_prompts[1]
+    assert "course schedule contains no courses" in retry_prompts[1]
 
 
 def test_vision_schema_never_accepts_guessed_or_partial_times():

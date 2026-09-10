@@ -14,6 +14,7 @@ from app.contracts.course_schedule import (
     ScheduleVisionResult,
     ScheduleVisionValidationError,
 )
+from app.services.course_schedule_normalizer import normalize_course_schedule
 
 
 SYSTEM_PROMPT = """你只负责读取图片中的课程表。
@@ -140,7 +141,7 @@ class CourseScheduleVisionService:
                                 for item in content if isinstance(item, dict)
                             )
                         decoded = json.loads(str(content))
-                        return ScheduleVisionResult.from_dict(
+                        return normalize_course_schedule(
                             decoded, max_items=self.max_items
                         )
                     except (
