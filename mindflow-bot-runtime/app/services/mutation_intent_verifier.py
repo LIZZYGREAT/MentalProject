@@ -41,6 +41,12 @@ _INTENTS = frozenset(
 _INTENT_ALIASES: dict[str, MutationIntent] = {
     "create_calendar_event": "direct_action",
 }
+_CANCEL_OR_REVERT_TOOLS = frozenset(
+    {
+        "course_schedule_cancel_pending_draft",
+        "course_schedule_cancel_or_revert_import",
+    }
+)
 _FORBIDDEN_CONTEXT_FIELDS = frozenset(
     {
         "participant_id",
@@ -144,7 +150,11 @@ def _parse_decision(value: Any) -> MutationIntentDecision:
         or re.fullmatch(r"[a-z0-9_]+", reason_code) is None
     ):
         raise MutationIntentVerificationError("verifier reason_code is invalid")
-    if decision == "allow" and intent not in {"direct_action", "destructive_action"}:
+    if decision == "allow" and intent not in {
+        "direct_action",
+        "destructive_action",
+        "cancel_or_revert",
+    }:
         raise MutationIntentVerificationError("non-action intent cannot be allowed")
     if decision == "needs_clarification" and intent != "ambiguous":
         raise MutationIntentVerificationError(
@@ -173,7 +183,7 @@ If the user requests an action but the target or requested change is ambiguous, 
 Do not modify the proposal, select identities or targets, or expand its scope.
 Return only JSON with decision, intent, and a short reason_code. Do not return reasoning.
 The intent value must be exactly one of: direct_action, destructive_action, status_query, capability_question, hypothetical, ambiguous, cancel_or_revert.
-For an allowed direct_request, use direct_action. For an allowed explicit_destructive_request, use destructive_action.
+For an allowed direct_request, use direct_action, except that an allowed cancellation, cleanup, or revert request must use cancel_or_revert. For an allowed explicit_destructive_request, use destructive_action.
 Never use a tool name or operation-specific value (for example, create_calendar_event) as intent."""
 
     def __init__(
@@ -317,10 +327,18 @@ class MutationIntentVerifier:
         if (
             authorization_requirement == "direct_request"
             and decision.decision == "allow"
-            and decision.intent != "direct_action"
+            and decision.intent not in {"direct_action", "cancel_or_revert"}
         ):
             raise MutationIntentVerificationError(
                 "direct_request requires direct_action intent"
+            )
+        if (
+            decision.decision == "allow"
+            and decision.intent == "cancel_or_revert"
+            and tool_name not in _CANCEL_OR_REVERT_TOOLS
+        ):
+            raise MutationIntentVerificationError(
+                "cancel_or_revert intent requires a cancellation tool"
             )
         if (
             authorization_requirement == "explicit_destructive_request"

@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import uuid
 
@@ -1224,6 +1225,73 @@ def test_verifier_rejects_invalid_or_mismatched_provider_output():
         asyncio.run(invalid.verify(**kwargs))
     with pytest.raises(MutationIntentVerificationError):
         asyncio.run(mismatched.verify(**kwargs))
+
+
+@pytest.mark.parametrize(
+    ("decision", "intent", "authorization_requirement"),
+    itertools.product(
+        ("allow", "deny", "needs_clarification"),
+        (
+            "direct_action",
+            "destructive_action",
+            "status_query",
+            "capability_question",
+            "hypothetical",
+            "ambiguous",
+            "cancel_or_revert",
+        ),
+        ("direct_request", "explicit_destructive_request"),
+    ),
+)
+def test_verifier_decision_intent_authorization_matrix(
+    decision, intent, authorization_requirement
+):
+    tool_name = (
+        "course_schedule_cancel_or_revert_import"
+        if authorization_requirement == "direct_request"
+        else "calendar_delete_event"
+    )
+    verifier = MutationIntentVerifier(
+        RawClient(
+            {
+                "decision": decision,
+                "intent": intent,
+                "reason_code": "matrix_case",
+            }
+        )
+    )
+    expected_valid = (
+        decision == "deny"
+        or (decision == "needs_clarification" and intent == "ambiguous")
+        or (
+            decision == "allow"
+            and (
+                (
+                    authorization_requirement == "direct_request"
+                    and intent in {"direct_action", "cancel_or_revert"}
+                )
+                or (
+                    authorization_requirement == "explicit_destructive_request"
+                    and intent == "destructive_action"
+                )
+            )
+        )
+    )
+    kwargs = {
+        "user_request_text": "清理这次导入",
+        "tool_name": tool_name,
+        "tool_effect": "internal_write",
+        "authorization_requirement": authorization_requirement,
+        "proposal_summary": {"proposed_operation": tool_name},
+        "source_kind": "text",
+    }
+
+    if expected_valid:
+        parsed = asyncio.run(verifier.verify(**kwargs))
+        assert (parsed.decision, parsed.intent) == (decision, intent)
+    else:
+        with pytest.raises(MutationIntentVerificationError):
+            asyncio.run(verifier.verify(**kwargs))
 
 
 def test_verifier_normalizes_observed_calendar_create_intent_alias():

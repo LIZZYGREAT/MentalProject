@@ -6,7 +6,10 @@ from datetime import date, time
 from typing import Any
 
 from app.agent.context import AgentContext
-from app.agent.tool_registry import ToolRegistry
+from app.agent.tool_registry import (
+    AuthorizationContextResolutionError,
+    ToolRegistry,
+)
 from app.integrations.feishu.cards import course_schedule_preview_card
 from app.repositories_course_schedule import (
     CourseCorrectionAmbiguityError,
@@ -142,6 +145,9 @@ class CourseScheduleTools:
             self.cancel_pending_draft,
             effect="internal_write",
             authorization_requirement="direct_request",
+            authorization_context_resolver=(
+                self.resolve_pending_cancel_authorization_context
+            ),
         )
         registry.register(
             "course_schedule_get_recent_imports",
@@ -163,6 +169,9 @@ class CourseScheduleTools:
             self.cancel_or_revert_import,
             effect="internal_write",
             authorization_requirement="direct_request",
+            authorization_context_resolver=(
+                self.resolve_cancel_or_revert_authorization_context
+            ),
         )
         registry.register(
             "course_schedule_update_active_context",
@@ -262,6 +271,28 @@ class CourseScheduleTools:
             "reply_text": result.get("reply_text"),
         }
 
+    def resolve_pending_cancel_authorization_context(
+        self, ctx: AgentContext, _arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        draft = self.imports.drafts.latest_pending_context(ctx.participant_id)
+        if draft is None:
+            raise AuthorizationContextResolutionError("authorization_target_not_found")
+        return {
+            "server_bound_participant_target": True,
+            "operation_intent": "cancel_or_revert",
+            "has_provider_effect": False,
+            "target": {
+                "status": draft.get("status"),
+                "created_at": draft.get("created_at"),
+                "course_names": [
+                    str(course.get("course_name") or "")[:80]
+                    for course in list(
+                        (draft.get("structured_result") or {}).get("courses") or []
+                    )[:10]
+                ],
+            },
+        }
+
     def get_recent_imports(
         self, ctx: AgentContext, _arguments: dict[str, Any]
     ) -> dict[str, Any]:
@@ -321,6 +352,34 @@ class CourseScheduleTools:
             "cancel_mode": result.get("cancel_mode"),
             "already_cancelled": bool(result.get("already_cancelled")),
             "reply_text": result.get("reply_text"),
+        }
+
+    def resolve_cancel_or_revert_authorization_context(
+        self, ctx: AgentContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        selector = dict(arguments.get("selector") or {})
+        try:
+            candidate = self.imports.drafts.resolve_cancel_selector(
+                ctx.participant_id, selector
+            )
+        except CourseScheduleImportAmbiguityError as exc:
+            raise AuthorizationContextResolutionError(
+                "authorization_target_ambiguous"
+            ) from exc
+        except (LookupError, ValueError) as exc:
+            raise AuthorizationContextResolutionError(
+                "authorization_target_not_found"
+            ) from exc
+        return {
+            "server_bound_participant_target": True,
+            "operation_intent": "cancel_or_revert",
+            "has_provider_effect": bool(candidate.get("has_provider_effect")),
+            "target": {
+                "status": candidate.get("status"),
+                "created_at": candidate.get("created_at"),
+                "created_local_date": candidate.get("created_local_date"),
+                "course_names": list(candidate.get("course_names") or [])[:10],
+            },
         }
 
     def update_active_context(

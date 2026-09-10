@@ -54,6 +54,12 @@ AuthorizationRequirement = Literal[
 STATE_CHANGING_EFFECTS = frozenset(
     {"internal_write", "external_write", "destructive_external_write"}
 )
+_SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS = frozenset(
+    {
+        "course_schedule_cancel_pending_draft",
+        "course_schedule_cancel_or_revert_import",
+    }
+)
 
 _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
     TurnEffectPolicy, frozenset[ToolEffect]
@@ -190,6 +196,22 @@ def _verifier_semantic_turns(ctx: AgentContext) -> tuple[dict[str, str], ...]:
             value = getattr(item, "text", "")
         turns.append({"role": str(role), "text": str(value)})
     return tuple(turns)
+
+
+def _is_server_bound_no_provider_effect(
+    name: str, authorization_context: Any
+) -> bool:
+    """Authorize only participant-bound course cleanup with no Calendar effect."""
+
+    return (
+        name in _SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS
+        and isinstance(authorization_context, dict)
+        and authorization_context.get("server_bound_participant_target") is True
+        and authorization_context.get("operation_intent") == "cancel_or_revert"
+        and authorization_context.get("has_provider_effect") is False
+        and isinstance(authorization_context.get("target"), dict)
+        and bool(authorization_context["target"])
+    )
 
 
 class ToolRegistry:
@@ -381,6 +403,7 @@ class ToolRegistry:
         reason_code = "authorization_not_required"
         if spec.effect in STATE_CHANGING_EFFECTS:
             proposal_summary = _verifier_proposal_summary(name, arguments)
+            deterministic_authorization = False
             if spec.authorization_context_resolver is not None:
                 try:
                     resolver = spec.authorization_context_resolver
@@ -407,6 +430,9 @@ class ToolRegistry:
                             "invalid_authorization_context"
                         )
                     proposal_summary.update(safe_context)
+                    deterministic_authorization = _is_server_bound_no_provider_effect(
+                        name, authorization_context
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -431,7 +457,10 @@ class ToolRegistry:
                         reason_code,
                     )
                     return ToolExecution(result, "authorization_unavailable")
-            if self.mutation_verifier is None:
+            if deterministic_authorization:
+                authorization_decision = "allow"
+                reason_code = "server_bound_no_provider_effect"
+            elif self.mutation_verifier is None:
                 result = {
                     "ok": False,
                     "error": "mutation_authorization_unavailable",
@@ -448,71 +477,72 @@ class ToolRegistry:
                     "verifier_unavailable",
                 )
                 return ToolExecution(result, "authorization_unavailable")
-            try:
-                decision = await self.mutation_verifier.verify(
-                    user_request_text=ctx.user_request_text,
-                    tool_name=spec.name,
-                    tool_effect=spec.effect,
-                    authorization_requirement=spec.authorization_requirement,
-                    proposal_summary=proposal_summary,
-                    source_kind=ctx.source_kind,
-                    semantic_turn_context=_verifier_semantic_turns(ctx),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                result = {
-                    "ok": False,
-                    "error": "mutation_authorization_unavailable",
-                    "reason_code": "verifier_failure",
-                }
-                await self._log(
-                    ctx,
-                    name,
-                    spec,
-                    arguments,
-                    result,
-                    "authorization_unavailable",
-                    "unavailable",
-                    "verifier_failure",
-                )
-                return ToolExecution(result, "authorization_unavailable")
-            authorization_decision = decision.decision
-            reason_code = decision.reason_code
-            if decision.decision == "deny":
-                result = {
-                    "ok": False,
-                    "error": "tool_effect_not_authorized",
-                    "reason_code": decision.reason_code,
-                }
-                await self._log(
-                    ctx,
-                    name,
-                    spec,
-                    arguments,
-                    result,
-                    "tool_effect_not_authorized",
-                    authorization_decision,
-                    reason_code,
-                )
-                return ToolExecution(result, "tool_effect_not_authorized")
-            if decision.decision == "needs_clarification":
-                result = {
-                    "ok": False,
-                    "error": "mutation_needs_clarification",
-                    "reason_code": decision.reason_code,
-                }
-                await self._log(
-                    ctx,
-                    name,
-                    spec,
-                    arguments,
-                    result,
-                    "mutation_needs_clarification",
-                    authorization_decision,
-                    reason_code,
-                )
-                return ToolExecution(result, "mutation_needs_clarification")
+            if not deterministic_authorization:
+                try:
+                    decision = await self.mutation_verifier.verify(
+                        user_request_text=ctx.user_request_text,
+                        tool_name=spec.name,
+                        tool_effect=spec.effect,
+                        authorization_requirement=spec.authorization_requirement,
+                        proposal_summary=proposal_summary,
+                        source_kind=ctx.source_kind,
+                        semantic_turn_context=_verifier_semantic_turns(ctx),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    result = {
+                        "ok": False,
+                        "error": "mutation_authorization_unavailable",
+                        "reason_code": "verifier_failure",
+                    }
+                    await self._log(
+                        ctx,
+                        name,
+                        spec,
+                        arguments,
+                        result,
+                        "authorization_unavailable",
+                        "unavailable",
+                        "verifier_failure",
+                    )
+                    return ToolExecution(result, "authorization_unavailable")
+                authorization_decision = decision.decision
+                reason_code = decision.reason_code
+                if decision.decision == "deny":
+                    result = {
+                        "ok": False,
+                        "error": "tool_effect_not_authorized",
+                        "reason_code": decision.reason_code,
+                    }
+                    await self._log(
+                        ctx,
+                        name,
+                        spec,
+                        arguments,
+                        result,
+                        "tool_effect_not_authorized",
+                        authorization_decision,
+                        reason_code,
+                    )
+                    return ToolExecution(result, "tool_effect_not_authorized")
+                if decision.decision == "needs_clarification":
+                    result = {
+                        "ok": False,
+                        "error": "mutation_needs_clarification",
+                        "reason_code": decision.reason_code,
+                    }
+                    await self._log(
+                        ctx,
+                        name,
+                        spec,
+                        arguments,
+                        result,
+                        "mutation_needs_clarification",
+                        authorization_decision,
+                        reason_code,
+                    )
+                    return ToolExecution(result, "mutation_needs_clarification")
 
         calendar_operation = CALENDAR_MUTATION_TOOLS.get(name)
         if (

@@ -93,6 +93,17 @@ class _Imports:
             "reply_text": "已取消这次课程表导入。",
         }
 
+    def cancel_or_revert(self, participant_id, selector):
+        candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
+        draft = self.drafts.request_cancel(participant_id, candidate["id"])
+        return {
+            "ok": True,
+            "status": draft["status"],
+            "cancel_mode": draft.get("cancel_mode"),
+            "already_cancelled": bool(draft.get("already_cancelled")),
+            "reply_text": "已清理这次课程表导入。",
+        }
+
 
 def test_repository_structured_correction_separates_selector_and_new_weekday():
     database = memory_database()
@@ -206,6 +217,70 @@ def test_hypothetical_correction_is_denied_before_draft_mutation():
     unchanged = repo.get(original["id"])["structured_result"]["courses"][0]
     assert (unchanged["period_start"], unchanged["period_end"]) == (1, 2)
     assert presentations.take_cards(ctx.agent_run_id) == []
+
+
+def test_participant_bound_pending_cancel_without_provider_effect_skips_verifier():
+    database = memory_database()
+    owner = participant(database, "STAGE3-CANCEL-BOUND")
+    repo = CourseScheduleImportRepository(database)
+    _draft(repo, owner.id)
+    verifier = _Verifier(None)
+    registry = ToolRegistry(mutation_verifier=verifier)
+    CourseScheduleTools(_Imports(repo), PresentationOutbox()).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "清理这次尚未导入的课表")
+
+    result = asyncio.run(
+        registry.execute(ctx, "course_schedule_cancel_pending_draft", {})
+    )
+
+    assert result.status == "succeeded"
+    assert result.result["status"] == "cancelled"
+    assert verifier.calls == []
+
+
+def test_cancel_with_provider_effect_still_requires_semantic_verification():
+    class Drafts:
+        def resolve_cancel_selector(self, participant_id, selector):
+            assert participant_id == owner.id
+            assert selector == {"latest": True}
+            return {
+                "id": "private-import-id",
+                "status": "succeeded",
+                "created_at": "2026-09-10T08:00:00+00:00",
+                "created_local_date": "2026-09-10",
+                "course_names": ["高等数学"],
+                "has_provider_effect": True,
+            }
+
+    class Imports:
+        drafts = Drafts()
+
+        def cancel_or_revert(self, participant_id, selector):
+            assert participant_id == owner.id
+            return {"ok": True, "status": "cancelling", "cancel_mode": "revert"}
+
+    database = memory_database()
+    owner = participant(database, "STAGE3-REVERT-VERIFY")
+    verifier = _Verifier(
+        MutationIntentDecision("allow", "cancel_or_revert", "explicit_cleanup")
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    CourseScheduleTools(Imports(), PresentationOutbox()).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "撤销刚才导入到日历的课程")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "course_schedule_cancel_or_revert_import",
+            {"selector": {"latest": True}},
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.result["status"] == "cancelling"
+    assert len(verifier.calls) == 1
+    serialized = str(verifier.calls[0]["proposal_summary"])
+    assert "private-import-id" not in serialized
 
 
 def test_context_tool_applies_user_period_mapping_and_semester_monday():
