@@ -44,7 +44,6 @@ from app.repositories import (
 )
 from app.repositories_course_schedule import (
     CreateDraftOutcome,
-    UnfillableScheduleContextError,
     prepare_schedule_context,
 )
 from app.repositories_course_schedule_image import (
@@ -1921,26 +1920,6 @@ class BotWorker:
                     draft,
                     "course_schedule",
                 )
-        except UnfillableScheduleContextError as exc:
-            await self._ensure_task_not_stopped(
-                participant_id, delivery_event.event_id, task_generation
-            )
-            logger.info(
-                "course_schedule_context_unfillable event_id=%s missing=%s",
-                event.event_id,
-                sorted(exc.missing),
-            )
-            await self._deliver(
-                delivery_event, "这张课程表缺少星期、周次或可用时间，暂时无法可靠导入。请换一张信息更完整、清晰的图片。"
-            )
-            await self._mark_schedule_image_failed(
-                event,
-                participant_id,
-                error_code="schedule_context_unfillable",
-                detail=str(exc),
-            )
-            return ScheduleImageOutcome("failed", None, "other")
-
         except MessageResourceTooLarge as exc:
             await self._ensure_task_not_stopped(
                 participant_id, delivery_event.event_id, task_generation

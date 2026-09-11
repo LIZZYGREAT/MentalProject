@@ -68,12 +68,6 @@ def _preserve_explicit_actual_time(source: str | None) -> bool:
     return source in _EXPLICIT_ACTUAL_TIME_SOURCES
 
 
-class UnfillableScheduleContextError(ValueError):
-    def __init__(self, missing: set[str]):
-        self.missing = frozenset(missing)
-        super().__init__("schedule contains context that cannot be completed in V1")
-
-
 class CourseCorrectionAmbiguityError(ValueError):
     """A participant-owned draft selector did not resolve to exactly one course."""
 
@@ -162,9 +156,6 @@ class CourseScheduleImportRepository:
         created_at = _aware(now or datetime.now(timezone.utc))
         structured = prepare_schedule_context(result)
         missing = derive_required_context(result, semester_start_date=semester_start_date)
-        unsupported = missing - DRAFT_FILLABLE_CONTEXT_FIELDS
-        if unsupported:
-            raise UnfillableScheduleContextError(unsupported)
         structured["missing_context"] = sorted(missing)
         row = CourseScheduleImport(
             participant_id=participant_id,

@@ -29,7 +29,6 @@ from app.integrations.feishu.message_resources import (
 from app.models import CourseScheduleImport
 from app.repositories_course_schedule import (
     CourseScheduleImportRepository,
-    UnfillableScheduleContextError,
     derive_required_context,
     prepare_schedule_context,
 )
