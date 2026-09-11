@@ -361,7 +361,9 @@ def test_cancel_with_provider_effect_still_requires_semantic_verification():
                 "id": "private-import-id",
                 "status": "succeeded",
                 "created_at": "2026-09-10T08:00:00+00:00",
+                "created_local_datetime": "2026-09-10T16:00:00+08:00",
                 "created_local_date": "2026-09-10",
+                "timezone": "Asia/Shanghai",
                 "course_names": ["高等数学"],
                 "has_provider_effect": True,
             }
@@ -395,6 +397,31 @@ def test_cancel_with_provider_effect_still_requires_semantic_verification():
     assert len(verifier.calls) == 1
     serialized = str(verifier.calls[0]["proposal_summary"])
     assert "private-import-id" not in serialized
+    assert "2026-09-10T08:00:00+00:00" not in serialized
+    assert "2026-09-10T16:00:00+08:00" in serialized
+
+
+def test_recent_imports_expose_local_timestamp_without_raw_utc():
+    database = memory_database()
+    owner = participant(database, "STAGE3-RECENT-LOCAL-TIME")
+    repo = CourseScheduleImportRepository(database)
+    _draft(repo, owner.id)
+    registry = ToolRegistry()
+    CourseScheduleTools(_Imports(repo), PresentationOutbox()).register(registry)
+
+    result = asyncio.run(
+        registry.execute(
+            _context(owner.id, uuid.uuid4(), "最近一次课表是什么时候导入的"),
+            "course_schedule_get_recent_imports",
+            {},
+        )
+    )
+
+    item = result.result["imports"][0]
+    assert item["timezone"] == "Asia/Shanghai"
+    assert item["created_local_datetime"].endswith("+08:00")
+    assert item["created_local_date"] == item["created_local_datetime"][:10]
+    assert "created_at" not in item
 
 
 def test_context_tool_applies_user_period_mapping_and_semester_monday():

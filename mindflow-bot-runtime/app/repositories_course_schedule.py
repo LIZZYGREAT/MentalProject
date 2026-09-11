@@ -1850,18 +1850,17 @@ class CourseScheduleImportRepository:
                     )
                 except Exception:
                     import_timezone = ZoneInfo(DEFAULT_IMPORT_TIMEZONE)
-                created_local_date = (
-                    _aware(row.created_at)
-                    .astimezone(import_timezone)
-                    .date()
-                    .isoformat()
+                created_local_datetime = _aware(row.created_at).astimezone(
+                    import_timezone
                 )
                 output.append({
                     "id": str(row.id),
                     "participant_id": str(row.participant_id),
                     "status": row.status,
                     "created_at": _aware(row.created_at).isoformat(),
-                    "created_local_date": created_local_date,
+                    "created_local_datetime": created_local_datetime.isoformat(),
+                    "created_local_date": created_local_datetime.date().isoformat(),
+                    "timezone": str(row.timezone or DEFAULT_IMPORT_TIMEZONE),
                     "source_image_hash": row.source_image_hash,
                     "course_names": [name[:80] for name in names[:10]],
                     "has_provider_effect": any(

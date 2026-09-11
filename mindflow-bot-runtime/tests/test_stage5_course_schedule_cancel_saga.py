@@ -409,6 +409,9 @@ def test_cancel_created_date_selector_uses_import_timezone():
 
     candidates = repository.recent_cancel_candidates(owner.id)
     assert candidates[0]["created_local_date"] == "2026-09-09"
+    assert candidates[0]["created_local_datetime"] == "2026-09-09T00:30:00+08:00"
+    assert candidates[0]["timezone"] == "Asia/Shanghai"
+    assert candidates[0]["created_at"] == "2026-09-08T16:30:00+00:00"
     assert repository.resolve_cancel_selector(
         owner.id, {"created_date": "2026-09-09"}
     )["id"] == draft["id"]

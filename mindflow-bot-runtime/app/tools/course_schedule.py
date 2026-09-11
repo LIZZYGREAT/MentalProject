@@ -77,6 +77,18 @@ def _cancel_selector_schema() -> dict[str, Any]:
     }
 
 
+def _public_import_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return timestamps in the import's local timezone, never raw UTC."""
+    return {
+        "status": candidate.get("status"),
+        "created_local_datetime": candidate.get("created_local_datetime"),
+        "created_local_date": candidate.get("created_local_date"),
+        "timezone": candidate.get("timezone"),
+        "course_names": list(candidate.get("course_names") or []),
+        "has_provider_effect": bool(candidate.get("has_provider_effect")),
+    }
+
+
 def _public_draft(draft: dict[str, Any]) -> dict[str, Any]:
     structured = dict(draft.get("structured_result") or {})
     metadata = dict(structured.get("_metadata") or {})
@@ -413,16 +425,7 @@ class CourseScheduleTools:
         return {
             "ok": True,
             "imports": [
-                {
-                    "status": candidate.get("status"),
-                    "created_at": candidate.get("created_at"),
-                    "created_local_date": candidate.get("created_local_date"),
-                    "course_names": list(candidate.get("course_names") or []),
-                    "has_provider_effect": bool(
-                        candidate.get("has_provider_effect")
-                    ),
-                }
-                for candidate in candidates
+                _public_import_candidate(candidate) for candidate in candidates
             ],
         }
 
@@ -441,15 +444,7 @@ class CourseScheduleTools:
                 "ok": False,
                 "error": "ambiguous_import",
                 "candidates": [
-                    {
-                        "status": candidate.get("status"),
-                        "created_at": candidate.get("created_at"),
-                        "created_local_date": candidate.get("created_local_date"),
-                        "course_names": list(candidate.get("course_names") or []),
-                        "has_provider_effect": bool(
-                            candidate.get("has_provider_effect")
-                        ),
-                    }
+                    _public_import_candidate(candidate)
                     for candidate in exc.candidates
                 ],
             }
@@ -491,8 +486,11 @@ class CourseScheduleTools:
             "has_provider_effect": bool(candidate.get("has_provider_effect")),
             "target": {
                 "status": candidate.get("status"),
-                "created_at": candidate.get("created_at"),
+                "created_local_datetime": candidate.get(
+                    "created_local_datetime"
+                ),
                 "created_local_date": candidate.get("created_local_date"),
+                "timezone": candidate.get("timezone"),
                 "course_names": list(candidate.get("course_names") or [])[:10],
             },
         }
