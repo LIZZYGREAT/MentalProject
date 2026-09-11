@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Literal, Protocol
+from typing import Literal, Mapping, Protocol
 
 from app.agent.claude_runtime import (
     FALLBACK_INTERRUPTED,
@@ -57,6 +57,11 @@ from app.presentation.contracts import (
     RuntimeResponse,
 )
 from app.presentation.progress_policy import should_force_silent_progress
+from app.presentation.feature_cards import (
+    feature_overview_card,
+    onboarding_welcome_card,
+    visible_feature_keys,
+)
 from app.presentation.onboarding import (
     already_bound_text,
     bind_unavailable_text,
@@ -104,7 +109,7 @@ CALENDAR_STATUS_PATTERN = re.compile(
 )
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
 HELP_PATTERN = re.compile(
-    r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
+    r"^(?:/help|帮助|功能|功能介绍|你会什么|你能做什么|你能干什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
     re.IGNORECASE,
 )
 # These are infrastructure gates only. Natural-language intent is delegated to
@@ -341,6 +346,7 @@ class BotWorker:
         multimodal_association_seconds: float = 15.0,
         multimodal_recent_context_seconds: float = 600.0,
         course_default_semester_start_date: str = "",
+        feature_capabilities: Mapping[str, bool] | None = None,
     ):
         self.queue = queue
         self.identity = identity
@@ -349,6 +355,7 @@ class BotWorker:
         self.skill_loader = skill_loader
         self.runtime = runtime
         self.sender = sender
+        self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
         self.presentations = presentations
         self.progress_presenter = progress_presenter or ProgressPresenter()
@@ -633,7 +640,7 @@ class BotWorker:
                 await asyncio.to_thread(
                     self.events.assign_participant, event.event_id, participant.id
                 )
-                await self._deliver(event, welcome_first_screen_text())
+                await self._deliver_welcome(event)
                 return
             if bind_match is not None:
                 await self._deliver(event, already_bound_text())
@@ -750,7 +757,11 @@ class BotWorker:
                 self.resume_device_flow(participant.id)
                 return
             if event.message_type == "text" and HELP_PATTERN.match(event.text):
-                await self._deliver(event, help_text())
+                if not await self._deliver_card(
+                    event,
+                    feature_overview_card(self.feature_keys),
+                ):
+                    await self._deliver(event, help_text())
                 return
             if event.message_type == "text":
                 attached = await self.multimodal_turns.attach_text(
@@ -2545,6 +2556,32 @@ class BotWorker:
                 error_code="card_send_failed",
             )
             return False
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
+    async def _deliver_welcome(self, event: BotEvent) -> bool:
+        """Progressive first screen after binding.
+
+        The interactive card is primary; when card sending is unavailable the
+        durable text first screen keeps the same guidance without duplicating
+        the welcome through later replays.
+        """
+
+        try:
+            message_id = await self._send_card(
+                event.chat_id,
+                onboarding_welcome_card(self.feature_keys),
+                message_uuid=self._stable_message_uuid(
+                    f"mindflow:card:{event.event_id}"
+                ),
+            )
+        except FeishuSendError:
+            return await self._deliver(event, welcome_first_screen_text())
         await asyncio.to_thread(
             self.events.finish,
             event.event_id,

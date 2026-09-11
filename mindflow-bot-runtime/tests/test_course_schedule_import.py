@@ -1158,7 +1158,10 @@ def test_image_workflow_does_not_write_before_card_confirmation():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert len(sender.cards) == 1
+    # Card 1 is the bind-success welcome screen; card 2 is the schedule
+    # preview produced by the image workflow.
+    assert len(sender.cards) == 2
+    assert sender.cards[1]["header"]["title"]["content"] == "课程表识别结果"
     assert runtime.calls == 1
     assert calendar.calls == []
 

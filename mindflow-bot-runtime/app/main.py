@@ -489,6 +489,9 @@ async def run() -> None:
         multimodal_association_seconds=settings.multimodal_association_seconds,
         multimodal_recent_context_seconds=settings.multimodal_recent_context_seconds,
         course_default_semester_start_date=settings.course_default_semester_start_date,
+        feature_capabilities={
+            "daily_review_enabled": settings.daily_review_enabled,
+        },
     )
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image

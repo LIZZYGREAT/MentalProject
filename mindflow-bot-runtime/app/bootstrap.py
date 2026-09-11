@@ -312,6 +312,9 @@ def build_business_services(
         calendar_mutation_plan_executor=(
             care_tools.execute_calendar_mutation_plan
         ),
+        feature_capabilities={
+            "daily_review_enabled": settings.daily_review_enabled,
+        },
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,

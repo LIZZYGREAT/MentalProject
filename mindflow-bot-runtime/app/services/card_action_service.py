@@ -25,6 +25,11 @@ from app.integrations.feishu.cards import (
     daily_checkin_card,
     today_calendar_card,
 )
+from app.presentation.feature_cards import (
+    OVERVIEW_FEATURE_KEY,
+    build_feature_card,
+    visible_feature_keys,
+)
 from app.repositories import ObservationRepository
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
@@ -182,6 +187,7 @@ class CardActionService:
         course_schedule_imports: Any = None,
         calendar_delete_executor: Any = None,
         calendar_mutation_plan_executor: Any = None,
+        feature_capabilities: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -193,6 +199,7 @@ class CardActionService:
         self.course_schedule_imports = course_schedule_imports
         self.calendar_delete_executor = calendar_delete_executor
         self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
+        self.feature_keys = visible_feature_keys(feature_capabilities)
 
     @staticmethod
     def _fallback_event_id(
@@ -552,6 +559,26 @@ class CardActionService:
                     result_text=result_text,
                 ),
             }
+        if action_name in {"feature_open", "feature_back"}:
+            # Feature cards are navigation only; the callback carries just the
+            # backend-validated feature key and version, and the response
+            # updates the source card in place instead of sending a new one.
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            wanted = (
+                OVERVIEW_FEATURE_KEY
+                if action_name == "feature_back"
+                else str(action.get("feature_key") or "")
+            )
+            card = build_feature_card(wanted, self.feature_keys)
+            if card is None:
+                return {"ok": False, "error": "unsupported_feature"}
+            reply_text = (
+                "这些是我目前能帮你做的事情。"
+                if wanted == OVERVIEW_FEATURE_KEY
+                else "这一项的用法如下，随时可以直接对我说。"
+            )
+            return {"ok": True, "reply_text": reply_text, "card": card}
         if action_name == "request_checkin":
             return {
                 "ok": True,
