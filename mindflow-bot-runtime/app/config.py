@@ -141,7 +141,7 @@ class Settings:
     vision_schedule_max_calendar_writes: int = 400
     multimodal_debounce_seconds: float = 3.0
     multimodal_association_seconds: float = 15.0
-    multimodal_recent_context_seconds: float = 120.0
+    multimodal_recent_context_seconds: float = 600.0
     course_default_semester_start_date: str = ""
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
@@ -439,7 +439,7 @@ class Settings:
                 values, "MULTIMODAL_ASSOCIATION_SECONDS", 15.0
             ),
             multimodal_recent_context_seconds=_float(
-                values, "MULTIMODAL_RECENT_CONTEXT_SECONDS", 120.0
+                values, "MULTIMODAL_RECENT_CONTEXT_SECONDS", 600.0
             ),
             course_default_semester_start_date=values.get(
                 "COURSE_DEFAULT_SEMESTER_START_DATE", ""

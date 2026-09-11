@@ -168,7 +168,7 @@ def test_multimodal_windows_have_safe_defaults_and_valid_order():
     assert settings.vision_api_timeout_seconds == 90
     assert settings.multimodal_debounce_seconds == 3
     assert settings.multimodal_association_seconds == 15
-    assert settings.multimodal_recent_context_seconds == 120
+    assert settings.multimodal_recent_context_seconds == 600
 
     environment = valid_environment()
     environment["MULTIMODAL_DEBOUNCE_SECONDS"] = "5"

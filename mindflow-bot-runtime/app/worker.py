@@ -323,7 +323,7 @@ class BotWorker:
         schedule_image_max_concurrency: int = 1,
         multimodal_debounce_seconds: float = 3.0,
         multimodal_association_seconds: float = 15.0,
-        multimodal_recent_context_seconds: float = 120.0,
+        multimodal_recent_context_seconds: float = 600.0,
         course_default_semester_start_date: str = "",
     ):
         self.queue = queue

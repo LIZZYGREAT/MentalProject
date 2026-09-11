@@ -62,7 +62,7 @@ class MultimodalTurnCoordinator:
         *,
         debounce_seconds: float = 3.0,
         association_seconds: float = 15.0,
-        recent_context_seconds: float = 120.0,
+        recent_context_seconds: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.debounce_seconds = max(0.0, float(debounce_seconds))
