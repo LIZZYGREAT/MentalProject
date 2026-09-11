@@ -1,13 +1,11 @@
 FROM crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
-ARG BUILD_REVISION=development
 ARG INSTALL_DEV_DEPS=0
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/srv/runtime:/srv/project \
     MPLCONFIGDIR=/tmp/matplotlib \
     HOME=/home/mindflow \
-    CLAUDE_WORKDIR=/srv/claude-workspace \
-    BUILD_REVISION=${BUILD_REVISION}
+    CLAUDE_WORKDIR=/srv/claude-workspace
 
 WORKDIR /srv/runtime
 COPY mindflow-bot-runtime/requirements.txt ./requirements.txt
@@ -41,6 +39,13 @@ RUN --mount=type=cache,id=mindflow-pip-cache,target=/home/mindflow/.cache/pip,sh
       --trusted-host pypi.tuna.tsinghua.edu.cn \
       -r "$REQUIREMENTS_FILE"
 RUN python -c "import claude_agent_sdk; print('claude-agent-sdk import ok')"
+
+# BUILD_REVISION changes on every deploy. The ARG/ENV must stay here, below
+# the dependency layers: a stage-scoped ARG only keys the layers after it,
+# so a new revision no longer invalidates the apt/pip cache. A global ARG
+# consumed anywhere in the stage poisons every RUN layer's cache key.
+ARG BUILD_REVISION=development
+ENV BUILD_REVISION=${BUILD_REVISION}
 
 COPY mindflow-bot-runtime/ /srv/runtime/
 COPY algorithm/ /srv/project/algorithm/
