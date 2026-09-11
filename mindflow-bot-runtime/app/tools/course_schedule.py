@@ -15,6 +15,7 @@ from app.repositories_course_schedule import (
     CourseCorrectionAmbiguityError,
     CourseScheduleImportAmbiguityError,
 )
+from app.services.participant_time import to_participant_local_datetime
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -128,11 +129,14 @@ class CourseScheduleTools:
         *,
         image_sessions: Any = None,
         recent_image_importer: Any = None,
+        timezone_name: str | None = None,
     ) -> None:
         self.imports = imports
         self.presentations = presentations
         self.image_sessions = image_sessions
         self.recent_image_importer = recent_image_importer
+        inherited_timezone = getattr(getattr(imports, "timezone", None), "key", None)
+        self.timezone_name = str(timezone_name or inherited_timezone or "Asia/Shanghai")
 
     def _stage_preview(self, run_id, draft: dict[str, Any]) -> None:
         if self.presentations is None:
@@ -317,7 +321,10 @@ class CourseScheduleTools:
             "has_provider_effect": False,
             "target": {
                 "status": image_session.get("status"),
-                "created_at": image_session.get("created_at"),
+                "created_local_datetime": to_participant_local_datetime(
+                    image_session.get("created_at"), self.timezone_name
+                ),
+                "timezone": self.timezone_name,
                 "last_error_code": image_session.get("last_error_code"),
             },
         }
@@ -329,8 +336,7 @@ class CourseScheduleTools:
             ctx.participant_id, chat_id=ctx.chat_id
         )
 
-    @staticmethod
-    def _public_image_session(value: dict[str, Any]) -> dict[str, Any]:
+    def _public_image_session(self, value: dict[str, Any]) -> dict[str, Any]:
         report = dict(value.get("parse_report") or {})
         quarantined = []
         for item in list(report.get("quarantined") or [])[:10]:
@@ -345,8 +351,13 @@ class CourseScheduleTools:
                 quarantined.append({"course_name": None, "reason": str(item)})
         return {
             "status": value.get("status"),
-            "created_at": value.get("created_at"),
-            "updated_at": value.get("updated_at"),
+            "created_local_datetime": to_participant_local_datetime(
+                value.get("created_at"), self.timezone_name
+            ),
+            "updated_local_datetime": to_participant_local_datetime(
+                value.get("updated_at"), self.timezone_name
+            ),
+            "timezone": self.timezone_name,
             "last_error_code": value.get("last_error_code"),
             "error_detail": value.get("error_detail"),
             "parse_report": {
@@ -413,7 +424,10 @@ class CourseScheduleTools:
             "has_provider_effect": False,
             "target": {
                 "status": draft.get("status"),
-                "created_at": draft.get("created_at"),
+                "created_local_datetime": to_participant_local_datetime(
+                    draft.get("created_at"), self.timezone_name
+                ),
+                "timezone": self.timezone_name,
                 "course_names": [
                     str(course.get("course_name") or "")[:80]
                     for course in list(

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date, time
+from datetime import date, datetime, time, timezone
 import uuid
 
 from app.agent.context import AgentContext
@@ -303,6 +303,7 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
         chat_id="chat",
         image_message_id="image-message",
         image_key="image-key",
+        now=datetime(2026, 9, 11, 7, 41, tzinfo=timezone.utc),
     )
     image_sessions.mark_failed(
         owner.id,
@@ -316,6 +317,7 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
             ],
             "missing": ["week_rule"],
         },
+        now=datetime(2026, 9, 11, 7, 46, tzinfo=timezone.utc),
     )
     imported = []
 
@@ -345,8 +347,9 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
     failure, retried = asyncio.run(scenario())
     assert failure.result["image_session"] == {
         "status": "needs_retry",
-        "created_at": failure.result["image_session"]["created_at"],
-        "updated_at": failure.result["image_session"]["updated_at"],
+        "created_local_datetime": "2026-09-11T15:41:00+08:00",
+        "updated_local_datetime": "2026-09-11T15:46:00+08:00",
+        "timezone": "Asia/Shanghai",
         "last_error_code": "schedule_validation_failed",
         "error_detail": "week range is missing",
         "parse_report": {
@@ -363,6 +366,8 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
     assert imported[0][1]["image_message_id"] == "image-message"
     assert imported[0][1]["image_key"] == "image-key"
     assert verifier.calls == []
+    assert "created_at" not in failure.result["image_session"]
+    assert "updated_at" not in failure.result["image_session"]
 
 
 def test_active_draft_includes_bound_image_session_status():
@@ -399,6 +404,9 @@ def test_active_draft_includes_bound_image_session_status():
 
     assert result.result["ok"] is True
     assert result.result["image_session"]["status"] == "needs_information"
+    assert result.result["image_session"]["timezone"] == "Asia/Shanghai"
+    assert "created_at" not in result.result["image_session"]
+    assert "updated_at" not in result.result["image_session"]
     assert result.result["image_session"]["parse_report"]["missing"] == [
         "semester_start_date"
     ]

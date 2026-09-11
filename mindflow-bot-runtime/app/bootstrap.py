@@ -317,6 +317,7 @@ def build_business_services(
         course_schedule_imports,
         presentations,
         image_sessions=course_schedule_image_sessions,
+        timezone_name=settings.timezone_name,
     )
     course_schedule_tools.register(registry)
     return BusinessServices(
