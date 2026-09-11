@@ -110,6 +110,20 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"- {name}（识别格式待确认）")
     if uncertain or warnings:
         lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
+    duplicate_warning = dict(draft.get("duplicate_warning") or {})
+    duplicate_names = [
+        _safe_schedule_text(value)
+        for value in duplicate_warning.get("course_names") or []
+    ]
+    if duplicate_names:
+        lines.extend(
+            [
+                "",
+                f"⚠️ 近期导入中有 {len(duplicate_names)} 门课可能重复：",
+                *[f"- {name}" for name in duplicate_names[:10]],
+                "你仍可继续确认；如日历中已存在，请先核对，避免重复添加。",
+            ]
+        )
     if "semester_start_date" in missing:
         lines.extend([
             "",

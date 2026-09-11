@@ -60,6 +60,7 @@ FINAL_PRESENTATION_STATUSES = frozenset({
 })
 DEFAULT_IMPORT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_RUN_LEASE_SECONDS = 10 * 60
+RECENT_DUPLICATE_LOOKBACK_DAYS = 180
 _EXPLICIT_ACTUAL_TIME_SOURCES = frozenset({"image", "user_actual"})
 
 
@@ -2443,6 +2444,7 @@ class CourseScheduleImportRepository:
 
     def _view(self, session: Any, row: CourseScheduleImport) -> dict[str, Any]:
         items = self._items(session, row.id)
+        duplicate_warning = self._recent_duplicate_warning(session, row, items)
         writes = list(
             session.execute(
                 select(CourseScheduleImportWrite).where(
@@ -2453,7 +2455,7 @@ class CourseScheduleImportRepository:
                 )
             ).scalars()
         )
-        return {
+        result = {
             "id": str(row.id),
             "participant_id": str(row.participant_id),
             "source_message_id": row.source_message_id,
@@ -2532,6 +2534,57 @@ class CourseScheduleImportRepository:
                     )
                 ).scalars()
             ],
+        }
+        if duplicate_warning is not None:
+            result["duplicate_warning"] = duplicate_warning
+        return result
+
+    @staticmethod
+    def _recent_duplicate_warning(
+        session: Any,
+        row: CourseScheduleImport,
+        items: list[CourseScheduleImportItem],
+    ) -> dict[str, Any] | None:
+        if row.status not in ACTIVE_DRAFT_STATUSES or not items:
+            return None
+        normalized_keys = {item.normalized_key for item in items}
+        cutoff = _aware(row.created_at) - timedelta(
+            days=RECENT_DUPLICATE_LOOKBACK_DAYS
+        )
+        matches = list(
+            session.execute(
+                select(
+                    CourseScheduleImportItem.normalized_key,
+                    CourseScheduleImportItem.course_name,
+                )
+                .join(
+                    CourseScheduleImport,
+                    CourseScheduleImport.id == CourseScheduleImportItem.import_id,
+                )
+                .where(
+                    CourseScheduleImport.participant_id == row.participant_id,
+                    CourseScheduleImport.id != row.id,
+                    CourseScheduleImport.status.in_(
+                        {"succeeded", "partial_failed", "cancelling", "cleanup_failed"}
+                    ),
+                    CourseScheduleImport.created_at >= cutoff,
+                    CourseScheduleImportItem.status == "succeeded",
+                    CourseScheduleImportItem.normalized_key.in_(normalized_keys),
+                )
+            ).all()
+        )
+        if not matches:
+            return None
+        names_by_key = {str(key): str(name) for key, name in matches}
+        ordered_names = [
+            item.course_name
+            for item in items
+            if item.normalized_key in names_by_key
+        ]
+        return {
+            "count": len(ordered_names),
+            "course_names": ordered_names[:20],
+            "lookback_days": RECENT_DUPLICATE_LOOKBACK_DAYS,
         }
 
     def _set_run_lease(self, row: CourseScheduleImport, claimed_at: datetime) -> None:

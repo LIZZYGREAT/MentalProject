@@ -379,6 +379,45 @@ def test_context_form_guides_non_monday_to_that_weeks_monday():
     assert "9 月 7 日" in str(captured.value)
 
 
+def test_preview_warns_about_recent_duplicate_courses_without_blocking_confirm():
+    database = memory_database()
+    owner = participant(database, "RECENT-DUPLICATE-WARNING")
+    repo, first = _draft(database, owner.id)
+    service = CourseScheduleImportService(repo, Calendar(), Tokens())
+    runner = _runner(service)
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            first["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    asyncio.run(runner.run_once())
+
+    second = repo.create_draft(
+        owner.id,
+        source_message_id="duplicate-second-image",
+        source_image_hash="8" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert second["duplicate_warning"]["course_names"] == ["高等数学A"]
+    preview = json.dumps(course_schedule_preview_card(second), ensure_ascii=False)
+    assert "可能重复" in preview
+    assert "高等数学A" in preview
+
+    confirmed = asyncio.run(
+        service.confirm(
+            owner.id,
+            second["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    assert confirmed["status"] == "queued"
+
+
 def test_weekly_odd_even_and_explicit_week_normalization():
     database = memory_database()
     person = participant(database, "P001")
