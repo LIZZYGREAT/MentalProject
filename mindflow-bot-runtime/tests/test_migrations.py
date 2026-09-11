@@ -162,6 +162,19 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
     assert migration_0037.down_revision == "0036_stage5_effective_profile"
 
 
+def test_0048_documents_fail_closed_legacy_processing_and_expiry_strategy():
+    migration = _migration(VERSIONS / "0048_calendar_mutation_plan_items.py")
+    source = (VERSIONS / "0048_calendar_mutation_plan_items.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert migration.down_revision == "0047_calendar_mutation_plans"
+    assert "legacy_plan_expired_on_0048_upgrade" in source
+    assert "0048 refuses to upgrade while legacy processing Calendar plans" in source
+    assert "WHERE status = 'processing'" in source
+    assert "status = 'expired'" in source
+
+
 def test_course_schedule_import_migration_extends_stage6_head():
     migration_0038 = _migration(VERSIONS / "0038_course_schedule_import.py")
     assert migration_0038.down_revision == "0037_stage6_care_jitai"
