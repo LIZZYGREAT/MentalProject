@@ -60,8 +60,11 @@ from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.user_capabilities import help_text, onboarding_text
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
-from app.services.presentation_service import PresentationOutbox
-from app.services.presentation_service import PendingImageCard
+from app.services.presentation_service import (
+    PendingCardUpdate,
+    PendingImageCard,
+    PresentationOutbox,
+)
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
     CourseScheduleVisionUnavailable,
@@ -1754,8 +1757,8 @@ class BotWorker:
                 await self._mark_schedule_image_ready(
                     event, participant_id, draft=existing
                 )
-                delivered = await self._deliver_card(
-                    delivery_event, course_schedule_preview_card(existing)
+                delivered = await self._deliver_course_schedule_preview(
+                    delivery_event, participant_id, existing
                 )
                 await self._ensure_task_not_stopped(
                     participant_id, delivery_event.event_id, task_generation
@@ -1790,8 +1793,8 @@ class BotWorker:
                     await self._mark_schedule_image_ready(
                         event, participant_id, draft=existing
                     )
-                    delivered = await self._deliver_card(
-                        delivery_event, course_schedule_preview_card(existing)
+                    delivered = await self._deliver_course_schedule_preview(
+                        delivery_event, participant_id, existing
                     )
                     await self._ensure_task_not_stopped(
                         participant_id, delivery_event.event_id, task_generation
@@ -1915,8 +1918,8 @@ class BotWorker:
                         task_generation,
                     )
                 try:
-                    delivered = await self._deliver_card(
-                        delivery_event, course_schedule_preview_card(draft)
+                    delivered = await self._deliver_course_schedule_preview(
+                        delivery_event, participant_id, draft
                     )
                 except asyncio.CancelledError:
                     if created_new:
@@ -2321,6 +2324,10 @@ class BotWorker:
                 try:
                     if isinstance(card, PendingImageCard):
                         await self._send_image_card(event.chat_id, card)
+                    elif isinstance(card, PendingCardUpdate):
+                        await asyncio.to_thread(
+                            self.sender.update_card, card.message_id, card.card
+                        )
                     else:
                         await self._send_card(event.chat_id, card)
                     delivered_cards.append(card)
@@ -2523,6 +2530,67 @@ class BotWorker:
                 error_code="card_send_failed",
             )
             return False
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
+    async def _deliver_course_schedule_preview(
+        self,
+        event: BotEvent,
+        participant_id,
+        draft: dict,
+    ) -> bool:
+        """Send once per draft, then update the same canonical Preview card."""
+
+        card = course_schedule_preview_card(draft)
+        import_id = str(draft.get("id") or "").strip()
+        message_id = str(draft.get("status_card_message_id") or "").strip()
+        try:
+            if message_id and callable(getattr(self.sender, "update_card", None)):
+                await asyncio.to_thread(self.sender.update_card, message_id, card)
+                route = "update"
+            else:
+                message_id = await self._send_card(
+                    event.chat_id,
+                    card,
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:course-preview:{import_id}"
+                    ),
+                )
+                route = "send"
+            bind = getattr(self.schedule_imports.drafts, "bind_preview_card", None)
+            if callable(bind):
+                bound = await asyncio.to_thread(
+                    bind,
+                    participant_id,
+                    import_id,
+                    message_id=message_id,
+                    chat_id=event.chat_id,
+                )
+                message_id = str(
+                    bound.get("status_card_message_id") or message_id
+                )
+        except FeishuSendError:
+            await asyncio.to_thread(
+                self.events.finish,
+                event.event_id,
+                status="received",
+                error_code="card_send_failed",
+            )
+            return False
+        logger.info(
+            "course_schedule_preview_presented event_id=%s image_message_id=%s "
+            "draft_id=%s card_message_id=%s presentation_route=%s",
+            event.event_id,
+            event.message_id,
+            import_id,
+            message_id,
+            route,
+        )
         await asyncio.to_thread(
             self.events.finish,
             event.event_id,

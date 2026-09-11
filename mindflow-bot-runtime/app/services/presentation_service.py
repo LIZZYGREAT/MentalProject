@@ -27,16 +27,36 @@ class PendingImageCard:
         return replace(deepcopy(self.card_template))
 
 
+@dataclass(frozen=True)
+class PendingCardUpdate:
+    message_id: str
+    card: dict[str, Any]
+
+
 class PresentationOutbox:
     def __init__(self, *, max_cards_per_turn: int = 2):
         self.max_cards_per_turn = max(1, int(max_cards_per_turn))
-        self._cards: dict[uuid.UUID, list[dict[str, Any] | PendingImageCard]] = {}
+        self._cards: dict[
+            uuid.UUID,
+            list[dict[str, Any] | PendingImageCard | PendingCardUpdate],
+        ] = {}
 
     def stage_card(self, run_id: uuid.UUID, card: dict[str, Any]) -> None:
         items = self._cards.setdefault(run_id, [])
         if len(items) >= self.max_cards_per_turn:
             raise ValueError("too many rich replies in one turn")
         items.append(dict(card))
+
+    def stage_card_update(
+        self, run_id: uuid.UUID, message_id: str, card: dict[str, Any]
+    ) -> None:
+        normalized = str(message_id).strip()
+        if not normalized:
+            raise ValueError("card update message id is required")
+        items = self._cards.setdefault(run_id, [])
+        if len(items) >= self.max_cards_per_turn:
+            raise ValueError("too many rich replies in one turn")
+        items.append(PendingCardUpdate(normalized, dict(card)))
 
     def stage_image_card(
         self, run_id: uuid.UUID, png_bytes: bytes, card_template: dict[str, Any]
@@ -50,7 +70,7 @@ class PresentationOutbox:
 
     def take_cards(
         self, run_id: uuid.UUID
-    ) -> list[dict[str, Any] | PendingImageCard]:
+    ) -> list[dict[str, Any] | PendingImageCard | PendingCardUpdate]:
         return self._cards.pop(run_id, [])
 
     def discard(self, run_id: uuid.UUID) -> None:

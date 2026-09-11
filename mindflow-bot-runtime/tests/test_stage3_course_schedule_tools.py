@@ -5,7 +5,7 @@ import uuid
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.contracts.course_schedule import ScheduleVisionResult
-from app.services.presentation_service import PresentationOutbox
+from app.services.presentation_service import PendingCardUpdate, PresentationOutbox
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
@@ -190,6 +190,44 @@ def test_participant_bound_tools_read_update_and_stage_preview_without_calendar_
     assert "学校默认作息" in str(cards[0])
     assert len(verifier.calls) == 1
     assert "participant" not in str(verifier.calls[0]["proposal_summary"]).lower()
+
+
+def test_draft_correction_updates_bound_preview_instead_of_sending_another_card():
+    database = memory_database()
+    owner = participant(database, "STAGE3-CANONICAL-PREVIEW")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id)
+    repo.bind_preview_card(
+        owner.id,
+        draft["id"],
+        message_id="om-existing-preview",
+        chat_id="chat",
+    )
+    presentations = PresentationOutbox()
+    registry = ToolRegistry(
+        mutation_verifier=_Verifier(
+            MutationIntentDecision("allow", "direct_action", "direct_request")
+        )
+    )
+    CourseScheduleTools(_Imports(repo), presentations).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "高数改到周四")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "course_schedule_update_active_draft",
+            {
+                "selector": {"course_name": "高等数学"},
+                "updates": {"new_weekday": 4},
+            },
+        )
+    )
+
+    assert result.result["ok"] is True
+    staged = presentations.take_cards(ctx.agent_run_id)
+    assert len(staged) == 1
+    assert isinstance(staged[0], PendingCardUpdate)
+    assert staged[0].message_id == "om-existing-preview"
 
 
 def test_hypothetical_correction_is_denied_before_draft_mutation():

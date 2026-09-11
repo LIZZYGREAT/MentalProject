@@ -134,6 +134,16 @@ class CourseScheduleTools:
         self.image_sessions = image_sessions
         self.recent_image_importer = recent_image_importer
 
+    def _stage_preview(self, run_id, draft: dict[str, Any]) -> None:
+        if self.presentations is None:
+            return
+        card = course_schedule_preview_card(draft)
+        message_id = str(draft.get("status_card_message_id") or "").strip()
+        if message_id:
+            self.presentations.stage_card_update(run_id, message_id, card)
+        else:
+            self.presentations.stage_card(run_id, card)
+
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "course_schedule_get_active_draft",
@@ -375,10 +385,7 @@ class CourseScheduleTools:
                 "error": "invalid_course_correction",
                 "detail": str(exc)[:200],
             }
-        if self.presentations is not None:
-            self.presentations.stage_card(
-                ctx.agent_run_id, course_schedule_preview_card(corrected)
-            )
+        self._stage_preview(ctx.agent_run_id, corrected)
         return {"ok": True, "draft": _public_draft(corrected), "preview_staged": True}
 
     def cancel_pending_draft(
@@ -534,8 +541,5 @@ class CourseScheduleTools:
                 "error": "invalid_schedule_context",
                 "detail": str(exc)[:200],
             }
-        if self.presentations is not None:
-            self.presentations.stage_card(
-                ctx.agent_run_id, course_schedule_preview_card(draft)
-            )
+        self._stage_preview(ctx.agent_run_id, draft)
         return {"ok": True, "draft": _public_draft(draft), "preview_staged": True}

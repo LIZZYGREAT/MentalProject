@@ -734,6 +734,35 @@ class CourseScheduleImportRepository:
                 self._normalize_identity_conflict_row(session, row, checked_at)
             return self._view(session, row)
 
+    def bind_preview_card(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        message_id: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Bind the one canonical card used across preview, edit, and import."""
+
+        bound_at = _aware(now or datetime.now(timezone.utc))
+        normalized_message_id = str(message_id).strip()[:128]
+        normalized_chat_id = str(chat_id).strip()[:128]
+        if not normalized_message_id or not normalized_chat_id:
+            raise ValueError("course schedule preview card identity is required")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=bound_at)
+            if not row.status_card_message_id:
+                row.status_card_message_id = normalized_message_id
+                row.status_card_chat_id = normalized_chat_id
+                row.last_progress_at = bound_at
+            session.flush()
+            return self._view(session, row)
+
     def set_recurrence_strategy(
         self,
         participant_id: uuid.UUID,
