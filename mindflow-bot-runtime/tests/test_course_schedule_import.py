@@ -59,7 +59,11 @@ from app.services.course_schedule_vision import (
     CourseScheduleVisionService,
     SYSTEM_PROMPT,
 )
-from app.services.card_action_service import CardActionService
+from app.services.card_action_service import (
+    CardActionService,
+    _period_time_mapping,
+    _semester_monday,
+)
 from helpers import memory_database, participant, skill_path
 
 
@@ -353,6 +357,26 @@ def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():
     assert created.created_new is True
     assert existing.created_new is False
     assert existing.draft["id"] == created.draft["id"]
+
+
+def test_context_form_accepts_friendly_dates_and_period_time_formats():
+    assert _semester_monday("2026/9/7", reference_date=date(2026, 9, 11)) == date(
+        2026, 9, 7
+    )
+    assert _semester_monday("9月7日", reference_date=date(2026, 9, 11)) == date(
+        2026, 9, 7
+    )
+    assert _period_time_mapping("1-2节：8:00-9:35\n3：10:00-10:45") == {
+        (1, 2): (time(8, 0), time(9, 35)),
+        3: (time(10, 0), time(10, 45)),
+    }
+
+
+def test_context_form_guides_non_monday_to_that_weeks_monday():
+    with pytest.raises(ValueError) as captured:
+        _semester_monday("2026/9/9", reference_date=date(2026, 9, 11))
+    assert "9 月 9 日是周三" in str(captured.value)
+    assert "9 月 7 日" in str(captured.value)
 
 
 def test_weekly_odd_even_and_explicit_week_normalization():

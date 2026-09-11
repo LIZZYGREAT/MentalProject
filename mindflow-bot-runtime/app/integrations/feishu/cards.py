@@ -331,7 +331,7 @@ def course_schedule_context_card(draft: dict[str, Any]) -> dict[str, Any]:
                 "max_length": 10,
                 "placeholder": {
                     "tag": "plain_text",
-                    "content": "例如 2026-09-07",
+                    "content": "例如 2026-09-07、2026/9/7 或 9月7日",
                 },
                 "label": {"tag": "plain_text", "content": "第一周周一"},
             },
@@ -340,10 +340,10 @@ def course_schedule_context_card(draft: dict[str, Any]) -> dict[str, Any]:
         elements.extend([
             {
                 "tag": "markdown",
-                "content": (
-                    "**节次时间对照**（必填）\n"
-                    "每行一条，例如：`1-2=08:00-09:35`\n"
-                    "可继续填写：`3-4=10:00-11:35`"
+                    "content": (
+                        "**节次时间对照**（必填）\n"
+                        "每行一条，例如：`1-2节：8:00-9:35`\n"
+                        "可继续填写：`3-4=10:00-11:35`"
                 ),
             },
             {
@@ -355,7 +355,7 @@ def course_schedule_context_card(draft: dict[str, Any]) -> dict[str, Any]:
                 "max_length": 1200,
                 "placeholder": {
                     "tag": "plain_text",
-                    "content": "1-2=08:00-09:35\n3-4=10:00-11:35",
+                    "content": "1-2节：8:00-9:35\n3-4=10:00-11:35",
                 },
                 "label": {"tag": "plain_text", "content": "节次时间对照"},
             },

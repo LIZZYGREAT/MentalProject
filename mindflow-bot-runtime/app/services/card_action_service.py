@@ -33,9 +33,16 @@ logger = logging.getLogger(__name__)
 
 _PERIOD_TIME_MAPPING_LINE = re.compile(
     r"^\s*(?P<first>\d{1,2})(?:\s*[-–—~]\s*(?P<last>\d{1,2}))?\s*"
-    r"(?:=|:|：)\s*(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)\s*"
-    r"[-–—~]\s*(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)\s*$"
+    r"(?:节)?\s*(?:=|:|：)\s*(?P<start>(?:[01]?\d|2[0-3]):[0-5]\d)\s*"
+    r"[-–—~]\s*(?P<end>(?:[01]?\d|2[0-3]):[0-5]\d)\s*$"
 )
+_CHINESE_MONTH_DAY = re.compile(
+    r"^\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日?\s*$"
+)
+_SLASH_DATE = re.compile(
+    r"^\s*(?P<year>\d{4})\s*/\s*(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})\s*$"
+)
+_WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
 def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
@@ -88,14 +95,14 @@ def _period_time_mapping(value: Any) -> dict[int | tuple[int, int], tuple[time, 
         match = _PERIOD_TIME_MAPPING_LINE.fullmatch(line)
         if match is None:
             raise ValueError(
-                "节次时间格式应为 1-2=08:00-09:35，每行一条"
+                "节次时间格式应为 1-2节：8:00-9:35，每行一条"
             )
         first = int(match.group("first"))
         last = int(match.group("last") or first)
         if not 1 <= first <= last <= 30:
             raise ValueError("节次范围应在 1 到 30 之间")
-        start = time.fromisoformat(match.group("start"))
-        end = time.fromisoformat(match.group("end"))
+        start = time.fromisoformat(match.group("start").zfill(5))
+        end = time.fromisoformat(match.group("end").zfill(5))
         if end <= start:
             raise ValueError("节次结束时间必须晚于开始时间")
         key: int | tuple[int, int] = first if first == last else (first, last)
@@ -103,6 +110,39 @@ def _period_time_mapping(value: Any) -> dict[int | tuple[int, int], tuple[time, 
             raise ValueError("同一节次范围只能填写一次")
         mapping[key] = (start, end)
     return mapping
+
+
+def _semester_monday(value: Any, *, reference_date: date) -> date:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("请填写第一周周一")
+    try:
+        slash = _SLASH_DATE.fullmatch(raw)
+        chinese = _CHINESE_MONTH_DAY.fullmatch(raw)
+        if slash is not None:
+            parsed = date(
+                int(slash.group("year")),
+                int(slash.group("month")),
+                int(slash.group("day")),
+            )
+        elif chinese is not None:
+            parsed = date(
+                reference_date.year,
+                int(chinese.group("month")),
+                int(chinese.group("day")),
+            )
+        else:
+            parsed = date.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("日期格式应为 2026-09-07、2026/9/7 或 9月7日") from exc
+    if parsed.weekday() != 0:
+        monday = parsed - timedelta(days=parsed.weekday())
+        raise ValueError(
+            f"{parsed.month} 月 {parsed.day} 日是{_WEEKDAY_NAMES[parsed.weekday()]}，"
+            f"这一周的周一是 {monday.month} 月 {monday.day} 日；"
+            "请填写第一周周一"
+        )
+    return parsed
 
 
 class CardActionService:
@@ -200,7 +240,12 @@ class CardActionService:
                 try:
                     semester_value = str(values.get("semester_start_date") or "").strip()
                     semester_start_date = (
-                        date.fromisoformat(semester_value) if semester_value else None
+                        _semester_monday(
+                            semester_value,
+                            reference_date=datetime.now(self.timezone).date(),
+                        )
+                        if semester_value
+                        else None
                     )
                     mapping_value = values.get("period_time_mapping")
                     period_mapping = (
