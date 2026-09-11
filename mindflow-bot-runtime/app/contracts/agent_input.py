@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,12 @@ class AgentTurnInput:
     text: str
     images: tuple[AgentImageAttachment, ...] = ()
     trusted_image_context: Mapping[str, Any] | None = None
+    # Backend-derived context, never a permission. The stage comes from the
+    # first real usage time (FeishuBinding.bound_at), not Participant.created_at.
+    participant_stage: Literal["day1", "week1", "active"] | None = None
+    # Reserved slot for future structured interaction preferences. The worker
+    # passes None until a memory/preferences feature exists.
+    interaction_preferences: Mapping[str, Any] | None = None
 
     def __str__(self) -> str:
         """Preserve text behavior at legacy adapter/test-double boundaries."""

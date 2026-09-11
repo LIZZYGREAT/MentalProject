@@ -316,7 +316,12 @@ class BindingRepository:
             ).scalar_one_or_none()
             if row is None:
                 return None
-            return {"app_id": row.app_id, "open_id": row.open_id, "chat_id": row.chat_id}
+            return {
+                "app_id": row.app_id,
+                "open_id": row.open_id,
+                "chat_id": row.chat_id,
+                "bound_at": row.bound_at,
+            }
 
 
 class ProfileRepository:

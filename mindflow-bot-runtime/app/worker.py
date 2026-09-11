@@ -9,7 +9,7 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Literal, Mapping, Protocol
 
@@ -87,6 +87,7 @@ from app.services.generic_image_vision import (
     GenericImageVisionUnavailable,
     GenericImageVisionValidationFailure,
 )
+from app.services.participant_stage import participant_stage_from_bound_at
 from app.services.multimodal_turn_coordinator import (
     MultimodalInputSnapshot,
     MultimodalTurnCoordinator,
@@ -2151,6 +2152,35 @@ class BotWorker:
                 exc_info=True,
             )
 
+    async def _with_backend_context(
+        self, ctx: AgentContext, turn_input: AgentTurnInput
+    ) -> AgentTurnInput:
+        """Attach backend-derived context (stage, preferences) to one turn.
+
+        The stage comes from the first real usage time, not participant
+        creation. Interaction preferences stay a reserved slot: the worker
+        passes None until such a preference feature exists.
+        """
+
+        if turn_input.participant_stage is not None:
+            return turn_input
+        stage = None
+        try:
+            binding = await asyncio.to_thread(
+                self.identity.bindings.get_for_participant, ctx.participant_id
+            )
+        except Exception:
+            logger.warning(
+                "participant_stage_lookup_failed participant_id=%s",
+                ctx.participant_id,
+                exc_info=True,
+            )
+            binding = None
+        stage = participant_stage_from_bound_at((binding or {}).get("bound_at"))
+        if stage is None:
+            return turn_input
+        return replace(turn_input, participant_stage=stage)
+
     async def _run_agent(
         self,
         event: BotEvent,
@@ -2161,6 +2191,7 @@ class BotWorker:
         run_generation: int,
     ) -> None:
         turn_input = turn_input or AgentTurnInput(text=event.text)
+        turn_input = await self._with_backend_context(ctx, turn_input)
         started = time.monotonic()
         progress = ProgressState(
             force_silent=should_force_silent_progress(turn_input.text)
