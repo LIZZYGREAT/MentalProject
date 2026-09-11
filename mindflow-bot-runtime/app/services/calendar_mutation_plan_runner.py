@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+from datetime import datetime
 from typing import Any
 import uuid
 
@@ -12,6 +14,8 @@ from app.integrations.feishu.calendar import (
     CalendarProviderUnavailable,
 )
 from app.integrations.feishu.cards import card_action_result_card
+from app.integrations.feishu.client import FeishuSendError
+from app.repositories import RuntimeIncidentRepository
 
 
 logger = logging.getLogger(__name__)
@@ -75,15 +79,22 @@ class CalendarMutationPlanRunner:
         self._startup_recovery_done = True
         return recovered + await self.run_once()
 
-    async def run_once(self) -> int:
+    async def run_once(self, *, now: datetime | None = None) -> int:
         plan = await asyncio.to_thread(
             self.plans.claim_next_plan,
             lease_owner=self.owner,
             lease_seconds=self.lease_seconds,
+            now=now,
         )
         if plan is None:
+            pending = await asyncio.to_thread(
+                self.plans.pending_completion_presentations, limit=1
+            )
+            if pending:
+                await self._present(pending[0])
+                return 1
             return 0
-        await self._run_plan(plan)
+        await self._run_plan(plan, now=now)
         return 1
 
     async def run_forever(self) -> None:
@@ -112,7 +123,9 @@ class CalendarMutationPlanRunner:
         except asyncio.CancelledError:
             raise
 
-    async def _run_plan(self, plan: dict[str, Any]) -> None:
+    async def _run_plan(
+        self, plan: dict[str, Any], *, now: datetime | None = None
+    ) -> None:
         plan_id = str(plan["id"])
         while True:
             item = await asyncio.to_thread(
@@ -120,6 +133,7 @@ class CalendarMutationPlanRunner:
                 plan_id,
                 lease_owner=self.owner,
                 lease_seconds=self.lease_seconds,
+                now=now,
             )
             if item is None:
                 break
@@ -157,28 +171,42 @@ class CalendarMutationPlanRunner:
                 raise
             except Exception as exc:
                 unknown = self._outcome_unknown(exc)
-                await asyncio.to_thread(
+                provider_unavailable = isinstance(exc, CalendarProviderUnavailable)
+                recorded = await asyncio.to_thread(
                     self.plans.record_item_failure,
                     plan_id,
                     item["id"],
                     lease_owner=self.owner,
-                    error_code=type(exc).__name__,
+                    error_code=(
+                        "calendar_provider_unavailable"
+                        if provider_unavailable
+                        else type(exc).__name__
+                    ),
                     error_detail=str(exc),
                     outcome_unknown=unknown,
+                    retryable=provider_unavailable,
                 )
                 logger.warning(
                     "calendar_mutation_plan_item_failed plan_id=%s item_index=%s "
-                    "outcome_unknown=%s",
+                    "outcome_unknown=%s provider_unavailable=%s",
                     plan_id,
                     item["item_index"],
                     unknown,
+                    provider_unavailable,
                     exc_info=True,
                 )
-                if unknown:
+                if (
+                    unknown
+                    and recorded is not None
+                    and int(recorded.get("attempt_count") or 0)
+                    >= self.plans._MAX_OUTCOME_UNKNOWN_ATTEMPTS
+                ):
+                    await self._record_recovery_incident(plan, item, exc)
+                if unknown or provider_unavailable:
                     return
 
         final = await asyncio.to_thread(
-            self.plans.finalize, plan_id, lease_owner=self.owner
+            self.plans.finalize, plan_id, lease_owner=self.owner, now=now
         )
         if final is not None and final.get("status") in {
             "succeeded",
@@ -188,15 +216,51 @@ class CalendarMutationPlanRunner:
 
     @staticmethod
     def _outcome_unknown(exc: Exception) -> bool:
-        return (
-            isinstance(exc, (CalendarMutationOutcomeUnknown, CalendarProviderUnavailable))
-            or type(exc).__name__.endswith("OutcomeUnknown")
+        return isinstance(exc, CalendarMutationOutcomeUnknown) or type(exc).__name__.endswith(
+            "OutcomeUnknown"
         )
+
+    async def _record_recovery_incident(
+        self, plan: dict[str, Any], item: dict[str, Any], exc: Exception
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                RuntimeIncidentRepository(self.plans.database).record,
+                severity="error",
+                subsystem="calendar_mutation_plan",
+                event_name="outcome_unknown_retry_exhausted",
+                summary="Calendar mutation plan outcome remains unknown after retry backoff",
+                participant_id=uuid.UUID(str(plan["participant_id"])),
+                error_code=type(exc).__name__,
+                error_class=type(exc).__name__,
+                details={
+                    "plan_id": str(plan["id"]),
+                    "item_id": str(item["id"]),
+                    "item_index": item["item_index"],
+                    "source_identity": item["source_identity"],
+                    "attempt_count": item.get("attempt_count"),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "calendar_mutation_plan_recovery_incident_failed plan_id=%s",
+                plan.get("id"),
+            )
 
     async def _present(self, plan: dict[str, Any]) -> None:
         sender = self.sender
         message_id = str(plan.get("status_card_message_id") or "").strip()
-        if sender is None or not message_id:
+        mark_failed = getattr(self.plans, "mark_completion_presentation_failed", None)
+        mark_presented = getattr(self.plans, "mark_completion_presented", None)
+
+        async def failed(error_code: str) -> None:
+            if callable(mark_failed):
+                await asyncio.to_thread(
+                    mark_failed, plan["id"], error_code=error_code
+                )
+
+        if sender is None:
+            await failed("sender_unavailable")
             return
         result = dict(plan.get("result") or {})
         succeeded_count = int(result.get("succeeded_count") or 0)
@@ -207,19 +271,64 @@ class CalendarMutationPlanRunner:
             if failed_count == 0
             else f"已{verb} {succeeded_count} 个，另有 {failed_count} 个未完成。"
         )
+        card = card_action_result_card(message=message)
+        presented = False
         try:
-            await asyncio.to_thread(
-                sender.update_card,
-                message_id,
-                card_action_result_card(message=message),
-            )
-        except Exception:
-            # Updating the same callback card is idempotent and can safely be
-            # retried by a future presentation recovery enhancement.
+            if message_id:
+                await asyncio.to_thread(sender.update_card, message_id, card)
+                presented = True
+            elif plan.get("status_card_chat_id"):
+                await asyncio.to_thread(
+                    sender.send_card,
+                    plan["status_card_chat_id"],
+                    card,
+                    message_uuid=self._presentation_message_uuid(plan["id"]),
+                )
+                presented = True
+        except FeishuSendError as exc:
+            if (
+                message_id
+                and exc.operation == "update_card"
+                and exc.replacement_allowed
+                and not exc.retryable
+                and plan.get("status_card_chat_id")
+            ):
+                try:
+                    await asyncio.to_thread(
+                        sender.send_card,
+                        plan["status_card_chat_id"],
+                        card,
+                        message_uuid=self._presentation_message_uuid(plan["id"]),
+                    )
+                    presented = True
+                except Exception as fallback_exc:
+                    logger.exception(
+                        "calendar_mutation_plan_result_fallback_failed plan_id=%s",
+                        plan.get("id"),
+                    )
+                    await failed(type(fallback_exc).__name__)
+            else:
+                await failed(type(exc).__name__)
+        except Exception as exc:
             logger.exception(
                 "calendar_mutation_plan_result_presentation_failed plan_id=%s",
                 plan.get("id"),
             )
+            await failed(type(exc).__name__)
+        if presented and callable(mark_presented):
+            await asyncio.to_thread(mark_presented, plan["id"])
+        elif not presented and not callable(mark_failed):
+            logger.error(
+                "calendar_mutation_plan_result_presentation_unavailable plan_id=%s",
+                plan.get("id"),
+            )
+
+    @staticmethod
+    def _presentation_message_uuid(plan_id: str) -> str:
+        digest = hashlib.sha256(
+            f"mindflow:calendar-plan-result:{plan_id}".encode("utf-8")
+        ).hexdigest()
+        return f"mindflow-{digest[:40]}"
 
     async def close(self) -> None:
         self._closed = True

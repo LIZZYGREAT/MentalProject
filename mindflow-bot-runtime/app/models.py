@@ -951,6 +951,15 @@ class CalendarMutationPlan(Base):
     status_card_chat_id: Mapped[str | None] = mapped_column(
         String(256), nullable=True
     )
+    completion_presented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completion_presentation_error: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    completion_presentation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
 
 
 class CalendarMutationPlanItem(Base):
@@ -995,6 +1004,9 @@ class CalendarMutationPlanItem(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

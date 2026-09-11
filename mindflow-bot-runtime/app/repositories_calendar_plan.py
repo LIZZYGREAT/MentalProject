@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, exists, or_, select
 
 from app.db import Database
 from app.models import CalendarMutationPlan, CalendarMutationPlanItem
@@ -19,6 +19,14 @@ def _aware(value: datetime) -> datetime:
 
 
 class CalendarMutationPlanRepository:
+    _RETRY_BACKOFF_SECONDS = (5, 15, 60, 300, 900)
+    _MAX_OUTCOME_UNKNOWN_ATTEMPTS = len(_RETRY_BACKOFF_SECONDS)
+
+    @classmethod
+    def _next_retry_at(cls, now: datetime, attempt_count: int) -> datetime:
+        index = max(0, min(int(attempt_count) - 1, len(cls._RETRY_BACKOFF_SECONDS) - 1))
+        return now + timedelta(seconds=cls._RETRY_BACKOFF_SECONDS[index])
+
     def __init__(self, database: Database):
         self.database = database
 
@@ -44,6 +52,9 @@ class CalendarMutationPlanRepository:
                 _aware(row.completed_at).isoformat() if row.completed_at else None
             ),
             "source_identity": row.source_identity,
+            "next_retry_at": (
+                _aware(row.next_retry_at).isoformat() if row.next_retry_at else None
+            ),
         }
 
     @classmethod
@@ -85,6 +96,15 @@ class CalendarMutationPlanRepository:
             ),
             "status_card_message_id": row.status_card_message_id,
             "status_card_chat_id": row.status_card_chat_id,
+            "completion_presented_at": (
+                _aware(row.completion_presented_at).isoformat()
+                if row.completion_presented_at
+                else None
+            ),
+            "completion_presentation_error": row.completion_presentation_error,
+            "completion_presentation_attempts": int(
+                row.completion_presentation_attempts or 0
+            ),
         }
         if items is not None:
             value["ledger_items"] = [cls._item_view(item) for item in items]
@@ -256,6 +276,9 @@ class CalendarMutationPlanRepository:
                     if item.status in {"creating", "deleting"}:
                         item.status = "outcome_unknown"
                         item.error_code = "runner_interrupted"
+                        item.next_retry_at = self._next_retry_at(
+                            recovered_at, max(1, int(item.attempt_count or 0))
+                        )
                         item.updated_at = recovered_at
                 row.status = "recovery_required"
                 row.lease_owner = None
@@ -277,7 +300,18 @@ class CalendarMutationPlanRepository:
                 select(CalendarMutationPlan)
                 .where(
                     or_(
-                        CalendarMutationPlan.status.in_(["queued", "recovery_required"]),
+                        CalendarMutationPlan.status == "queued",
+                        and_(
+                            CalendarMutationPlan.status == "recovery_required",
+                            ~exists(
+                                select(CalendarMutationPlanItem.id).where(
+                                    CalendarMutationPlanItem.plan_id
+                                    == CalendarMutationPlan.id,
+                                    CalendarMutationPlanItem.next_retry_at.is_not(None),
+                                    CalendarMutationPlanItem.next_retry_at > claimed_at,
+                                )
+                            ),
+                        ),
                         (
                             (CalendarMutationPlan.status == "running")
                             & or_(
@@ -300,6 +334,9 @@ class CalendarMutationPlanRepository:
                     if item.status in {"creating", "deleting"}:
                         item.status = "outcome_unknown"
                         item.error_code = "runner_lease_expired"
+                        item.next_retry_at = self._next_retry_at(
+                            claimed_at, max(1, int(item.attempt_count or 0))
+                        )
                         item.updated_at = claimed_at
             row.status = "running"
             row.lease_owner = str(lease_owner)[:64]
@@ -338,7 +375,20 @@ class CalendarMutationPlanRepository:
                 select(CalendarMutationPlanItem)
                 .where(
                     CalendarMutationPlanItem.plan_id == plan.id,
-                    CalendarMutationPlanItem.status.in_(["pending", "outcome_unknown"]),
+                    or_(
+                        CalendarMutationPlanItem.status.in_([
+                            "pending", "outcome_unknown"
+                        ]),
+                        and_(
+                            CalendarMutationPlanItem.status == "failed",
+                            CalendarMutationPlanItem.error_code
+                            == "calendar_provider_unavailable",
+                        ),
+                    ),
+                    or_(
+                        CalendarMutationPlanItem.next_retry_at.is_(None),
+                        CalendarMutationPlanItem.next_retry_at <= claimed_at,
+                    ),
                 )
                 .order_by(CalendarMutationPlanItem.item_index)
                 .with_for_update(skip_locked=True)
@@ -349,6 +399,7 @@ class CalendarMutationPlanRepository:
             item.status = "creating" if item.operation == "create" else "deleting"
             item.attempt_count = int(item.attempt_count or 0) + 1
             item.last_attempt_at = claimed_at
+            item.next_retry_at = None
             item.updated_at = claimed_at
             plan.lease_expires_at = claimed_at + timedelta(
                 seconds=max(5, int(lease_seconds))
@@ -394,6 +445,7 @@ class CalendarMutationPlanRepository:
             item.provider_event_id = normalized_provider_id or item.provider_event_id
             item.error_code = None
             item.error_detail = None
+            item.next_retry_at = None
             item.completed_at = completed_at
             item.updated_at = completed_at
             plan.last_progress_at = completed_at
@@ -410,6 +462,7 @@ class CalendarMutationPlanRepository:
         error_code: str,
         error_detail: str | None = None,
         outcome_unknown: bool = False,
+        retryable: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         failed_at = _aware(now or datetime.now(timezone.utc))
@@ -432,11 +485,17 @@ class CalendarMutationPlanRepository:
             item.status = "outcome_unknown" if outcome_unknown else "failed"
             item.error_code = str(error_code)[:128]
             item.error_detail = str(error_detail or "")[:1000] or None
-            item.completed_at = None if outcome_unknown else failed_at
+            should_retry = outcome_unknown or retryable
+            item.next_retry_at = (
+                self._next_retry_at(failed_at, max(1, int(item.attempt_count or 0)))
+                if should_retry
+                else None
+            )
+            item.completed_at = None if should_retry else failed_at
             item.updated_at = failed_at
             plan.last_progress_at = failed_at
             plan.updated_at = failed_at
-            if outcome_unknown:
+            if should_retry:
                 plan.status = "recovery_required"
                 plan.lease_owner = None
                 plan.lease_expires_at = None
@@ -491,6 +550,67 @@ class CalendarMutationPlanRepository:
             row = session.get(CalendarMutationPlan, uuid.UUID(str(plan_id)))
             if row is None:
                 return None
+            return self._view(row, self._items(session, row.id))
+
+    def pending_completion_presentations(
+        self, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        with self.database.session() as session:
+            rows = list(
+                session.scalars(
+                    select(CalendarMutationPlan)
+                    .where(
+                        CalendarMutationPlan.status.in_(["succeeded", "partial_failed"]),
+                        CalendarMutationPlan.completion_presented_at.is_(None),
+                    )
+                    .order_by(CalendarMutationPlan.updated_at)
+                    .limit(max(1, min(int(limit), 100)))
+                )
+            )
+            return [self._view(row, self._items(session, row.id)) for row in rows]
+
+    def mark_completion_presented(
+        self,
+        plan_id: uuid.UUID | str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        presented_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CalendarMutationPlan, uuid.UUID(str(plan_id)), with_for_update=True
+            )
+            if row is None or row.status not in {"succeeded", "partial_failed"}:
+                return None
+            row.completion_presented_at = presented_at
+            row.completion_presentation_error = None
+            row.completion_presentation_attempts = int(
+                row.completion_presentation_attempts or 0
+            ) + 1
+            row.updated_at = presented_at
+            session.flush()
+            return self._view(row, self._items(session, row.id))
+
+    def mark_completion_presentation_failed(
+        self,
+        plan_id: uuid.UUID | str,
+        *,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        failed_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CalendarMutationPlan, uuid.UUID(str(plan_id)), with_for_update=True
+            )
+            if row is None or row.status not in {"succeeded", "partial_failed"}:
+                return None
+            row.completion_presentation_error = str(error_code)[:256]
+            row.completion_presentation_attempts = int(
+                row.completion_presentation_attempts or 0
+            ) + 1
+            row.updated_at = failed_at
+            session.flush()
             return self._view(row, self._items(session, row.id))
 
     def complete(

@@ -8,7 +8,11 @@ from sqlalchemy import func, select
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
-from app.integrations.feishu.calendar import CalendarMutationOutcomeUnknown
+from app.integrations.feishu.calendar import (
+    CalendarMutationOutcomeUnknown,
+    CalendarProviderUnavailable,
+)
+from app.integrations.feishu.client import FeishuSendError
 from app.models import CalendarMutationPlan
 from app.repositories import ObservationRepository
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
@@ -297,7 +301,7 @@ def test_create_crash_recovery_skips_succeeded_item_and_resumes_next():
     repository.recover_stale(now=now + timedelta(seconds=6))
 
     runner = CalendarMutationPlanRunner(repository, execute)
-    asyncio.run(runner.run_once())
+    asyncio.run(runner.run_once(now=now + timedelta(seconds=12)))
 
     final = repository.get(plan["id"])
     assert final["status"] == "succeeded"
@@ -346,7 +350,11 @@ def test_delete_crash_recovery_does_not_repeat_completed_delete():
     )
     repository.recover_stale(now=now + timedelta(seconds=6))
 
-    asyncio.run(CalendarMutationPlanRunner(repository, execute).run_once())
+    asyncio.run(
+            CalendarMutationPlanRunner(repository, execute).run_once(
+                now=now + timedelta(seconds=12)
+        )
+    )
 
     assert repository.get(plan["id"])["status"] == "succeeded"
     assert existing == set()
@@ -382,8 +390,12 @@ def test_outcome_unknown_is_reconciled_with_stable_source_identity():
     intermediate = repository.get(plan["id"])
     assert intermediate["status"] == "recovery_required"
     assert intermediate["ledger_items"][0]["status"] == "outcome_unknown"
+    assert intermediate["ledger_items"][0]["next_retry_at"] is not None
 
-    asyncio.run(runner.run_once())
+    assert asyncio.run(runner.run_once()) == 0
+    asyncio.run(
+        runner.run_once(now=datetime.now(timezone.utc) + timedelta(seconds=6))
+    )
     final = repository.get(plan["id"])
     assert final["status"] == "succeeded"
     assert len(events) == 2
@@ -515,3 +527,108 @@ def test_batch_delete_capability_question_creates_no_plan_or_provider_effect():
     assert plan_count == 0
     assert outbox.take_cards(ctx.agent_run_id) == []
     assert calendar.deleted == []
+
+
+def test_terminal_plan_presentation_failure_is_retried_after_runner_restart():
+    database = memory_database()
+    owner = participant(database, "PLAN-PRESENTATION-RECOVERY")
+    repository = CalendarMutationPlanRepository(database)
+    now = datetime.now(timezone.utc)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": "first"}, {"summary": "second"}],
+        now=now,
+    )
+    repository.request_execution(
+        owner.id,
+        plan["id"],
+        status_card_message_id="om-confirmation",
+        status_card_chat_id="oc-chat",
+        now=now,
+    )
+
+    class RetryableSender:
+        def __init__(self, *, fail=False):
+            self.fail = fail
+            self.updates = []
+            self.sends = []
+
+        def update_card(self, message_id, card):
+            self.updates.append((message_id, card))
+            if self.fail:
+                raise FeishuSendError(
+                    "temporary update failure",
+                    retryable=True,
+                    operation="update_card",
+                )
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.sends.append((chat_id, card, message_uuid))
+            return "om-result"
+
+    failing_sender = RetryableSender(fail=True)
+
+    async def execute(_plan, item):
+        return {"ok": True, "created": {"id": f"event-{item['item_index']}"}}
+
+    first_runner = CalendarMutationPlanRunner(
+        repository, execute, sender=failing_sender
+    )
+    asyncio.run(first_runner.run_once())
+    failed_presentation = repository.get(plan["id"])
+    assert failed_presentation["status"] == "succeeded"
+    assert failed_presentation["completion_presented_at"] is None
+    assert failed_presentation["completion_presentation_attempts"] == 1
+    assert failed_presentation["completion_presentation_error"] == "FeishuSendError"
+
+    recovered_sender = RetryableSender()
+    second_runner = CalendarMutationPlanRunner(
+        repository, execute, sender=recovered_sender
+    )
+    asyncio.run(second_runner.run_once())
+    recovered = repository.get(plan["id"])
+    assert recovered["completion_presented_at"] is not None
+    assert recovered["completion_presentation_attempts"] == 2
+    assert recovered["completion_presentation_error"] is None
+    assert recovered_sender.updates[0][0] == "om-confirmation"
+
+
+def test_provider_unavailable_is_distinct_from_unknown_and_uses_backoff():
+    database = memory_database()
+    owner = participant(database, "PLAN-PROVIDER-UNAVAILABLE")
+    repository = CalendarMutationPlanRepository(database)
+    base = datetime.now(timezone.utc)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": "first"}, {"summary": "second"}],
+        now=base,
+    )
+    repository.request_execution(owner.id, plan["id"], now=base)
+    attempts = []
+
+    async def execute(_plan, item):
+        attempts.append(item["item_index"])
+        if len(attempts) == 1:
+            raise CalendarProviderUnavailable(
+                "calendar read unavailable", request_kind="calendar_preflight"
+            )
+        return {"ok": True, "created": {"id": f"event-{item['item_index']}"}}
+
+    runner = CalendarMutationPlanRunner(repository, execute)
+    asyncio.run(runner.run_once())
+    interim = repository.get(plan["id"])
+    assert CalendarMutationPlanRunner._outcome_unknown(
+        CalendarProviderUnavailable("unavailable", request_kind="read")
+    ) is False
+    assert interim["status"] == "recovery_required"
+    assert interim["ledger_items"][0]["status"] == "failed"
+    assert interim["ledger_items"][0]["error_code"] == "calendar_provider_unavailable"
+    assert asyncio.run(runner.run_once()) == 0
+
+    asyncio.run(
+        runner.run_once(now=base + timedelta(seconds=6))
+    )
+    assert repository.get(plan["id"])["status"] == "succeeded"
+    assert attempts == [0, 0, 1]
