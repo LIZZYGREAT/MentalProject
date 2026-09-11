@@ -230,6 +230,39 @@ def test_draft_correction_updates_bound_preview_instead_of_sending_another_card(
     assert staged[0].message_id == "om-existing-preview"
 
 
+def test_preview_card_rebind_uses_expected_old_message_compare_and_set():
+    database = memory_database()
+    owner = participant(database, "STAGE3-PREVIEW-REBIND")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id)
+    repo.bind_preview_card(
+        owner.id,
+        draft["id"],
+        message_id="om-old-preview",
+        chat_id="chat",
+    )
+
+    rebound = repo.rebind_preview_card(
+        owner.id,
+        draft["id"],
+        expected_old_message_id="om-old-preview",
+        message_id="om-replacement",
+        chat_id="chat",
+    )
+    stale_race = repo.rebind_preview_card(
+        owner.id,
+        draft["id"],
+        expected_old_message_id="om-old-preview",
+        message_id="om-late-replacement",
+        chat_id="chat",
+    )
+
+    assert rebound["preview_card_rebound"] is True
+    assert rebound["status_card_message_id"] == "om-replacement"
+    assert stale_race["preview_card_rebound"] is False
+    assert stale_race["status_card_message_id"] == "om-replacement"
+
+
 def test_hypothetical_correction_is_denied_before_draft_mutation():
     database = memory_database()
     owner = participant(database, "STAGE3-HYPOTHETICAL")

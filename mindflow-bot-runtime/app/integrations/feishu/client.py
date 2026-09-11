@@ -11,11 +11,13 @@ class FeishuSendError(RuntimeError):
     def __init__(
         self, message: str, *, code: int | None = None,
         retryable: bool = True, operation: str = "send_message",
+        replacement_allowed: bool = False,
     ):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.operation = operation
+        self.replacement_allowed = bool(replacement_allowed)
         self.error_class = type(self).__name__
 
 
@@ -87,6 +89,10 @@ class FeishuClient:
                 code=code,
                 retryable=retryable,
                 operation="update_card",
+                # These provider responses mean the original message target
+                # is gone or can no longer be patched. Authentication and
+                # generic validation failures must not create another card.
+                replacement_allowed=code in {230003, 230006},
             )
 
     def upload_image(self, png_bytes: bytes) -> str:

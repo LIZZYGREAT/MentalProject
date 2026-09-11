@@ -576,6 +576,130 @@ def test_same_draft_preview_is_sent_once_then_updates_canonical_card():
     assert worker.sender.sent_cards[0][2]
 
 
+def test_permanently_stale_preview_is_replaced_once_and_rebound():
+    class StaleSender(Sender):
+        def __init__(self):
+            super().__init__()
+            self.sent_cards = []
+            self.updated_cards = []
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.sent_cards.append((chat_id, card, message_uuid))
+            return "om-replacement-preview"
+
+        def update_card(self, message_id, card):
+            self.updated_cards.append((message_id, card))
+            if message_id == "om-stale-preview":
+                raise FeishuSendError(
+                    "message no longer updateable",
+                    code=230006,
+                    retryable=False,
+                    operation="update_card",
+                    replacement_allowed=True,
+                )
+
+    gateway, queue, worker, _runtime, _sender, _vision, _resources = _system(
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    worker.sender = StaleSender()
+    person = worker.identity.resolve("app", "open")
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="stale-preview-image",
+        source_image_hash="7" * 64,
+        vision_model="strict-vision",
+        result=_strict_schedule_result(),
+        timezone_name="Asia/Shanghai",
+    )
+    draft = repository.bind_preview_card(
+        person.id,
+        draft["id"],
+        message_id="om-stale-preview",
+        chat_id="chat",
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("first", "stale-first", "image"))
+        first = await queue.get()
+        await asyncio.to_thread(worker.events.set_processing, first.event_id, person.id)
+        assert await worker._deliver_course_schedule_preview(first, person.id, draft)
+        rebound = repository.get(draft["id"])
+
+        assert gateway.accept_payload(_payload("second", "stale-second", "image"))
+        second = await queue.get()
+        await asyncio.to_thread(worker.events.set_processing, second.event_id, person.id)
+        assert await worker._deliver_course_schedule_preview(second, person.id, rebound)
+        return rebound
+
+    rebound = asyncio.run(scenario())
+
+    assert rebound["status_card_message_id"] == "om-replacement-preview"
+    assert len(worker.sender.sent_cards) == 1
+    assert worker.sender.sent_cards[0][2]
+    assert [item[0] for item in worker.sender.updated_cards] == [
+        "om-stale-preview",
+        "om-replacement-preview",
+    ]
+
+
+def test_retryable_preview_update_failure_does_not_send_duplicate_card():
+    class RetryableSender(Sender):
+        def __init__(self):
+            super().__init__()
+            self.sent_cards = []
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.sent_cards.append((chat_id, card, message_uuid))
+            return "om-duplicate"
+
+        def update_card(self, message_id, card):
+            raise FeishuSendError(
+                "timeout",
+                retryable=True,
+                operation="update_card",
+            )
+
+    gateway, queue, worker, _runtime, _sender, _vision, _resources = _system(
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    worker.sender = RetryableSender()
+    person = worker.identity.resolve("app", "open")
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="retryable-preview-image",
+        source_image_hash="8" * 64,
+        vision_model="strict-vision",
+        result=_strict_schedule_result(),
+        timezone_name="Asia/Shanghai",
+    )
+    draft = repository.bind_preview_card(
+        person.id,
+        draft["id"],
+        message_id="om-existing-preview",
+        chat_id="chat",
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("retry", "retryable-preview", "image"))
+        event = await queue.get()
+        await asyncio.to_thread(worker.events.set_processing, event.event_id, person.id)
+        return await worker._deliver_course_schedule_preview(event, person.id, draft)
+
+    assert asyncio.run(scenario()) is False
+    assert worker.sender.sent_cards == []
+    assert repository.get(draft["id"])["status_card_message_id"] == "om-existing-preview"
+
+
 def test_image_plus_nearby_text_is_one_turn_and_one_final_reply():
     gateway, queue, worker, runtime, sender, vision, _ = _system()
 

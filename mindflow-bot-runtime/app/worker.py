@@ -2551,8 +2551,43 @@ class BotWorker:
         message_id = str(draft.get("status_card_message_id") or "").strip()
         try:
             if message_id and callable(getattr(self.sender, "update_card", None)):
-                await asyncio.to_thread(self.sender.update_card, message_id, card)
-                route = "update"
+                try:
+                    await asyncio.to_thread(self.sender.update_card, message_id, card)
+                    route = "update"
+                except FeishuSendError as exc:
+                    if not (
+                        exc.operation == "update_card"
+                        and exc.replacement_allowed
+                        and not exc.retryable
+                    ):
+                        raise
+                    old_message_id = message_id
+                    message_id = await self._send_card(
+                        event.chat_id,
+                        card,
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:course-preview:{import_id}:replace:{old_message_id}"
+                        ),
+                    )
+                    rebind = getattr(
+                        self.schedule_imports.drafts, "rebind_preview_card", None
+                    )
+                    if not callable(rebind):
+                        raise RuntimeError(
+                            "course schedule preview rebind is unavailable"
+                        )
+                    bound = await asyncio.to_thread(
+                        rebind,
+                        participant_id,
+                        import_id,
+                        expected_old_message_id=old_message_id,
+                        message_id=message_id,
+                        chat_id=event.chat_id,
+                    )
+                    message_id = str(
+                        bound.get("status_card_message_id") or message_id
+                    )
+                    route = "replacement"
             else:
                 message_id = await self._send_card(
                     event.chat_id,

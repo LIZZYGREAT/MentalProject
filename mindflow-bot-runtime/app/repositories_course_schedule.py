@@ -763,6 +763,40 @@ class CourseScheduleImportRepository:
             session.flush()
             return self._view(session, row)
 
+    def rebind_preview_card(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        expected_old_message_id: str,
+        message_id: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """CAS-replace a canonical Preview whose old message is permanently stale."""
+
+        rebound_at = _aware(now or datetime.now(timezone.utc))
+        expected = str(expected_old_message_id).strip()[:128]
+        replacement = str(message_id).strip()[:128]
+        normalized_chat_id = str(chat_id).strip()[:128]
+        if not expected or not replacement or not normalized_chat_id:
+            raise ValueError("course schedule preview rebind identity is required")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=rebound_at)
+            rebound = row.status_card_message_id == expected
+            if rebound:
+                row.status_card_message_id = replacement
+                row.status_card_chat_id = normalized_chat_id
+                row.last_progress_at = rebound_at
+            session.flush()
+            value = self._view(session, row)
+            value["preview_card_rebound"] = rebound
+            return value
+
     def set_recurrence_strategy(
         self,
         participant_id: uuid.UUID,

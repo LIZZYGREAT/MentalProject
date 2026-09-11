@@ -621,6 +621,28 @@ def test_feishu_client_update_card_surfaces_error():
         client.update_card("om-card", {"schema": "2.0"})
     assert caught.value.operation == "update_card"
     assert caught.value.retryable is False
+    assert caught.value.replacement_allowed is False
+
+
+def test_feishu_client_marks_permanently_stale_card_as_replaceable():
+    class Messages:
+        def patch(self, _request):
+            return SimpleNamespace(
+                success=lambda: False, code=230006, msg="message recalled"
+            )
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    with pytest.raises(FeishuSendError) as caught:
+        client.update_card("om-stale-card", {"schema": "2.0"})
+    assert caught.value.operation == "update_card"
+    assert caught.value.retryable is False
+    assert caught.value.replacement_allowed is True
 
 
 def test_feishu_client_message_uuid_accepts_50_and_rejects_51_characters():
