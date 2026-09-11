@@ -406,17 +406,41 @@ def test_cancel_created_date_selector_uses_import_timezone():
     draft = _draft(
         repository, owner.id, now=created_at, ttl_minutes=3 * 24 * 60
     )
+    query_now = created_at + timedelta(minutes=1)
 
-    candidates = repository.recent_cancel_candidates(owner.id)
+    candidates = repository.recent_cancel_candidates(owner.id, now=query_now)
     assert candidates[0]["created_local_date"] == "2026-09-09"
     assert candidates[0]["created_local_datetime"] == "2026-09-09T00:30:00+08:00"
     assert candidates[0]["timezone"] == "Asia/Shanghai"
     assert candidates[0]["created_at"] == "2026-09-08T16:30:00+00:00"
     assert repository.resolve_cancel_selector(
-        owner.id, {"created_date": "2026-09-09"}
+        owner.id, {"created_date": "2026-09-09"}, now=query_now
     )["id"] == draft["id"]
     with pytest.raises(LookupError):
-        repository.resolve_cancel_selector(owner.id, {"created_date": "2026-09-08"})
+        repository.resolve_cancel_selector(
+            owner.id, {"created_date": "2026-09-08"}, now=query_now
+        )
+
+
+def test_recent_cancel_candidates_explicit_now_controls_expiry():
+    database = memory_database()
+    owner = participant(database, "STAGE5-EXPLICIT-NOW")
+    repository = CourseScheduleImportRepository(database)
+    created_at = datetime(2026, 9, 8, 16, 30, tzinfo=timezone.utc)
+    draft = _draft(
+        repository, owner.id, now=created_at, ttl_minutes=3 * 24 * 60
+    )
+
+    before_ttl = repository.recent_cancel_candidates(
+        owner.id, now=created_at + timedelta(minutes=1)
+    )
+    assert [candidate["id"] for candidate in before_ttl] == [draft["id"]]
+
+    after_ttl = repository.recent_cancel_candidates(
+        owner.id, now=created_at + (3 * 24 * 60 + 1) * timedelta(minutes=1)
+    )
+    assert after_ttl == []
+    assert repository.get(draft["id"])["status"] == "expired"
 
 
 def test_expired_draft_is_archived_and_omitted_from_current_cancel_candidates():

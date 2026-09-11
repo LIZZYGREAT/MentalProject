@@ -1866,16 +1866,21 @@ class CourseScheduleImportRepository:
     resume_cleanup = resume_cleanup_for_participant
 
     def recent_cancel_candidates(
-        self, participant_id: uuid.UUID, *, limit: int = 10
+        self,
+        participant_id: uuid.UUID,
+        *,
+        limit: int = 10,
+        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         statuses = {
             "pending_context", "pending_confirmation", "queued", "running",
             "cancelling", "succeeded", "partial_failed", "cleanup_failed",
             "cancelled",
         }
+        query_now = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
             self._expire_participant_drafts(
-                session, participant_id, now=datetime.now(timezone.utc)
+                session, participant_id, now=query_now
             )
             rows = list(
                 session.execute(
@@ -1963,10 +1968,16 @@ class CourseScheduleImportRepository:
         return len(rows)
 
     def resolve_cancel_selector(
-        self, participant_id: uuid.UUID, selector: dict[str, Any]
+        self,
+        participant_id: uuid.UUID,
+        selector: dict[str, Any],
+        *,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         selector = dict(selector or {})
-        candidates = self.recent_cancel_candidates(participant_id, limit=50)
+        candidates = self.recent_cancel_candidates(
+            participant_id, limit=50, now=now
+        )
         if selector.get("latest") is True:
             matches = candidates[:1]
         elif selector.get("course_name"):
