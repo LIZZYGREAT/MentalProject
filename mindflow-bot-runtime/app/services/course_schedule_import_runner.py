@@ -622,9 +622,22 @@ class CourseScheduleImportRunner:
                 "course_schedule_import_completion_card_update_failed import_id=%s",
                 draft.get("id"),
             )
+        fallback_card_error: Exception | None = None
         if not presented and chat_id:
             try:
-                await asyncio.to_thread(sender.send_text, chat_id, message["reply_text"])
+                await asyncio.to_thread(sender.send_card, chat_id, card)
+                presented = True
+            except Exception as exc:
+                fallback_card_error = exc
+                logger.exception(
+                    "course_schedule_import_completion_card_send_failed import_id=%s",
+                    draft.get("id"),
+                )
+        if not presented and chat_id:
+            try:
+                await asyncio.to_thread(
+                    sender.send_text, chat_id, message["reply_text"]
+                )
                 presented = True
             except Exception:
                 logger.exception(
@@ -635,8 +648,8 @@ class CourseScheduleImportRunner:
             await succeed()
         else:
             await fail(
-                "completion_card_update_failed"
-                if card_error is not None
+                "completion_card_delivery_failed"
+                if card_error is not None or fallback_card_error is not None
                 else "completion_text_notice_failed"
             )
 

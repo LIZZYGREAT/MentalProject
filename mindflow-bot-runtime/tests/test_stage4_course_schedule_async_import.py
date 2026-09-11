@@ -490,6 +490,60 @@ def test_completion_card_failure_does_not_demote_durable_import():
     assert repository.writes_for_import(draft["id"])[0]["status"] == "created"
 
 
+def test_completion_update_failure_resends_result_card_with_retry_action():
+    class Drafts:
+        def __init__(self):
+            self.presented = []
+
+        def mark_completion_presented(self, import_id):
+            self.presented.append(import_id)
+
+    class Imports:
+        def __init__(self):
+            self.drafts = Drafts()
+            self.calendar = object()
+
+        @staticmethod
+        def _result(_draft):
+            return {
+                "reply_text": "已添加 1 项，有 1 项没能添加。",
+                "error": "calendar_not_connected",
+            }
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+            self.texts = []
+
+        def update_card(self, _message_id, _card):
+            raise RuntimeError("original card cannot be updated")
+
+        def send_card(self, chat_id, card):
+            self.cards.append((chat_id, card))
+
+        def send_text(self, chat_id, text):
+            self.texts.append((chat_id, text))
+
+    imports = Imports()
+    sender = Sender()
+    runner = CourseScheduleImportRunner(imports, sender=sender)
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "partial_failed",
+        "recurrence_strategy": PRESERVE_SCHEDULE_PATTERN,
+        "status_card_message_id": "old-card",
+        "status_card_chat_id": "chat",
+    }
+
+    asyncio.run(runner._present_completion(draft))
+
+    assert len(sender.cards) == 1
+    assert sender.cards[0][0] == "chat"
+    assert "course_schedule_import_confirm" in str(sender.cards[0][1])
+    assert sender.texts == []
+    assert imports.drafts.presented == [draft["id"]]
+
+
 class _ForecastSnapshotSpy:
     def __init__(self):
         self.invalidations = []
