@@ -88,7 +88,7 @@ class _Imports:
     def __init__(self, drafts):
         self.drafts = drafts
 
-    def cancel(self, participant_id, import_id):
+    def cancel(self, participant_id, import_id, **_kwargs):
         draft = self.drafts.cancel(participant_id, import_id)
         return {
             "ok": draft["status"] == "cancelled",
@@ -96,7 +96,7 @@ class _Imports:
             "reply_text": "已取消这次课程表导入。",
         }
 
-    def cancel_or_revert(self, participant_id, selector):
+    def cancel_or_revert(self, participant_id, selector, **_kwargs):
         candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
         draft = self.drafts.request_cancel(participant_id, candidate["id"])
         return {
@@ -369,7 +369,7 @@ def test_cancel_with_provider_effect_still_requires_semantic_verification():
     class Imports:
         drafts = Drafts()
 
-        def cancel_or_revert(self, participant_id, selector):
+        def cancel_or_revert(self, participant_id, selector, **_kwargs):
             assert participant_id == owner.id
             return {"ok": True, "status": "cancelling", "cancel_mode": "revert"}
 

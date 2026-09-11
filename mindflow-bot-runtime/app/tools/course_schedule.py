@@ -431,7 +431,11 @@ class CourseScheduleTools:
     ) -> dict[str, Any]:
         selector = dict(arguments.get("selector") or {})
         try:
-            result = self.imports.cancel_or_revert(ctx.participant_id, selector)
+            result = self.imports.cancel_or_revert(
+                ctx.participant_id,
+                selector,
+                status_card_chat_id=ctx.chat_id,
+            )
         except CourseScheduleImportAmbiguityError as exc:
             return {
                 "ok": False,

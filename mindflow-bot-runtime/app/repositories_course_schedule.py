@@ -446,6 +446,7 @@ class CourseScheduleImportRepository:
         participant_id: uuid.UUID,
         import_id: uuid.UUID | str,
         *,
+        item_id: uuid.UUID | str | None = None,
         course_name: str | None = None,
         selector_weekday: int | None = None,
         new_weekday: int | None = None,
@@ -466,6 +467,13 @@ class CourseScheduleImportRepository:
 
         if selector_weekday is not None and weekday is not None:
             raise ValueError("selector weekday was provided more than once")
+        if item_id is not None and (
+            course_name is not None or selector_weekday is not None
+        ):
+            raise ValueError("item id cannot be combined with semantic selectors")
+        normalized_item_id = (
+            uuid.UUID(str(item_id)) if item_id is not None else None
+        )
         selector_weekday = selector_weekday if selector_weekday is not None else weekday
         for value, label in (
             (selector_weekday, "selector weekday"),
@@ -522,7 +530,16 @@ class CourseScheduleImportRepository:
                 raise ValueError("draft no longer accepts corrections")
             structured = dict(row.structured_result or {})
             courses = [dict(value) for value in structured.get("courses") or []]
-            candidates = list(range(len(courses)))
+            items = self._items(session, row.id)
+            candidates = (
+                [
+                    index
+                    for index, item in enumerate(items)
+                    if item.id == normalized_item_id
+                ]
+                if normalized_item_id is not None
+                else list(range(len(courses)))
+            )
             if course_name:
                 needle = str(course_name).strip().lower()
                 candidates = [
@@ -546,7 +563,6 @@ class CourseScheduleImportRepository:
                 ])
             index = candidates[0]
             course = courses[index]
-            items = self._items(session, row.id)
             item = items[index]
             metadata = dict(structured.get("_metadata") or {})
             sources = list(metadata.get("course_time_sources") or [])
@@ -1266,6 +1282,7 @@ class CourseScheduleImportRepository:
         *,
         mode: str | None = None,
         cancel_mode: str | None = None,
+        status_card_chat_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Install the durable cancellation fence and materialize delete targets."""
@@ -1277,6 +1294,8 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             assert row is not None
+            if status_card_chat_id:
+                row.status_card_chat_id = str(status_card_chat_id)[:128]
             if (
                 row.status in EXPIRABLE_STATUSES
                 and _aware(row.expires_at) <= requested_at

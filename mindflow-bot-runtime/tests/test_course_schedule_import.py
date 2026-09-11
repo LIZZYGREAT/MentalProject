@@ -17,6 +17,7 @@ from app.contracts.course_schedule import (
 from app.integrations.feishu.gateway import BotEvent, FeishuEventParser, InvalidBotEvent
 from app.integrations.feishu.cards import (
     course_schedule_context_card,
+    course_schedule_item_time_card,
     course_schedule_preview_card,
     course_schedule_result_card,
 )
@@ -337,6 +338,81 @@ def test_context_card_submission_completes_draft_without_calendar_write():
     assert "按课程规律添加（推荐）" in payload
     assert "course_schedule_import_confirm" in payload
     assert repository.get(draft["id"])["status"] == "pending_confirmation"
+
+
+def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write():
+    database = memory_database()
+    person = participant(database, "ITEM-TIME-EDIT")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload()
+    first = dict(payload["courses"][0])
+    first.update({
+        "course_name": "计算机体系结构(0965)",
+        "weekday": 1,
+        "period_start": 2,
+        "period_end": 4,
+        "start_time": "08:55",
+        "end_time": "11:40",
+    })
+    second = dict(first)
+    second.update({
+        "period_start": 5,
+        "period_end": 6,
+        "start_time": "12:00",
+        "end_time": "13:40",
+    })
+    payload["courses"] = [first, second]
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-item-edit",
+        source_image_hash="e" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    preview = course_schedule_preview_card(draft)
+    edit_actions = [
+        element["behaviors"][0]["value"]
+        for element in preview["body"]["elements"]
+        if element.get("tag") == "button"
+        and element.get("behaviors", [{}])[0]
+        .get("value", {})
+        .get("mindflow_action") == "course_schedule_item_time_open"
+    ]
+    assert len(edit_actions) == 2
+    target_item_id = draft["items"][0]["id"]
+    assert edit_actions[0]["item_id"] == target_item_id
+    form = course_schedule_item_time_card(draft, target_item_id)
+    assert "mindflow_course_schedule_item_time" in json.dumps(form)
+
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+    submitted = handler.handle(
+        person.id,
+        message_id="om-item-form",
+        action_value={
+            "mindflow_action": "course_schedule_item_time_submit",
+            "version": "1",
+            "import_id": draft["id"],
+            "item_id": target_item_id,
+        },
+        form_value={"start_time": "08:55", "end_time": "11:30"},
+    )
+
+    assert submitted["ok"] is True
+    updated = repository.get(draft["id"])["structured_result"]["courses"]
+    assert (updated[0]["start_time"], updated[0]["end_time"]) == (
+        "08:55",
+        "11:30",
+    )
+    assert (updated[1]["start_time"], updated[1]["end_time"]) == (
+        "12:00",
+        "13:40",
+    )
 
 
 def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():

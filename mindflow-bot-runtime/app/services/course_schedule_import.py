@@ -195,9 +195,17 @@ class CourseScheduleImportService:
         return self._queued_result(queued, planned_writes=planned_writes)
 
     def cancel(
-        self, participant_id: uuid.UUID, import_id: uuid.UUID | str
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        status_card_chat_id: str | None = None,
     ) -> dict[str, Any]:
-        draft = self.drafts.request_cancel(participant_id, import_id)
+        draft = self.drafts.request_cancel(
+            participant_id,
+            import_id,
+            status_card_chat_id=status_card_chat_id,
+        )
         self._wake_runner()
         return self._cancel_result(draft)
 
@@ -205,11 +213,17 @@ class CourseScheduleImportService:
         self,
         participant_id: uuid.UUID,
         selector: dict[str, Any],
+        *,
+        status_card_chat_id: str | None = None,
     ) -> dict[str, Any]:
         """Resolve a participant-bound selector and install the Saga fence."""
 
         candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
-        result = self.drafts.request_cancel(participant_id, candidate["id"])
+        result = self.drafts.request_cancel(
+            participant_id,
+            candidate["id"],
+            status_card_chat_id=status_card_chat_id,
+        )
         self._wake_runner()
         return {**self._cancel_result(result), "selector": dict(selector)}
 

@@ -2215,7 +2215,7 @@ def test_stop_during_create_draft_does_not_leave_hidden_new_draft():
             assert self.release.wait(timeout=5)
             return self.outcome
 
-        def cancel(self, participant_id, import_id):
+        def cancel(self, participant_id, import_id, **_kwargs):
             return self.repository.cancel(participant_id, import_id)
 
     gateway, queue, worker, _runtime, sender, _, _ = _system(

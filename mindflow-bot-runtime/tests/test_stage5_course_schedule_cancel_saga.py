@@ -123,6 +123,51 @@ def test_pending_cancel_has_no_provider_effect():
     assert asyncio.run(runner.run_once()) == 0
 
 
+def test_revert_persists_request_chat_and_pushes_completion_without_followup():
+    database = memory_database()
+    owner = participant(database, "STAGE5-CANCEL-NOTICE")
+    calendar = Calendar()
+    repository = CourseScheduleImportRepository(database)
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+
+        def send_card(self, chat_id, card):
+            self.cards.append((chat_id, card))
+            return "om-completion"
+
+        def send_text(self, chat_id, text):
+            raise AssertionError(f"unexpected text fallback: {chat_id} {text}")
+
+        def update_card(self, _message_id, _card):
+            raise AssertionError("no status card message was supplied")
+
+    sender = Sender()
+    runner = CourseScheduleImportRunner(service, sender=sender)
+    service.queue_notifier = runner.wake
+    draft = _draft(repository, owner.id)
+    _queue(service, owner, draft)
+    assert asyncio.run(runner.run_once()) == 1
+    assert repository.get(draft["id"])["status"] == "succeeded"
+
+    result = service.cancel(
+        owner.id,
+        draft["id"],
+        status_card_chat_id="oc-cancel-request",
+    )
+    assert result["status"] == "cancelling"
+    assert repository.get(draft["id"])["status_card_chat_id"] == (
+        "oc-cancel-request"
+    )
+    assert asyncio.run(runner.run_once()) == 1
+
+    assert repository.get(draft["id"])["status"] == "cancelled"
+    assert sender.cards[-1][0] == "oc-cancel-request"
+    assert "已撤销" in str(sender.cards[-1][1])
+
+
 def test_queued_cancel_marks_planned_writes_without_delete():
     database = memory_database()
     owner = participant(database, "STAGE5-QUEUED")

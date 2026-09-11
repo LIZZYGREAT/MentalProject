@@ -160,6 +160,21 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         ])
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     status = str(draft.get("status") or "")
+    if status in {"pending_context", "pending_confirmation"} and not draft.get(
+        "recurrence_strategy"
+    ):
+        editable_items = [
+            item for item in items[:20] if str(item.get("id") or "").strip()
+        ]
+        if editable_items:
+            elements.append({
+                "tag": "markdown",
+                "content": "如单门课程时间有误，可直接修改对应课程：",
+            })
+            elements.extend(
+                _schedule_item_edit_button(draft["id"], item)
+                for item in editable_items
+            )
     if missing and status == "pending_context":
         lines.append("\n填写关键信息后，我会先给出完整预览；确认前不会添加到日历。")
         elements[0]["content"] = "\n".join(lines)
@@ -324,6 +339,102 @@ def _schedule_context_button(import_id: str) -> dict[str, Any]:
             "version": "3",
             "import_id": str(import_id),
         }}],
+    }
+
+
+def _schedule_item_edit_button(
+    import_id: str, item: dict[str, Any]
+) -> dict[str, Any]:
+    name = _safe_schedule_text(item.get("course_name") or "未命名课程")[:40]
+    period = (
+        f" · {item.get('start_time')}–{item.get('end_time')}"
+        if item.get("start_time") and item.get("end_time")
+        else ""
+    )
+    return {
+        "tag": "button",
+        "type": "default",
+        "text": {
+            "tag": "plain_text",
+            "content": f"修改 {name}{period}",
+        },
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_item_time_open",
+            "version": "1",
+            "import_id": str(import_id),
+            "item_id": str(item["id"]),
+        }}],
+    }
+
+
+def course_schedule_item_time_card(
+    draft: dict[str, Any], item_id: str
+) -> dict[str, Any]:
+    """Fixed form bound to one opaque course item identifier."""
+
+    items = list(draft.get("items") or [])
+    item = next(
+        (value for value in items if str(value.get("id") or "") == str(item_id)),
+        None,
+    )
+    if item is None:
+        raise LookupError("course schedule item not found")
+    name = _safe_schedule_text(item.get("course_name") or "未命名课程")
+    start = str(item.get("start_time") or "08:00")
+    end = str(item.get("end_time") or "09:00")
+    form_elements = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{name}**\n当前时间：{start}–{end}\n"
+                "修改只会刷新课程表预览，不会写入日历。"
+            ),
+        },
+        {
+            "tag": "input",
+            "name": "start_time",
+            "required": True,
+            "max_length": 5,
+            "placeholder": {"tag": "plain_text", "content": start},
+            "label": {"tag": "plain_text", "content": "开始时间（HH:MM）"},
+        },
+        {
+            "tag": "input",
+            "name": "end_time",
+            "required": True,
+            "max_length": 5,
+            "placeholder": {"tag": "plain_text", "content": end},
+            "label": {"tag": "plain_text", "content": "结束时间（HH:MM）"},
+        },
+        {
+            "tag": "button",
+            "name": "course_schedule_item_time_submit",
+            "type": "primary",
+            "text": {"tag": "plain_text", "content": "确认修改"},
+            "form_action_type": "submit",
+            "behaviors": [{"type": "callback", "value": {
+                "mindflow_action": "course_schedule_item_time_submit",
+                "version": "1",
+                "import_id": str(draft["id"]),
+                "item_id": str(item_id),
+            }}],
+        },
+    ]
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "修改课程时间"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [{
+                "tag": "form",
+                "name": "mindflow_course_schedule_item_time",
+                "elements": form_elements,
+            }],
+        },
     }
 
 
@@ -1036,12 +1147,20 @@ def pressure_curve_card(
                 {
                     "tag": "button",
                     "type": "default",
-                    "text": {"tag": "plain_text", "content": "查看今日日程"},
+                    "text": {
+                        "tag": "plain_text",
+                        "content": (
+                            "查看今日日程"
+                            if requested_date_is_today
+                            else "查看当日日程"
+                        ),
+                    },
                     "behaviors": [{
                         "type": "callback",
                         "value": {
-                            "mindflow_action": "view_today_calendar",
+                            "mindflow_action": "view_calendar_date",
                             "version": "1",
+                            "local_date": str(local_date)[:10],
                         },
                     }],
                 },
@@ -1056,7 +1175,10 @@ def pressure_curve_card(
 
 
 def today_calendar_card(
-    events: list[dict[str, Any]], *, local_date: str
+    events: list[dict[str, Any]],
+    *,
+    local_date: str,
+    requested_date_is_today: bool = True,
 ) -> dict[str, Any]:
     lines = []
     for event in events[:20]:
@@ -1064,13 +1186,14 @@ def today_calendar_card(
         label = start.split("T", 1)[-1][:5] if start else "全天"
         summary = str(event.get("summary") or "未命名日程")[:80]
         lines.append(f"• **{label}** {summary}")
-    content = "\n".join(lines) if lines else "今天暂无日程。"
+    day_label = "今日" if requested_date_is_today else "当日"
+    content = "\n".join(lines) if lines else f"{day_label}暂无日程。"
     return {
         "schema": "2.0",
         "config": {"width_mode": "fill", "enable_forward": False},
         "header": {
             "template": "turquoise",
-            "title": {"tag": "plain_text", "content": "今日日程"},
+            "title": {"tag": "plain_text", "content": f"{day_label}日程"},
             "subtitle": {"tag": "plain_text", "content": str(local_date)[:10]},
         },
         "body": {

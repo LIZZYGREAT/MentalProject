@@ -544,6 +544,51 @@ def test_completion_update_failure_resends_result_card_with_retry_action():
     assert imports.drafts.presented == [draft["id"]]
 
 
+def test_cancelled_completion_updates_status_card_and_pushes_new_notice():
+    class Drafts:
+        def __init__(self):
+            self.presented = []
+
+        def mark_completion_presented(self, import_id):
+            self.presented.append(import_id)
+
+    class Imports:
+        def __init__(self):
+            self.drafts = Drafts()
+            self.calendar = object()
+
+        @staticmethod
+        def _result(_draft):
+            return {"reply_text": "这次课程表导入已撤销，相关日程已清理。"}
+
+    class Sender:
+        def __init__(self):
+            self.updated = []
+            self.sent = []
+
+        def update_card(self, message_id, card):
+            self.updated.append((message_id, card))
+
+        def send_card(self, chat_id, card):
+            self.sent.append((chat_id, card))
+
+    imports = Imports()
+    sender = Sender()
+    runner = CourseScheduleImportRunner(imports, sender=sender)
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "cancelled",
+        "status_card_message_id": "old-status-card",
+        "status_card_chat_id": "request-chat",
+    }
+
+    asyncio.run(runner._present_completion(draft))
+
+    assert sender.updated[0][0] == "old-status-card"
+    assert sender.sent[0][0] == "request-chat"
+    assert imports.drafts.presented == [draft["id"]]
+
+
 class _ForecastSnapshotSpy:
     def __init__(self):
         self.invalidations = []

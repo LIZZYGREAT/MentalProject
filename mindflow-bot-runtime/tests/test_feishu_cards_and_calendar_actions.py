@@ -158,7 +158,68 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
         for item in card["body"]["elements"]
         if item.get("tag") == "button"
     }
-    assert actions == {"request_checkin", "view_today_calendar"}
+    assert actions == {"request_checkin", "view_calendar_date"}
+
+
+def test_historical_pressure_curve_opens_the_requested_calendar_date():
+    analysis = analyze_curve([
+        {"time": "09:00", "stress_0_10": 4.5, "vitality_0_10": 7.0},
+    ])
+    card = pressure_curve_card(
+        analysis,
+        image_key="img-key",
+        local_date="2026-09-10",
+        requested_date_is_today=False,
+    )
+    calendar_button = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("tag") == "button"
+        and "日程" in item.get("text", {}).get("content", "")
+    )
+    assert calendar_button["text"]["content"] == "查看当日日程"
+    assert calendar_button["behaviors"][0]["value"] == {
+        "mindflow_action": "view_calendar_date",
+        "version": "1",
+        "local_date": "2026-09-10",
+    }
+
+
+def test_calendar_date_callback_queries_the_date_carried_by_the_card():
+    database = memory_database()
+    person = participant(database, "P-HISTORY-CALENDAR")
+
+    class Calendar:
+        def __init__(self):
+            self.calls = []
+
+        async def get_events(self, participant_id, start, end):
+            self.calls.append((participant_id, start, end))
+            return []
+
+    calendar = Calendar()
+    service = CardActionService(
+        ObservationRepository(database),
+        calendar,
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+    )
+    result = service.handle(
+        person.id,
+        message_id="om-history",
+        action_value={
+            "mindflow_action": "view_calendar_date",
+            "version": "1",
+            "local_date": "2026-09-10",
+        },
+        form_value={},
+    )
+
+    assert result["reply_text"] == "已加载 2026-09-10 的日程。"
+    assert calendar.calls[0][1].date().isoformat() == "2026-09-10"
+    assert calendar.calls[0][2] - calendar.calls[0][1] == timedelta(days=1)
+    assert result["card"]["header"]["title"]["content"] == "当日日程"
 
 
 def test_daily_checkin_card_uses_json_2_form_submit_contract():

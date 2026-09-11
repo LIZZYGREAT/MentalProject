@@ -19,6 +19,7 @@ from app.integrations.feishu.cards import (
     card_action_result_card,
     care_intervention_result_card,
     course_schedule_context_card,
+    course_schedule_item_time_card,
     course_schedule_preview_card,
     course_schedule_result_card,
     daily_checkin_card,
@@ -44,6 +45,7 @@ _SLASH_DATE = re.compile(
     r"^\s*(?P<year>\d{4})\s*/\s*(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})\s*$"
 )
 _WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_CLOCK_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
@@ -201,6 +203,62 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "course_schedule_item_time_open",
+            "course_schedule_item_time_submit",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+                item_id = uuid.UUID(str(action.get("item_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule item target is invalid") from exc
+            drafts = self.course_schedule_imports.drafts
+            draft = drafts.get(import_id)
+            if draft is None or str(draft.get("participant_id")) != str(participant_id):
+                return {"ok": False, "error": "course_schedule_import_not_found"}
+            if action_name.endswith("_open"):
+                return {
+                    "ok": True,
+                    "reply_text": "请修改这门课程的起止时间。",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            values = dict(form_value or {})
+            start_value = str(values.get("start_time") or "").strip()
+            end_value = str(values.get("end_time") or "").strip()
+            if not _CLOCK_TIME.fullmatch(start_value) or not _CLOCK_TIME.fullmatch(
+                end_value
+            ):
+                return {
+                    "ok": True,
+                    "reply_text": "时间格式应为 HH:MM，例如 08:55。",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            try:
+                corrected = drafts.apply_correction(
+                    participant_id,
+                    import_id,
+                    item_id=item_id,
+                    start_time=start_value,
+                    end_time=end_value,
+                )
+            except (LookupError, PermissionError):
+                return {"ok": False, "error": "course_schedule_import_not_found"}
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "reply_text": f"课程时间需要调整：{str(exc)[:120]}",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            return {
+                "ok": True,
+                "status": corrected.get("status"),
+                "reply_text": "课程时间已修改，请核对更新后的预览。",
+                "card": course_schedule_preview_card(corrected),
+            }
         if action_name in {"calendar_delete_confirm", "calendar_delete_cancel"}:
             if str(action.get("version") or "") != "1":
                 return {"ok": False, "error": "unsupported_card_action_version"}
@@ -327,7 +385,11 @@ class CardActionService:
                     "card": course_schedule_preview_card(draft),
                 }
             if action_name.endswith("_cancel"):
-                result = self.course_schedule_imports.cancel(participant_id, import_id)
+                result = self.course_schedule_imports.cancel(
+                    participant_id,
+                    import_id,
+                    status_card_chat_id=chat_id,
+                )
             else:
                 import asyncio
 
@@ -425,20 +487,34 @@ class CardActionService:
                 "reply_text": "请填写此刻状态。",
                 "card": daily_checkin_card(),
             }
-        if action_name == "view_today_calendar":
+        if action_name in {"view_today_calendar", "view_calendar_date"}:
             if self.calendar is None:
                 raise RuntimeError("calendar service is unavailable")
             import asyncio
 
             today = datetime.now(self.timezone).date()
-            start = datetime.combine(today, time.min, self.timezone)
+            requested_date = (
+                date.fromisoformat(str(action.get("local_date") or ""))
+                if action_name == "view_calendar_date"
+                else today
+            )
+            start = datetime.combine(requested_date, time.min, self.timezone)
             events = asyncio.run(
                 self.calendar.get_events(participant_id, start, start + timedelta(days=1))
             )
+            requested_date_is_today = requested_date == today
             return {
                 "ok": True,
-                "reply_text": "已加载今日日程。",
-                "card": today_calendar_card(events, local_date=today.isoformat()),
+                "reply_text": (
+                    "已加载今日日程。"
+                    if requested_date_is_today
+                    else f"已加载 {requested_date.isoformat()} 的日程。"
+                ),
+                "card": today_calendar_card(
+                    events,
+                    local_date=requested_date.isoformat(),
+                    requested_date_is_today=requested_date_is_today,
+                ),
             }
         if action_name == "daily_review_submit":
             if self.daily_reviews is None:
