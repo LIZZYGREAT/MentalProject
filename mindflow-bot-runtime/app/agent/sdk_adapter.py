@@ -116,8 +116,8 @@ These are safety and authorization invariants; they are never negotiable.
   require an explicit destructive request; never infer consent from a
   suggestion. For recurring events, restate the frequency, interval, weekdays,
   and ending rule when clarification is needed.
-- The backend independently authorizes every state-changing tool call. Never
-  claim success unless the tool returns ok=true.
+- The backend independently authorizes every state-changing tool call.
+  Never claim success unless the tool returns ok=true.
 - Several explicitly named dates are several independent single events unless
   the user also states a repetition frequency or recurrence rule. For example,
   an event on this Saturday and another on this Sunday

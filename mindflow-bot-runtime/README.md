@@ -24,7 +24,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 ## 安全边界
 
-- 未绑定用户只能执行 `/bind`；仅允许私聊。
+- 未绑定用户只能触发绑定（发送 `/bind 绑定码`，或直接发送符合绑定码形态的文本）；其余任何输入只会得到欢迎引导，不会触发 token 查询。仅允许私聊。
 - `external_llm_consent_at` 为空时不会创建 Claude SDK client。
 - `/calendar` 由 Backend Device Flow 处理。
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
@@ -86,6 +86,20 @@ LLM，而由固定后端 action allowlist 处理。
 只有当业务域和 Tool 数量继续显著扩大，并且线上审计数据证明单 Agent 路由出现稳定、
 可复现的误调用时，才考虑增加轻量意图分类层。该分类层只能提供路由建议，不能获得
 日历写权限，也不能替代 Backend 对每次写 Tool proposal 的语义授权、schema 校验与幂等边界。
+
+## 冷启动与功能发现
+
+未绑定用户发送普通文本会收到自然欢迎引导；只有 `/bind 绑定码` 或形态符合绑定码规范
+（单一 URL-safe token）的文本才会进入绑定查询，绑定失败不区分“无效/过期/已使用”。
+绑定成功后发送轻量的渐进式欢迎卡，按钮只做导航（状态记录、日程、课程表、全部功能），
+不直接产生任何写操作；卡片不可发送时回退为同等内容的持久文本首屏。
+
+精确帮助词（功能/帮助/你会什么等）由确定性 fast-path 直接发送功能总览卡；其余自然
+语言帮助问题交给 Agent，Agent 只能通过 `help_show_feature_card`（仅接受后端枚举
+feature key 或 overview）排队由后端渲染的固定功能卡。`feature_open`/`feature_back`
+回调只携带 `feature_key` 与 `version`，经固定后端 allowlist 校验后原位更新来源卡片，
+不新发卡片。功能卡由 `app/presentation/feature_cards.py` 单一数据源渲染，禁用的
+capability（如 Daily Review）会直接隐藏对应功能。
 
 ## 配置
 

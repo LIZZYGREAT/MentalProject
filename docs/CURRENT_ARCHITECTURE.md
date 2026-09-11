@@ -448,6 +448,22 @@ CardAction 默认使用 `FEISHU_CARD_ACTION_TRANSPORT=ws` 且
 `FEISHU_CARD_CALLBACK_ENABLED=false`。WS 模式不要求公网 HTTPS；HTTP 是显式 fallback，启用时
 必须使用 `FEISHU_CARD_ACTION_TRANSPORT=http`、打开 callback 并配置验签所需参数。
 
+## 冷启动与功能发现
+
+未绑定用户只能触发绑定：`/bind 绑定码` 或形态符合单一 URL-safe token 的文本；其余输入
+只得到欢迎引导，不触发 token 查询。绑定成功后发送渐进式欢迎卡（按钮仅导航，不产生写
+操作），卡片发送失败时回退为持久文本首屏。精确帮助词走确定性 fast-path 直接发送功能
+总览卡；自然语言帮助问题由 Agent 通过 `help_show_feature_card`（ui_effect，schema 只接受
+后端枚举 feature key 或 overview）排队固定功能卡。`feature_open`/`feature_back` 回调只携带
+`feature_key` 与 `version`，经 CardActionService 后端枚举校验后原位更新来源卡片。功能卡由
+`app/presentation/feature_cards.py` 单一数据源渲染；capability 关闭的功能在所有入口隐藏。
+AgentTurnInput 携带由 `FeishuBinding.bound_at`（首次真实使用时间，非 Participant.created_at）
+推导的 `participant_stage`（day1/week1/active），`_text_transport_prompt` 渲染
+`backend_participant_stage` 上下文块；`interaction_preferences` 为预留槽，当前恒为 None 且
+对应块不出现。SYSTEM_RULES 为单一结构化常量（Role and voice / Conversation defaults /
+Hard boundaries / Presentation / Failure handling），七条 hard boundary 不变量由
+`tests/test_interaction_prompt_contracts.py` 锁定。
+
 ## 自动漂移保护
 
 `tests/test_authoritative_docs.py` 校验本文与 Runtime README 的 exact tool set、模型版本、
