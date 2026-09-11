@@ -276,6 +276,7 @@ class CareTools:
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
         self.calendar_mutation_plans = calendar_mutation_plans
+        self.calendar_mutation_plan_notifier: Any = None
         self.what_if = (
             CareWhatIfSimulationService(forecast_coordinator)
             if forecast_coordinator is not None else None
@@ -1860,8 +1861,10 @@ class CareTools:
         *,
         confirmed: bool,
         source_message_id: str,
+        status_card_message_id: str | None = None,
+        status_card_chat_id: str | None = None,
     ) -> dict[str, Any]:
-        """Cancel or execute one immutable participant-bound batch plan."""
+        """Cancel or durably queue one participant-bound batch plan."""
 
         if self.calendar_mutation_plans is None:
             return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
@@ -1887,97 +1890,80 @@ class CareTools:
             }
 
         plan = await asyncio.to_thread(
-            self.calendar_mutation_plans.claim,
+            self.calendar_mutation_plans.request_execution,
             participant_id,
             plan_id,
+            status_card_message_id=status_card_message_id,
+            status_card_chat_id=status_card_chat_id,
         )
         if plan is None:
             return {"ok": False, "error": "calendar_mutation_plan_not_found"}
-        claim_status = str(plan.get("claim_status") or "")
-        if claim_status != "claimed":
+        request_status = str(plan.get("request_status") or "")
+        if not plan.get("newly_queued"):
             replies = {
                 "expired": "这张确认卡已过期，请重新发起操作。",
                 "cancelled": "这项操作已经取消，日程未更改。",
-                "processing": "正在处理这项操作，请勿重复提交。",
+                "queued": "这项操作已经排队，请勿重复提交。",
+                "running": "正在处理这项操作，请勿重复提交。",
+                "recovery_required": "这项操作正在核对执行结果，请勿重复提交。",
                 "succeeded": "这些日程已经处理完成。",
                 "partial_failed": "这项操作已处理，部分日程未能完成。",
             }
             return {
                 "ok": True,
-                "status": claim_status,
+                "status": request_status,
                 "already_handled": True,
-                "reply_text": replies.get(claim_status, "这项操作已经处理。"),
+                "reply_text": replies.get(request_status, "这项操作已经处理。"),
             }
-
-        operation = str(plan["operation"])
-        succeeded_count = 0
-        errors: list[str] = []
-        for index, item in enumerate(list(plan.get("items") or [])):
-            item_source = (
-                f"{source_message_id}:calendar-plan:{plan_id}:{index}"
-            )
-            try:
-                if operation == "create":
-                    item_ctx = AgentContext(
-                        participant_id=participant_id,
-                        participant_code="",
-                        open_id="",
-                        chat_id="",
-                        message_id=item_source,
-                        agent_run_id=uuid.uuid4(),
-                        turn_effect_policy="deterministic_backend_action",
-                    )
-                    result = await self.create_calendar_event(
-                        item_ctx,
-                        {
-                            **dict(item),
-                            "recurrence_mode": "single",
-                        },
-                    )
-                elif operation == "delete":
-                    result = await self.confirm_calendar_delete(
-                        participant_id,
-                        str(item["event_id"]),
-                        source_message_id=item_source,
-                    )
-                else:
-                    raise ValueError("unsupported calendar mutation plan operation")
-                if result.get("ok"):
-                    succeeded_count += 1
-                else:
-                    errors.append(str(result.get("error") or "mutation_failed")[:128])
-            except Exception as exc:
-                logger.exception(
-                    "calendar mutation plan item failed plan_id=%s item=%s",
-                    plan_id,
-                    index,
-                )
-                errors.append(type(exc).__name__[:128])
-
-        item_count = len(list(plan.get("items") or []))
-        failed_count = item_count - succeeded_count
-        succeeded = failed_count == 0
-        await asyncio.to_thread(
-            self.calendar_mutation_plans.complete,
-            plan_id,
-            result={
-                "succeeded_count": succeeded_count,
-                "failed_count": failed_count,
-                "errors": errors,
-            },
-            succeeded=succeeded,
-        )
-        verb = "添加" if operation == "create" else "删除"
-        reply_text = (
-            f"已{verb} {succeeded_count} 个日程。"
-            if succeeded
-            else f"已{verb} {succeeded_count} 个，另有 {failed_count} 个未完成。"
-        )
+        notifier = self.calendar_mutation_plan_notifier
+        if callable(notifier):
+            notifier()
         return {
             "ok": True,
-            "status": "succeeded" if succeeded else "partial_failed",
-            "calendar_mutation": "succeeded" if succeeded else "partial_failed",
-            "succeeded_count": succeeded_count,
-            "failed_count": failed_count,
-            "reply_text": reply_text,
+            "status": "queued",
+            "calendar_mutation": "queued",
+            "reply_text": "已提交，正在处理这些日程。",
         }
+
+    async def execute_calendar_mutation_plan_item(
+        self, plan: dict[str, Any], item: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute or reconcile one runner-owned durable ledger item."""
+
+        participant_id = uuid.UUID(str(plan["participant_id"]))
+        payload = dict(item.get("payload") or {})
+        source_identity = str(item["source_identity"])
+        if item["operation"] == "create":
+            item_ctx = AgentContext(
+                participant_id=participant_id,
+                participant_code="",
+                open_id="",
+                chat_id="",
+                message_id=source_identity,
+                agent_run_id=uuid.uuid4(),
+                turn_effect_policy="deterministic_backend_action",
+            )
+            return await self.create_calendar_event(
+                item_ctx,
+                {**payload, "recurrence_mode": "single"},
+            )
+        if item["operation"] != "delete":
+            raise ValueError("unsupported calendar mutation plan operation")
+        event_id = str(payload["event_id"])
+        if item.get("reconcile"):
+            try:
+                await self.calendar.get_event(participant_id, event_id)
+            except CalendarMutationRejected as exc:
+                if exc.status_code == 404:
+                    return {
+                        "ok": True,
+                        "calendar_mutation": "succeeded",
+                        "deleted": True,
+                        "read_back": True,
+                    }
+                raise
+        return await self.confirm_calendar_delete(
+            participant_id,
+            event_id,
+            source_message_id=source_identity,
+        )

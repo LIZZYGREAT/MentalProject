@@ -39,6 +39,7 @@ from app.repositories_course_schedule_image import (
 )
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
+from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
 from app.services.course_schedule_vision import CourseScheduleVisionService
 from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
@@ -106,6 +107,7 @@ class BusinessServices:
     course_schedule_image_sessions: CourseScheduleImageSessionRepository
     course_schedule_tools: CourseScheduleTools
     calendar_mutation_plans: CalendarMutationPlanRepository
+    calendar_mutation_plan_runner: CalendarMutationPlanRunner
 
 
 def build_business_services(
@@ -292,6 +294,11 @@ def build_business_services(
         calendar_mutation_plans=calendar_mutation_plans,
     )
     care_tools.register(registry)
+    calendar_mutation_plan_runner = CalendarMutationPlanRunner(
+        calendar_mutation_plans,
+        care_tools.execute_calendar_mutation_plan_item,
+    )
+    care_tools.calendar_mutation_plan_notifier = calendar_mutation_plan_runner.wake
     card_actions = CardActionService(
         observations,
         calendar,
@@ -346,4 +353,5 @@ def build_business_services(
         course_schedule_image_sessions=course_schedule_image_sessions,
         course_schedule_tools=course_schedule_tools,
         calendar_mutation_plans=calendar_mutation_plans,
+        calendar_mutation_plan_runner=calendar_mutation_plan_runner,
     )

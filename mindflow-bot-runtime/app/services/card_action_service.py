@@ -318,6 +318,8 @@ class CardActionService:
                             message_id, action, dict(form_value or {})
                         )
                     ),
+                    status_card_message_id=message_id,
+                    status_card_chat_id=chat_id,
                 )
             )
             if not result.get("ok"):

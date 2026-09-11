@@ -355,6 +355,8 @@ async def run() -> None:
     )
     business.course_schedule_import_runner.sender = sender
     business.course_schedule_import_runner.start()
+    business.calendar_mutation_plan_runner.sender = sender
+    business.calendar_mutation_plan_runner.start()
     business.dependency_refresh.start()
     business.mutation_refresh.start()
     await business.mutation_refresh.recover_startup_fences(process_started_at)
@@ -609,20 +611,23 @@ async def run() -> None:
                     await business.course_schedule_import_runner.close()
                 finally:
                     try:
-                        await business.mutation_refresh.close()
+                        await business.calendar_mutation_plan_runner.close()
                     finally:
                         try:
-                            await business.observation_refresh.close()
+                            await business.mutation_refresh.close()
                         finally:
                             try:
-                                await business.dependency_refresh.close()
+                                await business.observation_refresh.close()
                             finally:
                                 try:
-                                    await business.semantic_preprocessor.close(
-                                        settings.semantic_api_timeout_seconds + 2
-                                    )
+                                    await business.dependency_refresh.close()
                                 finally:
-                                    await runtime.close()
+                                    try:
+                                        await business.semantic_preprocessor.close(
+                                            settings.semantic_api_timeout_seconds + 2
+                                        )
+                                    finally:
+                                        await runtime.close()
 
 
 def main() -> None:

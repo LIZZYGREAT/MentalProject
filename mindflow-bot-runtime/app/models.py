@@ -935,6 +935,67 @@ class CalendarMutationPlan(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    run_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status_card_message_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    status_card_chat_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+
+
+class CalendarMutationPlanItem(Base):
+    """One durable, idempotently recoverable provider effect in a batch plan."""
+
+    __tablename__ = "calendar_mutation_plan_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id", "item_index", name="uq_calendar_mutation_plan_item_index"
+        ),
+        UniqueConstraint(
+            "source_identity", name="uq_calendar_mutation_plan_item_source"
+        ),
+        Index("ix_calendar_mutation_plan_item_status", "plan_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("calendar_mutation_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    provider_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_identity: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class EventSemanticCache(Base):
