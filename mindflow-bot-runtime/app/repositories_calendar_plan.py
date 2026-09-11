@@ -21,11 +21,25 @@ def _aware(value: datetime) -> datetime:
 class CalendarMutationPlanRepository:
     _RETRY_BACKOFF_SECONDS = (5, 15, 60, 300, 900)
     _MAX_OUTCOME_UNKNOWN_ATTEMPTS = len(_RETRY_BACKOFF_SECONDS)
+    _MAX_COMPLETION_PRESENTATION_ATTEMPTS = len(_RETRY_BACKOFF_SECONDS)
 
     @classmethod
     def _next_retry_at(cls, now: datetime, attempt_count: int) -> datetime:
         index = max(0, min(int(attempt_count) - 1, len(cls._RETRY_BACKOFF_SECONDS) - 1))
         return now + timedelta(seconds=cls._RETRY_BACKOFF_SECONDS[index])
+
+    @classmethod
+    def _completion_presentation_due(
+        cls, updated_at: datetime, attempts: int, now: datetime
+    ) -> bool:
+        attempts = int(attempts or 0)
+        if attempts <= 0:
+            return True
+        index = max(0, min(attempts - 1, len(cls._RETRY_BACKOFF_SECONDS) - 1))
+        return (
+            _aware(updated_at) + timedelta(seconds=cls._RETRY_BACKOFF_SECONDS[index])
+            <= now
+        )
 
     def __init__(self, database: Database):
         self.database = database
@@ -553,8 +567,9 @@ class CalendarMutationPlanRepository:
             return self._view(row, self._items(session, row.id))
 
     def pending_completion_presentations(
-        self, *, limit: int = 20
+        self, *, limit: int = 20, now: datetime | None = None
     ) -> list[dict[str, Any]]:
+        current = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
             rows = list(
                 session.scalars(
@@ -564,10 +579,20 @@ class CalendarMutationPlanRepository:
                         CalendarMutationPlan.completion_presented_at.is_(None),
                     )
                     .order_by(CalendarMutationPlan.updated_at)
-                    .limit(max(1, min(int(limit), 100)))
+                    .limit(100)
                 )
             )
-            return [self._view(row, self._items(session, row.id)) for row in rows]
+            due = [
+                row
+                for row in rows
+                if self._completion_presentation_due(
+                    row.updated_at, row.completion_presentation_attempts, current
+                )
+            ]
+            return [
+                self._view(row, self._items(session, row.id))
+                for row in due[: max(1, min(int(limit), 100))]
+            ]
 
     def mark_completion_presented(
         self,

@@ -88,10 +88,10 @@ class CalendarMutationPlanRunner:
         )
         if plan is None:
             pending = await asyncio.to_thread(
-                self.plans.pending_completion_presentations, limit=1
+                self.plans.pending_completion_presentations, limit=1, now=now
             )
             if pending:
-                await self._present(pending[0])
+                await self._present(pending[0], now=now)
                 return 1
             return 0
         await self._run_plan(plan, now=now)
@@ -212,7 +212,7 @@ class CalendarMutationPlanRunner:
             "succeeded",
             "partial_failed",
         }:
-            await self._present(final)
+            await self._present(final, now=now)
 
     @staticmethod
     def _outcome_unknown(exc: Exception) -> bool:
@@ -223,9 +223,21 @@ class CalendarMutationPlanRunner:
     async def _record_recovery_incident(
         self, plan: dict[str, Any], item: dict[str, Any], exc: Exception
     ) -> None:
+        repository = RuntimeIncidentRepository(self.plans.database)
         try:
+            already_reported = await asyncio.to_thread(
+                repository.has_incident,
+                subsystem="calendar_mutation_plan",
+                event_name="outcome_unknown_retry_exhausted",
+                details_match={
+                    "plan_id": str(plan["id"]),
+                    "item_id": str(item["id"]),
+                },
+            )
+            if already_reported:
+                return
             await asyncio.to_thread(
-                RuntimeIncidentRepository(self.plans.database).record,
+                repository.record,
                 severity="error",
                 subsystem="calendar_mutation_plan",
                 event_name="outcome_unknown_retry_exhausted",
@@ -247,17 +259,66 @@ class CalendarMutationPlanRunner:
                 plan.get("id"),
             )
 
-    async def _present(self, plan: dict[str, Any]) -> None:
+    async def _record_presentation_incident(
+        self, plan: dict[str, Any], recorded: dict[str, Any]
+    ) -> None:
+        repository = RuntimeIncidentRepository(self.plans.database)
+        error_code = str(recorded.get("completion_presentation_error") or "")
+        try:
+            already_reported = await asyncio.to_thread(
+                repository.has_incident,
+                subsystem="calendar_mutation_plan",
+                event_name="completion_presentation_retry_exhausted",
+                details_match={"plan_id": str(plan["id"])},
+            )
+            if already_reported:
+                return
+            await asyncio.to_thread(
+                repository.record,
+                severity="error",
+                subsystem="calendar_mutation_plan",
+                event_name="completion_presentation_retry_exhausted",
+                summary=(
+                    "Calendar mutation plan completion card is still unpresented "
+                    "after retry backoff"
+                ),
+                participant_id=uuid.UUID(str(plan["participant_id"])),
+                error_code=error_code[:128] or None,
+                error_class=error_code[:128] or None,
+                details={
+                    "plan_id": str(plan["id"]),
+                    "completion_presentation_attempts": recorded.get(
+                        "completion_presentation_attempts"
+                    ),
+                    "completion_presentation_error": error_code,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "calendar_mutation_plan_presentation_incident_failed plan_id=%s",
+                plan.get("id"),
+            )
+
+    async def _present(
+        self, plan: dict[str, Any], *, now: datetime | None = None
+    ) -> None:
         sender = self.sender
         message_id = str(plan.get("status_card_message_id") or "").strip()
         mark_failed = getattr(self.plans, "mark_completion_presentation_failed", None)
         mark_presented = getattr(self.plans, "mark_completion_presented", None)
 
         async def failed(error_code: str) -> None:
-            if callable(mark_failed):
-                await asyncio.to_thread(
-                    mark_failed, plan["id"], error_code=error_code
-                )
+            if not callable(mark_failed):
+                return
+            recorded = await asyncio.to_thread(
+                mark_failed, plan["id"], error_code=error_code, now=now
+            )
+            if (
+                recorded is not None
+                and int(recorded.get("completion_presentation_attempts") or 0)
+                >= self.plans._MAX_COMPLETION_PRESENTATION_ATTEMPTS
+            ):
+                await self._record_presentation_incident(plan, recorded)
 
         if sender is None:
             await failed("sender_unavailable")
@@ -316,7 +377,7 @@ class CalendarMutationPlanRunner:
             )
             await failed(type(exc).__name__)
         if presented and callable(mark_presented):
-            await asyncio.to_thread(mark_presented, plan["id"])
+            await asyncio.to_thread(mark_presented, plan["id"], now=now)
         elif not presented and not callable(mark_failed):
             logger.error(
                 "calendar_mutation_plan_result_presentation_unavailable plan_id=%s",

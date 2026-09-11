@@ -4383,6 +4383,35 @@ class RuntimeIncidentRepository:
             session.flush()
             return row.id
 
+    def has_incident(
+        self,
+        *,
+        subsystem: str,
+        event_name: str,
+        details_match: dict[str, str],
+        scan_limit: int = 200,
+    ) -> bool:
+        """Best-effort dedupe probe for recurring incident writers."""
+
+        with self.database.session() as session:
+            rows = session.scalars(
+                select(RuntimeIncident)
+                .where(
+                    RuntimeIncident.subsystem == str(subsystem)[:64],
+                    RuntimeIncident.event_name == str(event_name)[:128],
+                )
+                .order_by(desc(RuntimeIncident.created_at))
+                .limit(max(1, int(scan_limit)))
+            )
+            for row in rows:
+                details = dict(row.details_json or {})
+                if all(
+                    details.get(key) == value
+                    for key, value in details_match.items()
+                ):
+                    return True
+            return False
+
 
 class AgentRunRepository:
     def __init__(self, database: Database):
