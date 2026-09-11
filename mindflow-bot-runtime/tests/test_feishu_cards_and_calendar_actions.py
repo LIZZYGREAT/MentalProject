@@ -24,7 +24,10 @@ from app.integrations.feishu.cards import (
     today_calendar_card,
 )
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
-from app.integrations.feishu.card_callback import FeishuCardCallbackServer
+from app.integrations.feishu.card_callback import (
+    FeishuCardCallbackServer,
+    _callback_error_text,
+)
 from app.integrations.feishu.gateway import (
     BotEvent,
     CardActionEvent,
@@ -43,6 +46,12 @@ from app.services.curve_analysis import analyze_curve
 from app.services.presentation_service import PendingImageCard, PresentationOutbox
 from app.tools.care import CareTools
 from app.worker import BotWorker
+
+
+def test_card_callback_error_text_distinguishes_expired_content():
+    assert "已过期" in _callback_error_text(ValueError("draft has expired"))
+    assert "最新卡片" in _callback_error_text(LookupError("not_found"))
+    assert _callback_error_text(RuntimeError("unexpected")) == "提交失败，请稍后重试"
 from helpers import memory_database, participant, skill_path
 
 

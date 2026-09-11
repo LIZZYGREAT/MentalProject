@@ -38,6 +38,23 @@ _PERIOD_TIME_MAPPING_LINE = re.compile(
 )
 
 
+def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
+    reply_text = "这份课程表预览已过期，请重新发送图片后再操作。"
+    return {
+        "ok": True,
+        "error": "course_schedule_import_expired",
+        "status": "expired",
+        "import_id": str(import_id),
+        "reply_text": reply_text,
+        "card": course_schedule_result_card(
+            reply_text,
+            status="expired",
+            import_id=str(import_id),
+            error="course_schedule_import_expired",
+        ),
+    }
+
+
 def _boolean(value: Any, field: str) -> bool:
     normalized = str(value).strip().lower()
     if normalized == "true":
@@ -163,6 +180,8 @@ class CardActionService:
                     draft = drafts.get(import_id)
                     if draft is None or str(draft.get("participant_id")) != str(participant_id):
                         return {"ok": False, "error": "course_schedule_import_not_found"}
+                    if str(draft.get("status") or "") == "expired":
+                        return _expired_schedule_card_result(import_id)
                     if (
                         str(draft.get("status") or "") != "pending_context"
                         or draft.get("recurrence_strategy")
@@ -199,6 +218,8 @@ class CardActionService:
                     # belongs to a different participant or has expired.
                     return {"ok": False, "error": "course_schedule_import_not_found"}
                 except ValueError as exc:
+                    if "expired" in str(exc).lower():
+                        return _expired_schedule_card_result(import_id)
                     return {
                         "ok": True,
                         "reply_text": f"信息格式需要调整：{str(exc)[:120]}",

@@ -976,7 +976,7 @@ def test_image_workflow_does_not_write_before_card_confirmation():
     assert calendar.calls == []
 
 
-def test_expired_draft_is_rejected_and_persisted_as_expired():
+def test_expired_draft_returns_readable_result_and_is_persisted_as_expired():
     database = memory_database()
     owner = participant(database, "P001")
     repo = CourseScheduleImportRepository(database)
@@ -991,13 +991,64 @@ def test_expired_draft_is_rejected_and_persisted_as_expired():
         ttl_minutes=1,
         now=datetime.now(timezone.utc) - timedelta(minutes=2),
     )
-    with pytest.raises(ValueError, match="expired"):
-        asyncio.run(
-            CourseScheduleImportService(repo, Calendar(), Tokens()).confirm(
-                owner.id, draft["id"]
-            )
+    result = asyncio.run(
+        CourseScheduleImportService(repo, Calendar(), Tokens()).confirm(
+            owner.id, draft["id"]
         )
+    )
+    assert result["status"] == "expired"
+    assert result["error"] == "course_schedule_import_expired"
+    assert "已过期" in result["reply_text"]
     assert repo.get(draft["id"])["status"] == "expired"
+
+
+def test_expired_context_card_buttons_return_a_terminal_result_card():
+    database = memory_database()
+    owner = participant(database, "P001-CONTEXT-EXPIRED")
+    repo = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="om-context-expired",
+        source_image_hash="f" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        ttl_minutes=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    with pytest.raises(ValueError, match="expired"):
+        repo.validate_for_confirmation(owner.id, draft["id"])
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=CourseScheduleImportService(
+            repo, Calendar(), Tokens()
+        ),
+    )
+
+    for action_name in (
+        "course_schedule_import_context_open",
+        "course_schedule_import_context_submit",
+    ):
+        result = handler.handle(
+            owner.id,
+            message_id="card-message",
+            action_value={
+                "mindflow_action": action_name,
+                "version": "3",
+                "import_id": draft["id"],
+            },
+            form_value={"semester_start_date": "2026-09-07"},
+        )
+        assert result["ok"] is True
+        assert result["status"] == "expired"
+        assert "已过期" in result["reply_text"]
+        assert "course_schedule_import_confirm" not in json.dumps(
+            result["card"], ensure_ascii=False
+        )
 
 
 def test_pending_context_and_pending_confirmation_are_the_only_ttl_states():

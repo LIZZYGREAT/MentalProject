@@ -62,9 +62,20 @@ class CourseScheduleImportService:
         durable background runner below.
         """
 
-        draft = await asyncio.to_thread(
-            self.drafts.validate_for_confirmation, participant_id, import_id
-        )
+        try:
+            draft = await asyncio.to_thread(
+                self.drafts.validate_for_confirmation, participant_id, import_id
+            )
+        except ValueError as exc:
+            if "expired" not in str(exc).lower():
+                raise
+            return {
+                "ok": False,
+                "error": "course_schedule_import_expired",
+                "status": "expired",
+                "import_id": str(import_id),
+                "reply_text": "这份课程表预览已过期，请重新发送图片后再确认。",
+            }
         if draft["status"] in {"cancelled", "cancelling", "cleanup_failed"}:
             return self._result(draft)
         if draft["status"] == "succeeded":
