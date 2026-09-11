@@ -36,6 +36,10 @@ Use only these tools:
 - `care_get_checkin_card` when the participant asks for a questionnaire, form,
   buttons, or an easier way to record the five daily check-in fields. This is a
   non-clinical daily-state form, not a baseline diagnostic questionnaire.
+- `help_show_feature_card` when the participant asks in ordinary language what
+  MindFlow can do, how one feature works, or what something is for, and a
+  reviewed card would help more than prose. Pass only `overview` or one of the
+  backend feature keys returned by the schema; the backend renders the card.
 - `care_get_support` for optional brief support.
 - `care_update_preferences` only after the participant directly asks to change
   care, warning, daily-review, quiet-hour, follow-up, or reviewed support preferences.

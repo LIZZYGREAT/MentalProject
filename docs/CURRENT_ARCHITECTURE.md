@@ -2,7 +2,7 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 18 -->
+<!-- BUSINESS_TOOL_COUNT: 19 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
 <!-- ALEMBIC_HEAD: 0050_calendar_plan_retry_backoff -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
@@ -47,6 +47,7 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `care_get_pressure_curve`
 - `care_simulate_schedule_change`
 - `care_get_checkin_card`
+- `help_show_feature_card`
 - `calendar_connection_status`
 - `calendar_list_calendars`
 - `calendar_list_events`

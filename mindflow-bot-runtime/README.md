@@ -39,7 +39,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
-<!-- BUSINESS_TOOL_COUNT: 18 -->
+<!-- BUSINESS_TOOL_COUNT: 19 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
 <!-- ALEMBIC_HEAD: 0050_calendar_plan_retry_backoff -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
@@ -61,6 +61,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `care_get_pressure_curve`
 - `care_simulate_schedule_change`
 - `care_get_checkin_card`
+- `help_show_feature_card`
 - `calendar_connection_status`
 - `calendar_list_calendars`
 - `calendar_list_events`

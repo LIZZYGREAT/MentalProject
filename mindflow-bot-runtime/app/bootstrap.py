@@ -292,6 +292,9 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
         calendar_mutation_plans=calendar_mutation_plans,
+        feature_capabilities={
+            "daily_review_enabled": settings.daily_review_enabled,
+        },
     )
     care_tools.register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(

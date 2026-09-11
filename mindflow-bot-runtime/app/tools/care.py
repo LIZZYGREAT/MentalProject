@@ -21,6 +21,11 @@ from app.integrations.feishu.cards import (
     daily_checkin_card,
     pressure_curve_card,
 )
+from app.presentation.feature_cards import (
+    OVERVIEW_FEATURE_KEY,
+    build_feature_card,
+    visible_feature_keys,
+)
 from app.integrations.feishu.calendar import (
     CalendarMutationOutcomeUnknown,
     CalendarMutationRejected,
@@ -248,6 +253,7 @@ class CareTools:
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         calendar_mutation_plans: Any = None,
+        feature_capabilities: Any = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -276,6 +282,7 @@ class CareTools:
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
         self.calendar_mutation_plans = calendar_mutation_plans
+        self.feature_keys = visible_feature_keys(feature_capabilities)
         self.calendar_mutation_plan_notifier: Any = None
         self.what_if = (
             CareWhatIfSimulationService(forecast_coordinator)
@@ -503,6 +510,30 @@ class CareTools:
             "Queue the reviewed Feishu daily-state questionnaire card for this participant.",
             _empty_schema(),
             self.get_checkin_card,
+            effect="ui_effect",
+            authorization_requirement="none",
+        )
+        registry.register(
+            "help_show_feature_card",
+            "Queue one reviewed MindFlow feature guide card, or the full feature "
+            "overview, when the participant asks in natural language what MindFlow "
+            "can do or how one feature works.",
+            {
+                "type": "object",
+                "properties": {
+                    "feature_key": {
+                        "type": "string",
+                        "enum": [*self.feature_keys, OVERVIEW_FEATURE_KEY],
+                        "description": (
+                            "One backend feature key, or 'overview' for the full "
+                            "feature list."
+                        ),
+                    }
+                },
+                "required": ["feature_key"],
+                "additionalProperties": False,
+            },
+            self.show_help_feature_card,
             effect="ui_effect",
             authorization_requirement="none",
         )
@@ -1365,6 +1396,20 @@ class CareTools:
             "card_queued": True,
             "questionnaire": "daily_non_clinical_checkin_v1",
         }
+
+    def show_help_feature_card(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            raise RuntimeError("rich reply delivery is unavailable")
+        feature_key = str(args.get("feature_key") or "").strip()
+        # The registry enum already restricted the key; this second gate keeps
+        # the queued card a reviewed, backend-owned render.
+        card = build_feature_card(feature_key, self.feature_keys)
+        if card is None:
+            return {"ok": False, "error": "unsupported_feature"}
+        self.presentations.stage_card(ctx.agent_run_id, card)
+        return {"ok": True, "card_queued": True, "feature_key": feature_key}
 
     def calendar_connection_status(
         self, ctx: AgentContext, _args: dict[str, Any]

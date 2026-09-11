@@ -312,3 +312,50 @@ def test_bind_success_falls_back_to_the_durable_text_first_screen():
     asyncio.run(scenario())
     assert sender.cards == []
     assert sender.sent == [("oc", welcome_first_screen_text())]
+
+
+def test_agent_can_only_queue_reviewed_feature_cards():
+    from app.agent.context import AgentContext
+    from app.agent.tool_registry import ToolRegistry
+    from app.tools.care import CareTools
+
+    staged = []
+
+    class Presentations:
+        def stage_card(self, agent_run_id, card):
+            staged.append((agent_run_id, card))
+
+    registry = ToolRegistry()
+    tools = CareTools(
+        None, None, None, None, "Asia/Shanghai", None,
+        presentations=Presentations(),
+        feature_capabilities={"daily_review_enabled": False},
+    )
+    tools.register(registry)
+    assert "help_show_feature_card" in registry.names
+    spec = {s.name: s for s in registry.specs}["help_show_feature_card"]
+    assert spec.effect == "ui_effect"
+    assert spec.authorization_requirement == "none"
+
+    ctx = AgentContext(
+        uuid.uuid4(), "P001", "ou", "oc", "om", uuid.uuid4()
+    )
+
+    async def run():
+        return await registry.execute(
+            ctx, "help_show_feature_card", {"feature_key": "overview"}
+        )
+
+    result = asyncio.run(run()).result
+    assert result["ok"] is True
+    assert result["card_queued"] is True
+    assert len(staged) == 1
+    assert card_action_values(staged[0][1])[0]["mindflow_action"] == "feature_open"
+
+    async def run_hidden():
+        return await registry.execute(
+            ctx, "help_show_feature_card", {"feature_key": "daily_review"}
+        )
+
+    rejected = asyncio.run(run_hidden()).result
+    assert rejected["error"] == "invalid_arguments"
