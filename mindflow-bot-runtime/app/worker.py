@@ -57,7 +57,14 @@ from app.presentation.contracts import (
     RuntimeResponse,
 )
 from app.presentation.progress_policy import should_force_silent_progress
-from app.presentation.user_capabilities import help_text, onboarding_text
+from app.presentation.onboarding import (
+    already_bound_text,
+    bind_unavailable_text,
+    invalid_invite_text,
+    unbound_welcome_text,
+    welcome_first_screen_text,
+)
+from app.presentation.user_capabilities import help_text
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import (
@@ -85,6 +92,10 @@ from app.services.multimodal_turn_coordinator import (
 
 logger = logging.getLogger(__name__)
 BIND_PATTERN = re.compile(r"^/bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
+# Minimal shape gate before any token lookup: a bare URL-safe token as
+# produced by secrets.token_urlsafe. Ordinary sentences (spaces, CJK,
+# punctuation) never reach the binding query.
+INVITE_TOKEN_SHAPE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 CALENDAR_CONNECT_PATTERN = re.compile(
     r"^/(?:calendar|connect-calendar)\s*$", re.IGNORECASE
 )
@@ -594,12 +605,16 @@ class BotWorker:
                 return
             bind_match = BIND_PATTERN.match(event.text) if event.message_type == "text" else None
             if participant is None:
-                if bind_match is None:
-                    await self._deliver(event, "尚未绑定。请发送：/bind 你的绑定码")
-                    return
-                raw_token = bind_match.group(1)
+                raw_token = None
+                if bind_match is not None:
+                    raw_token = str(bind_match.group(1) or "").strip()
+                elif (
+                    event.message_type == "text"
+                    and INVITE_TOKEN_SHAPE.fullmatch(event.text.strip())
+                ):
+                    raw_token = event.text.strip()
                 if not raw_token:
-                    await self._deliver(event, "请在 /bind 后填写一次性绑定码。")
+                    await self._deliver(event, unbound_welcome_text())
                     return
                 try:
                     participant = await asyncio.to_thread(
@@ -610,18 +625,18 @@ class BotWorker:
                         chat_id=event.chat_id,
                     )
                 except BindingError:
-                    await self._deliver(event, "绑定码无效、已使用或已过期。")
+                    await self._deliver(event, invalid_invite_text())
                     return
                 except Exception:
-                    await self._deliver(event, "绑定服务暂时不可用，请稍后重试。")
+                    await self._deliver(event, bind_unavailable_text())
                     return
                 await asyncio.to_thread(
                     self.events.assign_participant, event.event_id, participant.id
                 )
-                await self._deliver(event, onboarding_text(participant.participant_code))
+                await self._deliver(event, welcome_first_screen_text())
                 return
             if bind_match is not None:
-                await self._deliver(event, "当前飞书账号已经绑定。")
+                await self._deliver(event, already_bound_text())
                 return
             if STOP_PATTERN.match(event.text):
                 stop_generation = (

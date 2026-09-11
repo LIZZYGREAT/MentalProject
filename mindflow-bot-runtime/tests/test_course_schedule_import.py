@@ -36,7 +36,8 @@ from app.repositories_course_schedule import (
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
-from app.presentation.user_capabilities import help_text, onboarding_text
+from app.presentation.onboarding import welcome_first_screen_text
+from app.presentation.user_capabilities import help_text
 from app.repositories import (
     AgentRunRepository, BindingRepository, BotEventRepository, ParticipantRepository,
 )
@@ -973,7 +974,7 @@ def test_bind_and_help_use_stable_copy_without_agent():
 
     asyncio.run(scenario())
     assert sender.sent == [
-        onboarding_text("P009"),
+        welcome_first_screen_text(),
         help_text(),
         "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
     ]

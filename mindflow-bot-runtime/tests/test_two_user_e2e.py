@@ -5,8 +5,8 @@ from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
 from app.presentation.contracts import AgentActivityEvent
 from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
+from app.presentation.onboarding import welcome_first_screen_text
 from app.worker import BotWorker
-from app.presentation.user_capabilities import onboarding_text
 from helpers import memory_database, participant, skill_path
 from app.repositories import ParticipantRepository
 
@@ -212,7 +212,7 @@ def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent(caplo
                 recovered.chat_type,
             )
         )
-        assert second_sender.sent == [("oc_1", onboarding_text("P001"))]
+        assert second_sender.sent == [("oc_1", welcome_first_screen_text())]
         assert runtime.seen == []
 
     asyncio.run(scenario())
