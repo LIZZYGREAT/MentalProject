@@ -240,11 +240,14 @@ def test_calendar_create_persists_preintent_before_remote_call_and_resolves():
         observed_remote_statuses = []
 
         class Calendar:
-            async def create_event(self, _participant_id, **values):
+            async def create_single_event(self, _participant_id, **values):
                 with database.session() as session:
                     row = session.query(CalendarMutationReconciliation).one()
                     observed_remote_statuses.append([row.status])
                     assert row.work_json["operation"]["operation_type"] == "create"
+                    assert row.work_json["operation"]["requested"][
+                        "recurrence_mode"
+                    ] == "single"
                 return {
                     "id": "provider-event-1",
                     "start_time": values["start_time"].isoformat(),
@@ -282,6 +285,7 @@ def test_calendar_create_persists_preintent_before_remote_call_and_resolves():
             ctx,
             {
                 "summary": "课程",
+                "recurrence_mode": "single",
                 "start_time": start.isoformat(),
                 "end_time": (start + timedelta(hours=1)).isoformat(),
             },
@@ -309,7 +313,7 @@ def test_calendar_remote_failure_resolves_preintent_as_remote_failed():
         forecasts = ForecastSnapshotRepository(database)
 
         class Calendar:
-            async def create_event(self, *_args, **_kwargs):
+            async def create_single_event(self, *_args, **_kwargs):
                 with database.session() as session:
                     assert session.query(
                         CalendarMutationReconciliation
@@ -347,6 +351,7 @@ def test_calendar_remote_failure_resolves_preintent_as_remote_failed():
                 ctx,
                 {
                     "summary": "课程",
+                    "recurrence_mode": "single",
                     "start_time": start.isoformat(),
                     "end_time": (start + timedelta(hours=1)).isoformat(),
                 },
@@ -408,6 +413,43 @@ def test_startup_barrier_ignores_old_process_grace_but_not_live_request_grace():
     asyncio.run(scenario())
 
 
+def test_startup_recovery_respects_an_unexpired_processing_lease():
+    async def scenario():
+        database = memory_database()
+        person = participant(database, "CALENDAR-STARTUP-LEASE")
+        reconciliations = CalendarMutationReconciliationRepository(database)
+        process_started_at = datetime.now(timezone.utc)
+        target = date(2030, 2, 4)
+        intent = reconciliations.create(
+            person.id,
+            mutation_kind="calendar_create_event",
+            direct_dates={target},
+            refresh_targets={target: True},
+            dependency_sources={},
+            now=process_started_at - timedelta(seconds=1),
+        )
+        claim_token = uuid.uuid4()
+        claimed = reconciliations.claim_processing(
+            intent["id"], claim_token=claim_token
+        )
+        queue = ForecastMutationRefreshQueue(
+            Coordinator(),
+            reconciliations=reconciliations,
+            recovery_poll_seconds=3600,
+        )
+        queue.start()
+        recovered = await queue.recover_startup_fences(process_started_at)
+        current = reconciliations.get(intent["id"])
+        await queue.close()
+        return recovered, current
+
+    recovered, current = asyncio.run(scenario())
+
+    assert recovered == 0
+    assert current["status"] == "prepared"
+    assert current["work"]["processing_claim_token"]
+
+
 def test_timeout_after_mutation_request_stays_recoverable_and_is_fenced():
     async def scenario():
         database = memory_database()
@@ -416,7 +458,7 @@ def test_timeout_after_mutation_request_stays_recoverable_and_is_fenced():
         forecasts = ForecastSnapshotRepository(database)
 
         class Calendar:
-            async def create_event(self, *_args, **_kwargs):
+            async def create_single_event(self, *_args, **_kwargs):
                 raise CalendarMutationOutcomeUnknown(
                     "response timed out after request dispatch",
                     request_kind="create_event",
@@ -453,6 +495,7 @@ def test_timeout_after_mutation_request_stays_recoverable_and_is_fenced():
                 ctx,
                 {
                     "summary": "课程",
+                    "recurrence_mode": "single",
                     "start_time": start.isoformat(),
                     "end_time": (start + timedelta(hours=1)).isoformat(),
                 },
@@ -815,7 +858,7 @@ def test_preflight_failure_is_terminal_and_never_enters_replay_queue():
         forecasts = ForecastSnapshotRepository(database)
 
         class Calendar:
-            async def create_event(self, *_args, **_kwargs):
+            async def create_single_event(self, *_args, **_kwargs):
                 raise CalendarMutationNotSent(
                     "primary calendar lookup failed",
                     request_kind="primary_calendar_lookup",
@@ -846,6 +889,7 @@ def test_preflight_failure_is_terminal_and_never_enters_replay_queue():
                 ctx,
                 {
                     "summary": "课程",
+                    "recurrence_mode": "single",
                     "start_time": start.isoformat(),
                     "end_time": (start + timedelta(hours=1)).isoformat(),
                 },
@@ -869,7 +913,7 @@ def test_cancel_after_remote_commit_is_immediately_recoverable():
         forecasts = ForecastSnapshotRepository(database)
 
         class Calendar:
-            async def create_event(self, _participant_id, **values):
+            async def create_single_event(self, _participant_id, **values):
                 return {
                     "id": "provider-event-cancel",
                     "start_time": values["start_time"].isoformat(),
@@ -947,6 +991,7 @@ def test_cancel_after_remote_commit_is_immediately_recoverable():
                 ctx,
                 {
                     "summary": "课程",
+                    "recurrence_mode": "single",
                     "start_time": start.isoformat(),
                     "end_time": (start + timedelta(hours=1)).isoformat(),
                 },

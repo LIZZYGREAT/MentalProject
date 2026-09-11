@@ -86,6 +86,8 @@ def test_tool_schema_rejects_cross_user_argument():
             "additionalProperties": False,
         },
         handler,
+        effect="read",
+        authorization_requirement="none",
     )
     trusted_id = uuid.uuid4()
     ctx = AgentContext(trusted_id, "P001", "ou_1", "oc_1", "m1", uuid.uuid4())
@@ -109,4 +111,6 @@ def test_tool_schema_rejects_cross_user_argument():
                 "additionalProperties": False,
             },
             handler,
+            effect="read",
+            authorization_requirement="none",
         )

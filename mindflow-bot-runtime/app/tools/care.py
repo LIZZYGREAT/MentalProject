@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
-from typing import Any
+from typing import Any, Literal
 import uuid
 from zoneinfo import ZoneInfo
 
 
 from app.agent.context import AgentContext
-from app.agent.tool_registry import ToolRegistry
+from app.agent.tool_registry import (
+    AuthorizationContextResolutionError,
+    ToolRegistry,
+)
 from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
 from app.integrations.feishu.calendar import (
     CalendarMutationOutcomeUnknown,
@@ -45,6 +48,27 @@ from app.services.token_service import TokenRepository
 
 
 logger = logging.getLogger(__name__)
+
+
+CalendarTargetScope = Literal[
+    "single_event",
+    "recurring_series",
+    "recurring_occurrence",
+    "recurring_exception_occurrence",
+]
+
+
+def _calendar_target_scope(event: dict[str, Any]) -> CalendarTargetScope:
+    has_parent_series = bool(str(event.get("recurring_event_id") or "").strip())
+    is_exception = bool(event.get("is_exception"))
+    has_recurrence_rule = bool(str(event.get("recurrence") or "").strip())
+    if has_parent_series and is_exception:
+        return "recurring_exception_occurrence"
+    if has_parent_series:
+        return "recurring_occurrence"
+    if has_recurrence_rule:
+        return "recurring_series"
+    return "single_event"
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -132,6 +156,36 @@ def _recurrence_from_args(args: dict[str, Any], timezone_value: ZoneInfo) -> str
     return recurrence
 
 
+def _creation_recurrence_from_args(
+    args: dict[str, Any], timezone_value: ZoneInfo
+) -> tuple[str, str | None]:
+    mode = str(args.get("recurrence_mode") or "").strip().lower()
+    provided = {
+        name
+        for name in (
+            "recurrence_frequency",
+            "recurrence_weekdays",
+            "recurrence_count",
+            "recurrence_until",
+        )
+        if args.get(name) not in (None, "", [])
+    }
+    if args.get("recurrence_interval") not in (None, 1):
+        provided.add("recurrence_interval")
+    if mode == "single":
+        if provided:
+            raise ValueError("single calendar event cannot include recurrence fields")
+        return mode, None
+    if mode == "recurring":
+        if not args.get("recurrence_frequency"):
+            raise ValueError("recurring calendar event requires recurrence_frequency")
+        recurrence = _recurrence_from_args(args, timezone_value)
+        if not recurrence:
+            raise ValueError("recurring calendar event requires recurrence_frequency")
+        return mode, recurrence
+    raise ValueError("recurrence_mode must be single or recurring")
+
+
 def _validate_generated_weekly_recurrence(
     recurrence: str | None, start_time: datetime
 ) -> None:
@@ -210,6 +264,8 @@ class CareTools:
             "Return this participant's current profile, recent check-in, and latest forecast.",
             _empty_schema(),
             self.get_today_context,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "care_record_checkin",
@@ -239,6 +295,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.record_checkin,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_get_recent_state",
@@ -251,12 +309,16 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_recent_state,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "care_run_today_assessment",
             "Run today's reviewed MindFlow model using its active versioned state definition.",
             _empty_schema(),
             self.run_assessment,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_get_support",
@@ -269,6 +331,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_support,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_update_preferences",
@@ -340,6 +404,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_care_preferences,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_respond_to_latest_intervention",
@@ -366,6 +432,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.respond_to_latest_care,
+            effect="internal_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "care_get_pressure_curve",
@@ -382,6 +450,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.get_pressure_curve,
+            effect="ui_effect",
+            authorization_requirement="none",
         )
         registry.register(
             "care_simulate_schedule_change",
@@ -398,24 +468,32 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.simulate_schedule_change,
+            effect="compute",
+            authorization_requirement="none",
         )
         registry.register(
             "care_get_checkin_card",
             "Queue the reviewed Feishu daily-state questionnaire card for this participant.",
             _empty_schema(),
             self.get_checkin_card,
+            effect="ui_effect",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_connection_status",
             "Return whether this participant has a usable Feishu calendar authorization.",
             _empty_schema(),
             self.calendar_connection_status,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_list_calendars",
             "List calendars visible to this participant without exposing calendar identifiers.",
             _empty_schema(),
             self.list_calendars,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_list_events",
@@ -438,6 +516,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.list_calendar_events,
+            effect="read",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_create_event",
@@ -446,6 +526,10 @@ class CareTools:
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "recurrence_mode": {
+                        "type": "string",
+                        "enum": ["single", "recurring"],
+                    },
                     "start_time": {
                         "type": "string",
                         "format": "date-time",
@@ -464,14 +548,18 @@ class CareTools:
                     },
                     **_recurrence_schema_properties(),
                 },
-                "required": ["summary", "start_time", "end_time"],
+                "required": [
+                    "summary", "start_time", "end_time", "recurrence_mode"
+                ],
                 "additionalProperties": False,
             },
             self.create_calendar_event,
+            effect="external_write",
+            authorization_requirement="direct_request",
         )
         registry.register(
             "calendar_update_event",
-            "Update one exact event in this participant's primary calendar after confirmation.",
+            "Update one exact event in this participant's primary calendar after a direct user request authorized by the backend.",
             {
                 "type": "object",
                 "properties": {
@@ -492,20 +580,25 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_event,
+            effect="external_write",
+            authorization_requirement="direct_request",
+            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
         )
         registry.register(
             "calendar_delete_event",
-            "Delete one exact event from this participant's primary calendar after explicit confirmation.",
+            "Delete one exact event from this participant's primary calendar after an explicit destructive request authorized by the backend.",
             {
                 "type": "object",
                 "properties": {
                     "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "confirmed": {"type": "boolean", "const": True},
                 },
-                "required": ["event_id", "confirmed"],
+                "required": ["event_id"],
                 "additionalProperties": False,
             },
             self.delete_calendar_event,
+            effect="destructive_external_write",
+            authorization_requirement="explicit_destructive_request",
+            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -1250,9 +1343,12 @@ class CareTools:
     ) -> dict[str, Any]:
         start_time = _parse_datetime(args["start_time"], self.timezone)
         end_time = _parse_datetime(args["end_time"], self.timezone)
-        recurrence = _recurrence_from_args(args, self.timezone)
+        recurrence_mode, recurrence = _creation_recurrence_from_args(
+            args, self.timezone
+        )
         requested_event = {
             "summary": str(args["summary"]),
+            "recurrence_mode": recurrence_mode,
             "description": str(args.get("description") or ""),
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),
@@ -1276,16 +1372,22 @@ class CareTools:
             },
         )
         try:
-            event = await self.calendar.create_event(
-                ctx.participant_id,
-                summary=str(args["summary"]),
-                description=str(args.get("description") or ""),
-                start_time=start_time,
-                end_time=end_time,
-                reminder_minutes=args.get("reminder_minutes"),
-                recurrence=recurrence,
-                source_message_id=ctx.message_id,
+            create = (
+                self.calendar.create_single_event
+                if recurrence_mode == "single"
+                else self.calendar.create_recurring_event
             )
+            create_args = {
+                "summary": str(args["summary"]),
+                "description": str(args.get("description") or ""),
+                "start_time": start_time,
+                "end_time": end_time,
+                "reminder_minutes": args.get("reminder_minutes"),
+                "source_message_id": ctx.message_id,
+            }
+            if recurrence_mode == "recurring":
+                create_args["recurrence"] = recurrence
+            event = await create(ctx.participant_id, **create_args)
         except PermissionError as exc:
             await self._finish_remote_mutation_intent(
                 reconciliation, error=exc
@@ -1317,6 +1419,58 @@ class CareTools:
             ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
+
+    async def resolve_calendar_event_authorization_context(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve one participant-bound event without exposing provider identity."""
+
+        try:
+            event = await self.calendar.get_event(
+                ctx.participant_id, str(args["event_id"])
+            )
+        except PermissionError as exc:
+            raise AuthorizationContextResolutionError(
+                "calendar_not_connected"
+            ) from exc
+        except CalendarMutationRejected as exc:
+            reason_code = (
+                "authorization_target_not_found"
+                if exc.status_code == 404
+                else "authorization_context_failure"
+            )
+            raise AuthorizationContextResolutionError(reason_code) from exc
+
+        if not isinstance(event, dict) or not str(event.get("id") or "").strip():
+            raise AuthorizationContextResolutionError(
+                "authorization_target_not_found"
+            )
+
+        def optional_text(field: str, max_length: int) -> str | None:
+            value = event.get(field)
+            if value is None:
+                return None
+            return str(value)[:max_length]
+
+        def local_time(field: str) -> str | None:
+            value = optional_text(field, 64)
+            if not value or (len(value) == 10 and value.count("-") == 2):
+                return value
+            try:
+                return _parse_datetime(value, self.timezone).isoformat()
+            except ValueError:
+                return value
+
+        return {
+            "target": {
+                "summary": str(event.get("summary") or "")[:200],
+                "start_time": local_time("start_time"),
+                "end_time": local_time("end_time"),
+                "recurrence": optional_text("recurrence", 500),
+                "timezone": str(self.timezone),
+                "scope_kind": _calendar_target_scope(event),
+            }
+        }
 
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -1444,8 +1598,6 @@ class CareTools:
     async def delete_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        if args.get("confirmed") is not True:
-            return {"ok": False, "error": "explicit_confirmation_required"}
         try:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])

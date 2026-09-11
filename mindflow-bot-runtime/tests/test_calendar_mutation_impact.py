@@ -271,7 +271,7 @@ def test_recurring_calendar_create_invalidates_real_persisted_forecasts():
     end = start + timedelta(hours=1)
 
     class Calendar:
-        async def create_event(self, *_args, **_kwargs):
+        async def create_recurring_event(self, *_args, **_kwargs):
             return _event(
                 start,
                 end,
@@ -308,6 +308,7 @@ def test_recurring_calendar_create_invalidates_real_persisted_forecasts():
             ctx,
             {
                 "summary": "重复课程",
+                "recurrence_mode": "recurring",
                 "start_time": start.isoformat(),
                 "end_time": end.isoformat(),
                 "recurrence_frequency": "DAILY",
@@ -343,7 +344,7 @@ def test_large_recurring_mutation_invalidates_all_before_return_without_waiting_
     end = start + timedelta(hours=1)
 
     class Calendar:
-        async def create_event(self, *_args, **_kwargs):
+        async def create_recurring_event(self, *_args, **_kwargs):
             return _event(
                 start,
                 end,
@@ -389,6 +390,7 @@ def test_large_recurring_mutation_invalidates_all_before_return_without_waiting_
                 ctx,
                 {
                     "summary": "长期重复课程",
+                    "recurrence_mode": "recurring",
                     "start_time": start.isoformat(),
                     "end_time": end.isoformat(),
                     "recurrence_frequency": "DAILY",

@@ -10,7 +10,7 @@ import json
 import logging
 import multiprocessing
 from queue import Empty
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from app.identity.service import IdentityService
 from app.repositories import BotEventRepository
@@ -21,6 +21,50 @@ logger = logging.getLogger(__name__)
 
 class InvalidBotEvent(ValueError):
     pass
+
+
+def _message_content(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise InvalidBotEvent("invalid message content") from exc
+    if not isinstance(value, Mapping):
+        raise InvalidBotEvent("message content must be an object")
+    return value
+
+
+def _post_image_and_text(content: Mapping[str, Any]) -> tuple[str, str]:
+    """Extract the first image and visible text from a Feishu rich-text post."""
+
+    blocks: list[Any] = []
+    direct_blocks = content.get("content")
+    if isinstance(direct_blocks, list):
+        blocks.append(direct_blocks)
+    for localized in content.values():
+        if not isinstance(localized, Mapping):
+            continue
+        localized_blocks = localized.get("content")
+        if isinstance(localized_blocks, list):
+            blocks.append(localized_blocks)
+
+    text_parts: list[str] = []
+    image_key = ""
+    for rows in blocks:
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            for element in row:
+                if not isinstance(element, Mapping):
+                    continue
+                tag = str(element.get("tag") or "").strip().lower()
+                if tag == "text":
+                    text = str(element.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+                elif tag == "img" and not image_key:
+                    image_key = str(element.get("image_key") or "").strip()
+    return "\n".join(text_parts)[:4000], image_key
 
 
 class FeishuReceiverError(RuntimeError):
@@ -37,25 +81,31 @@ class BotEvent:
     text: str
     create_time: datetime
     chat_type: str = "p2p"
+    message_type: str = "text"
+    image_key: str | None = None
 
     def to_ipc_payload(self) -> dict[str, str]:
         """Return a stable, SDK-free payload suitable for process IPC."""
 
-        return {
+        payload = {
             "event_id": self.event_id,
             "message_id": self.message_id,
             "app_id": self.app_id,
             "open_id": self.open_id,
             "chat_id": self.chat_id,
             "chat_type": self.chat_type,
-            "message_type": "text",
+            "message_type": self.message_type,
             "text": self.text,
             "create_time": self.create_time.astimezone(timezone.utc).isoformat(),
         }
+        if self.message_type == "image":
+            payload["image_key"] = self.image_key or ""
+        return payload
 
     @classmethod
     def from_ipc_payload(cls, payload: dict[str, Any]) -> "BotEvent":
-        if payload.get("message_type") != "text":
+        message_type = str(payload.get("message_type") or "").strip()
+        if message_type not in {"text", "image"}:
             raise InvalidBotEvent("unsupported IPC message type")
         required = (
             "event_id",
@@ -63,12 +113,17 @@ class BotEvent:
             "app_id",
             "open_id",
             "chat_id",
-            "text",
             "create_time",
         )
         values = {name: str(payload.get(name) or "").strip() for name in required}
         if not all(values.values()):
             raise InvalidBotEvent("IPC event is missing required fields")
+        text = str(payload.get("text") or "").strip()
+        image_key = str(payload.get("image_key") or "").strip()
+        if message_type == "text" and not text:
+            raise InvalidBotEvent("IPC text event is empty")
+        if message_type == "image" and not image_key:
+            raise InvalidBotEvent("IPC image event has no image_key")
         try:
             created = datetime.fromisoformat(values["create_time"])
         except ValueError as exc:
@@ -81,9 +136,11 @@ class BotEvent:
             app_id=values["app_id"],
             open_id=values["open_id"],
             chat_id=values["chat_id"],
-            text=values["text"][:4000],
             create_time=created.astimezone(timezone.utc),
             chat_type=str(payload.get("chat_type") or "p2p"),
+            message_type=message_type,
+            text=text[:4000],
+            image_key=image_key or None,
         )
 
 
@@ -240,17 +297,21 @@ class FeishuEventParser:
         event_id = header.get("event_id") or payload.get("event_id") or message_id
         if not all((event_id, message_id, open_id, chat_id)):
             raise InvalidBotEvent("message event is missing routing fields")
-        if str(message.get("message_type") or "") != "text":
+        raw_message_type = str(message.get("message_type") or "")
+        if raw_message_type not in {"text", "image", "post"}:
             raise InvalidBotEvent("unsupported message type")
-        content = message.get("content") or "{}"
-        if isinstance(content, str):
-            try:
-                content = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise InvalidBotEvent("invalid text message content") from exc
-        text = str((content or {}).get("text") or "").strip()
-        if not text:
+        content = _message_content(message.get("content") or "{}")
+        if raw_message_type == "post":
+            text, image_key = _post_image_and_text(content)
+            message_type = "image"
+        else:
+            message_type = raw_message_type
+            text = str(content.get("text") or "").strip()
+            image_key = str(content.get("image_key") or "").strip()
+        if message_type == "text" and not text:
             raise InvalidBotEvent("empty text message")
+        if message_type == "image" and not image_key:
+            raise InvalidBotEvent("image message has no image_key")
         raw_time = message.get("create_time") or header.get("create_time")
         try:
             timestamp = int(raw_time)
@@ -265,9 +326,11 @@ class FeishuEventParser:
             app_id=self.app_id,
             open_id=str(open_id),
             chat_id=str(chat_id),
-            text=text[:4000],
             create_time=created,
             chat_type=str(message.get("chat_type") or "p2p"),
+            message_type=message_type,
+            text=text[:4000],
+            image_key=image_key or None,
         )
 
 
@@ -284,7 +347,8 @@ class FeishuChannelMessageAdapter:
             raise InvalidBotEvent("channel message is missing routing objects")
         if bool(getattr(sender, "is_bot", False)):
             raise InvalidBotEvent("bot self-message")
-        if str(getattr(message, "raw_content_type", "")) != "text":
+        raw_message_type = str(getattr(message, "raw_content_type", ""))
+        if raw_message_type not in {"text", "image", "post"}:
             raise InvalidBotEvent("unsupported message type")
         message_id = str(getattr(message, "id", "") or "").strip()
         open_id = str(getattr(sender, "open_id", "") or "").strip()
@@ -301,8 +365,38 @@ class FeishuChannelMessageAdapter:
         if not all((event_id, message_id, open_id, chat_id)):
             raise InvalidBotEvent("channel message is missing routing fields")
         text = str(getattr(message, "content_text", "") or "").strip()
-        if not text:
+        resources = list(getattr(message, "resources", None) or [])
+        image_key = ""
+        if raw_message_type in {"image", "post"}:
+            image_key = next(
+                (
+                    str(getattr(resource, "file_key", "") or "").strip()
+                    for resource in resources
+                    if str(getattr(resource, "type", "") or "") == "image"
+                ),
+                "",
+            )
+            if not image_key and raw_message_type == "image":
+                content = getattr(message, "content", None)
+                image_key = str(getattr(content, "image_key", "") or "").strip()
+        if raw_message_type == "post":
+            raw_content = raw.get("content")
+            raw_message = raw.get("message")
+            if raw_content is None and isinstance(raw_message, Mapping):
+                raw_content = raw_message.get("content")
+            if raw_content is not None:
+                post_text, post_image_key = _post_image_and_text(
+                    _message_content(raw_content)
+                )
+                text = post_text or text
+                image_key = image_key or post_image_key
+            message_type = "image"
+        else:
+            message_type = raw_message_type
+        if message_type == "text" and not text:
             raise InvalidBotEvent("empty text message")
+        if message_type == "image" and not image_key:
+            raise InvalidBotEvent("image message has no image_key")
         raw_time = getattr(message, "create_time", None)
         try:
             timestamp = int(raw_time)
@@ -317,9 +411,11 @@ class FeishuChannelMessageAdapter:
             app_id=self.app_id,
             open_id=open_id,
             chat_id=chat_id,
-            text=text[:4000],
             create_time=created,
             chat_type=str(getattr(conversation, "chat_type", "p2p") or "p2p"),
+            message_type=message_type,
+            text=text[:4000],
+            image_key=image_key or None,
         )
 
 
@@ -403,7 +499,9 @@ class FeishuGateway:
             open_id=event.open_id,
             chat_id=event.chat_id,
             chat_type=event.chat_type,
+            message_type=event.message_type,
             text=event.text,
+            image_key=event.image_key,
             create_time=event.create_time,
         ):
             logger.debug(

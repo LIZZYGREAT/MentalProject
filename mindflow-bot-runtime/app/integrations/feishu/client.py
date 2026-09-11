@@ -132,6 +132,48 @@ class FeishuClient:
             raise ValueError("Feishu image_key is required")
         return self._send_message(chat_id, "image", {"image_key": normalized})
 
+    def download_message_image(
+        self, message_id: str, image_key: str, *, max_bytes: int | None = None
+    ) -> bytes:
+        """Download an inbound image through Feishu's message-resource API."""
+
+        normalized_message_id = str(message_id or "").strip()
+        normalized_image_key = str(image_key or "").strip()
+        if not normalized_message_id or not normalized_image_key:
+            raise ValueError("message_id and image_key are required")
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        request = (
+            GetMessageResourceRequest.builder()
+            .message_id(normalized_message_id)
+            .file_key(normalized_image_key)
+            .type("image")
+            .build()
+        )
+        try:
+            response = self._client.im.v1.message_resource.get(request)
+        except Exception as exc:
+            raise FeishuSendError(
+                "Feishu message image download failed",
+                operation="download_message_image",
+            ) from exc
+        if not response or not response.success():
+            code = getattr(response, "code", None)
+            raise FeishuSendError(
+                "Feishu message image download failed",
+                code=code,
+                retryable=code not in {230001, 230003, 230006, 99991672},
+                operation="download_message_image",
+            )
+        file_obj = getattr(response, "file", None)
+        if not hasattr(file_obj, "read"):
+            raise FeishuSendError(
+                "Feishu message image response has no file",
+                operation="download_message_image",
+            )
+        read_limit = int(max_bytes) + 1 if max_bytes is not None else -1
+        return bytes(file_obj.read(read_limit))
+
     def _send_message(
         self, chat_id: str, msg_type: str, content: dict[str, Any], *,
         message_uuid: str | None = None,

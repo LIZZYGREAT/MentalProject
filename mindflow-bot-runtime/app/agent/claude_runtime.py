@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
-from app.agent.context import AgentContext
+from app.agent.context import (
+    AgentContext,
+    AuthorizationSemanticTurn,
+)
+from app.contracts.agent_input import AgentTurnInput, ensure_agent_turn_input
 from app.agent.sdk_adapter import (
     ClaudeSDKInvocationError,
     ClaudeSDKTurnInterrupted,
@@ -40,19 +45,20 @@ class ClaudeAgentRuntime:
     async def handle_message(
         self,
         ctx: AgentContext,
-        text: str,
+        turn_input: AgentTurnInput | str,
         *,
         chat_type: str = "p2p",
         on_activity: AgentActivityCallback | None = None,
     ) -> RuntimeResponse:
+        turn_input = ensure_agent_turn_input(turn_input)
         await asyncio.to_thread(
             self.conversations.add,
             ctx.participant_id,
             "user",
-            text,
+            turn_input.conversation_text,
             feishu_message_id=ctx.message_id,
         )
-        fixed = self.safety.precheck(text, chat_type=chat_type)
+        fixed = self.safety.precheck_turn(turn_input, chat_type=chat_type)
         if fixed is not None:
             await self._save_answer(ctx, fixed)
             return RuntimeResponse(
@@ -60,9 +66,10 @@ class ClaudeAgentRuntime:
                 safety_locked=True,
                 response_kind="fixed",
             )
+        ctx = await self._with_authorization_semantic_context(ctx, turn_input)
         try:
             result = await self.sessions.submit(
-                ctx, text, on_activity=on_activity
+                ctx, turn_input, on_activity=on_activity
             )
         except ClaudeSDKTurnInterrupted as exc:
             await self._save_answer(ctx, FALLBACK_INTERRUPTED)
@@ -91,4 +98,34 @@ class ClaudeAgentRuntime:
             "assistant",
             text,
             feishu_message_id=ctx.message_id,
+        )
+
+    async def _with_authorization_semantic_context(
+        self, ctx: AgentContext, turn_input: AgentTurnInput
+    ) -> AgentContext:
+        previous = await asyncio.to_thread(
+            self.conversations.recent,
+            ctx.participant_id,
+            3,
+            exclude_feishu_message_id=ctx.message_id,
+            chat_id=ctx.chat_id,
+        )
+        turns: list[AuthorizationSemanticTurn] = []
+        for item in previous:
+            role = str(item.get("role"))
+            text = str(item.get("content") or "")[:1000]
+            if role not in {"user", "assistant"} or not text.strip():
+                continue
+            turns.append(
+                AuthorizationSemanticTurn(
+                    role="user" if role == "user" else "assistant",
+                    text=text,
+                )
+            )
+        current_text = turn_input.conversation_text[:1000]
+        if current_text.strip():
+            turns.append(AuthorizationSemanticTurn("user", current_text))
+        return replace(
+            ctx,
+            authorization_semantic_context=tuple(turns[-4:]),
         )

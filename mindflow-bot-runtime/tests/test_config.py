@@ -38,6 +38,38 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_mutation_intent_verifier_has_independent_on_demand_configuration():
+    settings = Settings.from_env(
+        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.mutation_intent_api_enabled is True
+    assert settings.mutation_intent_api_url.endswith("/chat/completions")
+    assert settings.mutation_intent_api_model == "deepseek-v4-flash"
+    assert settings.mutation_intent_api_timeout_seconds == 8
+    assert settings.mutation_intent_api_max_tokens == 1024
+    assert settings.mutation_intent_max_concurrency == 2
+
+    environment = valid_environment()
+    environment["MUTATION_INTENT_API_MAX_TOKENS"] = "1536"
+    configured = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert configured.mutation_intent_api_max_tokens == 1536
+
+    environment = valid_environment()
+    environment.update(
+        {
+            "MUTATION_INTENT_API_ENABLED": "false",
+            "MUTATION_INTENT_API_URL": "",
+            "MUTATION_INTENT_API_MODEL": "",
+        }
+    )
+    disabled = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert disabled.mutation_intent_api_enabled is False
+
+
 def test_profile_calibration_is_disabled_by_default_and_requires_opt_in():
     base = valid_environment()
     settings = Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])
@@ -110,6 +142,54 @@ def test_progress_timers_have_independent_configuration():
 
     assert settings.generic_progress_delay_seconds == 8.5
     assert settings.tool_progress_grace_seconds == 0.75
+
+
+def test_vision_schedule_item_cap_cannot_exceed_visible_preview_limit():
+    environment = valid_environment()
+    environment["VISION_SCHEDULE_MAX_ITEMS"] = "21"
+    with pytest.raises(ValueError, match="VISION_SCHEDULE_MAX_ITEMS.*20"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+    environment["VISION_SCHEDULE_MAX_ITEMS"] = "20"
+    environment["VISION_SCHEDULE_MAX_CALENDAR_WRITES"] = "401"
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.vision_schedule_max_items == 20
+    assert settings.vision_schedule_max_calendar_writes == 401
+
+
+def test_multimodal_windows_have_safe_defaults_and_valid_order():
+    settings = Settings.from_env(
+        valid_environment(), base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.vision_api_timeout_seconds == 90
+    assert settings.multimodal_debounce_seconds == 3
+    assert settings.multimodal_association_seconds == 15
+    assert settings.multimodal_recent_context_seconds == 600
+
+    environment = valid_environment()
+    environment["MULTIMODAL_DEBOUNCE_SECONDS"] = "5"
+    environment["MULTIMODAL_ASSOCIATION_SECONDS"] = "4"
+    with pytest.raises(ValueError, match="MULTIMODAL_ASSOCIATION_SECONDS"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+    environment = valid_environment()
+    environment["COURSE_DEFAULT_SEMESTER_START_DATE"] = "2026-09-07"
+    configured = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert configured.course_default_semester_start_date == "2026-09-07"
+
+    environment["COURSE_DEFAULT_SEMESTER_START_DATE"] = "2026-09-08"
+    with pytest.raises(ValueError, match="must be a Monday"):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
 
 
 def test_haiku_and_subagent_must_use_the_same_model():

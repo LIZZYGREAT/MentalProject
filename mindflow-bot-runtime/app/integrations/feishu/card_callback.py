@@ -12,6 +12,17 @@ from app.integrations.feishu.gateway import CardActionEvent, FeishuCardActionAda
 logger = logging.getLogger(__name__)
 
 
+def _callback_error_text(exc: Exception) -> str:
+    detail = str(exc).lower()
+    if "expired" in detail:
+        return "这份内容已过期，请重新发送或打开最新卡片。"
+    if "not_found" in detail or "not found" in detail:
+        return "没有找到可操作的内容，请打开最新卡片后重试。"
+    if isinstance(exc, PermissionError) or "permission" in detail:
+        return "当前无法执行此操作，请确认使用的是自己的最新卡片。"
+    return "提交失败，请稍后重试"
+
+
 class FeishuCardCallbackServer:
     """A small ASGI server that validates and commits card actions synchronously."""
 
@@ -50,10 +61,10 @@ class FeishuCardCallbackServer:
                 if not result.get("ok"):
                     raise ValueError("unsupported card action")
                 content = str(result.get("reply_text") or "提交成功")
-            except (ValueError, RuntimeError):
+            except Exception as exc:
                 logger.warning("feishu_card_callback_rejected", exc_info=True)
                 return P2CardActionTriggerResponse(
-                    {"toast": {"type": "error", "content": "提交失败，请稍后重试"}}
+                    {"toast": {"type": "error", "content": _callback_error_text(exc)}}
                 )
             payload: dict[str, Any] = {
                 "toast": {"type": "success", "content": content}

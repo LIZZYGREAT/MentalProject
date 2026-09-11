@@ -6,16 +6,20 @@ validation here are the authority for any state change triggered by a card.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 import hashlib
 import json
 import logging
+import re
 import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
     care_intervention_result_card,
+    course_schedule_context_card,
+    course_schedule_preview_card,
+    course_schedule_result_card,
     daily_checkin_card,
     today_calendar_card,
 )
@@ -25,6 +29,37 @@ from app.services.care_outcome_refresh import CareOutcomeRefreshService
 
 
 logger = logging.getLogger(__name__)
+
+
+_PERIOD_TIME_MAPPING_LINE = re.compile(
+    r"^\s*(?P<first>\d{1,2})(?:\s*[-–—~]\s*(?P<last>\d{1,2}))?\s*"
+    r"(?:节)?\s*(?:=|:|：)\s*(?P<start>(?:[01]?\d|2[0-3]):[0-5]\d)\s*"
+    r"[-–—~]\s*(?P<end>(?:[01]?\d|2[0-3]):[0-5]\d)\s*$"
+)
+_CHINESE_MONTH_DAY = re.compile(
+    r"^\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日?\s*$"
+)
+_SLASH_DATE = re.compile(
+    r"^\s*(?P<year>\d{4})\s*/\s*(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})\s*$"
+)
+_WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
+    reply_text = "这份课程表预览已过期，请重新发送图片后再操作。"
+    return {
+        "ok": True,
+        "error": "course_schedule_import_expired",
+        "status": "expired",
+        "import_id": str(import_id),
+        "reply_text": reply_text,
+        "card": course_schedule_result_card(
+            reply_text,
+            status="expired",
+            import_id=str(import_id),
+            error="course_schedule_import_expired",
+        ),
+    }
 
 
 def _boolean(value: Any, field: str) -> bool:
@@ -46,6 +81,70 @@ def _score(value: Any, field: str) -> float:
     return score
 
 
+def _period_time_mapping(value: Any) -> dict[int | tuple[int, int], tuple[time, time]]:
+    """Parse the documented card format, without model interpretation."""
+
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 1200:
+        raise ValueError("period time mapping is invalid")
+    mapping: dict[int | tuple[int, int], tuple[time, time]] = {}
+    lines = [line.strip() for line in re.split(r"[\r\n;；]+", raw) if line.strip()]
+    if not lines or len(lines) > 30:
+        raise ValueError("period time mapping is invalid")
+    for line in lines:
+        match = _PERIOD_TIME_MAPPING_LINE.fullmatch(line)
+        if match is None:
+            raise ValueError(
+                "节次时间格式应为 1-2节：8:00-9:35，每行一条"
+            )
+        first = int(match.group("first"))
+        last = int(match.group("last") or first)
+        if not 1 <= first <= last <= 30:
+            raise ValueError("节次范围应在 1 到 30 之间")
+        start = time.fromisoformat(match.group("start").zfill(5))
+        end = time.fromisoformat(match.group("end").zfill(5))
+        if end <= start:
+            raise ValueError("节次结束时间必须晚于开始时间")
+        key: int | tuple[int, int] = first if first == last else (first, last)
+        if key in mapping:
+            raise ValueError("同一节次范围只能填写一次")
+        mapping[key] = (start, end)
+    return mapping
+
+
+def _semester_monday(value: Any, *, reference_date: date) -> date:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("请填写第一周周一")
+    try:
+        slash = _SLASH_DATE.fullmatch(raw)
+        chinese = _CHINESE_MONTH_DAY.fullmatch(raw)
+        if slash is not None:
+            parsed = date(
+                int(slash.group("year")),
+                int(slash.group("month")),
+                int(slash.group("day")),
+            )
+        elif chinese is not None:
+            parsed = date(
+                reference_date.year,
+                int(chinese.group("month")),
+                int(chinese.group("day")),
+            )
+        else:
+            parsed = date.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("日期格式应为 2026-09-07、2026/9/7 或 9月7日") from exc
+    if parsed.weekday() != 0:
+        monday = parsed - timedelta(days=parsed.weekday())
+        raise ValueError(
+            f"{parsed.month} 月 {parsed.day} 日是{_WEEKDAY_NAMES[parsed.weekday()]}，"
+            f"这一周的周一是 {monday.month} 月 {monday.day} 日；"
+            "请填写第一周周一"
+        )
+    return parsed
+
+
 class CardActionService:
     def __init__(
         self,
@@ -57,6 +156,7 @@ class CardActionService:
         observation_refresh: ObservationForecastRefreshService,
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
+        course_schedule_imports: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -65,6 +165,7 @@ class CardActionService:
         self.observation_refresh = observation_refresh
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
+        self.course_schedule_imports = course_schedule_imports
 
     @staticmethod
     def _fallback_event_id(
@@ -90,12 +191,138 @@ class CardActionService:
         participant_id: uuid.UUID,
         *,
         message_id: str,
+        chat_id: str | None = None,
         callback_event_id: str | None = None,
         action_value: dict[str, Any] | None,
         form_value: dict[str, Any] | None,
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "course_schedule_import_confirm",
+            "course_schedule_import_cancel",
+            "course_schedule_import_context_open",
+            "course_schedule_import_context_submit",
+        }:
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            context_action = action_name.startswith("course_schedule_import_context_")
+            expected_version = "3" if context_action else "2"
+            if str(action.get("version") or "") != expected_version:
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule import id is invalid") from exc
+            if context_action:
+                drafts = self.course_schedule_imports.drafts
+                if action_name.endswith("_open"):
+                    draft = drafts.get(import_id)
+                    if draft is None or str(draft.get("participant_id")) != str(participant_id):
+                        return {"ok": False, "error": "course_schedule_import_not_found"}
+                    if str(draft.get("status") or "") == "expired":
+                        return _expired_schedule_card_result(import_id)
+                    if (
+                        str(draft.get("status") or "") != "pending_context"
+                        or draft.get("recurrence_strategy")
+                    ):
+                        return {
+                            "ok": True,
+                            "reply_text": "这份课表已不需要补充信息。",
+                            "card": course_schedule_preview_card(draft),
+                        }
+                    return {
+                        "ok": True,
+                        "reply_text": "请补充课表导入信息。",
+                        "card": course_schedule_context_card(draft),
+                    }
+                values = dict(form_value or {})
+                try:
+                    semester_value = str(values.get("semester_start_date") or "").strip()
+                    semester_start_date = (
+                        _semester_monday(
+                            semester_value,
+                            reference_date=datetime.now(self.timezone).date(),
+                        )
+                        if semester_value
+                        else None
+                    )
+                    mapping_value = values.get("period_time_mapping")
+                    period_mapping = (
+                        _period_time_mapping(mapping_value)
+                        if str(mapping_value or "").strip() else None
+                    )
+                    draft = drafts.apply_context_update(
+                        participant_id,
+                        import_id,
+                        semester_start_date=semester_start_date,
+                        period_time_mapping=period_mapping,
+                    )
+                except (LookupError, PermissionError):
+                    # Do not disclose draft details when a copied/replayed card
+                    # belongs to a different participant or has expired.
+                    return {"ok": False, "error": "course_schedule_import_not_found"}
+                except ValueError as exc:
+                    if "expired" in str(exc).lower():
+                        return _expired_schedule_card_result(import_id)
+                    return {
+                        "ok": True,
+                        "reply_text": f"信息格式需要调整：{str(exc)[:120]}",
+                        "card": course_schedule_context_card(
+                            drafts.get(import_id) or {"id": str(import_id)}
+                        ),
+                    }
+                missing = list(
+                    dict(draft.get("structured_result") or {}).get("missing_context")
+                    or []
+                )
+                return {
+                    "ok": True,
+                    "status": draft.get("status"),
+                    "reply_text": (
+                        "课表信息已补齐，请确认预览并选择添加方式。"
+                        if not missing
+                        else "已保存部分信息，还需要补充课表中的其余项目。"
+                    ),
+                    "card": course_schedule_preview_card(draft),
+                }
+            if action_name.endswith("_cancel"):
+                result = self.course_schedule_imports.cancel(participant_id, import_id)
+            else:
+                import asyncio
+
+                recurrence_strategy = str(
+                    action.get("recurrence_strategy") or ""
+                ).strip()
+                if recurrence_strategy not in {
+                    "preserve_schedule_pattern", "expand_all_occurrences"
+                }:
+                    raise ValueError("course recurrence strategy is invalid")
+
+                result = asyncio.run(
+                    self.course_schedule_imports.confirm(
+                        participant_id,
+                        import_id,
+                        recurrence_strategy=recurrence_strategy,
+                        status_card_message_id=message_id,
+                        status_card_chat_id=chat_id,
+                    )
+                )
+            reply_text = str(result.get("reply_text") or "课程表操作已处理。")
+            # Missing Calendar authorization is a valid, non-mutating outcome.
+            return {
+                **result,
+                "ok": True,
+                "card": course_schedule_result_card(
+                    reply_text,
+                    status=str(result.get("status") or "") or None,
+                    import_id=str(result.get("import_id") or import_id),
+                    error=str(result.get("error") or "") or None,
+                    recurrence_strategy=(
+                        str(result.get("recurrence_strategy") or "") or None
+                    ),
+                ),
+            }
         if action_name.startswith("care_"):
             if self.care_interventions is None:
                 raise RuntimeError("care intervention service is unavailable")

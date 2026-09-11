@@ -1,0 +1,2388 @@
+import asyncio
+from datetime import date, datetime, time, timedelta, timezone
+import json
+import threading
+from types import SimpleNamespace
+import uuid
+from zoneinfo import ZoneInfo
+
+import httpx
+import pytest
+import app.services.course_schedule_vision as course_schedule_vision_module
+
+from app.contracts.course_schedule import (
+    ScheduleVisionResult,
+    ScheduleVisionValidationError,
+)
+from app.integrations.feishu.gateway import BotEvent, FeishuEventParser, InvalidBotEvent
+from app.integrations.feishu.cards import (
+    course_schedule_context_card,
+    course_schedule_preview_card,
+    course_schedule_result_card,
+)
+from app.integrations.feishu.message_resources import (
+    FeishuMessageResourceDownloader,
+    MessageResourceError,
+    MessageResourceTooLarge,
+    UnsupportedImageFormat,
+)
+from app.models import CourseScheduleImport
+from app.repositories_course_schedule import (
+    CourseScheduleImportRepository,
+    derive_required_context,
+    prepare_schedule_context,
+)
+from app.agent.skill_loader import SkillLoader
+from app.identity.service import IdentityService
+from app.integrations.feishu.gateway import FeishuGateway
+from app.presentation.user_capabilities import help_text, onboarding_text
+from app.repositories import (
+    AgentRunRepository, BindingRepository, BotEventRepository, ParticipantRepository,
+)
+from app.worker import BotWorker
+from app.services.course_schedule_import import CourseScheduleImportService
+from app.services.course_schedule_import_runner import CourseScheduleImportRunner
+from app.domain.course_schedule_recurrence import (
+    EXPAND_ALL_OCCURRENCES,
+    PRESERVE_SCHEDULE_PATTERN,
+    CalendarWriteKind,
+    course_weeks,
+    plan_course_writes,
+)
+from app.domain.course_schedule_periods import (
+    DEFAULT_SCHOOL_PERIODS,
+    resolve_period_time,
+)
+from app.services.course_schedule_vision import (
+    CourseScheduleVisionError,
+    CourseScheduleVisionUnavailable,
+    CourseScheduleVisionService,
+    SYSTEM_PROMPT,
+)
+from app.services.course_schedule_normalizer import normalize_course_schedule
+from app.services.card_action_service import (
+    CardActionService,
+    _period_time_mapping,
+    _semester_monday,
+)
+from helpers import memory_database, participant, skill_path
+
+
+def vision_payload(*, odd_even="all", explicit_weeks=None, actual_times=True):
+    return {
+        "document_type": "course_schedule",
+        "semester_label": "2026-2027-1",
+        "institution": None,
+        "courses": [{
+            "course_name": "高等数学A",
+            "weekday": 1,
+            "period_start": 1,
+            "period_end": 2,
+            "start_time": "08:00" if actual_times else None,
+            "end_time": "09:35" if actual_times else None,
+            "location": "A101",
+            "teacher": None,
+            "week_rule": {
+                "start_week": 1,
+                "end_week": 16,
+                "odd_even": odd_even,
+                "explicit_weeks": explicit_weeks,
+            },
+            "uncertain_fields": [],
+        }],
+        "missing_context": ["semester_start_date"] + (
+            [] if actual_times else ["period_time_mapping"]
+        ),
+        "warnings": [],
+    }
+
+
+def image_event_payload(message_type="image"):
+    content = {"image_key": "img_v2_opaque"} if message_type == "image" else {"file_key": "f"}
+    return {
+        "header": {"event_id": "evt-image"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou"}},
+            "message": {
+                "message_id": "om-image", "chat_id": "oc", "chat_type": "p2p",
+                "message_type": message_type, "content": json.dumps(content),
+                "create_time": "1786200000000",
+            },
+        },
+    }
+
+
+def test_channel_adapter_accepts_image_and_ipc_round_trips():
+    event = FeishuEventParser("app").parse(image_event_payload())
+    assert event.message_type == "image"
+    assert event.image_key == "img_v2_opaque"
+    assert event.text == ""
+    from app.integrations.feishu.gateway import BotEvent
+
+    assert BotEvent.from_ipc_payload(event.to_ipc_payload()) == event
+
+
+def test_unsupported_message_type_rejected():
+    with pytest.raises(InvalidBotEvent, match="unsupported"):
+        FeishuEventParser("app").parse(image_event_payload("file"))
+
+
+def test_image_resource_limits_magic_and_timeout():
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 8
+    valid = FeishuMessageResourceDownloader(object(), download=lambda *_: png, max_bytes=32)
+    assert asyncio.run(valid.download_image("m", "k")).mime_type == "image/png"
+    too_large = FeishuMessageResourceDownloader(
+        object(), download=lambda *_: png, max_bytes=4
+    )
+    with pytest.raises(MessageResourceTooLarge):
+        asyncio.run(too_large.download_image("m", "k"))
+    invalid = FeishuMessageResourceDownloader(
+        object(), download=lambda *_: b"not-an-image", max_bytes=32
+    )
+    with pytest.raises(UnsupportedImageFormat):
+        asyncio.run(invalid.download_image("m", "k"))
+
+    def slow(*_):
+        import time
+        time.sleep(0.05)
+        return png
+
+    timeout = FeishuMessageResourceDownloader(
+        object(), download=slow, timeout_seconds=0.001
+    )
+    with pytest.raises(MessageResourceError, match="timed out"):
+        asyncio.run(timeout.download_image("m", "k"))
+
+
+def test_vision_valid_json_and_malformed_json_rejected():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["model"] == "vision-model"
+        assert body["temperature"] == 0
+        assert body["messages"][1]["content"][1]["image_url"]["url"].startswith(
+            "data:image/png;base64,"
+        )
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(vision_payload())}}]
+        })
+
+    service = CourseScheduleVisionService(
+        "https://vision.invalid/chat", "secret", "vision-model", enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+    result = asyncio.run(service.parse(b"\x89PNG\r\n\x1a\n", "image/png"))
+    assert result.courses[0].start_time == "08:00"
+
+    malformed = CourseScheduleVisionService(
+        "https://vision.invalid/chat", "secret", "vision-model", enabled=True,
+        transport=httpx.MockTransport(lambda _request: httpx.Response(
+            200, json={"choices": [{"message": {"content": "not json"}}]}
+        )),
+    )
+    with pytest.raises(CourseScheduleVisionError):
+        asyncio.run(malformed.parse(b"x", "image/png"))
+
+
+def test_vision_retries_one_schema_invalid_response_before_rejecting_image():
+    calls = 0
+    retry_prompts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        retry_prompts.append(body["messages"][1]["content"][0]["text"])
+        payload = vision_payload()
+        if calls == 1:
+            payload["courses"] = "schema mistake"
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(payload)}}]
+        })
+
+    service = CourseScheduleVisionService(
+        "https://vision.invalid/chat", "secret", "vision-model", enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = asyncio.run(service.parse(b"\x89PNG\r\n\x1a\n", "image/png"))
+
+    assert result.document_type == "course_schedule"
+    assert calls == 2
+    assert "course schedule contains no courses" in retry_prompts[1]
+
+
+def test_vision_schema_never_accepts_guessed_or_partial_times():
+    payload = vision_payload()
+    payload["courses"][0]["end_time"] = None
+    with pytest.raises(ScheduleVisionValidationError, match="actual time range"):
+        ScheduleVisionResult.from_dict(payload)
+
+
+def _draft(database, person_id, *, odd_even="all", explicit_weeks=None):
+    repo = CourseScheduleImportRepository(database)
+    result = ScheduleVisionResult.from_dict(
+        vision_payload(odd_even=odd_even, explicit_weeks=explicit_weeks)
+    )
+    return repo, repo.create_draft(
+        person_id,
+        source_message_id="om-source",
+        source_image_hash="a" * 64,
+        vision_model="vision-model",
+        result=result,
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+
+def test_draft_persists_and_calendar_never_writes_before_confirm():
+    database = memory_database()
+    person = participant(database, "P001")
+    repo, draft = _draft(database, person.id)
+    assert draft["status"] == "pending_confirmation"
+    restarted_repo = CourseScheduleImportRepository(database)
+    assert restarted_repo.get(draft["id"])["items"][0]["status"] == "pending"
+    card = course_schedule_preview_card(draft)
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "按课程规律添加（推荐）" in payload
+    assert "每次上课都单独添加" in payload
+    assert "暂不导入" in payload
+    assert "时间来源：课表图片中的实际时间" in payload
+    assert PRESERVE_SCHEDULE_PATTERN in payload
+    assert EXPAND_ALL_OCCURRENCES in payload
+    visible_text = "\n".join(
+        element.get("content", "") for element in card["body"]["elements"]
+    )
+    assert "重复方式：每周重复" in visible_text
+    assert not any(
+        token in visible_text
+        for token in ("RRULE", "FREQ", "recurrence_strategy", "planner_version")
+    )
+
+
+def test_pending_context_card_opens_fixed_context_form_before_calendar_preview():
+    database = memory_database()
+    person = participant(database, "CONTEXT-CARD")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-context-card",
+        source_image_hash="c" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+    )
+
+    preview_payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    context_payload = json.dumps(course_schedule_context_card(draft), ensure_ascii=False)
+
+    assert "补充信息并生成预览" in preview_payload
+    assert "course_schedule_import_context_open" in preview_payload
+    assert "course_schedule_import_confirm" not in preview_payload
+    assert "第一周周一" in context_payload
+    assert "节次时间对照" in context_payload
+    assert "course_schedule_import_context_submit" in context_payload
+
+
+def test_context_card_submission_completes_draft_without_calendar_write():
+    database = memory_database()
+    person = participant(database, "CONTEXT-SUBMIT")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-context-submit",
+        source_image_hash="d" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+    )
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+
+    opened = handler.handle(
+        person.id,
+        message_id="om-card",
+        action_value={
+            "mindflow_action": "course_schedule_import_context_open",
+            "version": "3",
+            "import_id": draft["id"],
+        },
+        form_value={},
+    )
+    submitted = handler.handle(
+        person.id,
+        message_id="om-card",
+        action_value={
+            "mindflow_action": "course_schedule_import_context_submit",
+            "version": "3",
+            "import_id": draft["id"],
+        },
+        form_value={
+            "semester_start_date": "2026-09-07",
+            "period_time_mapping": "15-16=08:00-09:35",
+        },
+    )
+
+    assert "mindflow_course_schedule_context" in json.dumps(opened["card"])
+    assert submitted["status"] == "pending_confirmation"
+    payload = json.dumps(submitted["card"], ensure_ascii=False)
+    assert "按课程规律添加（推荐）" in payload
+    assert "course_schedule_import_confirm" in payload
+    assert repository.get(draft["id"])["status"] == "pending_confirmation"
+
+
+def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():
+    database = memory_database()
+    owner = participant(database, "CREATE-OUTCOME")
+    repository = CourseScheduleImportRepository(database)
+    arguments = {
+        "source_message_id": "create-outcome-source",
+        "source_image_hash": "a" * 64,
+        "vision_model": "vision-model",
+        "result": ScheduleVisionResult.from_dict(vision_payload()),
+        "timezone_name": "Asia/Shanghai",
+        "semester_start_date": date(2026, 9, 7),
+    }
+
+    created = repository.create_draft_outcome(owner.id, **arguments)
+    existing = repository.create_draft_outcome(owner.id, **arguments)
+
+    assert created.created_new is True
+    assert existing.created_new is False
+    assert existing.draft["id"] == created.draft["id"]
+
+
+def test_context_form_accepts_friendly_dates_and_period_time_formats():
+    assert _semester_monday("2026/9/7", reference_date=date(2026, 9, 11)) == date(
+        2026, 9, 7
+    )
+    assert _semester_monday("9月7日", reference_date=date(2026, 9, 11)) == date(
+        2026, 9, 7
+    )
+    assert _period_time_mapping("1-2节：8:00-9:35\n3：10:00-10:45") == {
+        (1, 2): (time(8, 0), time(9, 35)),
+        3: (time(10, 0), time(10, 45)),
+    }
+
+
+def test_context_form_guides_non_monday_to_that_weeks_monday():
+    with pytest.raises(ValueError) as captured:
+        _semester_monday("2026/9/9", reference_date=date(2026, 9, 11))
+    assert "9 月 9 日是周三" in str(captured.value)
+    assert "9 月 7 日" in str(captured.value)
+
+
+def test_preview_warns_about_recent_duplicate_courses_without_blocking_confirm():
+    database = memory_database()
+    owner = participant(database, "RECENT-DUPLICATE-WARNING")
+    repo, first = _draft(database, owner.id)
+    service = CourseScheduleImportService(repo, Calendar(), Tokens())
+    runner = _runner(service)
+    asyncio.run(
+        service.confirm(
+            owner.id,
+            first["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    asyncio.run(runner.run_once())
+
+    second = repo.create_draft(
+        owner.id,
+        source_message_id="duplicate-second-image",
+        source_image_hash="8" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert second["duplicate_warning"]["course_names"] == ["高等数学A"]
+    preview = json.dumps(course_schedule_preview_card(second), ensure_ascii=False)
+    assert "可能重复" in preview
+    assert "高等数学A" in preview
+
+    confirmed = asyncio.run(
+        service.confirm(
+            owner.id,
+            second["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+    )
+    assert confirmed["status"] == "queued"
+
+
+def test_weekly_odd_even_and_explicit_week_normalization():
+    database = memory_database()
+    person = participant(database, "P001")
+    _repo, odd = _draft(database, person.id, odd_even="odd")
+    write = plan_course_writes(
+        odd,
+        odd["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )[0]
+    assert "INTERVAL=2" in write.recurrence
+    assert "COUNT=8" in write.recurrence
+    assert write.start_time.date() == date(2026, 9, 7)
+
+    database_even = memory_database()
+    person_even = participant(database_even, "P008")
+    _repo, even = _draft(database_even, person_even.id, odd_even="even")
+    even_write = plan_course_writes(
+        even,
+        even["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )[0]
+    assert "INTERVAL=2" in even_write.recurrence
+    assert even_write.start_time.date() == date(2026, 9, 14)
+
+    database2 = memory_database()
+    person2 = participant(database2, "P002")
+    _repo, explicit = _draft(database2, person2.id, explicit_weeks=[1, 2, 4, 7, 10])
+    writes = plan_course_writes(
+        explicit,
+        explicit["items"][0],
+        strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert len(writes) == 5
+    assert all(write.recurrence is None for write in writes)
+
+
+def test_course_recurrence_planner_classifies_preserve_patterns():
+    timezone_name = ZoneInfo("Asia/Shanghai")
+
+    database = memory_database()
+    person = participant(database, "PLAN-WEEKLY")
+    _repo, weekly = _draft(database, person.id)
+    weekly_writes = plan_course_writes(
+        weekly, weekly["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(weekly_writes) == 1
+    assert weekly_writes[0].write_kind == CalendarWriteKind.RECURRING
+    assert "INTERVAL=1" in str(weekly_writes[0].recurrence)
+    assert "COUNT=16" in str(weekly_writes[0].recurrence)
+    assert len(weekly_writes[0].affected_dates) == 16
+
+    one_week_payload = vision_payload(explicit_weeks=[6])
+    one_week_result = ScheduleVisionResult.from_dict(one_week_payload)
+    one_week_repo = CourseScheduleImportRepository(database)
+    one_week = one_week_repo.create_draft(
+        person.id, source_message_id="plan-one-week", source_image_hash="2" * 64,
+        vision_model="vision-model", result=one_week_result,
+        timezone_name="Asia/Shanghai", semester_start_date=date(2026, 9, 7),
+    )
+    one_week_writes = plan_course_writes(
+        one_week, one_week["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(one_week_writes) == 1
+    assert one_week_writes[0].write_kind == CalendarWriteKind.SINGLE
+    assert one_week_writes[0].recurrence is None
+
+
+def test_explicit_periodic_and_irregular_course_weeks_are_deterministic():
+    timezone_name = ZoneInfo("Asia/Shanghai")
+    database = memory_database()
+    person = participant(database, "PLAN-EXPLICIT")
+    _repo, periodic = _draft(
+        database, person.id, explicit_weeks=[1, 3, 5, 7]
+    )
+    periodic_writes = plan_course_writes(
+        periodic, periodic["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(periodic_writes) == 1
+    assert periodic_writes[0].write_kind == CalendarWriteKind.RECURRING
+    assert "INTERVAL=2" in str(periodic_writes[0].recurrence)
+    assert "COUNT=4" in str(periodic_writes[0].recurrence)
+
+    database2 = memory_database()
+    person2 = participant(database2, "PLAN-IRREGULAR")
+    _repo, irregular = _draft(
+        database2, person2.id, explicit_weeks=[1, 2, 4, 7, 10]
+    )
+    irregular_writes = plan_course_writes(
+        irregular, irregular["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=timezone_name,
+    )
+    assert len(irregular_writes) == 5
+    assert all(write.write_kind == CalendarWriteKind.SINGLE for write in irregular_writes)
+    assert [write.affected_dates[0] for write in irregular_writes] == [
+        date(2026, 9, 7) + timedelta(weeks=week - 1)
+        for week in [1, 2, 4, 7, 10]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("weeks", "interval", "visible_label"),
+    [
+        ([1, 2, 3], 1, "每周重复"),
+        ([1, 3, 5], 2, "每两周重复"),
+        ([1, 4, 7], 3, "每3周重复"),
+    ],
+)
+def test_preview_uses_exact_planned_week_interval(weeks, interval, visible_label):
+    database = memory_database()
+    person = participant(database, f"PLAN-INTERVAL-{interval}")
+    _repo, draft = _draft(database, person.id, explicit_weeks=weeks)
+    writes = plan_course_writes(
+        draft, draft["items"][0], strategy=PRESERVE_SCHEDULE_PATTERN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert writes[0].recurrence_interval == interval
+    assert f"INTERVAL={interval}" in str(writes[0].recurrence)
+    card = course_schedule_preview_card(draft)
+    visible_text = "\n".join(
+        element.get("content", "") for element in card["body"]["elements"]
+    )
+    assert f"重复方式：{visible_label}" in visible_text
+    if interval > 2:
+        assert "重复方式：每周重复" not in visible_text
+
+
+def test_expand_all_occurrences_creates_only_independent_events():
+    database = memory_database()
+    person = participant(database, "PLAN-EXPAND")
+    _repo, draft = _draft(database, person.id)
+    writes = plan_course_writes(
+        draft, draft["items"][0], strategy=EXPAND_ALL_OCCURRENCES,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert len(writes) == 16
+    assert all(write.write_kind == CalendarWriteKind.SINGLE for write in writes)
+    assert all(write.recurrence is None for write in writes)
+    assert len({write.occurrence_identity for write in writes}) == 16
+
+
+class Tokens:
+    def status(self, _participant_id):
+        return {"connected": True, "scopes": ["calendar:calendar.event:create"]}
+
+
+class Calendar:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    async def _create(self, _participant_id, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("provider failed")
+        return {"id": f"event-{len(self.calls)}"}
+
+    async def create_single_event(self, participant_id, **kwargs):
+        kwargs["write_kind"] = "single"
+        return await self._create(participant_id, **kwargs)
+
+    async def create_recurring_event(self, participant_id, **kwargs):
+        kwargs["write_kind"] = "recurring"
+        return await self._create(participant_id, **kwargs)
+
+    async def create_event(self, participant_id, **kwargs):
+        if kwargs.get("recurrence"):
+            return await self.create_recurring_event(participant_id, **kwargs)
+        kwargs.pop("recurrence", None)
+        return await self.create_single_event(participant_id, **kwargs)
+
+
+def _runner(service):
+    runner = CourseScheduleImportRunner(service)
+    service.queue_notifier = runner.wake
+    return runner
+
+
+def test_confirm_owner_idempotency_cancel_and_partial_retry():
+    database = memory_database()
+    owner = participant(database, "P001")
+    other = participant(database, "P002")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    with pytest.raises(PermissionError):
+        asyncio.run(service.confirm(other.id, draft["id"]))
+    runner = _runner(service)
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert result["status"] == "queued"
+    assert result["succeeded"] == 0
+    assert calendar.calls == []
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+    assert len(calendar.calls) == 1
+    repeated = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert "已经添加过" in repeated["reply_text"]
+    assert len(calendar.calls) == 1
+
+    database2 = memory_database()
+    owner2 = participant(database2, "P003")
+    repo2, draft2 = _draft(database2, owner2.id)
+    failing = Calendar(fail=True)
+    service2 = CourseScheduleImportService(repo2, failing, Tokens())
+    runner2 = _runner(service2)
+    partial = asyncio.run(service2.confirm(
+        owner2.id, draft2["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert partial["status"] == "queued"
+    assert failing.calls == []
+    asyncio.run(runner2.run_once())
+    assert repo2.get(draft2["id"])["status"] == "partial_failed"
+    failing.fail = False
+    retried = asyncio.run(service2.confirm(owner2.id, draft2["id"]))
+    assert retried["status"] == "queued"
+    asyncio.run(runner2.run_once())
+    assert repo2.get(draft2["id"])["status"] == "succeeded"
+    assert len(failing.calls) == 2
+
+    database3 = memory_database()
+    owner3 = participant(database3, "P004")
+    repo3, draft3 = _draft(database3, owner3.id)
+    cancelled = service2.__class__(repo3, Calendar(), Tokens()).cancel(owner3.id, draft3["id"])
+    assert cancelled["status"] == "cancelled"
+
+
+def test_confirm_without_calendar_keeps_draft_and_writes_nothing():
+    database = memory_database()
+    owner = participant(database, "P001")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar()
+
+    class Disconnected:
+        def status(self, _participant_id):
+            return {"connected": False, "scopes": []}
+
+    service = CourseScheduleImportService(repo, calendar, Disconnected())
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert result["error"] == "calendar_not_connected"
+    assert calendar.calls == []
+    assert repo.get(draft["id"])["status"] == "pending_confirmation"
+
+
+def test_recurrence_strategy_is_durable_and_immutable_after_writes_begin():
+    database = memory_database()
+    owner = participant(database, "STRATEGY-LOCK")
+    repo, draft = _draft(database, owner.id)
+    selected = repo.set_recurrence_strategy(
+        owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN
+    )
+    assert selected["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert selected["recurrence_confirmed_at"] is not None
+    repo.begin_confirmation(owner.id, draft["id"])
+    with pytest.raises(ValueError, match="immutable"):
+        repo.set_recurrence_strategy(
+            owner.id, draft["id"], EXPAND_ALL_OCCURRENCES
+        )
+
+
+def test_calendar_write_cap_rejects_before_any_provider_or_item_mutation():
+    database = memory_database()
+    owner = participant(database, "WRITE-CAP")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar()
+    service = CourseScheduleImportService(
+        repo, calendar, Tokens(), max_calendar_writes=15
+    )
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=EXPAND_ALL_OCCURRENCES
+    ))
+    persisted = repo.get(draft["id"])
+    assert result["error"] == "calendar_write_limit_exceeded"
+    assert result["planned_writes"] == 16
+    assert calendar.calls == []
+    assert persisted["status"] == "pending_confirmation"
+    assert all(item["status"] == "pending" for item in persisted["items"])
+    assert persisted["recurrence_strategy"] == EXPAND_ALL_OCCURRENCES
+    card_payload = json.dumps(course_schedule_result_card(
+        result["reply_text"], status=result["status"], import_id=result["import_id"],
+        error=result["error"], recurrence_strategy=result["recurrence_strategy"],
+    ), ensure_ascii=False)
+    assert "改用按课表周期规则添加" in card_payload
+    assert "course_schedule_import_cancel" in card_payload
+
+
+def test_preserve_write_cap_has_cancel_recovery_without_strategy_misdirection():
+    database = memory_database()
+    owner = participant(database, "PRESERVE-CAP")
+    repo, draft = _draft(
+        database, owner.id, explicit_weeks=[1, 2, 4, 7, 10]
+    )
+    calendar = Calendar()
+    service = CourseScheduleImportService(
+        repo, calendar, Tokens(), max_calendar_writes=4
+    )
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    persisted = repo.get(draft["id"])
+    assert result["error"] == "calendar_write_limit_exceeded"
+    assert result["planned_writes"] == 5
+    assert "改用“按课表周期规则添加”" not in result["reply_text"]
+    assert "取消后拆分课程表重新导入" in result["reply_text"]
+    assert calendar.calls == []
+    assert persisted["status"] == "pending_confirmation"
+    assert persisted["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert all(item["status"] == "pending" for item in persisted["items"])
+
+    card_payload = json.dumps(course_schedule_result_card(
+        result["reply_text"], status=result["status"], import_id=result["import_id"],
+        error=result["error"], recurrence_strategy=result["recurrence_strategy"],
+    ), ensure_ascii=False)
+    assert "course_schedule_import_cancel" in card_payload
+    assert "改用按课表周期规则添加" not in card_payload
+    assert EXPAND_ALL_OCCURRENCES not in card_payload
+
+
+def test_period_defaults_cover_one_to_fourteen_and_respect_priority():
+    expected = {
+        1: (time(8, 0), time(8, 45)),
+        2: (time(8, 55), time(9, 40)),
+        3: (time(10, 0), time(10, 45)),
+        4: (time(10, 55), time(11, 40)),
+        5: (time(12, 0), time(12, 45)),
+        6: (time(12, 55), time(13, 40)),
+        7: (time(14, 0), time(14, 45)),
+        8: (time(14, 55), time(15, 40)),
+        9: (time(16, 0), time(16, 45)),
+        10: (time(16, 55), time(17, 40)),
+        11: (time(18, 30), time(19, 15)),
+        12: (time(19, 25), time(20, 10)),
+        13: (time(20, 30), time(21, 15)),
+        14: (time(21, 25), time(22, 10)),
+    }
+    assert DEFAULT_SCHOOL_PERIODS == expected
+    for period, clocks in expected.items():
+        assert resolve_period_time(period, period) == (*clocks, "default")
+    assert resolve_period_time(1, 2) == (time(8), time(9, 40), "default")
+    assert resolve_period_time(3, 4) == (time(10), time(11, 40), "default")
+    assert resolve_period_time(7, 8) == (time(14), time(15, 40), "default")
+    assert resolve_period_time(9, 10) == (time(16), time(17, 40), "default")
+    assert resolve_period_time(11, 12) == (time(18, 30), time(20, 10), "default")
+    assert resolve_period_time(13, 14) == (time(20, 30), time(22, 10), "default")
+
+    user = {1: (time(7, 50), time(8, 35)), 2: (time(8, 45), time(9, 30))}
+    ranges = {(1, 2): (time(7, 40), time(9, 20))}
+    assert resolve_period_time(1, 2, period_mapping=user) == (
+        time(7, 50), time(9, 30), "user"
+    )
+    assert resolve_period_time(
+        1, 2, period_mapping=user, range_overrides=ranges
+    ) == (time(7, 40), time(9, 20), "user")
+    assert resolve_period_time(
+        1, 2, actual_start=time(8, 10), actual_end=time(9, 50),
+        period_mapping=user, range_overrides=ranges,
+    ) == (time(8, 10), time(9, 50), "image")
+
+
+def test_bind_and_help_use_stable_copy_without_agent():
+    database = memory_database()
+    person = ParticipantRepository(database).create("P009")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue()
+    gateway = FeishuGateway("app", "secret", identity, events, queue)
+
+    class Runtime:
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_message(self, *_args, **_kwargs):
+            self.calls += 1
+            return "unexpected"
+
+    class Sender:
+        def __init__(self):
+            self.sent = []
+
+        def send_text(self, _chat_id, text, **_kwargs):
+            self.sent.append(text)
+            return f"om-{len(self.sent)}"
+
+    runtime = Runtime()
+    sender = Sender()
+
+    class BlockedVision:
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, *_args):
+            self.calls += 1
+            raise AssertionError("Vision must not run without consent")
+
+    vision = BlockedVision()
+    worker = BotWorker(
+        queue, identity, events, AgentRunRepository(database),
+        SkillLoader(skill_path()), runtime, sender, model="fake",
+        schedule_vision=vision,
+    )
+
+    def payload(event_id, message_id, text):
+        return {
+            "header": {"event_id": event_id},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou"}},
+                "message": {
+                    "message_id": message_id, "chat_id": "oc", "chat_type": "p2p",
+                    "message_type": "text", "content": json.dumps({"text": text}),
+                },
+            },
+        }
+
+    async def scenario():
+        assert gateway.accept_payload(payload("bind", "m-bind", f"/bind {code}"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(payload("help", "m-help", "你能做什么？"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(image_event_payload())
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert sender.sent == [
+        onboarding_text("P009"),
+        help_text(),
+        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
+    ]
+    assert runtime.calls == 0
+    assert vision.calls == 0
+
+
+def test_missing_context_card_has_no_confirm_and_context_can_be_completed():
+    database = memory_database()
+    person = participant(database, "P001")
+    repo = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    result = ScheduleVisionResult.from_dict(payload)
+    draft = repo.create_draft(
+        person.id,
+        source_message_id="om-context",
+        source_image_hash="b" * 64,
+        vision_model="vision-model",
+        result=result,
+        timezone_name="Asia/Shanghai",
+    )
+    assert draft["status"] == "pending_context"
+    assert "course_schedule_import_confirm" not in json.dumps(
+        course_schedule_preview_card(draft), ensure_ascii=False
+    )
+    draft = repo.set_semester_start_date(
+        person.id, draft["id"], date(2026, 9, 7)
+    )
+    draft = repo.set_period_time_mapping(
+        person.id,
+        draft["id"],
+        {(15, 16): (datetime.strptime("08:00", "%H:%M").time(),
+                    datetime.strptime("09:35", "%H:%M").time())},
+    )
+    assert draft["status"] == "pending_confirmation"
+    card_json = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    assert "course_schedule_import_confirm" in card_json
+    assert '"courses"' not in card_json
+
+
+def test_sequential_single_period_overrides_are_merged_durably_across_restart():
+    database = memory_database()
+    owner = participant(database, "PERIOD-MERGE")
+    repo, draft = _period_only_draft(database, owner.id, "period-merge")
+    first = repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(7, 50), time(8, 35))}
+    )
+    assert first["items"][0]["start_time"] == "07:50"
+    assert first["items"][0]["end_time"] == "09:40"
+
+    restarted = CourseScheduleImportRepository(database)
+    second = restarted.set_period_time_mapping(
+        owner.id, draft["id"], {2: (time(8, 45), time(9, 30))}
+    )
+    assert second["items"][0]["start_time"] == "07:50"
+    assert second["items"][0]["end_time"] == "09:30"
+    assert second["structured_result"]["_metadata"]["user_period_mapping"] == {
+        "1": ["07:50", "08:35"],
+        "2": ["08:45", "09:30"],
+    }
+
+
+def test_later_single_period_override_replaces_same_persisted_key():
+    database = memory_database()
+    owner = participant(database, "PERIOD-REPLACE")
+    repo, draft = _period_only_draft(database, owner.id, "period-replace")
+    repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(7, 50), time(8, 35))}
+    )
+    replaced = repo.set_period_time_mapping(
+        owner.id, draft["id"], {1: (time(8, 10), time(8, 55))}
+    )
+    assert replaced["items"][0]["start_time"] == "08:10"
+    assert replaced["items"][0]["end_time"] == "09:40"
+    assert replaced["structured_result"]["_metadata"]["user_period_mapping"] == {
+        "1": ["08:10", "08:55"]
+    }
+
+
+def test_legacy_draft_image_time_is_never_overwritten_by_user_period_mapping():
+    database = memory_database()
+    owner = participant(database, "PERIOD-IMAGE-PRIORITY")
+    repo, draft = _draft(database, owner.id)
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(draft["id"]))
+        structured = dict(row.structured_result)
+        structured.pop("_metadata", None)
+        row.structured_result = structured
+
+    updated = repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {(1, 2): (time(7, 40), time(9, 20))},
+    )
+    assert updated["items"][0]["start_time"] == "08:00"
+    assert updated["items"][0]["end_time"] == "09:35"
+    assert updated["structured_result"]["_metadata"]["course_time_sources"] == [
+        "image"
+    ]
+
+
+def test_image_workflow_does_not_write_before_card_confirmation():
+    database = memory_database()
+    person = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue()
+    gateway = FeishuGateway("app", "secret", identity, events, queue)
+    drafts = CourseScheduleImportRepository(database)
+    calendar = Calendar()
+    imports = CourseScheduleImportService(drafts, calendar, Tokens())
+
+    class Runtime:
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_message(self, *_args, **_kwargs):
+            self.calls += 1
+            return "context accepted"
+
+    class Sender:
+        def __init__(self):
+            self.texts = []
+            self.cards = []
+
+        def send_text(self, _chat_id, text, **_kwargs):
+            self.texts.append(text)
+            return "om-text"
+
+        def send_card(self, _chat_id, card, **_kwargs):
+            self.cards.append(card)
+            return "om-card"
+
+    class Resources:
+        async def download_image(self, _message_id, _image_key):
+            return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+    class Vision:
+        model = "vision-model"
+
+        async def parse(self, _data, _mime):
+            return ScheduleVisionResult.from_dict(vision_payload())
+
+    sender = Sender()
+    runtime = Runtime()
+    worker = BotWorker(
+        queue, identity, events, AgentRunRepository(database), SkillLoader(skill_path()),
+        runtime, sender, model="fake", schedule_vision=Vision(),
+        schedule_imports=imports, message_resources=Resources(),
+        multimodal_debounce_seconds=0.05,
+    )
+
+    def text_payload(event_id, message_id, text):
+        return {
+            "header": {"event_id": event_id},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou"}},
+                "message": {
+                    "message_id": message_id, "chat_id": "oc", "chat_type": "p2p",
+                    "message_type": "text", "content": json.dumps({"text": text}),
+                },
+            },
+        }
+
+    async def scenario():
+        assert gateway.accept_payload(text_payload("bind", "m-bind", f"/bind {code}"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(image_event_payload())
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            text_payload("intent", "m-intent", "把这个课程表导入飞书日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+        assert calendar.calls == []
+        assert gateway.accept_payload(text_payload("context", "m-context", "2026-09-07"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(sender.cards) == 1
+    assert runtime.calls == 1
+    assert calendar.calls == []
+
+
+def test_expired_draft_returns_readable_result_and_is_persisted_as_expired():
+    database = memory_database()
+    owner = participant(database, "P001")
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="om-expired",
+        source_image_hash="c" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+        ttl_minutes=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    result = asyncio.run(
+        CourseScheduleImportService(repo, Calendar(), Tokens()).confirm(
+            owner.id, draft["id"]
+        )
+    )
+    assert result["status"] == "expired"
+    assert result["error"] == "course_schedule_import_expired"
+    assert "已过期" in result["reply_text"]
+    assert repo.get(draft["id"])["status"] == "expired"
+
+
+def test_expired_context_card_buttons_return_a_terminal_result_card():
+    database = memory_database()
+    owner = participant(database, "P001-CONTEXT-EXPIRED")
+    repo = CourseScheduleImportRepository(database)
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="om-context-expired",
+        source_image_hash="f" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        ttl_minutes=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    with pytest.raises(ValueError, match="expired"):
+        repo.validate_for_confirmation(owner.id, draft["id"])
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=CourseScheduleImportService(
+            repo, Calendar(), Tokens()
+        ),
+    )
+
+    for action_name in (
+        "course_schedule_import_context_open",
+        "course_schedule_import_context_submit",
+    ):
+        result = handler.handle(
+            owner.id,
+            message_id="card-message",
+            action_value={
+                "mindflow_action": action_name,
+                "version": "3",
+                "import_id": draft["id"],
+            },
+            form_value={"semester_start_date": "2026-09-07"},
+        )
+        assert result["ok"] is True
+        assert result["status"] == "expired"
+        assert "已过期" in result["reply_text"]
+        assert "course_schedule_import_confirm" not in json.dumps(
+            result["card"], ensure_ascii=False
+        )
+
+
+def test_pending_context_and_pending_confirmation_are_the_only_ttl_states():
+    old = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+    database = memory_database()
+    owner = participant(database, "TTL-CONTEXT")
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = 15
+    payload["courses"][0]["period_end"] = 16
+    repo = CourseScheduleImportRepository(database)
+    pending_context = repo.create_draft(
+        owner.id, source_message_id="ttl-context", source_image_hash="3" * 64,
+        vision_model="vision-model", result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai", ttl_minutes=1, now=old,
+    )
+    with pytest.raises(ValueError, match="expired"):
+        repo.validate_for_confirmation(owner.id, pending_context["id"])
+    assert repo.get(pending_context["id"])["status"] == "expired"
+
+    running_db = memory_database()
+    running_owner = participant(running_db, "TTL-RUNNING")
+    running_repo, running = _draft(running_db, running_owner.id)
+    running_repo.set_recurrence_strategy(
+        running_owner.id, running["id"], PRESERVE_SCHEDULE_PATTERN
+    )
+    started = running_repo.begin_confirmation(running_owner.id, running["id"])
+    _expire_draft_ttl(running_db, running["id"])
+    _expire_run_lease(running_db, running["id"])
+    reclaimed = running_repo.begin_confirmation(running_owner.id, running["id"])
+    assert started["status"] == "running"
+    assert reclaimed["claimed"] is True
+    assert reclaimed["status"] == "running"
+
+
+def test_partial_failed_import_remains_retryable_after_original_ttl():
+    database = memory_database()
+    owner = participant(database, "TTL-PARTIAL")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar(fail=True)
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "partial_failed"
+    _expire_draft_ttl(database, draft["id"])
+    calendar.fail = False
+    retried = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert retried["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+
+
+def test_sync_download_timeout_holds_real_concurrency_slot_until_thread_exits():
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 8
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def blocking_download(message_id, _image_key):
+        if message_id == "first":
+            first_entered.set()
+            release_first.wait(timeout=2)
+        else:
+            second_entered.set()
+        return png
+
+    async def scenario():
+        downloader = FeishuMessageResourceDownloader(
+            object(), download=blocking_download, timeout_seconds=0.02,
+            max_concurrency=1,
+        )
+        with pytest.raises(MessageResourceError, match="timed out"):
+            await downloader.download_image("first", "image-a")
+        assert first_entered.is_set()
+        # The first request's 20 ms limit exercises timeout semantics. The
+        # second request verifies slot ownership, so do not make ordinary
+        # thread-pool scheduling under full-suite load part of that assertion.
+        downloader.timeout_seconds = 0.5
+        second = asyncio.create_task(
+            downloader.download_image("second", "image-b")
+        )
+        await asyncio.sleep(0.03)
+        assert not second_entered.is_set()
+        release_first.set()
+        result = await second
+        assert result.data == png
+        assert second_entered.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_batch_calendar_mutation_invalidates_and_enqueues_forecast_once():
+    database = memory_database()
+    owner = participant(database, "P001")
+    repo, draft = _draft(database, owner.id)
+
+    class Forecasts:
+        def __init__(self):
+            self.calls = []
+
+        def invalidate_for_calendar_mutation_dates(
+            self, warnings, participant_id, dates, *, reason
+        ):
+            self.calls.append((warnings, participant_id, set(dates), reason))
+
+    class Refresh:
+        reconciliations = None
+
+        def __init__(self):
+            self.calls = []
+
+        def enqueue(self, participant_id, dates, **kwargs):
+            self.calls.append((participant_id, dict(dates), kwargs))
+            return True
+
+    forecasts = Forecasts()
+    refresh = Refresh()
+    coordinator = SimpleNamespace(warnings=object(), dependency_refresh=None)
+    service = CourseScheduleImportService(
+        repo,
+        Calendar(),
+        Tokens(),
+        forecast_coordinator=coordinator,
+        forecast_snapshots=forecasts,
+        mutation_refresh=refresh,
+    )
+    runner = _runner(service)
+    result = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert result["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+    assert len(forecasts.calls) == 1
+    assert len(refresh.calls) == 1
+    assert forecasts.calls[0][3] == "course_schedule_import"
+
+
+def test_stale_running_draft_can_be_reclaimed():
+    database = memory_database()
+    owner = participant(database, "P101")
+    repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
+    _unused, draft = _draft_with_repo(repo, owner.id, "stale-draft")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
+    started = datetime.now(timezone.utc)
+    first = repo.begin_confirmation(owner.id, draft["id"], now=started)
+    assert first["claimed"] is True
+
+    reclaimed = repo.begin_confirmation(
+        owner.id, draft["id"], now=started + timedelta(seconds=61)
+    )
+    assert reclaimed["claimed"] is True
+    assert reclaimed["run_claimed_at"] == (
+        started + timedelta(seconds=61)
+    ).isoformat()
+
+
+def test_running_draft_with_live_lease_is_not_reclaimed():
+    database = memory_database()
+    owner = participant(database, "P102")
+    repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
+    _unused, draft = _draft_with_repo(repo, owner.id, "live-draft")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
+    started = datetime.now(timezone.utc)
+    repo.begin_confirmation(owner.id, draft["id"], now=started)
+
+    repeated = repo.begin_confirmation(
+        owner.id, draft["id"], now=started + timedelta(seconds=30)
+    )
+    assert repeated["claimed"] is False
+    assert repeated["status"] == "running"
+
+
+def test_stale_running_items_reset_to_pending():
+    database = memory_database()
+    owner = participant(database, "P103")
+    repo = CourseScheduleImportRepository(database, run_lease_seconds=60)
+    _unused, draft = _draft_with_repo(repo, owner.id, "stale-item")
+    repo.set_recurrence_strategy(owner.id, draft["id"], PRESERVE_SCHEDULE_PATTERN)
+    started = datetime.now(timezone.utc)
+    running = repo.begin_confirmation(owner.id, draft["id"], now=started)
+    assert repo.claim_item(
+        draft["id"], running["items"][0]["id"], now=started
+    )
+
+    reclaimed = repo.begin_confirmation(
+        owner.id, draft["id"], now=started + timedelta(seconds=61)
+    )
+    assert reclaimed["claimed"] is True
+    assert reclaimed["items"][0]["status"] == "pending"
+
+
+class IdempotentCalendar:
+    def __init__(self):
+        self.attempts = []
+        self.events = {}
+
+    async def _create(self, _participant_id, **kwargs):
+        source = kwargs["source_message_id"]
+        self.attempts.append(source)
+        if source not in self.events:
+            self.events[source] = {"id": f"event-{len(self.events) + 1}"}
+        return self.events[source]
+
+    async def create_single_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
+    async def create_recurring_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
+    async def create_event(self, participant_id, **kwargs):
+        return await self._create(participant_id, **kwargs)
+
+
+def test_restart_after_remote_create_does_not_duplicate_calendar_event():
+    database = memory_database()
+    owner = participant(database, "P104")
+    repo, draft = _draft(database, owner.id)
+    calendar = IdempotentCalendar()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    queued = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert queued["status"] == "queued"
+    claimed = repo.claim_next_import()
+    row = repo.claim_write(draft["id"], claimed["writes"][0]["id"])
+    source_id = row["source_identity"]
+    asyncio.run(calendar.create_event(
+        owner.id,
+        summary=row["summary"],
+        start_time=datetime.fromisoformat(row["start_time"]),
+        end_time=datetime.fromisoformat(row["end_time"]),
+        description=row["description"],
+        recurrence=row["recurrence"],
+        source_message_id=source_id,
+    ))
+    _expire_run_lease(database, draft["id"])
+
+    restarted = CourseScheduleImportRepository(database)
+    restarted_service = CourseScheduleImportService(restarted, calendar, Tokens())
+    restarted_runner = _runner(restarted_service)
+    assert asyncio.run(restarted_runner.recover_startup()) == 1
+    assert restarted.get(draft["id"])["status"] == "succeeded"
+    assert len(calendar.events) == 1
+    assert calendar.attempts == [source_id, source_id]
+
+
+def test_partial_success_then_crash_can_resume_and_finalize():
+    database = memory_database()
+    owner = participant(database, "P105")
+    repo, draft = _two_course_draft(database, owner.id, "partial-crash")
+    calendar = Calendar()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    queued = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert queued["status"] == "queued"
+    claimed = repo.claim_next_import()
+    first = next(
+        write for write in claimed["writes"] if write["summary"] == "高等数学A"
+    )
+    second = next(
+        write for write in claimed["writes"] if write["summary"] == "线性代数"
+    )
+    assert repo.claim_write(draft["id"], first["id"])
+    repo.record_write_created(draft["id"], first["id"], "event-first")
+    assert repo.claim_write(draft["id"], second["id"])
+    _expire_run_lease(database, draft["id"])
+
+    restarted = CourseScheduleImportRepository(database)
+    restarted_service = CourseScheduleImportService(restarted, calendar, Tokens())
+    restarted_runner = _runner(restarted_service)
+    assert asyncio.run(restarted_runner.recover_startup()) == 1
+    assert restarted.get(draft["id"])["status"] == "succeeded"
+    assert [call["summary"] for call in calendar.calls] == ["线性代数"]
+
+
+def test_calendar_not_connected_card_keeps_same_confirm_action():
+    database = memory_database()
+    owner = participant(database, "P109")
+    repo, draft = _draft(database, owner.id)
+
+    class Disconnected:
+        def status(self, _participant_id):
+            return {"connected": False, "scopes": []}
+
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=CourseScheduleImportService(
+            repo, Calendar(), Disconnected()
+        ),
+    )
+    result = handler.handle(
+        owner.id,
+        message_id="card-message",
+        action_value={
+            "mindflow_action": "course_schedule_import_confirm",
+            "version": "2",
+            "import_id": draft["id"],
+            "recurrence_strategy": PRESERVE_SCHEDULE_PATTERN,
+        },
+        form_value={},
+    )
+    payload = json.dumps(result["card"], ensure_ascii=False)
+    assert "course_schedule_import_confirm" in payload
+    assert "course_schedule_import_cancel" in payload
+    assert draft["id"] in payload
+
+
+def test_calendar_authorize_then_same_draft_confirm_succeeds():
+    database = memory_database()
+    owner = participant(database, "P106")
+    repo, draft = _draft(database, owner.id)
+    calendar = Calendar()
+
+    class ToggleTokens:
+        connected = False
+
+        def status(self, _participant_id):
+            return {
+                "connected": self.connected,
+                "scopes": ["calendar:calendar.event:create"] if self.connected else [],
+            }
+
+    tokens = ToggleTokens()
+    service = CourseScheduleImportService(repo, calendar, tokens)
+    runner = _runner(service)
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["error"] == "calendar_not_connected"
+    assert first["import_id"] == draft["id"]
+    tokens.connected = True
+    second = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+    assert len(calendar.calls) == 1
+
+
+def test_partial_failed_card_has_retry_failed_action():
+    import_id = str(uuid.uuid4())
+    card = course_schedule_result_card(
+        "已添加 18 项，有 2 项没能添加。",
+        status="partial_failed",
+        import_id=import_id,
+        recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+    )
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "重试失败项" in payload
+    assert "course_schedule_import_confirm" in payload
+    assert "course_schedule_import_cancel" not in payload
+    assert import_id in payload
+
+
+def test_retry_failed_items_does_not_recreate_succeeded_items():
+    database = memory_database()
+    owner = participant(database, "P107")
+    repo, draft = _two_course_draft(database, owner.id, "retry-failed")
+
+    class FailSecondOnce(Calendar):
+        failed = False
+
+        async def _create(self, participant_id, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["summary"] == "线性代数" and not self.failed:
+                self.failed = True
+                raise RuntimeError("provider failed")
+            return {"id": f"event-{len(self.calls)}"}
+
+    calendar = FailSecondOnce()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "partial_failed"
+    second = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+    summaries = [call["summary"] for call in calendar.calls]
+    assert summaries.count("高等数学A") == 1
+    assert summaries.count("线性代数") == 2
+
+
+def test_mid_batch_calendar_authorization_loss_preserves_strategy_and_resumes():
+    database = memory_database()
+    owner = participant(database, "AUTH-LOSS")
+    repo, draft = _two_course_draft(database, owner.id, "auth-loss")
+
+    class LoseAuthorizationOnce(Calendar):
+        denied = False
+
+        async def _create(self, participant_id, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["summary"] == "线性代数" and not self.denied:
+                self.denied = True
+                raise PermissionError("calendar authorization expired")
+            return {"id": f"event-{len(self.calls)}"}
+
+    calendar = LoseAuthorizationOnce()
+    service = CourseScheduleImportService(repo, calendar, Tokens())
+    runner = _runner(service)
+    first = asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    assert first["status"] == "queued"
+    asyncio.run(runner.run_once())
+    first = service._result(repo.get(draft["id"]))
+    assert first["status"] == "partial_failed"
+    assert first["error"] == "calendar_not_connected"
+    assert first["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+    assert "重新完成 /calendar 授权" in first["reply_text"]
+    assert "当前导入方式：按课表周期规则" in first["reply_text"]
+    assert repo.get(draft["id"])["recurrence_strategy"] == PRESERVE_SCHEDULE_PATTERN
+
+    second = asyncio.run(service.confirm(owner.id, draft["id"]))
+    assert second["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert repo.get(draft["id"])["status"] == "succeeded"
+    summaries = [call["summary"] for call in calendar.calls]
+    assert summaries.count("高等数学A") == 1
+    assert summaries.count("线性代数") == 2
+    assert all(
+        f":{PRESERVE_SCHEDULE_PATTERN}:" in call["source_message_id"]
+        for call in calendar.calls
+    )
+
+
+def test_succeeded_card_is_terminal():
+    card = course_schedule_result_card(
+        "已添加 2 项课程到日历。",
+        status="succeeded",
+        import_id=str(uuid.uuid4()),
+    )
+    assert "mindflow_action" not in json.dumps(card, ensure_ascii=False)
+
+
+def test_missing_weekday_enters_draft_correction_loop():
+    payload = vision_payload()
+    payload["courses"][0]["weekday"] = None
+    repo, owner, draft = _assert_draft_fillable(payload, "weekday")
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], course_name="高等数学A", new_weekday=4
+    )
+    assert corrected["status"] == "pending_confirmation"
+
+
+def test_missing_week_rule_enters_draft_correction_loop():
+    payload = vision_payload()
+    payload["courses"][0]["week_rule"] = None
+    repo, owner, draft = _assert_draft_fillable(payload, "week_rule")
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学A",
+        week_start=1,
+        week_end=16,
+    )
+    assert corrected["status"] == "pending_confirmation"
+
+
+def test_missing_actual_time_without_period_enters_draft_correction_loop():
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_start"] = None
+    payload["courses"][0]["period_end"] = None
+    repo, owner, draft = _assert_draft_fillable(payload, "actual_time")
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学A",
+        start_time="08:20",
+        end_time="09:55",
+    )
+    assert corrected["status"] == "pending_confirmation"
+
+
+def test_backend_derives_required_context():
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["weekday"] = None
+    payload["courses"][0]["week_rule"] = None
+    payload["missing_context"] = []
+    result = ScheduleVisionResult.from_dict(payload)
+    assert derive_required_context(result, semester_start_date=None) == {
+        "semester_start_date",
+        "weekday",
+        "week_rule",
+    }
+
+
+def test_read_only_schedule_default_time_clears_stale_actual_time_missing_context():
+    payload = vision_payload(actual_times=False)
+    payload["missing_context"] = [
+        "semester_start_date",
+        "period_time_mapping",
+        "actual_time",
+    ]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["start_time"] == "08:00"
+    assert structured["courses"][0]["end_time"] == "09:40"
+    assert structured["missing_context"] == ["semester_start_date"]
+
+
+def test_read_only_context_clears_stale_weekday_missing_flag():
+    payload = vision_payload()
+    payload["missing_context"] = ["semester_start_date", "weekday"]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["weekday"] == 1
+    assert structured["missing_context"] == ["semester_start_date"]
+
+
+def test_read_only_context_clears_stale_week_rule_missing_flag():
+    payload = vision_payload()
+    payload["missing_context"] = ["semester_start_date", "week_rule"]
+
+    structured = prepare_schedule_context(ScheduleVisionResult.from_dict(payload))
+
+    assert structured["courses"][0]["week_rule"] is not None
+    assert structured["missing_context"] == ["semester_start_date"]
+
+
+def test_complete_fields_ignore_stale_model_missing_context():
+    database = memory_database()
+    owner = participant(database, "P108")
+    payload = vision_payload()
+    payload["missing_context"] = [
+        "semester_start_date", "period_time_mapping", "weekday", "week_rule",
+        "actual_time",
+    ]
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="stale-model-context",
+        source_image_hash="d" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert draft["status"] == "pending_confirmation"
+    assert draft["structured_result"]["missing_context"] == []
+
+
+def test_period_inference_metadata_is_validated_and_preserved_for_audit():
+    database = memory_database()
+    owner = participant(database, "PERIOD-AUDIT")
+    payload = vision_payload(actual_times=False)
+    payload["courses"][0]["period_inference_source"] = "grid_position"
+    payload["courses"][0]["period_confidence"] = 0.88
+    result = ScheduleVisionResult.from_dict(payload)
+    draft = CourseScheduleImportRepository(database).create_draft(
+        owner.id,
+        source_message_id="period-audit",
+        source_image_hash="9" * 64,
+        vision_model="vision-model",
+        result=result,
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert draft["structured_result"]["_metadata"]["period_inference"] == [
+        {"source": "grid_position", "confidence": 0.88}
+    ]
+    assert draft["items"][0]["start_time"] == "08:00"
+    assert draft["items"][0]["end_time"] == "09:40"
+    assert "时间来源：学校默认作息" in json.dumps(
+        course_schedule_preview_card(draft), ensure_ascii=False
+    )
+
+
+def test_strict_schedule_prompt_uses_grid_rows_without_course_order_guessing():
+    assert "纵向网格绝对位置" in SYSTEM_PROMPT
+    assert "第几个识别到的课程" in SYSTEM_PROMPT
+    assert "Backend 有学校默认作息" in SYSTEM_PROMPT
+    assert "顶部被裁切" in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("period_start", "period_end", "expected_start", "expected_end"),
+    [
+        (1, 2, time(8, 0), time(9, 40)),
+        (7, 8, time(14, 0), time(15, 40)),
+        (13, 14, time(20, 30), time(22, 10)),
+    ],
+)
+def test_default_school_period_ranges_are_backend_authority(
+    period_start, period_end, expected_start, expected_end
+):
+    assert resolve_period_time(period_start, period_end) == (
+        expected_start,
+        expected_end,
+        "default",
+    )
+
+
+def test_grid_period_results_preserve_absolute_rows_and_cropped_grid_stays_null():
+    explicit = vision_payload(actual_times=False)
+    explicit["courses"][0].update({
+        "period_start": 1,
+        "period_end": 2,
+        "period_inference_source": "explicit_label",
+        "period_confidence": 1.0,
+    })
+    assert ScheduleVisionResult.from_dict(explicit).courses[0].period_start == 1
+
+    grid = vision_payload(actual_times=False)
+    grid["courses"][0].update({
+        "period_start": 3,
+        "period_end": 4,
+        "period_inference_source": "grid_position",
+        "period_confidence": 0.9,
+    })
+    parsed_grid = ScheduleVisionResult.from_dict(grid).courses[0]
+    assert (parsed_grid.period_start, parsed_grid.period_end) == (3, 4)
+
+    cropped = vision_payload(actual_times=False)
+    cropped["courses"][0].update({
+        "period_start": None,
+        "period_end": None,
+        "period_inference_source": "unknown",
+        "period_confidence": None,
+    })
+    parsed_cropped = ScheduleVisionResult.from_dict(cropped).courses[0]
+    assert parsed_cropped.period_start is None
+    assert parsed_cropped.period_end is None
+
+
+def test_natural_course_corrections_update_draft_without_schema_language():
+    database = memory_database()
+    owner = participant(database, "CORRECTION")
+    repo, draft = _draft(database, owner.id)
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+    course = corrected["structured_result"]["courses"][0]
+    assert (course["period_start"], course["period_end"]) == (3, 4)
+    assert corrected["items"][0]["start_time"] == "08:00"
+    assert corrected["items"][0]["end_time"] == "09:35"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "image"
+    ]
+
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], weekday=1, odd_even="odd"
+    )
+    assert corrected["items"][0]["week_rule"]["odd_even"] == "odd"
+
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], course_name="高等数学", location="逸夫楼"
+    )
+    assert corrected["items"][0]["location"] == "逸夫楼"
+
+
+def test_period_correction_preserves_existing_user_single_period_mapping():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-SINGLE")
+    repo, draft = _period_only_draft(database, owner.id, "correction-user-single")
+    repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {
+            1: (time(8, 10), time(8, 55)),
+            2: (time(9, 5), time(9, 50)),
+        },
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=1,
+        period_end=2,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:10"
+    assert corrected["items"][0]["end_time"] == "09:50"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user"
+    ]
+
+
+def test_period_correction_preserves_existing_user_range_override():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-RANGE")
+    repo, draft = _period_only_draft(database, owner.id, "correction-user-range")
+    repo.set_period_time_mapping(
+        owner.id,
+        draft["id"],
+        {(1, 2): (time(8, 10), time(9, 50))},
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=1,
+        period_end=2,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:10"
+    assert corrected["items"][0]["end_time"] == "09:50"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user"
+    ]
+
+
+def test_period_only_correction_preserves_image_explicit_actual_time():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-IMAGE-TIME")
+    payload = vision_payload()
+    payload["courses"][0]["start_time"] = "08:20"
+    payload["courses"][0]["end_time"] = "09:55"
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="correction-image-time",
+        source_image_hash="8" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert corrected["items"][0]["start_time"] == "08:20"
+    assert corrected["items"][0]["end_time"] == "09:55"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "image"
+    ]
+
+
+def test_period_only_correction_preserves_user_explicit_actual_time():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-USER-ACTUAL-TIME")
+    repo, draft = _draft(database, owner.id)
+
+    user_time = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        start_time="07:50",
+        end_time="09:25",
+    )
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert user_time["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user_actual"
+    ]
+    assert corrected["items"][0]["start_time"] == "07:50"
+    assert corrected["items"][0]["end_time"] == "09:25"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "user_actual"
+    ]
+
+
+def test_period_correction_uses_default_only_without_image_or_user_override():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-DEFAULT-TIME")
+    repo, draft = _period_only_draft(database, owner.id, "correction-default-time")
+
+    corrected = repo.apply_correction(
+        owner.id,
+        draft["id"],
+        course_name="高等数学",
+        period_start=3,
+        period_end=4,
+    )
+
+    assert corrected["items"][0]["start_time"] == "10:00"
+    assert corrected["items"][0]["end_time"] == "11:40"
+    assert corrected["structured_result"]["_metadata"]["course_time_sources"] == [
+        "default"
+    ]
+
+
+def test_odd_even_correction_filters_explicit_weeks_and_changes_occurrences():
+    database = memory_database()
+    owner = participant(database, "CORRECTION-EXPLICIT-WEEKS")
+    payload = vision_payload(explicit_weeks=[1, 2, 3, 4, 5, 6])
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id="explicit-week-correction",
+        source_image_hash="7" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    before = course_weeks(draft["items"][0]["week_rule"])
+    corrected = repo.apply_correction(
+        owner.id, draft["id"], weekday=1, odd_even="odd"
+    )
+    corrected_rule = corrected["items"][0]["week_rule"]
+    assert before == [1, 2, 3, 4, 5, 6]
+    assert corrected_rule["explicit_weeks"] == [1, 3, 5]
+    assert course_weeks(corrected_rule) == [1, 3, 5]
+
+
+def test_schedule_preview_translates_and_combines_uncertain_schema_fields():
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_context",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": None,
+        "structured_result": {
+            "courses": [{
+                **vision_payload()["courses"][0],
+                "uncertain_fields": [
+                    "weekday",
+                    "period_start",
+                    "period_end",
+                    "start_time",
+                    "end_time",
+                    "week_rule",
+                    "location",
+                    "teacher",
+                ],
+            }],
+            "missing_context": ["semester_start_date"],
+            "warnings": [],
+        },
+        "items": [],
+    }
+    payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    for internal_name in (
+        "weekday",
+        "period_start",
+        "period_end",
+        "start_time",
+        "end_time",
+        "week_rule",
+    ):
+        assert internal_name not in payload
+    assert "星期, 节次, 上课时间, 周次, 地点, 教师" in payload
+    assert payload.count("节次") == 1
+    assert payload.count("上课时间") == 1
+
+
+def test_schedule_image_pipeline_respects_max_concurrency():
+    async def scenario():
+        tracker = SimpleNamespace(active=0, maximum=0)
+
+        class Resources:
+            async def download_image(self, *_args):
+                tracker.active += 1
+                tracker.maximum = max(tracker.maximum, tracker.active)
+                await asyncio.sleep(0.02)
+                return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+        worker = _pipeline_worker(Resources(), tracker)
+        await asyncio.gather(
+            worker._handle_schedule_image(_image_event("evt-a", "msg-a"), uuid.uuid4()),
+            worker._handle_schedule_image(_image_event("evt-b", "msg-b"), uuid.uuid4()),
+        )
+        assert tracker.maximum == 1
+
+    asyncio.run(scenario())
+
+
+def test_second_image_does_not_enter_expensive_pipeline_before_slot():
+    async def scenario():
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        entered = []
+
+        class Resources:
+            async def download_image(self, message_id, _image_key):
+                entered.append(message_id)
+                if message_id == "msg-first":
+                    first_entered.set()
+                    await release_first.wait()
+                return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+        tracker = SimpleNamespace(active=0, maximum=0)
+        worker = _pipeline_worker(Resources(), tracker)
+        first = asyncio.create_task(worker._handle_schedule_image(
+            _image_event("evt-first", "msg-first"), uuid.uuid4()
+        ))
+        await first_entered.wait()
+        second = asyncio.create_task(worker._handle_schedule_image(
+            _image_event("evt-second", "msg-second"), uuid.uuid4()
+        ))
+        await asyncio.sleep(0.01)
+        assert entered == ["msg-first"]
+        release_first.set()
+        await asyncio.gather(first, second)
+        assert entered == ["msg-first", "msg-second"]
+
+    asyncio.run(scenario())
+
+
+def test_vision_encoding_waits_for_concurrency_slot(monkeypatch):
+    async def scenario():
+        first_request = asyncio.Event()
+        release_first = asyncio.Event()
+        encoded_inputs = []
+        original_encode = course_schedule_vision_module.base64.b64encode
+
+        def tracked_encode(value):
+            encoded_inputs.append(bytes(value))
+            return original_encode(value)
+
+        monkeypatch.setattr(
+            course_schedule_vision_module.base64, "b64encode", tracked_encode
+        )
+
+        class BlockingTransport(httpx.AsyncBaseTransport):
+            calls = 0
+
+            async def handle_async_request(self, _request):
+                self.calls += 1
+                if self.calls == 1:
+                    first_request.set()
+                    await release_first.wait()
+                return httpx.Response(200, json={
+                    "choices": [{"message": {
+                        "content": json.dumps(vision_payload())
+                    }}]
+                })
+
+            async def aclose(self):
+                return None
+
+        service = CourseScheduleVisionService(
+            "https://vision.invalid/chat",
+            "secret",
+            "vision-model",
+            enabled=True,
+            max_concurrency=1,
+            transport=BlockingTransport(),
+        )
+        first = asyncio.create_task(service.parse(b"first", "image/png"))
+        await first_request.wait()
+        second = asyncio.create_task(service.parse(b"second", "image/png"))
+        await asyncio.sleep(0.01)
+        assert encoded_inputs == [b"first"]
+        release_first.set()
+        await asyncio.gather(first, second)
+        assert encoded_inputs == [b"first", b"second"]
+
+    asyncio.run(scenario())
+
+
+def test_schedule_preview_limit_rejects_unseen_calendar_writes():
+    payload = vision_payload()
+    payload["courses"] = [
+        {**payload["courses"][0], "course_name": f"课程 {index}"}
+        for index in range(21)
+    ]
+    with pytest.raises(ScheduleVisionValidationError, match="item limit"):
+        ScheduleVisionResult.from_dict(payload, max_items=80)
+
+
+def test_defensive_preview_never_offers_calendar_actions_above_twenty_items():
+    courses = [dict(vision_payload()["courses"][0]) for _ in range(21)]
+    card = course_schedule_preview_card({
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": {"courses": courses, "missing_context": []},
+        "items": [],
+    })
+    payload = json.dumps(card, ensure_ascii=False)
+    assert "课程数量超过 20 项" in payload
+    assert "course_schedule_import_confirm" not in payload
+    assert "按课表周期规则添加" not in payload
+
+
+def test_partial_preview_explains_how_to_split_courses_above_twenty():
+    payload = vision_payload()
+    payload["courses"] = [
+        {**payload["courses"][0], "course_name": f"课程 {index}"}
+        for index in range(22)
+    ]
+    normalized = normalize_course_schedule(payload)
+    structured = prepare_schedule_context(normalized)
+    structured["missing_context"] = []
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": structured,
+        "items": [],
+    }
+    card_payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    assert "超出单次 20 门上限" in card_payload
+    assert "先发周一到周三" in card_payload
+
+
+def test_cancel_reply_starts_revert_for_persisted_completed_import():
+    database = memory_database()
+    owner = participant(database, "P110")
+    repo, draft = _draft(database, owner.id)
+    service = CourseScheduleImportService(repo, Calendar(), Tokens())
+    runner = _runner(service)
+    asyncio.run(service.confirm(
+        owner.id, draft["id"], recurrence_strategy=PRESERVE_SCHEDULE_PATTERN
+    ))
+    asyncio.run(runner.run_once())
+    cancelling = service.cancel(owner.id, draft["id"])
+    assert cancelling["status"] == "cancelling"
+    assert cancelling["cancel_mode"] == "revert"
+    assert "正在停止导入" in cancelling["reply_text"]
+
+    expired = repo.create_draft(
+        owner.id,
+        source_message_id="cancel-expired",
+        source_image_hash="1" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+        ttl_minutes=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    expired_result = service.cancel(owner.id, expired["id"])
+    assert expired_result["status"] == "expired"
+    assert "已过期" in expired_result["reply_text"]
+
+
+def _draft_with_repo(repo, participant_id, source):
+    result = ScheduleVisionResult.from_dict(vision_payload())
+    return repo, repo.create_draft(
+        participant_id,
+        source_message_id=source,
+        source_image_hash="e" * 64,
+        vision_model="vision-model",
+        result=result,
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+
+def _period_only_draft(database, participant_id, source):
+    repo = CourseScheduleImportRepository(database)
+    return repo, repo.create_draft(
+        participant_id,
+        source_message_id=source,
+        source_image_hash="4" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload(actual_times=False)),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+
+def _two_course_draft(database, participant_id, source):
+    payload = vision_payload()
+    second = dict(payload["courses"][0])
+    second["course_name"] = "线性代数"
+    second["weekday"] = 2
+    payload["courses"].append(second)
+    repo = CourseScheduleImportRepository(database)
+    return repo, repo.create_draft(
+        participant_id,
+        source_message_id=source,
+        source_image_hash="f" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+
+
+def _expire_run_lease(database, import_id):
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(str(import_id)))
+        row.run_claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+
+def _expire_draft_ttl(database, import_id):
+    with database.session() as session:
+        row = session.get(CourseScheduleImport, uuid.UUID(str(import_id)))
+        row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+
+def _assert_draft_fillable(payload, expected):
+    database = memory_database()
+    owner = participant(database, f"PX-{expected}")
+    repo = CourseScheduleImportRepository(database)
+    draft = repo.create_draft(
+        owner.id,
+        source_message_id=f"fillable-{expected}",
+        source_image_hash="0" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    assert draft["status"] == "pending_context"
+    assert expected in draft["structured_result"]["missing_context"]
+    return repo, owner, draft
+
+
+def _image_event(event_id, message_id):
+    return BotEvent(
+        event_id=event_id,
+        message_id=message_id,
+        app_id="app",
+        open_id="open",
+        chat_id="chat",
+        text="",
+        create_time=datetime.now(timezone.utc),
+        message_type="image",
+        image_key="image-key",
+    )
+
+
+def _pipeline_worker(resources, tracker):
+    payload = ScheduleVisionResult.from_dict(vision_payload())
+
+    class Drafts:
+        def get_by_source(self, *_args):
+            return None
+
+        def create_draft(self, _participant_id, **kwargs):
+            tracker.active = max(0, tracker.active - 1)
+            return {
+                "id": kwargs["source_message_id"],
+                "structured_result": kwargs["result"].to_dict(),
+            }
+
+    class Vision:
+        model = "vision-model"
+
+        async def parse(self, *_args):
+            await asyncio.sleep(0.01)
+            return payload
+
+    imports = SimpleNamespace(
+        drafts=Drafts(), timezone=ZoneInfo("Asia/Shanghai")
+    )
+    worker = BotWorker(
+        asyncio.Queue(), object(), object(), object(), object(), object(), object(),
+        model="fake",
+        schedule_vision=Vision(),
+        schedule_imports=imports,
+        message_resources=resources,
+        schedule_image_max_concurrency=1,
+    )
+
+    async def deliver_card(*_args):
+        return True
+
+    worker._deliver_card = deliver_card
+    return worker
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_text", "expected_code"),
+    [
+        (
+            MessageResourceTooLarge("message image exceeds configured limit"),
+            "图片太大",
+            "schedule_image_too_large",
+        ),
+        (
+            UnsupportedImageFormat("only JPEG, PNG, and WebP images are supported"),
+            "JPEG、PNG 或 WebP",
+            "schedule_image_format_unsupported",
+        ),
+        (
+            MessageResourceError("message image download timed out"),
+            "图片下载超时",
+            "schedule_image_download_timeout",
+        ),
+        (
+            MessageResourceError("message image download returned no data"),
+            "图片下载失败",
+            "schedule_image_download_failed",
+        ),
+    ],
+)
+def test_schedule_image_failures_return_specific_recovery_text(
+    failure, expected_text, expected_code
+):
+    class Resources:
+        async def download_image(self, *_args):
+            raise failure
+
+    worker = _pipeline_worker(Resources(), SimpleNamespace(active=0, maximum=0))
+    delivered = []
+    recorded = []
+
+    async def deliver(_event, text):
+        delivered.append(text)
+        return True
+
+    async def mark_failed(_event, _participant_id, **values):
+        recorded.append(values)
+
+    worker._deliver = deliver
+    worker._mark_schedule_image_failed = mark_failed
+    outcome = asyncio.run(
+        worker._handle_schedule_image(
+            _image_event("failure-event", "failure-message"), uuid.uuid4()
+        )
+    )
+
+    assert outcome.status == "failed"
+    assert expected_text in delivered[-1]
+    assert recorded[-1]["error_code"] == expected_code
+
+
+def test_schedule_vision_timeout_keeps_image_and_suggests_bound_retry():
+    class Resources:
+        async def download_image(self, *_args):
+            return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+    class TimeoutVision:
+        model = "vision-model"
+
+        async def parse(self, *_args):
+            try:
+                raise httpx.ReadTimeout("upstream timeout")
+            except httpx.ReadTimeout as exc:
+                raise CourseScheduleVisionUnavailable("vision unavailable") from exc
+
+    worker = _pipeline_worker(Resources(), SimpleNamespace(active=0, maximum=0))
+    worker.schedule_vision = TimeoutVision()
+    delivered = []
+    recorded = []
+
+    async def deliver(_event, text):
+        delivered.append(text)
+        return True
+
+    async def mark_failed(_event, _participant_id, **values):
+        recorded.append(values)
+
+    worker._deliver = deliver
+    worker._mark_schedule_image_failed = mark_failed
+    outcome = asyncio.run(
+        worker._handle_schedule_image(
+            _image_event("timeout-event", "timeout-message"), uuid.uuid4()
+        )
+    )
+
+    assert outcome.status == "failed"
+    assert "识别超时" in delivered[-1]
+    assert "重新识别刚才那张课表" in delivered[-1]
+    assert recorded[-1]["error_code"] == "schedule_vision_timeout"

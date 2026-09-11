@@ -94,6 +94,139 @@ class CalendarMutationReconciliationRepository:
             session.flush()
             return self._view(row)
 
+    def bind_course_schedule_effect_dates(
+        self,
+        reconciliation_id: uuid.UUID | str,
+        *,
+        effect_dates: set[date],
+        outcome_unknown: bool,
+        outcome_unknown_error: str = "CourseScheduleBatchOutcomeUnknown",
+        claim_token: uuid.UUID | str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Bind course reconciliation work to confirmed Calendar effects.
+
+        Course schedule reconciliation is prepared before the write ledger is
+        executed, so its initial targets are only planner evidence.  This
+        method is the durable hand-off from the course write ledger to the
+        downstream Forecast queue.  It deliberately keeps the row lock and
+        target normalization in the repository so a recovery worker cannot
+        observe planned dates as committed provider effects.
+        """
+
+        changed_at = _aware(now or datetime.now(timezone.utc))
+        normalized_effect_dates = {
+            value if isinstance(value, date) else date.fromisoformat(str(value))
+            for value in effect_dates
+        }
+        with self.database.session() as session:
+            row = session.get(
+                CalendarMutationReconciliation,
+                uuid.UUID(str(reconciliation_id)),
+                with_for_update=True,
+            )
+            if row is None:
+                return None
+
+            work = dict(row.work_json or {})
+            current_token = str(work.get("processing_claim_token") or "")
+            current_until = None
+            raw_until = work.get("processing_claim_until")
+            try:
+                current_until = _aware(datetime.fromisoformat(str(raw_until)))
+            except (TypeError, ValueError):
+                pass
+            if claim_token is not None:
+                # A live course runner may only bind the effects while its
+                # durable owner lease is still current.  If recovery won the
+                # row, the live path must leave downstream work to recovery.
+                if (
+                    current_token != str(claim_token)
+                    or current_until is None
+                    or current_until <= changed_at
+                ):
+                    return None
+            elif current_token and current_until and current_until > changed_at:
+                # A caller without an owner token must not mutate a row held
+                # by another live/recovery owner.
+                return None
+            planned_targets = list(work.get("targets") or [])
+            bound_targets: list[dict[str, Any]] = []
+            for item in planned_targets:
+                target = date.fromisoformat(str(item["local_date"]))
+                dependency_source = item.get("dependency_source")
+                dependency_matches = bool(
+                    dependency_source
+                    and date.fromisoformat(str(dependency_source))
+                    in normalized_effect_dates
+                )
+                if (
+                    (bool(item.get("requires_invalidation")) and target in normalized_effect_dates)
+                    or dependency_matches
+                ):
+                    bound_targets.append(dict(item))
+
+            work["targets"] = bound_targets
+            work["effect_dates"] = sorted(
+                value.isoformat() for value in normalized_effect_dates
+            )
+            work["effect_dates_bound"] = True
+            work["effect_dates_bound_at"] = changed_at.isoformat()
+            work["course_schedule_outcome_unknown"] = bool(outcome_unknown)
+            if outcome_unknown:
+                work["course_schedule_outcome_unknown_error"] = str(
+                    outcome_unknown_error
+                )[:128]
+            else:
+                work.pop("course_schedule_outcome_unknown_error", None)
+
+            if normalized_effect_dates:
+                work.pop("no_effect", None)
+                # Binding is not fencing. The downstream queue still needs
+                # to invalidate the confirmed dates once before refresh; a
+                # crash between these two steps must remain recoverable.
+                work.pop("fenced_at", None)
+                row.status = "remote_committed"
+                row.next_attempt_at = (
+                    current_until if current_until and current_until > changed_at else changed_at
+                )
+                row.last_error_class = (
+                    str(outcome_unknown_error)[:128]
+                    if outcome_unknown
+                    else None
+                )
+                row.resolved_at = None
+            elif outcome_unknown:
+                # No confirmed effect exists yet. Keep this row recoverable,
+                # but with no executable Forecast targets. The course runner
+                # will bind it again after provider recovery confirms a write.
+                work.pop("fenced_at", None)
+                work.pop("no_effect", None)
+                work.pop("processing_claim_token", None)
+                work.pop("processing_claim_until", None)
+                row.status = "remote_outcome_unknown"
+                row.next_attempt_at = (
+                    current_until if current_until and current_until > changed_at else changed_at
+                )
+                row.last_error_class = str(outcome_unknown_error)[:128]
+                row.resolved_at = None
+            else:
+                # Definite failures with no created write are a terminal
+                # no-effect outcome. No downstream work is allowed to run.
+                work["no_effect"] = True
+                work["fenced_at"] = changed_at.isoformat()
+                work.pop("processing_claim_token", None)
+                work.pop("processing_claim_until", None)
+                row.status = "no_effect"
+                row.next_attempt_at = None
+                row.last_error_class = None
+                row.resolved_at = changed_at
+
+            row.work_json = work
+            row.updated_at = changed_at
+            session.flush()
+            return self._view(row)
+
     def mark_remote_committed(
         self,
         reconciliation_id: uuid.UUID | str,

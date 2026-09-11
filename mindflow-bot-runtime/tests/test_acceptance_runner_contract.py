@@ -59,8 +59,15 @@ def test_common_provides_cache_cap_and_lightweight_postgres_validation():
         "validate_postgres_target_with_acceptance_image()", 1
     )[1].split("\n}", 1)[0]
     assert "run --rm --no-deps" in validator
+    assert '--env-file "$RUNTIME_ROOT/.env"' in validator
     assert "python3 -m app.postgres_test_guard" in validator
     assert "pytest" not in validator
+
+    env_file_guard = source.split("require_acceptance_env_file()", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert '"$RUNTIME_ROOT/.env"' in env_file_guard
+    assert "MINDFLOW_TEST_POSTGRES_URL" in env_file_guard
 
 
 def test_prepare_runner_orders_preflight_trap_stop_and_build():
@@ -84,7 +91,7 @@ def test_prepare_runner_orders_preflight_trap_stop_and_build():
     assert image_parity < restore < restored_parity
 
 
-def test_prepare_exit_cleanup_restores_then_caps_failed_build_cache_and_preserves_status():
+def test_prepare_exit_cleanup_restores_then_caps_only_failed_build_cache_and_preserves_status():
     source = PREPARE.read_text(encoding="utf-8")
     cleanup = source.split("prepare_cleanup() {", 1)[1].split("\n}", 1)[0]
 
@@ -92,15 +99,17 @@ def test_prepare_exit_cleanup_restores_then_caps_failed_build_cache_and_preserve
     disable_traps = cleanup.index("trap - EXIT HUP INT TERM", save_status)
     restore = cleanup.index("restore_runtime", disable_traps)
     build_guard = cleanup.index('BUILD_STARTED:-0}" = "1"', restore)
-    cache_cap = cleanup.index("cap_acceptance_build_cache", build_guard)
+    success_guard = cleanup.index('BUILD_SUCCEEDED:-0}" != "1"', build_guard)
+    cache_cap = cleanup.index("cap_acceptance_build_cache", success_guard)
     docker_df = cleanup.index("docker system df", cache_cap)
     root_df = cleanup.index("df -h /", docker_df)
     docker_ps = cleanup.index("docker ps", root_df)
     preserved_exit = cleanup.index('exit "$original_status"', docker_ps)
 
-    assert save_status < disable_traps < restore < build_guard < cache_cap
+    assert save_status < disable_traps < restore < build_guard < success_guard < cache_cap
     assert cache_cap < docker_df < root_df < docker_ps < preserved_exit
     assert "BUILD_STARTED=1" in source
+    assert "BUILD_SUCCEEDED=1" in source
     assert "cap_acceptance_build_cache || true" in cleanup
     assert "trap 'exit 129' HUP" in source
     assert "trap 'exit 130' INT" in source
@@ -113,7 +122,9 @@ def test_full_runner_never_builds_and_restores_after_running_acceptance():
     assert "build acceptance" not in source
     assert "python3 -m pip install" not in source
     assert "require_clean_working_tree" in source
+    assert "require_acceptance_env_file" in source
     assert "require_running_revision_parity" in source
+    assert '--env-file "$RUNTIME_ROOT/.env"' in source
 
     preflight = source.index("acceptance_preflight")
     image_gate = source.index("require_current_acceptance_image", preflight)
@@ -128,8 +139,18 @@ def test_full_runner_never_builds_and_restores_after_running_acceptance():
 
     assert preflight < image_gate < postgres_validation < trap
     assert trap < stop < acceptance < restore < restored_parity
-    assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' in source
+    assert '-e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL"' not in source
     assert "MINDFLOW_REQUIRE_POSTGRES_TESTS=1" in source
+
+
+def test_dockerfile_reuses_pip_downloads_through_buildkit_cache_mount():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert (
+        "--mount=type=cache,id=mindflow-pip-cache,"
+        "target=/home/mindflow/.cache/pip,sharing=locked"
+    ) in dockerfile
+    assert "--no-cache-dir" not in dockerfile
 
 
 def test_acceptance_image_bakes_dev_dependencies_and_runtime_only_runs_pytest():

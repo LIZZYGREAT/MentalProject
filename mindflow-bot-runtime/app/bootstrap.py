@@ -32,6 +32,14 @@ from app.repositories_daily_review import (
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
+from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.repositories_course_schedule_image import (
+    CourseScheduleImageSessionRepository,
+)
+from app.services.course_schedule_import import CourseScheduleImportService
+from app.services.course_schedule_import_runner import CourseScheduleImportRunner
+from app.services.course_schedule_vision import CourseScheduleVisionService
+from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
 from app.repositories_care import (
     CareInterventionRepository,
@@ -47,12 +55,17 @@ from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
 from app.services.hierarchical_personalization import ParameterLearningService
+from app.services.mutation_intent_verifier import (
+    MutationIntentVerifier,
+    OpenAICompatibleMutationIntentClient,
+)
 from app.services.token_service import (
     TokenEncryptionService,
     TokenRefreshService,
     TokenRepository,
 )
 from app.tools.care import CareTools
+from app.tools.course_schedule import CourseScheduleTools
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -85,6 +98,12 @@ class BusinessServices:
     care_preferences: ParticipantCarePreferenceRepository
     care_interventions: CareInterventionRepository
     care_outcome_refresh: CareOutcomeRefreshService
+    course_schedule_imports: CourseScheduleImportService
+    course_schedule_import_runner: CourseScheduleImportRunner
+    course_schedule_vision: CourseScheduleVisionService
+    generic_image_vision: GenericImageVisionService
+    course_schedule_image_sessions: CourseScheduleImageSessionRepository
+    course_schedule_tools: CourseScheduleTools
 
 
 def build_business_services(
@@ -182,9 +201,12 @@ def build_business_services(
     )
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
+    course_schedule_import_repository = CourseScheduleImportRepository(database)
+    course_schedule_image_sessions = CourseScheduleImageSessionRepository(database)
     mutation_refresh = ForecastMutationRefreshQueue(
         forecast_coordinator,
         reconciliations=CalendarMutationReconciliationRepository(database),
+        course_schedule_imports=course_schedule_import_repository,
     )
     observation_refresh = ObservationForecastRefreshService(
         forecast_snapshots,
@@ -194,6 +216,39 @@ def build_business_services(
         dependency_refresh=dependency_refresh,
     )
     care_outcome_refresh = CareOutcomeRefreshService(database)
+    course_schedule_imports = CourseScheduleImportService(
+        course_schedule_import_repository,
+        calendar,
+        token_repository,
+        timezone_name=settings.timezone_name,
+        forecast_coordinator=forecast_coordinator,
+        forecast_snapshots=forecast_snapshots,
+        mutation_refresh=mutation_refresh,
+        max_calendar_writes=settings.vision_schedule_max_calendar_writes,
+    )
+    device_flows.cleanup_resumer = course_schedule_imports.resume_cleanup_for_participant
+    course_schedule_import_runner = CourseScheduleImportRunner(
+        course_schedule_imports,
+        max_concurrency=1,
+    )
+    course_schedule_imports.queue_notifier = course_schedule_import_runner.wake
+    course_schedule_vision = CourseScheduleVisionService(
+        settings.vision_api_url,
+        settings.deepseek_api_key,
+        settings.vision_api_model,
+        enabled=settings.vision_api_enabled,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
+        max_items=settings.vision_schedule_max_items,
+    )
+    generic_image_vision = GenericImageVisionService(
+        settings.vision_api_url,
+        settings.deepseek_api_key,
+        settings.vision_api_model,
+        enabled=settings.vision_api_enabled,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
+    )
     card_actions = CardActionService(
         observations,
         calendar,
@@ -202,13 +257,28 @@ def build_business_services(
         observation_refresh=observation_refresh,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
     )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
     )
+    mutation_verifier = None
+    if settings.mutation_intent_api_enabled:
+        mutation_verifier = MutationIntentVerifier(
+            OpenAICompatibleMutationIntentClient(
+                settings.mutation_intent_api_url,
+                settings.deepseek_api_key,
+                settings.mutation_intent_api_model,
+                timeout=settings.mutation_intent_api_timeout_seconds,
+                max_tokens=settings.mutation_intent_api_max_tokens,
+            ),
+            max_concurrency=settings.mutation_intent_max_concurrency,
+        )
     registry = ToolRegistry(
-        runs, sync_max_concurrency=settings.tool_sync_max_concurrency
+        runs,
+        mutation_verifier=mutation_verifier,
+        sync_max_concurrency=settings.tool_sync_max_concurrency,
     )
     CareTools(
         profiles,
@@ -227,6 +297,12 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
     ).register(registry)
+    course_schedule_tools = CourseScheduleTools(
+        course_schedule_imports,
+        presentations,
+        image_sessions=course_schedule_image_sessions,
+    )
+    course_schedule_tools.register(registry)
     return BusinessServices(
         profiles=profiles,
         observations=observations,
@@ -254,4 +330,10 @@ def build_business_services(
         care_preferences=care_preferences,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
+        course_schedule_import_runner=course_schedule_import_runner,
+        course_schedule_vision=course_schedule_vision,
+        generic_image_vision=generic_image_vision,
+        course_schedule_image_sessions=course_schedule_image_sessions,
+        course_schedule_tools=course_schedule_tools,
     )

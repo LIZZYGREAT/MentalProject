@@ -32,13 +32,16 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - 生产 Skill 通过唯一的本地 `mindflow-care` 插件显式加载；`setting_sources=[]`，不读取用户或项目的隐式 Claude 配置。
 - SDK MCP 只暴露十六个业务 Tool，participant identity 只来自 frozen `AgentContext`。
 - 飞书 `card.action.trigger` 默认通过 WebSocket/长连接进入固定后端处理器；HTTP HTTPS callback 仅作 fallback，卡片动作不经过对话模型。
+- 课程表图片只在外部模型授权存在时通过 Bot App 消息资源接口下载到内存并交给独立 Vision 配置；完整图片流水线受同一并发上限约束，确认前不写 Calendar，确认者必须是 Draft 原绑定参与者。
+- 课程表确认前会展示重复语义，并由用户选择“按课表周期规则添加”或“全部拆成单次日程”；选择会持久化供授权恢复、失败重试与崩溃恢复复用。
+- 课程表确认使用 10 分钟运行租约恢复崩溃后的 stale-running Draft；V1 最多完整预览并确认 20 项，使用版本化的 1–14 节默认作息，单次展开默认最多写入 400 个日程。
 - 最终回复由 Backend 持久化、重试和恢复；progress 使用受控固定模板。
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
 <!-- BUSINESS_TOOL_COUNT: 16 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0037_stage6_care_jitai -->
+<!-- ALEMBIC_HEAD: 0046_course_schedule_image_sessions -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -79,7 +82,7 @@ LLM，而由固定后端 action allowlist 处理。
 
 只有当业务域和 Tool 数量继续显著扩大，并且线上审计数据证明单 Agent 路由出现稳定、
 可复现的误调用时，才考虑增加轻量意图分类层。该分类层只能提供路由建议，不能获得
-日历写权限，也不能替代各写 Tool 自身的确认、校验与幂等边界。
+日历写权限，也不能替代 Backend 对每次写 Tool proposal 的语义授权、schema 校验与幂等边界。
 
 ## 配置
 
@@ -91,6 +94,9 @@ LLM，而由固定后端 action allowlist 处理。
 - CardAction 默认设置 `FEISHU_CARD_ACTION_TRANSPORT=ws`，在飞书开放平台用 WebSocket/长连接接收 `card.action.trigger`；此模式不需要公网 HTTPS、Verification Token 或 Encrypt Key，并保持 `FEISHU_CARD_CALLBACK_ENABLED=false`。
 - HTTP fallback 使用 `FEISHU_CARD_ACTION_TRANSPORT=http` 和 `FEISHU_CARD_CALLBACK_ENABLED=true`，同时配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。同一 CardAction 不得同时启用 WS 与 HTTP ingress。
 - `DEEPSEEK_API_KEY`
+- `MUTATION_INTENT_API_ENABLED`、`MUTATION_INTENT_API_URL`、`MUTATION_INTENT_API_MODEL`、`MUTATION_INTENT_API_TIMEOUT_SECONDS`、`MUTATION_INTENT_MAX_CONCURRENCY`：仅在 Agent 提议内部或外部写操作时调用的 Backend 授权校验；不可用或响应非法时写操作 fail closed，read/compute/UI 不受影响。
+- `VISION_API_ENABLED`、`VISION_API_URL`、`VISION_API_MODEL`、`VISION_API_TIMEOUT_SECONDS`：独立课程表 Vision 开关与 endpoint/model/timeout。
+- `VISION_MAX_CONCURRENCY`、`VISION_MAX_IMAGE_BYTES`、`VISION_IMPORT_DRAFT_TTL_MINUTES`、`VISION_SCHEDULE_MAX_ITEMS`、`VISION_SCHEDULE_MAX_CALENDAR_WRITES`：完整图片流水线并发、图片、待确认 Draft、条目和日历写入上限；生产并发默认 `1`，V1 条目上限默认 `20`，单次导入写入上限默认 `400`。
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 - `CLAUDE_MODEL`：主会话模型或 Claude Code alias。
 - `CLAUDE_DEFAULT_OPUS_MODEL`、`CLAUDE_DEFAULT_SONNET_MODEL`：都填写云端已验证的 DeepSeek `v4-pro` 模型 ID。
@@ -223,7 +229,7 @@ Slow State 与 Learned Parameters；量表、事件评价和慢状态均追加�
 模型版本与验证状态。Forecast 只使用 validated 参数或迁移前已生效的 legacy 参数；candidate
 与 rejected 只保留作研究历史。Stage 2 增加因果 Forecast–Observation 匹配、研究评估、
 数据质量审计、数据集快照和模型评估运行；当前唯一 Alembic head 为
-`0037_stage6_care_jitai`。新快照使用包含 Participant Membership、画像历史、Care exposure 与
+`0039_course_schedule_recurrence_strategy`。新快照使用包含 Participant Membership、画像历史、Care exposure 与
 runtime-active history 的 Dataset Schema v7；既有 v2–v6 快照继续按各自不可变合同评估。JSON 业务列在
 PostgreSQL 使用 JSONB。Stage 3 增加独立派生的事件 workload、随时间 W(t)、Event Appraisal
 Ridge 探索性样本内校准与 Admin workload–stress 诊断；Event Appraisal/EMA 均按历史 current
@@ -275,17 +281,19 @@ cd mindflow-bot-runtime
 python -m pytest -q tests
 ```
 
-正式 ECS acceptance 必须预先创建独立、可清空的 PostgreSQL 数据库，并显式传入专用 URL：
+正式 ECS acceptance 必须预先创建独立、可清空的 PostgreSQL 数据库，并将专用 URL 配置在
+`mindflow-bot-runtime/.env` 的 `MINDFLOW_TEST_POSTGRES_URL`：
 
 ```bash
-export MINDFLOW_TEST_POSTGRES_URL='postgresql+psycopg://<test-user>:<test-password>@postgres:5432/mindflow_acceptance_test'
+sh ./scripts/prepare_acceptance_image.sh
 sh ./scripts/run_acceptance_tests.sh
 ```
 
 数据库名只允许 `mindflow_acceptance_test` 或 `mindflow_test_*`。runner 不读取、派生或 fallback
-到生产 `DATABASE_URL`；它会校验 clean tree、运行中的 Bot/Admin 与测试镜像 revision，随后在
-一次性 root 容器中临时安装固定版本的 pytest 并执行全量测试。该安装不会修改生产镜像或正在
-运行的服务。`ALLOW_DIRTY_ACCEPTANCE=1` 只供明确的本地临时诊断，正式验收不得设置。
+到生产 `DATABASE_URL`；它从 Runtime 目录的 `.env` 读取专用测试 URL，并会校验 clean tree、
+运行中的 Bot/Admin 与测试镜像 revision。`prepare_acceptance_image.sh` 会先将固定版本的测试依赖
+烘焙进验收镜像，runner 仅在一次性 root 容器中执行全量测试，不会安装依赖或修改生产镜像。
+`ALLOW_DIRTY_ACCEPTANCE=1` 只供明确的本地临时诊断，正式验收不得设置。
 
 本地测试使用 SQLite、Fake SDK client 和 Fake 外部服务，不需要安装系统级 Claude
 Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以下证据：

@@ -1,0 +1,3102 @@
+import asyncio
+import gc
+import json
+import threading
+from types import SimpleNamespace
+import weakref
+
+import pytest
+
+from app.agent.skill_loader import SkillLoader
+from app.agent.claude_runtime import ClaudeAgentRuntime
+from app.agent.sdk_adapter import ClaudeSDKTurnInterrupted, ClaudeTurnResult
+from app.agent.session_manager import ParticipantSessionManager
+from app.contracts.course_schedule import ScheduleVisionResult
+from app.contracts.generic_image_context import GenericImageContext
+from app.identity.service import IdentityService
+from app.integrations.feishu.gateway import FeishuGateway
+from app.integrations.feishu.client import FeishuSendError
+from app.models import AgentRun, BotEvent as StoredBotEvent
+from app.presentation.contracts import (
+    ResponsePlan,
+    ResponseSegment,
+    RuntimeResponse,
+)
+from app.repositories import (
+    AgentRunRepository,
+    BindingRepository,
+    BotEventRepository,
+    ClaudeSessionRepository,
+    ConversationRepository,
+)
+from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.services.safety_service import SafetyService
+from app.services.generic_image_vision import (
+    GenericImageInspection,
+    GenericImageVisionUnavailable,
+)
+from app.services.course_schedule_vision import (
+    CourseScheduleVisionValidationFailure,
+)
+from app.worker import (
+    BotWorker,
+    ScheduleImageOutcome,
+    is_explicit_schedule_import_fast_path,
+    is_schedule_recent_import_request,
+)
+from helpers import memory_database, participant, skill_path
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("帮我导入这个课表", True),
+        ("课程没问题，从 9 月 7 日开始，帮我加入上述的课程，是重复性日程。", True),
+        ("不要把上述课程加入日历", False),
+        ("上述课程有哪些？", False),
+    ],
+)
+def test_recent_schedule_import_intent_accepts_normal_direct_request(text, expected):
+    assert is_schedule_recent_import_request(text) is expected
+
+
+class Sender:
+    def __init__(self):
+        self.texts = []
+
+    def send_text(self, _chat_id, text, **_kwargs):
+        self.texts.append(text)
+        return f"reply-{len(self.texts)}"
+
+
+class FailingCardSender(Sender):
+    def send_card(self, _chat_id, _card, **_kwargs):
+        raise FeishuSendError("preview failed", retryable=False)
+
+
+class Runtime:
+    def __init__(self):
+        self.calls = []
+
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.calls.append((ctx, turn_input))
+        return RuntimeResponse(text=f"answer:{turn_input.text or 'image-only'}")
+
+    async def interrupt(self, _participant_id):
+        return False
+
+
+class CancellableRuntime(Runtime):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.pending = []
+
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.calls.append((ctx, turn_input))
+        future = asyncio.get_running_loop().create_future()
+        self.pending.append(future)
+        self.started.set()
+        await future
+        raise AssertionError("cancelled runtime must not resume")
+
+    async def interrupt(self, _participant_id):
+        cancelled = False
+        for future in self.pending:
+            if not future.done():
+                future.cancel()
+                cancelled = True
+        return cancelled
+
+
+class StopGenerationRaceRuntime(Runtime):
+    def __init__(self):
+        super().__init__()
+        self.old_started = asyncio.Event()
+        self.release_old = asyncio.Event()
+
+    async def handle_message(self, ctx, turn_input, **_kwargs):
+        self.calls.append((ctx, turn_input))
+        if turn_input.text == "旧请求":
+            self.old_started.set()
+            await self.release_old.wait()
+        return RuntimeResponse(text=f"answer:{turn_input.text}")
+
+    async def interrupt(self, _participant_id):
+        return True
+
+
+class ProductionStyleClient:
+    def __init__(self, binding, resume, factory):
+        self.binding = binding
+        self.resume = resume
+        self.factory = factory
+        self.release = asyncio.Event()
+        self.interrupted = False
+
+    async def connect(self):
+        return None
+
+    async def run_turn(self, turn_input):
+        self.factory.started.set()
+        await self.release.wait()
+        if self.interrupted:
+            raise ClaudeSDKTurnInterrupted("interrupted")
+        return ClaudeTurnResult(f"answer:{turn_input.text}", "session")
+
+    async def interrupt(self):
+        self.interrupted = True
+        self.release.set()
+
+    async def disconnect(self):
+        return None
+
+
+class ProductionStyleFactory:
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    def create(self, binding, *, resume_session_id):
+        return ProductionStyleClient(binding, resume_session_id, self)
+
+
+class FailingInterruptProductionClient(ProductionStyleClient):
+    async def interrupt(self):
+        raise RuntimeError("interrupt transport failed")
+
+
+class FailingInterruptProductionFactory(ProductionStyleFactory):
+    def create(self, binding, *, resume_session_id):
+        return FailingInterruptProductionClient(
+            binding, resume_session_id, self
+        )
+
+
+class Resources:
+    def __init__(self):
+        self.calls = []
+
+    async def download_image(self, message_id, image_key):
+        self.calls.append((message_id, image_key))
+        return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+
+class Vision:
+    model = "generic-vision"
+
+    def __init__(
+        self,
+        kind="code_or_error_screenshot",
+        *,
+        delay=0,
+        failure=False,
+        interaction_hint="unknown",
+    ):
+        self.kind = kind
+        self.delay = delay
+        self.failure = failure
+        self.interaction_hint = interaction_hint
+        self.calls = []
+
+    async def inspect(self, _data, _mime, *, user_text=""):
+        self.calls.append(user_text)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.failure:
+            raise GenericImageVisionUnavailable("timeout")
+        return GenericImageContext(
+            image_kind=self.kind,
+            summary="图片摘要",
+            visible_text="可见文字",
+            interaction_hint=self.interaction_hint,
+        )
+
+
+class RecordingScheduleMutationDrafts:
+    def __init__(self):
+        self.corrections = []
+        self.semester_dates = []
+        self.period_mappings = []
+
+    def latest_pending_context(self, _participant_id):
+        return {"id": "pending-draft", "items": []}
+
+    def apply_correction(self, participant_id, draft_id, **correction):
+        self.corrections.append((participant_id, draft_id, correction))
+        return {"id": draft_id, "items": []}
+
+    def set_semester_start_date(
+        self, participant_id, draft_id, semester_start_date
+    ):
+        self.semester_dates.append(
+            (participant_id, draft_id, semester_start_date)
+        )
+        return {"id": draft_id, "items": []}
+
+    def set_period_time_mapping(self, participant_id, draft_id, mapping):
+        self.period_mappings.append((participant_id, draft_id, mapping))
+        return {"id": draft_id, "items": []}
+
+
+def _run_pending_schedule_text(text):
+    drafts = RecordingScheduleMutationDrafts()
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        schedule_imports=SimpleNamespace(drafts=drafts)
+    )
+
+    async def deliver_card(_event, _card):
+        return True
+
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("schedule-text", "m-schedule-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    return drafts, runtime
+
+
+def test_period_question_does_not_mutate_pending_draft():
+    drafts, runtime = _run_pending_schedule_text("高数第3-4节有冲突吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_odd_even_question_does_not_mutate_pending_draft():
+    drafts, runtime = _run_pending_schedule_text("周三的课单周吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_semester_date_question_does_not_set_semester_start():
+    drafts, runtime = _run_pending_schedule_text(
+        "第一周周一是2026-09-07吗？"
+    )
+
+    assert drafts.semester_dates == []
+    assert len(runtime.calls) == 1
+
+
+def test_period_mapping_question_does_not_override_schedule():
+    drafts, runtime = _run_pending_schedule_text(
+        "第1-2节是08:00-09:40吗？"
+    )
+
+    assert drafts.period_mappings == []
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_period_correction_statement_is_delegated_to_agent_tools():
+    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_odd_even_correction_statement_is_delegated_to_agent_tools():
+    drafts, runtime = _run_pending_schedule_text("周三的课改为单周")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_should_be_period_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text("高数应该是第3-4节吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_should_be_odd_even_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text("周三应该是单周吗？")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_should_be_semester_date_question_does_not_mutate():
+    drafts, runtime = _run_pending_schedule_text(
+        "第一周周一应该是2026-09-07吗？"
+    )
+
+    assert drafts.semester_dates == []
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_imperative_period_change_reaches_agent_semantics():
+    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_plain_correction_statement_reaches_agent_semantics():
+    drafts, runtime = _run_pending_schedule_text("高数其实是第3-4节")
+
+    assert drafts.corrections == []
+    assert len(runtime.calls) == 1
+
+
+def test_only_explicit_schedule_import_phrase_uses_infrastructure_fast_path():
+    assert is_explicit_schedule_import_fast_path("把这张课程表导入日历")
+    assert not is_explicit_schedule_import_fast_path("能不能帮我导入这张课程表？")
+    assert not is_explicit_schedule_import_fast_path("这个课程表怎么导入")
+
+
+def _payload(event_id, message_id, message_type, *, text=""):
+    content = {"text": text} if message_type == "text" else {"image_key": "img-key"}
+    return {
+        "header": {"event_id": event_id},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "open"}},
+            "message": {
+                "message_id": message_id,
+                "chat_id": "chat",
+                "chat_type": "p2p",
+                "message_type": message_type,
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+        },
+    }
+
+
+def _system(
+    *,
+    vision=None,
+    runtime=None,
+    schedule_vision=None,
+    schedule_imports=None,
+    debounce=0.2,
+    association=1.0,
+    recent=1.0,
+):
+    database = memory_database()
+    person = participant(database, "MM-001")
+    bindings = BindingRepository(database)
+    identity = IdentityService(database, bindings)
+    code, _ = identity.create_invite(person.id)
+    identity.bind(
+        raw_token=code,
+        app_id="app",
+        open_id="open",
+        chat_id="chat",
+    )
+    queue = asyncio.Queue()
+    events = BotEventRepository(database)
+    gateway = FeishuGateway("app", "secret", identity, events, queue)
+    runtime = runtime or Runtime()
+    sender = Sender()
+    resources = Resources()
+    vision = vision or Vision()
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        runtime,
+        sender,
+        model="fake",
+        generic_image_vision=vision,
+        schedule_vision=schedule_vision,
+        schedule_imports=schedule_imports,
+        message_resources=resources,
+        multimodal_debounce_seconds=debounce,
+        multimodal_association_seconds=association,
+        multimodal_recent_context_seconds=recent,
+    )
+    return gateway, queue, worker, runtime, sender, vision, resources
+
+
+def _strict_schedule_result():
+    return ScheduleVisionResult.from_dict({
+        "document_type": "course_schedule",
+        "semester_label": "2026 秋",
+        "institution": "测试大学",
+        "courses": [{
+            "course_name": "高等数学",
+            "weekday": 3,
+            "period_start": 7,
+            "period_end": 8,
+            "start_time": None,
+            "end_time": None,
+            "location": "教一楼",
+            "teacher": "张老师",
+            "week_rule": {
+                "start_week": 1,
+                "end_week": 16,
+                "odd_even": "all",
+                "explicit_weeks": None,
+            },
+            "uncertain_fields": [],
+            "period_inference_source": "grid_position",
+            "period_confidence": 0.95,
+        }],
+        "missing_context": [],
+        "warnings": [],
+    })
+
+
+def _run_preview_delivery_failure(*, existing_draft=False):
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    gateway, queue, worker, _runtime, _sender, _vision, _resources = _system(
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(
+            drafts=None, timezone="Asia/Shanghai"
+        ),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    worker.sender = FailingCardSender()
+    person = worker.identity.resolve("app", "open")
+    original = None
+    if existing_draft:
+        original = repository.create_draft(
+            person.id,
+            source_message_id="m-image",
+            source_image_hash="7" * 64,
+            vision_model="strict-vision",
+            result=_strict_schedule_result(),
+            timezone_name="Asia/Shanghai",
+        )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        event = await queue.get()
+        await asyncio.to_thread(
+            worker.events.set_processing, event.event_id, person.id
+        )
+        return await worker._handle_schedule_image(event, person.id)
+
+    outcome = asyncio.run(scenario())
+    return worker, repository, outcome, original
+
+
+def test_new_draft_is_cancelled_when_preview_card_send_fails():
+    _worker, repository, outcome, _original = _run_preview_delivery_failure()
+
+    assert repository.get(outcome.draft["id"])["status"] == "cancelled"
+
+
+def test_preview_card_failure_does_not_leave_hidden_pending_draft():
+    worker, repository, outcome, _original = _run_preview_delivery_failure()
+
+    person = worker.identity.resolve("app", "open")
+    assert repository.latest_pending_context(person.id) is None
+    assert outcome.status == "preview_delivery_failed"
+
+
+def test_existing_draft_is_not_cancelled_when_preview_resend_fails():
+    _worker, repository, outcome, original = _run_preview_delivery_failure(
+        existing_draft=True
+    )
+
+    assert repository.get(original["id"])["status"] in {
+        "pending_context",
+        "pending_confirmation",
+    }
+    assert outcome.draft["id"] == original["id"]
+
+
+def test_preview_card_failure_returns_non_success_outcome():
+    worker, _repository, outcome, _original = _run_preview_delivery_failure()
+
+    assert outcome.status == "preview_delivery_failed"
+    assert outcome.status not in {"draft_created", "existing_draft"}
+    assert worker.sender.texts == [
+        "课程表已经识别出来了，但预览卡刚才没发成功。请稍后重新发送这张课程表。"
+    ]
+
+
+def test_image_plus_nearby_text_is_one_turn_and_one_final_reply():
+    gateway, queue, worker, runtime, sender, vision, _ = _system()
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="看看是什么问题")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert vision.calls == ["看看是什么问题"]
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][1].text == "看看是什么问题"
+    context = runtime.calls[0][0]
+    assert context.turn_effect_policy == "verify_on_demand"
+    assert context.source_kind == "generic_image"
+    assert context.user_request_text == "看看是什么问题"
+    assert sender.texts == ["answer:看看是什么问题"]
+
+
+def test_image_only_uses_read_only_agent_and_never_assumes_import():
+    gateway, queue, worker, runtime, sender, _, _ = _system(debounce=0)
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][1].text == ""
+    context = runtime.calls[0][0]
+    assert context.turn_effect_policy == "verify_on_demand"
+    assert context.source_kind == "generic_image"
+    assert context.user_request_text == ""
+    assert sender.texts == ["answer:image-only"]
+
+
+def test_generic_image_bytes_are_released_before_main_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"large-image-bytes"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, vision=Vision(kind="photo"), debounce=0
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_false_positive_fallback_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"large-image-bytes"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return ScheduleVisionResult.from_dict({
+                "document_type": "not_course_schedule",
+                "semester_label": None,
+                "institution": None,
+                "courses": [],
+                "missing_context": [],
+                "warnings": [],
+            })
+
+    class Drafts:
+        def get_by_source(self, _participant_id, _message_id):
+            return None
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=Drafts()),
+        debounce=0.2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这个讲座添加到日历",
+            )
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_strict_read_only_schedule_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self):
+            self.data = b"strict-read-only-image"
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+    class StrictVision:
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_ref() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=object()),
+        debounce=0.2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+
+
+def test_recent_strict_read_only_schedule_releases_image_before_agent_wait():
+    class ImagePayload:
+        __slots__ = ("data", "mime_type", "__weakref__")
+
+        def __init__(self, marker):
+            self.data = marker.encode()
+            self.mime_type = "image/png"
+
+    class TrackingResources(Resources):
+        def __init__(self):
+            super().__init__()
+            self.payload_refs = []
+
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            payload = ImagePayload(message_id)
+            self.payload_refs.append(weakref.ref(payload))
+            return payload
+
+    class StrictVision:
+        async def parse(self, _data, _mime):
+            return _strict_schedule_result()
+
+    class VerifyingRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            gc.collect()
+            assert resources.payload_refs[-1]() is None
+            return await super().handle_message(ctx, turn_input, **_kwargs)
+
+    resources = TrackingResources()
+    runtime = VerifyingRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+    worker.message_resources = resources
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(resources.payload_refs) == 2
+    assert len(runtime.calls) == 1
+
+
+def test_explicit_import_to_calendar_still_uses_fast_path():
+    vision = Vision(failure=True)
+    gateway, queue, worker, runtime, sender, _, _ = _system(vision=vision)
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        await worker._deliver(event, "strict-preview")
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "draft-1"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这个课程表导入飞书日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(strict_calls) == 1
+    assert vision.calls == []
+    assert runtime.calls == []
+    assert sender.texts == ["strict-preview"]
+
+
+def test_generic_vision_interaction_hint_routes_natural_import_to_preview():
+    vision = Vision(
+        kind="course_schedule", interaction_hint="course_import_request"
+    )
+    gateway, queue, worker, runtime, _sender, _, _ = _system(vision=vision)
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "hint-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.005)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="帮我导入一下")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 1
+    assert len(strict_calls) == 1
+    assert runtime.calls == []
+
+
+def test_unified_course_schedule_vision_creates_preview_without_second_model_call():
+    class UnifiedVision:
+        model = "unified-vision"
+
+        def __init__(self):
+            self.calls = []
+
+        async def inspect(self, _data, _mime, *, user_text=""):
+            self.calls.append(user_text)
+            return GenericImageInspection(
+                GenericImageContext(
+                    image_kind="course_schedule",
+                    summary="一张课程表",
+                    interaction_hint="unknown",
+                ),
+                _strict_schedule_result(),
+            )
+
+    class StrictVisionMustNotRun:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            raise AssertionError("unified extraction must avoid a second model call")
+
+    unified = UnifiedVision()
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=unified,
+        schedule_vision=StrictVisionMustNotRun(),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    previews = []
+
+    async def deliver_card(_event, card):
+        previews.append(card)
+        return True
+
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    draft = repository.get_by_source(person.id, "m-image")
+    assert unified.calls == [""]
+    assert draft is not None
+    assert draft["vision_model"] == "unified-vision"
+    assert len(previews) == 1
+    assert runtime.calls == []
+    image_session = worker.schedule_image_sessions.latest(
+        person.id, chat_id="chat"
+    )
+    assert image_session["status"] == "needs_information"
+    assert image_session["import_id"] == draft["id"]
+
+
+def test_strict_schedule_failure_persists_diagnostic_and_event_telemetry():
+    class FailingStrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            raise CourseScheduleVisionValidationFailure(
+                "invalid schedule",
+                detail="course_name is missing",
+                model=self.model,
+                parse_report={
+                    "quarantined": [{"path": "courses[2]", "reason": "missing_name"}]
+                },
+            )
+
+    gateway, queue, worker, _runtime, _sender, _, _ = _system(
+        schedule_vision=FailingStrictVision(),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    failure = worker.schedule_image_sessions.last_failure(
+        person.id, chat_id="chat"
+    )
+    assert failure["last_error_code"] == "schedule_validation_failed"
+    assert failure["error_detail"] == "course_name is missing"
+    assert failure["parse_report"]["quarantined"][0]["path"] == "courses[2]"
+    with worker.events.database.session() as session:
+        telemetry = session.get(StoredBotEvent, "image").telemetry_json
+    assert telemetry["course_schedule_failure"]["error_code"] == (
+        "schedule_validation_failed"
+    )
+    assert telemetry["course_schedule_failure"]["validator_detail"] == (
+        "course_name is missing"
+    )
+
+
+def test_completed_course_image_accepts_natural_omitted_import_followup():
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0
+    )
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "recent-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="帮我导入这个")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert len(strict_calls) == 2
+
+
+def test_failed_strict_import_retries_the_same_recent_image_not_an_old_draft():
+    vision = Vision(
+        kind="course_schedule", interaction_hint="course_import_request"
+    )
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=vision, debounce=0
+    )
+    strict_calls = []
+
+    async def strict(event, participant_id, **_kwargs):
+        strict_calls.append((event.message_id, participant_id))
+        if len(strict_calls) == 1:
+            return ScheduleImageOutcome("failed", None, "other")
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "retried-current-image"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("retry", "m-retry", "text", text="导入这张课表")
+        )
+        await worker.process(await queue.get())
+        person = worker.identity.resolve("app", "open")
+        return await worker.multimodal_turns.recent_context(person.id, "chat")
+
+    recent = asyncio.run(scenario())
+    assert [message_id for message_id, _person_id in strict_calls] == [
+        "m-image", "m-image"
+    ]
+    assert runtime.calls == []
+    assert recent.structured_or_agent_summary == {
+        "image_kind": "course_schedule",
+        "route": "recent_strict_schedule",
+        "draft_id": "retried-current-image",
+    }
+
+
+def test_course_schedule_question_is_read_only_and_recent_followup_reuses_context():
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint="question")
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.005)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三有什么课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+        assert gateway.accept_payload(
+            _payload("followup", "m-followup", "text", text="那周四呢？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 1
+    assert len(resources.calls) == 1
+    assert [call[1].text for call in runtime.calls] == ["周三有什么课？", "那周四呢？"]
+    assert len(sender.texts) == 2
+
+
+def test_rich_text_image_caption_is_passed_to_generic_vision_and_agent():
+    gateway, queue, worker, runtime, _sender, vision, _resources = _system(
+        vision=Vision(kind="photo"), debounce=0
+    )
+    event = _payload("captioned-image", "m-captioned-image", "image")
+    event["event"]["message"].update(
+        message_type="post",
+        content=json.dumps(
+            {
+                "zh_cn": {
+                    "content": [[
+                        {"tag": "text", "text": "这张图片里是什么？"},
+                        {"tag": "img", "image_key": "img-key"},
+                    ]]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(event)
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert vision.calls == ["这张图片里是什么？"]
+    assert runtime.calls[0][1].text == "这张图片里是什么？"
+
+
+def test_text_arriving_during_vision_failure_is_not_silently_lost():
+    vision = Vision(delay=0.04, failure=True)
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=vision, debounce=0, association=0.2
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.sleep(0.01)
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="按默认学校作息")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert [call[1].text for call in runtime.calls] == ["按默认学校作息"]
+    assert sender.texts == [
+        "这张图刚才没有读完整，你可以重发一次；如果方便，也可以告诉我你想让我重点看哪里。",
+        "answer:按默认学校作息",
+    ]
+
+
+def test_unrelated_text_after_association_window_is_a_new_agent_turn():
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="今天心情不错")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 2
+    assert runtime.calls[0][0].turn_effect_policy == "verify_on_demand"
+    assert runtime.calls[0][0].source_kind == "generic_image"
+    assert runtime.calls[1][0].calendar_mutation_allowed is True
+    assert len(sender.texts) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "今天压力怎么样？",
+        "我刚才压力很大",
+        "刚刚老师又布置作业了",
+        "我刚才睡了一会儿",
+        "这个图书馆在哪？",
+        "那张图书是谁写的？",
+        "地图里哪个地方比较好？",
+    ),
+)
+def test_completed_image_does_not_capture_immediate_unrelated_text(text):
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 2
+    assert runtime.calls[1][1].trusted_image_context is None
+    assert runtime.calls[1][0].calendar_mutation_policy == "normal"
+    assert len(sender.texts) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "周三我压力很大呢",
+        "周四我有点累呢",
+        "周五心情不太好呢",
+    ),
+)
+def test_completed_course_schedule_does_not_capture_ordinary_weekday_text(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is None
+    assert runtime.calls[-1][0].calendar_mutation_policy == "normal"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "刚才那张图里的报错怎么修？",
+        "这张图是什么意思？",
+        "那张图片帮我再看一下",
+        "那个截图里写了什么？",
+        "刚刚那个截图是什么意思？",
+    ),
+)
+def test_completed_image_keeps_explicit_reference_followups(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="photo"), debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "那周四呢",
+        "周三有什么课",
+        "周三几点",
+        "这张课表帮我再看一下",
+        "刚才那张课表里的周三呢",
+    ),
+)
+def test_completed_course_schedule_keeps_explicit_schedule_followups(text):
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text=text)
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls[-1][1].trusted_image_context is not None
+
+
+def test_explicit_reference_after_new_image_association_timeout_never_reuses_old_image():
+    class SecondImageBlocks(Vision):
+        def __init__(self):
+            super().__init__(kind="photo")
+            self.second_started = asyncio.Event()
+            self.release_second = asyncio.Event()
+
+        async def inspect(self, data, mime, *, user_text=""):
+            self.calls.append(user_text)
+            if len(self.calls) == 2:
+                self.second_started.set()
+                await self.release_second.wait()
+            return GenericImageContext(
+                image_kind="photo",
+                summary="图片摘要",
+                visible_text="可见文字",
+            )
+
+    vision = SecondImageBlocks()
+    gateway, queue, worker, runtime, _sender, _, _resources = _system(
+        vision=vision, debounce=0, association=0.01
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        second = asyncio.create_task(worker.process(await queue.get()))
+        await vision.second_started.wait()
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="这张图怎么看？")
+        )
+        await worker.process(await queue.get())
+        vision.release_second.set()
+        await second
+
+    asyncio.run(scenario())
+    question_call = next(call for call in runtime.calls if call[1].text == "这张图怎么看？")
+    assert question_call[1].trusted_image_context is None
+
+
+def test_slow_first_image_fast_second_image_followup_uses_second_image():
+    class MessageAwareResources(Resources):
+        async def download_image(self, message_id, image_key):
+            self.calls.append((message_id, image_key))
+            return SimpleNamespace(
+                data=message_id.encode(), mime_type="image/png"
+            )
+
+    class MessageAwareVision(Vision):
+        async def inspect(self, data, _mime, *, user_text=""):
+            message_id = data.decode()
+            self.calls.append(message_id)
+            return GenericImageContext(
+                image_kind="photo",
+                summary=message_id,
+                visible_text="",
+            )
+
+    class SlowFirstRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            trusted = turn_input.trusted_image_context or {}
+            if trusted.get("summary") == "m-image-1":
+                self.first_started.set()
+                await self.release_first.wait()
+            return RuntimeResponse(text=f"answer:{turn_input.text or 'image-only'}")
+
+    runtime = SlowFirstRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, vision=MessageAwareVision(), debounce=0, association=0.01
+    )
+    worker.message_resources = MessageAwareResources()
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        first = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.first_started.wait()
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        await worker.process(await queue.get())
+        runtime.release_first.set()
+        await first
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("followup", "m-followup", "text", text="这张图怎么看？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    followup = next(call for call in runtime.calls if call[1].text == "这张图怎么看？")
+    assert followup[1].trusted_image_context["summary"] == "m-image-2"
+
+
+def test_explicit_image_supplement_reuses_image_after_fast_completion():
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        vision=Vision(kind="course_schedule"), debounce=0, association=1.0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload(
+                "supplement",
+                "m-supplement",
+                "text",
+                text="这张图按默认学校作息",
+            )
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 1
+    assert len(resources.calls) == 1
+    assert [call[1].text for call in runtime.calls] == ["这张图按默认学校作息"]
+    assert len(sender.texts) == 2
+
+
+def test_two_images_are_two_image_only_turns_not_one_aggregate():
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        debounce=0.2, association=1.0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        first = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        second = asyncio.create_task(worker.process(await queue.get()))
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+    assert len(vision.calls) == 2
+    assert len(resources.calls) == 2
+    assert len(runtime.calls) == 2
+    assert len(sender.texts) == 2
+
+
+def test_stop_passes_routing_lock_and_cancels_long_image_turn():
+    vision = Vision(delay=1.0)
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=vision, debounce=0, association=1.0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(200):
+            if vision.calls:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_generation_blocks_recent_publish_after_generic_vision_returns():
+    class CancellationResistantVision(Vision):
+        def __init__(self):
+            super().__init__(kind="photo")
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def inspect(self, _data, _mime, *, user_text=""):
+            self.calls.append(user_text)
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+            return GenericImageContext(image_kind="photo", summary="late result")
+
+    vision = CancellationResistantVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=vision, debounce=0.05, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("attached", "m-attached", "text", text="看看图片")
+        )
+        await worker.process(await queue.get())
+        await vision.started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        vision.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "image").status == "interrupted"
+        assert session.get(StoredBotEvent, "attached").status == "interrupted"
+
+
+def test_stop_generation_blocks_recent_publish_after_generic_agent_returns():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(debounce=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_agent(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    worker._run_agent_input = cancellation_resistant_agent
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_generation_blocks_recent_publish_after_strict_import_returns():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(debounce=0.05)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_import(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "late-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = cancellation_resistant_import
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这张课程表导入",
+            )
+        )
+        await worker.process(await queue.get())
+        await started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def _agent_run_states(worker):
+    with worker.runs.database.session() as session:
+        return [
+            (row.status, row.finished_at)
+            for row in session.query(AgentRun).order_by(AgentRun.started_at).all()
+        ]
+
+
+def _run_new_request_after_stop_race():
+    runtime = StopGenerationRaceRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("old", "m-old", "text", text="旧请求")
+        )
+        old_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.old_started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("new", "m-new", "text", text="新请求")
+        )
+        await worker.process(await queue.get())
+        runtime.release_old.set()
+        await old_task
+
+    asyncio.run(scenario())
+    return worker, runtime, sender
+
+
+def test_new_request_after_stop_cannot_revive_old_agent_reply():
+    _worker, _runtime, sender = _run_new_request_after_stop_race()
+
+    assert "answer:旧请求" not in sender.texts
+    assert "answer:新请求" in sender.texts
+
+
+def test_new_request_after_stop_does_not_restore_second_interrupted_message():
+    _worker, _runtime, sender = _run_new_request_after_stop_race()
+
+    assert sender.texts == ["已请求停止当前处理。", "answer:新请求"]
+
+
+def test_old_run_stays_stopped_after_new_run_starts():
+    worker, _runtime, _sender = _run_new_request_after_stop_race()
+
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted",
+        "succeeded",
+    ]
+
+
+def _run_three_text_stop_scenario():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        for index in range(1, 4):
+            assert gateway.accept_payload(
+                _payload(
+                    f"text-{index}",
+                    f"m-text-{index}",
+                    "text",
+                    text=f"排队请求 {index}",
+                )
+            )
+        tasks = [
+            asyncio.create_task(worker.process(await queue.get()))
+            for _index in range(3)
+        ]
+        for _ in range(200):
+            if len(runtime.pending) == 3:
+                break
+            await asyncio.sleep(0.001)
+        assert len(runtime.pending) == 3
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+    return worker, sender
+
+
+def test_stop_marks_all_queued_text_bot_events_interrupted():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    with worker.events.database.session() as session:
+        assert [
+            session.get(StoredBotEvent, f"text-{index}").status
+            for index in range(1, 4)
+        ] == ["interrupted", "interrupted", "interrupted"]
+
+
+def test_stop_three_text_requests_leaves_no_processing_bot_event():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    with worker.events.database.session() as session:
+        statuses = [row.status for row in session.query(StoredBotEvent).all()]
+    assert "processing" not in statuses
+
+
+def test_stop_three_text_requests_leaves_no_running_agent_run():
+    worker, _sender = _run_three_text_stop_scenario()
+
+    assert all(
+        status != "running" for status, _finished_at in _agent_run_states(worker)
+    )
+
+
+def test_new_post_stop_text_request_is_not_marked_interrupted():
+    worker, _runtime, _sender = _run_new_request_after_stop_race()
+
+    with worker.events.database.session() as session:
+        new_event = session.get(StoredBotEvent, "new")
+        assert new_event.status == "completed"
+        assert new_event.error_code is None
+
+
+def test_interrupted_event_cannot_be_reopened_by_late_reply_plan():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+
+    assert gateway.accept_payload(
+        _payload("late-plan", "m-late-plan", "text", text="旧请求")
+    )
+    event = asyncio.run(queue.get())
+    worker.events.set_processing(event.event_id, None)
+    worker.events.cancel_reply_plan(event.event_id)
+    worker.events.stage_reply_plan(
+        event.event_id,
+        full_text="不得恢复",
+        segments=["不得恢复"],
+    )
+
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, event.event_id)
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+    assert worker.events.pending_reply_plan(event.event_id) is None
+
+
+def test_interrupted_event_is_terminal_for_late_lifecycle_writes():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+
+    assert gateway.accept_payload(
+        _payload("terminal-event", "m-terminal-event", "text", text="旧请求")
+    )
+    event = asyncio.run(queue.get())
+    worker.events.set_processing(event.event_id, None)
+    worker.events.stage_reply_plan(
+        event.event_id,
+        full_text="已发送内容",
+        segments=["已发送内容"],
+    )
+    worker.events.mark_reply_segment_sent(
+        event.event_id,
+        segment_index=0,
+        message_id="om-reply",
+    )
+    worker.events.cancel_reply_plan(event.event_id)
+
+    worker.events.finish_reply_plan(event.event_id)
+    worker.events.note_reply_failure(event.event_id)
+    worker.events.set_processing(event.event_id, None)
+    worker.events.finish(event.event_id, status="completed")
+
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, event.event_id)
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+
+
+def test_stop_during_multimodal_run_start_leaves_no_running_agent_run():
+    gateway, queue, worker, runtime, _sender, _, _ = _system(debounce=0)
+    delegate = worker.runs
+
+    class BlockingRunRepository:
+        database = delegate.database
+
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def start(self, *args, **kwargs):
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            return delegate.start(*args, **kwargs)
+
+        def finish(self, *args, **kwargs):
+            return delegate.finish(*args, **kwargs)
+
+    blocking_runs = BlockingRunRepository()
+    worker.runs = blocking_runs
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        assert await asyncio.to_thread(blocking_runs.started.wait, 1)
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        blocking_runs.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert runtime.calls == []
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted"
+    ]
+
+
+def test_cancelled_queued_agent_run_is_finished_as_interrupted():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(runtime=runtime)
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("text", "m-text", "text", text="排队请求")
+        )
+        agent_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(agent_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "text").status == "interrupted"
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_cancelled_active_multimodal_agent_run_is_finished_as_interrupted():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "image").status == "interrupted"
+
+
+def test_stop_does_not_leave_agent_run_running():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert all(status != "running" for status, _finished_at in _agent_run_states(worker))
+
+
+def test_stop_does_not_emit_duplicate_interrupted_reply():
+    runtime = CancellableRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(
+        runtime=runtime, debounce=0
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def _run_production_style_stop(*, factory=None, message_type="text"):
+    gateway, queue, worker, _runtime, sender, _, _ = _system()
+    database = worker.runs.database
+    factory = factory or ProductionStyleFactory()
+    sessions = ParticipantSessionManager(
+        factory,
+        ClaudeSessionRepository(database),
+        idle_timeout_seconds=60,
+    )
+    worker.runtime = ClaudeAgentRuntime(
+        sessions,
+        ConversationRepository(database),
+        SafetyService(),
+    )
+
+    async def scenario():
+        original_event_id = f"production-{message_type}"
+        assert gateway.accept_payload(
+            _payload(
+                original_event_id,
+                f"m-{original_event_id}",
+                message_type,
+                text="长任务" if message_type == "text" else "",
+            )
+        )
+        agent_task = asyncio.create_task(worker.process(await queue.get()))
+        await factory.started.wait()
+        assert gateway.accept_payload(
+            _payload("production-stop", "m-production-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(agent_task, return_exceptions=True)
+        await worker.runtime.close()
+
+    asyncio.run(scenario())
+    return worker, sender
+
+
+def test_production_style_stop_emits_exactly_one_user_visible_stop_reply():
+    _worker, sender = _run_production_style_stop()
+
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_production_style_stop_finishes_agent_run_as_interrupted():
+    worker, _sender = _run_production_style_stop()
+
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+
+
+def test_production_style_stop_marks_original_bot_event_interrupted():
+    worker, _sender = _run_production_style_stop()
+
+    with worker.events.database.session() as session:
+        event = session.get(StoredBotEvent, "production-text")
+        assert event.status == "interrupted"
+        assert event.error_code == "stopped"
+
+
+def test_stop_cleanup_continues_when_client_interrupt_raises():
+    worker, _sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory(),
+        message_type="image",
+    )
+
+    assert worker._active_multimodal_tasks == {}
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "production-image").status == "interrupted"
+
+
+def test_stop_reply_is_still_sent_when_sdk_interrupt_fails():
+    _worker, sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory()
+    )
+
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_interrupt_failure_does_not_leave_agent_run_running():
+    worker, _sender = _run_production_style_stop(
+        factory=FailingInterruptProductionFactory()
+    )
+
+    states = _agent_run_states(worker)
+    assert [status for status, _finished_at in states] == ["interrupted"]
+    assert states[0][1] is not None
+
+
+def test_attached_event_is_not_completed_before_consumption_is_guaranteed():
+    gateway, queue, worker, _runtime, _sender, _vision, _resources = _system(
+        debounce=0.08
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("attached", "m-attached", "text", text="看看这张图")
+        )
+        await worker.process(await queue.get())
+        with worker.events.database.session() as session:
+            assert session.get(StoredBotEvent, "attached").status == "processing"
+        await image_task
+        with worker.events.database.session() as session:
+            assert session.get(StoredBotEvent, "attached").status == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_text_arriving_during_agent_run_becomes_image_followup():
+    class BlockingRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            if len(self.calls) == 1:
+                self.started.set()
+                await self.release.wait()
+            return RuntimeResponse(text=f"answer:{turn_input.text or 'image-only'}")
+
+    runtime = BlockingRuntime()
+    gateway, queue, worker, _, sender, _, _ = _system(
+        runtime=runtime, debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(
+            _payload("late", "m-late", "text", text="刚才图里的报错怎么修？")
+        )
+        await worker.process(await queue.get())
+        assert len(runtime.calls) == 1
+        runtime.release.set()
+        await image_task
+
+    asyncio.run(scenario())
+    assert [call[1].text for call in runtime.calls] == [
+        "",
+        "刚才图里的报错怎么修？",
+    ]
+    assert len(sender.texts) == 2
+
+
+def test_text_arriving_during_strict_extractor_is_not_lost():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Drafts:
+        def get(self, draft_id):
+            assert draft_id == "draft-1"
+            return {
+                "id": draft_id,
+                "structured_result": {"courses": [{"course_name": "高等数学"}]},
+                "items": [{"course_name": "高等数学"}],
+            }
+
+    imports = SimpleNamespace(drafts=Drafts())
+    gateway, queue, worker, runtime, sender, vision, _ = _system(
+        schedule_imports=imports, debounce=0.2, association=1
+    )
+
+    async def strict(event, _participant_id, **_kwargs):
+        started.set()
+        await release.wait()
+        await worker._deliver(event, "strict-preview")
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "draft-1"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await started.wait()
+        assert gateway.accept_payload(
+            _payload("late", "m-late", "text", text="那周四呢？")
+        )
+        await worker.process(await queue.get())
+        release.set()
+        await image_task
+
+    asyncio.run(scenario())
+    assert vision.calls == []
+    assert [call[1].text for call in runtime.calls] == ["那周四呢？"]
+    assert runtime.calls[0][1].trusted_image_context["draft_id"] == "draft-1"
+    assert runtime.calls[0][1].trusted_image_context["schedule"]["courses"][0][
+        "course_name"
+    ] == "高等数学"
+    assert sender.texts == ["strict-preview", "answer:那周四呢？"]
+
+
+def test_stop_marks_drained_late_schedule_correction_interrupted():
+    strict_started = asyncio.Event()
+    strict_release = asyncio.Event()
+    correction_agent_started = asyncio.Event()
+
+    class BlockingCorrectionRuntime(Runtime):
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            correction_agent_started.set()
+            await asyncio.Event().wait()
+
+    class Drafts(RecordingScheduleMutationDrafts):
+        def get(self, draft_id):
+            return {
+                "id": draft_id,
+                "structured_result": {"courses": []},
+                "items": [],
+            }
+
+    drafts = Drafts()
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        runtime=BlockingCorrectionRuntime(),
+        schedule_imports=SimpleNamespace(drafts=drafts),
+        debounce=0.2,
+        association=1,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        strict_started.set()
+        await strict_release.wait()
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "draft-1"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入")
+        )
+        await worker.process(await queue.get())
+        await strict_started.wait()
+        assert gateway.accept_payload(
+            _payload(
+                "late-correction",
+                "m-late-correction",
+                "text",
+                text="高数其实是第3-4节",
+            )
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload(
+                "queued-late-correction",
+                "m-queued-late-correction",
+                "text",
+                text="周三其实是单周",
+            )
+        )
+        await worker.process(await queue.get())
+        strict_release.set()
+        await correction_agent_started.wait()
+
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    with worker.events.database.session() as session:
+        for event_id in ("late-correction", "queued-late-correction"):
+            stored = session.get(StoredBotEvent, event_id)
+            assert stored.status == "interrupted"
+            assert stored.error_code == "stopped"
+    assert worker._active_recent_image_tasks == {}
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_strict_failure_does_not_create_false_recent_context():
+    gateway, queue, worker, _runtime, _sender, _vision, _ = _system(
+        debounce=0.2
+    )
+
+    async def failed(event, _participant_id, **_kwargs):
+        await worker._deliver(event, "strict-failed")
+        return ScheduleImageOutcome("failed", None, "other")
+
+    worker._handle_schedule_image = failed
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(
+            person.id, "chat"
+        ) is None
+
+    asyncio.run(scenario())
+
+
+def test_strict_not_course_does_not_cache_course_schedule_kind():
+    gateway, queue, worker, _runtime, _sender, _vision, _ = _system(
+        debounce=0.2
+    )
+
+    async def not_course(event, _participant_id, **_kwargs):
+        await worker._deliver(event, "not-course")
+        return ScheduleImageOutcome("not_course_schedule", None, "other")
+
+    worker._handle_schedule_image = not_course
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("intent", "m-intent", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await image_task
+        person = worker.identity.resolve("app", "open")
+        assert await worker.multimodal_turns.recent_context(person.id, "chat") is None
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_create_draft_does_not_leave_hidden_new_draft():
+    class BlockingDrafts:
+        def __init__(self, repository):
+            self.repository = repository
+            self.created = threading.Event()
+            self.release = threading.Event()
+            self.outcome = None
+
+        def get_by_source(self, participant_id, source_message_id):
+            return self.repository.get_by_source(participant_id, source_message_id)
+
+        def create_draft_outcome(self, participant_id, **kwargs):
+            self.outcome = self.repository.create_draft_outcome(
+                participant_id, **kwargs
+            )
+            self.created.set()
+            assert self.release.wait(timeout=5)
+            return self.outcome
+
+        def cancel(self, participant_id, import_id):
+            return self.repository.cancel(participant_id, import_id)
+
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        schedule_vision=SimpleNamespace(
+            model="strict-vision",
+            parse=lambda *_args: None,
+        ),
+        schedule_imports=SimpleNamespace(drafts=None, timezone="Asia/Shanghai"),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    drafts = BlockingDrafts(repository)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=drafts, timezone="Asia/Shanghai"
+    )
+
+    async def parse(_data, _mime):
+        return _strict_schedule_result()
+
+    worker.schedule_vision.parse = parse
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        for _ in range(500):
+            if drafts.created.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert drafts.created.is_set()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        drafts.release.set()
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert drafts.outcome.created_new is True
+    assert repository.get(drafts.outcome.draft["id"])["status"] == "cancelled"
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_stop_does_not_cancel_preexisting_idempotent_draft():
+    gateway, queue, worker, _runtime, sender, _, _ = _system(
+        schedule_vision=SimpleNamespace(model="strict-vision"),
+        schedule_imports=SimpleNamespace(
+            drafts=None, timezone="Asia/Shanghai"
+        ),
+        debounce=0.2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository, timezone="Asia/Shanghai"
+    )
+    person = worker.identity.resolve("app", "open")
+    existing = repository.create_draft(
+        person.id,
+        source_message_id="m-image",
+        source_image_hash="9" * 64,
+        vision_model="strict-vision",
+        result=_strict_schedule_result(),
+        timezone_name="Asia/Shanghai",
+    )
+    preview_started = asyncio.Event()
+
+    async def blocked_preview(_event, _card):
+        preview_started.set()
+        await asyncio.Event().wait()
+
+    worker._deliver_card = blocked_preview
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="把这张课程表导入日历")
+        )
+        await worker.process(await queue.get())
+        await preview_started.wait()
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(image_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert repository.get(existing["id"])["status"] in {
+        "pending_context",
+        "pending_confirmation",
+    }
+    assert sender.texts == ["已请求停止当前处理。"]
+
+
+def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent():
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            return ScheduleVisionResult.from_dict({
+                "document_type": "not_course_schedule",
+                "semester_label": None,
+                "institution": None,
+                "courses": [],
+                "missing_context": [],
+                "warnings": [],
+            })
+
+    class Drafts:
+        def get_by_source(self, _participant_id, _message_id):
+            return None
+
+    gateway, queue, worker, runtime, sender, vision, resources = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=Drafts()),
+        debounce=0.2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这个讲座添加到日历",
+            )
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert vision.calls == ["把这个讲座添加到日历"]
+    assert len(resources.calls) == 1
+    assert len(runtime.calls) == 1
+    ctx, turn_input = runtime.calls[0]
+    assert ctx.calendar_mutation_policy == "normal"
+    assert ctx.allows_calendar_mutation("create") is True
+    assert ctx.allows_calendar_mutation("delete") is True
+    assert ctx.turn_effect_policy == "verify_on_demand"
+    assert ctx.source_kind == "generic_image"
+    assert ctx.user_request_text == "把这个讲座添加到日历"
+    assert turn_input.trusted_image_context == {
+        "image_kind": "other",
+        "summary": "图片摘要",
+        "visible_text": "可见文字",
+        "warnings": [],
+        "interaction_hint": "unknown",
+    }
+    assert sender.texts == ["answer:把这个讲座添加到日历"]
+
+
+@pytest.mark.parametrize(
+    "interaction_hint",
+    ("describe_only", "calendar_event_request"),
+)
+def test_course_schedule_non_question_hints_default_to_preview_workflow(
+    interaction_hint,
+):
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint=interaction_hint),
+        debounce=0,
+    )
+    preview_calls = []
+
+    async def preview(event, participant_id, **kwargs):
+        preview_calls.append((event.message_id, participant_id, kwargs))
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "default-preview"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = preview
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert len(preview_calls) == 1
+
+
+def test_course_schedule_question_strict_failure_keeps_read_only_boundary():
+    class FailingStrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            from app.services.course_schedule_vision import CourseScheduleVisionError
+
+            raise CourseScheduleVisionError("strict parser failed")
+
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
+        schedule_vision=FailingStrictVision(),
+        debounce=0,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 1
+    ctx, turn_input = runtime.calls[0]
+    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
+    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.source_kind == "generic_image"
+    assert turn_input.trusted_image_context["image_kind"] == "course_schedule"
+    assert ctx.allows_calendar_mutation("create") is False
+
+
+def test_strict_success_recent_followup_uses_authoritative_draft():
+    class Drafts:
+        def get(self, draft_id):
+            assert draft_id == "authoritative-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {
+                    "courses": [{
+                        "course_name": "Repository 中的高等数学",
+                        "weekday": 3,
+                    }]
+                },
+                "items": [{"course_name": "Repository 中的高等数学"}],
+            }
+
+    imports = SimpleNamespace(drafts=Drafts())
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        schedule_imports=imports, debounce=0, recent=2
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_event = await queue.get()
+        person = worker.identity.resolve("app", "open")
+        turn = await worker.multimodal_turns.open_image(
+            person.id, image_event.chat_id, image_event
+        )
+        await worker.multimodal_turns.wait_for_debounce(turn)
+        await worker.multimodal_turns.complete(
+            turn,
+            image_message_id=image_event.message_id,
+            image_key=image_event.image_key,
+            image_kind="course_schedule",
+            summary={
+                "route": "strict_schedule_fast_path",
+                "draft_id": "authoritative-draft",
+                "stale_summary": "不得用于回答",
+            },
+        )
+        assert gateway.accept_payload(
+            _payload("followup", "m-followup", "text", text="那周四呢？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    trusted = runtime.calls[0][1].trusted_image_context
+    assert trusted["draft_id"] == "authoritative-draft"
+    assert "stale_summary" not in trusted
+    assert trusted["schedule"]["courses"][0]["course_name"] == (
+        "Repository 中的高等数学"
+    )
+
+
+def test_recent_import_promotes_recent_context_to_authoritative_draft():
+    gateway, queue, worker, _runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"), debounce=0
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "promoted-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        person = worker.identity.resolve("app", "open")
+        return await worker.multimodal_turns.recent_context(person.id, "chat")
+
+    recent = asyncio.run(scenario())
+    assert recent.structured_or_agent_summary == {
+        "image_kind": "course_schedule",
+        "route": "recent_strict_schedule",
+        "draft_id": "promoted-draft",
+    }
+
+
+def test_followup_qa_after_recent_import_reads_authoritative_draft():
+    class Drafts:
+        def get(self, draft_id):
+            assert draft_id == "authoritative-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {
+                    "courses": [{"course_name": "用户修正后的课程", "weekday": 4}]
+                },
+                "items": [{"course_name": "用户修正后的课程"}],
+            }
+
+    class StrictVisionMustNotRun:
+        async def parse(self, *_args):
+            raise AssertionError("authoritative draft must bypass image reparse")
+
+    imports = SimpleNamespace(drafts=Drafts())
+    gateway, queue, worker, runtime, _sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=StrictVisionMustNotRun(),
+        schedule_imports=imports,
+        debounce=0,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "authoritative-draft"}, "course_schedule"
+        )
+
+    worker._handle_schedule_image = strict
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("qa", "m-qa", "text", text="那周四有什么课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    trusted = runtime.calls[-1][1].trusted_image_context
+    assert trusted["draft_id"] == "authoritative-draft"
+    assert trusted["schedule"]["courses"][0]["course_name"] == "用户修正后的课程"
+
+
+def test_two_late_followups_import_then_correction_use_same_draft_context(monkeypatch):
+    monkeypatch.setattr(
+        "app.worker.course_schedule_preview_card",
+        lambda draft: {"draft_id": draft["id"]},
+    )
+    class BlockingRuntime(Runtime):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.calls.append((ctx, turn_input))
+            self.started.set()
+            await self.release.wait()
+            return RuntimeResponse(text="initial complete")
+
+    class Drafts:
+        def __init__(self):
+            self.corrections = []
+
+        def get(self, draft_id):
+            assert draft_id == "late-draft"
+            return {
+                "id": draft_id,
+                "structured_result": {"courses": [{"course_name": "高数"}]},
+                "items": [{"course_name": "高数"}],
+            }
+
+        def apply_correction(self, participant_id, draft_id, **correction):
+            self.corrections.append((participant_id, draft_id, correction))
+            return self.get(draft_id)
+
+    runtime = BlockingRuntime()
+    drafts = Drafts()
+    gateway, queue, worker, _, _sender, _, _ = _system(
+        runtime=runtime,
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
+        schedule_imports=SimpleNamespace(drafts=drafts),
+        debounce=0,
+        association=1,
+    )
+
+    async def strict(_event, _participant_id, **_kwargs):
+        return ScheduleImageOutcome(
+            "draft_created", {"id": "late-draft"}, "course_schedule"
+        )
+
+    delivered_cards = []
+
+    async def deliver_card(_event, card):
+        delivered_cards.append(card)
+        return True
+
+    worker._handle_schedule_image = strict
+    worker._deliver_card = deliver_card
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        await runtime.started.wait()
+        assert gateway.accept_payload(
+            _payload("late-import", "m-late-import", "text", text="帮我导入这个课表")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("late-correction", "m-late-correction", "text", text="高数其实是第3-4节")
+        )
+        await worker.process(await queue.get())
+        runtime.release.set()
+        await image_task
+
+    asyncio.run(scenario())
+    assert drafts.corrections == []
+    assert runtime.calls[-1][1].text == "高数其实是第3-4节"
+    assert runtime.calls[-1][1].trusted_image_context["draft_id"] == "late-draft"
+    assert delivered_cards == []
+
+
+def test_stop_after_two_consecutive_images_cancels_both_turns():
+    vision = Vision(delay=1)
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=vision, debounce=0, association=1
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image-1", "m-image-1", "image"))
+        first = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(200):
+            if vision.calls:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(_payload("image-2", "m-image-2", "image"))
+        second = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(200):
+            active = sum(len(value) for value in worker._active_multimodal_tasks.values())
+            if active == 2:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(_payload("stop", "m-stop", "text", text="/stop"))
+        await worker.process(await queue.get())
+        await asyncio.gather(first, second, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+    assert worker._active_multimodal_tasks == {}
+
+
+def test_natural_schedule_questions_are_not_infrastructure_fast_paths():
+    assert not is_explicit_schedule_import_fast_path("这个课程表怎么导入到日历？")
+    assert not is_explicit_schedule_import_fast_path("把这个课程添加到日历")
+
+
+def test_arbitrary_recent_image_does_not_capture_schedule_question():
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="photo"), debounce=0, association=1, recent=5
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三有什么课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert len(runtime.calls) == 2
+    assert runtime.calls[1][1].trusted_image_context is None
+    assert runtime.calls[1][0].calendar_mutation_policy == "normal"
+
+
+def test_ordinary_image_direct_calendar_request_has_explicit_policy():
+    gateway, queue, worker, runtime, _sender, _vision, _resources = _system(
+        vision=Vision(kind="photo"), debounce=0.2
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload(
+                "intent",
+                "m-intent",
+                "text",
+                text="把这个讲座添加到日历",
+            )
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert runtime.calls[0][0].calendar_mutation_policy == "normal"
+    assert runtime.calls[0][0].calendar_mutation_allowed is True
+    assert runtime.calls[0][0].turn_effect_policy == "verify_on_demand"
+    assert runtime.calls[0][0].source_kind == "generic_image"
+
+
+def test_course_schedule_qa_uses_strict_parser_and_default_times_without_draft():
+    class StrictVision:
+        model = "strict-vision"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, _data, _mime):
+            self.calls += 1
+            return _strict_schedule_result()
+
+    class NoDrafts:
+        def create_draft(self, *_args, **_kwargs):
+            raise AssertionError("read-only schedule QA must not create a draft")
+
+    strict = StrictVision()
+    generic = Vision(kind="course_schedule", interaction_hint="question")
+    imports = SimpleNamespace(drafts=NoDrafts())
+    gateway, queue, worker, runtime, _sender, _, resources = _system(
+        vision=generic,
+        schedule_vision=strict,
+        schedule_imports=imports,
+        debounce=0.2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    assert strict.calls == 1
+    assert generic.calls == ["周三几点上课？"]
+    assert len(resources.calls) == 1
+    assert len(runtime.calls) == 1
+    ctx, turn_input = runtime.calls[0]
+    course = turn_input.trusted_image_context["schedule"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
+    assert ctx.calendar_mutation_policy == "course_schedule_strict_only"
+    assert ctx.calendar_mutation_allowed is False
+    assert ctx.turn_effect_policy == "read_compute_only"
+    assert ctx.source_kind == "course_schedule_strict"
+
+
+def test_read_only_schedule_context_never_reports_missing_time_after_backend_resolution():
+    class StrictVision:
+        model = "strict-vision"
+
+        async def parse(self, _data, _mime):
+            payload = _strict_schedule_result().to_dict()
+            payload["missing_context"] = [
+                "actual_time",
+                "period_time_mapping",
+            ]
+            return ScheduleVisionResult.from_dict(payload)
+
+    gateway, queue, worker, runtime, _sender, _, _resources = _system(
+        vision=Vision(kind="course_schedule", interaction_hint="question"),
+        schedule_vision=StrictVision(),
+        schedule_imports=SimpleNamespace(drafts=object()),
+        debounce=0.2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        image_task = asyncio.create_task(worker.process(await queue.get()))
+        for _ in range(100):
+            if worker._active_multimodal_tasks:
+                break
+            await asyncio.sleep(0.001)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+        await image_task
+
+    asyncio.run(scenario())
+    schedule = runtime.calls[0][1].trusted_image_context["schedule"]
+    assert schedule["missing_context"] == []
+
+
+def test_recent_course_schedule_qa_upgrades_generic_context_to_strict_parser():
+    class StrictVision:
+        model = "strict-vision"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, _data, _mime):
+            self.calls += 1
+            return _strict_schedule_result()
+
+    strict = StrictVision()
+    generic = Vision(kind="course_schedule")
+    gateway, queue, worker, runtime, _sender, _, resources = _system(
+        vision=generic,
+        schedule_vision=strict,
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="周三几点上课？")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert generic.calls == [""]
+    assert strict.calls == 1
+    assert len(resources.calls) == 2
+    assert len(runtime.calls) == 1
+    followup_context = runtime.calls[0][1].trusted_image_context
+    assert followup_context["route"] == "strict_schedule_read_only"
+    course = followup_context["schedule"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("14:00", "15:40")
+    assert runtime.calls[0][0].calendar_mutation_allowed is False
+
+
+class CancellationResistantStrictVision:
+    model = "strict-vision"
+
+    def __init__(self):
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def parse(self, _data, _mime):
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.release.wait()
+        return _strict_schedule_result()
+
+
+def _run_stopped_recent_schedule_qa():
+    strict = CancellationResistantStrictVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=strict,
+        debounce=0,
+        association=0.01,
+        recent=2,
+    )
+    observed = {}
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        await asyncio.sleep(0.02)
+        assert gateway.accept_payload(
+            _payload("question", "m-question", "text", text="那周三几点上课？")
+        )
+        question_task = asyncio.create_task(worker.process(await queue.get()))
+        await strict.started.wait()
+        person = worker.identity.resolve("app", "open")
+        handles = worker._active_recent_image_tasks[(person.id, "chat")]
+        observed["task_generation"] = handles["question"].stop_generation
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        observed["stop_generation"] = worker._current_stop_generation(person.id)
+        strict.release.set()
+        await asyncio.gather(question_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    return worker, runtime, sender, strict, observed
+
+
+def test_stop_cancels_recent_schedule_qa_during_strict_vision():
+    worker, _runtime, _sender, strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert strict.cancelled.is_set()
+    assert worker._active_recent_image_tasks == {}
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "question").status == "interrupted"
+
+
+def test_recent_schedule_qa_does_not_start_agent_after_stop():
+    _worker, runtime, sender, _strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert runtime.calls == []
+    assert sender.texts == [
+        "这张课表刚才没有读完整，你可以直接重试一次。",
+        "已请求停止当前处理。",
+    ]
+
+
+def test_stop_reports_active_for_recent_image_followup():
+    _worker, _runtime, sender, _strict, _observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert sender.texts[-1] == "已请求停止当前处理。"
+
+
+def test_recent_followup_inherits_original_stop_generation():
+    _worker, _runtime, _sender, _strict, observed = (
+        _run_stopped_recent_schedule_qa()
+    )
+
+    assert observed == {"task_generation": 0, "stop_generation": 1}
+
+
+def _run_stopped_recent_schedule_import():
+    strict = CancellationResistantStrictVision()
+    gateway, queue, worker, runtime, sender, _, _ = _system(
+        vision=Vision(kind="course_schedule"),
+        schedule_vision=strict,
+        schedule_imports=SimpleNamespace(
+            drafts=None,
+            timezone="Asia/Shanghai",
+        ),
+        debounce=0,
+        association=1,
+        recent=2,
+    )
+    repository = CourseScheduleImportRepository(worker.runs.database)
+    worker.schedule_imports = SimpleNamespace(
+        drafts=repository,
+        timezone="Asia/Shanghai",
+    )
+    previews = []
+
+    async def deliver_card(_event, card):
+        previews.append(card)
+        return True
+
+    worker._deliver_card = deliver_card
+    original_handle_schedule = worker._handle_schedule_image
+
+    async def defer_initial_parse(event, participant_id, **kwargs):
+        if event.event_id == "image":
+            return ScheduleImageOutcome("failed", None, "course_schedule")
+        return await original_handle_schedule(event, participant_id, **kwargs)
+
+    worker._handle_schedule_image = defer_initial_parse
+
+    async def scenario():
+        assert gateway.accept_payload(_payload("image", "m-image", "image"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            _payload("import", "m-import", "text", text="帮我导入这个课表")
+        )
+        import_task = asyncio.create_task(worker.process(await queue.get()))
+        await strict.started.wait()
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        strict.release.set()
+        await asyncio.gather(import_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    person = worker.identity.resolve("app", "open")
+    return worker, runtime, sender, strict, repository, person, previews
+
+
+def test_stop_cancels_recent_schedule_import_during_strict_vision():
+    worker, _runtime, _sender, strict, repository, person, _previews = (
+        _run_stopped_recent_schedule_import()
+    )
+
+    assert strict.cancelled.is_set()
+    assert worker._active_recent_image_tasks == {}
+    assert repository.latest_pending_context(person.id) is None
+
+
+def test_recent_schedule_import_does_not_send_preview_after_stop():
+    worker, runtime, sender, _strict, repository, person, previews = (
+        _run_stopped_recent_schedule_import()
+    )
+
+    assert previews == []
+    assert repository.latest_pending_context(person.id) is None
+    assert runtime.calls == []
+    assert sender.texts == ["已请求停止当前处理。"]
+    with worker.events.database.session() as session:
+        assert session.get(StoredBotEvent, "import").status == "interrupted"
+
+
+def test_stop_during_provider_final_send_keeps_durable_interrupted_state():
+    class BlockingFirstSegmentSender(Sender):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def send_text(self, chat_id, text, **kwargs):
+            if text == "first segment":
+                self.started.set()
+                assert self.release.wait(timeout=5)
+            return super().send_text(chat_id, text, **kwargs)
+
+    class TwoSegmentOrchestrator:
+        async def build_plan(self, _response, **_kwargs):
+            return ResponsePlan(
+                kind="analysis",
+                full_text="first segment\n\nsecond segment",
+                segments=(
+                    ResponseSegment(0, "first segment"),
+                    ResponseSegment(1, "second segment"),
+                ),
+                use_cards=False,
+            )
+
+        async def close(self):
+            return None
+
+    gateway, queue, worker, _runtime, _sender, _, _ = _system()
+    sender = BlockingFirstSegmentSender()
+    worker.sender = sender
+    worker.response_orchestrator = TwoSegmentOrchestrator()
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _payload("provider-race", "m-provider-race", "text", text="长回复")
+        )
+        request_task = asyncio.create_task(worker.process(await queue.get()))
+        assert await asyncio.to_thread(sender.started.wait, 2)
+        assert gateway.accept_payload(
+            _payload("stop", "m-stop", "text", text="/stop")
+        )
+        await worker.process(await queue.get())
+        with worker.events.database.session() as session:
+            assert (
+                session.get(StoredBotEvent, "provider-race").status
+                == "interrupted"
+            )
+        sender.release.set()
+        await request_task
+
+    asyncio.run(scenario())
+
+    assert "first segment" in sender.texts
+    assert "second segment" not in sender.texts
+    assert "已请求停止当前处理。" in sender.texts
+    with worker.events.database.session() as session:
+        stored = session.get(StoredBotEvent, "provider-race")
+        assert stored.status == "interrupted"
+        assert stored.error_code == "stopped"
+    assert [status for status, _finished_at in _agent_run_states(worker)] == [
+        "interrupted"
+    ]

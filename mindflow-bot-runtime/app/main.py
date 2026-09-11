@@ -198,6 +198,7 @@ def _build_card_action_handler(
             result = card_actions.handle(
                 participant.id,
                 message_id=event.message_id,
+                chat_id=event.chat_id,
                 callback_event_id=event.event_id,
                 action_value=event.action_value,
                 form_value=event.form_value,
@@ -346,6 +347,14 @@ async def run() -> None:
     incidents = RuntimeIncidentRepository(database)
     runs = AgentRunRepository(database)
     business = build_business_services(database, settings, runs)
+    # Start the course import owner before generic Calendar mutation recovery.
+    # Forecast recovery is downstream-only and must not get a chance to replay
+    # a course provider write first.
+    sender = FeishuClient(
+        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+    )
+    business.course_schedule_import_runner.sender = sender
+    business.course_schedule_import_runner.start()
     business.dependency_refresh.start()
     business.mutation_refresh.start()
     await business.mutation_refresh.recover_startup_fences(process_started_at)
@@ -424,8 +433,15 @@ async def run() -> None:
     queue: asyncio.Queue[BotEvent] = asyncio.Queue(
         maxsize=settings.queue_max_size
     )
-    sender = FeishuClient(
-        settings.feishu_bot_app_id, settings.feishu_bot_app_secret
+    from app.integrations.feishu.message_resources import (
+        FeishuMessageResourceDownloader,
+    )
+
+    message_resources = FeishuMessageResourceDownloader(
+        sender,
+        max_bytes=settings.vision_max_image_bytes,
+        timeout_seconds=settings.vision_api_timeout_seconds,
+        max_concurrency=settings.vision_max_concurrency,
     )
     handle_card_action = _build_card_action_handler(
         identity, business.card_actions, sender, incidents
@@ -459,6 +475,20 @@ async def run() -> None:
         progress_cooldown_seconds=settings.progress_cooldown_seconds,
         progress_max_messages=settings.progress_max_messages,
         incidents=incidents,
+        schedule_vision=business.course_schedule_vision,
+        generic_image_vision=business.generic_image_vision,
+        schedule_imports=business.course_schedule_imports,
+        schedule_image_sessions=business.course_schedule_image_sessions,
+        message_resources=message_resources,
+        schedule_draft_ttl_minutes=settings.vision_import_draft_ttl_minutes,
+        schedule_image_max_concurrency=settings.vision_max_concurrency,
+        multimodal_debounce_seconds=settings.multimodal_debounce_seconds,
+        multimodal_association_seconds=settings.multimodal_association_seconds,
+        multimodal_recent_context_seconds=settings.multimodal_recent_context_seconds,
+        course_default_semester_start_date=settings.course_default_semester_start_date,
+    )
+    business.course_schedule_tools.recent_image_importer = (
+        worker.import_recent_schedule_image
     )
     card_callback = _build_card_callback(settings, handle_card_action)
     card_action_transport_available = _card_action_transport_available(
@@ -514,9 +544,11 @@ async def run() -> None:
                 app_id=saved.app_id,
                 open_id=saved.open_id,
                 chat_id=saved.chat_id,
-                text=saved.text,
                 create_time=saved.create_time,
                 chat_type=saved.chat_type,
+                message_type=saved.message_type,
+                text=saved.text,
+                image_key=saved.image_key,
             )
         )
     for participant_id in business.device_flows.pending_participants():
@@ -573,20 +605,23 @@ async def run() -> None:
                 await worker.close()
             finally:
                 try:
-                    await business.mutation_refresh.close()
+                    await business.course_schedule_import_runner.close()
                 finally:
                     try:
-                        await business.observation_refresh.close()
+                        await business.mutation_refresh.close()
                     finally:
                         try:
-                            await business.dependency_refresh.close()
+                            await business.observation_refresh.close()
                         finally:
                             try:
-                                await business.semantic_preprocessor.close(
-                                    settings.semantic_api_timeout_seconds + 2
-                                )
+                                await business.dependency_refresh.close()
                             finally:
-                                await runtime.close()
+                                try:
+                                    await business.semantic_preprocessor.close(
+                                        settings.semantic_api_timeout_seconds + 2
+                                    )
+                                finally:
+                                    await runtime.close()
 
 
 def main() -> None:

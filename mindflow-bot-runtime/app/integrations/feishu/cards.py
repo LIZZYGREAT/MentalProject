@@ -3,6 +3,436 @@
 from __future__ import annotations
 
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from app.domain.course_schedule_recurrence import (
+    EXPAND_ALL_OCCURRENCES,
+    PRESERVE_SCHEDULE_PATTERN,
+    describe_course_write_plan,
+    plan_course_writes,
+)
+
+
+_UNCERTAIN_FIELD_LABELS = {
+    "weekday": "星期",
+    "period_start": "节次",
+    "period_end": "节次",
+    "start_time": "上课时间",
+    "end_time": "上课时间",
+    "actual_time": "上课时间",
+    "week_rule": "周次",
+    "location": "地点",
+    "teacher": "教师",
+}
+
+
+def _natural_uncertain_fields(fields: list[Any]) -> list[str]:
+    labels: list[str] = []
+    for field in fields:
+        label = _UNCERTAIN_FIELD_LABELS.get(str(field), "其他信息")
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
+    """Fixed schedule preview; callback carries only the opaque draft id."""
+
+    structured = dict(draft.get("structured_result") or {})
+    courses = list(structured.get("courses") or [])
+    items = list(draft.get("items") or [])
+    missing = set(structured.get("missing_context") or [])
+    metadata = dict(structured.get("_metadata") or {})
+    time_sources = list(metadata.get("course_time_sources") or [])
+    lines = [f"识别到 **{len(courses)}** 门课"]
+    uncertain: list[str] = []
+    weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+    for index, course in enumerate(courses[:20]):
+        name = _safe_schedule_text(course.get("course_name") or "未命名课程")
+        weekday = course.get("weekday")
+        day = weekday_names[int(weekday) - 1] if isinstance(weekday, int) and 1 <= weekday <= 7 else "星期待确认"
+        start = course.get("start_time")
+        end = course.get("end_time")
+        period = (
+            f"第{course.get('period_start')}–{course.get('period_end')}节"
+            if course.get("period_start") and course.get("period_end")
+            else "节次待确认"
+        )
+        actual_time = f"{start}–{end}" if start and end else "时间待确认"
+        rule = dict(course.get("week_rule") or {})
+        if rule.get("explicit_weeks"):
+            week_text = ",".join(str(value) for value in rule["explicit_weeks"]) + "周"
+        elif rule.get("start_week") and rule.get("end_week"):
+            week_text = f"{rule.get('start_week')}–{rule.get('end_week')}周"
+            if rule.get("odd_even") == "odd":
+                week_text += "单周"
+            elif rule.get("odd_even") == "even":
+                week_text += "双周"
+        else:
+            week_text = "周次待确认"
+        location = _safe_schedule_text(course.get("location") or "地点待确认")
+        lines.extend([
+            "",
+            f"**{name}**",
+            f"{day} · {period} · {actual_time} · {week_text} · {location}",
+        ])
+        source = time_sources[index] if index < len(time_sources) else None
+        source_text = {
+            "image": "课表图片中的实际时间",
+            "user": "你刚刚提供的作息",
+            "user_actual": "你刚刚提供的实际时间",
+            "default": "学校默认作息",
+        }.get(source)
+        if source_text:
+            lines.append(f"时间来源：{source_text}")
+        if not missing and index < len(items):
+            writes = plan_course_writes(
+                draft,
+                items[index],
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                timezone=ZoneInfo(str(draft.get("timezone") or "Asia/Shanghai")),
+            )
+            lines.append(f"重复方式：{describe_course_write_plan(writes)}")
+        fields = list(course.get("uncertain_fields") or [])
+        if fields:
+            uncertain.append(
+                f"- {name}：{', '.join(_natural_uncertain_fields(fields))}"
+            )
+    if len(courses) > 20:
+        lines.extend(["", "课程数量超过 20 项，请拆分图片后重新导入。"])
+    warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]
+    parse_report = dict(metadata.get("parse_report") or {})
+    quarantined = list(parse_report.get("quarantined") or [])
+    over_limit = [
+        item
+        for item in quarantined
+        if item.get("reason") == "course_item_limit_exceeded"
+    ]
+    other_quarantined = [item for item in quarantined if item not in over_limit]
+    if over_limit:
+        lines.extend(
+            [
+                "",
+                f"另有 {len(over_limit)} 门课超出单次 20 门上限，未放入本次预览。",
+                "请拆成两张图重新发送，例如先发周一到周三，再发周四到周日。",
+            ]
+        )
+    if other_quarantined:
+        lines.extend(["", f"另有 {len(other_quarantined)} 门课需要补充后再并入："])
+        for item in other_quarantined[:10]:
+            name = _safe_schedule_text(item.get("course_name") or "未命名课程")
+            lines.append(f"- {name}（识别格式待确认）")
+    if uncertain or warnings:
+        lines.extend(["", f"有 {len(uncertain) + len(warnings)} 项需要你确认", *uncertain, *[f"- {v}" for v in warnings]])
+    duplicate_warning = dict(draft.get("duplicate_warning") or {})
+    duplicate_names = [
+        _safe_schedule_text(value)
+        for value in duplicate_warning.get("course_names") or []
+    ]
+    if duplicate_names:
+        lines.extend(
+            [
+                "",
+                f"⚠️ 近期导入中有 {len(duplicate_names)} 门课可能重复：",
+                *[f"- {name}" for name in duplicate_names[:10]],
+                "你仍可继续确认；如日历中已存在，请先核对，避免重复添加。",
+            ]
+        )
+    if "semester_start_date" in missing:
+        lines.extend([
+            "",
+            "还差一个信息：这学期第一周周一是哪天？例如 2026-09-07。",
+        ])
+    if "weekday" in missing:
+        lines.extend([
+            "",
+            "有课程的星期还不确定，请告诉我对应课程是周几。",
+        ])
+    if "week_rule" in missing:
+        lines.extend([
+            "",
+            "有课程的周次还不确定，请告诉我起止周，或说明单周/双周。",
+        ])
+    if missing & {"period_time_mapping", "actual_time"}:
+        lines.extend([
+            "",
+            "有课程的节次或实际时间还不确定，请告诉我是第几节到第几节，或直接提供起止时间。",
+        ])
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
+    status = str(draft.get("status") or "")
+    if missing and status == "pending_context":
+        lines.append("\n填写关键信息后，我会先给出完整预览；确认前不会添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+        elements.extend([
+            _schedule_context_button(draft["id"]),
+            _schedule_cancel_button(draft["id"]),
+        ])
+    elif not missing and len(courses) <= 20 and status == "pending_confirmation":
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": (
+                    "按课程规律添加：例如“每周一第1-2节”，在日历里按周重复。\n"
+                    "每次单独添加：每一次上课都创建成独立日程。"
+                ),
+            },
+            _schedule_action_button(
+                draft["id"],
+                "按课程规律添加（推荐）",
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                primary=True,
+            ),
+            _schedule_action_button(
+                draft["id"],
+                "每次上课都单独添加",
+                strategy=EXPAND_ALL_OCCURRENCES,
+            ),
+            _schedule_cancel_button(draft["id"]),
+        ])
+        lines.append("\n确认无误后，我再添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+    elif not missing and status == "partial_failed" and draft.get("recurrence_strategy"):
+        elements.append(_schedule_action_button(
+            draft["id"],
+            "重试失败项",
+            strategy=str(draft["recurrence_strategy"]),
+            primary=True,
+        ))
+    elif status in {"queued", "running", "cancelling", "cleanup_failed"}:
+        if status == "cancelling":
+            lines.append("\n正在停止导入，并清理已经添加的课程…")
+        elif status == "cleanup_failed":
+            lines.append("\n导入已停止，但还有部分日程尚未清理完成。")
+        else:
+            lines.append("\n正在添加到日历，请稍候。")
+        elements[0]["content"] = "\n".join(lines)
+        if status in {"queued", "running"}:
+            elements.append(_schedule_cancel_button(draft["id"], "取消并撤销"))
+    elif status == "succeeded":
+        lines.append("\n这份课程表已经添加到日历。")
+        elements[0]["content"] = "\n".join(lines)
+    elif status in {"cancelled", "expired"}:
+        lines.append("\n这份课程表导入已取消或过期，请重新发送图片。")
+        elements[0]["content"] = "\n".join(lines)
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "课程表识别结果"}},
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def course_schedule_result_card(
+    message: str,
+    *,
+    status: str | None = None,
+    import_id: str | None = None,
+    error: str | None = None,
+    recurrence_strategy: str | None = None,
+) -> dict[str, Any]:
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": _safe_schedule_text(message)}
+    ]
+    if (
+        error == "calendar_not_connected"
+        and import_id
+        and recurrence_strategy
+        and status != "cleanup_failed"
+    ):
+        elements.append(_schedule_action_button(
+            import_id,
+            "重试失败项" if status == "partial_failed" else "继续按已选择策略添加",
+            strategy=recurrence_strategy,
+            primary=True,
+        ))
+        if status != "partial_failed":
+            elements.append(_schedule_cancel_button(import_id))
+    elif (
+        error != "provider_event_identity_conflict"
+        and status == "partial_failed"
+        and import_id
+        and recurrence_strategy
+    ):
+        elements.append(_schedule_action_button(
+            import_id,
+            "重试失败项",
+            strategy=recurrence_strategy,
+            primary=True,
+        ))
+    elif error == "calendar_write_limit_exceeded" and import_id:
+        if recurrence_strategy == EXPAND_ALL_OCCURRENCES:
+            elements.append(_schedule_action_button(
+                import_id,
+                "改用按课表周期规则添加",
+                strategy=PRESERVE_SCHEDULE_PATTERN,
+                primary=True,
+            ))
+        elements.append(_schedule_cancel_button(import_id))
+    template = "green" if status in {"succeeded", "cancelled"} else "blue"
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {"template": template, "title": {"tag": "plain_text", "content": "课程表导入"}},
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def _schedule_action_button(
+    import_id: str,
+    text: str,
+    *,
+    strategy: str,
+    primary: bool = False,
+) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "type": "primary" if primary else "default",
+        "text": {"tag": "plain_text", "content": text},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_confirm",
+            "version": "2",
+            "import_id": str(import_id),
+            "recurrence_strategy": strategy,
+        }}],
+    }
+
+
+def _schedule_cancel_button(
+    import_id: str, text: str = "暂不导入"
+) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "type": "default",
+        "text": {"tag": "plain_text", "content": text},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_cancel",
+            "version": "2",
+            "import_id": str(import_id),
+        }}],
+    }
+
+
+def _schedule_context_button(import_id: str) -> dict[str, Any]:
+    """Open the fixed, non-LLM context form for an incomplete draft."""
+
+    return {
+        "tag": "button",
+        "type": "primary",
+        "text": {"tag": "plain_text", "content": "补充信息并生成预览"},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_context_open",
+            "version": "3",
+            "import_id": str(import_id),
+        }}],
+    }
+
+
+def course_schedule_context_card(draft: dict[str, Any]) -> dict[str, Any]:
+    """Collect the two common import prerequisites without invoking an LLM.
+
+    This card only updates the participant-owned draft.  It never queues or
+    writes Calendar events; the existing preview card remains the sole place
+    where the participant chooses a recurrence strategy and confirms import.
+    """
+
+    structured = dict(draft.get("structured_result") or {})
+    missing = set(structured.get("missing_context") or [])
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                "先补齐课表的关键信息。提交后会显示完整预览，"
+                "由你选择重复方式；这一步不会添加日历。"
+            ),
+        }
+    ]
+    if "semester_start_date" in missing:
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": "**第一周周一**（必填）",
+            },
+            {
+                "tag": "input",
+                "name": "semester_start_date",
+                "required": True,
+                "max_length": 10,
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "例如 2026-09-07、2026/9/7 或 9月7日",
+                },
+                "label": {"tag": "plain_text", "content": "第一周周一"},
+            },
+        ])
+    if missing & {"period_time_mapping", "actual_time"}:
+        elements.extend([
+            {
+                "tag": "markdown",
+                    "content": (
+                        "**节次时间对照**（必填）\n"
+                        "每行一条，例如：`1-2节：8:00-9:35`\n"
+                        "可继续填写：`3-4=10:00-11:35`"
+                ),
+            },
+            {
+                "tag": "input",
+                "name": "period_time_mapping",
+                "required": True,
+                "input_type": "multiline_text",
+                "rows": 4,
+                "max_length": 1200,
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "1-2节：8:00-9:35\n3-4=10:00-11:35",
+                },
+                "label": {"tag": "plain_text", "content": "节次时间对照"},
+            },
+        ])
+    other_missing = missing - {
+        "semester_start_date", "period_time_mapping", "actual_time"
+    }
+    if other_missing:
+        labels = {
+            "weekday": "上课星期",
+            "week_rule": "起止周或单、双周规则",
+        }
+        detail = "、".join(labels.get(value, "课程详情") for value in sorted(other_missing))
+        elements.append({
+            "tag": "markdown",
+            "content": f"这张图还有无法可靠识别的{detail}，请先用文字补充后再继续。",
+        })
+    elements.append({
+        "tag": "button",
+        "name": "course_schedule_import_context_submit",
+        "type": "primary",
+        "text": {"tag": "plain_text", "content": "生成导入预览"},
+        "form_action_type": "submit",
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": "course_schedule_import_context_submit",
+            "version": "3",
+            "import_id": str(draft["id"]),
+        }}],
+    })
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "补充课表导入信息"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [{
+                "tag": "form",
+                "name": "mindflow_course_schedule_context",
+                "elements": elements,
+            }],
+        },
+    }
+
+
+def _safe_schedule_text(value: Any) -> str:
+    return str(value).replace("<", "＜").replace(">", "＞")[:500]
 
 from app.services.curve_analysis import CurveAnalysis, forecast_model_context
 

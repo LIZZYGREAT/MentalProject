@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 require_clean_working_tree
 load_host_revision
+require_acceptance_env_file
 export MINDFLOW_REQUIRE_POSTGRES_TESTS=1
 acceptance_preflight
 require_running_revision_parity
@@ -22,10 +23,7 @@ RUNTIME_STOPPED=1
 docker compose -f "$COMPOSE_FILE" stop bot admin
 
 set +e
-docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
-  -e MINDFLOW_TEST_POSTGRES_URL="$MINDFLOW_TEST_POSTGRES_URL" \
-  -e DATABASE_URL="$MINDFLOW_TEST_POSTGRES_URL" \
-  -e MINDFLOW_REQUIRE_POSTGRES_TESTS=1 \
+docker compose --env-file "$RUNTIME_ROOT/.env" -f "$COMPOSE_FILE" run --rm --no-deps \
   acceptance
 TEST_RESULT=$?
 set -e

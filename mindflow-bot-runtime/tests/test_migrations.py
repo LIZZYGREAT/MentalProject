@@ -162,6 +162,142 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
     assert migration_0037.down_revision == "0036_stage5_effective_profile"
 
 
+def test_course_schedule_import_migration_extends_stage6_head():
+    migration_0038 = _migration(VERSIONS / "0038_course_schedule_import.py")
+    assert migration_0038.down_revision == "0037_stage6_care_jitai"
+    migration_0039 = _migration(
+        VERSIONS / "0039_course_schedule_recurrence_strategy.py"
+    )
+    assert migration_0039.down_revision == "0038_course_schedule_import"
+    migration_0040 = _migration(
+        VERSIONS / "0040_course_schedule_import_ledger.py"
+    )
+    assert migration_0040.down_revision == "0039_course_schedule_recurrence_strategy"
+    migration_0041 = _migration(
+        VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
+    )
+    assert migration_0041.down_revision == "0040_course_schedule_import_ledger"
+    migration_0042 = _migration(
+        VERSIONS / "0042_course_schedule_provider_identity_conflict.py"
+    )
+    assert migration_0042.down_revision == "0041_course_schedule_created_provider_id_guard"
+
+
+def test_0045_adds_durable_course_schedule_rollback_refresh_outbox(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0045_course_schedule_compensation_refresh_outbox.py"
+    )
+    columns = []
+    checks = []
+    indexes = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, fields, **kwargs: indexes.append(
+            (name, table, tuple(fields))
+        ),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    assert migration.down_revision == "0044_course_schedule_compensation_saga"
+    migration.upgrade()
+
+    assert [name for _table, name in columns] == [
+        "rollback_refresh_status",
+        "rollback_refresh_attempt_count",
+        "rollback_refresh_next_attempt_at",
+        "rollback_refresh_claim_expires_at",
+        "rollback_refresh_completed_at",
+        "rollback_refresh_error_code",
+    ]
+    assert checks[0][0] == "ck_course_schedule_compensation_refresh_status"
+    assert checks[1][0] == "ck_course_schedule_compensation_deleted_refresh"
+    assert indexes == [
+        (
+            "ix_course_schedule_compensation_refresh_due",
+            "course_schedule_import_compensations",
+            (
+                "status",
+                "rollback_refresh_status",
+                "rollback_refresh_next_attempt_at",
+                "rollback_refresh_claim_expires_at",
+            ),
+        )
+    ]
+    assert "rollback_refresh_status = 'pending'" in statements[0]
+
+
+def test_0041_requires_provider_identity_for_created_writes(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0041_course_schedule_created_provider_id_guard.py"
+    )
+    checks = []
+    statements = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.upgrade()
+
+    assert len(statements) == 2
+    assert "legacy_missing_provider_event_id" in statements[0]
+    assert "create_outcome_unknown" in statements[0]
+    assert "status = 'partial_failed'" in statements[1]
+    assert checks == [
+        (
+            "ck_course_schedule_write_created_provider_id",
+            "course_schedule_import_writes",
+            "status <> 'created' OR (provider_event_id IS NOT NULL "
+            "AND trim(provider_event_id) <> '')",
+        )
+    ]
+
+
+def test_0042_adds_provider_identity_conflict_ledger(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0042_course_schedule_provider_identity_conflict.py"
+    )
+    columns = []
+    checks = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_constraint",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda name, table, condition: checks.append((name, table, condition)),
+    )
+
+    migration.upgrade()
+
+    assert columns == [
+        ("course_schedule_import_writes", "provider_conflict_event_id")
+    ]
+    assert "'create_identity_conflict'" in checks[0][2]
+    assert checks[1][0] == "ck_course_schedule_write_conflict_provider_ids"
+
+
 def test_0031_adds_auditable_parameter_learning_workflow(monkeypatch):
     migration = _migration(VERSIONS / "0031_parameter_learning_runs.py")
     tables = []

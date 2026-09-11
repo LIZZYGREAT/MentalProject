@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
+from datetime import date
 from pathlib import Path
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -123,6 +124,25 @@ class Settings:
     semantic_api_timeout_seconds: float = 8.0
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    mutation_intent_api_enabled: bool = True
+    mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
+    mutation_intent_api_model: str = "deepseek-v4-flash"
+    mutation_intent_api_timeout_seconds: float = 8.0
+    mutation_intent_api_max_tokens: int = 1024
+    mutation_intent_max_concurrency: int = 2
+    vision_api_enabled: bool = False
+    vision_api_url: str = "https://api.deepseek.com/chat/completions"
+    vision_api_model: str = "deepseek-v4-flash-vision-exp"
+    vision_api_timeout_seconds: float = 90.0
+    vision_max_concurrency: int = 1
+    vision_max_image_bytes: int = 8 * 1024 * 1024
+    vision_import_draft_ttl_minutes: int = 60
+    vision_schedule_max_items: int = 20
+    vision_schedule_max_calendar_writes: int = 400
+    multimodal_debounce_seconds: float = 3.0
+    multimodal_association_seconds: float = 15.0
+    multimodal_recent_context_seconds: float = 600.0
+    course_default_semester_start_date: str = ""
     forecast_max_concurrency: int = 1
     warning_poll_interval_seconds: int = 15
     warning_lead_minutes: int = 20
@@ -370,6 +390,60 @@ class Settings:
             semantic_materiality_threshold=_float(
                 values, "SEMANTIC_MATERIALITY_THRESHOLD", 0.03
             ),
+            mutation_intent_api_enabled=_bool(
+                values, "MUTATION_INTENT_API_ENABLED", True
+            ),
+            mutation_intent_api_url=values.get(
+                "MUTATION_INTENT_API_URL",
+                "https://api.deepseek.com/chat/completions",
+            ).strip(),
+            mutation_intent_api_model=values.get(
+                "MUTATION_INTENT_API_MODEL", "deepseek-v4-flash"
+            ).strip(),
+            mutation_intent_api_timeout_seconds=_float(
+                values, "MUTATION_INTENT_API_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            ),
+            mutation_intent_api_max_tokens=_int(
+                values, "MUTATION_INTENT_API_MAX_TOKENS", 1024, minimum=256
+            ),
+            mutation_intent_max_concurrency=_int(
+                values, "MUTATION_INTENT_MAX_CONCURRENCY", 2
+            ),
+            vision_api_enabled=_bool(values, "VISION_API_ENABLED", False),
+            vision_api_url=values.get(
+                "VISION_API_URL", "https://api.deepseek.com/chat/completions"
+            ).strip(),
+            vision_api_model=values.get(
+                "VISION_API_MODEL", "deepseek-v4-flash-vision-exp"
+            ).strip(),
+            vision_api_timeout_seconds=_float(
+                values, "VISION_API_TIMEOUT_SECONDS", 90.0, minimum=0.1
+            ),
+            vision_max_concurrency=_int(values, "VISION_MAX_CONCURRENCY", 1),
+            vision_max_image_bytes=_int(
+                values, "VISION_MAX_IMAGE_BYTES", 8 * 1024 * 1024
+            ),
+            vision_import_draft_ttl_minutes=_int(
+                values, "VISION_IMPORT_DRAFT_TTL_MINUTES", 60
+            ),
+            vision_schedule_max_items=_int(
+                values, "VISION_SCHEDULE_MAX_ITEMS", 20
+            ),
+            vision_schedule_max_calendar_writes=_int(
+                values, "VISION_SCHEDULE_MAX_CALENDAR_WRITES", 400
+            ),
+            multimodal_debounce_seconds=_float(
+                values, "MULTIMODAL_DEBOUNCE_SECONDS", 3.0
+            ),
+            multimodal_association_seconds=_float(
+                values, "MULTIMODAL_ASSOCIATION_SECONDS", 15.0
+            ),
+            multimodal_recent_context_seconds=_float(
+                values, "MULTIMODAL_RECENT_CONTEXT_SECONDS", 600.0
+            ),
+            course_default_semester_start_date=values.get(
+                "COURSE_DEFAULT_SEMESTER_START_DATE", ""
+            ).strip(),
             forecast_max_concurrency=_int(values, "FORECAST_MAX_CONCURRENCY", 1),
             warning_poll_interval_seconds=_int(
                 values, "WARNING_POLL_INTERVAL_SECONDS", 15
@@ -459,6 +533,13 @@ class Settings:
         if self.claude_code_subagent_model != self.claude_default_haiku_model:
             raise ValueError(
                 "CLAUDE_CODE_SUBAGENT_MODEL must match CLAUDE_DEFAULT_HAIKU_MODEL"
+            )
+        if self.mutation_intent_api_enabled and (
+            not self.mutation_intent_api_url or not self.mutation_intent_api_model
+        ):
+            raise ValueError(
+                "MUTATION_INTENT_API_URL and MUTATION_INTENT_API_MODEL are required "
+                "when mutation intent verification is enabled"
             )
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
@@ -554,6 +635,29 @@ class Settings:
             raise ValueError(
                 "RESPONSE_SEGMENT_TARGET_CHARS must be <= RESPONSE_SEGMENT_MAX_CHARS"
             )
+        if self.vision_api_enabled and not (
+            self.vision_api_url and self.vision_api_model and self.deepseek_api_key
+        ):
+            raise ValueError("Vision API requires URL, model, and DEEPSEEK_API_KEY")
+        if self.vision_schedule_max_items > 20:
+            raise ValueError("VISION_SCHEDULE_MAX_ITEMS must be <= 20")
+        if self.multimodal_association_seconds < self.multimodal_debounce_seconds:
+            raise ValueError(
+                "MULTIMODAL_ASSOCIATION_SECONDS must be >= MULTIMODAL_DEBOUNCE_SECONDS"
+            )
+        if self.course_default_semester_start_date:
+            try:
+                configured_semester_start = date.fromisoformat(
+                    self.course_default_semester_start_date
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "COURSE_DEFAULT_SEMESTER_START_DATE must be YYYY-MM-DD"
+                ) from exc
+            if configured_semester_start.weekday() != 0:
+                raise ValueError(
+                    "COURSE_DEFAULT_SEMESTER_START_DATE must be a Monday"
+                )
         if self.response_max_segments > 3:
             raise ValueError("RESPONSE_MAX_SEGMENTS must be <= 3")
         if self.presentation_agent_max_segments > 3:

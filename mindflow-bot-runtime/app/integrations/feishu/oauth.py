@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import logging
 import uuid
 from typing import Any
 
@@ -17,6 +18,9 @@ from app.services.token_service import (
     TokenEncryptionService,
     TokenRepository,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class FeishuOAuthError(RuntimeError):
@@ -134,6 +138,8 @@ class DeviceFlowService:
         self.encryption = encryption
         self.tokens = tokens
         self.oauth = oauth
+        # Optional participant-scoped cleanup hook installed by bootstrap.
+        self.cleanup_resumer: Any | None = None
 
     def pending_participants(self) -> list[uuid.UUID]:
         with self.database.session() as session:
@@ -250,4 +256,16 @@ class DeviceFlowService:
             await asyncio.to_thread(
                 self._set_flow_status, participant_id, "complete"
             )
+            resumer = self.cleanup_resumer
+            if callable(resumer):
+                try:
+                    await asyncio.to_thread(resumer, participant_id)
+                except Exception:
+                    # Authorization is complete even if the cleanup wake-up
+                    # fails; startup/runner recovery will retry safely.
+                    logger.exception(
+                        "course_schedule_cleanup_resume_after_oauth_failed "
+                        "participant_id=%s",
+                        participant_id,
+                    )
             return

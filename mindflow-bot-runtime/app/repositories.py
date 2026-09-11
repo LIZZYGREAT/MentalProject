@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, desc, or_, select
+from sqlalchemy import case, desc, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -188,7 +188,9 @@ class RecoverableBotEvent:
     open_id: str
     chat_id: str
     chat_type: str
+    message_type: str
     text: str
+    image_key: str | None
     create_time: datetime
 
 
@@ -3989,11 +3991,21 @@ class ConversationRepository:
         limit: int,
         *,
         exclude_feishu_message_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> list[dict[str, str]]:
         with self.database.session() as session:
             query = select(ConversationMessage).where(
                 ConversationMessage.participant_id == participant_id
             )
+            if chat_id:
+                query = query.where(
+                    exists().where(
+                        BotEvent.participant_id == participant_id,
+                        BotEvent.message_id
+                        == ConversationMessage.feishu_message_id,
+                        BotEvent.chat_id == str(chat_id),
+                    )
+                )
             if exclude_feishu_message_id:
                 query = query.where(
                     or_(
@@ -4084,7 +4096,9 @@ class BotEventRepository:
         open_id: str,
         chat_id: str,
         chat_type: str,
+        message_type: str = "text",
         text: str,
+        image_key: str | None = None,
         create_time: datetime,
     ) -> bool:
         try:
@@ -4097,7 +4111,9 @@ class BotEventRepository:
                         open_id=open_id,
                         chat_id=chat_id,
                         chat_type=chat_type,
+                        message_type=str(message_type)[:16],
                         text=str(text)[:4000],
+                        image_key=str(image_key)[:512] if image_key else None,
                         message_created_at=create_time,
                         participant_id=participant_id,
                         status="received",
@@ -4135,7 +4151,9 @@ class BotEventRepository:
                     open_id=row.open_id,
                     chat_id=row.chat_id,
                     chat_type=row.chat_type,
+                    message_type=row.message_type,
                     text=row.text,
+                    image_key=row.image_key,
                     create_time=row.message_created_at,
                 )
                 for row in rows
@@ -4187,6 +4205,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
+            if row.status == "interrupted":
+                return
             if row.status == "reply_pending" and row.reply_segments_json:
                 return
             row.reply_text = str(full_text)
@@ -4230,6 +4250,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
+            if row.status == "interrupted":
+                return
             segments = row.reply_segments_json or (
                 [row.reply_text] if row.reply_text else []
             )
@@ -4237,6 +4259,7 @@ class BotEventRepository:
                 raise ValueError("reply plan is not fully delivered")
             row.status = "completed"
             row.error_code = None
+            row.image_key = None
             row.processed_at = utc_now()
 
     def cancel_reply_plan(self, event_id: str) -> None:
@@ -4246,12 +4269,13 @@ class BotEventRepository:
                 return
             row.status = "interrupted"
             row.error_code = "stopped"
+            row.image_key = None
             row.processed_at = utc_now()
 
     def note_reply_failure(self, event_id: str) -> None:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
-            if row is not None:
+            if row is not None and row.status != "interrupted":
                 row.status = "reply_pending"
                 row.error_code = "send_failed"
 
@@ -4259,6 +4283,8 @@ class BotEventRepository:
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
+                return
+            if row.status == "interrupted":
                 return
             row.participant_id = participant_id
             row.status = "processing"
@@ -4282,10 +4308,14 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is None:
                 return
+            if row.status == "interrupted":
+                return
             row.status = status
             row.error_code = str(error_code)[:64] if error_code else None
             if reply_message_id:
                 row.reply_message_id = str(reply_message_id)[:128]
+            if status not in {"received", "processing", "reply_pending"}:
+                row.image_key = None
             row.processed_at = utc_now()
 
     def save_telemetry(self, event_id: str, metrics: dict[str, Any]) -> None:
@@ -4308,12 +4338,16 @@ class BotEventRepository:
             "presentation_agent_outcome",
             "presentation_agent_latency_ms",
             "presentation_cleanup_pending",
+            "multimodal_primary_event_id",
+            "multimodal_attached_to_event_id",
+            "multimodal_route",
+            "course_schedule_failure",
         }
         payload = {key: metrics[key] for key in allowed if key in metrics}
         with self.database.session() as session:
             row = session.get(BotEvent, event_id, with_for_update=True)
             if row is not None:
-                row.telemetry_json = payload
+                row.telemetry_json = {**(row.telemetry_json or {}), **payload}
 
 
 class RuntimeIncidentRepository:
