@@ -103,9 +103,23 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
     warnings = [_safe_schedule_text(value) for value in structured.get("warnings") or []]
     parse_report = dict(metadata.get("parse_report") or {})
     quarantined = list(parse_report.get("quarantined") or [])
-    if quarantined:
-        lines.extend(["", f"另有 {len(quarantined)} 门课需要补充后再并入："])
-        for item in quarantined[:10]:
+    over_limit = [
+        item
+        for item in quarantined
+        if item.get("reason") == "course_item_limit_exceeded"
+    ]
+    other_quarantined = [item for item in quarantined if item not in over_limit]
+    if over_limit:
+        lines.extend(
+            [
+                "",
+                f"另有 {len(over_limit)} 门课超出单次 20 门上限，未放入本次预览。",
+                "请拆成两张图重新发送，例如先发周一到周三，再发周四到周日。",
+            ]
+        )
+    if other_quarantined:
+        lines.extend(["", f"另有 {len(other_quarantined)} 门课需要补充后再并入："])
+        for item in other_quarantined[:10]:
             name = _safe_schedule_text(item.get("course_name") or "未命名课程")
             lines.append(f"- {name}（识别格式待确认）")
     if uncertain or warnings:

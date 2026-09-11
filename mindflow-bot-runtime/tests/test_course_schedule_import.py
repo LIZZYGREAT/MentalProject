@@ -56,9 +56,11 @@ from app.domain.course_schedule_periods import (
 )
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
+    CourseScheduleVisionUnavailable,
     CourseScheduleVisionService,
     SYSTEM_PROMPT,
 )
+from app.services.course_schedule_normalizer import normalize_course_schedule
 from app.services.card_action_service import (
     CardActionService,
     _period_time_mapping,
@@ -2110,6 +2112,28 @@ def test_defensive_preview_never_offers_calendar_actions_above_twenty_items():
     assert "按课表周期规则添加" not in payload
 
 
+def test_partial_preview_explains_how_to_split_courses_above_twenty():
+    payload = vision_payload()
+    payload["courses"] = [
+        {**payload["courses"][0], "course_name": f"课程 {index}"}
+        for index in range(22)
+    ]
+    normalized = normalize_course_schedule(payload)
+    structured = prepare_schedule_context(normalized)
+    structured["missing_context"] = []
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": structured,
+        "items": [],
+    }
+    card_payload = json.dumps(course_schedule_preview_card(draft), ensure_ascii=False)
+    assert "超出单次 20 门上限" in card_payload
+    assert "先发周一到周三" in card_payload
+
+
 def test_cancel_reply_starts_revert_for_persisted_completed_import():
     database = memory_database()
     owner = participant(database, "P110")
@@ -2267,3 +2291,99 @@ def _pipeline_worker(resources, tracker):
 
     worker._deliver_card = deliver_card
     return worker
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_text", "expected_code"),
+    [
+        (
+            MessageResourceTooLarge("message image exceeds configured limit"),
+            "图片太大",
+            "schedule_image_too_large",
+        ),
+        (
+            UnsupportedImageFormat("only JPEG, PNG, and WebP images are supported"),
+            "JPEG、PNG 或 WebP",
+            "schedule_image_format_unsupported",
+        ),
+        (
+            MessageResourceError("message image download timed out"),
+            "图片下载超时",
+            "schedule_image_download_timeout",
+        ),
+        (
+            MessageResourceError("message image download returned no data"),
+            "图片下载失败",
+            "schedule_image_download_failed",
+        ),
+    ],
+)
+def test_schedule_image_failures_return_specific_recovery_text(
+    failure, expected_text, expected_code
+):
+    class Resources:
+        async def download_image(self, *_args):
+            raise failure
+
+    worker = _pipeline_worker(Resources(), SimpleNamespace(active=0, maximum=0))
+    delivered = []
+    recorded = []
+
+    async def deliver(_event, text):
+        delivered.append(text)
+        return True
+
+    async def mark_failed(_event, _participant_id, **values):
+        recorded.append(values)
+
+    worker._deliver = deliver
+    worker._mark_schedule_image_failed = mark_failed
+    outcome = asyncio.run(
+        worker._handle_schedule_image(
+            _image_event("failure-event", "failure-message"), uuid.uuid4()
+        )
+    )
+
+    assert outcome.status == "failed"
+    assert expected_text in delivered[-1]
+    assert recorded[-1]["error_code"] == expected_code
+
+
+def test_schedule_vision_timeout_keeps_image_and_suggests_bound_retry():
+    class Resources:
+        async def download_image(self, *_args):
+            return SimpleNamespace(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+
+    class TimeoutVision:
+        model = "vision-model"
+
+        async def parse(self, *_args):
+            try:
+                raise httpx.ReadTimeout("upstream timeout")
+            except httpx.ReadTimeout as exc:
+                raise CourseScheduleVisionUnavailable("vision unavailable") from exc
+
+    worker = _pipeline_worker(Resources(), SimpleNamespace(active=0, maximum=0))
+    worker.schedule_vision = TimeoutVision()
+    delivered = []
+    recorded = []
+
+    async def deliver(_event, text):
+        delivered.append(text)
+        return True
+
+    async def mark_failed(_event, _participant_id, **values):
+        recorded.append(values)
+
+    worker._deliver = deliver
+    worker._mark_schedule_image_failed = mark_failed
+    outcome = asyncio.run(
+        worker._handle_schedule_image(
+            _image_event("timeout-event", "timeout-message"), uuid.uuid4()
+        )
+    )
+
+    assert outcome.status == "failed"
+    assert "识别超时" in delivered[-1]
+    assert "重新识别刚才那张课表" in delivered[-1]
+    assert recorded[-1]["error_code"] == "schedule_vision_timeout"

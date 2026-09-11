@@ -1941,7 +1941,7 @@ class BotWorker:
             )
             return ScheduleImageOutcome("failed", None, "other")
 
-        except (MessageResourceTooLarge, UnsupportedImageFormat, ValueError) as exc:
+        except MessageResourceTooLarge as exc:
             await self._ensure_task_not_stopped(
                 participant_id, delivery_event.event_id, task_generation
             )
@@ -1952,12 +1952,34 @@ class BotWorker:
                 type(exc).__name__,
             )
             await self._deliver(
-                delivery_event, "无法处理这张图片，请使用大小合适的 JPEG、PNG 或 WebP 图片。"
+                delivery_event,
+                "这张图片太大，暂时无法读取。请压缩图片，或拆成两张图后重新发送。",
             )
             await self._mark_schedule_image_failed(
                 event,
                 participant_id,
-                error_code="schedule_image_rejected",
+                error_code="schedule_image_too_large",
+                detail=str(exc),
+            )
+            return ScheduleImageOutcome("failed", None, "other")
+        except (UnsupportedImageFormat, ValueError) as exc:
+            await self._ensure_task_not_stopped(
+                participant_id, delivery_event.event_id, task_generation
+            )
+            logger.warning(
+                "course_schedule_image_rejected event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            await self._deliver(
+                delivery_event,
+                "无法读取这张图片的格式，请重新发送 JPEG、PNG 或 WebP 图片。",
+            )
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code="schedule_image_format_unsupported",
                 detail=str(exc),
             )
             return ScheduleImageOutcome("failed", None, "other")
@@ -1973,9 +1995,9 @@ class BotWorker:
             )
             await self._deliver(
                 delivery_event,
-                "这张图已识别为课程表，但导入所需的结构化信息没有通过校验，"
-                "所以还没有写入日历。请直接再试一次“导入这张课表”；"
-                "如果仍失败，管理员可依据日志中的校验项定位问题。",
+                "这张图已识别为课程表，但有关键课程信息无法可靠确认，"
+                "所以还没有写入日历。图片已保留，你可以直接说“重新识别刚才那张课表”；"
+                "也可以换一张更清晰、包含完整星期和周次的图片。",
             )
             await self._mark_schedule_image_failed(
                 event,
@@ -1985,9 +2007,43 @@ class BotWorker:
                 parse_report=getattr(exc, "parse_report", None),
             )
             return ScheduleImageOutcome("failed", None, "other")
-        except (CourseScheduleVisionUnavailable, CourseScheduleVisionError, MessageResourceError) as exc:
+        except MessageResourceError as exc:
             await self._ensure_task_not_stopped(
                 participant_id, delivery_event.event_id, task_generation
+            )
+            timed_out = "timed out" in str(exc).lower()
+            logger.warning(
+                "course_schedule_image_service_unavailable event_id=%s message_id=%s error_class=%s",
+                event.event_id,
+                event.message_id,
+                type(exc).__name__,
+            )
+            await self._deliver(
+                delivery_event,
+                (
+                    "图片下载超时了，请稍后直接重新发送这张图片。"
+                    if timed_out
+                    else "图片下载失败了，请重新发送原图后再试。"
+                ),
+            )
+            await self._mark_schedule_image_failed(
+                event,
+                participant_id,
+                error_code=(
+                    "schedule_image_download_timeout"
+                    if timed_out
+                    else "schedule_image_download_failed"
+                ),
+                detail=str(exc),
+            )
+            return ScheduleImageOutcome("failed", None, "other")
+        except (CourseScheduleVisionUnavailable, CourseScheduleVisionError) as exc:
+            await self._ensure_task_not_stopped(
+                participant_id, delivery_event.event_id, task_generation
+            )
+            cause = exc.__cause__
+            timed_out = isinstance(cause, (TimeoutError, asyncio.TimeoutError)) or (
+                cause is not None and "timeout" in type(cause).__name__.lower()
             )
             logger.warning(
                 "course_schedule_image_service_unavailable event_id=%s message_id=%s error_class=%s",
@@ -1995,11 +2051,22 @@ class BotWorker:
                 event.message_id,
                 type(exc).__name__,
             )
-            await self._deliver(delivery_event, "这张课表刚才没有读完整，你可以直接重试一次。")
+            await self._deliver(
+                delivery_event,
+                (
+                    "课程表识别超时了，图片已保留。请稍后说“重新识别刚才那张课表”。"
+                    if timed_out
+                    else "课程表识别服务暂时不可用，图片已保留。请稍后重试。"
+                ),
+            )
             await self._mark_schedule_image_failed(
                 event,
                 participant_id,
-                error_code="schedule_vision_unavailable",
+                error_code=(
+                    "schedule_vision_timeout"
+                    if timed_out
+                    else "schedule_vision_unavailable"
+                ),
                 detail=str(exc),
             )
             return ScheduleImageOutcome("failed", None, "other")
