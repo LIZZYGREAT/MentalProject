@@ -49,6 +49,50 @@ def test_six_second_text_associates_but_text_after_fifteen_seconds_does_not():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("elapsed", "expected_route"),
+    [
+        (1.0, "attached_text"),
+        (2.9, "attached_text"),
+        (3.1, "late_followup"),
+        (10.0, "late_followup"),
+    ],
+)
+def test_documented_image_text_timing_routes_are_deterministic(
+    elapsed, expected_route
+):
+    now = [0.0]
+    coordinator = MultimodalTurnCoordinator(
+        debounce_seconds=3.0,
+        association_seconds=15.0,
+        clock=lambda: now[0],
+    )
+    participant_id = uuid.uuid4()
+
+    async def scenario():
+        turn = await coordinator.open_image(participant_id, "chat", "image")
+        if elapsed <= 3.0:
+            now[0] = elapsed
+            assert await coordinator.attach_text(
+                participant_id, "chat", f"text-{elapsed}"
+            ) is turn
+        else:
+            now[0] = 3.0
+            assert await coordinator.wait_for_debounce(turn) is turn
+            await coordinator.freeze_or_snapshot_input(turn)
+            now[0] = elapsed
+            assert await coordinator.attach_text(
+                participant_id, "chat", f"text-{elapsed}"
+            ) is turn
+        return turn
+
+    turn = asyncio.run(scenario())
+    actual_route = (
+        "late_followup" if turn.late_followups else "attached_text"
+    )
+    assert actual_route == expected_route
+
+
 def test_debounce_moves_current_turn_to_processing_without_holding_lock():
     coordinator = MultimodalTurnCoordinator(debounce_seconds=0)
     participant_id = uuid.uuid4()

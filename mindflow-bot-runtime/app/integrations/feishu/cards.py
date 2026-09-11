@@ -382,6 +382,41 @@ def course_schedule_item_time_card(
     name = _safe_schedule_text(item.get("course_name") or "未命名课程")
     start = str(item.get("start_time") or "08:00")
     end = str(item.get("end_time") or "09:00")
+    start_hour, start_minute = start.split(":", 1)
+    end_hour, end_minute = end.split(":", 1)
+
+    def select(
+        field: str,
+        label: str,
+        selected: str,
+        values: list[str],
+        suffix: str,
+    ) -> dict[str, Any]:
+        return {
+            "tag": "select_static",
+            "name": field,
+            "required": True,
+            "placeholder": {"tag": "plain_text", "content": label},
+            "initial_option": selected,
+            "options": [
+                {
+                    "text": {
+                        "tag": "plain_text",
+                        "content": f"{value} {suffix}",
+                    },
+                    "value": value,
+                }
+                for value in values
+            ],
+        }
+
+    hours = [f"{value:02d}" for value in range(24)]
+    start_minutes = sorted(
+        {f"{value:02d}" for value in range(0, 60, 5)} | {start_minute}
+    )
+    end_minutes = sorted(
+        {f"{value:02d}" for value in range(0, 60, 5)} | {end_minute}
+    )
     form_elements = [
         {
             "tag": "markdown",
@@ -390,22 +425,12 @@ def course_schedule_item_time_card(
                 "修改只会刷新课程表预览，不会写入日历。"
             ),
         },
-        {
-            "tag": "input",
-            "name": "start_time",
-            "required": True,
-            "max_length": 5,
-            "placeholder": {"tag": "plain_text", "content": start},
-            "label": {"tag": "plain_text", "content": "开始时间（HH:MM）"},
-        },
-        {
-            "tag": "input",
-            "name": "end_time",
-            "required": True,
-            "max_length": 5,
-            "placeholder": {"tag": "plain_text", "content": end},
-            "label": {"tag": "plain_text", "content": "结束时间（HH:MM）"},
-        },
+        {"tag": "markdown", "content": "**开始时间**"},
+        select("start_hour", "选择小时", start_hour, hours, "时"),
+        select("start_minute", "选择分钟", start_minute, start_minutes, "分"),
+        {"tag": "markdown", "content": "**结束时间**"},
+        select("end_hour", "选择小时", end_hour, hours, "时"),
+        select("end_minute", "选择分钟", end_minute, end_minutes, "分"),
         {
             "tag": "button",
             "name": "course_schedule_item_time_submit",
@@ -414,7 +439,7 @@ def course_schedule_item_time_card(
             "form_action_type": "submit",
             "behaviors": [{"type": "callback", "value": {
                 "mindflow_action": "course_schedule_item_time_submit",
-                "version": "1",
+                "version": "2",
                 "import_id": str(draft["id"]),
                 "item_id": str(item_id),
             }}],

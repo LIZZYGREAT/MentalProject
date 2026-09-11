@@ -48,6 +48,26 @@ _WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "�
 _CLOCK_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
+def _structured_clock(values: dict[str, Any], prefix: str) -> str:
+    hour = str(values.get(f"{prefix}_hour") or "").strip()
+    minute = str(values.get(f"{prefix}_minute") or "").strip()
+    if not hour.isdigit() or not minute.isdigit():
+        raise ValueError("请选择完整的小时和分钟")
+    hour_value = int(hour)
+    minute_value = int(minute)
+    if not 0 <= hour_value <= 23 or not 0 <= minute_value <= 59:
+        raise ValueError("请选择有效的小时和分钟")
+    return f"{hour_value:02d}:{minute_value:02d}"
+
+
+def _legacy_clock(value: Any) -> str:
+    normalized = str(value or "").strip().replace("：", ":")
+    pieces = normalized.split(":", 1)
+    if len(pieces) == 2 and all(piece.isdigit() for piece in pieces):
+        normalized = f"{int(pieces[0]):02d}:{int(pieces[1]):02d}"
+    return normalized
+
+
 def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
     reply_text = "这份课程表预览已过期，请重新发送图片后再操作。"
     return {
@@ -209,7 +229,8 @@ class CardActionService:
             "course_schedule_item_time_open",
             "course_schedule_item_time_submit",
         }:
-            if str(action.get("version") or "") != "1":
+            action_version = str(action.get("version") or "")
+            if action_version not in {"1", "2"}:
                 return {"ok": False, "error": "unsupported_card_action_version"}
             if self.course_schedule_imports is None:
                 raise RuntimeError("course schedule import service is unavailable")
@@ -229,14 +250,25 @@ class CardActionService:
                     "card": course_schedule_item_time_card(draft, str(item_id)),
                 }
             values = dict(form_value or {})
-            start_value = str(values.get("start_time") or "").strip()
-            end_value = str(values.get("end_time") or "").strip()
+            try:
+                if action_version == "2":
+                    start_value = _structured_clock(values, "start")
+                    end_value = _structured_clock(values, "end")
+                else:
+                    start_value = _legacy_clock(values.get("start_time"))
+                    end_value = _legacy_clock(values.get("end_time"))
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "reply_text": str(exc),
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
             if not _CLOCK_TIME.fullmatch(start_value) or not _CLOCK_TIME.fullmatch(
                 end_value
             ):
                 return {
                     "ok": True,
-                    "reply_text": "时间格式应为 HH:MM，例如 08:55。",
+                    "reply_text": "请选择完整、有效的开始和结束时间。",
                     "card": course_schedule_item_time_card(draft, str(item_id)),
                 }
             try:

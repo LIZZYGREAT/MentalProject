@@ -384,7 +384,11 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
     target_item_id = draft["items"][0]["id"]
     assert edit_actions[0]["item_id"] == target_item_id
     form = course_schedule_item_time_card(draft, target_item_id)
-    assert "mindflow_course_schedule_item_time" in json.dumps(form)
+    form_json = json.dumps(form, ensure_ascii=False)
+    assert "mindflow_course_schedule_item_time" in form_json
+    assert '"tag": "input"' not in form_json
+    assert form_json.count('"tag": "select_static"') == 4
+    assert "HH:MM" not in form_json
 
     handler = CardActionService(
         object(),
@@ -396,11 +400,16 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
         message_id="om-item-form",
         action_value={
             "mindflow_action": "course_schedule_item_time_submit",
-            "version": "1",
+            "version": "2",
             "import_id": draft["id"],
             "item_id": target_item_id,
         },
-        form_value={"start_time": "08:55", "end_time": "11:30"},
+        form_value={
+            "start_hour": "08",
+            "start_minute": "55",
+            "end_hour": "11",
+            "end_minute": "30",
+        },
     )
 
     assert submitted["ok"] is True
@@ -413,6 +422,43 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
         "12:00",
         "13:40",
     )
+
+
+def test_legacy_time_card_submission_accepts_unpadded_and_full_width_colon():
+    database = memory_database()
+    person = participant(database, "ITEM-TIME-LEGACY")
+    repository = CourseScheduleImportRepository(database)
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-item-edit-legacy",
+        source_image_hash="f" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    target_item_id = draft["items"][0]["id"]
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+
+    result = handler.handle(
+        person.id,
+        message_id="om-legacy-card",
+        action_value={
+            "mindflow_action": "course_schedule_item_time_submit",
+            "version": "1",
+            "import_id": draft["id"],
+            "item_id": target_item_id,
+        },
+        form_value={"start_time": "8：05", "end_time": "9:40"},
+    )
+
+    assert result["ok"] is True
+    course = repository.get(draft["id"])["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:05", "09:40")
 
 
 def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():
@@ -2365,6 +2411,7 @@ def _pipeline_worker(resources, tracker):
         return True
 
     worker._deliver_card = deliver_card
+    worker._deliver_course_schedule_preview = deliver_card
     return worker
 
 
