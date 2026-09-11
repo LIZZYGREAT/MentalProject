@@ -15,7 +15,11 @@ from app.agent.tool_registry import (
     AuthorizationContextResolutionError,
     ToolRegistry,
 )
-from app.integrations.feishu.cards import daily_checkin_card, pressure_curve_card
+from app.integrations.feishu.cards import (
+    calendar_delete_confirmation_card,
+    daily_checkin_card,
+    pressure_curve_card,
+)
 from app.integrations.feishu.calendar import (
     CalendarMutationOutcomeUnknown,
     CalendarMutationRejected,
@@ -586,7 +590,7 @@ class CareTools:
         )
         registry.register(
             "calendar_delete_event",
-            "Delete one exact event from this participant's primary calendar after an explicit destructive request authorized by the backend.",
+            "Queue a fixed confirmation card for deleting one exact event. The event is not deleted until the user clicks Confirm Delete and the backend callback succeeds.",
             {
                 "type": "object",
                 "properties": {
@@ -1604,24 +1608,50 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        if self.presentations is None:
+            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            calendar_delete_confirmation_card(previous),
+        )
+        return {
+            "ok": True,
+            "calendar_mutation": "pending_confirmation",
+            "confirmation_required": True,
+        }
+
+    async def confirm_calendar_delete(
+        self,
+        participant_id,
+        event_id: str,
+        *,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        """Execute deletion only after the fixed participant-bound callback."""
+
+        try:
+            previous = await self.calendar.get_event(participant_id, event_id)
+        except PermissionError:
+            return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
         dates = await self._calendar_mutation_dates(
-            ctx.participant_id,
+            participant_id,
             previous=previous,
             updated=None,
         )
         reconciliation = await self._prepare_calendar_mutation_reconciliation(
-            ctx.participant_id,
+            participant_id,
             dates,
             "calendar_delete_event",
             {
                 "operation_type": "delete",
-                "event_id": str(args["event_id"]),
+                "event_id": event_id,
+                "source_message_id": source_message_id,
                 "previous": dict(previous or {}),
             },
         )
         try:
             deleted = await self.calendar.delete_event(
-                ctx.participant_id, str(args["event_id"])
+                participant_id, event_id
             )
         except PermissionError as exc:
             await self._finish_remote_mutation_intent(
@@ -1634,7 +1664,7 @@ class CareTools:
             )
             if self._calendar_outcome_unknown(exc):
                 await self._refresh_calendar_mutation_forecasts(
-                    ctx.participant_id,
+                    participant_id,
                     dates,
                     "calendar_delete_event_outcome_unknown",
                     reconciliation_id=(
@@ -1644,10 +1674,10 @@ class CareTools:
             raise
         await self._finish_remote_mutation_intent(
             reconciliation,
-            provider_result={"deleted": bool(deleted), "event_id": str(args["event_id"])},
+            provider_result={"deleted": bool(deleted), "event_id": event_id},
         )
         refresh = await self._refresh_calendar_mutation_forecasts(
-            ctx.participant_id,
+            participant_id,
             dates,
             "calendar_delete_event",
             reconciliation_id=(

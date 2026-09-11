@@ -16,6 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
+    card_action_result_card,
     care_intervention_result_card,
     course_schedule_context_card,
     course_schedule_preview_card,
@@ -157,6 +158,7 @@ class CardActionService:
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         course_schedule_imports: Any = None,
+        calendar_delete_executor: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -166,6 +168,7 @@ class CardActionService:
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
         self.course_schedule_imports = course_schedule_imports
+        self.calendar_delete_executor = calendar_delete_executor
 
     @staticmethod
     def _fallback_event_id(
@@ -198,6 +201,43 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {"calendar_delete_confirm", "calendar_delete_cancel"}:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if action_name == "calendar_delete_cancel":
+                reply_text = "已取消删除，日程未更改。"
+                return {
+                    "ok": True,
+                    "reply_text": reply_text,
+                    "card": card_action_result_card(message=reply_text),
+                }
+            if self.calendar_delete_executor is None:
+                raise RuntimeError("calendar delete executor is unavailable")
+            event_id = str(action.get("event_id") or "").strip()
+            if not event_id or len(event_id) > 256:
+                raise ValueError("calendar event id is invalid")
+            import asyncio
+
+            result = asyncio.run(
+                self.calendar_delete_executor(
+                    participant_id,
+                    event_id,
+                    source_message_id=(
+                        str(callback_event_id or "").strip()
+                        or self._fallback_event_id(
+                            message_id, action, dict(form_value or {})
+                        )
+                    ),
+                )
+            )
+            if not result.get("ok"):
+                return result
+            reply_text = "日程已删除。"
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
         if action_name in {
             "course_schedule_import_confirm",
             "course_schedule_import_cancel",

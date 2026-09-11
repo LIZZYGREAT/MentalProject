@@ -249,16 +249,6 @@ def build_business_services(
         timeout_seconds=settings.vision_api_timeout_seconds,
         max_concurrency=settings.vision_max_concurrency,
     )
-    card_actions = CardActionService(
-        observations,
-        calendar,
-        timezone_name=settings.timezone_name,
-        daily_reviews=daily_reviews,
-        observation_refresh=observation_refresh,
-        care_interventions=care_interventions,
-        care_outcome_refresh=care_outcome_refresh,
-        course_schedule_imports=course_schedule_imports,
-    )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
@@ -280,7 +270,7 @@ def build_business_services(
         mutation_verifier=mutation_verifier,
         sync_max_concurrency=settings.tool_sync_max_concurrency,
     )
-    CareTools(
+    care_tools = CareTools(
         profiles,
         observations,
         calendar,
@@ -296,7 +286,19 @@ def build_business_services(
         care_preferences=care_preferences,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
-    ).register(registry)
+    )
+    care_tools.register(registry)
+    card_actions = CardActionService(
+        observations,
+        calendar,
+        timezone_name=settings.timezone_name,
+        daily_reviews=daily_reviews,
+        observation_refresh=observation_refresh,
+        care_interventions=care_interventions,
+        care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
+        calendar_delete_executor=care_tools.confirm_calendar_delete,
+    )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
         presentations,

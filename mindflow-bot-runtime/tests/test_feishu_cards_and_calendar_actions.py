@@ -16,6 +16,7 @@ from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.tools.care import _creation_recurrence_from_args, _recurrence_from_args
 from app.integrations.feishu.cards import (
+    calendar_delete_confirmation_card,
     care_intervention_card,
     care_intervention_result_card,
     daily_checkin_card,
@@ -56,6 +57,72 @@ from helpers import memory_database, participant, skill_path
 
 
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+def test_calendar_delete_confirmation_card_uses_fixed_backend_actions():
+    card = calendar_delete_confirmation_card({
+        "id": "event/1",
+        "summary": "测试日程",
+        "start_time": "2026-09-11T09:00:00+08:00",
+        "end_time": "2026-09-11T10:00:00+08:00",
+    })
+    buttons = [
+        element
+        for element in card["body"]["elements"]
+        if element.get("tag") == "button"
+    ]
+    actions = [button["behaviors"][0]["value"] for button in buttons]
+    assert actions == [
+        {
+            "mindflow_action": "calendar_delete_confirm",
+            "version": "1",
+            "event_id": "event/1",
+        },
+        {"mindflow_action": "calendar_delete_cancel", "version": "1"},
+    ]
+
+
+def test_calendar_delete_callback_executes_only_on_confirm():
+    database = memory_database()
+    person = participant(database, "P-CALENDAR-DELETE")
+    calls = []
+
+    async def execute(participant_id, event_id, *, source_message_id):
+        calls.append((participant_id, event_id, source_message_id))
+        return {"ok": True, "calendar_mutation": "succeeded"}
+
+    service = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+        calendar_delete_executor=execute,
+    )
+    cancelled = service.handle(
+        person.id,
+        message_id="om-delete",
+        callback_event_id="callback-cancel",
+        action_value={
+            "mindflow_action": "calendar_delete_cancel",
+            "version": "1",
+        },
+        form_value={},
+    )
+    confirmed = service.handle(
+        person.id,
+        message_id="om-delete",
+        callback_event_id="callback-confirm",
+        action_value={
+            "mindflow_action": "calendar_delete_confirm",
+            "version": "1",
+            "event_id": "event/1",
+        },
+        form_value={},
+    )
+
+    assert cancelled["reply_text"] == "已取消删除，日程未更改。"
+    assert confirmed["reply_text"] == "日程已删除。"
+    assert calls == [(person.id, "event/1", "callback-confirm")]
 
 
 def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():

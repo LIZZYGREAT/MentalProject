@@ -1,5 +1,7 @@
 import asyncio
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -19,8 +21,19 @@ from app.contracts.generic_image_context import (
 from app.services.generic_image_vision import GenericImageVisionService
 
 
-def test_text_only_turn_keeps_original_transport_payload():
-    assert _text_transport_prompt(AgentTurnInput(text="你好")) == "你好"
+def test_text_only_turn_includes_authoritative_local_time_context():
+    prompt = _text_transport_prompt(
+        AgentTurnInput(text="今天有什么安排？"),
+        timezone_name="Asia/Shanghai",
+        current_datetime=datetime(
+            2026, 9, 11, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai")
+        ),
+    )
+    assert "<backend_time_context>" in prompt
+    assert "timezone=Asia/Shanghai" in prompt
+    assert "local_datetime=2026-09-11T00:30:00+08:00" in prompt
+    assert "local_date=2026-09-11" in prompt
+    assert prompt.endswith("User request:\n今天有什么安排？")
 
 
 def test_generic_image_context_is_framed_as_untrusted_evidence_without_base64():

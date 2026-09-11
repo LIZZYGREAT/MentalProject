@@ -889,6 +889,67 @@ def card_action_result_card(*, message: str) -> dict[str, Any]:
     }
 
 
+def calendar_delete_confirmation_card(event: dict[str, Any]) -> dict[str, Any]:
+    """Fixed confirmation card for one backend-resolved Calendar event."""
+
+    event_id = str(event.get("id") or "").strip()
+    if not event_id or len(event_id) > 256:
+        raise ValueError("calendar event id is invalid")
+    summary = str(event.get("summary") or "未命名日程")[:200]
+    start = str(event.get("start_time") or "")[:40]
+    end = str(event.get("end_time") or "")[:40]
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "确认删除日程"},
+        },
+        "header": {
+            "template": "red",
+            "title": {"tag": "plain_text", "content": "确认删除日程"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**{summary}**\n{start} – {end}\n\n"
+                        "删除后无法恢复，请确认是否继续。"
+                    ),
+                },
+                {
+                    "tag": "button",
+                    "type": "danger",
+                    "text": {"tag": "plain_text", "content": "确认删除"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "calendar_delete_confirm",
+                            "version": "1",
+                            "event_id": event_id,
+                        },
+                    }],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "calendar_delete_cancel",
+                            "version": "1",
+                        },
+                    }],
+                },
+            ],
+        },
+    }
+
+
 def pressure_curve_card(
     analysis: CurveAnalysis,
     *,

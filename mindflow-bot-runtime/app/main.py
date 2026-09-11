@@ -377,6 +377,7 @@ async def run() -> None:
         auth_token=settings.deepseek_api_key,
         max_turns=settings.claude_max_turns,
         partial_messages_enabled=settings.claude_partial_messages_enabled,
+        timezone_name=settings.timezone_name,
     )
     factory.validate()
     sessions = ParticipantSessionManager(
