@@ -13,10 +13,13 @@ from app.models import (
     AgentRun,
     AgentToolCall,
     BotEvent,
+    CalendarMutationReconciliation,
     CalendarSnapshot,
     CareInterventionEvent,
     CareInterventionFeedback,
     CareInterventionOutcome,
+    CourseScheduleImageSession,
+    CourseScheduleImport,
     FeishuBinding,
     FeishuOAuthToken,
     ForecastSnapshot,
@@ -674,25 +677,312 @@ class AdminRepository:
         }
 
     def incidents(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Aggregate user-visible and operational failures across durable stores."""
+
+        limit = max(1, min(limit, 500))
         with self.database.session() as session:
-            rows = session.execute(
+            runtime_rows = session.execute(
                 select(RuntimeIncident)
                 .order_by(desc(RuntimeIncident.created_at))
-                .limit(max(1, min(limit, 500)))
+                .limit(limit)
             ).scalars().all()
-            return [
-                {
-                    "id": str(row.id),
-                    "severity": row.severity,
-                    "subsystem": row.subsystem,
-                    "event_name": row.event_name,
-                    "participant_id": str(row.participant_id) if row.participant_id else None,
-                    "bot_event_id": row.bot_event_id,
-                    "error_code": row.error_code,
-                    "error_class": row.error_class,
-                    "summary": row.summary,
-                    "details": _redact(dict(row.details_json)),
-                    "created_at": _iso(row.created_at),
-                }
-                for row in rows
-            ]
+            bot_rows = session.execute(
+                select(BotEvent)
+                .where(
+                    or_(
+                        BotEvent.error_code.is_not(None),
+                        BotEvent.status.in_(
+                            ("failed", "failed_replied", "reply_pending")
+                        ),
+                    )
+                )
+                .order_by(desc(BotEvent.received_at))
+                .limit(limit)
+            ).scalars().all()
+            run_rows = session.execute(
+                select(AgentRun)
+                .where(AgentRun.status == "failed")
+                .order_by(desc(AgentRun.started_at))
+                .limit(limit)
+            ).scalars().all()
+            tool_rows = session.execute(
+                select(AgentToolCall, AgentRun)
+                .join(AgentRun, AgentRun.id == AgentToolCall.agent_run_id)
+                .where(AgentToolCall.status != "succeeded")
+                .order_by(desc(AgentToolCall.created_at))
+                .limit(limit)
+            ).all()
+            import_rows = session.execute(
+                select(CourseScheduleImport)
+                .where(
+                    CourseScheduleImport.status.in_(
+                        ("partial_failed", "cleanup_failed")
+                    )
+                )
+                .order_by(desc(CourseScheduleImport.created_at))
+                .limit(limit)
+            ).scalars().all()
+            reconciliation_rows = session.execute(
+                select(CalendarMutationReconciliation)
+                .where(
+                    or_(
+                        CalendarMutationReconciliation.status.in_(
+                            (
+                                "remote_failed",
+                                "remote_outcome_unknown",
+                                "fencing_failed",
+                            )
+                        ),
+                        (
+                            CalendarMutationReconciliation.status == "resolved"
+                        )
+                        & (CalendarMutationReconciliation.attempt_count > 0),
+                    )
+                )
+                .order_by(desc(CalendarMutationReconciliation.updated_at))
+                .limit(limit)
+            ).scalars().all()
+            warning_rows = session.execute(
+                select(WarningSchedule)
+                .where(
+                    or_(
+                        WarningSchedule.last_error_code.is_not(None),
+                        WarningSchedule.last_error_class.is_not(None),
+                    )
+                )
+                .order_by(desc(WarningSchedule.updated_at))
+                .limit(limit)
+            ).scalars().all()
+            image_rows = session.execute(
+                select(CourseScheduleImageSession)
+                .where(CourseScheduleImageSession.last_error_code.is_not(None))
+                .order_by(desc(CourseScheduleImageSession.updated_at))
+                .limit(limit)
+            ).scalars().all()
+            participant_codes = dict(
+                session.execute(
+                    select(Participant.id, Participant.participant_code)
+                ).all()
+            )
+
+            items: list[dict[str, Any]] = []
+
+            def append(
+                *,
+                source: str,
+                source_id: str,
+                created_at: datetime,
+                severity: str,
+                subsystem: str,
+                event_name: str,
+                participant_id: uuid.UUID | None,
+                status: str,
+                summary: str,
+                error_code: str | None = None,
+                error_class: str | None = None,
+                recovered: bool = False,
+                details: dict[str, Any] | None = None,
+                **references: Any,
+            ) -> None:
+                items.append({
+                    "id": f"{source}:{source_id}",
+                    "source": source,
+                    "source_id": source_id,
+                    "severity": severity,
+                    "subsystem": subsystem,
+                    "event_name": event_name,
+                    "participant_id": (
+                        str(participant_id) if participant_id else None
+                    ),
+                    "participant_code": (
+                        participant_codes.get(participant_id)
+                        if participant_id else None
+                    ),
+                    "status": status,
+                    "recovered": recovered,
+                    "error_code": error_code,
+                    "error_class": error_class,
+                    "summary": str(summary)[:500],
+                    "details": _redact(dict(details or {})),
+                    "created_at": _iso(created_at),
+                    "_sort_at": created_at,
+                    **references,
+                })
+
+            for row in runtime_rows:
+                append(
+                    source="runtime_incident",
+                    source_id=str(row.id),
+                    created_at=row.created_at,
+                    severity=row.severity,
+                    subsystem=row.subsystem,
+                    event_name=row.event_name,
+                    participant_id=row.participant_id,
+                    status="open",
+                    summary=row.summary,
+                    error_code=row.error_code,
+                    error_class=row.error_class,
+                    details=dict(row.details_json or {}),
+                    bot_event_id=row.bot_event_id,
+                )
+
+            for row in bot_rows:
+                append(
+                    source="bot_event",
+                    source_id=row.event_id,
+                    created_at=row.processed_at or row.received_at,
+                    severity="error",
+                    subsystem="bot",
+                    event_name="bot_event_failure",
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    summary=row.text or "Bot event processing failed.",
+                    error_code=row.error_code or row.status,
+                    details={"telemetry": dict(row.telemetry_json or {})},
+                    bot_event_id=row.event_id,
+                    message_id=row.message_id,
+                )
+
+            for row in run_rows:
+                append(
+                    source="agent_run",
+                    source_id=str(row.id),
+                    created_at=row.finished_at or row.started_at,
+                    severity="error",
+                    subsystem="agent",
+                    event_name="agent_run_failed",
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    summary="Agent run did not complete successfully.",
+                    error_code="agent_run_failed",
+                    agent_run_id=str(row.id),
+                    message_id=row.message_id,
+                )
+
+            for tool, run in tool_rows:
+                result = dict(tool.result_summary_json or {})
+                tool_result = dict(result.get("result") or {})
+                reason_code = str(
+                    result.get("reason_code")
+                    or tool_result.get("reason_code")
+                    or tool_result.get("error")
+                    or tool.status
+                )
+                subsystem = (
+                    "calendar"
+                    if tool.tool_name.startswith("calendar_")
+                    else "course_schedule"
+                    if tool.tool_name.startswith("course_schedule_")
+                    else "care"
+                    if tool.tool_name.startswith("care_")
+                    else "agent_tool"
+                )
+                severity = (
+                    "error"
+                    if tool.status in {"tool_exception", "authorization_unavailable"}
+                    else "warning"
+                )
+                append(
+                    source="agent_tool_call",
+                    source_id=str(tool.id),
+                    created_at=tool.created_at,
+                    severity=severity,
+                    subsystem=subsystem,
+                    event_name=tool.tool_name,
+                    participant_id=run.participant_id,
+                    status=tool.status,
+                    summary=f"{tool.tool_name} ended with {tool.status}.",
+                    error_code=reason_code,
+                    details={
+                        "arguments": dict(tool.arguments_summary_json or {}),
+                        "result": result,
+                    },
+                    agent_run_id=str(run.id),
+                    message_id=run.message_id,
+                )
+
+            for row in import_rows:
+                courses = list((row.structured_result or {}).get("courses") or [])
+                names = [
+                    str(course.get("course_name") or "未命名课程")[:80]
+                    for course in courses[:3]
+                ]
+                append(
+                    source="course_schedule_import",
+                    source_id=str(row.id),
+                    created_at=row.completed_at or row.created_at,
+                    severity=(
+                        "error" if row.status == "cleanup_failed" else "warning"
+                    ),
+                    subsystem="course_schedule",
+                    event_name=row.status,
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    summary=(
+                        "课程表导入未完全完成"
+                        + (f"：{', '.join(names)}" if names else "")
+                    ),
+                    error_code=row.cleanup_error_code or row.status,
+                    import_id=str(row.id),
+                    message_id=row.source_message_id,
+                )
+
+            for row in reconciliation_rows:
+                recovered = row.status == "resolved"
+                append(
+                    source="calendar_reconciliation",
+                    source_id=str(row.id),
+                    created_at=row.updated_at,
+                    severity="recovered" if recovered else "error",
+                    subsystem="calendar",
+                    event_name="calendar_mutation_reconciliation",
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    recovered=recovered,
+                    summary=f"{row.mutation_kind} reconciliation is {row.status}.",
+                    error_code=row.last_error_class or row.status,
+                    details={"attempt_count": row.attempt_count},
+                    reconciliation_id=str(row.id),
+                )
+
+            for row in warning_rows:
+                recovered = row.status == "sent"
+                append(
+                    source="warning_schedule",
+                    source_id=str(row.id),
+                    created_at=row.updated_at,
+                    severity="recovered" if recovered else "warning",
+                    subsystem="warning",
+                    event_name="warning_delivery_failure",
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    recovered=recovered,
+                    summary=f"Warning delivery for {row.local_date} is {row.status}.",
+                    error_code=row.last_error_code,
+                    error_class=row.last_error_class,
+                    details={"attempt_count": row.attempt_count},
+                    warning_id=str(row.id),
+                )
+
+            for row in image_rows:
+                append(
+                    source="course_schedule_image",
+                    source_id=str(row.id),
+                    created_at=row.updated_at,
+                    severity="warning",
+                    subsystem="vision",
+                    event_name="course_schedule_image_failure",
+                    participant_id=row.participant_id,
+                    status=row.status,
+                    summary=row.error_detail or "Course schedule image parsing failed.",
+                    error_code=row.last_error_code,
+                    details={"parse_report": dict(row.parse_report_json or {})},
+                    image_session_id=str(row.id),
+                    message_id=row.image_message_id,
+                )
+
+            items.sort(key=lambda item: item["_sort_at"], reverse=True)
+            output = items[:limit]
+            for item in output:
+                item.pop("_sort_at", None)
+            return output

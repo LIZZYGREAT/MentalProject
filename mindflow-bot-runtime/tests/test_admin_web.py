@@ -1,12 +1,19 @@
 from pathlib import Path
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 from starlette.testclient import TestClient
 
 from app.admin_web.auth import hash_password
 from app.admin_web.main import create_app
+from app.admin_web.repositories import AdminRepository
 from app.config import Settings
+from app.repositories import (
+    AgentRunRepository,
+    BotEventRepository,
+    RuntimeIncidentRepository,
+)
 from app.services.workload_diagnostic_renderer import WorkloadDiagnosticRenderer
 from helpers import memory_database, participant
 
@@ -98,6 +105,78 @@ def test_admin_exposes_participant_bound_care_timeline_and_ui_tab():
     script = browser.get("/admin/static/app.js").text
     assert "Care Timeline" in script
     assert "/care-timeline" in script
+
+
+def test_operational_error_center_aggregates_runtime_bot_agent_and_tool_failures():
+    database = memory_database()
+    person = participant(database, "P-ERROR-CENTER")
+    events = BotEventRepository(database)
+    assert events.accept(
+        "event-failed",
+        "message-failed",
+        person.id,
+        app_id="app",
+        open_id="open",
+        chat_id="chat",
+        chat_type="p2p",
+        text="请清理课程表",
+        create_time=datetime.now(timezone.utc),
+    )
+    events.finish(
+        "event-failed",
+        status="failed_replied",
+        error_code="verifier_failure",
+    )
+    runs = AgentRunRepository(database)
+    run_id = runs.start(person.id, "message-failed", "model", "skill")
+    runs.tool_call(
+        run_id,
+        "calendar_delete_event",
+        {"effect": "destructive_external_write"},
+        {
+            "reason_code": "verifier_failure",
+            "result": {
+                "ok": False,
+                "error": "mutation_authorization_unavailable",
+            },
+        },
+        "authorization_unavailable",
+    )
+    runs.finish(run_id, "failed")
+    RuntimeIncidentRepository(database).record(
+        severity="error",
+        subsystem="feishu",
+        event_name="feishu_card_send_failed",
+        summary="Card delivery failed.",
+        participant_id=person.id,
+        error_code="feishu_card_send_failed",
+    )
+
+    items = AdminRepository(database).incidents()
+    sources = {item["source"] for item in items}
+
+    assert {
+        "runtime_incident",
+        "bot_event",
+        "agent_run",
+        "agent_tool_call",
+    } <= sources
+    tool = next(item for item in items if item["source"] == "agent_tool_call")
+    assert tool["participant_code"] == "P-ERROR-CENTER"
+    assert tool["subsystem"] == "calendar"
+    assert tool["error_code"] == "verifier_failure"
+    assert tool["agent_run_id"] == str(run_id)
+    assert "access_token" not in str(items).lower()
+
+
+def test_admin_error_center_ui_describes_the_unified_sources():
+    browser = client()
+    script = browser.get("/admin/static/app.js").text
+
+    assert "OPERATIONAL FAILURE CENTER" in script
+    assert "Agent / Tool" in script
+    assert "日历对账" in script
+    assert "participant_code" in script
 
 
 def test_admin_profile_ui_has_the_four_research_layers():
