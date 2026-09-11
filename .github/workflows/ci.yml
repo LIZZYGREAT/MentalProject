@@ -4,13 +4,11 @@ on:
   push:
     branches:
       - main
-      - production_runtime
       - "feature/**"
 
   pull_request:
     branches:
       - main
-      - production_runtime
 
   workflow_dispatch:
 
