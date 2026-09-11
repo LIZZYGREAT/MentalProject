@@ -70,6 +70,7 @@ def test_agent_rules_keep_conversation_default_and_distinguish_questions_from_ac
     assert "capability questions" in SYSTEM_RULES
     assert "status questions" in SYSTEM_RULES
     assert "hypotheticals are not action requests" in SYSTEM_RULES
+    assert "question form still counts as a direct request" in SYSTEM_RULES
     assert "backend independently authorizes every state-changing tool call" in (
         SYSTEM_RULES
     )

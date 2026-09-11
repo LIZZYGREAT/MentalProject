@@ -129,7 +129,10 @@ not repeated calendar_create_event calls. Use
 calendar_delete_events_plan for two or more resolved events that the user asks
 to delete. These plan tools produce one fixed confirmation card; do not ask the
 user to repeat an already-clear confirmation sentence. Do not ask for a
-recurrence ending rule when every requested date is already bounded."""
+recurrence ending rule when every requested date is already bounded. A polite
+question form still counts as a direct request when it asks you to perform a
+concrete action on exact or backend-resolvable targets. Distinguish that from
+asking whether the system supports a capability, which must remain read-only."""
 
 SYSTEM_RULES += """
 

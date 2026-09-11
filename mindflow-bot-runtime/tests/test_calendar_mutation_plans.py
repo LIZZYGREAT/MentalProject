@@ -4,9 +4,12 @@ import json
 from types import SimpleNamespace
 import uuid
 
+from sqlalchemy import func, select
+
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.calendar import CalendarMutationOutcomeUnknown
+from app.models import CalendarMutationPlan
 from app.repositories import ObservationRepository
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
 from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
@@ -18,12 +21,15 @@ from helpers import memory_database, participant
 
 
 class _Verifier:
-    def __init__(self):
+    def __init__(self, decision=None):
         self.calls = []
+        self.decision = decision or MutationIntentDecision(
+            "allow", "direct_action", "batch_scope_matches"
+        )
 
     async def verify(self, **kwargs):
         self.calls.append(kwargs)
-        return MutationIntentDecision("allow", "batch_scope_matches", "direct_request")
+        return self.decision
 
 
 class _Calendar:
@@ -413,3 +419,99 @@ def test_deterministic_item_failure_yields_partial_failed_without_rollback():
         "errors": ["provider_rejected"],
     }
     assert calls == [0, 1]
+
+
+def test_polite_question_with_concrete_create_action_stages_one_plan():
+    database = memory_database()
+    owner = participant(database, "PLAN-POLITE-CREATE")
+    calendar = _Calendar()
+    verifier = _Verifier()
+    _plans, outbox, _tools, registry, _runner = _stack(
+        database, calendar, verifier
+    )
+    ctx = _context(owner.id, "能不能帮我把这周六周天都加上？")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "calendar_create_events_plan",
+            {
+                "events": [
+                    {
+                        "summary": "周末安排",
+                        "start_time": "2030-01-12T17:30:00+08:00",
+                        "end_time": "2030-01-12T19:00:00+08:00",
+                    },
+                    {
+                        "summary": "周末安排",
+                        "start_time": "2030-01-13T17:30:00+08:00",
+                        "end_time": "2030-01-13T19:00:00+08:00",
+                    },
+                ]
+            },
+        )
+    )
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert len(outbox.take_cards(ctx.agent_run_id)) == 1
+    assert calendar.created == []
+
+
+def test_polite_question_with_concrete_delete_action_stages_one_plan():
+    database = memory_database()
+    owner = participant(database, "PLAN-POLITE-DELETE")
+    calendar = _Calendar()
+    verifier = _Verifier(
+        MutationIntentDecision(
+            "allow", "destructive_action", "explicit_batch_delete"
+        )
+    )
+    _plans, outbox, _tools, registry, _runner = _stack(
+        database, calendar, verifier
+    )
+    ctx = _context(owner.id, "删除刚刚加入的两个周末事件，行不行？")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "calendar_delete_events_plan",
+            {"event_ids": ["weekend-1", "weekend-2"]},
+        )
+    )
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert len(outbox.take_cards(ctx.agent_run_id)) == 1
+    assert calendar.deleted == []
+
+
+def test_batch_delete_capability_question_creates_no_plan_or_provider_effect():
+    database = memory_database()
+    owner = participant(database, "PLAN-CAPABILITY")
+    calendar = _Calendar()
+    verifier = _Verifier(
+        MutationIntentDecision(
+            "deny", "capability_question", "capability_question"
+        )
+    )
+    _plans, outbox, _tools, registry, _runner = _stack(
+        database, calendar, verifier
+    )
+    ctx = _context(owner.id, "你能不能一次删除两个日程？")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "calendar_delete_events_plan",
+            {"event_ids": ["weekend-1", "weekend-2"]},
+        )
+    )
+
+    with database.session() as session:
+        plan_count = session.scalar(
+            select(func.count()).select_from(CalendarMutationPlan)
+        )
+    assert result.status == "tool_effect_not_authorized"
+    assert result.result["reason_code"] == "capability_question"
+    assert plan_count == 0
+    assert outbox.take_cards(ctx.agent_run_id) == []
+    assert calendar.deleted == []
