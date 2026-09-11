@@ -11,6 +11,7 @@ require_running_revision_parity
 
 RUNTIME_STOPPED=0
 BUILD_STARTED=0
+BUILD_SUCCEEDED=0
 
 prepare_cleanup() {
   original_status=$?
@@ -21,7 +22,11 @@ prepare_cleanup() {
     acceptance_warning "runtime restoration failed during prepare cleanup"
   fi
 
-  if [ "${BUILD_STARTED:-0}" = "1" ]; then
+  # A failed build may leave large, unusable cache records behind. Successful
+  # builds deliberately keep their dependency layers and pip cache mount for
+  # the next code-only revision; routine cleanup is an explicit operation.
+  if [ "${BUILD_STARTED:-0}" = "1" ] && \
+    [ "${BUILD_SUCCEEDED:-0}" != "1" ]; then
     cap_acceptance_build_cache || true
   fi
 
@@ -50,6 +55,7 @@ if ! load_acceptance_image_revision || \
   exit 4
 fi
 
+BUILD_SUCCEEDED=1
 restore_runtime
 require_restored_revision_parity
 

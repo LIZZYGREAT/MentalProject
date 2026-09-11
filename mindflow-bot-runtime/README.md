@@ -281,17 +281,19 @@ cd mindflow-bot-runtime
 python -m pytest -q tests
 ```
 
-正式 ECS acceptance 必须预先创建独立、可清空的 PostgreSQL 数据库，并显式传入专用 URL：
+正式 ECS acceptance 必须预先创建独立、可清空的 PostgreSQL 数据库，并将专用 URL 配置在
+`mindflow-bot-runtime/.env` 的 `MINDFLOW_TEST_POSTGRES_URL`：
 
 ```bash
-export MINDFLOW_TEST_POSTGRES_URL='postgresql+psycopg://<test-user>:<test-password>@postgres:5432/mindflow_acceptance_test'
+sh ./scripts/prepare_acceptance_image.sh
 sh ./scripts/run_acceptance_tests.sh
 ```
 
 数据库名只允许 `mindflow_acceptance_test` 或 `mindflow_test_*`。runner 不读取、派生或 fallback
-到生产 `DATABASE_URL`；它会校验 clean tree、运行中的 Bot/Admin 与测试镜像 revision，随后在
-一次性 root 容器中临时安装固定版本的 pytest 并执行全量测试。该安装不会修改生产镜像或正在
-运行的服务。`ALLOW_DIRTY_ACCEPTANCE=1` 只供明确的本地临时诊断，正式验收不得设置。
+到生产 `DATABASE_URL`；它从 Runtime 目录的 `.env` 读取专用测试 URL，并会校验 clean tree、
+运行中的 Bot/Admin 与测试镜像 revision。`prepare_acceptance_image.sh` 会先将固定版本的测试依赖
+烘焙进验收镜像，runner 仅在一次性 root 容器中执行全量测试，不会安装依赖或修改生产镜像。
+`ALLOW_DIRTY_ACCEPTANCE=1` 只供明确的本地临时诊断，正式验收不得设置。
 
 本地测试使用 SQLite、Fake SDK client 和 Fake 外部服务，不需要安装系统级 Claude
 Code，也不会真实调用 DeepSeek。正式上线前必须在云端形成以下证据：

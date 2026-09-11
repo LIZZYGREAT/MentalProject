@@ -162,10 +162,16 @@ require_current_acceptance_image() {
 }
 
 validate_postgres_target_with_acceptance_image() {
-  docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
-    -e MINDFLOW_TEST_POSTGRES_URL="${MINDFLOW_TEST_POSTGRES_URL:-}" \
+  docker compose --env-file "$RUNTIME_ROOT/.env" -f "$COMPOSE_FILE" run --rm --no-deps \
     acceptance \
     python3 -m app.postgres_test_guard
+}
+
+require_acceptance_env_file() {
+  if [ ! -r "$RUNTIME_ROOT/.env" ]; then
+    acceptance_error "missing or unreadable $RUNTIME_ROOT/.env; acceptance needs MINDFLOW_TEST_POSTGRES_URL there"
+    return 4
+  fi
 }
 
 cap_acceptance_build_cache() {

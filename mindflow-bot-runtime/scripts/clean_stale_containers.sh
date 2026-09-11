@@ -3,38 +3,45 @@ set -eu
 
 # Remove stopped one-shot containers and dangling images left behind by
 # rebuilds (e.g. leftover migrate/claude-state-init runs, superseded image
-# layers). Never touches:
+# layers). By default it never touches:
 #   - running containers (postgres, bot, admin)
 #   - named volumes (postgres_data, claude_state)
 #   - the Docker builder cache, which holds the mindflow-pip-cache BuildKit
-#     cache mount; pruning it forces full requirement re-downloads.
-#     Acceptance already caps it separately via ACCEPTANCE_BUILD_CACHE_KEEP.
+#     cache mount; pruning it can force full requirement re-downloads.
+# Use --build-cache only when reclaiming disk space outweighs the next-build
+# cache hit. The cap remains configurable through ACCEPTANCE_BUILD_CACHE_KEEP.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RUNTIME_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 usage() {
   cat <<EOF
-usage: sh ./scripts/clean_stale_containers.sh [--dry-run]
+usage: sh ./scripts/clean_stale_containers.sh [--dry-run] [--build-cache]
 
-  --dry-run  only list what would be removed
+  --dry-run      only list what would be removed
+  --build-cache  also cap the BuildKit cache; may require dependency downloads
+                 during a later image build
 EOF
 }
 
 DRY_RUN=0
-case ${1:-} in
-  --dry-run) DRY_RUN=1 ;;
-  -h | --help | help)
-    usage
-    exit 0
-    ;;
-  '') ;;
-  *)
-    usage
-    echo "unknown option: $1" >&2
-    exit 2
-    ;;
-esac
+PRUNE_BUILD_CACHE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --build-cache) PRUNE_BUILD_CACHE=1 ;;
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      echo "unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 echo "== docker usage before cleanup =="
 docker system df
@@ -62,6 +69,17 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "dry run: dangling images listed above would be removed"
 else
   docker image prune -f
+fi
+
+if [ "$PRUNE_BUILD_CACHE" = "1" ]; then
+  ACCEPTANCE_BUILD_CACHE_KEEP=${ACCEPTANCE_BUILD_CACHE_KEEP:-6GB}
+  echo
+  echo "== BuildKit cache (keep $ACCEPTANCE_BUILD_CACHE_KEEP) =="
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "dry run: BuildKit cache would be capped; this can evict the pip download cache"
+  else
+    docker builder prune -a -f --keep-storage "$ACCEPTANCE_BUILD_CACHE_KEEP"
+  fi
 fi
 
 if [ "$DRY_RUN" = "1" ]; then
