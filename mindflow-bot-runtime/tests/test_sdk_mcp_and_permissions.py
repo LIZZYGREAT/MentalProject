@@ -416,8 +416,10 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "calendar_list_calendars",
         "calendar_list_events",
         "calendar_create_event",
+        "calendar_create_events_plan",
         "calendar_update_event",
         "calendar_delete_event",
+        "calendar_delete_events_plan",
     }
     for spec in registry.specs:
         assert spec.parameters["type"] == "object"
@@ -447,8 +449,13 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "calendar_list_calendars": ("read", "none"),
         "calendar_list_events": ("read", "none"),
         "calendar_create_event": ("external_write", "direct_request"),
+        "calendar_create_events_plan": ("external_write", "direct_request"),
         "calendar_update_event": ("external_write", "direct_request"),
         "calendar_delete_event": (
+            "destructive_external_write",
+            "explicit_destructive_request",
+        ),
+        "calendar_delete_events_plan": (
             "destructive_external_write",
             "explicit_destructive_request",
         ),

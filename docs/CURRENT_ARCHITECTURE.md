@@ -2,9 +2,9 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 16 -->
+<!-- BUSINESS_TOOL_COUNT: 18 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0046_course_schedule_image_sessions -->
+<!-- ALEMBIC_HEAD: 0047_calendar_mutation_plans -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -51,8 +51,10 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `calendar_list_calendars`
 - `calendar_list_events`
 - `calendar_create_event`
+- `calendar_create_events_plan`
 - `calendar_update_event`
 - `calendar_delete_event`
+- `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
 
 `calendar_update_event` 的 `start_time` 与 `end_time` 是互相依赖字段：两者同时提供或同时

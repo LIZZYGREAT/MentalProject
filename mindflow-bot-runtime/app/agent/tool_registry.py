@@ -79,8 +79,10 @@ _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
 
 CALENDAR_MUTATION_TOOLS: dict[str, CalendarMutationOperation] = {
     "calendar_create_event": "create",
+    "calendar_create_events_plan": "create",
     "calendar_update_event": "update",
     "calendar_delete_event": "delete",
+    "calendar_delete_events_plan": "delete",
 }
 
 
@@ -130,7 +132,7 @@ def _safe_summary(value: Any, depth: int = 0) -> Any:
         return {
             str(key): "[redacted]"
             if str(key).lower() in FORBIDDEN_FIELDS
-            or str(key).lower().endswith("_id")
+            or str(key).lower().endswith(("_id", "_ids"))
             else _safe_summary(child, depth + 1)
             for key, child in list(value.items())[:30]
         }
@@ -151,7 +153,7 @@ def _safe_authorization_context(value: Any, depth: int = 0) -> Any:
             str(key): _safe_authorization_context(child, depth + 1)
             for key, child in list(value.items())[:30]
             if str(key).lower() not in FORBIDDEN_FIELDS
-            and not str(key).lower().endswith("_id")
+            and not str(key).lower().endswith(("_id", "_ids"))
             and "provider" not in str(key).lower()
         }
     if isinstance(value, list):
@@ -166,19 +168,22 @@ def _safe_authorization_context(value: Any, depth: int = 0) -> Any:
 def _verifier_proposal_summary(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Describe proposal scope without sending provider/database identifiers."""
 
-    exact_target = bool(arguments.get("event_id")) if name in {
-        "calendar_update_event",
-        "calendar_delete_event",
-    } else None
+    exact_target = (
+        bool(arguments.get("event_id"))
+        if name in {"calendar_update_event", "calendar_delete_event"}
+        else None
+    )
     semantic_arguments = {
         str(key): _safe_summary(value)
         for key, value in arguments.items()
         if str(key).lower() not in FORBIDDEN_FIELDS
-        and not str(key).lower().endswith("_id")
+        and not str(key).lower().endswith(("_id", "_ids"))
     }
     summary: dict[str, Any] = {"proposed_operation": str(name)[:128]}
     if exact_target is not None:
         summary["exact_target_supplied"] = exact_target
+    if name == "calendar_delete_events_plan":
+        summary["exact_target_count"] = len(arguments.get("event_ids") or [])
     if semantic_arguments:
         summary["requested_values"] = semantic_arguments
     return summary

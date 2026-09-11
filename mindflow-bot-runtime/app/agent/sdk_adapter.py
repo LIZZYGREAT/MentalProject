@@ -123,10 +123,13 @@ SYSTEM_RULES += """
 
 Several explicitly named dates are several independent single events unless the
 user also states a repetition frequency or recurrence rule. For example, an
-event on this Saturday and another on this Sunday means two single-event tool
-calls, not a weekly Saturday/Sunday series. Do not ask for a recurrence ending
-rule when every requested date is already bounded. A matching single-event call
-may implement one item of that explicit bounded multi-date request."""
+event on this Saturday and another on this Sunday is not a weekly Saturday/Sunday series.
+It means one calendar_create_events_plan call containing two single events,
+not repeated calendar_create_event calls. Use
+calendar_delete_events_plan for two or more resolved events that the user asks
+to delete. These plan tools produce one fixed confirmation card; do not ask the
+user to repeat an already-clear confirmation sentence. Do not ask for a
+recurrence ending rule when every requested date is already bounded."""
 
 SYSTEM_RULES += """
 

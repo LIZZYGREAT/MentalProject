@@ -23,8 +23,10 @@ TOOL_STAGE = {
     "care_update_preferences": "preferences",
     "care_respond_to_latest_intervention": "intervention_feedback",
     "calendar_create_event": "calendar_mutation",
+    "calendar_create_events_plan": "calendar_mutation_plan",
     "calendar_update_event": "calendar_mutation",
     "calendar_delete_event": "calendar_mutation",
+    "calendar_delete_events_plan": "calendar_mutation_plan",
 }
 
 _GENERIC_PROGRESS_MESSAGES = (
@@ -85,6 +87,8 @@ class ProgressPresenter:
                 return "我正在修改这条日程。"
             if tool_name == "calendar_delete_event":
                 return "我正在处理这条已确认的删除操作。"
+            if stage == "calendar_mutation_plan":
+                return "我正在核对这些日程并准备确认卡片。"
         return None
 
     def delayed(

@@ -17,6 +17,7 @@ from app.agent.tool_registry import (
 )
 from app.integrations.feishu.cards import (
     calendar_delete_confirmation_card,
+    calendar_mutation_plan_confirmation_card,
     daily_checkin_card,
     pressure_curve_card,
 )
@@ -77,6 +78,25 @@ def _calendar_target_scope(event: dict[str, Any]) -> CalendarTargetScope:
 
 def _empty_schema() -> dict[str, Any]:
     return {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+def _calendar_plan_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+            "start_time": {"type": "string", "format": "date-time"},
+            "end_time": {"type": "string", "format": "date-time"},
+            "description": {"type": "string", "maxLength": 1000},
+            "reminder_minutes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1440,
+            },
+        },
+        "required": ["summary", "start_time", "end_time"],
+        "additionalProperties": False,
+    }
 
 
 def _safe_profile(profile: dict[str, Any]) -> dict[str, Any]:
@@ -227,6 +247,7 @@ class CareTools:
         care_preferences: Any = None,
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
+        calendar_mutation_plans: Any = None,
     ):
         self.profiles = profiles
         self.observations = observations
@@ -254,6 +275,7 @@ class CareTools:
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
+        self.calendar_mutation_plans = calendar_mutation_plans
         self.what_if = (
             CareWhatIfSimulationService(forecast_coordinator)
             if forecast_coordinator is not None else None
@@ -562,6 +584,26 @@ class CareTools:
             authorization_requirement="direct_request",
         )
         registry.register(
+            "calendar_create_events_plan",
+            "Create one backend-owned confirmation plan for 2 to 20 explicit, bounded single events. Use this instead of repeated calendar_create_event calls when one user request names multiple dates. It stages one fixed card and writes no Calendar event until the user clicks Confirm.",
+            {
+                "type": "object",
+                "properties": {
+                    "events": {
+                        "type": "array",
+                        "items": _calendar_plan_item_schema(),
+                        "minItems": 2,
+                        "maxItems": 20,
+                    }
+                },
+                "required": ["events"],
+                "additionalProperties": False,
+            },
+            self.create_calendar_events_plan,
+            effect="external_write",
+            authorization_requirement="direct_request",
+        )
+        registry.register(
             "calendar_update_event",
             "Update one exact event in this participant's primary calendar after a direct user request authorized by the backend.",
             {
@@ -603,6 +645,34 @@ class CareTools:
             effect="destructive_external_write",
             authorization_requirement="explicit_destructive_request",
             authorization_context_resolver=self.resolve_calendar_event_authorization_context,
+        )
+        registry.register(
+            "calendar_delete_events_plan",
+            "Create one backend-owned confirmation plan for deleting 2 to 20 exact participant-owned events. Use this instead of repeated calendar_delete_event calls for one multi-event request. It stages one fixed card and deletes nothing until the user clicks Confirm.",
+            {
+                "type": "object",
+                "properties": {
+                    "event_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256,
+                        },
+                        "minItems": 2,
+                        "maxItems": 20,
+                        "uniqueItems": True,
+                    }
+                },
+                "required": ["event_ids"],
+                "additionalProperties": False,
+            },
+            self.delete_calendar_events_plan,
+            effect="destructive_external_write",
+            authorization_requirement="explicit_destructive_request",
+            authorization_context_resolver=(
+                self.resolve_calendar_events_plan_authorization_context
+            ),
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -1424,6 +1494,44 @@ class CareTools:
         )
         return {"ok": True, "calendar_mutation": "succeeded", "created": event, **refresh}
 
+    async def create_calendar_events_plan(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
+        if self.calendar_mutation_plans is None:
+            return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
+        items: list[dict[str, Any]] = []
+        for raw in list(args.get("events") or []):
+            item = dict(raw)
+            start_time = _parse_datetime(item["start_time"], self.timezone)
+            end_time = _parse_datetime(item["end_time"], self.timezone)
+            if end_time <= start_time:
+                raise ValueError("calendar event end_time must be after start_time")
+            items.append({
+                "summary": str(item["summary"]),
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "description": str(item.get("description") or ""),
+                "reminder_minutes": item.get("reminder_minutes"),
+            })
+        plan = await asyncio.to_thread(
+            self.calendar_mutation_plans.create,
+            ctx.participant_id,
+            operation="create",
+            items=items,
+        )
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            calendar_mutation_plan_confirmation_card(plan),
+        )
+        return {
+            "ok": True,
+            "calendar_mutation": "pending_confirmation",
+            "confirmation_required": True,
+            "item_count": len(items),
+        }
+
     async def resolve_calendar_event_authorization_context(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1473,6 +1581,23 @@ class CareTools:
                 "recurrence": optional_text("recurrence", 500),
                 "timezone": str(self.timezone),
                 "scope_kind": _calendar_target_scope(event),
+            }
+        }
+
+    async def resolve_calendar_events_plan_authorization_context(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        targets = []
+        for event_id in list(args.get("event_ids") or []):
+            resolved = await self.resolve_calendar_event_authorization_context(
+                ctx, {"event_id": str(event_id)}
+            )
+            targets.append(dict(resolved["target"]))
+        return {
+            "target": {
+                "count": len(targets),
+                "events": targets,
+                "timezone": str(self.timezone),
             }
         }
 
@@ -1620,6 +1745,48 @@ class CareTools:
             "confirmation_required": True,
         }
 
+    async def delete_calendar_events_plan(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
+        if self.calendar_mutation_plans is None:
+            return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
+        items = []
+        try:
+            for event_id in list(args.get("event_ids") or []):
+                event = await self.calendar.get_event(
+                    ctx.participant_id, str(event_id)
+                )
+                items.append({
+                    "event_id": str(event_id),
+                    "summary": str(event.get("summary") or "未命名日程")[:200],
+                    "start_time": str(event.get("start_time") or "")[:64],
+                    "end_time": str(event.get("end_time") or "")[:64],
+                })
+        except PermissionError:
+            return {
+                "ok": False,
+                "error": "calendar_not_connected",
+                "command": "/calendar",
+            }
+        plan = await asyncio.to_thread(
+            self.calendar_mutation_plans.create,
+            ctx.participant_id,
+            operation="delete",
+            items=items,
+        )
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            calendar_mutation_plan_confirmation_card(plan),
+        )
+        return {
+            "ok": True,
+            "calendar_mutation": "pending_confirmation",
+            "confirmation_required": True,
+            "item_count": len(items),
+        }
+
     async def confirm_calendar_delete(
         self,
         participant_id,
@@ -1685,3 +1852,132 @@ class CareTools:
             ),
         )
         return {"ok": True, "calendar_mutation": "succeeded", "deleted": deleted, **refresh}
+
+    async def execute_calendar_mutation_plan(
+        self,
+        participant_id,
+        plan_id: str,
+        *,
+        confirmed: bool,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        """Cancel or execute one immutable participant-bound batch plan."""
+
+        if self.calendar_mutation_plans is None:
+            return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
+        if not confirmed:
+            plan = await asyncio.to_thread(
+                self.calendar_mutation_plans.cancel,
+                participant_id,
+                plan_id,
+            )
+            if plan is None:
+                return {"ok": False, "error": "calendar_mutation_plan_not_found"}
+            status = str(plan["status"])
+            reply_text = (
+                "已取消，日程未更改。"
+                if status == "cancelled"
+                else "这项操作已经处理，日程不会再次更改。"
+            )
+            return {
+                "ok": True,
+                "status": status,
+                "already_handled": status != "cancelled",
+                "reply_text": reply_text,
+            }
+
+        plan = await asyncio.to_thread(
+            self.calendar_mutation_plans.claim,
+            participant_id,
+            plan_id,
+        )
+        if plan is None:
+            return {"ok": False, "error": "calendar_mutation_plan_not_found"}
+        claim_status = str(plan.get("claim_status") or "")
+        if claim_status != "claimed":
+            replies = {
+                "expired": "这张确认卡已过期，请重新发起操作。",
+                "cancelled": "这项操作已经取消，日程未更改。",
+                "processing": "正在处理这项操作，请勿重复提交。",
+                "succeeded": "这些日程已经处理完成。",
+                "partial_failed": "这项操作已处理，部分日程未能完成。",
+            }
+            return {
+                "ok": True,
+                "status": claim_status,
+                "already_handled": True,
+                "reply_text": replies.get(claim_status, "这项操作已经处理。"),
+            }
+
+        operation = str(plan["operation"])
+        succeeded_count = 0
+        errors: list[str] = []
+        for index, item in enumerate(list(plan.get("items") or [])):
+            item_source = (
+                f"{source_message_id}:calendar-plan:{plan_id}:{index}"
+            )
+            try:
+                if operation == "create":
+                    item_ctx = AgentContext(
+                        participant_id=participant_id,
+                        participant_code="",
+                        open_id="",
+                        chat_id="",
+                        message_id=item_source,
+                        agent_run_id=uuid.uuid4(),
+                        turn_effect_policy="deterministic_backend_action",
+                    )
+                    result = await self.create_calendar_event(
+                        item_ctx,
+                        {
+                            **dict(item),
+                            "recurrence_mode": "single",
+                        },
+                    )
+                elif operation == "delete":
+                    result = await self.confirm_calendar_delete(
+                        participant_id,
+                        str(item["event_id"]),
+                        source_message_id=item_source,
+                    )
+                else:
+                    raise ValueError("unsupported calendar mutation plan operation")
+                if result.get("ok"):
+                    succeeded_count += 1
+                else:
+                    errors.append(str(result.get("error") or "mutation_failed")[:128])
+            except Exception as exc:
+                logger.exception(
+                    "calendar mutation plan item failed plan_id=%s item=%s",
+                    plan_id,
+                    index,
+                )
+                errors.append(type(exc).__name__[:128])
+
+        item_count = len(list(plan.get("items") or []))
+        failed_count = item_count - succeeded_count
+        succeeded = failed_count == 0
+        await asyncio.to_thread(
+            self.calendar_mutation_plans.complete,
+            plan_id,
+            result={
+                "succeeded_count": succeeded_count,
+                "failed_count": failed_count,
+                "errors": errors,
+            },
+            succeeded=succeeded,
+        )
+        verb = "添加" if operation == "create" else "删除"
+        reply_text = (
+            f"已{verb} {succeeded_count} 个日程。"
+            if succeeded
+            else f"已{verb} {succeeded_count} 个，另有 {failed_count} 个未完成。"
+        )
+        return {
+            "ok": True,
+            "status": "succeeded" if succeeded else "partial_failed",
+            "calendar_mutation": "succeeded" if succeeded else "partial_failed",
+            "succeeded_count": succeeded_count,
+            "failed_count": failed_count,
+            "reply_text": reply_text,
+        }

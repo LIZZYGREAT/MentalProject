@@ -1061,6 +1061,78 @@ def calendar_delete_confirmation_card(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def calendar_mutation_plan_confirmation_card(
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """One fixed card for an immutable backend-owned batch mutation plan."""
+
+    plan_id = str(plan.get("id") or "").strip()
+    operation = str(plan.get("operation") or "").strip()
+    items = [dict(item) for item in list(plan.get("items") or [])]
+    if not plan_id or len(plan_id) > 64:
+        raise ValueError("calendar mutation plan id is invalid")
+    if operation not in {"create", "delete"} or not 2 <= len(items) <= 20:
+        raise ValueError("calendar mutation plan is invalid")
+    verb = "添加" if operation == "create" else "删除"
+    lines = []
+    for index, item in enumerate(items, start=1):
+        summary = str(item.get("summary") or "未命名日程")[:80]
+        start = str(item.get("start_time") or "")[:40]
+        end = str(item.get("end_time") or "")[:40]
+        lines.append(f"{index}. **{summary}**\n   {start} – {end}")
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": f"确认批量{verb}日程"},
+        },
+        "header": {
+            "template": "red" if operation == "delete" else "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": f"确认{verb}以下 {len(items)} 个日程",
+            },
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": "\n\n".join(lines)},
+                {
+                    "tag": "button",
+                    "type": "danger" if operation == "delete" else "primary",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": f"确认{verb}这 {len(items)} 个",
+                    },
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "calendar_mutation_plan_confirm",
+                            "version": "1",
+                            "plan_id": plan_id,
+                        },
+                    }],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "calendar_mutation_plan_cancel",
+                            "version": "1",
+                            "plan_id": plan_id,
+                        },
+                    }],
+                },
+            ],
+        },
+    }
+
+
 def pressure_curve_card(
     analysis: CurveAnalysis,
     *,

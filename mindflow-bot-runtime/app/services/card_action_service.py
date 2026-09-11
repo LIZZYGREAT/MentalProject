@@ -161,6 +161,7 @@ class CardActionService:
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         course_schedule_imports: Any = None,
         calendar_delete_executor: Any = None,
+        calendar_mutation_plan_executor: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -171,6 +172,7 @@ class CardActionService:
         self.care_outcome_refresh = care_outcome_refresh
         self.course_schedule_imports = course_schedule_imports
         self.calendar_delete_executor = calendar_delete_executor
+        self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
 
     @staticmethod
     def _fallback_event_id(
@@ -258,6 +260,41 @@ class CardActionService:
                 "status": corrected.get("status"),
                 "reply_text": "课程时间已修改，请核对更新后的预览。",
                 "card": course_schedule_preview_card(corrected),
+            }
+        if action_name in {
+            "calendar_mutation_plan_confirm",
+            "calendar_mutation_plan_cancel",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.calendar_mutation_plan_executor is None:
+                raise RuntimeError("calendar mutation plan executor is unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            import asyncio
+
+            result = asyncio.run(
+                self.calendar_mutation_plan_executor(
+                    participant_id,
+                    plan_id,
+                    confirmed=action_name.endswith("_confirm"),
+                    source_message_id=(
+                        str(callback_event_id or "").strip()
+                        or self._fallback_event_id(
+                            message_id, action, dict(form_value or {})
+                        )
+                    ),
+                )
+            )
+            if not result.get("ok"):
+                return result
+            reply_text = str(result.get("reply_text") or "操作已处理。")
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
             }
         if action_name in {"calendar_delete_confirm", "calendar_delete_cancel"}:
             if str(action.get("version") or "") != "1":

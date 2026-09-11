@@ -32,6 +32,7 @@ from app.repositories_daily_review import (
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
+from app.repositories_calendar_plan import CalendarMutationPlanRepository
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
@@ -104,6 +105,7 @@ class BusinessServices:
     generic_image_vision: GenericImageVisionService
     course_schedule_image_sessions: CourseScheduleImageSessionRepository
     course_schedule_tools: CourseScheduleTools
+    calendar_mutation_plans: CalendarMutationPlanRepository
 
 
 def build_business_services(
@@ -202,6 +204,7 @@ def build_business_services(
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
     course_schedule_import_repository = CourseScheduleImportRepository(database)
+    calendar_mutation_plans = CalendarMutationPlanRepository(database)
     course_schedule_image_sessions = CourseScheduleImageSessionRepository(database)
     mutation_refresh = ForecastMutationRefreshQueue(
         forecast_coordinator,
@@ -286,6 +289,7 @@ def build_business_services(
         care_preferences=care_preferences,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        calendar_mutation_plans=calendar_mutation_plans,
     )
     care_tools.register(registry)
     card_actions = CardActionService(
@@ -298,6 +302,9 @@ def build_business_services(
         care_outcome_refresh=care_outcome_refresh,
         course_schedule_imports=course_schedule_imports,
         calendar_delete_executor=care_tools.confirm_calendar_delete,
+        calendar_mutation_plan_executor=(
+            care_tools.execute_calendar_mutation_plan
+        ),
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
@@ -338,4 +345,5 @@ def build_business_services(
         generic_image_vision=generic_image_vision,
         course_schedule_image_sessions=course_schedule_image_sessions,
         course_schedule_tools=course_schedule_tools,
+        calendar_mutation_plans=calendar_mutation_plans,
     )

@@ -896,6 +896,47 @@ class CalendarMutationReconciliation(Base):
     )
 
 
+class CalendarMutationPlan(Base):
+    """Participant-bound, immutable batch Calendar proposal awaiting a card action."""
+
+    __tablename__ = "calendar_mutation_plans"
+    __table_args__ = (
+        Index(
+            "ix_calendar_mutation_plan_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_calendar_mutation_plan_expiry", "status", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    items_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="awaiting_confirmation"
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class EventSemanticCache(Base):
     __tablename__ = "event_semantic_cache"
     __table_args__ = (
