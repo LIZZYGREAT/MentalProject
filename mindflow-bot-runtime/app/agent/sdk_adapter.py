@@ -117,6 +117,15 @@ conflict is read-only and must never call an update tool. Draft changes only
 refresh Preview and never authorize Calendar writes. Only the fixed Preview
 card actions can confirm Calendar creation."""
 
+SYSTEM_RULES += """
+
+Several explicitly named dates are several independent single events unless the
+user also states a repetition frequency or recurrence rule. For example, an
+event on this Saturday and another on this Sunday means two single-event tool
+calls, not a weekly Saturday/Sunday series. Do not ask for a recurrence ending
+rule when every requested date is already bounded. A matching single-event call
+may implement one item of that explicit bounded multi-date request."""
+
 class ClaudeSDKUnavailable(RuntimeError):
     pass
 

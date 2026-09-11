@@ -1326,3 +1326,5 @@ def test_verifier_prompt_requires_canonical_intent_labels():
 
     assert "The intent value must be exactly one of" in prompt
     assert "Never use a tool name or operation-specific value" in prompt
+    assert "independent single events" in prompt
+    assert "valid decomposition" in prompt

@@ -101,6 +101,61 @@ def test_two_users_bind_route_and_run_without_identity_crossover():
     assert sender.sent[-2:] == [("oc_1", "P001:apple"), ("oc_2", "P002:banana")]
 
 
+def test_calendar_status_command_reports_connection_without_starting_oauth():
+    database = memory_database()
+    person = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    events = BotEventRepository(database)
+    queue = asyncio.Queue(maxsize=4)
+    gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
+    runtime = FakeRuntime()
+    sender = FakeSender()
+
+    class DeviceFlows:
+        def __init__(self):
+            self.status_calls = []
+            self.start_calls = []
+
+        def status(self, participant_id):
+            self.status_calls.append(participant_id)
+            return {"connected": True, "status": "connected"}
+
+        async def start(self, participant_id):
+            self.start_calls.append(participant_id)
+            raise AssertionError("status command must not start authorization")
+
+    device_flows = DeviceFlows()
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        runtime,
+        sender,
+        device_flows,
+        model="fake",
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(
+            payload("bind", "bind-message", "ou", "oc", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            payload("status", "status-message", "ou", "oc", "/calendar status")
+        )
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+
+    assert device_flows.status_calls == [person.id]
+    assert device_flows.start_calls == []
+    assert runtime.seen == []
+    assert sender.sent[-1] == ("oc", "日历状态：已连接。")
+
+
 def test_staged_reply_is_sent_after_worker_restart_without_rerunning_agent(caplog):
     database = memory_database()
     p1 = participant(database, "P001")

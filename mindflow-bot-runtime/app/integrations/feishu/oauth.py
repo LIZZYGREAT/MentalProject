@@ -153,6 +153,11 @@ class DeviceFlowService:
                 ).scalars()
             )
 
+    def status(self, participant_id: uuid.UUID) -> dict[str, Any]:
+        """Return the participant-scoped Calendar connection status."""
+
+        return self.tokens.status(participant_id)
+
     async def start(self, participant_id: uuid.UUID) -> dict[str, Any]:
         result = await self.oauth.start_device_flow(self.DEFAULT_SCOPE)
         now = datetime.now(timezone.utc)

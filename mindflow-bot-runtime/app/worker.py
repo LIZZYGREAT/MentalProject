@@ -85,6 +85,9 @@ BIND_PATTERN = re.compile(r"^/bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
 CALENDAR_CONNECT_PATTERN = re.compile(
     r"^/(?:calendar|connect-calendar)\s*$", re.IGNORECASE
 )
+CALENDAR_STATUS_PATTERN = re.compile(
+    r"^/(?:calendar|connect-calendar)\s+status\s*$", re.IGNORECASE
+)
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
 HELP_PATTERN = re.compile(
     r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
@@ -683,6 +686,31 @@ class BotWorker:
                     event,
                     "已请求停止当前处理。" if stopped else "当前没有正在处理的任务。",
                 )
+                return
+            if CALENDAR_STATUS_PATTERN.match(event.text):
+                if self.device_flows is None:
+                    await self._deliver(event, "日历授权状态暂时不可查询。")
+                    return
+                status = await asyncio.to_thread(
+                    self.device_flows.status, participant.id
+                )
+                state = str(status.get("status") or "disconnected")
+                if status.get("connected"):
+                    state_text = {
+                        "connected": "已连接",
+                        "refresh_required": "已连接，访问凭证将在使用时自动刷新",
+                    }.get(state, "已连接")
+                    await self._deliver(event, f"日历状态：{state_text}。")
+                elif state == "reconnect_required":
+                    await self._deliver(
+                        event,
+                        "日历状态：需要重新授权。请发送 /calendar 开始授权。",
+                    )
+                else:
+                    await self._deliver(
+                        event,
+                        "日历状态：尚未连接。请发送 /calendar 开始授权。",
+                    )
                 return
             if CALENDAR_CONNECT_PATTERN.match(event.text):
                 if self.device_flows is None:
