@@ -29,6 +29,7 @@ from app.repositories_daily_review import (
     DailyReviewScheduleRepository,
     RetrospectiveCurveRepository,
 )
+from app.repositories_morning_brief import MorningBriefScheduleRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -113,6 +114,7 @@ class BusinessServices:
     calendar_mutation_plans: CalendarMutationPlanRepository
     calendar_mutation_plan_runner: CalendarMutationPlanRunner
     proactive_notifications: ProactiveNotificationPolicy
+    morning_brief_schedules: MorningBriefScheduleRepository
 
 
 def build_business_services(
@@ -182,6 +184,7 @@ def build_business_services(
         timezone_name=settings.timezone_name,
         default_system_budget=warning_delivery_policy.max_daily_sends,
     )
+    morning_brief_schedules = MorningBriefScheduleRepository(database)
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -331,6 +334,7 @@ def build_business_services(
             "daily_review_enabled": settings.daily_review_enabled,
         },
         consent_service=consent_service,
+        care_preferences=care_preferences,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
@@ -376,4 +380,5 @@ def build_business_services(
         calendar_mutation_plans=calendar_mutation_plans,
         calendar_mutation_plan_runner=calendar_mutation_plan_runner,
         proactive_notifications=proactive_notifications,
+        morning_brief_schedules=morning_brief_schedules,
     )

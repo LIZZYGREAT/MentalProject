@@ -26,6 +26,7 @@ from app.integrations.feishu.cards import (
     external_llm_consent_card,
     external_llm_consent_details_card,
     external_llm_consent_status_card,
+    morning_brief_settings_card,
     today_calendar_card,
 )
 from app.presentation.consent_texts import external_llm_consent_declined_text
@@ -193,6 +194,7 @@ class CardActionService:
         calendar_mutation_plan_executor: Any = None,
         feature_capabilities: Any = None,
         consent_service: Any = None,
+        care_preferences: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -206,6 +208,7 @@ class CardActionService:
         self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.consent_service = consent_service
+        self.care_preferences = care_preferences
 
     @staticmethod
     def _fallback_event_id(
@@ -238,6 +241,34 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "morning_brief_toggle", "morning_brief_time_update",
+            "morning_brief_pause_week",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.care_preferences is None:
+                raise RuntimeError("morning brief settings are unavailable")
+            changes: dict[str, Any]
+            if action_name == "morning_brief_toggle":
+                changes = {"morning_brief_enabled": _boolean(action.get("enabled"), "enabled")}
+            elif action_name == "morning_brief_pause_week":
+                changes = {
+                    "morning_brief_paused_until": (
+                        datetime.now(self.timezone) + timedelta(days=7)
+                    ).isoformat()
+                }
+            else:
+                selected = str((form_value or {}).get("morning_brief_local_time") or "")
+                if selected not in {"07:00", "07:30", "08:00", "08:30", "09:00"}:
+                    return {"ok": False, "error": "invalid_morning_brief_time"}
+                changes = {"morning_brief_local_time": selected}
+            updated = self.care_preferences.update(participant_id, changes)
+            return {
+                "ok": True,
+                "reply_text": "早报设置已更新。",
+                "card": morning_brief_settings_card(updated),
+            }
         if action_name in {
             "course_schedule_item_time_open",
             "course_schedule_item_time_submit",

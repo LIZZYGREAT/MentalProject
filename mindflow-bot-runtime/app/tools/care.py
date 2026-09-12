@@ -19,6 +19,7 @@ from app.integrations.feishu.cards import (
     calendar_delete_confirmation_card,
     calendar_mutation_plan_confirmation_card,
     daily_checkin_card,
+    morning_brief_settings_card,
     pressure_curve_card,
 )
 from app.presentation.feature_cards import (
@@ -377,6 +378,11 @@ class CareTools:
                     "care_enabled": {"type": "boolean"},
                     "warning_enabled": {"type": "boolean"},
                     "daily_review_enabled": {"type": "boolean"},
+                    "morning_brief_enabled": {"type": "boolean"},
+                    "morning_brief_local_time": {
+                        "type": "string",
+                        "enum": ["07:00", "07:30", "08:00", "08:30", "09:00"],
+                    },
                     "quiet_hours_start": {
                         "type": "string",
                         "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
@@ -440,6 +446,14 @@ class CareTools:
             self.update_care_preferences,
             effect="internal_write",
             authorization_requirement="direct_request",
+        )
+        registry.register(
+            "morning_brief_show_settings",
+            "Show the fixed morning-brief settings card when the participant asks to configure or inspect it.",
+            _empty_schema(),
+            self.show_morning_brief_settings,
+            effect="ui_effect",
+            authorization_requirement="none",
         )
         registry.register(
             "care_respond_to_latest_intervention",
@@ -902,6 +916,17 @@ class CareTools:
             "ok": True,
             "care_preferences": _public_care_preferences(preferences),
         }
+
+    def show_morning_brief_settings(
+        self, ctx: AgentContext, _args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None or self.care_preferences is None:
+            raise RuntimeError("morning brief settings are unavailable")
+        preferences = self.care_preferences.get(ctx.participant_id)
+        self.presentations.stage_card(
+            ctx.agent_run_id, morning_brief_settings_card(preferences)
+        )
+        return {"ok": True, "card_queued": True}
 
     def respond_to_latest_care(
         self, ctx: AgentContext, args: dict[str, Any]

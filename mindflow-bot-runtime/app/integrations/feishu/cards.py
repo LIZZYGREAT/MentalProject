@@ -1447,3 +1447,56 @@ def external_llm_consent_status_card(status: dict[str, Any]) -> dict[str, Any]:
         _consent_button("external_llm_consent_details_open", "了解数据范围"),
     ]
     return _consent_card_shell("数据与隐私 · 外部 AI 处理", content, elements)
+
+
+def morning_brief_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
+    """Fixed opt-in settings; time is selected rather than typed."""
+
+    enabled = bool(preferences.get("morning_brief_enabled", False))
+    current = str(preferences.get("morning_brief_local_time") or "08:00")
+    options = [
+        {"text": {"tag": "plain_text", "content": value}, "value": value}
+        for value in ("07:00", "07:30", "08:00", "08:30", "09:00")
+    ]
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "早报设置"},
+        },
+        "elements": [
+            {"tag": "markdown", "content": (
+                f"状态：{'已开启' if enabled else '已关闭'}\n\n发送时间：{current}\n\n"
+                "早报只包含今日日程、你创建的提醒事项和一句固定轻提示，不包含压力预测。"
+            )},
+            {
+                "tag": "form", "name": "morning_brief_settings",
+                "elements": [
+                    {
+                        "tag": "select_static", "name": "morning_brief_local_time",
+                        "placeholder": {"tag": "plain_text", "content": "选择发送时间"},
+                        "initial_option": current, "options": options,
+                    },
+                    {
+                        "tag": "button", "text": {"tag": "plain_text", "content": "保存时间"},
+                        "type": "primary", "action_type": "form_submit",
+                        "value": {"mindflow_action": "morning_brief_time_update", "version": "1"},
+                    },
+                ],
+            },
+            {
+                "tag": "action", "actions": [
+                    {
+                        "tag": "button", "text": {"tag": "plain_text", "content": "关闭" if enabled else "开启"},
+                        "type": "primary", "value": {
+                            "mindflow_action": "morning_brief_toggle", "version": "1", "enabled": not enabled,
+                        },
+                    },
+                    {
+                        "tag": "button", "text": {"tag": "plain_text", "content": "暂停一周"},
+                        "value": {"mindflow_action": "morning_brief_pause_week", "version": "1"},
+                    },
+                ],
+            },
+        ],
+    }
