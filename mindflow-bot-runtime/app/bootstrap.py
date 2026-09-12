@@ -21,6 +21,8 @@ from app.repositories import (
     ProfileRepository,
     LearnedProfileRepository,
     PsychometricAssessmentRepository,
+    ParticipantSlowStateRepository,
+    EventAppraisalFeedbackRepository,
     WarningScheduleRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
@@ -84,6 +86,7 @@ from app.tools.memory import MemoryTools
 from app.tools.preferences import InteractionPreferenceTools
 from app.services.memory_service import MemoryService
 from app.services.interaction_preference_service import InteractionPreferenceService
+from app.services.psychological_context_builder import PsychologicalContextBuilder
 from app.services.web_search_service import (
     DisabledSearchProvider,
     HttpJsonSearchProvider,
@@ -137,6 +140,7 @@ class BusinessServices:
     web_search: WebSearchService
     memory: MemoryService
     interaction_preferences: InteractionPreferenceService
+    psychological_context: PsychologicalContextBuilder
 
 
 def build_business_services(
@@ -228,6 +232,12 @@ def build_business_services(
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
     psychometrics = PsychometricAssessmentRepository(database)
+    psychological_context = PsychologicalContextBuilder(
+        observations=observations,
+        slow_states=ParticipantSlowStateRepository(database),
+        appraisals=EventAppraisalFeedbackRepository(database),
+        learned_profiles=learned_profiles,
+    )
     # Stage 5 replaces per-EMA refitting with a weekly immutable-snapshot run.
     # The scheduler still consumes the small maybe_calibrate interface.
     profile_calibration = ParameterLearningService(
@@ -382,6 +392,7 @@ def build_business_services(
         care_preferences=care_preferences,
         memory=memory,
         interaction_preferences=interaction_preferences,
+        psychological_context=psychological_context,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,

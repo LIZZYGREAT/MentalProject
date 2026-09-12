@@ -87,14 +87,14 @@ def test_interaction_preferences_block_renders_only_when_provided():
         ),
         timezone_name="Asia/Shanghai",
     )
-    assert "<backend_interaction_preferences>" in prompt
+    assert "<interaction_preferences>" in prompt
     assert json.dumps({"tone": "concise"}, sort_keys=True) in prompt
 
     without = _text_transport_prompt(
         AgentTurnInput(text="看看日程"),
         timezone_name="Asia/Shanghai",
     )
-    assert "<backend_interaction_preferences>" not in without
+    assert "<interaction_preferences>" not in without
 
 
 def test_stage_block_keeps_image_evidence_untrusted_framing():

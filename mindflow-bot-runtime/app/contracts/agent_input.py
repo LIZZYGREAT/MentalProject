@@ -26,9 +26,11 @@ class AgentTurnInput:
     # Backend-derived context, never a permission. The stage comes from the
     # first real usage time (FeishuBinding.bound_at), not Participant.created_at.
     participant_stage: Literal["day1", "week1", "active"] | None = None
-    # Reserved slot for future structured interaction preferences. The worker
-    # passes None until a memory/preferences feature exists.
+    # These three domains stay separate. They are backend context, never
+    # instructions, permissions, or a durable copy of research state.
+    participant_memory: tuple[Mapping[str, Any], ...] = ()
     interaction_preferences: Mapping[str, Any] | None = None
+    psychological_context: Mapping[str, Any] | None = None
 
     def __str__(self) -> str:
         """Preserve text behavior at legacy adapter/test-double boundaries."""

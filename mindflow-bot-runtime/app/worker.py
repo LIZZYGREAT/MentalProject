@@ -355,6 +355,9 @@ class BotWorker:
         course_default_semester_start_date: str = "",
         feature_capabilities: Mapping[str, bool] | None = None,
         consent_service: Any = None,
+        memory_service: Any = None,
+        interaction_preferences: Any = None,
+        psychological_context_builder: Any = None,
     ):
         self.queue = queue
         self.identity = identity
@@ -373,6 +376,9 @@ class BotWorker:
                 else None
             )
         self.sender = sender
+        self.memory_service = memory_service
+        self.interaction_preferences = interaction_preferences
+        self.psychological_context_builder = psychological_context_builder
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
         self.presentations = presentations
@@ -2163,31 +2169,61 @@ class BotWorker:
     async def _with_backend_context(
         self, ctx: AgentContext, turn_input: AgentTurnInput
     ) -> AgentTurnInput:
-        """Attach backend-derived context (stage, preferences) to one turn.
+        """Attach isolated backend-owned personalization domains to one turn."""
 
-        The stage comes from the first real usage time, not participant
-        creation. Interaction preferences stay a reserved slot: the worker
-        passes None until such a preference feature exists.
-        """
-
-        if turn_input.participant_stage is not None:
-            return turn_input
         stage = None
-        try:
-            binding = await asyncio.to_thread(
-                self.identity.bindings.get_for_participant, ctx.participant_id
-            )
-        except Exception:
-            logger.warning(
-                "participant_stage_lookup_failed participant_id=%s",
+        if turn_input.participant_stage is None:
+            try:
+                binding = await asyncio.to_thread(
+                    self.identity.bindings.get_for_participant, ctx.participant_id
+                )
+                stage = participant_stage_from_bound_at((binding or {}).get("bound_at"))
+            except Exception:
+                logger.warning(
+                    "participant_stage_lookup_failed participant_id=%s",
+                    ctx.participant_id,
+                    exc_info=True,
+                )
+
+        async def load(
+            service: Any, method: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            if service is None:
+                return None
+            try:
+                return await asyncio.to_thread(
+                    getattr(service, method), *args, **kwargs
+                )
+            except Exception:
+                logger.warning(
+                    "personalization_context_lookup_failed domain=%s participant_id=%s",
+                    method,
+                    ctx.participant_id,
+                    exc_info=True,
+                )
+                return None
+
+        memories, preferences, psychological = await asyncio.gather(
+            load(self.memory_service, "retrieve", ctx.participant_id, turn_input.text),
+            load(self.interaction_preferences, "get", ctx.participant_id),
+            load(
+                self.psychological_context_builder,
+                "build",
                 ctx.participant_id,
-                exc_info=True,
-            )
-            binding = None
-        stage = participant_stage_from_bound_at((binding or {}).get("bound_at"))
-        if stage is None:
-            return turn_input
-        return replace(turn_input, participant_stage=stage)
+                current_text=turn_input.text,
+            ),
+        )
+        safe_memories = tuple(
+            {"memory_type": row.get("memory_type"), "content": row.get("content")}
+            for row in (memories or [])
+        )
+        return replace(
+            turn_input,
+            participant_stage=turn_input.participant_stage or stage,
+            participant_memory=safe_memories,
+            interaction_preferences=preferences,
+            psychological_context=psychological,
+        )
 
     async def _run_agent(
         self,

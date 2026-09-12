@@ -500,6 +500,9 @@ async def run() -> None:
             "daily_review_enabled": settings.daily_review_enabled,
         },
         consent_service=business.consent_service,
+        memory_service=business.memory,
+        interaction_preferences=business.interaction_preferences,
+        psychological_context_builder=business.psychological_context,
     )
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image
