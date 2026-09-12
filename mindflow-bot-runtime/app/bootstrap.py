@@ -54,6 +54,7 @@ from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
+from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
@@ -111,6 +112,7 @@ class BusinessServices:
     course_schedule_tools: CourseScheduleTools
     calendar_mutation_plans: CalendarMutationPlanRepository
     calendar_mutation_plan_runner: CalendarMutationPlanRunner
+    proactive_notifications: ProactiveNotificationPolicy
 
 
 def build_business_services(
@@ -174,6 +176,11 @@ def build_business_services(
         database,
         system_max_daily_sends=warning_delivery_policy.max_daily_sends,
         timezone_name=settings.timezone_name,
+    )
+    proactive_notifications = ProactiveNotificationPolicy(
+        database,
+        timezone_name=settings.timezone_name,
+        default_system_budget=warning_delivery_policy.max_daily_sends,
     )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
@@ -368,4 +375,5 @@ def build_business_services(
         course_schedule_tools=course_schedule_tools,
         calendar_mutation_plans=calendar_mutation_plans,
         calendar_mutation_plan_runner=calendar_mutation_plan_runner,
+        proactive_notifications=proactive_notifications,
     )

@@ -1592,10 +1592,23 @@ class ParticipantCarePreference(Base):
     warning_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     daily_review_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     morning_brief_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    morning_brief_local_time: Mapped[time] = mapped_column(
+        Time(), nullable=False, default=lambda: time(8, 0)
+    )
+    morning_brief_paused_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     weekly_summary_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    weekly_summary_local_time: Mapped[time] = mapped_column(
+        Time(), nullable=False, default=lambda: time(9, 0)
+    )
+    weekly_summary_weekday: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
     max_proactive_care_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Kept separate from the historical care-only budget so expanding the
+    # policy cannot silently change existing study semantics.
+    max_system_proactive_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     allow_schedule_suggestions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     allow_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     preferred_support_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
@@ -1604,7 +1617,49 @@ class ParticipantCarePreference(Base):
     interruption_tolerance: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
     preferred_reminder_windows: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    global_proactive_muted_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ProactiveNotificationDelivery(Base):
+    """Cross-feature reservation and delivery ledger for proactive messages."""
+
+    __tablename__ = "proactive_notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "message_kind", "dedupe_key",
+            name="uq_proactive_notification_dedupe",
+        ),
+        Index(
+            "ix_proactive_notification_budget",
+            "participant_id", "message_class", "scheduled_at", "status",
+        ),
+        CheckConstraint(
+            "message_class IN ('system_proactive', 'user_requested')",
+            name="ck_proactive_notification_class",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    message_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    message_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="reserved")
+    suppression_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

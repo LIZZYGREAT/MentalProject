@@ -93,11 +93,17 @@ class ParticipantCarePreferenceRepository:
             "warning_enabled": True,
             "daily_review_enabled": True,
             "morning_brief_enabled": False,
+            "morning_brief_local_time": "08:00",
+            "morning_brief_paused_until": None,
             "weekly_summary_enabled": False,
+            "weekly_summary_local_time": "09:00",
+            "weekly_summary_weekday": 1,
             "quiet_hours_start": None,
             "quiet_hours_end": None,
             "max_proactive_care_per_day": self.system_max_daily_sends,
             "effective_max_proactive_care_per_day": self.system_max_daily_sends,
+            "max_system_proactive_per_day": self.system_max_daily_sends,
+            "effective_max_system_proactive_per_day": self.system_max_daily_sends,
             "allow_schedule_suggestions": False,
             "allow_follow_up": True,
             "preferred_support_types": [],
@@ -106,6 +112,7 @@ class ParticipantCarePreferenceRepository:
             "interruption_tolerance": 0.5,
             "preferred_reminder_windows": [],
             "muted_until": None,
+            "global_proactive_muted_until": None,
             "version": 0,
             "updated_at": None,
         }
@@ -129,11 +136,17 @@ class ParticipantCarePreferenceRepository:
             "daily_review_enabled",
             "morning_brief_enabled",
             "weekly_summary_enabled",
+            "morning_brief_local_time",
+            "morning_brief_paused_until",
+            "weekly_summary_local_time",
+            "weekly_summary_weekday",
             "quiet_hours_start",
             "quiet_hours_end",
             "max_proactive_care_per_day",
+            "max_system_proactive_per_day",
             "allow_schedule_suggestions",
             "allow_follow_up",
+            "global_proactive_muted_until",
             "preferred_support_types",
             "reenable_intervention_types",
         }
@@ -290,6 +303,42 @@ class ParticipantCarePreferenceRepository:
                 )
             else:
                 row.max_proactive_care_per_day = raw_max
+        if "max_system_proactive_per_day" in changes:
+            raw_max = changes["max_system_proactive_per_day"]
+            if raw_max is None:
+                row.max_system_proactive_per_day = None
+            elif (
+                not isinstance(raw_max, int)
+                or isinstance(raw_max, bool)
+                or not 0 <= raw_max <= self.system_max_daily_sends
+            ):
+                raise ValueError(
+                    "max_system_proactive_per_day exceeds the backend safety cap"
+                )
+            else:
+                row.max_system_proactive_per_day = raw_max
+        for key in ("morning_brief_local_time", "weekly_summary_local_time"):
+            if key in changes:
+                parsed = _parse_clock(changes[key])
+                if parsed is None:
+                    raise ValueError(f"{key} is required")
+                setattr(row, key, parsed)
+        if "weekly_summary_weekday" in changes:
+            weekday = changes["weekly_summary_weekday"]
+            if not isinstance(weekday, int) or isinstance(weekday, bool) or not 1 <= weekday <= 7:
+                raise ValueError("weekly_summary_weekday must be between 1 and 7")
+            row.weekly_summary_weekday = weekday
+        for key in ("morning_brief_paused_until", "global_proactive_muted_until"):
+            if key in changes:
+                value = changes[key]
+                if value in (None, ""):
+                    setattr(row, key, None)
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(str(value))
+                except ValueError as exc:
+                    raise ValueError(f"{key} must be ISO 8601") from exc
+                setattr(row, key, _aware(parsed))
         start = (
             _parse_clock(changes["quiet_hours_start"])
             if "quiet_hours_start" in changes
@@ -429,12 +478,25 @@ class ParticipantCarePreferenceRepository:
             self.system_max_daily_sends,
             self.system_max_daily_sends if configured_max is None else configured_max,
         )
+        configured_system_max = row.max_system_proactive_per_day
+        effective_system_max = min(
+            self.system_max_daily_sends,
+            self.system_max_daily_sends
+            if configured_system_max is None else configured_system_max,
+        )
         return {
             "care_enabled": bool(row.care_enabled),
             "warning_enabled": bool(row.warning_enabled),
             "daily_review_enabled": bool(row.daily_review_enabled),
             "morning_brief_enabled": bool(row.morning_brief_enabled),
+            "morning_brief_local_time": row.morning_brief_local_time.strftime("%H:%M"),
+            "morning_brief_paused_until": (
+                _aware(row.morning_brief_paused_until).isoformat()
+                if row.morning_brief_paused_until else None
+            ),
             "weekly_summary_enabled": bool(row.weekly_summary_enabled),
+            "weekly_summary_local_time": row.weekly_summary_local_time.strftime("%H:%M"),
+            "weekly_summary_weekday": int(row.weekly_summary_weekday),
             "quiet_hours_start": (
                 row.quiet_hours_start.strftime("%H:%M")
                 if row.quiet_hours_start else None
@@ -449,6 +511,12 @@ class ParticipantCarePreferenceRepository:
                 else self.system_max_daily_sends
             ),
             "effective_max_proactive_care_per_day": effective_max,
+            "max_system_proactive_per_day": (
+                configured_system_max
+                if configured_system_max is not None
+                else self.system_max_daily_sends
+            ),
+            "effective_max_system_proactive_per_day": effective_system_max,
             "allow_schedule_suggestions": bool(row.allow_schedule_suggestions),
             "allow_follow_up": bool(row.allow_follow_up),
             "preferred_support_types": list(row.preferred_support_types or []),
@@ -458,6 +526,10 @@ class ParticipantCarePreferenceRepository:
             "preferred_reminder_windows": list(row.preferred_reminder_windows or []),
             "muted_until": (
                 _aware(row.muted_until).isoformat() if row.muted_until else None
+            ),
+            "global_proactive_muted_until": (
+                _aware(row.global_proactive_muted_until).isoformat()
+                if row.global_proactive_muted_until else None
             ),
             "version": int(row.version),
             "updated_at": _aware(row.updated_at).isoformat(),
