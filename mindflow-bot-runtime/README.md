@@ -25,6 +25,8 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 ## 安全边界
 
 - 未绑定用户只能触发绑定（发送 `/bind 绑定码`，或直接发送符合绑定码形态的文本）；其余任何输入只会得到欢迎引导，不会触发 token 查询。仅允许私聊。
+- External LLM（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的 `participant_consents` 记录；无同意时 fail closed 并发送固定 Consent 卡，未授权用户不会看到“联系研究者”类提示。
+- Safety 命中只返回固定审核文案：不通知研究者、不写入长期画像/记忆、不触发次日强制关怀；只允许匿名聚合的运营指标。
 - `external_llm_consent_at` 为空时不会创建 Claude SDK client。
 - `/calendar` 由 Backend Device Flow 处理。
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
@@ -191,8 +193,13 @@ Copy-Item .\profiles\profile.example.json .\profiles\P001.json
 docker compose exec bot python3 -m app.admin create-participant P001
 docker compose cp .\profiles\P001.json bot:/tmp/P001.json
 docker compose exec bot python3 -m app.admin set-profile P001 /tmp/P001.json
-docker compose exec bot python3 -m app.admin set-llm-consent P001
 ```
+
+外部 LLM 处理没有研究者/管理员批准入口：参与者绑定后，首次触发对话或图片
+处理时会收到固定的用户 Consent 卡，同意后写入 `participant_consents`（带
+consent version），用户可在“数据与隐私”中随时关闭。旧字段
+`participants.external_llm_consent_at` 只作为过渡期审计数据显示，不再授权
+任何 external LLM 调用。
 
 第一条命令只显示一次 `/bind <code>`；数据库仅保存绑定码 Hash。撤回外部 LLM
 授权：
