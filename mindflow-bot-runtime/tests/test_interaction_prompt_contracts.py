@@ -43,6 +43,8 @@ def test_system_rules_keep_conversation_as_the_default_path():
     assert "at most one follow-up question" in SYSTEM_RULES
     assert "Do not pitch features proactively" in SYSTEM_RULES
     assert "The backend owns progress messages" in SYSTEM_RULES
+    # Original global style anchor, restored during the restructure review.
+    assert "concise, calm, and optional" in SYSTEM_RULES
 
 
 def test_system_rules_are_one_structured_constant_without_appends():

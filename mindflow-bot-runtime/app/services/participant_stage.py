@@ -22,7 +22,8 @@ def participant_stage_from_bound_at(
     """Classify usage recency from FeishuBinding.bound_at.
 
     Participant.created_at is deliberately not used: researchers may create
-    participants long before the first real Feishu session.
+    participants long before the first real Feishu session. Malformed input
+    degrades to None instead of failing the agent turn.
     """
 
     if bound_at is None:
@@ -33,7 +34,12 @@ def participant_stage_from_bound_at(
             return None
         if normalized.endswith("Z"):
             normalized = normalized[:-1] + "+00:00"
-        bound_at = datetime.fromisoformat(normalized)
+        try:
+            bound_at = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    if not isinstance(bound_at, datetime):
+        return None
     first_used_at = _aware(bound_at)
     current = _aware(now or datetime.now(timezone.utc))
     age = current - first_used_at

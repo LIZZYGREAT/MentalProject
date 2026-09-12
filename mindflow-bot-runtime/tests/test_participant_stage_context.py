@@ -55,6 +55,12 @@ def test_naive_bound_at_is_treated_as_utc():
     )
 
 
+def test_malformed_bound_at_degrades_to_none_instead_of_failing_the_turn():
+    assert participant_stage_from_bound_at("not-a-timestamp") is None
+    assert participant_stage_from_bound_at(object()) is None
+    assert participant_stage_from_bound_at("2026-09-08T16:30:00+00:00") is not None
+
+
 def test_stage_block_appears_only_when_stage_is_known():
     prompt = _text_transport_prompt(
         AgentTurnInput(text="你好", participant_stage=STAGE_DAY1),
