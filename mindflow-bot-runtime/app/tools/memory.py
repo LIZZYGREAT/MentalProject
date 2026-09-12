@@ -8,11 +8,13 @@ from typing import Any
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.services.memory_service import MEMORY_TYPES
+from app.integrations.feishu.cards import memory_center_card
 
 
 class MemoryTools:
-    def __init__(self, memory: Any) -> None:
+    def __init__(self, memory: Any, presentations: Any = None) -> None:
         self.memory = memory
+        self.presentations = presentations
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -47,6 +49,11 @@ class MemoryTools:
             {"type": "object", "properties": {}, "additionalProperties": False},
             self.clear_all, effect="internal_write", authorization_requirement="direct_request",
         )
+        registry.register(
+            "memory_center_show", "Show the participant's fixed Memory Center card.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self.show_center, effect="ui_effect", authorization_requirement="none",
+        )
 
     def remember(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
         row = self.memory.remember_explicit(
@@ -63,6 +70,14 @@ class MemoryTools:
 
     def clear_all(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
         return {"ok": True, "deleted_count": self.memory.clear_all(ctx.participant_id)}
+
+    def show_center(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
+        if self.presentations is None:
+            raise RuntimeError("Memory Center delivery is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id, memory_center_card(self.memory.list(ctx.participant_id))
+        )
+        return {"ok": True, "card_queued": True}
 
     @staticmethod
     def _public(row: dict) -> dict:

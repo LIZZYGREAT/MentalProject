@@ -353,7 +353,7 @@ def build_business_services(
         reminders, proactive_notifications, timezone_name=settings.timezone_name
     ).register(registry)
     WebTools(web_search).register(registry)
-    MemoryTools(memory).register(registry)
+    MemoryTools(memory, presentations).register(registry)
     InteractionPreferenceTools(interaction_preferences).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
@@ -378,6 +378,7 @@ def build_business_services(
         },
         consent_service=consent_service,
         care_preferences=care_preferences,
+        memory=memory,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,

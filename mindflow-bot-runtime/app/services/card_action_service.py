@@ -27,6 +27,10 @@ from app.integrations.feishu.cards import (
     external_llm_consent_details_card,
     external_llm_consent_status_card,
     morning_brief_settings_card,
+    memory_center_card,
+    memory_clear_all_confirmation_card,
+    memory_delete_confirmation_card,
+    memory_detail_card,
     today_calendar_card,
 )
 from app.presentation.consent_texts import external_llm_consent_declined_text
@@ -195,6 +199,7 @@ class CardActionService:
         feature_capabilities: Any = None,
         consent_service: Any = None,
         care_preferences: Any = None,
+        memory: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -209,6 +214,7 @@ class CardActionService:
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.consent_service = consent_service
         self.care_preferences = care_preferences
+        self.memory = memory
 
     @staticmethod
     def _fallback_event_id(
@@ -241,6 +247,38 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "memory_delete_prompt", "memory_delete_confirm",
+            "memory_clear_prompt", "memory_clear_confirm",
+            "memory_center_refresh",
+            "memory_detail_open",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.memory is None:
+                raise RuntimeError("Memory Center is unavailable")
+            memories = self.memory.list(participant_id)
+            if action_name == "memory_center_refresh":
+                return {"ok": True, "reply_text": "已返回 Memory Center。", "card": memory_center_card(memories)}
+            if action_name == "memory_clear_prompt":
+                return {"ok": True, "reply_text": "请确认是否清空全部长期记忆。", "card": memory_clear_all_confirmation_card()}
+            if action_name == "memory_clear_confirm":
+                deleted = self.memory.clear_all(participant_id)
+                return {"ok": True, "reply_text": f"已清空 {deleted} 条长期记忆。", "card": memory_center_card([])}
+            try:
+                memory_id = uuid.UUID(str(action.get("memory_id") or ""))
+            except ValueError:
+                return {"ok": False, "error": "invalid_memory_id"}
+            target = next((item for item in memories if item["id"] == str(memory_id)), None)
+            if target is None:
+                return {"ok": False, "error": "memory_not_found"}
+            if action_name == "memory_detail_open":
+                return {"ok": True, "reply_text": "已打开记忆详情。", "card": memory_detail_card(target)}
+            if action_name == "memory_delete_prompt":
+                return {"ok": True, "reply_text": "请确认是否删除这条记忆。", "card": memory_delete_confirmation_card(target)}
+            deleted = self.memory.delete(participant_id, memory_id)
+            remaining = self.memory.list(participant_id)
+            return {"ok": deleted, "reply_text": "这条记忆已删除。" if deleted else "没有找到这条记忆。", "card": memory_center_card(remaining)}
         if action_name in {
             "morning_brief_toggle", "morning_brief_time_update",
             "morning_brief_pause_week",

@@ -1500,3 +1500,78 @@ def morning_brief_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
             },
         ],
     }
+
+
+def memory_center_card(memories: list[dict[str, Any]]) -> dict[str, Any]:
+    elements: list[dict[str, Any]] = [{
+        "tag": "markdown",
+        "content": "这里仅显示你明确要求 MindFlow 记住的内容。你可以逐条删除或全部清空。",
+    }]
+    for item in memories[:50]:
+        elements.append({
+            "tag": "column_set", "flex_mode": "stretch", "columns": [
+                {"tag": "column", "width": "weighted", "weight": 4, "elements": [{
+                    "tag": "markdown", "content": f"**{str(item.get('memory_type') or 'memory')}**\n{str(item.get('content') or '')[:500]}",
+                }]},
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [{
+                    "tag": "button", "text": {"tag": "plain_text", "content": "查看"},
+                    "value": {"mindflow_action": "memory_detail_open", "version": "1", "memory_id": str(item.get("id") or "")},
+                }]},
+            ],
+        })
+    if not memories:
+        elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": "目前没有长期记忆。"}]})
+    elements.append({
+        "tag": "action", "actions": [{
+            "tag": "button", "text": {"tag": "plain_text", "content": "清空全部记忆"},
+            "type": "danger", "value": {"mindflow_action": "memory_clear_prompt", "version": "1"},
+        }],
+    })
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "Memory Center"}},
+        "elements": elements,
+    }
+
+
+def memory_detail_card(memory: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "记忆详情"}},
+        "elements": [
+            {"tag": "markdown", "content": (
+                f"类型：{str(memory.get('memory_type') or '')}\n\n"
+                f"内容：{str(memory.get('content') or '')[:500]}\n\n"
+                "如需修改，可以在对话中明确告诉我新的内容；保存成功后会替代冲突的旧记忆。"
+            )},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "删除"}, "type": "danger", "value": {"mindflow_action": "memory_delete_prompt", "version": "1", "memory_id": str(memory.get("id") or "")}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "返回"}, "value": {"mindflow_action": "memory_center_refresh", "version": "1"}},
+            ]},
+        ],
+    }
+
+
+def memory_delete_confirmation_card(memory: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "header": {"template": "orange", "title": {"tag": "plain_text", "content": "确认删除记忆"}},
+        "elements": [
+            {"tag": "markdown", "content": f"将删除：\n\n{str(memory.get('content') or '')[:500]}"},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "确认删除"}, "type": "danger", "value": {"mindflow_action": "memory_delete_confirm", "version": "1", "memory_id": str(memory.get("id") or "")}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "取消"}, "value": {"mindflow_action": "memory_center_refresh", "version": "1"}},
+            ]},
+        ],
+    }
+
+
+def memory_clear_all_confirmation_card() -> dict[str, Any]:
+    return {
+        "header": {"template": "red", "title": {"tag": "plain_text", "content": "确认清空全部记忆"}},
+        "elements": [
+            {"tag": "markdown", "content": "这只会清空你的长期个性化记忆，不会删除日历、状态记录、研究数据、预测或授权。"},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "确认清空"}, "type": "danger", "value": {"mindflow_action": "memory_clear_confirm", "version": "1"}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "取消"}, "value": {"mindflow_action": "memory_center_refresh", "version": "1"}},
+            ]},
+        ],
+    }
