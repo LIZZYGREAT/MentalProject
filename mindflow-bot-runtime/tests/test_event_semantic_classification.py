@@ -12,6 +12,8 @@ from app.repositories import (
     ParticipantRepository,
     ProfileRepository,
 )
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import (
     ForecastCoordinator,
@@ -272,7 +274,8 @@ def test_forecast_recompute_persists_and_returns_final_classified_events():
     database = memory_database()
     participants = ParticipantRepository(database)
     participant = participants.create("COURSE-FORECAST")
-    participant = participants.set_external_llm_consent(participant.id, allowed=True)
+    consent_service = ConsentService(ParticipantConsentRepository(database))
+    consent_service.grant_external_llm_consent(participant.id)
     client = SemanticClient()
     semantics = EventSemanticPreprocessor(
         EventSemanticCacheRepository(database),
@@ -308,6 +311,7 @@ def test_forecast_recompute_persists_and_returns_final_classified_events():
         forecasts=forecasts,
         warnings=warning_repository(database),
         timezone_name="Asia/Shanghai",
+        consent_service=consent_service,
     )
 
     async def scenario():

@@ -601,6 +601,22 @@ class CardActionService:
             if self.consent_service is None:
                 raise RuntimeError("consent service is unavailable")
             if action_name == "external_llm_consent_accept":
+                # The card must carry the disclosure version the user actually
+                # saw. A stale card never grants a newer consent: zero writes,
+                # re-render the current disclosure instead.
+                from app.services.consent_service import EXTERNAL_LLM_CONSENT_VERSION
+
+                if str(action.get("consent_version") or "") != (
+                    EXTERNAL_LLM_CONSENT_VERSION
+                ):
+                    return {
+                        "ok": True,
+                        "navigation_only": True,
+                        "reply_text": (
+                            "外部 AI 处理说明已经更新，请先查看最新说明后再选择。"
+                        ),
+                        "card": external_llm_consent_card(),
+                    }
                 self.consent_service.grant_external_llm_consent(participant_id)
                 status = self.consent_service.status(participant_id)
                 return {

@@ -17,7 +17,12 @@ def _aware(value: datetime) -> datetime:
 
 
 class ParticipantConsentRepository:
-    """Append-only consent storage; current record is the latest row."""
+    """Versioned consent lifecycle storage; current record is the latest row.
+
+    History-preserving rather than strictly append-only: revocation updates
+    the current grant row in place (status/revoked_at) and prior rows remain
+    queryable.
+    """
 
     def __init__(self, database: Database):
         self.database = database

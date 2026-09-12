@@ -17,7 +17,9 @@ from app.repositories_consent import ParticipantConsentRepository
 
 EXTERNAL_LLM_CONSENT_TYPE = "external_llm_processing"
 # Bumping this version invalidates prior grants until the user re-consents.
-EXTERNAL_LLM_CONSENT_VERSION = "1"
+# v2 extends the disclosed scope to calendar event text used for schedule
+# semantic classification; v1 grants never auto-upgrade.
+EXTERNAL_LLM_CONSENT_VERSION = "2"
 
 
 class ExternalLLMConsentRequired(PermissionError):
@@ -46,8 +48,22 @@ class ConsentService:
     def grant_external_llm_consent(
         self, participant_id: uuid.UUID, *, now: datetime | None = None
     ) -> dict[str, Any]:
-        """Durable grant; returns only after the record is committed."""
+        """Durable grant; returns only after the record is committed.
 
+        Idempotent for the current version: replaying accept on an already
+        active current-version grant returns it without inserting a
+        duplicate lifecycle row.
+        """
+
+        current = self.consents.get_current(
+            participant_id, EXTERNAL_LLM_CONSENT_TYPE
+        )
+        if (
+            current
+            and current["status"] == "active"
+            and current["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
+        ):
+            return current
         return self.consents.grant(
             participant_id,
             EXTERNAL_LLM_CONSENT_TYPE,

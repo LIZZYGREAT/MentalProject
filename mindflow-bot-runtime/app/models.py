@@ -57,12 +57,14 @@ class Participant(Base):
 
 
 class ParticipantConsent(Base):
-    """Append-only, participant-owned consent records.
+    """Versioned, history-preserving, participant-owned consent records.
 
     The current record is the latest row per (participant_id, consent_type);
     only an active row whose consent_version matches the expected version
-    authorizes processing. Legacy researcher-set flags are never migrated
-    into this table: user consent must come from the user.
+    authorizes processing. Grant rows keep prior lifecycle state visible
+    (revoke updates the current row instead of deleting it). Legacy
+    researcher-set flags are never migrated into this table: user consent
+    must come from the user.
     """
 
     __tablename__ = "participant_consents"
@@ -450,6 +452,12 @@ class BotEvent(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # normal | protected. "protected" marks Safety-handled content: researcher
+    # and admin projections show a redaction placeholder, never the original
+    # text and never a classifier label.
+    content_privacy_class: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="normal"
+    )
     reply_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_segments_json: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     reply_next_segment: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

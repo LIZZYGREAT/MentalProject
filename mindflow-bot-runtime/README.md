@@ -25,9 +25,9 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 ## 安全边界
 
 - 未绑定用户只能触发绑定（发送 `/bind 绑定码`，或直接发送符合绑定码形态的文本）；其余任何输入只会得到欢迎引导，不会触发 token 查询。仅允许私聊。
-- External LLM（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的 `participant_consents` 记录；无同意时 fail closed 并发送固定 Consent 卡，未授权用户不会看到“联系研究者”类提示。
-- Safety 命中只返回固定审核文案：不通知研究者、不写入长期画像/记忆、不触发次日强制关怀；只允许匿名聚合的运营指标。
-- `external_llm_consent_at` 为空时不会创建 Claude SDK client。
+- External LLM（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的 `participant_consents` 记录（v2 disclosure 覆盖对话文字、图片与最少必要日程文本）；Consent 回调绑定用户实际看到的 `consent_version`，旧卡 accept 零写入并刷新最新说明，revoke 始终可用。无同意时 fail closed 并发送固定 Consent 卡，未授权用户不会看到“联系研究者”类提示。
+- Safety 命中只返回固定审核文案：不通知研究者、不写入长期画像/记忆、不触发次日强制关怀；Safety 内容在 Admin 消息视图中显示为“[内容受隐私保护]”，不暴露原文与分类标签；只允许匿名聚合的运营指标。
+- 没有当前版本 active 的 `participant_consents` 记录时，不会启动该参与者的 External LLM 对话/图片处理；legacy `external_llm_consent_at` 不具备授权能力，Worker/Forecast 缺少 ConsentService 时一律 fail closed。
 - `/calendar` 由 Backend Device Flow 处理。
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
@@ -43,7 +43,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 <!-- BUSINESS_TOOL_COUNT: 19 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0051_participant_consents -->
+<!-- ALEMBIC_HEAD: 0052_bot_event_content_privacy -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->

@@ -1317,22 +1317,34 @@ _CONSENT_CARD_VERSION = "1"
 
 
 def _consent_button(
-    action_name: str, text: str, *, primary: bool = False
+    action_name: str,
+    text: str,
+    *,
+    primary: bool = False,
+    bind_consent_version: bool = False,
 ) -> dict[str, Any]:
-    """Consent callback values carry only the action and version.
+    """Consent callback values carry only action/schema versions.
 
-    No participant ID, image key, or open ID: the backend binds the action to
-    the clicking participant through the authenticated card callback.
+    ``version`` is the card action schema version; ``consent_version`` is the
+    disclosure version the user actually saw, so a stale card can never grant
+    a newer consent. No participant ID, image key, or open ID: the backend
+    binds the action to the clicking participant through the authenticated
+    card callback.
     """
 
+    from app.services.consent_service import EXTERNAL_LLM_CONSENT_VERSION
+
+    value: dict[str, Any] = {
+        "mindflow_action": action_name,
+        "version": _CONSENT_CARD_VERSION,
+    }
+    if bind_consent_version:
+        value["consent_version"] = EXTERNAL_LLM_CONSENT_VERSION
     return {
         "tag": "button",
         "type": "primary" if primary else "default",
         "text": {"tag": "plain_text", "content": text},
-        "behaviors": [{"type": "callback", "value": {
-            "mindflow_action": action_name,
-            "version": _CONSENT_CARD_VERSION,
-        }}],
+        "behaviors": [{"type": "callback", "value": value}],
     }
 
 
@@ -1356,12 +1368,18 @@ def external_llm_consent_card() -> dict[str, Any]:
 
     content = (
         "**开启外部 AI 处理**\n\n"
-        "为了回复你的消息、识别你主动发送的图片，相关内容会发送给外部 AI 模型处理。\n\n"
-        "MindFlow 不会把你的账号标识作为提示内容发送给模型。\n\n"
+        "为了回复你的消息、识别你主动发送的图片，以及在需要时理解你的日程内容，"
+        "完成这些功能所需的最少内容会发送给外部 AI 模型处理。\n\n"
+        "MindFlow 不会把你的账号标识、绑定码等身份信息作为提示内容发送给模型。\n\n"
         "你可以随时在“数据与隐私”中关闭这项能力。"
     )
     elements = [
-        _consent_button("external_llm_consent_accept", "同意并开启", primary=True),
+        _consent_button(
+            "external_llm_consent_accept",
+            "同意并开启",
+            primary=True,
+            bind_consent_version=True,
+        ),
         _consent_button("external_llm_consent_decline", "暂不使用"),
         _consent_button("external_llm_consent_details_open", "了解详情"),
     ]
@@ -1371,15 +1389,27 @@ def external_llm_consent_card() -> dict[str, Any]:
 def external_llm_consent_details_card() -> dict[str, Any]:
     content = (
         "**外部 AI 处理的数据范围**\n\n"
-        "- 会发送：你主动发送的图片内容，以及为完成识别和回复所需的必要文字。\n"
-        "- 不会发送：你的飞书身份、账号标识或绑定码。\n"
-        "- 用途：仅用于完成当次的识别与回复。\n"
-        "- 你可以随时在“数据与隐私”中关闭这项能力；关闭不影响已保存的记录、"
-        "本地日历和压力功能。\n"
-        "- 数据的使用、保存与研究用途，以项目正式说明与知情同意内容为准。"
+        "可能发送：\n"
+        "- 你主动发送、需要 AI 回复的文字；\n"
+        "- 你主动发送并要求识别的图片内容；\n"
+        "- 为压力建模理解日程语义时所需的日程标题、描述等最少必要文本。\n\n"
+        "不会作为提示内容发送：\n"
+        "- 飞书 open_id；\n"
+        "- participant_id / participant_code；\n"
+        "- 绑定码；\n"
+        "- Token / Secret 等凭据。\n\n"
+        "用途：仅用于完成对应的回复、图片识别或日程语义分析。\n\n"
+        "关闭：关闭后，新的外部 AI 处理立即停止；已保存的本地记录、日历授权和"
+        "既有压力数据不会因此被删除。\n\n"
+        "数据保存与研究用途：以项目正式知情同意文本为准。"
     )
     elements = [
-        _consent_button("external_llm_consent_accept", "同意并开启", primary=True),
+        _consent_button(
+            "external_llm_consent_accept",
+            "同意并开启",
+            primary=True,
+            bind_consent_version=True,
+        ),
         _consent_button("external_llm_consent_prompt_open", "返回"),
     ]
     return _consent_card_shell("外部 AI 处理 · 数据范围", content, elements)
@@ -1397,7 +1427,12 @@ def external_llm_consent_status_card(status: dict[str, Any]) -> dict[str, Any]:
     else:
         state_line = "状态：已关闭"
         actions = [
-            _consent_button("external_llm_consent_accept", "重新开启", primary=True),
+            _consent_button(
+                "external_llm_consent_accept",
+                "重新开启",
+                primary=True,
+                bind_consent_version=True,
+            ),
         ]
     version = str(status.get("consent_version") or "")
     if version:

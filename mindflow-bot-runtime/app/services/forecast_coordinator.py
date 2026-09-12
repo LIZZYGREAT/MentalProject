@@ -26,6 +26,8 @@ from app.repositories import (
 )
 from algorithm.dynamic_state_model import model_variant_metadata, normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.services.care_message_service import (
     CARE_MESSAGE_SCHEMA_VERSION,
     CareMessageService,
@@ -323,7 +325,13 @@ class ForecastCoordinator:
         self.care_messages = CareMessageService(timezone_name)
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
-        self.consent_service = consent_service
+        if consent_service is False:
+            # Explicitly disabled: the gate fails closed.
+            self.consent_service = None
+        else:
+            self.consent_service = consent_service or ConsentService(
+                ParticipantConsentRepository(participants.database)
+            )
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
         self.dependency_refresh: ForecastDependencyRefreshService | None = None
@@ -331,17 +339,16 @@ class ForecastCoordinator:
     async def _has_external_llm_consent(self, participant_id) -> bool:
         """External-LLM gate for calendar-content classification.
 
-        The participant-owned consent service is the only production
-        authority; the legacy researcher/CLI flag is a transition default
-        for constructions without the service and never grants beyond it.
+        Fails closed when no consent service is wired: the legacy
+        researcher/CLI flag never authorizes external LLM processing, and
+        production always constructs the coordinator with the service.
         """
 
-        if self.consent_service is not None:
-            return await asyncio.to_thread(
-                self.consent_service.is_active, participant_id
-            )
-        participant = await asyncio.to_thread(self.participants.get, participant_id)
-        return bool(participant and participant.external_llm_consent_at)
+        if self.consent_service is None:
+            return False
+        return await asyncio.to_thread(
+            self.consent_service.is_active, participant_id
+        )
 
     def mark_dependency_dirty(
         self,

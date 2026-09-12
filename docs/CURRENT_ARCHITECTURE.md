@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 19 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0051_participant_consents -->
+<!-- ALEMBIC_HEAD: 0052_bot_event_content_privacy -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -467,7 +467,7 @@ Hard boundaries / Presentation / Failure handling），七条 hard boundary 不�
 ## External LLM Consent 与 Safety 边界
 
 External LLM 处理（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的
-`participant_consents` 记录（append-only，`consent_type=external_llm_processing`，
+`participant_consents` 记录（versioned history-preserving，`consent_type=external_llm_processing`，
 带 `consent_version`；Repository 取最新记录，只有 active 且版本匹配才算同意）。
 `ConsentService.require_external_llm_consent()` 是唯一 gate：fail closed、授权
 持久化、撤销立即生效、版本不匹配视为未同意。Worker 的三处入口（recent-image
@@ -475,15 +475,22 @@ External LLM 处理（对话模型、图片 Vision、日历事件语义分类）
 该 gate；无同意时发送固定 Consent 卡（回调只携带 action 与 version，绝不携带
 participant/image/open 标识，绑定关系由鉴权回调解析）。Consent 的授权/撤销走
 CardActionService 固定 allowlist，accept/revoke 是仅有的两个写动作；decline 与
-状态/详情卡均为 navigation_only。Admin/CLI 没有 approve external LLM 的入口；
-旧字段 `participants.external_llm_consent_at` 只作过渡期审计显示，不迁移、不授权。
+状态/详情卡均为 navigation_only。Admin/CLI 没有 approve external LLM 的入口；旧字段
+`participants.external_llm_consent_at` 只作过渡期审计显示（admin 读模型单独命名为
+`legacy_external_llm_consent_at`），不迁移、不授权。Worker / ForecastCoordinator
+在缺少 ConsentService 时 fail closed，不存在 legacy fallback。Accept 回调必须携带
+用户实际看到的 `consent_version`，与当前版本不一致时零写入并重新渲染最新说明卡；
+重复 accept 幂等；revoke 与 disclosure 版本无关、始终可用。
 
 Safety 命中（文本或图片证据中的高风险语义）只返回固定审核文案并短路 Agent：
 不通知研究者、不产生 participant-linked incident、不写入长期画像/记忆/标签、
 不触发次日强制关怀（supportive follow-up 属于后续主动消息批次的 Care Policy，
 须走 care context、care preferences、allow_follow_up、proactive budget 与
 quiet hours）。`tests/test_safety_boundary.py` 以源级契约锁定上述禁用引用；
-第三方语境（新闻/论文含高风险词）保持既有语义回归。
+第三方语境（新闻/论文含高风险词）保持既有语义回归。Safety 命中的 BotEvent 记录
+`content_privacy_class=protected`（只有 normal/protected 两值，不保存任何风险标签），
+admin 消息读模型对 protected 内容返回 `[内容受隐私保护]` 占位并置
+`content_redacted=true`，原始 Safety 文本与固定支持文案不进入研究者/管理员视图。
 
 ## 自动漂移保护
 

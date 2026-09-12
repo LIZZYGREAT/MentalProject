@@ -60,6 +60,8 @@ from app.integrations.feishu.cards import (
     external_llm_consent_card,
 )
 from app.presentation.consent_texts import external_llm_consent_prompt_text
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.feature_cards import (
     feature_overview_card,
@@ -360,7 +362,16 @@ class BotWorker:
         self.runs = runs
         self.skill_loader = skill_loader
         self.runtime = runtime
-        self.consent_service = consent_service
+        if consent_service is False:
+            # Explicitly disabled: the gate fails closed.
+            self.consent_service = None
+        else:
+            database = getattr(events, "database", None)
+            self.consent_service = consent_service or (
+                ConsentService(ParticipantConsentRepository(database))
+                if database is not None
+                else None
+            )
         self.sender = sender
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
@@ -825,7 +836,7 @@ class BotWorker:
                     )
                 )
                 if reuse_recent and recent is not None:
-                    if not self._has_external_llm_consent(participant):
+                    if not await self._has_external_llm_consent(participant):
                         await self._deliver_consent_prompt(event)
                         return
                     task_generation = self._current_stop_generation(
@@ -860,7 +871,7 @@ class BotWorker:
             if long_task is not None:
                 pass
             elif event.message_type == "image":
-                if not self._has_external_llm_consent(participant):
+                if not await self._has_external_llm_consent(participant):
                     await self._deliver_consent_prompt(event)
                     return
                 opened_turn = await self.multimodal_turns.open_image(
@@ -892,7 +903,7 @@ class BotWorker:
                         self._active_multimodal_tasks.pop(multimodal_key, None)
 
                 long_task.add_done_callback(clear_multimodal)
-            elif not self._has_external_llm_consent(participant):
+            elif not await self._has_external_llm_consent(participant):
                 await self._deliver_consent_prompt(event)
                 return
 
@@ -2361,6 +2372,12 @@ class BotWorker:
             metrics["agent_result_ms"] = round(
                 (time.monotonic() - agent_started) * 1000, 1
             )
+            if isinstance(response, RuntimeResponse) and response.safety_locked:
+                # Safety-handled content is durable but protected: admin and
+                # researcher projections must never show the original text.
+                await asyncio.to_thread(
+                    self.events.mark_content_protected, event.event_id
+                )
             await close_progress_before_final()
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
@@ -2592,17 +2609,20 @@ class BotWorker:
         )
         return True
 
-    def _has_external_llm_consent(self, participant) -> bool:
+    async def _has_external_llm_consent(self, participant) -> bool:
         """Single external-LLM gate read; the service is the only authority.
 
-        Production always wires the participant-owned consent service. The
-        legacy researcher/CLI flag is a transition default for minimal
-        constructions only and never grants beyond that field.
+        The service reads participant_consents only - the legacy
+        researcher/CLI flag never authorizes external LLM processing. When no
+        service is available the gate fails closed. The read runs off the
+        event loop like every other DB access.
         """
 
-        if self.consent_service is not None:
-            return self.consent_service.is_active(participant.id)
-        return participant.external_llm_consent_at is not None
+        if self.consent_service is None:
+            return False
+        return await asyncio.to_thread(
+            self.consent_service.is_active, participant.id
+        )
 
     async def _deliver_consent_prompt(self, event: BotEvent) -> None:
         """Fixed user-consent prompt; never mentions researcher approval."""

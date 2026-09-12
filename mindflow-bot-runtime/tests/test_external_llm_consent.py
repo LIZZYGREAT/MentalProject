@@ -14,6 +14,7 @@ from app.services.consent_service import (
     ConsentService,
     ExternalLLMConsentRequired,
 )
+from helpers import seed_legacy_external_llm_consent
 from helpers import memory_database, participant
 
 
@@ -104,7 +105,7 @@ def test_current_record_is_the_latest_consent_not_the_first():
     current = repository.get_current(participant_id, EXTERNAL_LLM_CONSENT_TYPE)
     assert current["id"] == second["id"]
     assert current["id"] != first["id"]
-    # The revoked row stays as append-only history.
+    # Prior lifecycle rows stay queryable (history-preserving records).
     history = current
     assert history["status"] == "active"
 
@@ -127,7 +128,7 @@ def test_legacy_flag_alone_never_activates_user_consent():
     service, database = _service()
     repository = ParticipantRepository(database)
     participant = repository.create("P-LEGACY")
-    repository.set_external_llm_consent(participant.id, allowed=True)
+    seed_legacy_external_llm_consent(database, participant.id)
 
     assert service.is_active(participant.id) is False
     with pytest.raises(ExternalLLMConsentRequired):
@@ -147,11 +148,21 @@ def _card_service(database):
     )
 
 
-def _consent_action(service, database, participant_id, action_name):
+def _consent_action(
+    service,
+    database,
+    participant_id,
+    action_name,
+    *,
+    consent_version=EXTERNAL_LLM_CONSENT_VERSION,
+):
+    action = {"mindflow_action": action_name, "version": "1"}
+    if consent_version is not None:
+        action["consent_version"] = consent_version
     return service.handle(
         participant_id,
         message_id="om-consent",
-        action_value={"mindflow_action": action_name, "version": "1"},
+        action_value=action,
         form_value={},
     )
 
@@ -236,7 +247,12 @@ def test_consent_status_and_details_are_navigation_only_and_participant_bound():
         for element in details["card"]["body"]["elements"]
         if element.get("tag") == "button"
     ]
-    assert all(set(value) == {"mindflow_action", "version"} for value in values)
+    for value in values:
+        if value["mindflow_action"] == "external_llm_consent_accept":
+            assert set(value) == {"mindflow_action", "version", "consent_version"}
+            assert value["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
+        else:
+            assert set(value) == {"mindflow_action", "version"}
 
 
 def test_consent_callback_ignores_forged_participant_identity():
@@ -251,6 +267,7 @@ def test_consent_callback_ignores_forged_participant_identity():
         action_value={
             "mindflow_action": "external_llm_consent_accept",
             "version": "1",
+            "consent_version": EXTERNAL_LLM_CONSENT_VERSION,
             "participant_id": str(forged),
         },
         form_value={},
@@ -411,7 +428,11 @@ def test_image_without_user_consent_gets_consent_card_and_zero_vision_calls():
         for element in sender.cards[-1][1]["body"]["elements"]
         if element.get("tag") == "button"
     ]
-    assert all(set(value) == {"mindflow_action", "version"} for value in actions)
+    assert all(
+        "consent_version" in value
+        for value in actions
+        if value["mindflow_action"] == "external_llm_consent_accept"
+    )
 
 
 def test_legacy_flag_without_user_consent_still_requires_consent():
@@ -422,9 +443,7 @@ def test_legacy_flag_without_user_consent_still_requires_consent():
     )
     sender = worker.sender
     # Researcher/CLI-set legacy flag must not authorize external LLM use.
-    ParticipantRepository(database).set_external_llm_consent(
-        person.id, allowed=True
-    )
+    seed_legacy_external_llm_consent(database, person.id)
 
     async def scenario():
         assert gateway.accept_payload(
@@ -472,7 +491,7 @@ def test_text_turn_opens_after_user_grants_consent_and_closes_after_revoke():
     assert "外部 AI 处理" in sender.cards[-1][1]["body"]["elements"][0]["content"]
 
 
-def test_unwired_worker_falls_back_to_legacy_transition_gate():
+def test_unwired_worker_fails_closed_even_when_legacy_flag_is_set():
     database = memory_database()
     vision = BlockedVision()
     gateway, worker, queue, person, identity, code, vision = _gate_worker(
@@ -480,10 +499,7 @@ def test_unwired_worker_falls_back_to_legacy_transition_gate():
     )
     worker.consent_service = None
     sender = worker.sender
-    # The helper-granted legacy flag opens the transition gate.
-    ParticipantRepository(database).set_external_llm_consent(
-        person.id, allowed=True
-    )
+    seed_legacy_external_llm_consent(database, person.id)
 
     async def scenario():
         assert gateway.accept_payload(
@@ -494,8 +510,9 @@ def test_unwired_worker_falls_back_to_legacy_transition_gate():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert worker.runtime.turns == 1
-    assert person.id
+    # No consent service means fail closed, even with the legacy flag set.
+    assert worker.runtime.turns == 0
+    assert "外部 AI 处理" in sender.cards[-1][1]["body"]["elements"][0]["content"]
 
 
 def test_consent_copy_matches_resend_semantics():
@@ -506,3 +523,189 @@ def test_consent_copy_matches_resend_semantics():
     text = repr(external_llm_consent_card())
     assert "同意并开启" in text
     assert "同意并继续" not in text
+
+
+def test_stale_disclosure_accept_never_grants_newer_consent():
+    database = memory_database()
+    service = _card_service(database)
+    participant_id = uuid.uuid4()
+
+    result = _consent_action(
+        service,
+        database,
+        participant_id,
+        "external_llm_consent_accept",
+        consent_version="1",
+    )
+
+    assert result["ok"] is True
+    assert result["navigation_only"] is True
+    assert "说明已经更新" in result["reply_text"]
+    # Zero writes: the current disclosure card is returned instead.
+    content = result["card"]["body"]["elements"][0]["content"]
+    assert "开启外部 AI 处理" in content
+    assert ConsentService(ParticipantConsentRepository(database)).is_active(
+        participant_id
+    ) is False
+
+
+def test_current_version_accept_is_idempotent_without_duplicate_rows():
+    database = memory_database()
+    service = _card_service(database)
+    participant_id = uuid.uuid4()
+
+    first = _consent_action(service, database, participant_id, "external_llm_consent_accept")
+    second = _consent_action(service, database, participant_id, "external_llm_consent_accept")
+
+    assert first["ok"] is True and second["ok"] is True
+    with database.session() as session:
+        from sqlalchemy import select
+
+        from app.models import ParticipantConsent
+
+        rows = list(
+            session.execute(
+                select(ParticipantConsent).where(
+                    ParticipantConsent.participant_id == participant_id
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].status == "active"
+    assert rows[0].consent_version == EXTERNAL_LLM_CONSENT_VERSION
+
+
+def test_revoke_on_stale_disclosure_card_still_takes_effect():
+    database = memory_database()
+    service = _card_service(database)
+    participant_id = uuid.uuid4()
+    service.consent_service.grant_external_llm_consent(participant_id)
+
+    result = service.handle(
+        participant_id,
+        message_id="om-consent",
+        # An old card carries the previous disclosure version; revoke must
+        # still work because revocation never depends on the disclosure.
+        action_value={
+            "mindflow_action": "external_llm_consent_revoke",
+            "version": "1",
+            "consent_version": "1",
+        },
+        form_value={},
+    )
+
+    assert result["ok"] is True
+    assert ConsentService(ParticipantConsentRepository(database)).is_active(
+        participant_id
+    ) is False
+
+
+def test_consent_card_buttons_carry_current_disclosure_version():
+    from app.integrations.feishu.cards import (
+        external_llm_consent_card,
+        external_llm_consent_details_card,
+    )
+
+    for card in (external_llm_consent_card(), external_llm_consent_details_card()):
+        accepts = [
+            element["behaviors"][0]["value"]
+            for element in card["body"]["elements"]
+            if element.get("tag") == "button"
+            and element["behaviors"][0]["value"]["mindflow_action"]
+            == "external_llm_consent_accept"
+        ]
+        assert len(accepts) == 1
+        assert accepts[0]["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
+        assert accepts[0]["version"] == "1"
+
+
+def test_forecast_coordinator_rejects_legacy_flag_only_participant():
+    import asyncio as _asyncio
+    from datetime import date
+    from types import SimpleNamespace
+
+    from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+    from app.services.forecast_coordinator import ForecastCoordinator
+    from app.repositories import (
+        CalendarSnapshotRepository,
+        EventSemanticCacheRepository,
+        ForecastSnapshotRepository,
+        ObservationRepository,
+        ProfileRepository,
+    )
+    from helpers import warning_repository
+
+    database = memory_database()
+    repository = ParticipantRepository(database)
+    person = repository.create("P-COORD-FAILCLOSED")
+    seed_legacy_external_llm_consent(database, person.id)
+
+    class Calendar:
+        async def get_events(self, *_args):
+            return [{
+                "id": "evt-1",
+                "summary": "组会汇报",
+                "description": "讨论压力建模进展",
+                "start_time": "2030-01-15T09:00:00+08:00",
+                "end_time": "2030-01-15T10:00:00+08:00",
+            }]
+
+    class Prediction:
+        model = SimpleNamespace(MODEL_VERSION="classification-test-v1")
+
+        def calculate(self, **_kwargs):
+            return {"trajectory": [{"time": "09:00", "stress_0_10": 4.0}], "alerts": []}
+
+    semantics = EventSemanticPreprocessor(
+        EventSemanticCacheRepository(database), client=None, model="semantic-test",
+    )
+    coordinator = ForecastCoordinator(
+        participants=repository,
+        profiles=ProfileRepository(database),
+        observations=ObservationRepository(database),
+        calendar=Calendar(),
+        calendar_snapshots=CalendarSnapshotRepository(database),
+        semantics=semantics,
+        prediction=Prediction(),
+        forecasts=ForecastSnapshotRepository(database),
+        warnings=warning_repository(database),
+        timezone_name="Asia/Shanghai",
+    )
+
+    target = date(2030, 1, 15)
+    result = _asyncio.run(coordinator.ensure_forecast(person.id, target, "gate-test"))
+    assert result["semantic_status"] in {"missing", "degraded", "partial", "rules_only"}
+    # Without consent the external semantic classification never runs.
+    assert result["semantic_status"] != "current"
+
+
+def test_admin_read_model_reports_real_user_consent_not_legacy_flag():
+    from app.admin_web.repositories import AdminRepository
+
+    database = memory_database()
+    repository = ParticipantRepository(database)
+    person = repository.create("P-ADMIN-CONSENT")
+    admin = AdminRepository(database)
+
+    # No consent yet, legacy flag set: detail must not claim user consent.
+    seed_legacy_external_llm_consent(database, person.id)
+    detail = admin.participant("P-ADMIN-CONSENT")
+    assert detail["external_llm_user_consent"]["active"] is False
+    assert detail["legacy_external_llm_consent_at"] is not None
+    assert "external_llm_consent" not in detail
+
+    service = ConsentService(ParticipantConsentRepository(database))
+    service.grant_external_llm_consent(person.id)
+    detail = admin.participant("P-ADMIN-CONSENT")
+    consent = detail["external_llm_user_consent"]
+    assert consent["active"] is True
+    assert consent["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
+    assert consent["consented_at"] is not None
+
+    service.revoke_external_llm_consent(person.id)
+    detail = admin.participant("P-ADMIN-CONSENT")
+    consent = detail["external_llm_user_consent"]
+    assert consent["active"] is False
+    assert consent["revoked_at"] is not None
+    # The legacy flag is never interpreted as user consent.
+    assert detail["legacy_external_llm_consent_at"] is not None

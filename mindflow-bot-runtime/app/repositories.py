@@ -249,17 +249,6 @@ class ParticipantRepository:
                 row.id, row.participant_code, row.status, row.external_llm_consent_at
             )
 
-    def set_external_llm_consent(
-        self, participant_id: uuid.UUID, *, allowed: bool
-    ) -> ParticipantView:
-        with self.database.session() as session:
-            row = session.get(Participant, participant_id, with_for_update=True)
-            if row is None:
-                raise ValueError("participant not found")
-            row.external_llm_consent_at = utc_now() if allowed else None
-            return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
-            )
 
     def active_ids(self) -> list[uuid.UUID]:
         with self.database.session() as session:
@@ -4322,6 +4311,15 @@ class BotEventRepository:
             if status not in {"received", "processing", "reply_pending"}:
                 row.image_key = None
             row.processed_at = utc_now()
+
+    def mark_content_protected(self, event_id: str) -> None:
+        """Mark Safety-handled content so admin projections redact it."""
+
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.content_privacy_class = "protected"
 
     def save_telemetry(self, event_id: str, metrics: dict[str, Any]) -> None:
         """Persist non-secret delivery timings in an independent transaction."""

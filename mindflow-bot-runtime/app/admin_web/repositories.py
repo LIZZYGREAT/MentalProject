@@ -13,6 +13,7 @@ from app.models import (
     AgentRun,
     AgentToolCall,
     BotEvent,
+    ParticipantConsent,
     CalendarMutationReconciliation,
     CalendarSnapshot,
     CareInterventionEvent,
@@ -272,7 +273,12 @@ class AdminRepository:
             legacy_compatibility["legacy_profile"] = profile_payload
         result.update(
             {
-                "external_llm_consent": bool(row.external_llm_consent_at),
+                "external_llm_user_consent": (
+                    self._consent_view(session, row.id)
+                ),
+                "legacy_external_llm_consent_at": _iso(
+                    row.external_llm_consent_at
+                ),
                 "profile": _redact(dict(profile.profile_json)) if profile else None,
                 "learned_profile": (
                     {
@@ -348,6 +354,44 @@ class AdminRepository:
         )
         return result
 
+    @staticmethod
+    def _consent_view(session: Any, participant_id: uuid.UUID) -> dict[str, Any]:
+        """Authoritative participant-owned external LLM consent state.
+
+        Read-only: the admin surface has no grant/revoke/approve entry, and
+        the legacy researcher/CLI flag is exposed separately for audit only.
+        """
+
+        from app.services.consent_service import EXTERNAL_LLM_CONSENT_TYPE, EXTERNAL_LLM_CONSENT_VERSION
+
+        current = session.execute(
+            select(ParticipantConsent)
+            .where(
+                ParticipantConsent.participant_id == participant_id,
+                ParticipantConsent.consent_type == EXTERNAL_LLM_CONSENT_TYPE,
+            )
+            .order_by(
+                desc(ParticipantConsent.consented_at),
+                desc(ParticipantConsent.created_at),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        active = bool(
+            current
+            and current.status == "active"
+            and current.consent_version == EXTERNAL_LLM_CONSENT_VERSION
+        )
+        return {
+            "active": active,
+            "consent_version": (
+                current.consent_version
+                if current is not None
+                else EXTERNAL_LLM_CONSENT_VERSION
+            ),
+            "consented_at": _iso(current.consented_at) if current else None,
+            "revoked_at": _iso(current.revoked_at) if current else None,
+        }
+
     def messages(
         self,
         participant_id: uuid.UUID,
@@ -415,16 +459,19 @@ class AdminRepository:
 
     @staticmethod
     def _message_view(row: BotEvent) -> dict[str, Any]:
+        protected = row.content_privacy_class == "protected"
         return {
             "event_id": row.event_id,
             "message_id": row.message_id,
             "received_at": _iso(row.received_at),
             "processed_at": _iso(row.processed_at),
-            "text": row.text,
+            "content_privacy_class": row.content_privacy_class,
+            "content_redacted": protected,
+            "text": "[内容受隐私保护]" if protected else row.text,
             "status": row.status,
             "attempts": row.attempts,
             "error_code": row.error_code,
-            "reply_text": row.reply_text,
+            "reply_text": "[内容受隐私保护]" if protected else row.reply_text,
             "segment_count": len(row.reply_segments_json or []),
             "reply_message_ids": list(row.reply_message_ids_json or []),
             "telemetry": _redact(dict(row.telemetry_json or {})),

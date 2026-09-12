@@ -99,3 +99,150 @@ def test_safety_locked_turn_leaves_only_conversation_rows_behind():
     with database.session() as session:
         profiles = list(session.execute(select(ParticipantProfile)).scalars())
     assert profiles == []
+
+
+def test_safety_hit_marks_bot_event_protected_and_admin_view_redacts():
+    from datetime import datetime, timezone
+
+    from app.admin_web.repositories import AdminRepository
+    from app.repositories import BotEventRepository
+
+    database = memory_database()
+    person = participant(database, "P-SAFETY-REDACT")
+    events = BotEventRepository(database)
+    events.accept(
+        "evt-risk",
+        "om-risk",
+        person.id,
+        app_id="cli",
+        open_id="ou",
+        chat_id="oc",
+        chat_type="p2p",
+        message_type="text",
+        text="我不想活了",
+        create_time=datetime.now(timezone.utc),
+    )
+    events.accept(
+        "evt-normal",
+        "om-normal",
+        person.id,
+        app_id="cli",
+        open_id="ou",
+        chat_id="oc",
+        chat_type="p2p",
+        message_type="text",
+        text="帮我看看今天的安排",
+        create_time=datetime.now(timezone.utc),
+    )
+
+    events.mark_content_protected("evt-risk")
+
+    admin = AdminRepository(database)
+    views = {item["event_id"]: item for item in admin.messages(person.id)}
+    protected = views["evt-risk"]
+    assert protected["content_redacted"] is True
+    assert protected["content_privacy_class"] == "protected"
+    assert "我不想活了" not in protected["text"]
+    assert protected["text"] == "[内容受隐私保护]"
+    assert protected["reply_text"] == "[内容受隐私保护]"
+    normal = views["evt-normal"]
+    assert normal["content_redacted"] is False
+    assert normal["text"] == "帮我看看今天的安排"
+
+    detail = admin.message("evt-risk")
+    assert detail["content_redacted"] is True
+    assert "我不想活了" not in str(detail)
+
+
+def test_worker_safety_locked_turn_persists_protected_privacy_class():
+    import asyncio as _asyncio
+    import json as _json
+
+    from app.presentation.contracts import RuntimeResponse
+    from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
+    from app.agent.skill_loader import SkillLoader
+    from app.identity.service import IdentityService
+    from app.integrations.feishu.gateway import FeishuGateway
+    from app.worker import BotWorker
+    from helpers import skill_path
+    from sqlalchemy import select
+
+    from app.models import BotEvent
+
+    database = memory_database()
+    person = participant(database, "P-SAFETY-WORKER")
+    identity = IdentityService(database, BindingRepository(database))
+    events = BotEventRepository(database)
+    queue = _asyncio.Queue(maxsize=8)
+    gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
+    sender_messages = []
+
+    class Sender:
+        def send_text(self, chat_id, text):
+            sender_messages.append((chat_id, text))
+            return f"out-{len(sender_messages)}"
+
+    class SafetyRuntime:
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            return RuntimeResponse(
+                text="你已经很重要。此刻如有紧急情况，请立即拨打当地紧急电话或前往最近医院急诊。",
+                safety_locked=True,
+                response_kind="fixed",
+            )
+
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        SafetyRuntime(),
+        Sender(),
+        model="fake",
+        consent_service=__import__(
+            "app.services.consent_service", fromlist=["ConsentService"]
+        ).ConsentService(
+            __import__(
+                "app.repositories_consent", fromlist=["ParticipantConsentRepository"]
+            ).ParticipantConsentRepository(database)
+        ),
+    )
+
+    def payload(event_id, message_id, text):
+        return {
+            "header": {"event_id": event_id},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou-sw"}},
+                "message": {
+                    "message_id": message_id,
+                    "chat_id": "oc-sw",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": _json.dumps({"text": text}),
+                },
+            },
+        }
+
+    code, _ = identity.create_invite(person.id)
+
+    async def scenario():
+        assert gateway.accept_payload(
+            payload("sw-bind", "m-bind", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(
+            payload("sw-risk", "m-sw", "我不想活了")
+        )
+        await worker.process(await queue.get())
+
+    _asyncio.run(scenario())
+    with database.session() as session:
+        row = session.execute(
+            select(BotEvent).where(BotEvent.event_id == "sw-risk")
+        ).scalar_one()
+    assert row.content_privacy_class == "protected"
+    from app.admin_web.repositories import AdminRepository
+
+    view = AdminRepository(database).message("sw-risk")
+    assert view["content_redacted"] is True
+    assert "我不想活了" not in view["text"]
