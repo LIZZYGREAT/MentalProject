@@ -227,7 +227,20 @@ def feature_detail_card(
     lines.append("")
     lines.append("需要知道的")
     lines.extend(f"- {limit}" for limit in spec["limits"])
-    elements = [_feature_button("feature_back", OVERVIEW_FEATURE_KEY, "返回全部功能")]
+    elements: list[dict[str, Any]] = []
+    if key == "data_privacy":
+        # Participant-bound settings entry; renders the per-participant
+        # external AI processing status card through the fixed backend flow.
+        elements.append({
+            "tag": "button",
+            "type": "primary",
+            "text": {"tag": "plain_text", "content": "外部 AI 处理设置"},
+            "behaviors": [{"type": "callback", "value": {
+                "mindflow_action": "external_llm_consent_status_open",
+                "version": "1",
+            }}],
+        })
+    elements.append(_feature_button("feature_back", OVERVIEW_FEATURE_KEY, "返回全部功能"))
     return _feature_card(f"功能 · {spec['title']}", "\n".join(lines), elements)
 
 

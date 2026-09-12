@@ -33,6 +33,7 @@ from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
+from app.repositories_consent import ParticipantConsentRepository
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
@@ -47,6 +48,7 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from app.services.consent_service import ConsentService
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
@@ -116,6 +118,7 @@ def build_business_services(
     profiles = ProfileRepository(database)
     observations = ObservationRepository(database)
     conversations = ConversationRepository(database)
+    consent_service = ConsentService(ParticipantConsentRepository(database))
     encryption = TokenEncryptionService(settings.token_encryption_key)
     token_repository = TokenRepository(
         database, encryption, oauth_app_id=settings.feishu_calendar_app_id
@@ -318,6 +321,7 @@ def build_business_services(
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
         },
+        consent_service=consent_service,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,

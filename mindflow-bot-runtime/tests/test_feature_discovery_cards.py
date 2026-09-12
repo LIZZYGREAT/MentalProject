@@ -80,11 +80,13 @@ def test_every_feature_spec_renders_an_overview_and_detail_card():
         detail = feature_detail_card(key)
         assert detail is not None
         back = card_action_values(detail)
-        assert back == [{
+        assert back[-1] == {
             "mindflow_action": "feature_back",
             "version": "1",
             "feature_key": "overview",
-        }]
+        }
+        expected_actions = 2 if key == "data_privacy" else 1
+        assert len(back) == expected_actions
 
 
 def test_disabled_capability_hides_the_feature_everywhere():

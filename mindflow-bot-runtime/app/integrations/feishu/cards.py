@@ -1311,3 +1311,104 @@ def today_calendar_card(
             ]
         },
     }
+
+
+_CONSENT_CARD_VERSION = "1"
+
+
+def _consent_button(
+    action_name: str, text: str, *, primary: bool = False
+) -> dict[str, Any]:
+    """Consent callback values carry only the action and version.
+
+    No participant ID, image key, or open ID: the backend binds the action to
+    the clicking participant through the authenticated card callback.
+    """
+
+    return {
+        "tag": "button",
+        "type": "primary" if primary else "default",
+        "text": {"tag": "plain_text", "content": text},
+        "behaviors": [{"type": "callback", "value": {
+            "mindflow_action": action_name,
+            "version": _CONSENT_CARD_VERSION,
+        }}],
+    }
+
+
+def _consent_card_shell(
+    title: str, content: str, elements: list[dict[str, Any]]
+) -> dict[str, Any]:
+    elements.insert(0, {"tag": "markdown", "content": content})
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def external_llm_consent_card() -> dict[str, Any]:
+    """Fixed user-consent prompt; one consent covers conversation and images."""
+
+    content = (
+        "**开启外部 AI 处理**\n\n"
+        "为了回复你的消息、识别你主动发送的图片，相关内容会发送给外部 AI 模型处理。\n\n"
+        "MindFlow 不会把你的账号标识作为提示内容发送给模型。\n\n"
+        "你可以随时在“数据与隐私”中关闭这项能力。"
+    )
+    elements = [
+        _consent_button("external_llm_consent_accept", "同意并开启", primary=True),
+        _consent_button("external_llm_consent_decline", "暂不使用"),
+        _consent_button("external_llm_consent_details_open", "了解详情"),
+    ]
+    return _consent_card_shell("外部 AI 处理", content, elements)
+
+
+def external_llm_consent_details_card() -> dict[str, Any]:
+    content = (
+        "**外部 AI 处理的数据范围**\n\n"
+        "- 会发送：你主动发送的图片内容，以及为完成识别和回复所需的必要文字。\n"
+        "- 不会发送：你的飞书身份、账号标识或绑定码。\n"
+        "- 用途：仅用于完成当次的识别与回复。\n"
+        "- 你可以随时在“数据与隐私”中关闭这项能力；关闭不影响已保存的记录、"
+        "本地日历和压力功能。\n"
+        "- 数据的使用、保存与研究用途，以项目正式说明与知情同意内容为准。"
+    )
+    elements = [
+        _consent_button("external_llm_consent_accept", "同意并开启", primary=True),
+        _consent_button("external_llm_consent_prompt_open", "返回"),
+    ]
+    return _consent_card_shell("外部 AI 处理 · 数据范围", content, elements)
+
+
+def external_llm_consent_status_card(status: dict[str, Any]) -> dict[str, Any]:
+    """Per-participant consent state; buttons follow the current state."""
+
+    active = bool(status.get("active"))
+    if active:
+        state_line = "状态：已开启"
+        actions = [
+            _consent_button("external_llm_consent_revoke", "关闭外部 AI 处理"),
+        ]
+    else:
+        state_line = "状态：已关闭"
+        actions = [
+            _consent_button("external_llm_consent_accept", "重新开启", primary=True),
+        ]
+    version = str(status.get("consent_version") or "")
+    if version:
+        state_line += f"（同意版本 v{version}）"
+    content = (
+        "**外部 AI 处理**\n\n"
+        f"{state_line}\n\n"
+        "关闭后，对话和图片不再交给外部 AI 模型处理；"
+        "已保存的记录、本地日历和压力功能不受影响。"
+    )
+    elements = actions + [
+        _consent_button("external_llm_consent_details_open", "了解数据范围"),
+    ]
+    return _consent_card_shell("数据与隐私 · 外部 AI 处理", content, elements)

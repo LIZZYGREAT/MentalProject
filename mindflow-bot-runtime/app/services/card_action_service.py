@@ -23,8 +23,12 @@ from app.integrations.feishu.cards import (
     course_schedule_preview_card,
     course_schedule_result_card,
     daily_checkin_card,
+    external_llm_consent_card,
+    external_llm_consent_details_card,
+    external_llm_consent_status_card,
     today_calendar_card,
 )
+from app.presentation.consent_texts import external_llm_consent_declined_text
 from app.presentation.feature_cards import (
     OVERVIEW_FEATURE_KEY,
     build_feature_card,
@@ -188,6 +192,7 @@ class CardActionService:
         calendar_delete_executor: Any = None,
         calendar_mutation_plan_executor: Any = None,
         feature_capabilities: Any = None,
+        consent_service: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -200,6 +205,7 @@ class CardActionService:
         self.calendar_delete_executor = calendar_delete_executor
         self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
         self.feature_keys = visible_feature_keys(feature_capabilities)
+        self.consent_service = consent_service
 
     @staticmethod
     def _fallback_event_id(
@@ -586,6 +592,66 @@ class CardActionService:
                 "reply_text": reply_text,
                 "card": card,
             }
+        if action_name.startswith("external_llm_consent_"):
+            # User-owned external LLM consent. The callback binds to the
+            # clicking participant only; grant/revoke are the fixed backend
+            # workflow and the consent record is the sole authority.
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.consent_service is None:
+                raise RuntimeError("consent service is unavailable")
+            if action_name == "external_llm_consent_accept":
+                self.consent_service.grant_external_llm_consent(participant_id)
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "reply_text": (
+                        "已开启外部 AI 处理。请重新发送图片，我会直接处理；"
+                        "对话也会正常回复。"
+                    ),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_decline":
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": external_llm_consent_declined_text(),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_revoke":
+                self.consent_service.revoke_external_llm_consent(participant_id)
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "reply_text": (
+                        "已关闭外部 AI 处理。已保存的记录、本地日历和压力功能不受影响。"
+                    ),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_status_open":
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "这是外部 AI 处理的当前状态。",
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_details_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "这是外部 AI 处理的数据范围。",
+                    "card": external_llm_consent_details_card(),
+                }
+            if action_name == "external_llm_consent_prompt_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "开启后即可使用图片识别和对话处理。",
+                    "card": external_llm_consent_card(),
+                }
+            return {"ok": False, "error": "unsupported_card_action"}
         if action_name == "request_checkin":
             return {
                 "ok": True,
