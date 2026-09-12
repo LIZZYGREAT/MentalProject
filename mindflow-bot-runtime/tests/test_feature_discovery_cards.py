@@ -8,6 +8,7 @@ from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
 from app.presentation.feature_cards import (
+    feature_overview_text,
     FEATURE_SPECS,
     build_feature_card,
     feature_detail_card,
@@ -17,7 +18,6 @@ from app.presentation.feature_cards import (
     visible_feature_keys,
 )
 from app.presentation.onboarding import welcome_first_screen_text
-from app.presentation.user_capabilities import help_text
 from app.repositories import (
     AgentRunRepository,
     BindingRepository,
@@ -275,7 +275,7 @@ def test_help_fast_path_falls_back_to_text_when_cards_are_unavailable():
 
     asyncio.run(scenario())
     assert sender.cards == []
-    assert ("oc", help_text()) in sender.sent
+    assert ("oc", feature_overview_text()) in sender.sent
 
 
 def test_bind_success_sends_the_progressive_welcome_card():
@@ -312,6 +312,114 @@ def test_bind_success_falls_back_to_the_durable_text_first_screen():
     asyncio.run(scenario())
     assert sender.cards == []
     assert sender.sent == [("oc", welcome_first_screen_text())]
+
+
+def test_overview_text_and_overview_card_share_the_same_visible_keys():
+    keys = visible_feature_keys({"daily_review_enabled": False})
+    text = feature_overview_text(keys)
+    card_content = feature_overview_card(keys)["body"]["elements"][0]["content"]
+    for key in keys:
+        title = FEATURE_SPECS[key]["title"]
+        assert title in text
+        assert title in card_content
+    hidden = FEATURE_SPECS["daily_review"]["title"]
+    assert hidden not in text
+    assert hidden not in card_content
+    assert "每日回顾" not in text
+
+
+def test_help_fallback_text_hides_disabled_features_when_cards_cannot_send():
+    database = memory_database()
+    person = participant(database, "P001")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    sender = FakeSender(fail_cards=True)
+    gateway, worker, queue = build_worker(database, identity, sender)
+    worker.feature_keys = visible_feature_keys({"daily_review_enabled": False})
+
+    async def scenario():
+        assert gateway.accept_payload(payload("b1", "m1", "ou", "oc", f"/bind {code}"))
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(payload("h1", "m2", "ou", "oc", "功能"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    fallbacks = [text for _chat_id, text in sender.sent]
+    assert any("状态记录" in text for text in fallbacks)
+    assert not any("每日回顾" in text for text in fallbacks)
+
+
+def test_feature_navigation_results_are_marked_navigation_only():
+    service = _card_service(memory_database())
+    result = service.handle(
+        uuid.uuid4(),
+        message_id="om",
+        action_value={
+            "mindflow_action": "feature_back",
+            "version": "1",
+            "feature_key": "overview",
+        },
+        form_value={},
+    )
+    assert result["ok"] is True
+    assert result["navigation_only"] is True
+
+
+def test_navigation_update_failure_uses_navigation_copy_not_commit_copy():
+    from types import SimpleNamespace
+
+    import app.main as app_main
+
+    def build(result):
+        class Actions:
+            def handle(self, _participant_id, **_kwargs):
+                return result
+
+        class Sender:
+            def __init__(self):
+                self.messages = []
+
+            def update_card(self, _message_id, _card):
+                raise RuntimeError("card patch failed")
+
+            def send_text(self, chat_id, text):
+                self.messages.append((chat_id, text))
+
+        sender = Sender()
+        handler = app_main._build_card_action_handler(
+            SimpleNamespace(resolve=lambda *_args: SimpleNamespace(id="p1")),
+            Actions(),
+            sender,
+        )
+        event = SimpleNamespace(
+            event_id="provider-event",
+            message_id="om-card",
+            app_id="cli",
+            open_id="ou-user",
+            chat_id="oc-chat",
+            action_tag="button",
+            action_value={"mindflow_action": "feature_back"},
+            form_value={},
+        )
+        return handler, sender, event
+
+    handler, sender, event = build({
+        "ok": True,
+        "navigation_only": True,
+        "reply_text": "x",
+        "card": {"schema": "2.0"},
+    })
+    result = handler(event)
+    assert result["card_update_ok"] is False
+    assert sender.messages == [
+        ("oc-chat", "功能卡暂时没能更新，重新发“功能”即可。")
+    ]
+
+    handler, sender, event = build({"ok": True, "reply_text": "已记录"})
+    handler(event)
+    assert sender.messages == [
+        ("oc-chat", "操作已记录，但卡片状态暂未更新，无需重复提交。")
+    ]
 
 
 def test_agent_can_only_queue_reviewed_feature_cards():

@@ -175,12 +175,14 @@ def _build_card_action_handler(
                 event.message_id,
             )
 
-    def notify_card_update_failure(event: Any) -> None:
+    def notify_card_update_failure(event: Any, *, navigation_only: bool = False) -> None:
+        message = (
+            "功能卡暂时没能更新，重新发“功能”即可。"
+            if navigation_only
+            else "操作已记录，但卡片状态暂未更新，无需重复提交。"
+        )
         try:
-            sender.send_text(
-                event.chat_id,
-                "操作已记录，但卡片状态暂未更新，无需重复提交。",
-            )
+            sender.send_text(event.chat_id, message)
         except Exception:
             logging.getLogger(__name__).exception(
                 "feishu_card_action_update_notice_failed "
@@ -243,7 +245,9 @@ def _build_card_action_handler(
                 error_class=type(exc).__name__,
                 participant_id=participant.id,
             )
-            notify_card_update_failure(event)
+            notify_card_update_failure(
+                event, navigation_only=bool(result.get("navigation_only"))
+            )
             return {**result, "card_update_ok": False}
         return {**result, "card_update_ok": True}
 

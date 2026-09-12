@@ -49,8 +49,8 @@ FEATURE_SPECS: dict[str, dict[str, Any]] = {
         "title": "日程与日历",
         "summary": "查看、添加、修改或删除你的飞书日历日程。",
         "what": (
-            "可以问今天、明天或某一周的安排，也可以让我添加、"
-            "修改或删除具体的日程；改动前都会先和你确认。"
+            "可以问今天、明天或某一周的安排，也可以让我添加、修改或删除具体的日程。"
+            "添加、修改或删除都需要你明确提出；删除、批量等需要确认的操作会按固定流程确认。"
         ),
         "how_to_say": (
             "明天有什么安排",
@@ -58,7 +58,6 @@ FEATURE_SPECS: dict[str, dict[str, Any]] = {
         ),
         "limits": (
             "第一次使用日历需要发 /calendar 完成一次授权。",
-            "删除日程需要你明确说明，并且会再次和你确认。",
         ),
         "capability_flag": None,
     },
@@ -109,16 +108,18 @@ FEATURE_SPECS: dict[str, dict[str, Any]] = {
     },
     "data_privacy": {
         "title": "数据与隐私",
-        "summary": "你的数据只用于这份服务，研究者只以匿名编号查看。",
+        "summary": "查看 MindFlow 如何使用和保护你的数据。",
         "what": (
-            "状态记录、日历内容和模型结果分开保存；"
-            "对话里不会出现你的编号、身份或原始图片。"
+            "MindFlow 会把状态记录、日历数据和模型结果按不同用途处理。"
+            "系统内部使用参与者编号关联记录，并限制工具和模型获得不必要的身份信息。"
         ),
         "how_to_say": (
             "我的数据是怎么保存的",
             "谁可以看到我的记录",
         ),
-        "limits": ("如需导出或删除数据，请联系研究者处理。",),
+        "limits": (
+            "具体的数据使用、保存、研究用途和删除方式，以项目正式说明与知情同意内容为准。",
+        ),
         "capability_flag": None,
     },
 }
@@ -189,6 +190,25 @@ def feature_overview_card(feature_keys: tuple[str, ...] | None = None) -> dict[s
     elements = [_feature_button("feature_open", key, FEATURE_SPECS[key]["title"])
                 for key in keys if key in FEATURE_SPECS]
     return _feature_card("MindFlow 功能一览", "\n".join(lines).rstrip(), elements)
+
+
+def feature_overview_text(feature_keys: tuple[str, ...] | None = None) -> str:
+    """Plain-text overview rendered from the same specs as the overview card.
+
+    Used when the interactive card cannot be delivered, so disabled features
+    stay hidden in every fallback surface.
+    """
+
+    keys = feature_keys or visible_feature_keys()
+    lines = ["目前可以用这些：", ""]
+    for key in keys:
+        spec = FEATURE_SPECS.get(key)
+        if spec is None:
+            continue
+        lines.append(f"• {spec['title']}：{spec['summary']}")
+    lines.append("")
+    lines.append("发“功能”可以随时再看一次；想了解某一项的用法，直接问我就行。")
+    return "\n".join(lines)
 
 
 def feature_detail_card(

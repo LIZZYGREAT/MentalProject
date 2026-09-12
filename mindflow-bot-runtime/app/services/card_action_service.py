@@ -578,7 +578,14 @@ class CardActionService:
                 if wanted == OVERVIEW_FEATURE_KEY
                 else "这一项的用法如下，随时可以直接对我说。"
             )
-            return {"ok": True, "reply_text": reply_text, "card": card}
+            # Navigation only: nothing is committed, so a failed in-place
+            # update must not be reported as a recorded operation.
+            return {
+                "ok": True,
+                "navigation_only": True,
+                "reply_text": reply_text,
+                "card": card,
+            }
         if action_name == "request_checkin":
             return {
                 "ok": True,

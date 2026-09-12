@@ -84,3 +84,42 @@ def test_preference_block_absent_without_preferences():
         timezone_name="Asia/Shanghai",
     )
     assert "<backend_interaction_preferences>" not in prompt
+
+
+def _skill_example(keyword: str) -> str:
+    """Return one style-example bullet block from the production SKILL.md."""
+
+    skill_path = (
+        Path(__file__).resolve().parents[2]
+        / "claude-runtime"
+        / "plugins"
+        / "mindflow-care"
+        / "skills"
+        / "mental-health-care"
+        / "SKILL.md"
+    )
+    lines = skill_path.read_text(encoding="utf-8").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("- ") and keyword in line:
+            start = index
+            break
+    assert start is not None, f"missing skill example containing: {keyword}"
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if not line.strip() or line.startswith("- ") or line.startswith("## "):
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+def test_reminder_complaint_is_not_treated_as_a_direct_preference_request():
+    complaint = _skill_example("最近提醒太多了")
+    assert "care_update_preferences" not in complaint
+    assert "要我帮你把提醒调少一点吗" in complaint
+    assert "not by itself a durable preference request" in complaint
+
+    explicit = _skill_example("帮我减少提醒")
+    assert "care_update_preferences" in explicit
+    assert "direct request" in explicit
+    assert "ok: true" in explicit

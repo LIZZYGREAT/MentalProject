@@ -59,6 +59,7 @@ from app.presentation.contracts import (
 from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.feature_cards import (
     feature_overview_card,
+    feature_overview_text,
     onboarding_welcome_card,
     visible_feature_keys,
 )
@@ -69,7 +70,6 @@ from app.presentation.onboarding import (
     unbound_welcome_text,
     welcome_first_screen_text,
 )
-from app.presentation.user_capabilities import help_text
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.services.presentation_service import (
@@ -762,7 +762,7 @@ class BotWorker:
                     event,
                     feature_overview_card(self.feature_keys),
                 ):
-                    await self._deliver(event, help_text())
+                    await self._deliver(event, feature_overview_text(self.feature_keys))
                 return
             if event.message_type == "text":
                 attached = await self.multimodal_turns.attach_text(
