@@ -48,10 +48,45 @@ class Participant(Base):
     participant_code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     student_no_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    # Legacy researcher/CLI-set flag kept for transition and audit only; it
+    # never authorizes external LLM processing (see participant_consents).
     external_llm_consent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantConsent(Base):
+    """Append-only, participant-owned consent records.
+
+    The current record is the latest row per (participant_id, consent_type);
+    only an active row whose consent_version matches the expected version
+    authorizes processing. Legacy researcher-set flags are never migrated
+    into this table: user consent must come from the user.
+    """
+
+    __tablename__ = "participant_consents"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id",
+            "consent_type",
+            "consent_version",
+            "consented_at",
+            name="uq_participant_consent_version_time",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    consent_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    consent_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    consented_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class ParticipantInvite(Base):
