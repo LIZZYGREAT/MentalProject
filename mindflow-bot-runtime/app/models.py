@@ -1938,6 +1938,31 @@ class MorningBriefSchedule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        Index("ix_reminder_due", "status", "next_fire_at"),
+        CheckConstraint("recurrence_type IN ('none', 'daily', 'weekly')", name="ck_reminder_recurrence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    message: Mapped[str] = mapped_column(String(500), nullable=False)
+    remind_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recurrence_type: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    weekday: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class DailyReviewResponse(Base):
     __tablename__ = "daily_review_responses"
     __table_args__ = (

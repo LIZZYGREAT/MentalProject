@@ -421,8 +421,9 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "calendar_create_events_plan",
         "calendar_update_event",
         "calendar_delete_event",
-        "calendar_delete_events_plan",
-    }
+            "calendar_delete_events_plan",
+            "morning_brief_show_settings",
+        }
     for spec in registry.specs:
         assert spec.parameters["type"] == "object"
         assert spec.parameters["additionalProperties"] is False
@@ -447,7 +448,8 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "care_get_pressure_curve": ("ui_effect", "none"),
         "care_simulate_schedule_change": ("compute", "none"),
         "care_get_checkin_card": ("ui_effect", "none"),
-        "help_show_feature_card": ("ui_effect", "none"),
+            "help_show_feature_card": ("ui_effect", "none"),
+            "morning_brief_show_settings": ("ui_effect", "none"),
         "calendar_connection_status": ("read", "none"),
         "calendar_list_calendars": ("read", "none"),
         "calendar_list_events": ("read", "none"),

@@ -323,6 +323,7 @@ async def run() -> None:
     from app.services.forecast_scheduler import ForecastScheduler
     from app.services.daily_review_scheduler import DailyReviewScheduler
     from app.services.morning_brief_scheduler import MorningBriefScheduler
+    from app.services.reminder_scheduler import ReminderScheduler
     from app.services.safety_service import SafetyService
     from app.presentation.presentation_agent import ProductionPresentationAgent
     from app.presentation.progress_presenter import ProgressPresenter
@@ -553,7 +554,13 @@ async def run() -> None:
         proactive_policy=business.proactive_notifications,
         calendar=business.calendar,
         sender=sender,
+        reminder_source=business.reminders,
         timezone_name=settings.timezone_name,
+    )
+    reminder_scheduler = ReminderScheduler(
+        reminders=business.reminders,
+        participants=ParticipantRepository(database), bindings=bindings,
+        proactive_policy=business.proactive_notifications, sender=sender,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.
@@ -579,9 +586,10 @@ async def run() -> None:
     forecast_tasks: asyncio.Task | None = None
     daily_review_tasks: asyncio.Task | None = None
     morning_brief_tasks: asyncio.Task | None = None
+    reminder_tasks: asyncio.Task | None = None
 
     async def start_scheduler_after_gateway_ready() -> None:
-        nonlocal forecast_tasks, daily_review_tasks, morning_brief_tasks
+        nonlocal forecast_tasks, daily_review_tasks, morning_brief_tasks, reminder_tasks
         _log_startup_phase("gateway_ready")
         forecast_tasks = asyncio.create_task(
             scheduler.run_forever(), name="forecast-scheduler"
@@ -595,10 +603,14 @@ async def run() -> None:
         morning_brief_tasks = asyncio.create_task(
             morning_brief_scheduler.run_forever(), name="morning-brief-scheduler"
         )
+        reminder_tasks = asyncio.create_task(
+            reminder_scheduler.run_forever(), name="reminder-scheduler"
+        )
         await scheduler.started.wait()
         if daily_review_tasks is not None:
             await daily_review_scheduler.started.wait()
         await morning_brief_scheduler.started.wait()
+        await reminder_scheduler.started.wait()
         _log_startup_phase("forecast_scheduler_ready")
 
     try:
@@ -619,16 +631,19 @@ async def run() -> None:
             await scheduler.close()
             await daily_review_scheduler.close()
             await morning_brief_scheduler.close()
+            await reminder_scheduler.close()
             if forecast_tasks is not None:
                 forecast_tasks.cancel()
             if daily_review_tasks is not None:
                 daily_review_tasks.cancel()
             if morning_brief_tasks is not None:
                 morning_brief_tasks.cancel()
+            if reminder_tasks is not None:
+                reminder_tasks.cancel()
             dispatcher.cancel()
             await asyncio.gather(
                 dispatcher,
-                *(task for task in (forecast_tasks, daily_review_tasks, morning_brief_tasks) if task is not None),
+                *(task for task in (forecast_tasks, daily_review_tasks, morning_brief_tasks, reminder_tasks) if task is not None),
                 return_exceptions=True,
             )
             try:

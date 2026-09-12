@@ -133,6 +133,19 @@ class ProactiveNotificationPolicy:
         except IntegrityError:
             return ProactiveDecision(False, "duplicate")
 
+    def user_requested_quiet_hours_warning(
+        self, participant_id: uuid.UUID, scheduled_at: datetime
+    ) -> bool:
+        """Inspect creation-time quiet hours without consuming a delivery slot."""
+
+        instant = _aware(scheduled_at)
+        with self.database.session() as session:
+            preference = session.get(ParticipantCarePreference, participant_id)
+            start = preference.quiet_hours_start if preference else None
+            end = preference.quiet_hours_end if preference else None
+            local_clock = instant.astimezone(self.timezone).time().replace(tzinfo=None)
+            return _in_quiet_hours(local_clock, start, end)
+
     def mark_sent(self, reservation_id: uuid.UUID, *, now: datetime | None = None) -> bool:
         changed_at = _aware(now or utc_now())
         with self.database.session() as session:

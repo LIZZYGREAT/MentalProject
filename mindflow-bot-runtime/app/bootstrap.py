@@ -30,6 +30,7 @@ from app.repositories_daily_review import (
     RetrospectiveCurveRepository,
 )
 from app.repositories_morning_brief import MorningBriefScheduleRepository
+from app.repositories_reminder import ReminderRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -72,6 +73,7 @@ from app.services.token_service import (
 )
 from app.tools.care import CareTools
 from app.tools.course_schedule import CourseScheduleTools
+from app.tools.reminder import ReminderTools
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -115,6 +117,7 @@ class BusinessServices:
     calendar_mutation_plan_runner: CalendarMutationPlanRunner
     proactive_notifications: ProactiveNotificationPolicy
     morning_brief_schedules: MorningBriefScheduleRepository
+    reminders: ReminderRepository
 
 
 def build_business_services(
@@ -185,6 +188,7 @@ def build_business_services(
         default_system_budget=warning_delivery_policy.max_daily_sends,
     )
     morning_brief_schedules = MorningBriefScheduleRepository(database)
+    reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -312,6 +316,9 @@ def build_business_services(
         },
     )
     care_tools.register(registry)
+    ReminderTools(
+        reminders, proactive_notifications, timezone_name=settings.timezone_name
+    ).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -381,4 +388,5 @@ def build_business_services(
         calendar_mutation_plan_runner=calendar_mutation_plan_runner,
         proactive_notifications=proactive_notifications,
         morning_brief_schedules=morning_brief_schedules,
+        reminders=reminders,
     )
