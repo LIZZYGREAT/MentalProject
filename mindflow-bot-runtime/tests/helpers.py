@@ -6,6 +6,11 @@ import uuid
 from app.db import Database, build_engine
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.repositories import ParticipantRepository
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import (
+    EXTERNAL_LLM_CONSENT_TYPE,
+    EXTERNAL_LLM_CONSENT_VERSION,
+)
 from app.models import CalendarSnapshot
 
 
@@ -16,9 +21,21 @@ def memory_database() -> Database:
 
 
 def participant(database: Database, code: str):
+    """Create a participant with external LLM processing already consented.
+
+    Grants the participant-owned consent record used by the production gate
+    and keeps the legacy flag set for transition fallback paths.
+    """
+
     repository = ParticipantRepository(database)
     created = repository.create(code)
-    return repository.set_external_llm_consent(created.id, allowed=True)
+    granted = repository.set_external_llm_consent(created.id, allowed=True)
+    ParticipantConsentRepository(database).grant(
+        created.id,
+        EXTERNAL_LLM_CONSENT_TYPE,
+        EXTERNAL_LLM_CONSENT_VERSION,
+    )
+    return granted
 
 
 def warning_repository(

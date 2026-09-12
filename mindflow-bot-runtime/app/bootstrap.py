@@ -106,6 +106,7 @@ class BusinessServices:
     course_schedule_import_runner: CourseScheduleImportRunner
     course_schedule_vision: CourseScheduleVisionService
     generic_image_vision: GenericImageVisionService
+    consent_service: ConsentService
     course_schedule_image_sessions: CourseScheduleImageSessionRepository
     course_schedule_tools: CourseScheduleTools
     calendar_mutation_plans: CalendarMutationPlanRepository
@@ -199,6 +200,7 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
+        consent_service=consent_service,
     )
     dependency_refresh = ForecastDependencyRefreshService(
         forecast_snapshots,
@@ -362,6 +364,7 @@ def build_business_services(
         course_schedule_vision=course_schedule_vision,
         generic_image_vision=generic_image_vision,
         course_schedule_image_sessions=course_schedule_image_sessions,
+        consent_service=consent_service,
         course_schedule_tools=course_schedule_tools,
         calendar_mutation_plans=calendar_mutation_plans,
         calendar_mutation_plan_runner=calendar_mutation_plan_runner,

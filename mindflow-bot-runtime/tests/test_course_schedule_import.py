@@ -36,6 +36,7 @@ from app.repositories_course_schedule import (
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
+from app.presentation.consent_texts import external_llm_consent_prompt_text
 from app.presentation.feature_cards import feature_overview_text
 from app.presentation.onboarding import welcome_first_screen_text
 from app.repositories import (
@@ -976,7 +977,7 @@ def test_bind_and_help_use_stable_copy_without_agent():
     assert sender.sent == [
         welcome_first_screen_text(),
         feature_overview_text(),
-        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
+        external_llm_consent_prompt_text(),
     ]
     assert runtime.calls == 0
     assert vision.calls == 0

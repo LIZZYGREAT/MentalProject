@@ -496,6 +496,7 @@ async def run() -> None:
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
         },
+        consent_service=business.consent_service,
     )
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image

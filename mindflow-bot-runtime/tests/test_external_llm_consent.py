@@ -1,10 +1,12 @@
 """Participant-owned external LLM consent records and service contracts."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import uuid
 
 import pytest
 
+from app.repositories import ParticipantRepository
 from app.repositories_consent import ParticipantConsentRepository
 from app.services.consent_service import (
     EXTERNAL_LLM_CONSENT_TYPE,
@@ -12,7 +14,7 @@ from app.services.consent_service import (
     ConsentService,
     ExternalLLMConsentRequired,
 )
-from helpers import memory_database
+from helpers import memory_database, participant
 
 
 def _service(database=None):
@@ -123,10 +125,8 @@ def test_grant_honours_explicit_time_for_deterministic_history():
 
 def test_legacy_flag_alone_never_activates_user_consent():
     service, database = _service()
-    from app.repositories import ParticipantRepository
-
-    participant = ParticipantRepository(database).create("P-LEGACY")
     repository = ParticipantRepository(database)
+    participant = repository.create("P-LEGACY")
     repository.set_external_llm_consent(participant.id, allowed=True)
 
     assert service.is_active(participant.id) is False
@@ -275,3 +275,224 @@ def test_data_privacy_detail_card_links_consent_settings():
         "mindflow_action": "external_llm_consent_status_open",
         "version": "1",
     } in actions
+
+
+def _gate_worker(database, sender, vision, *, consent_service=True):
+    """Bind a fresh participant and build a worker wired to the consent gate."""
+
+    import asyncio as _asyncio
+
+    from app.agent.skill_loader import SkillLoader
+    from app.identity.service import IdentityService
+    from app.integrations.feishu.gateway import FeishuGateway
+    from app.repositories import AgentRunRepository, BindingRepository, BotEventRepository
+    from app.services.consent_service import ConsentService
+    from app.worker import BotWorker
+    from helpers import skill_path
+
+    person = ParticipantRepository(database).create("P-GATE")
+    identity = IdentityService(database, BindingRepository(database))
+    code, _ = identity.create_invite(person.id)
+    events = BotEventRepository(database)
+    queue = _asyncio.Queue(maxsize=8)
+    gateway = FeishuGateway("cli_test", "secret", identity, events, queue)
+
+    class Runtime:
+        def __init__(self):
+            self.turns = 0
+
+        async def handle_message(self, ctx, turn_input, **_kwargs):
+            self.turns += 1
+            return "ok"
+
+    runtime = Runtime()
+    worker = BotWorker(
+        queue,
+        identity,
+        events,
+        AgentRunRepository(database),
+        SkillLoader(skill_path()),
+        runtime,
+        sender,
+        model="fake",
+        consent_service=(
+            ConsentService(ParticipantConsentRepository(database))
+            if consent_service
+            else None
+        ),
+    )
+    return gateway, worker, queue, person, identity, code, vision
+
+
+def _image_payload(event_id, message_id):
+    import json as _json
+
+    return {
+        "header": {"event_id": event_id},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou-gate"}},
+            "message": {
+                "message_id": message_id,
+                "chat_id": "oc-gate",
+                "chat_type": "p2p",
+                "message_type": "image",
+                "content": _json.dumps({"image_key": "img_v2_opaque"}),
+                "create_time": "1786200000000",
+            },
+        },
+    }
+
+
+def _text_payload(event_id, message_id, text):
+    import json as _json
+
+    return {
+        "header": {"event_id": event_id},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou-gate"}},
+            "message": {
+                "message_id": message_id,
+                "chat_id": "oc-gate",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": _json.dumps({"text": text}),
+            },
+        },
+    }
+
+
+class CardCapturingSender:
+    def __init__(self):
+        self.sent = []
+        self.cards = []
+
+    def send_text(self, chat_id, text):
+        self.sent.append((chat_id, text))
+        return f"out-{len(self.sent)}"
+
+    def send_card(self, chat_id, card, **_kwargs):
+        self.cards.append((chat_id, card))
+        return f"card-{len(self.cards)}"
+
+
+class BlockedVision:
+    def __init__(self):
+        self.calls = 0
+
+    async def parse(self, *_args, **_kwargs):
+        self.calls += 1
+        raise AssertionError("Vision must not run without consent")
+
+
+def test_image_without_user_consent_gets_consent_card_and_zero_vision_calls():
+    database = memory_database()
+    vision = BlockedVision()
+    gateway, worker, queue, _person, identity, code, vision = _gate_worker(
+        database, CardCapturingSender(), vision
+    )
+    sender = worker.sender
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _text_payload("bind", "m-bind", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_image_payload("img1", "m-img1"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert vision.calls == 0
+    # Bind welcome card first, then the fixed consent prompt.
+    assert len(sender.cards) == 2
+    content = sender.cards[-1][1]["body"]["elements"][0]["content"]
+    assert "外部 AI 处理" in content
+    actions = [
+        element["behaviors"][0]["value"]
+        for element in sender.cards[-1][1]["body"]["elements"]
+        if element.get("tag") == "button"
+    ]
+    assert all(set(value) == {"mindflow_action", "version"} for value in actions)
+
+
+def test_legacy_flag_without_user_consent_still_requires_consent():
+    database = memory_database()
+    vision = BlockedVision()
+    gateway, worker, queue, person, identity, code, vision = _gate_worker(
+        database, CardCapturingSender(), vision
+    )
+    sender = worker.sender
+    # Researcher/CLI-set legacy flag must not authorize external LLM use.
+    ParticipantRepository(database).set_external_llm_consent(
+        person.id, allowed=True
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _text_payload("bind", "m-bind", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_text_payload("t1", "m-t1", "你好"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert worker.runtime.turns == 0
+    assert len(sender.cards) == 2
+    assert "外部 AI 处理" in sender.cards[-1][1]["body"]["elements"][0]["content"]
+
+
+def test_text_turn_opens_after_user_grants_consent_and_closes_after_revoke():
+    database = memory_database()
+    vision = BlockedVision()
+    gateway, worker, queue, person, identity, code, vision = _gate_worker(
+        database, CardCapturingSender(), vision
+    )
+    sender = worker.sender
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _text_payload("bind", "m-bind", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_text_payload("t1", "m-t1", "你好"))
+        await worker.process(await queue.get())
+        assert worker.runtime.turns == 0
+
+        worker.consent_service.grant_external_llm_consent(person.id)
+        assert gateway.accept_payload(_text_payload("t2", "m-t2", "你好"))
+        await worker.process(await queue.get())
+        assert worker.runtime.turns == 1
+
+        worker.consent_service.revoke_external_llm_consent(person.id)
+        assert gateway.accept_payload(_text_payload("t3", "m-t3", "你好"))
+        await worker.process(await queue.get())
+        assert worker.runtime.turns == 1
+
+    asyncio.run(scenario())
+    assert len(sender.cards) == 3
+    assert "外部 AI 处理" in sender.cards[-1][1]["body"]["elements"][0]["content"]
+
+
+def test_unwired_worker_falls_back_to_legacy_transition_gate():
+    database = memory_database()
+    vision = BlockedVision()
+    gateway, worker, queue, person, identity, code, vision = _gate_worker(
+        database, CardCapturingSender(), vision, consent_service=False
+    )
+    worker.consent_service = None
+    sender = worker.sender
+    # The helper-granted legacy flag opens the transition gate.
+    ParticipantRepository(database).set_external_llm_consent(
+        person.id, allowed=True
+    )
+
+    async def scenario():
+        assert gateway.accept_payload(
+            _text_payload("bind", "m-bind", f"/bind {code}")
+        )
+        await worker.process(await queue.get())
+        assert gateway.accept_payload(_text_payload("t1", "m-t1", "你好"))
+        await worker.process(await queue.get())
+
+    asyncio.run(scenario())
+    assert worker.runtime.turns == 1
+    assert person.id

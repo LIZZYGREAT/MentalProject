@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
-from typing import Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 from app.agent.claude_runtime import (
     FALLBACK_INTERRUPTED,
@@ -30,7 +30,6 @@ from app.agent.skill_loader import SkillLoader
 from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
-from app.integrations.feishu.cards import course_schedule_preview_card
 from app.integrations.feishu.message_resources import (
     MessageResourceError,
     MessageResourceTooLarge,
@@ -56,6 +55,11 @@ from app.presentation.contracts import (
     ResponseSegment,
     RuntimeResponse,
 )
+from app.integrations.feishu.cards import (
+    course_schedule_preview_card,
+    external_llm_consent_card,
+)
+from app.presentation.consent_texts import external_llm_consent_prompt_text
 from app.presentation.progress_policy import should_force_silent_progress
 from app.presentation.feature_cards import (
     feature_overview_card,
@@ -348,6 +352,7 @@ class BotWorker:
         multimodal_recent_context_seconds: float = 600.0,
         course_default_semester_start_date: str = "",
         feature_capabilities: Mapping[str, bool] | None = None,
+        consent_service: Any = None,
     ):
         self.queue = queue
         self.identity = identity
@@ -355,6 +360,7 @@ class BotWorker:
         self.runs = runs
         self.skill_loader = skill_loader
         self.runtime = runtime
+        self.consent_service = consent_service
         self.sender = sender
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
@@ -819,11 +825,8 @@ class BotWorker:
                     )
                 )
                 if reuse_recent and recent is not None:
-                    if participant.external_llm_consent_at is None:
-                        await self._deliver(
-                            event,
-                            "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
-                        )
+                    if not self._has_external_llm_consent(participant):
+                        await self._deliver_consent_prompt(event)
                         return
                     task_generation = self._current_stop_generation(
                         participant.id
@@ -857,11 +860,8 @@ class BotWorker:
             if long_task is not None:
                 pass
             elif event.message_type == "image":
-                if participant.external_llm_consent_at is None:
-                    await self._deliver(
-                        event,
-                        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
-                    )
+                if not self._has_external_llm_consent(participant):
+                    await self._deliver_consent_prompt(event)
                     return
                 opened_turn = await self.multimodal_turns.open_image(
                     participant.id, event.chat_id, event
@@ -892,11 +892,8 @@ class BotWorker:
                         self._active_multimodal_tasks.pop(multimodal_key, None)
 
                 long_task.add_done_callback(clear_multimodal)
-            elif participant.external_llm_consent_at is None:
-                await self._deliver(
-                    event,
-                    "尚未记录将本次对话发送给外部模型的实验授权，请先联系研究者。",
-                )
+            elif not self._has_external_llm_consent(participant):
+                await self._deliver_consent_prompt(event)
                 return
 
             elif long_task is None:
@@ -2594,6 +2591,39 @@ class BotWorker:
             reply_message_id=message_id,
         )
         return True
+
+    def _has_external_llm_consent(self, participant) -> bool:
+        """Single external-LLM gate read; the service is the only authority.
+
+        Production always wires the participant-owned consent service. The
+        legacy researcher/CLI flag is a transition default for minimal
+        constructions only and never grants beyond that field.
+        """
+
+        if self.consent_service is not None:
+            return self.consent_service.is_active(participant.id)
+        return participant.external_llm_consent_at is not None
+
+    async def _deliver_consent_prompt(self, event: BotEvent) -> None:
+        """Fixed user-consent prompt; never mentions researcher approval."""
+
+        try:
+            message_id = await self._send_card(
+                event.chat_id,
+                external_llm_consent_card(),
+                message_uuid=self._stable_message_uuid(
+                    f"mindflow:card:{event.event_id}"
+                ),
+            )
+        except FeishuSendError:
+            await self._deliver(event, external_llm_consent_prompt_text())
+            return
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
 
     async def _deliver_welcome(self, event: BotEvent) -> bool:
         """Progressive first screen after binding.

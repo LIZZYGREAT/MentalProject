@@ -273,7 +273,7 @@ def test_same_participant_messages_are_processed_serially():
     assert [item[2] for item in runtime.seen] == ["first", "second"]
 
 
-def test_external_llm_is_blocked_until_research_consent_is_recorded():
+def test_external_llm_waits_for_participant_owned_consent():
     database = memory_database()
     p1 = ParticipantRepository(database).create("P001")
     identity = IdentityService(database, BindingRepository(database))
@@ -302,7 +302,11 @@ def test_external_llm_is_blocked_until_research_consent_is_recorded():
 
     asyncio.run(scenario())
     assert runtime.seen == []
-    assert "实验授权" in sender.sent[-1][1]
+    # The participant-owned consent prompt replaces the researcher-approval
+    # copy; the worker sender fakes have no send_card, so the text fallback
+    # is delivered instead of the interactive card.
+    assert "外部 AI 处理需要你的同意" in sender.sent[-1][1]
+    assert "联系研究者" not in sender.sent[-1][1]
 
 
 def test_stop_bypasses_running_turn_and_interrupts_runtime():

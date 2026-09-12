@@ -300,6 +300,7 @@ class ForecastCoordinator:
         retrospective_curves: RetrospectiveCurveRepository | None = None,
         care_preferences: ParticipantCarePreferenceRepository | None = None,
         care_interventions: Any | None = None,
+        consent_service: Any | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -322,9 +323,25 @@ class ForecastCoordinator:
         self.care_messages = CareMessageService(timezone_name)
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.consent_service = consent_service
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
         self.dependency_refresh: ForecastDependencyRefreshService | None = None
+
+    async def _has_external_llm_consent(self, participant_id) -> bool:
+        """External-LLM gate for calendar-content classification.
+
+        The participant-owned consent service is the only production
+        authority; the legacy researcher/CLI flag is a transition default
+        for constructions without the service and never grants beyond it.
+        """
+
+        if self.consent_service is not None:
+            return await asyncio.to_thread(
+                self.consent_service.is_active, participant_id
+            )
+        participant = await asyncio.to_thread(self.participants.get, participant_id)
+        return bool(participant and participant.external_llm_consent_at)
 
     def mark_dependency_dirty(
         self,
@@ -686,8 +703,7 @@ class ForecastCoordinator:
         calendar_snapshot, calendar_changed = await self._calendar_snapshot(
             participant_id, target, refresh_calendar
         )
-        participant = await asyncio.to_thread(self.participants.get, participant_id)
-        consent = bool(participant and participant.external_llm_consent_at)
+        consent = await self._has_external_llm_consent(participant_id)
         events = prepare_event_instances(calendar_snapshot["events"], target.isoformat())
         semantic_events, semantic_revision, semantic_status, misses = await asyncio.to_thread(
             self.semantics.prepare, participant_id, events, consent=consent
