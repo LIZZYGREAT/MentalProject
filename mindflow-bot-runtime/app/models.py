@@ -1963,6 +1963,33 @@ class Reminder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class CareFollowupCandidate(Base):
+    """Short-lived neutral follow-up intent; never stores participant wording."""
+
+    __tablename__ = "care_followup_candidates"
+    __table_args__ = (
+        Index("ix_care_followup_due", "status", "due_at"),
+        CheckConstraint(
+            "reason_category IN ('check_in', 'task_transition', 'recovery')",
+            name="ck_care_followup_reason_category",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    reason_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class DailyReviewResponse(Base):
     __tablename__ = "daily_review_responses"
     __table_args__ = (

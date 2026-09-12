@@ -31,6 +31,7 @@ from app.repositories_daily_review import (
 )
 from app.repositories_morning_brief import MorningBriefScheduleRepository
 from app.repositories_reminder import ReminderRepository
+from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -118,6 +119,7 @@ class BusinessServices:
     proactive_notifications: ProactiveNotificationPolicy
     morning_brief_schedules: MorningBriefScheduleRepository
     reminders: ReminderRepository
+    followup_candidates: CareFollowupCandidateRepository
 
 
 def build_business_services(
@@ -189,6 +191,7 @@ def build_business_services(
     )
     morning_brief_schedules = MorningBriefScheduleRepository(database)
     reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
+    followup_candidates = CareFollowupCandidateRepository(database)
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -389,4 +392,5 @@ def build_business_services(
         proactive_notifications=proactive_notifications,
         morning_brief_schedules=morning_brief_schedules,
         reminders=reminders,
+        followup_candidates=followup_candidates,
     )
