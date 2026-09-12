@@ -2,9 +2,9 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 19 -->
+<!-- BUSINESS_TOOL_COUNT: 20 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0052_bot_event_content_privacy -->
+<!-- ALEMBIC_HEAD: 0057_controlled_web_search -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -48,6 +48,7 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `care_simulate_schedule_change`
 - `care_get_checkin_card`
 - `help_show_feature_card`
+- `morning_brief_show_settings`
 - `calendar_connection_status`
 - `calendar_list_calendars`
 - `calendar_list_events`

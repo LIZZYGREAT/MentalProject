@@ -32,6 +32,7 @@ from app.repositories_daily_review import (
 from app.repositories_morning_brief import MorningBriefScheduleRepository
 from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
+from app.repositories_web_search import WebSearchRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -75,6 +76,12 @@ from app.services.token_service import (
 from app.tools.care import CareTools
 from app.tools.course_schedule import CourseScheduleTools
 from app.tools.reminder import ReminderTools
+from app.tools.web import WebTools
+from app.services.web_search_service import (
+    DisabledSearchProvider,
+    HttpJsonSearchProvider,
+    WebSearchService,
+)
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -120,6 +127,7 @@ class BusinessServices:
     morning_brief_schedules: MorningBriefScheduleRepository
     reminders: ReminderRepository
     followup_candidates: CareFollowupCandidateRepository
+    web_search: WebSearchService
 
 
 def build_business_services(
@@ -192,6 +200,16 @@ def build_business_services(
     morning_brief_schedules = MorningBriefScheduleRepository(database)
     reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
     followup_candidates = CareFollowupCandidateRepository(database)
+    search_provider = (
+        HttpJsonSearchProvider(
+            settings.web_search_api_url,
+            settings.web_search_api_key,
+            timeout_seconds=settings.web_search_timeout_seconds,
+        )
+        if settings.web_search_enabled
+        else DisabledSearchProvider()
+    )
+    web_search = WebSearchService(WebSearchRepository(database), search_provider)
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -322,6 +340,7 @@ def build_business_services(
     ReminderTools(
         reminders, proactive_notifications, timezone_name=settings.timezone_name
     ).register(registry)
+    WebTools(web_search).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -393,4 +412,5 @@ def build_business_services(
         morning_brief_schedules=morning_brief_schedules,
         reminders=reminders,
         followup_candidates=followup_candidates,
+        web_search=web_search,
     )
