@@ -278,6 +278,29 @@ class AdminAPI:
         )
         return JSONResponse(value) if value else _json_error("participant_not_found", 404)
 
+    async def memory_audit(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        return JSONResponse({
+            "items": await asyncio.to_thread(
+                self.repository.memory_audit, participant_id
+            ),
+            "read_only": True,
+        })
+
+    async def research_state_audit(self, request: Request) -> Response:
+        if await self._authorized(request) is None:
+            return _json_error("unauthorized", 401)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
+        return JSONResponse(await asyncio.to_thread(
+            self.repository.research_state_audit, participant_id
+        ))
+
     async def messages(self, request: Request) -> Response:
         participant_id, error = await self._participant(request)
         if error:
@@ -1192,6 +1215,8 @@ class AdminAPI:
             Route(f"{prefix}/dashboard", self.dashboard, methods=["GET"]),
             Route(f"{prefix}/participants", self.participants, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}", self.participant, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/memory-audit", self.memory_audit, methods=["GET"]),
+            Route(f"{prefix}/participants/{{participant_code}}/research-state-audit", self.research_state_audit, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/overview", self.participant_overview, methods=["GET"]),
             Route(f"{prefix}/participants/{{participant_code}}/messages", self.messages, methods=["GET"]),
             Route(f"{prefix}/messages/{{event_id}}", self.message, methods=["GET"]),

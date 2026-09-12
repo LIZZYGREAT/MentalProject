@@ -27,6 +27,7 @@ from app.models import (
     LearnedModelProfile,
     Participant,
     ParticipantCarePreference,
+    ParticipantMemoryItem,
     ParticipantProfile,
     ParticipantSlowState,
     PsychometricAssessment,
@@ -171,6 +172,84 @@ class AdminRepository:
                     Participant.participant_code == participant_code
                 )
             ).scalar_one_or_none()
+
+    def memory_audit(self, participant_id: uuid.UUID) -> list[dict[str, Any]]:
+        """Return provenance only; the admin surface cannot edit user memory."""
+
+        with self.database.session() as session:
+            rows = session.execute(
+                select(ParticipantMemoryItem)
+                .where(ParticipantMemoryItem.participant_id == participant_id)
+                .order_by(desc(ParticipantMemoryItem.updated_at))
+                .limit(100)
+            ).scalars().all()
+            return [
+                {
+                    "memory_type": row.memory_type,
+                    "source": row.source,
+                    "consent_basis": row.consent_basis,
+                    "status": row.status,
+                    "created_at": _iso(row.created_at),
+                    "updated_at": _iso(row.updated_at),
+                }
+                for row in rows
+            ]
+
+    def research_state_audit(
+        self, participant_id: uuid.UUID
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Expose research-state provenance separately from explicit memory."""
+
+        with self.database.session() as session:
+            observations = session.execute(
+                select(StateObservation)
+                .where(StateObservation.participant_id == participant_id)
+                .order_by(desc(StateObservation.observed_at))
+                .limit(100)
+            ).scalars().all()
+            slow_states = session.execute(
+                select(ParticipantSlowState)
+                .where(ParticipantSlowState.participant_id == participant_id)
+                .order_by(desc(ParticipantSlowState.effective_at))
+                .limit(100)
+            ).scalars().all()
+            profiles = session.execute(
+                select(LearnedModelProfile)
+                .where(LearnedModelProfile.participant_id == participant_id)
+                .order_by(desc(LearnedModelProfile.version))
+                .limit(100)
+            ).scalars().all()
+            return {
+                "observations": [
+                    {
+                        "type": row.observation_type,
+                        "observed_at": _iso(row.observed_at),
+                        "created_at": _iso(row.created_at),
+                    }
+                    for row in observations
+                ],
+                "slow_states": [
+                    {
+                        "effective_at": _iso(row.effective_at),
+                        "cadence": row.cadence,
+                        "source": row.source,
+                        "created_at": _iso(row.created_at),
+                    }
+                    for row in slow_states
+                ],
+                "model_profiles": [
+                    {
+                        "version": row.version,
+                        "model_version": row.model_version,
+                        "validation_status": row.validation_status,
+                        "sample_count": row.sample_count,
+                        "window_start": _iso(row.window_start),
+                        "window_end": _iso(row.window_end),
+                        "created_at": _iso(row.created_at),
+                    }
+                    for row in profiles
+                ],
+            }
 
     @staticmethod
     def _participant_row(session, row: Participant) -> dict[str, Any]:

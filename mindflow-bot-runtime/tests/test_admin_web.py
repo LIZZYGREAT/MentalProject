@@ -12,8 +12,11 @@ from app.config import Settings
 from app.repositories import (
     AgentRunRepository,
     BotEventRepository,
+    ObservationRepository,
     RuntimeIncidentRepository,
 )
+from app.repositories_memory import ParticipantMemoryRepository
+from app.services.memory_service import MemoryService
 from app.services.workload_diagnostic_renderer import WorkloadDiagnosticRenderer
 from helpers import memory_database, participant
 
@@ -75,6 +78,39 @@ def test_admin_frontend_and_public_health_are_available():
         "status": "ok",
         "database": "ok",
     }
+
+
+def test_admin_separates_read_only_memory_and_research_state_audits():
+    database = memory_database()
+    person = participant(database, "P-AUDIT")
+    MemoryService(ParticipantMemoryRepository(database)).remember_explicit(
+        person.id, memory_type="goal", content="完成毕业论文"
+    )
+    ObservationRepository(database).add(
+        person.id, "ema_checkin", {"stress": 7, "private_note": "not exposed"}
+    )
+    browser = TestClient(create_app(database, settings()))
+    login(browser)
+
+    memory = browser.get("/admin/api/participants/P-AUDIT/memory-audit")
+    research = browser.get(
+        "/admin/api/participants/P-AUDIT/research-state-audit"
+    )
+
+    assert memory.status_code == research.status_code == 200
+    assert memory.json()["read_only"] is True
+    assert set(memory.json()["items"][0]) == {
+        "memory_type", "source", "consent_basis", "status",
+        "created_at", "updated_at",
+    }
+    assert "content" not in str(memory.json()).lower()
+    assert research.json()["observations"][0]["type"] == "ema_checkin"
+    assert "private_note" not in str(research.json())
+    assert "memory" not in research.json()
+
+    script = browser.get("/admin/static/app.js").text
+    assert "Memory 审计" in script
+    assert "Research State 审计" in script
 
 
 def test_admin_startup_does_not_require_workload_cjk_font(monkeypatch):
