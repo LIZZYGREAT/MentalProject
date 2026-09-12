@@ -2027,6 +2027,48 @@ class WebSearchResult(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ParticipantMemoryItem(Base):
+    __tablename__ = "participant_memory_items"
+    __table_args__ = (
+        Index("ix_memory_participant_status", "participant_id", "status", "updated_at"),
+        CheckConstraint(
+            "memory_type IN ('preference', 'stable_fact', 'goal', 'routine', 'support_preference', 'context')",
+            name="ck_memory_type",
+        ),
+        CheckConstraint(
+            "source IN ('user_explicit', 'assistant_summary', 'system_candidate')",
+            name="ck_memory_source",
+        ),
+        CheckConstraint(
+            "consent_basis IN ('user_requested_memory', 'explicit_setting', 'candidate_only')",
+            name="ck_memory_consent_basis",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted', 'candidate')",
+            name="ck_memory_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(String(500), nullable=False)
+    normalized_content: Mapped[str] = mapped_column(String(500), nullable=False)
+    conflict_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    consent_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participant_memory_items.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class DailyReviewResponse(Base):
     __tablename__ = "daily_review_responses"
     __table_args__ = (

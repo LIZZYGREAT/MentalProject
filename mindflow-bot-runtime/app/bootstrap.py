@@ -33,6 +33,7 @@ from app.repositories_morning_brief import MorningBriefScheduleRepository
 from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
+from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -77,6 +78,8 @@ from app.tools.care import CareTools
 from app.tools.course_schedule import CourseScheduleTools
 from app.tools.reminder import ReminderTools
 from app.tools.web import WebTools
+from app.tools.memory import MemoryTools
+from app.services.memory_service import MemoryService
 from app.services.web_search_service import (
     DisabledSearchProvider,
     HttpJsonSearchProvider,
@@ -128,6 +131,7 @@ class BusinessServices:
     reminders: ReminderRepository
     followup_candidates: CareFollowupCandidateRepository
     web_search: WebSearchService
+    memory: MemoryService
 
 
 def build_business_services(
@@ -210,6 +214,7 @@ def build_business_services(
         else DisabledSearchProvider()
     )
     web_search = WebSearchService(WebSearchRepository(database), search_provider)
+    memory = MemoryService(ParticipantMemoryRepository(database))
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -341,6 +346,7 @@ def build_business_services(
         reminders, proactive_notifications, timezone_name=settings.timezone_name
     ).register(registry)
     WebTools(web_search).register(registry)
+    MemoryTools(memory).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -413,4 +419,5 @@ def build_business_services(
         reminders=reminders,
         followup_candidates=followup_candidates,
         web_search=web_search,
+        memory=memory,
     )
