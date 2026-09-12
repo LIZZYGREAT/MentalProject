@@ -124,6 +124,10 @@ class Settings:
     semantic_api_timeout_seconds: float = 8.0
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    web_search_enabled: bool = False
+    web_search_api_url: str = ""
+    web_search_api_key: str = ""
+    web_search_timeout_seconds: float = 10.0
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -377,6 +381,12 @@ class Settings:
                 values, "FORECAST_CALENDAR_SYNC_INTERVAL_SECONDS", 300, minimum=60
             ),
             semantic_api_enabled=_bool(values, "SEMANTIC_API_ENABLED", False),
+            web_search_enabled=_bool(values, "WEB_SEARCH_ENABLED", False),
+            web_search_api_url=values.get("WEB_SEARCH_API_URL", "").strip(),
+            web_search_api_key=values.get("WEB_SEARCH_API_KEY", "").strip(),
+            web_search_timeout_seconds=_float(
+                values, "WEB_SEARCH_TIMEOUT_SECONDS", 10.0, minimum=1.0
+            ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
             ).strip(),
@@ -540,6 +550,12 @@ class Settings:
             raise ValueError(
                 "MUTATION_INTENT_API_URL and MUTATION_INTENT_API_MODEL are required "
                 "when mutation intent verification is enabled"
+            )
+        if self.web_search_enabled and (
+            not self.web_search_api_url or not self.web_search_api_key
+        ):
+            raise ValueError(
+                "WEB_SEARCH_API_URL and WEB_SEARCH_API_KEY are required when web search is enabled"
             )
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
