@@ -31,6 +31,7 @@ from app.integrations.feishu.cards import (
     memory_clear_all_confirmation_card,
     memory_delete_confirmation_card,
     memory_detail_card,
+    preference_settings_card,
     today_calendar_card,
 )
 from app.presentation.consent_texts import external_llm_consent_declined_text
@@ -200,6 +201,7 @@ class CardActionService:
         consent_service: Any = None,
         care_preferences: Any = None,
         memory: Any = None,
+        interaction_preferences: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -215,6 +217,7 @@ class CardActionService:
         self.consent_service = consent_service
         self.care_preferences = care_preferences
         self.memory = memory
+        self.interaction_preferences = interaction_preferences
 
     @staticmethod
     def _fallback_event_id(
@@ -247,6 +250,41 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        if action_name in {
+            "preference_settings_save", "support_acknowledge_first",
+            "support_followup_disable",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.interaction_preferences is None:
+                raise RuntimeError("preference settings are unavailable")
+            if action_name == "preference_settings_save":
+                values = dict(form_value or {})
+                style = {
+                    key: str(values.get(key) or "")
+                    for key in ("verbosity", "tone", "suggestion_style")
+                }
+                if style["verbosity"] not in {"concise", "balanced", "detailed"} or style["tone"] not in {"neutral", "warm", "direct"} or style["suggestion_style"] not in {"ask_first", "light_suggestions", "proactive_suggestions"}:
+                    return {"ok": False, "error": "invalid_interaction_preferences"}
+                try:
+                    max_suggestions = int(values.get("max_suggestions"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "invalid_support_preferences"}
+                self.interaction_preferences.update_style(participant_id, style)
+                self.interaction_preferences.update_support(
+                    participant_id, {"max_suggestions": max_suggestions}
+                )
+            elif action_name == "support_acknowledge_first":
+                self.interaction_preferences.update_support(
+                    participant_id,
+                    {"acknowledge_before_advice": True, "ask_before_suggestion": True},
+                )
+            else:
+                self.interaction_preferences.update_support(
+                    participant_id, {"allow_supportive_follow_up": False}
+                )
+            updated = self.interaction_preferences.get(participant_id)
+            return {"ok": True, "reply_text": "表达与支持偏好已更新。", "card": preference_settings_card(updated)}
         if action_name in {
             "memory_delete_prompt", "memory_delete_confirm",
             "memory_clear_prompt", "memory_clear_confirm",

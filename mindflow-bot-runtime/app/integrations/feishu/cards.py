@@ -1575,3 +1575,29 @@ def memory_clear_all_confirmation_card() -> dict[str, Any]:
             ]},
         ],
     }
+
+
+def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
+    support = dict(preferences.get("support") or {})
+
+    def options(values: tuple[str, ...]) -> list[dict[str, Any]]:
+        return [{"text": {"tag": "plain_text", "content": value}, "value": value} for value in values]
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "表达与支持偏好"}},
+        "elements": [
+            {"tag": "markdown", "content": "这些设置只影响表达和建议方式，不能改变安全规则、授权或工具权限。"},
+            {"tag": "form", "name": "interaction_preference_settings", "elements": [
+                {"tag": "select_static", "name": "verbosity", "placeholder": {"tag": "plain_text", "content": "回答长度"}, "initial_option": str(preferences.get("verbosity") or "balanced"), "options": options(("concise", "balanced", "detailed"))},
+                {"tag": "select_static", "name": "tone", "placeholder": {"tag": "plain_text", "content": "语气"}, "initial_option": str(preferences.get("tone") or "warm"), "options": options(("neutral", "warm", "direct"))},
+                {"tag": "select_static", "name": "suggestion_style", "placeholder": {"tag": "plain_text", "content": "建议方式"}, "initial_option": str(preferences.get("suggestion_style") or "light_suggestions"), "options": options(("ask_first", "light_suggestions", "proactive_suggestions"))},
+                {"tag": "select_static", "name": "max_suggestions", "placeholder": {"tag": "plain_text", "content": "每次最多建议数"}, "initial_option": str(support.get("max_suggestions") or 3), "options": options(("1", "2", "3", "4", "5"))},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "保存"}, "type": "primary", "action_type": "form_submit", "value": {"mindflow_action": "preference_settings_save", "version": "1"}},
+            ]},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "先听我说，再建议"}, "value": {"mindflow_action": "support_acknowledge_first", "version": "1"}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "关闭支持性跟进"}, "value": {"mindflow_action": "support_followup_disable", "version": "1"}},
+            ]},
+        ],
+    }

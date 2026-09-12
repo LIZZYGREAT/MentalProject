@@ -27,10 +27,10 @@ def test_conflicting_preference_supersedes_old_active_item():
     user = participant(database, "MEMORY-2")
     service = MemoryService(ParticipantMemoryRepository(database))
     first = service.remember_explicit(
-        user.id, memory_type="preference", content="以后回答详细一点"
+        user.id, memory_type="routine", content="我一般十一点睡"
     )
     second = service.remember_explicit(
-        user.id, memory_type="preference", content="以后回答简短一点"
+        user.id, memory_type="routine", content="我通常一点睡"
     )
     active = service.list(user.id)
     assert [row["id"] for row in active] == [second["id"]]

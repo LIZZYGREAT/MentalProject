@@ -567,6 +567,7 @@ async def run() -> None:
         candidates=business.followup_candidates,
         participants=ParticipantRepository(database), bindings=bindings,
         policy=business.proactive_notifications, sender=sender,
+        support_preferences=business.interaction_preferences,
     )
     # Start the consumer before recovery.  Queue capacity can be smaller than
     # the durable backlog without causing startup deadlock.

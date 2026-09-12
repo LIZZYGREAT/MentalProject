@@ -8,7 +8,7 @@ from typing import Any
 
 
 MEMORY_TYPES = frozenset({
-    "preference", "stable_fact", "goal", "routine", "support_preference", "context",
+    "stable_fact", "goal", "routine", "context", "preferred_name",
 })
 _FORBIDDEN = re.compile(
     r"(?:忽略|绕过|覆盖|取消).{0,12}(?:系统|安全|权限|授权|规则)|"
@@ -31,10 +31,8 @@ def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
     if _CLINICAL_INFERENCE.search(normalized):
         raise ValueError("clinical or psychological inference cannot become durable memory")
     key = None
-    if re.search(r"(?:叫我|称呼我|我的名字|我叫)", normalized):
+    if memory_type == "preferred_name" or re.search(r"(?:叫我|称呼我|我的名字|我叫)", normalized):
         key = "preferred_name"
-    elif memory_type in {"preference", "support_preference"} and re.search(r"(?:简短|简洁|详细|展开)", normalized):
-        key = "response_verbosity"
     elif memory_type == "routine" and re.search(r"(?:睡|起床|作息)", normalized):
         key = "sleep_routine"
     return normalized.casefold(), key

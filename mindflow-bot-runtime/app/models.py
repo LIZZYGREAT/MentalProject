@@ -2032,15 +2032,15 @@ class ParticipantMemoryItem(Base):
     __table_args__ = (
         Index("ix_memory_participant_status", "participant_id", "status", "updated_at"),
         CheckConstraint(
-            "memory_type IN ('preference', 'stable_fact', 'goal', 'routine', 'support_preference', 'context')",
+            "memory_type IN ('stable_fact', 'goal', 'routine', 'context', 'preferred_name')",
             name="ck_memory_type",
         ),
         CheckConstraint(
-            "source IN ('user_explicit', 'assistant_summary', 'system_candidate')",
+            "source IN ('user_explicit', 'system_candidate')",
             name="ck_memory_source",
         ),
         CheckConstraint(
-            "consent_basis IN ('user_requested_memory', 'explicit_setting', 'candidate_only')",
+            "consent_basis IN ('user_requested_memory', 'candidate_only')",
             name="ck_memory_consent_basis",
         ),
         CheckConstraint(
@@ -2096,6 +2096,20 @@ class ParticipantInteractionRule(Base):
     normalized_value: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantSupportPreference(Base):
+    __tablename__ = "participant_support_preferences"
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    acknowledge_before_advice: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    ask_before_suggestion: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    max_suggestions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    allow_supportive_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    preferred_support_style: Mapped[str] = mapped_column(String(24), nullable=False, default="gentle")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

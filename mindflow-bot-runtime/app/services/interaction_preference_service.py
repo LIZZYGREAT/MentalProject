@@ -8,11 +8,15 @@ from app.services.preference_validator import normalize_rule, validate_style_cha
 
 
 class InteractionPreferenceService:
-    def __init__(self, repository: Any) -> None:
+    def __init__(self, repository: Any, support_repository: Any) -> None:
         self.repository = repository
+        self.support_repository = support_repository
 
     def get(self, participant_id):
-        return self.repository.get(participant_id)
+        return {
+            **self.repository.get(participant_id),
+            "support": self.support_repository.get(participant_id),
+        }
 
     def update_style(self, participant_id, changes: dict):
         return self.repository.update_style(participant_id, validate_style_changes(changes))
@@ -29,4 +33,14 @@ class InteractionPreferenceService:
                 self.repository.update_style(
                     participant_id, {accepted["category"]: accepted["value"]}
                 )
+            elif accepted["category"] in {
+                "acknowledge_before_advice", "ask_before_suggestion",
+                "max_suggestions", "allow_supportive_follow_up",
+            }:
+                self.support_repository.update(
+                    participant_id, {accepted["category"]: accepted["value"]}
+                )
         return {"accepted": stored, "rejected": result["rejected"], "preferences": self.get(participant_id)}
+
+    def update_support(self, participant_id, changes: dict):
+        return self.support_repository.update(participant_id, changes)

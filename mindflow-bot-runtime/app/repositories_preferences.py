@@ -51,6 +51,7 @@ class InteractionPreferenceRepository:
         return self.get(participant_id)
 
     def add_rule(self, participant_id: uuid.UUID, *, safe_text: str, category: str, value: str) -> dict:
+        stored_value = str(value).lower() if isinstance(value, bool) else str(value)
         now = utc_now()
         with self.database.session() as session:
             same = session.execute(select(ParticipantInteractionRule).where(
@@ -71,9 +72,9 @@ class InteractionPreferenceRepository:
                 old.updated_at = now
             row = ParticipantInteractionRule(
                 participant_id=participant_id, raw_text=safe_text[:200],
-                normalized_category=category, normalized_value=value,
+                normalized_category=category, normalized_value=stored_value,
                 status="active", created_at=now, updated_at=now,
             )
             session.add(row)
             session.flush()
-            return {"id": str(row.id), "category": category, "value": value}
+            return {"id": str(row.id), "category": category, "value": stored_value}

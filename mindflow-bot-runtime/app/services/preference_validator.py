@@ -46,6 +46,14 @@ def normalize_rule(raw_text: str) -> dict:
         candidates.append(("suggestion_style", "proactive_suggestions", "主动提供建议"))
     elif re.search(r"少给建议|轻一点的建议", text):
         candidates.append(("suggestion_style", "light_suggestions", "只提供轻量建议"))
+    if re.search(r"先听我说完|先听我说|先共情", text):
+        candidates.append(("acknowledge_before_advice", True, "先回应感受再给建议"))
+    if re.search(r"先问我.{0,8}(?:建议|办法)|想不想听建议", text):
+        candidates.append(("ask_before_suggestion", True, "给建议前先询问"))
+    if re.search(r"别一次给我很多|不要一次给太多|少给.{0,4}办法", text):
+        candidates.append(("max_suggestions", 1, "每次最多一条建议"))
+    if re.search(r"别.{0,8}(?:主动跟进|主动问我)|不要.{0,8}(?:主动跟进|主动问我)", text):
+        candidates.append(("allow_supportive_follow_up", False, "不主动支持性跟进"))
     if not candidates:
         if rejected:
             return {"accepted": [], "rejected": rejected}

@@ -15,12 +15,13 @@ MESSAGES = {
 
 
 class SupportiveFollowupScheduler:
-    def __init__(self, *, candidates, participants, bindings, policy, sender, poll_interval_seconds: int = 60) -> None:
+    def __init__(self, *, candidates, participants, bindings, policy, sender, support_preferences=None, poll_interval_seconds: int = 60) -> None:
         self.candidates = candidates
         self.participants = participants
         self.bindings = bindings
         self.policy = policy
         self.sender = sender
+        self.support_preferences = support_preferences
         self.poll_interval_seconds = max(1, poll_interval_seconds)
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
@@ -31,6 +32,19 @@ class SupportiveFollowupScheduler:
         counts = {"sent": 0, "suppressed": 0, "failed": 0}
         for item in await asyncio.to_thread(self.candidates.claim_due, instant):
             participant_id = uuid.UUID(item["participant_id"])
+            if self.support_preferences is not None:
+                preferences = await asyncio.to_thread(
+                    self.support_preferences.get, participant_id
+                )
+                if not preferences.get("support", {}).get(
+                    "allow_supportive_follow_up", True
+                ):
+                    await asyncio.to_thread(
+                        self.candidates.finish, item["id"], item["claim_token"],
+                        status="suppressed", now=instant,
+                    )
+                    counts["suppressed"] += 1
+                    continue
             participant = await asyncio.to_thread(self.participants.get, participant_id)
             binding = await asyncio.to_thread(self.bindings.get_for_participant, participant_id)
             if participant is None or participant.status != "active" or not binding or not binding.get("chat_id"):

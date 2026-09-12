@@ -35,6 +35,7 @@ from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
 from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_support_preferences import SupportPreferenceRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -220,7 +221,8 @@ def build_business_services(
     web_search = WebSearchService(WebSearchRepository(database), search_provider)
     memory = MemoryService(ParticipantMemoryRepository(database))
     interaction_preferences = InteractionPreferenceService(
-        InteractionPreferenceRepository(database)
+        InteractionPreferenceRepository(database),
+        SupportPreferenceRepository(database),
     )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
@@ -354,7 +356,7 @@ def build_business_services(
     ).register(registry)
     WebTools(web_search).register(registry)
     MemoryTools(memory, presentations).register(registry)
-    InteractionPreferenceTools(interaction_preferences).register(registry)
+    InteractionPreferenceTools(interaction_preferences, presentations).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -379,6 +381,7 @@ def build_business_services(
         consent_service=consent_service,
         care_preferences=care_preferences,
         memory=memory,
+        interaction_preferences=interaction_preferences,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
