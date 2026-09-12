@@ -933,6 +933,8 @@ class BotWorker:
                     turn_effect_policy="verify_on_demand",
                     user_request_text=event.text,
                     source_kind="text",
+                    access_tier=participant.access_tier,
+                    scopes=participant.scopes,
                 )
                 # Creating the task under the routing lock preserves arrival order;
                 # the lock is released before the long Agent turn so /stop can pass.
@@ -1614,6 +1616,8 @@ class BotWorker:
             turn_effect_policy=turn_effect_policy,
             user_request_text=turn_input.text,
             source_kind=source_kind,
+            access_tier=participant.access_tier,
+            scopes=participant.scopes,
         )
         self._active_agent_events.setdefault(participant.id, {})[
             event.event_id

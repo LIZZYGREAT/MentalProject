@@ -178,6 +178,8 @@ class ParticipantView:
     participant_code: str
     status: str
     external_llm_consent_at: datetime | None = None
+    access_tier: str = "participant"
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,7 +226,9 @@ class ParticipantRepository:
             session.add(row)
             session.flush()
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get(self, participant_id: uuid.UUID) -> Optional[ParticipantView]:
@@ -233,7 +237,9 @@ class ParticipantRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get_by_code(self, participant_code: str) -> Optional[ParticipantView]:
@@ -246,7 +252,9 @@ class ParticipantRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
 
@@ -293,7 +301,9 @@ class BindingRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get_for_participant(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:

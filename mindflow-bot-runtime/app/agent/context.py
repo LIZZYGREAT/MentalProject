@@ -60,6 +60,8 @@ class AgentContext:
     user_request_text: str = ""
     source_kind: SourceKind = "text"
     authorization_semantic_context: tuple[AuthorizationSemanticTurn, ...] = ()
+    access_tier: str = "participant"
+    scopes: tuple[str, ...] = ()
 
     @property
     def calendar_mutation_allowed(self) -> bool:

@@ -43,11 +43,21 @@ def _warning_authorization_deadline(context: object) -> datetime:
 
 class Participant(Base):
     __tablename__ = "participants"
+    __table_args__ = (
+        CheckConstraint(
+            "access_tier IN ('participant', 'researcher')",
+            name="ck_participant_access_tier",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     participant_code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     student_no_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    access_tier: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="participant"
+    )
+    scopes_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     # Legacy researcher/CLI-set flag kept for transition and audit only; it
     # never authorizes external LLM processing (see participant_consents).
     external_llm_consent_at: Mapped[datetime | None] = mapped_column(

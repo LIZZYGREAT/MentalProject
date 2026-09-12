@@ -84,9 +84,11 @@ from app.tools.reminder import ReminderTools
 from app.tools.web import WebTools
 from app.tools.memory import MemoryTools
 from app.tools.preferences import InteractionPreferenceTools
+from app.tools.research import ResearchTools
 from app.services.memory_service import MemoryService
 from app.services.interaction_preference_service import InteractionPreferenceService
 from app.services.psychological_context_builder import PsychologicalContextBuilder
+from app.services.research_aggregate_service import ResearchAggregateService
 from app.services.web_search_service import (
     DisabledSearchProvider,
     HttpJsonSearchProvider,
@@ -141,6 +143,7 @@ class BusinessServices:
     memory: MemoryService
     interaction_preferences: InteractionPreferenceService
     psychological_context: PsychologicalContextBuilder
+    research_aggregates: ResearchAggregateService
 
 
 def build_business_services(
@@ -238,6 +241,7 @@ def build_business_services(
         appraisals=EventAppraisalFeedbackRepository(database),
         learned_profiles=learned_profiles,
     )
+    research_aggregates = ResearchAggregateService(database)
     # Stage 5 replaces per-EMA refitting with a weekly immutable-snapshot run.
     # The scheduler still consumes the small maybe_calibrate interface.
     profile_calibration = ParameterLearningService(
@@ -367,6 +371,7 @@ def build_business_services(
     WebTools(web_search).register(registry)
     MemoryTools(memory, presentations).register(registry)
     InteractionPreferenceTools(interaction_preferences, presentations).register(registry)
+    ResearchTools(research_aggregates).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -392,7 +397,6 @@ def build_business_services(
         care_preferences=care_preferences,
         memory=memory,
         interaction_preferences=interaction_preferences,
-        psychological_context=psychological_context,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
@@ -444,4 +448,6 @@ def build_business_services(
         web_search=web_search,
         memory=memory,
         interaction_preferences=interaction_preferences,
+        psychological_context=psychological_context,
+        research_aggregates=research_aggregates,
     )

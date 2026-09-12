@@ -48,7 +48,7 @@ def build_sdk_mcp_server(
     """Create SDK tools without duplicating schemas or business handlers."""
 
     tools = []
-    for spec in registry.specs:
+    for spec in registry.specs_for(binding.current):
 
         async def execute(arguments: dict[str, Any], *, tool_name: str = spec.name):
             await binding.emit(

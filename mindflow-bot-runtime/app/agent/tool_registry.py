@@ -96,6 +96,7 @@ class ToolSpec:
     handler: ToolHandler
     execution_mode: Literal["async", "sync_io"]
     authorization_context_resolver: AuthorizationContextResolver | None = None
+    required_scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,7 @@ class ToolRegistry:
         authorization_requirement: AuthorizationRequirement,
         execution_mode: Literal["async", "sync_io"] | None = None,
         authorization_context_resolver: AuthorizationContextResolver | None = None,
+        required_scope: str | None = None,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"duplicate tool: {name}")
@@ -301,6 +303,7 @@ class ToolRegistry:
             handler,
             mode,
             authorization_context_resolver,
+            str(required_scope).strip() if required_scope else None,
         )
 
     @property
@@ -311,7 +314,26 @@ class ToolRegistry:
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(self._tools.values())
 
-    def schemas(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _scope_allowed(spec: ToolSpec, ctx: AgentContext | None) -> bool:
+        if spec.required_scope is None:
+            return True
+        return bool(
+            ctx is not None
+            and ctx.access_tier == "researcher"
+            and spec.required_scope in ctx.scopes
+        )
+
+    def specs_for(self, ctx: AgentContext | None) -> tuple[ToolSpec, ...]:
+        return tuple(
+            spec for spec in self._tools.values()
+            if self._scope_allowed(spec, ctx)
+        )
+
+    def names_for(self, ctx: AgentContext | None) -> tuple[str, ...]:
+        return tuple(spec.name for spec in self.specs_for(ctx))
+
+    def schemas(self, ctx: AgentContext | None = None) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -321,7 +343,7 @@ class ToolRegistry:
                     "parameters": spec.parameters,
                 },
             }
-            for spec in self._tools.values()
+            for spec in self.specs_for(ctx)
         ]
 
     async def execute(
@@ -341,6 +363,17 @@ class ToolRegistry:
                 "invalid_tool",
             )
             return ToolExecution(result, "invalid_tool")
+        if not self._scope_allowed(spec, ctx):
+            result = {
+                "ok": False,
+                "error": "tool_not_authorized",
+                "reason_code": "required_scope_missing",
+            }
+            await self._log(
+                ctx, name, spec, None, result, "tool_not_authorized",
+                "deny", "required_scope_missing",
+            )
+            return ToolExecution(result, "tool_not_authorized")
         if not isinstance(arguments, dict):
             result = {"ok": False, "error": "invalid_arguments"}
             await self._log(

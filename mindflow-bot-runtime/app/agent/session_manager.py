@@ -221,6 +221,10 @@ class ParticipantSessionManager:
                     session.queue.task_done()
                     continue
                 try:
+                    # The initial trusted context is needed while constructing
+                    # a participant-specific MCP tool surface.
+                    session.binding.current = request.ctx
+                    session.binding.activity_callback = request.on_activity
                     client = await self._ensure_client(session)
                     async with self._lock:
                         cancelled_before_run = (
