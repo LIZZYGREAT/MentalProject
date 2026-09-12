@@ -496,3 +496,13 @@ def test_unwired_worker_falls_back_to_legacy_transition_gate():
     asyncio.run(scenario())
     assert worker.runtime.turns == 1
     assert person.id
+
+
+def test_consent_copy_matches_resend_semantics():
+    """Simplified continuation: the button must not promise in-place replay."""
+
+    from app.integrations.feishu.cards import external_llm_consent_card
+
+    text = repr(external_llm_consent_card())
+    assert "同意并开启" in text
+    assert "同意并继续" not in text
