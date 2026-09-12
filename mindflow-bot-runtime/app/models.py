@@ -432,6 +432,10 @@ class BotEvent(Base):
     __table_args__ = (
         Index("ix_bot_event_participant_received", "participant_id", "received_at"),
         Index("ix_bot_event_status_received", "status", "received_at"),
+        CheckConstraint(
+            "content_privacy_class IN ('normal', 'protected')",
+            name="ck_bot_event_content_privacy_class",
+        ),
     )
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)

@@ -20,6 +20,10 @@ def upgrade() -> None:
         sa.Column(
             "content_privacy_class",
             sa.String(length=16),
+            sa.CheckConstraint(
+                "content_privacy_class IN ('normal', 'protected')",
+                name="ck_bot_event_content_privacy_class",
+            ),
             nullable=False,
             server_default="normal",
         ),

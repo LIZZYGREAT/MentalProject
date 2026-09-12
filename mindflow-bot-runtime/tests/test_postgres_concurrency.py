@@ -13,12 +13,13 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.db import Base, Database, build_engine
 from app.models import (
     CareInterventionEvent,
+    ParticipantConsent,
     CareInterventionFeedback,
     DatasetSnapshot,
     ForecastCurrentnessEvent,
@@ -41,6 +42,8 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.forecast_coordinator import _sha
@@ -857,3 +860,40 @@ def test_postgres_oauth_refresh_lease_has_one_authoritative_owner(
     assert asyncio.run(scenario()) == ["access-new", "access-new"]
     assert refresh_count == 1
     assert repository.status(participant.id)["token_version"] == 2
+
+
+def test_postgres_concurrent_consent_accept_yields_single_active_grant(
+    postgres_database,
+):
+    """Two truly concurrent accepts must end with exactly one active grant."""
+
+    database = postgres_database
+    person = ParticipantRepository(database).create("CONSENT-RACE")
+    service = ConsentService(ParticipantConsentRepository(database))
+    barrier = threading.Barrier(2)
+    results = []
+
+    def accept():
+        barrier.wait()
+        results.append(service.grant_external_llm_consent(person.id))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(accept) for _ in range(2)]:
+            future.result(timeout=30)
+
+    assert len(results) == 2
+    assert all(result["status"] == "active" for result in results)
+    assert all(
+        result["consent_version"] == result["consent_version"] for result in results
+    )
+    with database.session() as session:
+        rows = list(
+            session.execute(
+                select(ParticipantConsent).where(
+                    ParticipantConsent.participant_id == person.id
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].status == "active"
+    assert service.is_active(person.id) is True

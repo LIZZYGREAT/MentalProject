@@ -246,3 +246,39 @@ def test_worker_safety_locked_turn_persists_protected_privacy_class():
     view = AdminRepository(database).message("sw-risk")
     assert view["content_redacted"] is True
     assert "我不想活了" not in view["text"]
+
+
+def test_bot_event_schema_rejects_risk_label_privacy_classes():
+    """Only normal/protected exist; classifier labels can never be stored."""
+
+    from datetime import datetime, timezone
+
+    from sqlalchemy.exc import IntegrityError
+
+    from app.models import BotEvent
+
+    database = memory_database()
+    with database.session() as session:
+        session.add(
+            BotEvent(
+                event_id="evt-label",
+                message_id="om-label",
+                app_id="cli",
+                open_id="ou",
+                chat_id="oc",
+                chat_type="p2p",
+                message_type="text",
+                text="text",
+                message_created_at=datetime.now(timezone.utc),
+                status="completed",
+                content_privacy_class="high_risk",
+            )
+        )
+        raised = None
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raised = exc
+            session.rollback()
+    assert raised is not None
+    assert "ck_bot_event_content_privacy_class" in str(raised)
