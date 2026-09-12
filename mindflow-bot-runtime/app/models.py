@@ -2069,6 +2069,36 @@ class ParticipantMemoryItem(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ParticipantInteractionStyle(Base):
+    __tablename__ = "participant_interaction_styles"
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    verbosity: Mapped[str] = mapped_column(String(16), nullable=False, default="balanced")
+    tone: Mapped[str] = mapped_column(String(16), nullable=False, default="warm")
+    suggestion_style: Mapped[str] = mapped_column(String(32), nullable=False, default="light_suggestions")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantInteractionRule(Base):
+    __tablename__ = "participant_interaction_rules"
+    __table_args__ = (
+        Index("ix_interaction_rule_active", "participant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    raw_text: Mapped[str] = mapped_column(String(200), nullable=False)
+    normalized_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class DailyReviewResponse(Base):
     __tablename__ = "daily_review_responses"
     __table_args__ = (

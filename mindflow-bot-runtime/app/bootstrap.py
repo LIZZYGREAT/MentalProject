@@ -34,6 +34,7 @@ from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
 from app.repositories_memory import ParticipantMemoryRepository
+from app.repositories_preferences import InteractionPreferenceRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -79,7 +80,9 @@ from app.tools.course_schedule import CourseScheduleTools
 from app.tools.reminder import ReminderTools
 from app.tools.web import WebTools
 from app.tools.memory import MemoryTools
+from app.tools.preferences import InteractionPreferenceTools
 from app.services.memory_service import MemoryService
+from app.services.interaction_preference_service import InteractionPreferenceService
 from app.services.web_search_service import (
     DisabledSearchProvider,
     HttpJsonSearchProvider,
@@ -132,6 +135,7 @@ class BusinessServices:
     followup_candidates: CareFollowupCandidateRepository
     web_search: WebSearchService
     memory: MemoryService
+    interaction_preferences: InteractionPreferenceService
 
 
 def build_business_services(
@@ -215,6 +219,9 @@ def build_business_services(
     )
     web_search = WebSearchService(WebSearchRepository(database), search_provider)
     memory = MemoryService(ParticipantMemoryRepository(database))
+    interaction_preferences = InteractionPreferenceService(
+        InteractionPreferenceRepository(database)
+    )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
@@ -347,6 +354,7 @@ def build_business_services(
     ).register(registry)
     WebTools(web_search).register(registry)
     MemoryTools(memory).register(registry)
+    InteractionPreferenceTools(interaction_preferences).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -420,4 +428,5 @@ def build_business_services(
         followup_candidates=followup_candidates,
         web_search=web_search,
         memory=memory,
+        interaction_preferences=interaction_preferences,
     )
