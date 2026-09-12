@@ -1,5 +1,6 @@
 import asyncio
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 import uuid
 
 from app.agent.context import AgentContext
@@ -298,12 +299,17 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
     owner = participant(database, "STAGE3-IMAGE-RETRY")
     drafts = CourseScheduleImportRepository(database)
     image_sessions = CourseScheduleImageSessionRepository(database)
+    # Relative times keep the 24h session TTL out of the assertion: the
+    # fixture must never expire just because the wall clock moved on.
+    reference_now = datetime.now(timezone.utc).replace(microsecond=0)
+    created_at = reference_now - timedelta(minutes=10)
+    failed_at = reference_now - timedelta(minutes=5)
     image_sessions.start(
         owner.id,
         chat_id="chat",
         image_message_id="image-message",
         image_key="image-key",
-        now=datetime(2026, 9, 11, 7, 41, tzinfo=timezone.utc),
+        now=created_at,
     )
     image_sessions.mark_failed(
         owner.id,
@@ -317,7 +323,7 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
             ],
             "missing": ["week_rule"],
         },
-        now=datetime(2026, 9, 11, 7, 46, tzinfo=timezone.utc),
+        now=failed_at,
     )
     imported = []
 
@@ -345,10 +351,13 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
         return failure, retried
 
     failure, retried = asyncio.run(scenario())
+    tz = ZoneInfo("Asia/Shanghai")
+    expected_created_local = created_at.astimezone(tz).isoformat()
+    expected_updated_local = failed_at.astimezone(tz).isoformat()
     assert failure.result["image_session"] == {
         "status": "needs_retry",
-        "created_local_datetime": "2026-09-11T15:41:00+08:00",
-        "updated_local_datetime": "2026-09-11T15:46:00+08:00",
+        "created_local_datetime": expected_created_local,
+        "updated_local_datetime": expected_updated_local,
         "timezone": "Asia/Shanghai",
         "last_error_code": "schedule_validation_failed",
         "error_detail": "week range is missing",
