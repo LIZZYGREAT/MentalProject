@@ -533,6 +533,7 @@ async def run() -> None:
         incidents=incidents,
         care_card_enabled=card_action_transport_available,
         care_outcome_refresh=business.care_outcome_refresh,
+        proactive_policy=business.proactive_notifications,
     )
     daily_review_scheduler = DailyReviewScheduler(
         schedules=business.daily_review_schedules,
@@ -549,6 +550,7 @@ async def run() -> None:
         validity_minutes=settings.daily_review_validity_minutes,
         catch_up_minutes=settings.daily_review_catch_up_minutes,
         care_preferences=business.care_preferences,
+        proactive_policy=business.proactive_notifications,
     )
     morning_brief_scheduler = MorningBriefScheduler(
         schedules=business.morning_brief_schedules,

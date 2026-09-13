@@ -3857,6 +3857,48 @@ class WarningScheduleRepository:
             self._mirror_care(session, row)
             return True
 
+    def suppress_claim(
+        self,
+        warning_id: uuid.UUID,
+        *,
+        claim_token: uuid.UUID | str,
+        expected_forecast_version: str,
+        now: datetime,
+        reason: str,
+    ) -> bool:
+        """Close a current domain claim rejected by the global send gate."""
+
+        changed_at = self._aware(now)
+        token = uuid.UUID(str(claim_token))
+        with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return False
+            session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
+            row.status = "suppressed"
+            row.payload_json = {
+                **dict(row.payload_json),
+                "suppression_reason": f"global_{str(reason)[:64]}",
+            }
+            row.claim_token = None
+            row.claimed_at = None
+            row.lease_until = None
+            row.authorized_at = None
+            row.next_attempt_at = None
+            row.updated_at = changed_at
+            self._mirror_care(session, row)
+            return True
+
     def block_delivery(
         self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
         expected_forecast_version: str, now: datetime, reason: str,

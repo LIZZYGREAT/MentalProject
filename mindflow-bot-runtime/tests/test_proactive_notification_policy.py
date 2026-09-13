@@ -49,3 +49,37 @@ def test_reservation_is_deduplicated_and_can_be_released():
     assert first.allowed and first.reservation_id
     assert policy.reserve(user.id, message_kind="warning", dedupe_key="episode-1", scheduled_at=due).reason == "duplicate"
     assert policy.release(first.reservation_id, reason="provider_failed") is True
+    retry = policy.reserve(
+        user.id,
+        message_kind="warning",
+        dedupe_key="episode-1",
+        scheduled_at=due,
+    )
+    assert retry.allowed is True
+    assert retry.reservation_id == first.reservation_id
+
+
+def test_warning_daily_review_and_morning_brief_share_one_system_budget():
+    database = memory_database()
+    user = participant(database, "PROACTIVE-CROSS-FEATURE")
+    policy = ProactiveNotificationPolicy(
+        database, timezone_name="Asia/Shanghai", default_system_budget=2
+    )
+    due = datetime(2026, 9, 12, 1, 0, tzinfo=timezone.utc)
+
+    brief = policy.reserve(
+        user.id, message_kind="morning_brief", dedupe_key="brief", scheduled_at=due
+    )
+    review = policy.reserve(
+        user.id, message_kind="daily_review", dedupe_key="review", scheduled_at=due
+    )
+    warning = policy.reserve(
+        user.id, message_kind="warning", dedupe_key="warning", scheduled_at=due
+    )
+    reminder = policy.reserve(
+        user.id, message_kind="reminder", dedupe_key="reminder", scheduled_at=due
+    )
+
+    assert brief.allowed and review.allowed
+    assert warning.reason == "daily_budget"
+    assert reminder.allowed

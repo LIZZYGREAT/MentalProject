@@ -44,6 +44,7 @@ class ForecastScheduler:
         care_card_enabled: bool = False,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         care_outcome_reconcile_interval_seconds: int = 1200,
+        proactive_policy: object | None = None,
     ):
         self.coordinator = coordinator
         self.participants = participants
@@ -75,6 +76,7 @@ class ForecastScheduler:
         self.care_outcome_reconcile_interval = min(
             1800, max(600, int(care_outcome_reconcile_interval_seconds))
         )
+        self.proactive_policy = proactive_policy
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -310,6 +312,27 @@ class ForecastScheduler:
             now=datetime.now(timezone.utc),
         ):
             return
+        reservation_id = None
+        if self.proactive_policy is not None:
+            decision = await asyncio.to_thread(
+                self.proactive_policy.reserve,
+                uuid.UUID(claimed["participant_id"]),
+                message_kind="warning",
+                dedupe_key=f"warning:{warning_id}",
+                scheduled_at=now,
+                now=now,
+            )
+            if not decision.allowed:
+                await asyncio.to_thread(
+                    self.warnings.suppress_claim,
+                    warning_id,
+                    claim_token=claim_token,
+                    expected_forecast_version=expected_forecast_version,
+                    now=now,
+                    reason=decision.reason,
+                )
+                return
+            reservation_id = decision.reservation_id
         payload = claimed["payload"]
         text = str(
             payload.get("message")
@@ -362,6 +385,12 @@ class ForecastScheduler:
                 summary="A forecast warning could not be delivered.",
                 details={"warning_id": str(warning_id)},
             )
+            if reservation_id is not None:
+                await asyncio.to_thread(
+                    self.proactive_policy.release,
+                    reservation_id,
+                    reason="provider_failed",
+                )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
                 claim_token=claim_token,
@@ -386,6 +415,12 @@ class ForecastScheduler:
                 summary="A forecast warning could not be delivered.",
                 details={"warning_id": str(warning_id)},
             )
+            if reservation_id is not None:
+                await asyncio.to_thread(
+                    self.proactive_policy.release,
+                    reservation_id,
+                    reason="provider_failed",
+                )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
                 claim_token=claim_token,
@@ -395,6 +430,10 @@ class ForecastScheduler:
                 retry_base_seconds=self.warning_retry_base_seconds,
             )
             return
+        if reservation_id is not None:
+            await asyncio.to_thread(
+                self.proactive_policy.mark_sent, reservation_id, now=now
+            )
         await asyncio.to_thread(
             self.warnings.finish_claim, warning_id, sent=True,
             claim_token=claim_token,

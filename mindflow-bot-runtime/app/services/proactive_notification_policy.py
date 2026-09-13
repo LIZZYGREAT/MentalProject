@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
 from app.models import (
+    Participant,
     ParticipantCarePreference,
     ProactiveNotificationDelivery,
     utc_now,
@@ -84,6 +85,13 @@ class ProactiveNotificationPolicy:
 
         try:
             with self.database.session() as session:
+                # Participant is the lock root even when no preference row
+                # exists, so all feature schedulers serialize one budget.
+                participant = session.get(
+                    Participant, participant_id, with_for_update=True
+                )
+                if participant is None:
+                    return ProactiveDecision(False, "participant_not_found")
                 preference = session.get(
                     ParticipantCarePreference, participant_id, with_for_update=True
                 )
@@ -93,6 +101,18 @@ class ProactiveNotificationPolicy:
                 )
                 if reason != "allowed":
                     return ProactiveDecision(False, reason)
+                existing = session.execute(
+                    select(ProactiveNotificationDelivery).where(
+                        ProactiveNotificationDelivery.participant_id
+                        == participant_id,
+                        ProactiveNotificationDelivery.message_kind
+                        == message_kind,
+                        ProactiveNotificationDelivery.dedupe_key
+                        == str(dedupe_key),
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if existing is not None and existing.status != "released":
+                    return ProactiveDecision(False, "duplicate")
                 if message_class == "system_proactive":
                     local_day = instant.astimezone(self.timezone).date()
                     day_start = datetime.combine(local_day, time.min, self.timezone).astimezone(timezone.utc)
@@ -113,6 +133,15 @@ class ProactiveNotificationPolicy:
                     budget = self.default_system_budget if configured is None else max(0, int(configured))
                     if used >= budget:
                         return ProactiveDecision(False, "daily_budget")
+                if existing is not None:
+                    existing.status = "reserved"
+                    existing.suppression_reason = None
+                    existing.scheduled_at = instant
+                    existing.updated_at = checked_at
+                    return ProactiveDecision(
+                        True, "allowed", existing.id,
+                        quiet_hours_warning=quiet_warning,
+                    )
                 row = ProactiveNotificationDelivery(
                     participant_id=participant_id,
                     message_class=message_class,
