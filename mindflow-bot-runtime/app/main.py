@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -122,6 +124,73 @@ def _build_card_action_handler(
 
     from app.integrations.feishu.cards import card_action_result_card
 
+    allowed_action_names = {
+        "calendar_delete_cancel", "calendar_delete_confirm",
+        "calendar_mutation_plan_cancel", "calendar_mutation_plan_confirm",
+        "course_schedule_import_cancel", "course_schedule_import_confirm",
+        "course_schedule_import_context_open",
+        "course_schedule_import_context_submit",
+        "course_schedule_item_time_open", "course_schedule_item_time_submit",
+        "daily_review_submit", "external_llm_consent_accept",
+        "external_llm_consent_decline", "external_llm_consent_details_open",
+        "external_llm_consent_prompt_open", "external_llm_consent_revoke",
+        "external_llm_consent_status_open", "feature_back", "feature_open",
+        "memory_center_refresh", "memory_clear_confirm", "memory_clear_prompt",
+        "memory_delete_confirm", "memory_delete_prompt", "memory_detail_open",
+        "memory_edit_open", "memory_edit_save", "morning_brief_pause_week",
+        "morning_brief_time_update", "morning_brief_toggle",
+        "preference_settings_save", "request_checkin", "submit_checkin",
+        "support_acknowledge_first", "support_followup_disable",
+        "view_calendar_date", "view_today_calendar",
+        "care_ack", "care_disable_type", "care_helpful", "care_mute_today",
+        "care_not_relevant", "care_snooze_30",
+    }
+
+    def safe_action_name(event: Any) -> str | None:
+        candidate = str((event.action_value or {}).get("mindflow_action") or "")
+        return candidate if candidate in allowed_action_names else None
+
+    def replacement_message_uuid(event_id: str) -> str:
+        digest = hashlib.sha256(
+            f"mindflow:card-action-result:{event_id}".encode("utf-8")
+        ).hexdigest()
+        return f"mindflow-{digest[:40]}"
+
+    def log_stage(
+        event: Any,
+        stage: str,
+        *,
+        participant_id: Any = None,
+        result_ok: bool | None = None,
+        navigation_only: bool = False,
+        card_update_ok: bool | None = None,
+        provider_error_code: Any = None,
+        error_class: str | None = None,
+        error_id: str | None = None,
+        exc_info: bool = False,
+    ) -> None:
+        logging.getLogger(__name__).log(
+            logging.ERROR if error_class else logging.INFO,
+            (
+                "%s event_id=%s message_id=%s action_name=%s "
+                "participant_id=%s result_ok=%s navigation_only=%s "
+                "card_update_ok=%s provider_error_code=%s error_class=%s "
+                "error_id=%s"
+            ),
+            stage,
+            event.event_id,
+            event.message_id,
+            safe_action_name(event),
+            participant_id,
+            result_ok,
+            navigation_only,
+            card_update_ok,
+            provider_error_code,
+            error_class,
+            error_id,
+            exc_info=exc_info,
+        )
+
     def record_failure(
         event: Any,
         *,
@@ -131,13 +200,19 @@ def _build_card_action_handler(
         error_class: str | None,
         participant_id: Any = None,
         severity: str = "error",
+        error_id: str | None = None,
+        provider_error_code: Any = None,
+        exc_info: bool = False,
     ) -> None:
-        logging.getLogger(__name__).error(
-            "%s event_id=%s message_id=%s error_code=%s",
+        log_stage(
+            event,
             event_name,
-            event.event_id,
-            event.message_id,
-            error_code,
+            participant_id=participant_id,
+            result_ok=False,
+            provider_error_code=provider_error_code,
+            error_class=error_class,
+            error_id=error_id,
+            exc_info=exc_info,
         )
         if incidents is not None:
             try:
@@ -153,6 +228,9 @@ def _build_card_action_handler(
                     details={
                         "message_id": event.message_id,
                         "action_tag": event.action_tag,
+                        "action_name": safe_action_name(event),
+                        "error_id": error_id,
+                        "provider_error_code": provider_error_code,
                     },
                 )
             except Exception:
@@ -193,6 +271,7 @@ def _build_card_action_handler(
 
     def handle_card_action(event: Any) -> dict[str, Any]:
         participant = None
+        log_stage(event, "card_action_received")
         try:
             participant = identity.resolve(event.app_id, event.open_id)
             if participant is None:
@@ -206,17 +285,37 @@ def _build_card_action_handler(
                 form_value=event.form_value,
             )
         except Exception as exc:
+            error_id = uuid.uuid4().hex
             record_failure(
                 event,
                 summary="CardAction business handling failed",
                 error_code="business_failed",
                 error_class=type(exc).__name__,
                 participant_id=getattr(participant, "id", None),
+                error_id=error_id,
+                exc_info=True,
             )
             notify_failure(event)
+            log_stage(
+                event,
+                "card_action_completed",
+                participant_id=getattr(participant, "id", None),
+                result_ok=False,
+                error_class=type(exc).__name__,
+                error_id=error_id,
+            )
             raise
 
         if not result.get("ok"):
+            error_id = uuid.uuid4().hex
+            log_stage(
+                event,
+                "card_action_business_rejected",
+                participant_id=participant.id,
+                result_ok=False,
+                navigation_only=bool(result.get("navigation_only")),
+                error_id=error_id,
+            )
             record_failure(
                 event,
                 summary="CardAction was rejected",
@@ -224,9 +323,26 @@ def _build_card_action_handler(
                 error_class=None,
                 participant_id=participant.id,
                 severity="warning",
+                error_id=error_id,
             )
             notify_failure(event)
-            return result
+            log_stage(
+                event,
+                "card_action_completed",
+                participant_id=participant.id,
+                result_ok=False,
+                error_id=error_id,
+            )
+            return {**result, "error_id": error_id}
+
+        navigation_only = bool(result.get("navigation_only"))
+        log_stage(
+            event,
+            "card_action_business_succeeded",
+            participant_id=participant.id,
+            result_ok=True,
+            navigation_only=navigation_only,
+        )
 
         card = result.get("card")
         if not isinstance(card, dict) or not card:
@@ -237,6 +353,20 @@ def _build_card_action_handler(
         try:
             sender.update_card(event.message_id, card)
         except Exception as exc:
+            update_error_id = uuid.uuid4().hex
+            provider_error_code = getattr(exc, "code", None)
+            log_stage(
+                event,
+                "card_action_update_failed",
+                participant_id=participant.id,
+                result_ok=True,
+                navigation_only=navigation_only,
+                card_update_ok=False,
+                provider_error_code=provider_error_code,
+                error_class=type(exc).__name__,
+                error_id=update_error_id,
+                exc_info=True,
+            )
             record_failure(
                 event,
                 event_name="card_action_card_update_failed_after_commit",
@@ -244,12 +374,87 @@ def _build_card_action_handler(
                 error_code="card_update_failed_after_commit",
                 error_class=type(exc).__name__,
                 participant_id=participant.id,
+                error_id=update_error_id,
+                provider_error_code=provider_error_code,
             )
-            notify_card_update_failure(
-                event, navigation_only=bool(result.get("navigation_only"))
+            try:
+                sender.send_card(
+                    event.chat_id,
+                    card,
+                    message_uuid=replacement_message_uuid(event.event_id),
+                )
+            except Exception as replacement_exc:
+                replacement_error_id = uuid.uuid4().hex
+                replacement_provider_code = getattr(replacement_exc, "code", None)
+                log_stage(
+                    event,
+                    "card_action_replacement_failed",
+                    participant_id=participant.id,
+                    result_ok=True,
+                    navigation_only=navigation_only,
+                    card_update_ok=False,
+                    provider_error_code=replacement_provider_code,
+                    error_class=type(replacement_exc).__name__,
+                    error_id=replacement_error_id,
+                    exc_info=True,
+                )
+                notify_card_update_failure(event, navigation_only=navigation_only)
+                completed = {
+                    **result,
+                    "card_update_ok": False,
+                    "card_replacement_ok": False,
+                    "error_id": replacement_error_id,
+                }
+                log_stage(
+                    event,
+                    "card_action_completed",
+                    participant_id=participant.id,
+                    result_ok=True,
+                    navigation_only=navigation_only,
+                    card_update_ok=False,
+                    error_id=replacement_error_id,
+                )
+                return completed
+            log_stage(
+                event,
+                "card_action_replacement_succeeded",
+                participant_id=participant.id,
+                result_ok=True,
+                navigation_only=navigation_only,
+                card_update_ok=False,
             )
-            return {**result, "card_update_ok": False}
-        return {**result, "card_update_ok": True}
+            completed = {
+                **result,
+                "card_update_ok": False,
+                "card_replacement_ok": True,
+            }
+            log_stage(
+                event,
+                "card_action_completed",
+                participant_id=participant.id,
+                result_ok=True,
+                navigation_only=navigation_only,
+                card_update_ok=False,
+            )
+            return completed
+        log_stage(
+            event,
+            "card_action_update_succeeded",
+            participant_id=participant.id,
+            result_ok=True,
+            navigation_only=navigation_only,
+            card_update_ok=True,
+        )
+        completed = {**result, "card_update_ok": True}
+        log_stage(
+            event,
+            "card_action_completed",
+            participant_id=participant.id,
+            result_ok=True,
+            navigation_only=navigation_only,
+            card_update_ok=True,
+        )
+        return completed
 
     return handle_card_action
 

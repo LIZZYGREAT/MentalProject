@@ -166,6 +166,57 @@ def test_card_action_handler_keeps_success_when_card_update_fails_after_commit()
     assert incidents.records[0]["error_code"] == "card_update_failed_after_commit"
 
 
+def test_card_action_handler_uses_idempotent_replacement_card_after_patch_failure():
+    participant = SimpleNamespace(id="participant-1")
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, participant_id, **_kwargs):
+            self.calls += 1
+            assert participant_id == participant.id
+            return {
+                "ok": True,
+                "navigation_only": True,
+                "reply_text": "已打开",
+                "card": {"schema": "2.0"},
+            }
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+            self.messages = []
+
+        def update_card(self, _message_id, _card):
+            raise RuntimeError("card patch failed")
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.cards.append((chat_id, card, message_uuid))
+
+        def send_text(self, chat_id, text):
+            self.messages.append((chat_id, text))
+
+    sender = Sender()
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant), card_actions, sender
+    )
+
+    first = handler(_card_action_event())
+    second = handler(_card_action_event())
+
+    assert first["card_update_ok"] is False
+    assert first["card_replacement_ok"] is True
+    assert second["card_replacement_ok"] is True
+    assert card_actions.calls == 2
+    assert len(sender.cards) == 2
+    assert sender.cards[0][2] == sender.cards[1][2]
+    assert sender.cards[0][2]
+    assert len(sender.cards[0][2]) <= 50
+    assert sender.messages == []
+
+
 def test_card_action_handler_preserves_business_failure_behavior():
     participant = SimpleNamespace(id="participant-1")
 
