@@ -59,7 +59,7 @@ def test_reservation_is_deduplicated_and_can_be_released():
     assert retry.reservation_id == first.reservation_id
 
 
-def test_warning_daily_review_and_morning_brief_share_one_system_budget():
+def test_cross_feature_budget_is_arrival_order_not_priority_arbitration():
     database = memory_database()
     user = participant(database, "PROACTIVE-CROSS-FEATURE")
     policy = ProactiveNotificationPolicy(
@@ -81,5 +81,7 @@ def test_warning_daily_review_and_morning_brief_share_one_system_budget():
     )
 
     assert brief.allowed and review.allowed
+    # warning has a higher audit priority, but an already-consumed budget is
+    # never preempted: the current contract has no cross-scheduler arbitration.
     assert warning.reason == "daily_budget"
     assert reminder.allowed

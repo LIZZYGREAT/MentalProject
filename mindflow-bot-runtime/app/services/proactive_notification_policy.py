@@ -24,7 +24,9 @@ SYSTEM_PROACTIVE_KINDS = frozenset({
     "care_intervention", "supportive_follow_up",
 })
 USER_REQUESTED_KINDS = frozenset({"reminder"})
-PRIORITIES = {
+# Stored for audit/observability only. Reservations are intentionally decided
+# in arrival order; this policy does not reorder or merge independent schedulers.
+AUDIT_PRIORITIES = {
     "warning": 60,
     "daily_review": 50,
     "morning_brief": 40,
@@ -54,7 +56,7 @@ class ProactiveDecision:
 
 
 class ProactiveNotificationPolicy:
-    """Atomically reserve budget and dedupe slots before provider delivery."""
+    """Atomically reserve budget/dedupe slots; no priority arbitration or merge."""
 
     def __init__(
         self, database: Database, *, timezone_name: str, default_system_budget: int
@@ -146,7 +148,7 @@ class ProactiveNotificationPolicy:
                     participant_id=participant_id,
                     message_class=message_class,
                     message_kind=message_kind,
-                    priority=PRIORITIES[message_kind],
+                    priority=AUDIT_PRIORITIES[message_kind],
                     dedupe_key=str(dedupe_key),
                     scheduled_at=instant,
                     status="reserved",

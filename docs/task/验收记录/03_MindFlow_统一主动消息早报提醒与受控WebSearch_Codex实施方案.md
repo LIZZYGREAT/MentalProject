@@ -88,10 +88,12 @@ supportive_follow_up
 global mute
 quiet hours
 per-day budget
-priority
 dedupe
-merge window
 ```
+
+当前阶段明确采用到达顺序原子占用预算：`priority` 仅作为审计/可观测字段，
+不承诺跨调度器抢占或重排；也不提供跨类型 `merge window`。产品若需要合并通知，
+应作为后续独立能力实现，当前验收不得宣称已经具备。
 
 ### 3.2 user_requested
 
@@ -113,7 +115,7 @@ reminder
 
 到点仍按用户要求发送。
 
-### 3.3 建议优先级
+### 3.3 审计优先级标签（当前不参与调度）
 
 ```text
 warning                 high
@@ -681,7 +683,7 @@ built-in WebSearch/WebFetch 仍在 DISALLOWED_TOOLS
 
 ### 已交付
 
-- 全局主动消息策略：区分 `system_proactive` 与 `user_requested`，统一执行静默时段、全局暂停、系统预算、优先级与去重；用户明确创建的 Reminder 不被系统主动消息预算吞掉。
+- 全局主动消息策略：区分 `system_proactive` 与 `user_requested`，统一执行静默时段、全局暂停、系统预算与去重；用户明确创建的 Reminder 不被系统主动消息预算吞掉。`priority` 当前仅留作审计标签，不宣称具备跨调度器抢占、重排或合并能力。
 - Morning Brief：默认关闭、用户主动开启、固定本地时间、可暂停；内容只聚合日历、用户 Reminder 与固定轻提示，不展示压力预测、等级或峰值。
 - Reminder：参与者绑定、明确时间创建、模糊时间澄清、持久化调度、重启恢复与重复规则。
 - Supportive Follow-up：候选有时效上限并统一经过主动消息策略和支持偏好。
