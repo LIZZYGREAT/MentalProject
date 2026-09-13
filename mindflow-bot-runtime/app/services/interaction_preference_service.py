@@ -7,6 +7,13 @@ from typing import Any
 from app.services.preference_validator import normalize_rule, validate_style_changes
 
 
+STYLE_FIELDS = frozenset({"verbosity", "tone", "suggestion_style"})
+SUPPORT_FIELDS = frozenset({
+    "acknowledge_before_advice", "ask_before_suggestion", "max_suggestions",
+    "allow_supportive_follow_up", "preferred_support_style",
+})
+
+
 class InteractionPreferenceService:
     def __init__(self, repository: Any, support_repository: Any) -> None:
         self.repository = repository
@@ -25,21 +32,21 @@ class InteractionPreferenceService:
         result = normalize_rule(raw_text)
         stored = []
         for accepted in result["accepted"]:
-            stored.append(self.repository.add_rule(
-                participant_id, safe_text=accepted["safe_text"],
-                category=accepted["category"], value=accepted["value"],
-            ))
-            if accepted["category"] in {"verbosity", "tone", "suggestion_style"}:
+            if accepted["category"] in STYLE_FIELDS:
                 self.repository.update_style(
                     participant_id, {accepted["category"]: accepted["value"]}
                 )
-            elif accepted["category"] in {
-                "acknowledge_before_advice", "ask_before_suggestion",
-                "max_suggestions", "allow_supportive_follow_up",
-            }:
+                stored.append(dict(accepted))
+            elif accepted["category"] in SUPPORT_FIELDS:
                 self.support_repository.update(
                     participant_id, {accepted["category"]: accepted["value"]}
                 )
+                stored.append(dict(accepted))
+            else:
+                stored.append(self.repository.add_rule(
+                    participant_id, safe_text=accepted["safe_text"],
+                    category=accepted["category"], value=accepted["value"],
+                ))
         return {"accepted": stored, "rejected": result["rejected"], "preferences": self.get(participant_id)}
 
     def update_support(self, participant_id, changes: dict):

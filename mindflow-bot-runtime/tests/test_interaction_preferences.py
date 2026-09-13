@@ -26,9 +26,7 @@ def test_only_safe_structured_fragment_is_persisted():
     assert result["preferences"]["verbosity"] == "concise"
     assert result["rejected"] == ["authorization_or_safety_override"]
     with database.session() as session:
-        row = session.query(ParticipantInteractionRule).one()
-        assert row.raw_text == "回答简短"
-        assert "忽略" not in row.raw_text
+        assert session.query(ParticipantInteractionRule).count() == 0
         assert session.query(ParticipantMemoryItem).count() == 0
 
 
@@ -72,7 +70,35 @@ def test_support_preference_is_separate_from_memory_and_normalized():
     assert result["preferences"]["support"]["acknowledge_before_advice"] is True
     assert result["accepted"][0]["category"] == "acknowledge_before_advice"
     with database.session() as session:
+        assert session.query(ParticipantInteractionRule).count() == 0
         assert session.query(ParticipantMemoryItem).count() == 0
+
+
+def test_natural_language_support_preferences_write_only_canonical_fields():
+    database = memory_database()
+    user = participant(database, "PREF-6")
+    service = InteractionPreferenceService(
+        InteractionPreferenceRepository(database), SupportPreferenceRepository(database)
+    )
+    for text in (
+        "最多给我两条建议",
+        "可以主动关心我",
+        "以后不用先问，直接给建议",
+        "我更喜欢实际一点的建议",
+        "我主要想让你听我说",
+    ):
+        service.apply_rule(user.id, text)
+
+    support = service.get(user.id)["support"]
+    assert support == {
+        "acknowledge_before_advice": True,
+        "ask_before_suggestion": False,
+        "max_suggestions": 2,
+        "allow_supportive_follow_up": True,
+        "preferred_support_style": "listening",
+    }
+    with database.session() as session:
+        assert session.query(ParticipantInteractionRule).count() == 0
 
 
 def test_preference_settings_card_declares_authority_boundary():
