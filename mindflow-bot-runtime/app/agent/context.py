@@ -1,6 +1,7 @@
 """Trusted context constructed only by the backend worker."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 import uuid
 
@@ -58,6 +59,7 @@ class AgentContext:
     calendar_mutation_policy: CalendarMutationPolicy = "normal"
     turn_effect_policy: TurnEffectPolicy = "verify_on_demand"
     user_request_text: str = ""
+    received_at_utc: datetime | None = None
     source_kind: SourceKind = "text"
     authorization_semantic_context: tuple[AuthorizationSemanticTurn, ...] = ()
     access_tier: str = "participant"

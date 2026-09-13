@@ -9,7 +9,7 @@ from app.repositories import ParticipantRepository
 from app.repositories_reminder import ReminderRepository
 from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.reminder_scheduler import ReminderScheduler
-from app.tools.reminder import has_exact_time_grounding
+from app.tools.reminder import ReminderTools, has_exact_time_grounding
 from tests.helpers import memory_database, participant
 
 
@@ -34,6 +34,24 @@ class _FailingSender:
     def send_text(self, *_args, **_kwargs):
         self.thread_ids.append(threading.get_ident())
         raise RuntimeError("provider unavailable")
+
+
+class _ReminderStore:
+    def __init__(self):
+        self.created = []
+
+    def create(self, participant_id, *, message, remind_at, recurrence_type):
+        self.created.append((participant_id, message, remind_at, recurrence_type))
+        return {
+            "id": str(uuid.uuid4()), "participant_id": str(participant_id),
+            "message": message, "remind_at": remind_at.isoformat(),
+            "recurrence_type": recurrence_type,
+        }
+
+
+class _QuietPolicy:
+    def user_requested_quiet_hours_warning(self, _participant_id, _remind_at):
+        return False
 
 
 def test_reminder_repository_is_participant_bound_and_limited():
@@ -218,3 +236,60 @@ def test_reminder_grounding_does_not_compose_unrelated_historical_time():
 
     assert has_exact_time_grounding(vague_current) is False
     assert has_exact_time_grounding(valid_clarification) is True
+
+
+def test_reminder_tool_persists_only_backend_grounded_absolute_time():
+    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
+    base = dict(
+        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+        user_request_text="明天15:00提醒我交作业", received_at_utc=received_at,
+    )
+    store = _ReminderStore()
+    tools = ReminderTools(
+        store, _QuietPolicy(), timezone_name="Asia/Shanghai"
+    )
+
+    accepted = tools.create(AgentContext(**base), {
+        "message": "交作业", "remind_at": "2026-09-14T15:00:00+08:00",
+        "recurrence_type": "none",
+    })
+    wrong_day = tools.create(AgentContext(**base), {
+        "message": "交作业", "remind_at": "2026-09-15T15:00:00+08:00",
+        "recurrence_type": "none",
+    })
+    wrong_clock = tools.create(AgentContext(**base), {
+        "message": "交作业", "remind_at": "2026-09-14T16:00:00+08:00",
+        "recurrence_type": "none",
+    })
+
+    assert accepted["ok"] is True
+    assert wrong_day["error"] == "reminder_time_not_grounded"
+    assert wrong_clock["error"] == "reminder_time_not_grounded"
+    assert len(store.created) == 1
+    assert store.created[0][2].isoformat() == "2026-09-14T15:00:00+08:00"
+
+
+def test_reminder_tool_persists_only_backend_grounded_relative_time():
+    received_at = datetime(2026, 9, 13, 2, 15, tzinfo=timezone.utc)
+    ctx = AgentContext(
+        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+        user_request_text="一小时后提醒我喝水", received_at_utc=received_at,
+    )
+    store = _ReminderStore()
+    tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
+
+    accepted = tools.create(ctx, {
+        "message": "喝水", "remind_at": "2026-09-13T03:15:00Z",
+        "recurrence_type": "none",
+    })
+    rejected = tools.create(ctx, {
+        "message": "喝水", "remind_at": "2026-09-13T04:15:00Z",
+        "recurrence_type": "none",
+    })
+
+    assert accepted["ok"] is True
+    assert rejected["error"] == "reminder_time_not_grounded"
+    assert len(store.created) == 1
+    assert store.created[0][2] == received_at + timedelta(hours=1)
