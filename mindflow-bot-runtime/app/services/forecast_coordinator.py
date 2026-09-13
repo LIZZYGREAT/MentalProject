@@ -43,7 +43,11 @@ from app.services.forecast_initial_state import (
     ForecastInitialState,
     ForecastInitialStateResolver,
 )
-from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.forecast_dependency_refresh import (
+    ForecastDependencyRefreshService,
+    dependent_date_for,
+)
+from app.services.runtime_clock import RuntimeClock
 from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
@@ -303,6 +307,7 @@ class ForecastCoordinator:
         care_preferences: ParticipantCarePreferenceRepository | None = None,
         care_interventions: Any | None = None,
         consent_service: Any | None = None,
+        clock: RuntimeClock | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -314,6 +319,7 @@ class ForecastCoordinator:
         self.forecasts = forecasts
         self.warnings = warnings
         self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self.materiality_threshold = materiality_threshold
         self.warning_lead_minutes = warning_lead_minutes
         self.warning_late_grace_minutes = warning_late_grace_minutes
@@ -722,7 +728,7 @@ class ForecastCoordinator:
             or (item.get("metadata") or {}).get("classification")
             for item in semantic_events
         )
-        local_now = datetime.now(self.timezone)
+        local_now = self.clock.now()
         observation_window_start = None
         observation_window_end = None
         if target == local_now.date():
@@ -950,8 +956,12 @@ class ForecastCoordinator:
                         target,
                         reason="previous_day_semantic_terminal_changed",
                     )
-                elif target == datetime.now(self.timezone).date():
-                    dependent_date = target + timedelta(days=1)
+                else:
+                    dependent_date = dependent_date_for(
+                        target, self.clock.local_date()
+                    )
+                    if dependent_date is None:
+                        return
                     await asyncio.to_thread(
                         self.mark_dependency_dirty,
                         participant_id,
@@ -979,7 +989,7 @@ class ForecastCoordinator:
         refresh_calendar: bool,
         effective_profile: dict[str, Any],
     ) -> ForecastInitialState:
-        local_today = datetime.now(self.timezone).date()
+        local_today = self.clock.local_date()
         previous = None
         if target == local_today:
             previous = await asyncio.to_thread(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import logging
 from typing import Any
 import uuid
@@ -17,6 +17,8 @@ from app.domain.course_schedule_recurrence import (
     plan_course_writes,
 )
 from app.repositories_course_schedule import CourseScheduleImportRepository
+from app.services.forecast_dependency_refresh import dependent_date_for
+from app.services.runtime_clock import RuntimeClock
 
 
 logger = logging.getLogger(__name__)
@@ -35,11 +37,13 @@ class CourseScheduleImportService:
         mutation_refresh: Any = None,
         max_calendar_writes: int = 400,
         queue_notifier: Any = None,
+        clock: RuntimeClock | None = None,
     ) -> None:
         self.drafts = drafts
         self.calendar = calendar
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
         self.mutation_refresh = mutation_refresh
@@ -297,7 +301,10 @@ class CourseScheduleImportService:
         repository = getattr(self.mutation_refresh, "reconciliations", None)
         if repository is None:
             return None
-        today, direct, refresh, dependencies = self._mutation_work(dates)
+        reference_local_date = self.clock.local_date()
+        _today, direct, refresh, dependencies = self._mutation_work(
+            dates, reference_local_date=reference_local_date
+        )
         return await asyncio.to_thread(
             repository.create,
             participant_id,
@@ -315,6 +322,7 @@ class CourseScheduleImportService:
                 "planner_version": COURSE_IMPORT_PLANNER_VERSION,
                 "period_map_version": DEFAULT_PERIOD_MAP_VERSION,
                 "recurrence_strategy": draft["recurrence_strategy"],
+                "reference_local_date": reference_local_date.isoformat(),
             },
         )
 
@@ -370,7 +378,10 @@ class CourseScheduleImportService:
     ) -> None:
         if self.forecast_coordinator is None or self.forecast_snapshots is None:
             return
-        _today, direct, refresh, dependencies = self._mutation_work(dates)
+        reference_local_date = self._reference_local_date(reconciliation)
+        _today, direct, refresh, dependencies = self._mutation_work(
+            dates, reference_local_date=reference_local_date
+        )
         errors: set[date] = set()
         if direct:
             try:
@@ -393,6 +404,7 @@ class CourseScheduleImportService:
                         participant_id,
                         source,
                         reason="previous_day_terminal_changed",
+                        reference_local_date=reference_local_date,
                     )
             except Exception:
                 errors.add(target)
@@ -422,18 +434,36 @@ class CourseScheduleImportService:
             reason="course_schedule_import_rollback",
         )
 
+    def _reference_local_date(
+        self, reconciliation: dict[str, Any] | None
+    ) -> date:
+        operation = dict((reconciliation or {}).get("work", {}).get("operation") or {})
+        raw = operation.get("reference_local_date")
+        if raw:
+            try:
+                return date.fromisoformat(str(raw))
+            except ValueError:
+                logger.warning(
+                    "course_schedule_invalid_reference_local_date reconciliation_id=%s",
+                    (reconciliation or {}).get("id"),
+                )
+        return self.clock.local_date()
+
     def _mutation_work(
-        self, dates: set[date]
+        self,
+        dates: set[date],
+        *,
+        reference_local_date: date | None = None,
     ) -> tuple[date, set[date], dict[date, bool], dict[date, date]]:
-        today = datetime.now(self.timezone).date()
+        today = reference_local_date or self.clock.local_date()
         direct = {value for value in dates if value >= today}
         refresh = {value: True for value in sorted(direct)}
         dependencies: dict[date, date] = {}
-        if today in direct:
-            tomorrow = today + timedelta(days=1)
-            if tomorrow not in refresh:
-                refresh[tomorrow] = False
-                dependencies[tomorrow] = today
+        for source in sorted(direct):
+            dependent = dependent_date_for(source, today)
+            if dependent is not None and dependent not in refresh:
+                refresh[dependent] = False
+                dependencies[dependent] = source
         return today, direct, refresh, dependencies
 
     @staticmethod

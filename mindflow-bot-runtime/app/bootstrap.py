@@ -69,6 +69,7 @@ from app.services.observation_forecast_refresh import ObservationForecastRefresh
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
+from app.services.runtime_clock import RuntimeClock
 from app.services.hierarchical_personalization import ParameterLearningService
 from app.services.mutation_intent_verifier import (
     MutationIntentVerifier,
@@ -150,6 +151,7 @@ class BusinessServices:
 def build_business_services(
     database: Database, settings: Settings, runs: AgentRunRepository
 ) -> BusinessServices:
+    runtime_clock = RuntimeClock(settings.timezone_name)
     profiles = ProfileRepository(database)
     observations = ObservationRepository(database)
     conversations = ConversationRepository(database)
@@ -273,12 +275,14 @@ def build_business_services(
         care_preferences=care_preferences,
         care_interventions=care_interventions,
         consent_service=consent_service,
+        clock=runtime_clock,
     )
     dependency_refresh = ForecastDependencyRefreshService(
         forecast_snapshots,
         warning_schedules,
         forecast_coordinator,
         timezone_name=settings.timezone_name,
+        clock=runtime_clock,
     )
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
@@ -296,6 +300,7 @@ def build_business_services(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
         dependency_refresh=dependency_refresh,
+        clock=runtime_clock,
     )
     care_outcome_refresh = CareOutcomeRefreshService(database)
     course_schedule_imports = CourseScheduleImportService(
@@ -307,6 +312,7 @@ def build_business_services(
         forecast_snapshots=forecast_snapshots,
         mutation_refresh=mutation_refresh,
         max_calendar_writes=settings.vision_schedule_max_calendar_writes,
+        clock=runtime_clock,
     )
     device_flows.cleanup_resumer = course_schedule_imports.resume_cleanup_for_participant
     course_schedule_import_runner = CourseScheduleImportRunner(
