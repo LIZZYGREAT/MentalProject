@@ -23,6 +23,16 @@ def _log_startup_phase(name: str) -> None:
     )
 
 
+def _log_web_search_config(settings: Any) -> None:
+    logging.getLogger(__name__).info(
+        "web_search_config enabled=%s provider=http_json "
+        "url_configured=%s key_configured=%s",
+        bool(settings.web_search_enabled),
+        bool(str(settings.web_search_api_url or "").strip()),
+        bool(str(settings.web_search_api_key or "").strip()),
+    )
+
+
 def _should_start_daily_review_scheduler(
     settings: Any, card_action_transport_available: bool
 ) -> bool:
@@ -548,6 +558,7 @@ async def run() -> None:
     )
     install_credential_redaction()
     announce_build("bot")
+    _log_web_search_config(settings)
     _log_startup_phase("settings_ready")
     database = Database(build_engine(settings.database_url))
     with database.session() as session:

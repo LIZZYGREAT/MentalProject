@@ -6,6 +6,24 @@ import pytest
 from app import main as app_main
 
 
+def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
+    settings = SimpleNamespace(
+        web_search_enabled=True,
+        web_search_api_url="https://search.example.test/path?private=value",
+        web_search_api_key="secret-key-value",
+    )
+
+    with caplog.at_level("INFO"):
+        app_main._log_web_search_config(settings)
+
+    assert (
+        "web_search_config enabled=True provider=http_json "
+        "url_configured=True key_configured=True"
+    ) in caplog.text
+    assert "search.example.test" not in caplog.text
+    assert "secret-key-value" not in caplog.text
+
+
 def test_daily_review_scheduler_fails_closed_without_card_action_transport():
     disabled = SimpleNamespace(daily_review_enabled=False)
     enabled = SimpleNamespace(daily_review_enabled=True)

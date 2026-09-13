@@ -61,10 +61,16 @@ def test_provider_failure_is_explicit_and_builtin_web_tools_stay_disabled():
     result = asyncio.run(WebSearchService(
         WebSearchRepository(database), DisabledSearchProvider()
     ).search(user.id, query="今天的公开新闻", freshness="day"))
-    assert result == {"ok": False, "error": "web_search_unavailable", "verified": False}
+    assert result == {
+        "ok": False,
+        "error": "web_search_unavailable",
+        "reason_code": "provider_not_configured",
+        "verified": False,
+    }
     assert {"WebSearch", "WebFetch"} <= set(DISALLOWED_TOOLS)
     assert "external_web_evidence" in SYSTEM_RULES
     assert "could not be verified" in SYSTEM_RULES
+    assert "provider_not_configured" in SYSTEM_RULES
 
 
 def test_private_context_without_punctuation_fails_closed_and_is_not_persisted():

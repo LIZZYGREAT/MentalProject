@@ -126,14 +126,28 @@ class WebSearchService:
         query_hash = hashlib.sha256(normalized.casefold().encode("utf-8")).hexdigest()
         try:
             items = await self.provider.search(normalized, freshness, count)
+        except SearchUnavailable as exc:
+            provider_reason = str(exc) or "provider_unavailable"
+            await asyncio.to_thread(
+                self.repository.record_failure, participant_id,
+                query_hash=query_hash, freshness=freshness,
+                error_code=provider_reason,
+                ttl_minutes=self.ttl_minutes,
+            )
+            return {
+                "ok": False, "error": "web_search_unavailable",
+                "reason_code": provider_reason, "verified": False,
+            }
         except Exception as exc:
             await asyncio.to_thread(
                 self.repository.record_failure, participant_id,
-                query_hash=query_hash,
-                freshness=freshness, error_code=type(exc).__name__,
-                ttl_minutes=self.ttl_minutes,
+                query_hash=query_hash, freshness=freshness,
+                error_code=type(exc).__name__, ttl_minutes=self.ttl_minutes,
             )
-            return {"ok": False, "error": "web_search_unavailable", "verified": False}
+            return {
+                "ok": False, "error": "web_search_unavailable",
+                "reason_code": "provider_request_failed", "verified": False,
+            }
         results = await asyncio.to_thread(
             self.repository.record_success, participant_id,
             query_hash=query_hash,
