@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 from typing import Any, Callable
 import uuid
@@ -15,14 +15,31 @@ MORNING_BRIEF_HINT = "给今天留一点余量，按自己的节奏来就好。"
 FORBIDDEN_BRIEF_TERMS = frozenset({"压力预测", "压力等级", "高压峰值", "AUC", "风险窗口", "模型解释"})
 
 
-def render_morning_brief(local_date: str, events: list[dict[str, Any]], reminders: list[dict[str, Any]]) -> str:
+def render_morning_brief(
+    local_date: str,
+    events: list[dict[str, Any]],
+    reminders: list[dict[str, Any]],
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> str:
     """Render factual agenda/reminders plus one fixed non-predictive hint."""
     lines = [f"早上好，今天是 {local_date}。", "", "今日日程："]
     if events:
         for event in events[:20]:
             summary = str(event.get("summary") or event.get("title") or "未命名安排")[:120]
             start = str(event.get("start_time") or event.get("start") or "")
-            lines.append(f"- {start[-5:] if start else '时间待定'} {summary}")
+            display_time = "时间待定"
+            if start:
+                try:
+                    parsed = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+                    display_time = parsed.astimezone(
+                        ZoneInfo(timezone_name)
+                    ).strftime("%H:%M")
+                except ValueError:
+                    pass
+            lines.append(f"- {display_time} {summary}")
     else:
         lines.append("- 暂无日程")
     lines.extend(["", "提醒事项："])
@@ -89,14 +106,20 @@ class MorningBriefScheduler:
                 await asyncio.to_thread(self.schedules.finish, item["id"], item["claim_token"], status="suppressed", now=instant, error_code=decision.reason)
                 counts["suppressed"] += 1
                 continue
-            day_start = datetime.combine(local_now.date(), time.min, self.timezone)
+            item_date = date.fromisoformat(item["local_date"])
+            day_start = datetime.combine(item_date, time.min, self.timezone)
             try:
                 events = await self.calendar.get_events(participant_id, day_start, day_start + timedelta(days=1))
             except Exception:
                 logger.info("morning_brief_calendar_unavailable")
                 events = []
-            reminders = await asyncio.to_thread(self.reminder_source.for_local_date, participant_id, local_now.date()) if self.reminder_source is not None else []
-            message = render_morning_brief(item["local_date"], events, reminders)
+            reminders = await asyncio.to_thread(
+                self.reminder_source.for_local_date, participant_id, item_date
+            ) if self.reminder_source is not None else []
+            message = render_morning_brief(
+                item["local_date"], events, reminders,
+                timezone_name=self.timezone.key,
+            )
             try:
                 provider_id = await asyncio.to_thread(self.sender.send_text, binding["chat_id"], message, message_uuid=item["id"])
             except Exception as exc:

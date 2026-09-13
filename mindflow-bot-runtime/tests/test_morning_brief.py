@@ -43,6 +43,8 @@ def test_morning_brief_template_never_contains_prediction_fields():
         [{"message": "交作业", "risk": "high"}],
     )
     assert "上课" in text and "交作业" in text
+    assert "- 08:30 上课" in text
+    assert "- 08:00 上课" not in text
     assert not any(term in text for term in FORBIDDEN_BRIEF_TERMS)
     assert "high" not in text
 
