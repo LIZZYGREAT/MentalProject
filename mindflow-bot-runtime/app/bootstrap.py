@@ -241,7 +241,9 @@ def build_business_services(
         appraisals=EventAppraisalFeedbackRepository(database),
         learned_profiles=learned_profiles,
     )
-    research_aggregates = ResearchAggregateService(database)
+    research_aggregates = ResearchAggregateService(
+        database, timezone_name=settings.timezone_name
+    )
     # Stage 5 replaces per-EMA refitting with a weekly immutable-snapshot run.
     # The scheduler still consumes the small maybe_calibrate interface.
     profile_calibration = ParameterLearningService(

@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from statistics import mean, median
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -19,7 +20,9 @@ from app.models import (
 )
 
 
-def _range(date_start: str, date_end: str) -> tuple[date, date, datetime, datetime]:
+def _range(
+    date_start: str, date_end: str, project_timezone: ZoneInfo,
+) -> tuple[date, date, datetime, datetime]:
     start = date.fromisoformat(str(date_start))
     end = date.fromisoformat(str(date_end))
     next_month = (
@@ -33,8 +36,10 @@ def _range(date_start: str, date_end: str) -> tuple[date, date, datetime, dateti
     return (
         start,
         end,
-        datetime.combine(start, time.min, timezone.utc),
-        datetime.combine(end + timedelta(days=1), time.min, timezone.utc),
+        datetime.combine(start, time.min, project_timezone).astimezone(timezone.utc),
+        datetime.combine(
+            end + timedelta(days=1), time.min, project_timezone
+        ).astimezone(timezone.utc),
     )
 
 
@@ -43,8 +48,12 @@ def _level(value: float) -> str:
 
 
 class ResearchAggregateService:
-    def __init__(self, database: Any, *, minimum_cohort_size: int = 5) -> None:
+    def __init__(
+        self, database: Any, *, timezone_name: str,
+        minimum_cohort_size: int = 5,
+    ) -> None:
         self.database = database
+        self.timezone = ZoneInfo(timezone_name)
         self.minimum_cohort_size = max(5, int(minimum_cohort_size))
 
     def _suppressed(self, cohort_size: int) -> dict[str, Any] | None:
@@ -77,7 +86,9 @@ class ResearchAggregateService:
         }
 
     def weekly_stress_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
-        start, end, start_at, end_at = _range(date_start, date_end)
+        start, end, start_at, end_at = _range(
+            date_start, date_end, self.timezone
+        )
         with self.database.session() as session:
             rows = session.execute(select(StateObservation).where(
                 StateObservation.observed_at >= start_at,
@@ -104,7 +115,7 @@ class ResearchAggregateService:
         )
 
     def checkin_completion_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
-        start, end, _, _ = _range(date_start, date_end)
+        start, end, _, _ = _range(date_start, date_end, self.timezone)
         with self.database.session() as session:
             schedules = session.execute(select(DailyReviewSchedule).where(
                 DailyReviewSchedule.local_date >= start,
@@ -128,7 +139,9 @@ class ResearchAggregateService:
         )
 
     def intervention_response_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
-        start, end, start_at, end_at = _range(date_start, date_end)
+        start, end, start_at, end_at = _range(
+            date_start, date_end, self.timezone
+        )
         with self.database.session() as session:
             rows = session.execute(select(CareInterventionFeedback).where(
                 CareInterventionFeedback.submitted_at >= start_at,
@@ -145,7 +158,9 @@ class ResearchAggregateService:
         )
 
     def longitudinal_state_distribution(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
-        start, end, start_at, end_at = _range(date_start, date_end)
+        start, end, start_at, end_at = _range(
+            date_start, date_end, self.timezone
+        )
         with self.database.session() as session:
             rows = session.execute(select(ParticipantSlowState).where(
                 ParticipantSlowState.effective_at >= start_at,

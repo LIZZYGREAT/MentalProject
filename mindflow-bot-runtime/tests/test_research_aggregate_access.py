@@ -40,7 +40,9 @@ def _context(*, researcher: bool) -> AgentContext:
 
 def test_research_tools_are_hidden_without_tier_and_scope_and_denied_if_guessed():
     registry = ToolRegistry()
-    ResearchTools(ResearchAggregateService(memory_database())).register(registry)
+    ResearchTools(ResearchAggregateService(
+        memory_database(), timezone_name="Asia/Shanghai"
+    )).register(registry)
     participant_ctx = _context(researcher=False)
     researcher_ctx = _context(researcher=True)
 
@@ -58,7 +60,9 @@ def test_research_tools_are_hidden_without_tier_and_scope_and_denied_if_guessed(
 
 def test_guessed_research_tool_is_rejected_by_backend_authorization():
     registry = ToolRegistry()
-    ResearchTools(ResearchAggregateService(memory_database())).register(registry)
+    ResearchTools(ResearchAggregateService(
+        memory_database(), timezone_name="Asia/Shanghai"
+    )).register(registry)
 
     result = asyncio.run(
         registry.execute(
@@ -83,7 +87,9 @@ def test_stress_aggregate_is_deidentified_and_small_cohorts_are_suppressed():
             {"stress_0_10": index + 3, "private_note": f"secret-{index}"},
             observed_at=datetime(2026, 9, 10, 8, tzinfo=timezone.utc),
         )
-    service = ResearchAggregateService(database, minimum_cohort_size=5)
+    service = ResearchAggregateService(
+        database, timezone_name="Asia/Shanghai", minimum_cohort_size=5
+    )
 
     aggregate = service.weekly_stress_summary("2026-09-07", "2026-09-13")
 
@@ -107,7 +113,7 @@ def test_stress_aggregate_is_deidentified_and_small_cohorts_are_suppressed():
 
 def test_research_aggregate_rejects_sliding_ranges_and_audits_fixed_bucket_queries():
     database = memory_database()
-    service = ResearchAggregateService(database)
+    service = ResearchAggregateService(database, timezone_name="Asia/Shanghai")
     researcher = participant(database, "RESEARCH-AUDITOR")
 
     try:
@@ -130,3 +136,49 @@ def test_research_aggregate_rejects_sliding_ranges_and_audits_fixed_bucket_queri
         assert audit.tool_name == "research_get_weekly_stress_summary"
         assert audit.cohort_size == 0
         assert audit.suppressed is True
+
+
+def test_week_bucket_uses_project_timezone_for_timestamp_boundaries():
+    database = memory_database()
+    observations = ObservationRepository(database)
+    people = [participant(database, f"WEEK-TZ-{index}") for index in range(5)]
+    for person in people:
+        for observed_at in (
+            datetime(2026, 9, 6, 16, 30, tzinfo=timezone.utc),
+            datetime(2026, 9, 13, 15, 59, tzinfo=timezone.utc),
+            datetime(2026, 9, 13, 16, 30, tzinfo=timezone.utc),
+        ):
+            observations.add(
+                person.id, "ema_checkin", {"stress_0_10": 5},
+                observed_at=observed_at,
+            )
+    service = ResearchAggregateService(database, timezone_name="Asia/Shanghai")
+
+    result = service.weekly_stress_summary("2026-09-07", "2026-09-13")
+
+    assert result["suppressed"] is False
+    assert result["cohort_size"] == 5
+    assert result["observation_count"] == 10
+
+
+def test_month_bucket_uses_project_timezone_for_timestamp_boundaries():
+    database = memory_database()
+    observations = ObservationRepository(database)
+    people = [participant(database, f"MONTH-TZ-{index}") for index in range(5)]
+    for person in people:
+        for observed_at in (
+            datetime(2026, 8, 31, 16, 30, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, 15, 59, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, 16, 30, tzinfo=timezone.utc),
+        ):
+            observations.add(
+                person.id, "ema_checkin", {"stress_0_10": 5},
+                observed_at=observed_at,
+            )
+    service = ResearchAggregateService(database, timezone_name="Asia/Shanghai")
+
+    result = service.weekly_stress_summary("2026-09-01", "2026-09-30")
+
+    assert result["suppressed"] is False
+    assert result["cohort_size"] == 5
+    assert result["observation_count"] == 10
