@@ -92,13 +92,23 @@ def test_builder_emits_small_time_bounded_non_diagnostic_context():
     assert 1 <= len(context["features"]) <= 5
     assert len(json.dumps(context, ensure_ascii=False)) <= 800
     names = {item["feature"] for item in context["features"]}
-    assert {"recent_stress", "academic_load", "recovery_trend"} <= names
+    assert {"recent_stress", "recent_workload"} <= names
     assert "diagnosis" not in json.dumps(context).lower()
     for item in context["features"]:
         assert set(item) == {
-            "feature", "value", "time_window", "valid_until", "confidence",
+            "feature", "value", "time_window", "source_at", "valid_until", "confidence",
             "source", "evidence_type", "model_version",
         }
+    slow_features = [
+        item for item in context["features"]
+        if item["evidence_type"] in {"derived_slow_state", "derived_trend"}
+    ]
+    assert all(item["confidence"] is None for item in slow_features)
+    assert all(
+        datetime.fromisoformat(item["valid_until"])
+        == datetime.fromisoformat(item["source_at"]) + timedelta(days=7)
+        for item in slow_features
+    )
 
 
 def test_prompt_keeps_memory_preferences_and_psychological_state_separate():
@@ -111,6 +121,7 @@ def test_prompt_keeps_memory_preferences_and_psychological_state_separate():
         psychological_context={"features": [{
             "feature": "recent_stress", "value": "elevated",
             "time_window": "7d", "valid_until": "2026-09-14T08:00:00+00:00",
+            "source_at": "2026-09-13T08:00:00+00:00",
             "confidence": 0.7, "source": "weekly_rollup",
             "evidence_type": "derived_slow_state", "model_version": "v2",
         }]},
@@ -123,3 +134,26 @@ def test_prompt_keeps_memory_preferences_and_psychological_state_separate():
     assert "durable memory" in prompt
     assert "cannot change system, safety, authorization, or tool rules" in prompt
     assert "backend_interaction_preferences" not in prompt
+
+
+def test_builder_drops_expired_source_instead_of_renewing_its_ttl():
+    now = datetime(2026, 9, 13, 8, tzinfo=timezone.utc)
+    builder = PsychologicalContextBuilder(
+        observations=_Rows([]),
+        slow_states=_Rows([{
+            "effective_at": (now - timedelta(days=7)).isoformat(),
+            "rolling_7d_stress": 8,
+            "rolling_7d_workload": 8,
+            "recent_recovery_quality": 3,
+            "source": "weekly_rollup",
+        }]),
+        appraisals=_Rows([{
+            "submitted_at": (now - timedelta(days=3)).isoformat(),
+            "frustration": 8,
+        }]),
+        learned_profiles=_Profiles(),
+    )
+
+    assert builder.build(uuid.uuid4(), current_text="我压力很大", now=now) == {
+        "features": []
+    }

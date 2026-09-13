@@ -53,22 +53,28 @@ class PsychologicalContextBuilder:
         model_version = str((profile or {}).get("model_version") or "research-state-v1")
         features: list[dict[str, Any]] = []
 
-        slow = [row for row in self.slow_states.history(participant_id, limit=3) if _aware(row["effective_at"]) >= instant - timedelta(days=8)]
+        slow = [
+            row for row in self.slow_states.history(participant_id, limit=3)
+            if _aware(row["effective_at"]) + timedelta(days=7) > instant
+        ]
         if slow:
             latest = slow[0]
+            slow_source_at = _aware(latest["effective_at"])
+            slow_valid_until = slow_source_at + timedelta(days=7)
             if latest.get("rolling_7d_stress") is not None:
                 features.append(self._feature(
                     "recent_stress", _level(float(latest["rolling_7d_stress"])),
-                    window="7d", valid_until=instant + timedelta(hours=24),
-                    confidence=float((profile or {}).get("confidence") or 0.7),
+                    window="7d", source_at=slow_source_at,
+                    valid_until=slow_valid_until, confidence=None,
                     source=latest.get("source") or "participant_slow_state",
                     evidence_type="derived_slow_state", model_version=model_version,
                 ))
             if latest.get("rolling_7d_workload") is not None:
                 features.append(self._feature(
-                    "academic_load", _level(float(latest["rolling_7d_workload"])),
-                    window="7d", valid_until=instant + timedelta(hours=24),
-                    confidence=0.7, source=latest.get("source") or "participant_slow_state",
+                    "recent_workload", _level(float(latest["rolling_7d_workload"])),
+                    window="7d", source_at=slow_source_at,
+                    valid_until=slow_valid_until, confidence=None,
+                    source=latest.get("source") or "participant_slow_state",
                     evidence_type="derived_slow_state", model_version=model_version,
                 ))
             if len(slow) > 1 and latest.get("recent_recovery_quality") is not None and slow[1].get("recent_recovery_quality") is not None:
@@ -78,19 +84,24 @@ class PsychologicalContextBuilder:
                 direction = "improving" if delta > 0.5 else "declining" if delta < -0.5 else "stable"
                 features.append(self._feature(
                     "recovery_trend", direction, window="7d",
-                    valid_until=instant + timedelta(hours=24), confidence=0.65,
+                    source_at=slow_source_at, valid_until=slow_valid_until,
+                    confidence=None,
                     source=latest.get("source") or "participant_slow_state",
                     evidence_type="derived_trend", model_version=model_version,
                 ))
 
-        recent_observations = [row for row in self.observations.recent(participant_id, limit=10) if _aware(row["observed_at"]) >= instant - timedelta(hours=24) and "safety" not in str(row.get("type") or "").casefold() and "protected" not in str(row.get("type") or "").casefold()]
+        recent_observations = [row for row in self.observations.recent(participant_id, limit=10) if _aware(row["observed_at"]) + timedelta(hours=24) > instant and "safety" not in str(row.get("type") or "").casefold() and "protected" not in str(row.get("type") or "").casefold()]
         if recent_observations and len(features) < 5:
-            payload = dict(recent_observations[0].get("payload") or {})
+            observation = recent_observations[0]
+            observation_source_at = _aware(observation["observed_at"])
+            payload = dict(observation.get("payload") or {})
             stress = payload.get("stress") if payload.get("stress") is not None else payload.get("stress_level")
             if isinstance(stress, (int, float)):
                 features.append(self._feature(
                     "current_stress", _level(float(stress)), window="24h",
-                    valid_until=instant + timedelta(hours=24), confidence=1.0,
+                    source_at=observation_source_at,
+                    valid_until=observation_source_at + timedelta(hours=24),
+                    confidence=1.0,
                     source="state_observation", evidence_type="self_report",
                     model_version="observation-v1",
                 ))
@@ -98,13 +109,15 @@ class PsychologicalContextBuilder:
         appraisals = [
             row
             for row in self.appraisals.history(participant_id, limit=5)
-            if _aware(row["submitted_at"]) >= instant - timedelta(days=3)
+            if _aware(row["submitted_at"]) + timedelta(days=3) > instant
         ]
         for row in appraisals[:1]:
             if len(features) < 5 and row.get("frustration") is not None:
+                appraisal_source_at = _aware(row["submitted_at"])
                 features.append(self._feature(
                     "recent_frustration", _level(float(row["frustration"])),
-                    window="3d", valid_until=instant + timedelta(days=1),
+                    window="3d", source_at=appraisal_source_at,
+                    valid_until=appraisal_source_at + timedelta(days=3),
                     confidence=1.0, source="event_appraisal",
                     evidence_type="self_report", model_version=str(row.get("workload_model_version") or "appraisal-v1"),
                 ))
@@ -115,11 +128,15 @@ class PsychologicalContextBuilder:
         return result
 
     @staticmethod
-    def _feature(name: str, value: str, *, window: str, valid_until: datetime, confidence: float, source: str, evidence_type: str, model_version: str) -> dict[str, Any]:
+    def _feature(name: str, value: str, *, window: str, source_at: datetime, valid_until: datetime, confidence: float | None, source: str, evidence_type: str, model_version: str) -> dict[str, Any]:
         return {
             "feature": name, "value": value, "time_window": window,
+            "source_at": source_at.astimezone(timezone.utc).isoformat(),
             "valid_until": valid_until.astimezone(timezone.utc).isoformat(),
-            "confidence": round(max(0.0, min(1.0, confidence)), 3),
+            "confidence": (
+                round(max(0.0, min(1.0, confidence)), 3)
+                if confidence is not None else None
+            ),
             "source": str(source)[:64], "evidence_type": evidence_type,
             "model_version": str(model_version)[:64],
         }
