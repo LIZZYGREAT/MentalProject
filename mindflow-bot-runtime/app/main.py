@@ -704,6 +704,7 @@ async def run() -> None:
         course_default_semester_start_date=settings.course_default_semester_start_date,
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
+            "web_search_enabled": settings.web_search_enabled,
         },
         consent_service=business.consent_service,
         memory_service=business.memory,

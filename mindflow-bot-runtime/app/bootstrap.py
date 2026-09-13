@@ -364,6 +364,7 @@ def build_business_services(
         calendar_mutation_plans=calendar_mutation_plans,
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
+            "web_search_enabled": settings.web_search_enabled,
         },
     )
     care_tools.register(registry)
@@ -394,6 +395,7 @@ def build_business_services(
         ),
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
+            "web_search_enabled": settings.web_search_enabled,
         },
         consent_service=consent_service,
         care_preferences=care_preferences,

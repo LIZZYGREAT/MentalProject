@@ -90,14 +90,37 @@ def test_every_feature_spec_renders_an_overview_and_detail_card():
 
 
 def test_disabled_capability_hides_the_feature_everywhere():
-    keys = visible_feature_keys({"daily_review_enabled": False})
+    keys = visible_feature_keys({
+        "daily_review_enabled": False,
+        "web_search_enabled": False,
+    })
     assert "daily_review" not in keys
+    assert "web_search" not in keys
     overview_actions = [
         value["feature_key"] for value in card_action_values(feature_overview_card(keys))
     ]
     assert "daily_review" not in overview_actions
     assert feature_detail_card("daily_review", keys) is None
+    assert feature_detail_card("web_search", keys) is None
     assert feature_detail_card("daily_review", visible_feature_keys()) is not None
+
+
+def test_overview_contains_all_enabled_participant_features():
+    keys = visible_feature_keys({
+        "daily_review_enabled": True,
+        "web_search_enabled": True,
+    })
+    assert {
+        "morning_brief",
+        "reminder",
+        "web_search",
+        "memory",
+        "interaction_preferences",
+    }.issubset(keys)
+    card = feature_overview_card(keys)
+    rendered = card["body"]["elements"][0]["content"]
+    for title in ("早报", "提醒", "联网搜索", "长期记忆", "表达与支持偏好"):
+        assert title in rendered
 
 
 def test_feature_key_normalization_rejects_unknown_values():
