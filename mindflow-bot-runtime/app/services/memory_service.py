@@ -15,8 +15,12 @@ _FORBIDDEN = re.compile(
     r"(?:token|secret|password|api[_ -]?key|密码|密钥)\s*[:=]",
     re.I,
 )
-_CLINICAL_INFERENCE = re.compile(
-    r"(?:用户|他|她).{0,8}(?:患有|诊断|抑郁症|焦虑症|精神疾病|情绪不稳定)", re.I
+_SENSITIVE_HEALTH_DATA = re.compile(
+    r"(?:抑郁症|焦虑症|双相(?:情感)?(?:障碍)?|躁郁症|精神分裂|精神疾病|"
+    r"自伤风险|自杀风险|自杀倾向|自残倾向|临床筛查|筛查结果|"
+    r"PHQ-?9|GAD-?7|抗抑郁药|抗焦虑药|精神科用药|心理治疗|药物治疗)|"
+    r"(?:我|本人|用户|他|她).{0,12}(?:确诊|诊断为|患有).{0,12}(?:精神|心理|情绪)",
+    re.I,
 )
 
 
@@ -28,8 +32,8 @@ def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
         raise ValueError("unsupported memory type")
     if _FORBIDDEN.search(normalized):
         raise ValueError("memory cannot alter system, safety, authorization, or secrets")
-    if _CLINICAL_INFERENCE.search(normalized):
-        raise ValueError("clinical or psychological inference cannot become durable memory")
+    if _SENSITIVE_HEALTH_DATA.search(normalized):
+        raise ValueError("sensitive clinical or health data cannot become durable memory")
     key = None
     if memory_type == "preferred_name" or re.search(r"(?:叫我|称呼我|我的名字|我叫)", normalized):
         key = "preferred_name"
