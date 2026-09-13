@@ -127,10 +127,10 @@ def _build_card_callback(
 def _build_card_action_handler(
     identity: Any,
     card_actions: Any,
-    sender: Any,
+    sender: Any = None,
     incidents: Any = None,
 ) -> Any:
-    """Build the single business entry shared by WS and HTTP CardAction."""
+    """Build CardAction business execution with optional WS delivery."""
 
     from app.integrations.feishu.cards import card_action_result_card
 
@@ -253,6 +253,8 @@ def _build_card_action_handler(
                 )
 
     def notify_failure(event: Any) -> None:
+        if sender is None:
+            return
         try:
             sender.send_text(event.chat_id, "操作未能完成，请稍后重试。")
         except Exception:
@@ -264,10 +266,12 @@ def _build_card_action_handler(
             )
 
     def notify_card_update_failure(event: Any, *, navigation_only: bool = False) -> None:
+        if sender is None:
+            return
         message = (
             "功能卡暂时没能更新，重新发“功能”即可。"
             if navigation_only
-            else "操作已记录，但卡片状态暂未更新，无需重复提交。"
+            else "操作已经完成，但卡片状态暂未更新，无需重复点击。"
         )
         try:
             sender.send_text(event.chat_id, message)
@@ -360,8 +364,27 @@ def _build_card_action_handler(
                 message=str(result.get("reply_text") or "已提交")
             )
             result = {**result, "card": card}
+        if sender is None:
+            log_stage(
+                event,
+                "card_action_completed",
+                participant_id=participant.id,
+                result_ok=True,
+                navigation_only=navigation_only,
+            )
+            return result
         try:
-            sender.update_card(event.message_id, card)
+            update_from_callback = getattr(
+                sender, "update_card_from_callback", None
+            )
+            if callable(update_from_callback):
+                update_from_callback(
+                    getattr(event, "callback_token", None),
+                    event.message_id,
+                    card,
+                )
+            else:
+                sender.update_card(event.message_id, card)
         except Exception as exc:
             update_error_id = uuid.uuid4().hex
             provider_error_code = getattr(exc, "code", None)
@@ -379,14 +402,40 @@ def _build_card_action_handler(
             )
             record_failure(
                 event,
-                event_name="card_action_card_update_failed_after_commit",
+                event_name=(
+                    "card_action_navigation_update_failed"
+                    if navigation_only
+                    else "card_action_update_failed_after_commit"
+                ),
                 summary="CardAction succeeded but source card update failed",
-                error_code="card_update_failed_after_commit",
+                error_code=(
+                    "navigation_update_failed"
+                    if navigation_only
+                    else "card_update_failed_after_commit"
+                ),
                 error_class=type(exc).__name__,
                 participant_id=participant.id,
                 error_id=update_error_id,
                 provider_error_code=provider_error_code,
             )
+            if not bool(getattr(exc, "replacement_allowed", False)):
+                notify_card_update_failure(event, navigation_only=navigation_only)
+                completed = {
+                    **result,
+                    "card_update_ok": False,
+                    "card_replacement_ok": False,
+                    "error_id": update_error_id,
+                }
+                log_stage(
+                    event,
+                    "card_action_completed",
+                    participant_id=participant.id,
+                    result_ok=True,
+                    navigation_only=navigation_only,
+                    card_update_ok=False,
+                    error_id=update_error_id,
+                )
+                return completed
             try:
                 sender.send_card(
                     event.chat_id,
@@ -673,6 +722,9 @@ async def run() -> None:
     handle_card_action = _build_card_action_handler(
         identity, business.card_actions, sender, incidents
     )
+    execute_card_action = _build_card_action_handler(
+        identity, business.card_actions, None, incidents
+    )
     sender, gateway = _build_bot_transport(
         settings,
         identity,
@@ -725,7 +777,7 @@ async def run() -> None:
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image
     )
-    card_callback = _build_card_callback(settings, handle_card_action)
+    card_callback = _build_card_callback(settings, execute_card_action)
     card_action_transport_available = _card_action_transport_available(
         settings, card_callback
     )

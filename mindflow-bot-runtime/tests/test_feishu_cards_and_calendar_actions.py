@@ -355,11 +355,12 @@ def test_card_callback_server_exposes_only_configured_callback_and_health_routes
         event = handled[0]
         assert event.message_id == "om-card"
         assert event.action_value["mindflow_action"] == "submit_checkin"
+        assert event.callback_token == "update-token"
 
     asyncio.run(verify_url_challenge())
 
 
-def test_http_card_callback_stays_successful_when_source_card_update_fails():
+def test_http_card_callback_returns_card_without_active_message_patch():
     participant = SimpleNamespace(id="participant-1")
     replacement_card = {
         "schema": "2.0",
@@ -404,7 +405,7 @@ def test_http_card_callback_stays_successful_when_source_card_update_fails():
     handler = app_main._build_card_action_handler(
         SimpleNamespace(resolve=lambda *_args: participant),
         card_actions,
-        sender,
+        None,
         incidents,
     )
     server = FeishuCardCallbackServer(
@@ -479,16 +480,9 @@ def test_http_card_callback_stays_successful_when_source_card_update_fails():
         "data": replacement_card,
     }
     assert card_actions.calls == 1
-    assert sender.update_calls == 1
-    assert sender.messages == [
-        (
-            "oc-chat",
-            "操作已记录，但卡片状态暂未更新，无需重复提交。",
-        )
-    ]
-    assert incidents.records[0]["event_name"] == (
-        "card_action_card_update_failed_after_commit"
-    )
+    assert sender.update_calls == 0
+    assert sender.messages == []
+    assert incidents.records == []
 
 
 def test_recurrence_builder_exposes_only_reviewed_rfc5545_subset():
@@ -601,6 +595,49 @@ def test_feishu_client_updates_interactive_card():
     assert client.update_card("om-card", card) is None
     assert requests[0].message_id == "om-card"
     assert json.loads(requests[0].request_body.content) == card
+
+
+def test_feishu_client_prefers_callback_token_without_message_patch():
+    delayed_requests = []
+
+    class Messages:
+        def patch(self, _request):
+            raise AssertionError("message.patch must not run when callback token exists")
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(success=lambda: True)
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    client.update_card_from_callback("callback-token", "om-card", card)
+
+    assert len(delayed_requests) == 1
+    assert delayed_requests[0].uri == "/open-apis/interactive/v1/card/update"
+    assert delayed_requests[0].body == {"token": "callback-token", "card": card}
+
+
+def test_feishu_client_uses_message_patch_without_callback_token():
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    client.update_card_from_callback(None, "om-card", {"schema": "2.0"})
+    assert patched == ["om-card"]
 
 
 def test_feishu_client_update_card_surfaces_error():

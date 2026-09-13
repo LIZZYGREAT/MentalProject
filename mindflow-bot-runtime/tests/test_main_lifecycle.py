@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import main as app_main
+from app.integrations.feishu.client import FeishuSendError
 
 
 def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
@@ -90,6 +91,7 @@ def _card_action_event():
         action_tag="button",
         action_value={"mindflow_action": "submit_checkin"},
         form_value={},
+        callback_token="callback-token",
     )
 
 
@@ -123,6 +125,40 @@ def test_card_action_handler_updates_original_card_after_success():
     assert result["card_update_ok"] is True
     assert card_actions.calls == 1
     assert sender.updated == [("om-card", result["card"])]
+
+
+def test_card_action_handler_uses_callback_token_for_single_delayed_update():
+    participant = SimpleNamespace(id="participant-1")
+
+    class Sender:
+        def __init__(self):
+            self.delayed = []
+
+        def update_card_from_callback(self, token, message_id, card):
+            self.delayed.append((token, message_id, card))
+
+        def update_card(self, _message_id, _card):
+            raise AssertionError("direct message patch must not also run")
+
+    sender = Sender()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        SimpleNamespace(
+            handle=lambda *_args, **_kwargs: {
+                "ok": True,
+                "reply_text": "已记录",
+                "card": {"schema": "2.0"},
+            }
+        ),
+        sender,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["card_update_ok"] is True
+    assert sender.delayed == [
+        ("callback-token", "om-card", {"schema": "2.0"})
+    ]
 
 
 def test_card_action_handler_keeps_success_when_card_update_fails_after_commit():
@@ -175,11 +211,11 @@ def test_card_action_handler_keeps_success_when_card_update_fails_after_commit()
     assert sender.messages == [
         (
             "oc-chat",
-            "操作已记录，但卡片状态暂未更新，无需重复提交。",
+            "操作已经完成，但卡片状态暂未更新，无需重复点击。",
         )
     ]
     assert incidents.records[0]["event_name"] == (
-        "card_action_card_update_failed_after_commit"
+        "card_action_update_failed_after_commit"
     )
     assert incidents.records[0]["error_code"] == "card_update_failed_after_commit"
 
@@ -207,7 +243,11 @@ def test_card_action_handler_uses_idempotent_replacement_card_after_patch_failur
             self.messages = []
 
         def update_card(self, _message_id, _card):
-            raise RuntimeError("card patch failed")
+            raise FeishuSendError(
+                "card patch failed",
+                operation="update_card",
+                replacement_allowed=True,
+            )
 
         def send_card(self, chat_id, card, *, message_uuid=None):
             self.cards.append((chat_id, card, message_uuid))

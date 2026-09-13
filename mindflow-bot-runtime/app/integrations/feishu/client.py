@@ -95,6 +95,51 @@ class FeishuClient:
                 replacement_allowed=code in {230003, 230006},
             )
 
+    def update_card_from_callback(
+        self,
+        callback_token: str | None,
+        message_id: str,
+        card: dict[str, Any],
+    ) -> None:
+        """Update a callback card exactly once using the strongest target."""
+
+        normalized_token = str(callback_token or "").strip()
+        if not normalized_token:
+            self.update_card(message_id, card)
+            return
+        if not isinstance(card, dict) or not card:
+            raise ValueError("Feishu card must be a non-empty object")
+
+        from lark_oapi.core.enum import AccessTokenType, HttpMethod
+        from lark_oapi.core.model import BaseRequest
+
+        request = (
+            BaseRequest.builder()
+            .http_method(HttpMethod.POST)
+            .uri("/open-apis/interactive/v1/card/update")
+            .token_types({AccessTokenType.TENANT})
+            .body({"token": normalized_token, "card": card})
+            .build()
+        )
+        try:
+            response = self._client.request(request)
+        except Exception as exc:
+            raise FeishuSendError(
+                "Feishu delayed card update request failed",
+                operation="update_card_from_callback",
+            ) from exc
+        if not response or not response.success():
+            code = getattr(response, "code", None)
+            raise FeishuSendError(
+                str(getattr(response, "msg", "Feishu delayed card update failed")),
+                code=code,
+                retryable=code not in {230001, 99991672},
+                operation="update_card_from_callback",
+                # A callback-token failure does not establish that creating a
+                # second message is safe or useful.
+                replacement_allowed=False,
+            )
+
     def upload_image(self, png_bytes: bytes) -> str:
         if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:
             raise ValueError("Feishu image upload requires non-empty bytes")

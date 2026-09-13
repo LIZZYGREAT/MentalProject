@@ -443,7 +443,7 @@ def test_navigation_update_failure_uses_navigation_copy_not_commit_copy():
     handler, sender, event = build({"ok": True, "reply_text": "已记录"})
     handler(event)
     assert sender.messages == [
-        ("oc-chat", "操作已记录，但卡片状态暂未更新，无需重复提交。")
+        ("oc-chat", "操作已经完成，但卡片状态暂未更新，无需重复点击。")
     ]
 
 
