@@ -22,6 +22,14 @@ _SENSITIVE_HEALTH_DATA = re.compile(
     r"(?:我|本人|用户|他|她).{0,12}(?:确诊|诊断为|患有).{0,12}(?:精神|心理|情绪)",
     re.I,
 )
+_STRUCTURED_PREFERENCE_REQUEST = re.compile(
+    r"(?:以后|请|希望你|你要|回答时).{0,20}(?:回答|回复|表达|语气|建议|听我说|"
+    r"关心我|跟进|提醒).{0,20}(?:短|简洁|详细|直接|温和|先问|先听|不要|最多|主动)|"
+    r"(?:以后|请).{0,8}(?:直接|温和|简短|详细).{0,8}(?:一点|回复|回答)|"
+    r"(?:先问我.{0,8}(?:要不要|想不想).{0,6}建议|先听我说完|"
+    r"压力大时别一次给很多建议)",
+    re.I,
+)
 
 
 def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
@@ -34,6 +42,8 @@ def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
         raise ValueError("memory cannot alter system, safety, authorization, or secrets")
     if _SENSITIVE_HEALTH_DATA.search(normalized):
         raise ValueError("sensitive clinical or health data cannot become durable memory")
+    if _STRUCTURED_PREFERENCE_REQUEST.search(normalized):
+        raise ValueError("interaction or support preferences cannot become durable memory")
     key = None
     if memory_type == "preferred_name" or re.search(r"(?:叫我|称呼我|我的名字|我叫)", normalized):
         key = "preferred_name"

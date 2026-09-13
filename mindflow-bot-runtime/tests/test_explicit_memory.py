@@ -60,6 +60,21 @@ def test_memory_validator_rejects_authorization_and_clinical_inference():
             raise AssertionError(f"unsafe memory accepted: {content}")
 
 
+def test_memory_validator_routes_structured_preferences_out_of_memory():
+    for content in (
+        "以后回答短一点",
+        "以后直接一点回复我",
+        "先问我要不要建议",
+        "我压力大时别一次给很多建议",
+    ):
+        try:
+            normalize_memory(content, "context")
+        except ValueError as exc:
+            assert "preferences" in str(exc)
+        else:
+            raise AssertionError(f"preference-shaped memory accepted: {content}")
+
+
 def test_clear_all_is_participant_scoped():
     database = memory_database()
     first = participant(database, "MEMORY-3")
