@@ -1,5 +1,7 @@
 """Fast schema checks for fixed interactive Feishu card builders."""
 
+from app.card_actions.registry import card_action_spec
+
 from app.integrations.feishu.cards import (
     course_schedule_context_card,
     course_schedule_item_time_card,
@@ -36,8 +38,13 @@ def _assert_callback_contract(element):
         callback_values.append(element["value"])
     for value in callback_values:
         assert isinstance(value, dict)
-        assert str(value.get("mindflow_action") or "").strip()
-        assert str(value.get("version") or "").strip()
+        action_name = str(value.get("mindflow_action") or "").strip()
+        version = str(value.get("version") or "").strip()
+        assert action_name
+        assert version
+        spec = card_action_spec(action_name)
+        assert spec is not None, action_name
+        assert version in spec.versions, (action_name, version)
 
 
 def _assert_card_contract(card):

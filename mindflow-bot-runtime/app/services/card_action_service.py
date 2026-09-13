@@ -251,6 +251,13 @@ class CardActionService:
     ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        from app.card_actions.registry import card_action_spec
+
+        spec = card_action_spec(action_name)
+        if spec is None:
+            return {"ok": False, "error": "unsupported_card_action"}
+        if str(action.get("version") or "") not in spec.versions:
+            return {"ok": False, "error": "unsupported_card_action_version"}
         if action_name in {
             "preference_settings_save", "support_acknowledge_first",
             "support_followup_disable",

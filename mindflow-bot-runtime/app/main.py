@@ -135,32 +135,12 @@ def _build_card_action_handler(
     """Build CardAction business execution with optional WS delivery."""
 
     from app.integrations.feishu.cards import card_action_result_card
-
-    allowed_action_names = {
-        "calendar_delete_cancel", "calendar_delete_confirm",
-        "calendar_mutation_plan_cancel", "calendar_mutation_plan_confirm",
-        "course_schedule_import_cancel", "course_schedule_import_confirm",
-        "course_schedule_import_context_open",
-        "course_schedule_import_context_submit",
-        "course_schedule_item_time_open", "course_schedule_item_time_submit",
-        "daily_review_submit", "external_llm_consent_accept",
-        "external_llm_consent_decline", "external_llm_consent_details_open",
-        "external_llm_consent_prompt_open", "external_llm_consent_revoke",
-        "external_llm_consent_status_open", "feature_back", "feature_open",
-        "memory_center_refresh", "memory_clear_confirm", "memory_clear_prompt",
-        "memory_delete_confirm", "memory_delete_prompt", "memory_detail_open",
-        "memory_edit_open", "memory_edit_save", "morning_brief_pause_week",
-        "morning_brief_time_update", "morning_brief_toggle",
-        "preference_settings_save", "request_checkin", "submit_checkin",
-        "support_acknowledge_first", "support_followup_disable",
-        "view_calendar_date", "view_today_calendar",
-        "care_ack", "care_disable_type", "care_helpful", "care_mute_today",
-        "care_not_relevant", "care_snooze_30",
-    }
+    from app.card_actions.delivery import card_update_failure_policy
+    from app.card_actions.registry import card_action_spec
 
     def safe_action_name(event: Any) -> str | None:
         candidate = str((event.action_value or {}).get("mindflow_action") or "")
-        return candidate if candidate in allowed_action_names else None
+        return candidate if card_action_spec(candidate) is not None else None
 
     def replacement_message_uuid(event_id: str) -> str:
         digest = hashlib.sha256(
@@ -440,7 +420,11 @@ def _build_card_action_handler(
             )
             return {**result, "error_id": error_id}
 
-        navigation_only = bool(result.get("navigation_only"))
+        spec = card_action_spec(safe_action_name(event))
+        navigation_only = bool(
+            result.get("navigation_only")
+            or (spec is not None and spec.kind == "navigation")
+        )
         log_stage(
             event,
             "card_action_business_succeeded",
@@ -485,7 +469,8 @@ def _build_card_action_handler(
                 sender.update_card(event.message_id, card)
         except Exception as exc:
             update_error_id = uuid.uuid4().hex
-            provider_error_code = getattr(exc, "code", None)
+            failure_policy = card_update_failure_policy(exc)
+            provider_error_code = failure_policy.provider_error_code
             log_stage(
                 event,
                 "card_action_update_failed",
@@ -516,7 +501,7 @@ def _build_card_action_handler(
                 error_id=update_error_id,
                 provider_error_code=provider_error_code,
             )
-            if not bool(getattr(exc, "replacement_allowed", False)):
+            if not failure_policy.replacement_allowed:
                 notify_card_update_failure(event, navigation_only=navigation_only)
                 completed = {
                     **result,
