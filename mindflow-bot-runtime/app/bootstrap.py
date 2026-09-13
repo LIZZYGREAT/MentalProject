@@ -24,6 +24,7 @@ from app.repositories import (
     ParticipantSlowStateRepository,
     EventAppraisalFeedbackRepository,
     WarningScheduleRepository,
+    RuntimeIncidentRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.repositories_daily_review import (
@@ -342,6 +343,7 @@ def build_business_services(
         )
     registry = ToolRegistry(
         runs,
+        incidents=RuntimeIncidentRepository(database),
         mutation_verifier=mutation_verifier,
         sync_max_concurrency=settings.tool_sync_max_concurrency,
     )

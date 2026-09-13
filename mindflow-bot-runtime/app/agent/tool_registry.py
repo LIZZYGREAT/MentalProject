@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
@@ -15,6 +17,9 @@ from app.services.mutation_intent_verifier import (
     MutationIntentVerifier,
     redact_sensitive_text,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 FORBIDDEN_FIELDS = {
@@ -133,7 +138,10 @@ def _safe_summary(value: Any, depth: int = 0) -> Any:
         return {
             str(key): "[redacted]"
             if str(key).lower() in FORBIDDEN_FIELDS
-            or str(key).lower().endswith(("_id", "_ids"))
+            or (
+                str(key).lower() != "error_id"
+                and str(key).lower().endswith(("_id", "_ids"))
+            )
             else _safe_summary(child, depth + 1)
             for key, child in list(value.items())[:30]
         }
@@ -225,11 +233,13 @@ class ToolRegistry:
         self,
         runs: AgentRunRepository | None = None,
         *,
+        incidents: Any = None,
         mutation_verifier: MutationIntentVerifier | None = None,
         sync_max_concurrency: int = 8,
     ):
         self._tools: dict[str, ToolSpec] = {}
         self.runs = runs
+        self.incidents = incidents
         self.mutation_verifier = mutation_verifier
         self._sync_slots = asyncio.Semaphore(max(1, int(sync_max_concurrency)))
 
@@ -624,8 +634,23 @@ class ToolRegistry:
                 reason_code,
             )
             return ToolExecution(safe, "succeeded")
-        except Exception:
-            result = {"ok": False, "error": "tool_exception"}
+        except Exception as exc:
+            error_id = uuid.uuid4().hex
+            result = {
+                "ok": False,
+                "error": "tool_exception",
+                "reason_code": "internal_tool_error",
+                "error_id": error_id,
+            }
+            logger.exception(
+                "agent_tool_execution_failed error_id=%s agent_run_id=%s "
+                "tool_name=%s participant_id=%s error_class=%s",
+                error_id,
+                ctx.agent_run_id,
+                name,
+                ctx.participant_id,
+                type(exc).__name__,
+            )
             await self._log(
                 ctx,
                 name,
@@ -634,9 +659,53 @@ class ToolRegistry:
                 result,
                 "tool_exception",
                 authorization_decision,
-                reason_code,
+                "internal_tool_error",
+            )
+            await self._record_tool_incident(
+                ctx,
+                name=name,
+                error_id=error_id,
+                error_class=type(exc).__name__,
             )
             return ToolExecution(result, "tool_exception")
+
+    async def _record_tool_incident(
+        self,
+        ctx: AgentContext,
+        *,
+        name: str,
+        error_id: str,
+        error_class: str,
+    ) -> None:
+        if self.incidents is None:
+            return
+        try:
+            async with self._sync_slots:
+                await asyncio.to_thread(
+                    self.incidents.record,
+                    severity="error",
+                    subsystem="agent_tool",
+                    event_name="tool_execution_failed",
+                    summary="A participant-bound agent tool failed internally.",
+                    participant_id=ctx.participant_id,
+                    error_code="internal_tool_error",
+                    error_class=error_class,
+                    details={
+                        "error_id": error_id,
+                        "agent_run_id": str(ctx.agent_run_id),
+                        "tool_name": str(name)[:128],
+                        "error_class": str(error_class)[:128],
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "agent_tool_incident_record_failed error_id=%s agent_run_id=%s "
+                "tool_name=%s participant_id=%s",
+                error_id,
+                ctx.agent_run_id,
+                name,
+                ctx.participant_id,
+            )
 
     async def _log(
         self,

@@ -396,6 +396,71 @@ def test_sdk_mcp_emits_failed_lifecycle_without_sensitive_payloads():
     ]
     assert all(not hasattr(event, "arguments") for event in activities)
     assert "private argument" not in repr(activities)
+    payload = json.loads(response["content"][0]["text"])
+    assert payload["error"] == "tool_exception"
+    assert payload["reason_code"] == "internal_tool_error"
+    assert len(payload["error_id"]) == 32
+    assert "secret raw result" not in repr(payload)
+
+
+def test_unknown_tool_exception_correlates_audit_log_and_runtime_incident(caplog):
+    class Runs:
+        def __init__(self):
+            self.calls = []
+
+        def tool_call(self, *args):
+            self.calls.append(args)
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    runs = Runs()
+    incidents = Incidents()
+    registry = ToolRegistry(runs, incidents=incidents)
+
+    def handler(_ctx, _args):
+        raise RuntimeError("private database detail")
+
+    registry.register(
+        "safe_tool",
+        "safe",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        handler,
+        effect="read",
+        authorization_requirement="none",
+    )
+    ctx = AgentContext(uuid.uuid4(), "P001", "ou", "oc", "msg", uuid.uuid4())
+
+    with caplog.at_level("ERROR"):
+        execution = asyncio.run(registry.execute(ctx, "safe_tool", {}))
+
+    error_id = execution.result["error_id"]
+    assert execution.status == "tool_exception"
+    assert runs.calls[0][4] == "tool_exception"
+    audit_result = runs.calls[0][3]["result"]
+    assert audit_result["reason_code"] == "internal_tool_error"
+    assert audit_result["error_id"] == error_id
+    assert incidents.records == [{
+        "severity": "error",
+        "subsystem": "agent_tool",
+        "event_name": "tool_execution_failed",
+        "summary": "A participant-bound agent tool failed internally.",
+        "participant_id": ctx.participant_id,
+        "error_code": "internal_tool_error",
+        "error_class": "RuntimeError",
+        "details": {
+            "error_id": error_id,
+            "agent_run_id": str(ctx.agent_run_id),
+            "tool_name": "safe_tool",
+            "error_class": "RuntimeError",
+        },
+    }]
+    assert error_id in caplog.text
+    assert "agent_tool_execution_failed" in caplog.text
 
 
 def test_all_production_tool_schemas_are_closed_and_identity_free():
