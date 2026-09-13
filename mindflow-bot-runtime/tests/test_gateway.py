@@ -491,6 +491,8 @@ def test_receiver_card_action_emits_ipc_envelope():
     while not output.empty():
         envelopes.append(output.get_nowait())
     card_envelope = next(item for item in envelopes if item["kind"] == "card_action")
+    received_monotonic = card_envelope["payload"].pop("received_monotonic")
+    assert received_monotonic > 0
     assert card_envelope["payload"] == {
         "event_id": "card-provider-1",
         "message_id": "om-card",

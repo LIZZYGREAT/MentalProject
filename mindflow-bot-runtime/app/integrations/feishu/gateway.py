@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import multiprocessing
+import time
 from queue import Empty
 from typing import Any, Callable, Mapping
 
@@ -155,6 +156,7 @@ class CardActionEvent:
     action_value: dict[str, Any]
     form_value: dict[str, Any]
     callback_token: str | None = None
+    received_monotonic: float | None = None
 
     def to_ipc_payload(self) -> dict[str, Any]:
         """Return the SDK-free CardAction contract shared with the receiver."""
@@ -171,6 +173,8 @@ class CardActionEvent:
         }
         if self.callback_token:
             payload["callback_token"] = self.callback_token
+        if self.received_monotonic is not None:
+            payload["received_monotonic"] = self.received_monotonic
         return payload
 
     @classmethod
@@ -183,6 +187,17 @@ class CardActionEvent:
             raise InvalidBotEvent("card action IPC event is missing routing fields")
         if not isinstance(action_value, dict) or not isinstance(form_value, dict):
             raise InvalidBotEvent("card action IPC values must be objects")
+        raw_received_monotonic = payload.get("received_monotonic")
+        try:
+            received_monotonic = (
+                float(raw_received_monotonic)
+                if raw_received_monotonic is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise InvalidBotEvent(
+                "card action IPC monotonic timestamp is invalid"
+            ) from exc
         return cls(
             event_id=values["event_id"],
             message_id=values["message_id"],
@@ -195,6 +210,7 @@ class CardActionEvent:
             callback_token=(
                 str(payload.get("callback_token") or "").strip() or None
             ),
+            received_monotonic=received_monotonic,
         )
 
 
@@ -265,6 +281,7 @@ class FeishuCardActionAdapter:
             action_value=dict(value),
             form_value=dict(form_value),
             callback_token=str(callback_token or "").strip() or None,
+            received_monotonic=time.monotonic(),
         )
 
 
@@ -783,9 +800,15 @@ class FeishuGateway:
                     continue
                 logger.info(
                     "feishu_gateway_ipc_card_action_received "
-                    "event_id=%s message_id=%s",
+                    "event_id=%s message_id=%s ipc_queue_delay_ms=%.3f",
                     event.event_id,
                     event.message_id,
+                    max(
+                        0.0,
+                        (time.monotonic() - event.received_monotonic) * 1000,
+                    )
+                    if event.received_monotonic is not None
+                    else 0.0,
                 )
                 if self.card_action_handler is None:
                     logger.warning(

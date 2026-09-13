@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import signal
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -183,6 +184,9 @@ def _build_card_action_handler(
         provider_error_code: Any = None,
         error_class: str | None = None,
         error_id: str | None = None,
+        business_latency_ms: float | None = None,
+        card_update_latency_ms: float | None = None,
+        total_card_action_latency_ms: float | None = None,
         exc_info: bool = False,
     ) -> None:
         logging.getLogger(__name__).log(
@@ -191,7 +195,8 @@ def _build_card_action_handler(
                 "%s event_id=%s message_id=%s action_name=%s "
                 "participant_id=%s result_ok=%s navigation_only=%s "
                 "card_update_ok=%s provider_error_code=%s error_class=%s "
-                "error_id=%s"
+                "error_id=%s business_latency_ms=%s card_update_latency_ms=%s "
+                "total_card_action_latency_ms=%s"
             ),
             stage,
             event.event_id,
@@ -204,6 +209,9 @@ def _build_card_action_handler(
             provider_error_code,
             error_class,
             error_id,
+            business_latency_ms,
+            card_update_latency_ms,
+            total_card_action_latency_ms,
             exc_info=exc_info,
         )
 
@@ -290,6 +298,8 @@ def _build_card_action_handler(
             )
 
     def handle_card_action(event: Any) -> dict[str, Any]:
+        total_started = time.monotonic()
+        business_started = total_started
         participant = None
         receipt_fingerprint = None
         receipt_claimed = False
@@ -319,7 +329,7 @@ def _build_card_action_handler(
                 if claim.outcome == "replay":
                     log_stage(
                         event,
-                        "card_action_receipt_replayed",
+                        "card_action_duplicate_replayed",
                         participant_id=participant.id,
                         result_ok=claim.status == "succeeded",
                     )
@@ -431,6 +441,7 @@ def _build_card_action_handler(
             participant_id=participant.id,
             result_ok=True,
             navigation_only=navigation_only,
+            business_latency_ms=(time.monotonic() - business_started) * 1000,
         )
 
         card = result.get("card")
@@ -455,6 +466,7 @@ def _build_card_action_handler(
                 navigation_only=navigation_only,
             )
             return result
+        update_started = time.monotonic()
         try:
             update_from_callback = getattr(
                 sender, "update_card_from_callback", None
@@ -481,6 +493,8 @@ def _build_card_action_handler(
                 provider_error_code=provider_error_code,
                 error_class=type(exc).__name__,
                 error_id=update_error_id,
+                card_update_latency_ms=(time.monotonic() - update_started) * 1000,
+                total_card_action_latency_ms=(time.monotonic() - total_started) * 1000,
                 exc_info=True,
             )
             record_failure(
@@ -586,6 +600,8 @@ def _build_card_action_handler(
             result_ok=True,
             navigation_only=navigation_only,
             card_update_ok=True,
+            card_update_latency_ms=(time.monotonic() - update_started) * 1000,
+            total_card_action_latency_ms=(time.monotonic() - total_started) * 1000,
         )
         completed = {**result, "card_update_ok": True}
         log_stage(

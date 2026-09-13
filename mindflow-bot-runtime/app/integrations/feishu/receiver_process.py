@@ -165,7 +165,6 @@ def receiver_process_main(
 
         if card_action_enabled:
             def enqueue_card_action(event: Any) -> None:
-                started = time.monotonic()
                 output_queue.put(
                     {"kind": "card_action", "payload": event.to_ipc_payload()}
                 )
@@ -174,7 +173,14 @@ def receiver_process_main(
                     "message_id=%s receiver_ack_ms=%.3f",
                     event.event_id,
                     event.message_id,
-                    (time.monotonic() - started) * 1000,
+                    max(
+                        0.0,
+                        (
+                            time.monotonic()
+                            - (event.received_monotonic or time.monotonic())
+                        )
+                        * 1000,
+                    ),
                 )
 
             def on_card_action(card_action: Any) -> None:
@@ -218,6 +224,9 @@ def receiver_process_main(
                         return P2CardActionTriggerResponse(
                             {"toast": {"type": "error", "content": "操作无法识别，请刷新后重试。"}}
                         )
+                    except Exception:
+                        logger.exception("card_action_callback_ack_failed")
+                        raise
                     return P2CardActionTriggerResponse(
                         {"toast": {"type": "info", "content": "处理中…"}}
                     )
