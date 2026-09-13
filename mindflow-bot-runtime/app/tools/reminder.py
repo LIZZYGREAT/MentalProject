@@ -285,8 +285,12 @@ class ReminderTools:
         submitted = datetime.fromisoformat(raw)
         if submitted.tzinfo is None:
             submitted = submitted.replace(tzinfo=self.timezone)
-        _, remind_at = resolved
-        if submitted.astimezone(timezone.utc) != remind_at.astimezone(timezone.utc):
+        grounding, remind_at = resolved
+        if (
+            grounding.kind == "absolute"
+            and submitted.astimezone(timezone.utc)
+            != remind_at.astimezone(timezone.utc)
+        ):
             return {
                 "ok": False,
                 "error": "reminder_time_not_grounded",

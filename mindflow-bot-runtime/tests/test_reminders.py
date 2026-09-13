@@ -270,8 +270,8 @@ def test_reminder_tool_persists_only_backend_grounded_absolute_time():
     assert store.created[0][2].isoformat() == "2026-09-14T15:00:00+08:00"
 
 
-def test_reminder_tool_persists_only_backend_grounded_relative_time():
-    received_at = datetime(2026, 9, 13, 2, 15, tzinfo=timezone.utc)
+def test_relative_reminder_ignores_agent_execution_delay_and_lost_seconds():
+    received_at = datetime(2026, 9, 13, 8, 0, 8, tzinfo=timezone.utc)
     ctx = AgentContext(
         participant_id=uuid.uuid4(), participant_code="P", open_id="open",
         chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
@@ -281,15 +281,18 @@ def test_reminder_tool_persists_only_backend_grounded_relative_time():
     tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
 
     accepted = tools.create(ctx, {
-        "message": "喝水", "remind_at": "2026-09-13T03:15:00Z",
+        "message": "喝水", "remind_at": "2026-09-13T17:00:20+08:00",
         "recurrence_type": "none",
     })
-    rejected = tools.create(ctx, {
-        "message": "喝水", "remind_at": "2026-09-13T04:15:00Z",
+    minute_precision = tools.create(ctx, {
+        "message": "喝水", "remind_at": "2026-09-13T17:00:00+08:00",
         "recurrence_type": "none",
     })
 
     assert accepted["ok"] is True
-    assert rejected["error"] == "reminder_time_not_grounded"
-    assert len(store.created) == 1
-    assert store.created[0][2] == received_at + timedelta(hours=1)
+    assert minute_precision["ok"] is True
+    assert len(store.created) == 2
+    assert all(
+        created[2] == received_at + timedelta(hours=1)
+        for created in store.created
+    )
