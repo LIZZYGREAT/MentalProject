@@ -3,6 +3,11 @@
 from app.card_actions.registry import card_action_spec
 
 from app.integrations.feishu.cards import (
+    calendar_delete_confirmation_card,
+    calendar_mutation_plan_confirmation_card,
+    care_intervention_card,
+    course_schedule_preview_card,
+    course_schedule_result_card,
     course_schedule_context_card,
     course_schedule_item_time_card,
     daily_checkin_card,
@@ -11,11 +16,22 @@ from app.integrations.feishu.cards import (
     external_llm_consent_details_card,
     external_llm_consent_status_card,
     memory_clear_all_confirmation_card,
+    memory_center_card,
     memory_delete_confirmation_card,
+    memory_detail_card,
     memory_edit_card,
     morning_brief_settings_card,
     preference_settings_card,
+    pressure_curve_card,
+    today_calendar_card,
 )
+from app.presentation.feature_cards import (
+    feature_detail_card,
+    feature_overview_card,
+    onboarding_welcome_card,
+    visible_feature_keys,
+)
+from app.services.curve_analysis import analyze_curve
 
 
 def _walk(value):
@@ -66,6 +82,110 @@ def _assert_card_contract(card):
                 )
 
 
+def _reviewed_interactive_cards():
+    import_id = "00000000-0000-0000-0000-000000000001"
+    item_id = "00000000-0000-0000-0000-000000000002"
+    context_draft = {
+        "id": import_id,
+        "status": "pending_context",
+        "structured_result": {"missing_context": ["semester_start_date"]},
+        "items": [{
+            "id": item_id,
+            "course_name": "测试课程",
+            "start_time": "08:00",
+            "end_time": "09:00",
+        }],
+    }
+    confirmation_draft = {
+        "id": import_id,
+        "status": "pending_confirmation",
+        "structured_result": {"courses": [], "missing_context": []},
+        "items": [],
+    }
+    memory = {
+        "id": "00000000-0000-0000-0000-000000000003",
+        "memory_type": "preference",
+        "content": "测试记忆",
+    }
+    analysis = analyze_curve([
+        {"time": "09:00", "stress_0_10": 4.0, "vitality_0_10": 6.0}
+    ])
+    feature_cards = {
+        "feature_overview": feature_overview_card(),
+        "onboarding_welcome": onboarding_welcome_card(),
+        **{
+            f"feature_detail_{key}": feature_detail_card(key)
+            for key in visible_feature_keys()
+        },
+    }
+    return {
+        "course_schedule_context": course_schedule_context_card(context_draft),
+        "course_schedule_item_time": course_schedule_item_time_card(
+            context_draft, item_id
+        ),
+        "course_schedule_preview_context": course_schedule_preview_card(
+            context_draft
+        ),
+        "course_schedule_preview_confirmation": course_schedule_preview_card(
+            confirmation_draft
+        ),
+        "course_schedule_retry": course_schedule_result_card(
+            "请重试",
+            status="partial_failed",
+            import_id=import_id,
+            error="calendar_not_connected",
+            recurrence_strategy="preserve_schedule_pattern",
+        ),
+        "daily_checkin": daily_checkin_card(),
+        "daily_review": daily_review_card(
+            schedule_id="schedule-1", local_date="2026-09-13"
+        ),
+        "care_intervention": care_intervention_card(
+            intervention_id=import_id,
+            message="测试提醒",
+            actions=[
+                "ack",
+                "snooze_30",
+                "mute_today",
+                "helpful",
+                "not_relevant",
+                "disable_type",
+            ],
+        ),
+        "calendar_delete": calendar_delete_confirmation_card({
+            "id": "event-1",
+            "summary": "测试日程",
+            "start_time": "2026-09-14T09:00:00+08:00",
+            "end_time": "2026-09-14T10:00:00+08:00",
+        }),
+        "calendar_mutation_plan": calendar_mutation_plan_confirmation_card({
+            "id": import_id,
+            "operation": "delete",
+            "items": [
+                {"summary": "一", "start_time": "09:00", "end_time": "10:00"},
+                {"summary": "二", "start_time": "10:00", "end_time": "11:00"},
+            ],
+        }),
+        "pressure_curve": pressure_curve_card(
+            analysis, image_key="img-key", local_date="2026-09-14"
+        ),
+        "today_calendar": today_calendar_card([], local_date="2026-09-14"),
+        "morning_brief": morning_brief_settings_card({}),
+        "preference_settings": preference_settings_card({}),
+        "memory_center": memory_center_card([memory]),
+        "memory_detail": memory_detail_card(memory),
+        "memory_edit": memory_edit_card(memory),
+        "memory_delete": memory_delete_confirmation_card(memory),
+        "memory_clear": memory_clear_all_confirmation_card(),
+        "external_llm_consent": external_llm_consent_card(),
+        "external_llm_consent_details": external_llm_consent_details_card(),
+        "external_llm_consent_status": external_llm_consent_status_card(
+            {"active": False}
+        ),
+        **feature_cards,
+    }
+
+
 def test_reviewed_fixed_cards_satisfy_interactive_contract():
     draft = {
         "id": "00000000-0000-0000-0000-000000000001",
@@ -98,3 +218,53 @@ def test_reviewed_fixed_cards_satisfy_interactive_contract():
     )
     for card in cards:
         _assert_card_contract(card)
+
+
+def test_all_participant_visible_interactive_cards_match_registry_contract():
+    cards = _reviewed_interactive_cards()
+    assert len(cards) >= 30
+    schema_inventory = {
+        name: card.get("schema", "1.0") for name, card in cards.items()
+    }
+    assert {
+        name for name, schema in schema_inventory.items() if schema == "1.0"
+    } == {
+        "morning_brief",
+        "preference_settings",
+        "memory_center",
+        "memory_detail",
+        "memory_edit",
+        "memory_delete",
+        "memory_clear",
+    }
+    for name, card in cards.items():
+        assert card is not None, name
+        assert schema_inventory[name] in {"1.0", "2.0"}, name
+        _assert_card_contract(card)
+
+
+def test_card_2_callback_encoding_inventory_is_explicit():
+    inventory = {}
+    for name, card in _reviewed_interactive_cards().items():
+        encodings = set()
+        for element in _walk(card):
+            if any(
+                isinstance(behavior, dict)
+                and behavior.get("type") == "callback"
+                for behavior in element.get("behaviors", [])
+            ):
+                encodings.add("behaviors_callback")
+            if (
+                element.get("tag") in {"button", "select_static", "input"}
+                and
+                isinstance(element.get("value"), dict)
+                and element["value"].get("mindflow_action")
+                and not element.get("behaviors")
+            ):
+                encodings.add("direct_value")
+        inventory[name] = frozenset(encodings)
+
+    assert all(value for value in inventory.values())
+    assert inventory["feature_overview"] == frozenset({"behaviors_callback"})
+    assert "direct_value" in inventory["memory_center"]
+    assert "direct_value" in inventory["preference_settings"]
