@@ -10,6 +10,7 @@ from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from app.admin_web.api import AdminAPI
+from app.admin_web.admin_users import PARTICIPANT_RESEARCH_DETAIL_SCOPE
 from app.admin_web.auth import AdminSession, hash_password
 from app.admin_web.main import create_app
 from app.admin_web.repositories import AdminRepository
@@ -192,9 +193,13 @@ def test_admin_rebuild_offloads_slow_reconstruction_from_event_loop(monkeypatch)
             csrf_token="csrf",
             user_id=str(uuid.uuid4()),
             role="admin",
+            scopes=(PARTICIPANT_RESEARCH_DETAIL_SCOPE,),
         )
 
     monkeypatch.setattr(api, "_authorized", authorized)
+    monkeypatch.setattr(
+        api.admin_users, "record_research_detail_access", lambda *_args: None
+    )
     target = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     request = Request(
         {

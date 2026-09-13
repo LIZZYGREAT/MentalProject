@@ -56,6 +56,7 @@ class AdminSession:
     csrf_token: str
     user_id: str = ""
     role: str = "viewer"
+    scopes: tuple[str, ...] = ()
 
 
 class SessionSigner:
@@ -64,7 +65,8 @@ class SessionSigner:
         self.ttl_seconds = ttl_seconds
 
     def issue(
-        self, username: str, *, user_id: str = "", role: str = "viewer"
+        self, username: str, *, user_id: str = "", role: str = "viewer",
+        scopes: tuple[str, ...] = (),
     ) -> tuple[str, AdminSession]:
         session = AdminSession(
             username=username,
@@ -72,6 +74,7 @@ class SessionSigner:
             csrf_token=secrets.token_urlsafe(24),
             user_id=user_id,
             role=role,
+            scopes=tuple(scopes),
         )
         payload = _b64(
             json.dumps(
@@ -81,6 +84,7 @@ class SessionSigner:
                     "csrf_token": session.csrf_token,
                     "user_id": session.user_id,
                     "role": session.role,
+                    "scopes": list(session.scopes),
                 },
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -103,6 +107,7 @@ class SessionSigner:
                 csrf_token=str(value["csrf_token"]),
                 user_id=str(value.get("user_id") or ""),
                 role=str(value.get("role") or "viewer"),
+                scopes=tuple(str(scope) for scope in (value.get("scopes") or ())),
             )
             return session if session.expires_at >= int(time.time()) else None
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):

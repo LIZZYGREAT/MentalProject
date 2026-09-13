@@ -16,7 +16,10 @@ from starlette.routing import Route
 from app.admin_web.auth import (
     COOKIE_NAME, AdminSession, SessionSigner, hash_password, verify_password,
 )
-from app.admin_web.admin_users import AdminUserRepository
+from app.admin_web.admin_users import (
+    PARTICIPANT_RESEARCH_DETAIL_SCOPE,
+    AdminUserRepository,
+)
 from app.admin_web.repositories import AdminRepository
 from app.config import Settings
 from app.services.pressure_curve_service import (
@@ -153,6 +156,7 @@ class AdminAPI:
             csrf_token=session.csrf_token,
             user_id=str(row.id),
             role=row.role,
+            scopes=tuple(str(scope) for scope in (row.scopes_json or ())),
         )
         return session
 
@@ -187,7 +191,8 @@ class AdminAPI:
         ):
             return _json_error("invalid_credentials", 401)
         token, session = self.signer.issue(
-            row.username, user_id=str(row.id), role=row.role
+            row.username, user_id=str(row.id), role=row.role,
+            scopes=tuple(str(scope) for scope in (row.scopes_json or ())),
         )
         await asyncio.to_thread(self.admin_users.touch_login, row.id)
         response = JSONResponse(
@@ -195,6 +200,7 @@ class AdminAPI:
                 "authenticated": True,
                 "username": username,
                 "role": row.role,
+                "scopes": list(row.scopes_json or ()),
                 "csrf_token": session.csrf_token,
                 **self._business_context(),
             }
@@ -219,6 +225,7 @@ class AdminAPI:
                 "authenticated": True,
                 "username": session.username,
                 "role": session.role,
+                "scopes": list(session.scopes),
                 "csrf_token": session.csrf_token,
                 "expires_at": session.expires_at,
                 **self._business_context(),
@@ -258,21 +265,30 @@ class AdminAPI:
         )
 
     async def _participant(
-        self, request: Request
+        self, request: Request, *, research_detail: bool = True,
     ) -> tuple[Any, Response | None]:
-        if await self._authorized(request) is None:
+        session = await self._authorized(request)
+        if session is None:
             return None, _json_error("unauthorized", 401)
+        if research_detail and PARTICIPANT_RESEARCH_DETAIL_SCOPE not in session.scopes:
+            return None, _json_error("participant_research_detail_forbidden", 403)
         code = request.path_params["participant_code"]
         participant_id = await asyncio.to_thread(
             self.repository.participant_id, code
         )
         if participant_id is None:
             return None, _json_error("participant_not_found", 404)
+        if research_detail:
+            await asyncio.to_thread(
+                self.admin_users.record_research_detail_access,
+                session.user_id, participant_id, request.url.path,
+            )
         return participant_id, None
 
     async def participant(self, request: Request) -> Response:
-        if await self._authorized(request) is None:
-            return _json_error("unauthorized", 401)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
         value = await asyncio.to_thread(
             self.repository.participant, request.path_params["participant_code"]
         )
@@ -281,7 +297,7 @@ class AdminAPI:
     async def memory_audit(self, request: Request) -> Response:
         if await self._authorized(request) is None:
             return _json_error("unauthorized", 401)
-        participant_id, error = await self._participant(request)
+        participant_id, error = await self._participant(request, research_detail=False)
         if error:
             return error
         return JSONResponse({
@@ -302,7 +318,7 @@ class AdminAPI:
         ))
 
     async def messages(self, request: Request) -> Response:
-        participant_id, error = await self._participant(request)
+        participant_id, error = await self._participant(request, research_detail=False)
         if error:
             return error
         query = request.query_params
@@ -339,7 +355,7 @@ class AdminAPI:
         })
 
     async def calendars(self, request: Request) -> Response:
-        participant_id, error = await self._participant(request)
+        participant_id, error = await self._participant(request, research_detail=False)
         if error:
             return error
         return JSONResponse({
@@ -377,12 +393,9 @@ class AdminAPI:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role not in {"admin", "superadmin"}:
             return _json_error("forbidden", 403)
-        participant_id = await asyncio.to_thread(
-            self.repository.participant_id,
-            request.path_params["participant_code"],
-        )
-        if participant_id is None:
-            return _json_error("participant_not_found", 404)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
         try:
             target = date.fromisoformat(request.path_params["local_date"])
         except ValueError:
@@ -555,12 +568,9 @@ class AdminAPI:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role not in {"admin", "superadmin"}:
             return _json_error("forbidden", 403)
-        participant_id = await asyncio.to_thread(
-            self.repository.participant_id,
-            request.path_params["participant_code"],
-        )
-        if participant_id is None:
-            return _json_error("participant_not_found", 404)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
         if self.daily_reviews is None:
             return _json_error("daily_review_service_unavailable", 503)
         try:
@@ -597,12 +607,9 @@ class AdminAPI:
             return _json_error("unauthorized_or_csrf", 401)
         if session.role not in {"admin", "superadmin"}:
             return _json_error("forbidden", 403)
-        participant_id = await asyncio.to_thread(
-            self.repository.participant_id,
-            request.path_params["participant_code"],
-        )
-        if participant_id is None:
-            return _json_error("participant_not_found", 404)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
         if self.daily_reviews is None:
             return _json_error("daily_review_service_unavailable", 503)
         try:
@@ -711,11 +718,9 @@ class AdminAPI:
             return _json_error("unauthorized_or_csrf", 401)
         if self.what_if is None:
             return _json_error("forecast_service_unavailable", 503)
-        participant_id = await asyncio.to_thread(
-            self.repository.participant_id, request.path_params["participant_code"]
-        )
-        if participant_id is None:
-            return _json_error("participant_not_found", 404)
+        participant_id, error = await self._participant(request)
+        if error:
+            return error
         try:
             value = await request.json()
             target = date.fromisoformat(str(value.get("local_date") or ""))
@@ -1177,6 +1182,7 @@ class AdminAPI:
                 hash_password(password),
                 str(value.get("role") or "viewer"),
                 created_by=uuid.UUID(session.user_id),
+                scopes=value.get("scopes") or (),
             )
         except (ValueError, TypeError) as exc:
             return _json_error(str(exc), 400)
@@ -1199,6 +1205,7 @@ class AdminAPI:
                 role=value.get("role"),
                 status=value.get("status"),
                 password_hash=hash_password(str(password)) if password else None,
+                scopes=value.get("scopes") if "scopes" in value else None,
                 actor_id=uuid.UUID(session.user_id),
             )
         except (ValueError, TypeError) as exc:

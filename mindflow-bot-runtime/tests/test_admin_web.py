@@ -6,6 +6,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from app.admin_web.auth import hash_password
+from app.admin_web.admin_users import PARTICIPANT_RESEARCH_DETAIL_SCOPE
 from app.admin_web.main import create_app
 from app.admin_web.repositories import AdminRepository
 from app.config import Settings
@@ -16,6 +17,7 @@ from app.repositories import (
     RuntimeIncidentRepository,
 )
 from app.repositories_memory import ParticipantMemoryRepository
+from app.models import AdminResearchDetailAccessAudit
 from app.services.memory_service import MemoryService
 from app.services.workload_diagnostic_renderer import WorkloadDiagnosticRenderer
 from helpers import memory_database, participant
@@ -111,6 +113,53 @@ def test_admin_separates_read_only_memory_and_research_state_audits():
     script = browser.get("/admin/static/app.js").text
     assert "Memory 审计" in script
     assert "Research State 审计" in script
+
+
+def test_participant_research_detail_requires_independent_scope_and_is_audited():
+    database = memory_database()
+    participant(database, "P-SCOPED")
+    browser = TestClient(create_app(database, settings()))
+    root = login(browser)
+    created = browser.post(
+        "/admin/api/admin-users",
+        headers={"x-csrf-token": root["csrf_token"]},
+        json={
+            "username": "limited-admin", "password": "limited-password",
+            "role": "admin", "scopes": [],
+        },
+    )
+    assert created.status_code == 201
+
+    limited = browser.post(
+        "/admin/api/login",
+        json={"username": "limited-admin", "password": "limited-password"},
+    ).json()
+    assert limited["scopes"] == []
+    assert browser.get("/admin/api/participants/P-SCOPED").status_code == 403
+    assert browser.get(
+        "/admin/api/participants/P-SCOPED/research-state-audit"
+    ).status_code == 403
+    assert browser.get(
+        "/admin/api/participants/P-SCOPED/memory-audit"
+    ).status_code == 200
+
+    root = login(browser)
+    granted = browser.patch(
+        f"/admin/api/admin-users/{created.json()['id']}",
+        headers={"x-csrf-token": root["csrf_token"]},
+        json={"scopes": [PARTICIPANT_RESEARCH_DETAIL_SCOPE]},
+    )
+    assert granted.status_code == 200
+    browser.post(
+        "/admin/api/login",
+        json={"username": "limited-admin", "password": "limited-password"},
+    )
+    assert browser.get("/admin/api/participants/P-SCOPED").status_code == 200
+
+    with database.session() as session:
+        audits = session.query(AdminResearchDetailAccessAudit).all()
+        assert len(audits) == 1
+        assert audits[0].endpoint == "/admin/api/participants/P-SCOPED"
 
 
 def test_admin_startup_does_not_require_workload_cjk_font(monkeypatch):

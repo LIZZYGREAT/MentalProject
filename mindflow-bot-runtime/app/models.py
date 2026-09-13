@@ -1883,6 +1883,7 @@ class AdminUser(Base):
     username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="viewer")
+    scopes_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     is_environment_bootstrap: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
@@ -1899,6 +1900,24 @@ class AdminUser(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class AdminResearchDetailAccessAudit(Base):
+    __tablename__ = "admin_research_detail_access_audit"
+    __table_args__ = (
+        Index("ix_admin_research_detail_access", "admin_id", "created_at"),
+        Index("ix_participant_research_detail_access", "participant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    admin_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="RESTRICT"), nullable=False
+    )
+    endpoint: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class DailyReviewSchedule(Base):
