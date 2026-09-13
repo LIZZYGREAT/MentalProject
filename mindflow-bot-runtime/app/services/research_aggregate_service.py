@@ -14,6 +14,7 @@ from app.models import (
     DailyReviewResponse,
     DailyReviewSchedule,
     ParticipantSlowState,
+    ResearchAggregateQueryAudit,
     StateObservation,
 )
 
@@ -21,8 +22,14 @@ from app.models import (
 def _range(date_start: str, date_end: str) -> tuple[date, date, datetime, datetime]:
     start = date.fromisoformat(str(date_start))
     end = date.fromisoformat(str(date_end))
-    if end < start or (end - start).days > 366:
-        raise ValueError("date range must be ordered and at most 367 days")
+    next_month = (
+        date(start.year + 1, 1, 1)
+        if start.month == 12 else date(start.year, start.month + 1, 1)
+    )
+    is_calendar_week = start.weekday() == 0 and end == start + timedelta(days=6)
+    is_calendar_month = start.day == 1 and end == next_month - timedelta(days=1)
+    if not (is_calendar_week or is_calendar_month):
+        raise ValueError("research aggregates require a complete calendar week or month")
     return (
         start,
         end,
@@ -50,10 +57,18 @@ class ResearchAggregateService:
         }
 
     def _result(
-        self, start: date, end: date, cohort: Iterable[Any], **summary: Any
+        self, start: date, end: date, cohort: Iterable[Any], *,
+        researcher_id: Any = None, tool_name: str | None = None, **summary: Any
     ) -> dict[str, Any]:
         cohort_size = len(set(cohort))
         suppressed = self._suppressed(cohort_size)
+        if researcher_id is not None and tool_name:
+            with self.database.session() as session:
+                session.add(ResearchAggregateQueryAudit(
+                    researcher_id=researcher_id, tool_name=tool_name,
+                    date_start=start, date_end=end, cohort_size=cohort_size,
+                    suppressed=bool(suppressed),
+                ))
         if suppressed:
             return {"date_start": start.isoformat(), "date_end": end.isoformat(), **suppressed}
         return {
@@ -61,7 +76,7 @@ class ResearchAggregateService:
             "suppressed": False, "cohort_size": cohort_size, **summary,
         }
 
-    def weekly_stress_summary(self, date_start: str, date_end: str) -> dict[str, Any]:
+    def weekly_stress_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
         start, end, start_at, end_at = _range(date_start, date_end)
         with self.database.session() as session:
             rows = session.execute(select(StateObservation).where(
@@ -81,13 +96,14 @@ class ResearchAggregateService:
         distribution = Counter(_level(value) for value in values)
         return self._result(
             start, end, participants,
+            researcher_id=researcher_id, tool_name=tool_name,
             observation_count=len(values),
             mean_stress=round(mean(values), 3) if values else None,
             median_stress=round(median(values), 3) if values else None,
             level_distribution=dict(sorted(distribution.items())),
         )
 
-    def checkin_completion_summary(self, date_start: str, date_end: str) -> dict[str, Any]:
+    def checkin_completion_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
         start, end, _, _ = _range(date_start, date_end)
         with self.database.session() as session:
             schedules = session.execute(select(DailyReviewSchedule).where(
@@ -105,12 +121,13 @@ class ResearchAggregateService:
         completed_count = len(scheduled & completed)
         return self._result(
             start, end, cohort,
+            researcher_id=researcher_id, tool_name=tool_name,
             scheduled_count=denominator,
             completed_count=completed_count,
             completion_rate=(round(completed_count / denominator, 4) if denominator else None),
         )
 
-    def intervention_response_summary(self, date_start: str, date_end: str) -> dict[str, Any]:
+    def intervention_response_summary(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
         start, end, start_at, end_at = _range(date_start, date_end)
         with self.database.session() as session:
             rows = session.execute(select(CareInterventionFeedback).where(
@@ -121,12 +138,13 @@ class ResearchAggregateService:
         relevance = Counter(str(row.relevance or "unspecified") for row in rows)
         return self._result(
             start, end, (row.participant_id for row in rows),
+            researcher_id=researcher_id, tool_name=tool_name,
             response_count=len(rows),
             helpfulness_distribution=dict(sorted(helpfulness.items())),
             relevance_distribution=dict(sorted(relevance.items())),
         )
 
-    def longitudinal_state_distribution(self, date_start: str, date_end: str) -> dict[str, Any]:
+    def longitudinal_state_distribution(self, date_start: str, date_end: str, *, researcher_id: Any = None, tool_name: str | None = None) -> dict[str, Any]:
         start, end, start_at, end_at = _range(date_start, date_end)
         with self.database.session() as session:
             rows = session.execute(select(ParticipantSlowState).where(
@@ -143,6 +161,7 @@ class ResearchAggregateService:
         )
         return self._result(
             start, end, (row.participant_id for row in rows),
+            researcher_id=researcher_id, tool_name=tool_name,
             state_count=len(rows),
             stress_distribution=dict(sorted(stress.items())),
             workload_distribution=dict(sorted(workload.items())),

@@ -32,12 +32,15 @@ class ResearchTools:
             "research_get_longitudinal_state_distribution": self.service.longitudinal_state_distribution,
         }
         for name, operation in tools.items():
-            def handler(ctx, arguments, *, execute=operation):
-                return execute(arguments["date_start"], arguments["date_end"])
+            def handler(ctx, arguments, *, execute=operation, tool_name=name):
+                return execute(
+                    arguments["date_start"], arguments["date_end"],
+                    researcher_id=ctx.participant_id, tool_name=tool_name,
+                )
 
             registry.register(
                 name,
-                "Return a de-identified read-only cohort aggregate. Small cohorts are suppressed.",
+                "Return a de-identified read-only cohort aggregate for one complete calendar week or month. Small cohorts are suppressed and every query is audited.",
                 _schema(),
                 handler,
                 effect="read",
