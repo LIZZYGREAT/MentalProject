@@ -860,6 +860,7 @@ def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
     result = asyncio.run(tools.get_pressure_curve(context, {}))
 
     assert result["card_queued"] is True
+    assert result["delivery_state"] == "queued_not_delivered"
     assert result["predicted_peak"] == {"time": "10:00", "stress_0_10": 7.5}
     cards = outbox.take_cards(context.agent_run_id)
     assert len(cards) == 1
@@ -953,7 +954,7 @@ def test_worker_logs_feishu_card_failure_details_and_sends_fallback(caplog):
                 "schema": "2.0",
                 "body": {"elements": [{"content": sensitive_card_value}]},
             })
-            return "曲线卡片已生成。"
+            return "曲线卡片已经发出了。"
 
     class Sender:
         def __init__(self):
@@ -1005,8 +1006,9 @@ def test_worker_logs_feishu_card_failure_details_and_sends_fallback(caplog):
     asyncio.run(scenario())
 
     assert [item[0] for item in sender.sent[-2:]] == ["card", "text"]
+    assert "卡片已经发出" not in sender.sent[-1][2]
     assert sender.sent[-1][2] == (
-        "曲线卡片已生成。\n\n卡片暂时未能发送，请稍后再试。"
+        "曲线卡片已生成，但尚未成功发送。\n\n卡片暂时未能发送，请稍后再试。"
     )
     assert "230099" in caplog.text
     assert "Failed to create card content" in caplog.text

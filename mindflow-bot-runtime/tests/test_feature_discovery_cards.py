@@ -482,6 +482,7 @@ def test_agent_can_only_queue_reviewed_feature_cards():
     result = asyncio.run(run()).result
     assert result["ok"] is True
     assert result["card_queued"] is True
+    assert result["delivery_state"] == "queued_not_delivered"
     assert len(staged) == 1
     assert card_action_values(staged[0][1])[0]["mindflow_action"] == "feature_open"
 

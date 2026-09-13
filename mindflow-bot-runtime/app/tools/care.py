@@ -449,7 +449,7 @@ class CareTools:
         )
         registry.register(
             "morning_brief_show_settings",
-            "Show the fixed morning-brief settings card when the participant asks to configure or inspect it.",
+            "Generate the fixed morning-brief settings card for backend delivery when the participant asks to configure or inspect it. card_queued means generated, not delivered to Feishu.",
             _empty_schema(),
             self.show_morning_brief_settings,
             effect="ui_effect",
@@ -485,7 +485,7 @@ class CareTools:
         )
         registry.register(
             "care_get_pressure_curve",
-            "Generate a participant-bound pressure forecast for today or a requested future local date and queue its pressure-only curve card. A past date is read-only and succeeds only when its original forecast was persisted.",
+            "Generate a participant-bound pressure forecast for today or a requested future local date and queue its pressure-only curve card. card_queued means generated, not delivered to Feishu. A past date is read-only and succeeds only when its original forecast was persisted.",
             {
                 "type": "object",
                 "properties": {
@@ -521,7 +521,7 @@ class CareTools:
         )
         registry.register(
             "care_get_checkin_card",
-            "Queue the reviewed Feishu daily-state questionnaire card for this participant.",
+            "Generate the reviewed Feishu daily-state questionnaire card for backend delivery. card_queued means generated, not delivered to Feishu.",
             _empty_schema(),
             self.get_checkin_card,
             effect="ui_effect",
@@ -529,9 +529,9 @@ class CareTools:
         )
         registry.register(
             "help_show_feature_card",
-            "Queue one reviewed MindFlow feature guide card, or the full feature "
+            "Generate one reviewed MindFlow feature guide card, or the full feature "
             "overview, when the participant asks in natural language what MindFlow "
-            "can do or how one feature works.",
+            "can do or how one feature works. card_queued means generated, not delivered to Feishu.",
             {
                 "type": "object",
                 "properties": {
@@ -926,7 +926,11 @@ class CareTools:
         self.presentations.stage_card(
             ctx.agent_run_id, morning_brief_settings_card(preferences)
         )
-        return {"ok": True, "card_queued": True}
+        return {
+            "ok": True,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
+        }
 
     def respond_to_latest_care(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -1040,6 +1044,7 @@ class CareTools:
         return {
             "ok": True,
             "card_queued": True,
+            "delivery_state": "queued_not_delivered",
             "local_date": str(result.get("local_date") or ""),
             "point_count": analysis.point_count,
             "predicted_peak": {
@@ -1419,6 +1424,7 @@ class CareTools:
         return {
             "ok": True,
             "card_queued": True,
+            "delivery_state": "queued_not_delivered",
             "questionnaire": "daily_non_clinical_checkin_v1",
         }
 
@@ -1434,7 +1440,12 @@ class CareTools:
         if card is None:
             return {"ok": False, "error": "unsupported_feature"}
         self.presentations.stage_card(ctx.agent_run_id, card)
-        return {"ok": True, "card_queued": True, "feature_key": feature_key}
+        return {
+            "ok": True,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
+            "feature_key": feature_key,
+        }
 
     def calendar_connection_status(
         self, ctx: AgentContext, _args: dict[str, Any]

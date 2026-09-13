@@ -62,7 +62,7 @@ class InteractionPreferenceTools:
             self.update_support, effect="internal_write", authorization_requirement="direct_request",
         )
         registry.register(
-            "preference_settings_show", "Show the fixed interaction and support preference settings card.",
+            "preference_settings_show", "Generate the fixed interaction and support preference settings card for backend delivery. card_queued means generated, not delivered to Feishu.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             self.show_settings, effect="ui_effect", authorization_requirement="none",
         )
@@ -86,4 +86,8 @@ class InteractionPreferenceTools:
         self.presentations.stage_card(
             ctx.agent_run_id, preference_settings_card(self.service.get(ctx.participant_id))
         )
-        return {"ok": True, "card_queued": True}
+        return {
+            "ok": True,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
+        }

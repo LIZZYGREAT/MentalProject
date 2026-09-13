@@ -104,6 +104,30 @@ from app.services.multimodal_turn_coordinator import (
 
 
 logger = logging.getLogger(__name__)
+_CARD_DELIVERED_CLAIM = re.compile(
+    r"(?:卡片|设置卡片?|功能卡片?)(?:已经|已)(?:成功)?(?:发出|发送|投递)(?:了)?"
+)
+
+
+def _with_card_delivery_failure(response: RuntimeResponse | str) -> RuntimeResponse:
+    authoritative = (
+        response
+        if isinstance(response, RuntimeResponse)
+        else RuntimeResponse(text=str(response))
+    )
+    text = _CARD_DELIVERED_CLAIM.sub(
+        "卡片已生成，但尚未成功发送", authoritative.text
+    ).rstrip()
+    notice = "卡片暂时未能发送，请稍后再试。"
+    if notice not in text:
+        text = f"{text}\n\n{notice}" if text else notice
+    return RuntimeResponse(
+        text=text,
+        safety_locked=authoritative.safety_locked,
+        response_kind=authoritative.response_kind,
+    )
+
+
 BIND_PATTERN = re.compile(r"^/bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
 # Minimal shape gate before any token lookup: a bare URL-safe token as
 # produced by secrets.token_urlsafe. Ordinary sentences (spaces, CJK,
@@ -2488,16 +2512,7 @@ class BotWorker:
                 (time.monotonic() - card_started) * 1000, 1
             )
             if card_delivery_failed:
-                authoritative = (
-                    response
-                    if isinstance(response, RuntimeResponse)
-                    else RuntimeResponse(text=str(response))
-                )
-                response = RuntimeResponse(
-                    text=authoritative.text + "\n\n卡片暂时未能发送，请稍后再试。",
-                    safety_locked=authoritative.safety_locked,
-                    response_kind=authoritative.response_kind,
-                )
+                response = _with_card_delivery_failure(response)
             presentation_started = time.monotonic()
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)

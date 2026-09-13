@@ -62,7 +62,7 @@ class MemoryTools:
             self.clear_all, effect="internal_write", authorization_requirement="direct_request",
         )
         registry.register(
-            "memory_center_show", "Show the participant's fixed Memory Center card.",
+            "memory_center_show", "Generate the participant's fixed Memory Center card for backend delivery. card_queued means generated, not delivered to Feishu.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             self.show_center, effect="ui_effect", authorization_requirement="none",
         )
@@ -98,7 +98,11 @@ class MemoryTools:
         self.presentations.stage_card(
             ctx.agent_run_id, memory_center_card(self.memory.list(ctx.participant_id))
         )
-        return {"ok": True, "card_queued": True}
+        return {
+            "ok": True,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
+        }
 
     @staticmethod
     def _public(row: dict) -> dict:

@@ -252,6 +252,12 @@ current web search backend is not enabled and the latest information therefore
 cannot be verified; do not claim that the tool is missing. For other failures,
 say the current fact could not be verified and do not guess from memory.
 
+For every tool result with `card_queued=true` or
+`delivery_state=queued_not_delivered`, say only that the card has been
+generated. This state is an in-memory presentation request, not confirmation
+that Feishu received it; never say "sent" or "delivered" at this stage. The
+worker owns final delivery and will add an explicit failure notice if needed.
+
 For possible immediate self-harm or suicide, do not perform general generation
 or calculate a score. The runtime supplies reviewed fixed support text.
 
