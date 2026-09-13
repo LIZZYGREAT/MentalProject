@@ -1,5 +1,8 @@
 from app.models import ParticipantInteractionRule, ParticipantMemoryItem
-from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_preferences import (
+    InteractionPreferenceRepository,
+    PreferenceRuleLimitReached,
+)
 from app.repositories_support_preferences import SupportPreferenceRepository
 from app.services.interaction_preference_service import InteractionPreferenceService
 from app.services.preference_validator import normalize_rule
@@ -30,7 +33,7 @@ def test_only_safe_structured_fragment_is_persisted():
         assert session.query(ParticipantMemoryItem).count() == 0
 
 
-def test_interaction_rules_are_capped_at_three_and_scoped():
+def test_fourth_distinct_interaction_rule_returns_visible_limit_error():
     database = memory_database()
     first = participant(database, "PREF-2")
     second = participant(database, "PREF-3")
@@ -38,9 +41,33 @@ def test_interaction_rules_are_capped_at_three_and_scoped():
     repo.add_rule(first.id, safe_text="a", category="custom_a", value="1")
     repo.add_rule(first.id, safe_text="b", category="custom_b", value="2")
     repo.add_rule(first.id, safe_text="c", category="custom_c", value="3")
-    repo.add_rule(first.id, safe_text="d", category="custom_d", value="4")
+    try:
+        repo.add_rule(first.id, safe_text="d", category="custom_d", value="4")
+    except PreferenceRuleLimitReached as exc:
+        assert exc.code == "preference_rule_limit_reached"
+        assert "3 条自定义规则" in str(exc)
+    else:
+        raise AssertionError("fourth distinct rule silently displaced an existing rule")
     assert len(repo.get(first.id)["rules"]) == 3
     assert repo.get(second.id)["rules"] == []
+
+
+def test_same_category_custom_rule_can_replace_at_limit():
+    database = memory_database()
+    user = participant(database, "PREF-7")
+    repo = InteractionPreferenceRepository(database, max_rules=3)
+    repo.add_rule(user.id, safe_text="a", category="custom_a", value="1")
+    repo.add_rule(user.id, safe_text="b", category="custom_b", value="2")
+    repo.add_rule(user.id, safe_text="c", category="custom_c", value="3")
+
+    replacement = repo.add_rule(
+        user.id, safe_text="a-new", category="custom_a", value="new"
+    )
+
+    assert replacement["value"] == "new"
+    rules = repo.get(user.id)["rules"]
+    assert len(rules) == 3
+    assert {row["category"]: row["value"] for row in rules}["custom_a"] == "new"
 
 
 def test_structured_style_enums_are_validated():

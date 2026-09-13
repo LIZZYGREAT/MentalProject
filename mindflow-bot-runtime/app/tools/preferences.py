@@ -75,7 +75,7 @@ class InteractionPreferenceTools:
 
     def set_rule(self, ctx: AgentContext, args: dict[str, Any]):
         result = self.service.apply_rule(ctx.participant_id, args["rule"])
-        return {"ok": bool(result["accepted"]), **result}
+        return {"ok": bool(result["accepted"]) and not result.get("error"), **result}
 
     def update_support(self, ctx: AgentContext, args: dict[str, Any]):
         return {"ok": True, "support_preferences": self.service.update_support(ctx.participant_id, args)}

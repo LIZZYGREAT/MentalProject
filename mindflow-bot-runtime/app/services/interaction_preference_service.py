@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.repositories_preferences import PreferenceRuleLimitReached
 from app.services.preference_validator import normalize_rule, validate_style_changes
 
 
@@ -43,11 +44,21 @@ class InteractionPreferenceService:
                 )
                 stored.append(dict(accepted))
             else:
-                stored.append(self.repository.add_rule(
-                    participant_id, safe_text=accepted["safe_text"],
-                    category=accepted["category"], value=accepted["value"],
-                ))
-        return {"accepted": stored, "rejected": result["rejected"], "preferences": self.get(participant_id)}
+                try:
+                    stored.append(self.repository.add_rule(
+                        participant_id, safe_text=accepted["safe_text"],
+                        category=accepted["category"], value=accepted["value"],
+                    ))
+                except PreferenceRuleLimitReached as exc:
+                    return {
+                        "accepted": stored, "rejected": result["rejected"],
+                        "error": exc.code, "message": str(exc),
+                        "preferences": self.get(participant_id),
+                    }
+        return {
+            "accepted": stored, "rejected": result["rejected"], "error": None,
+            "preferences": self.get(participant_id),
+        }
 
     def update_support(self, participant_id, changes: dict):
         return self.support_repository.update(participant_id, changes)

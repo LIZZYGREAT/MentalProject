@@ -16,6 +16,13 @@ DEFAULT_STYLE = {
 }
 
 
+class PreferenceRuleLimitReached(ValueError):
+    code = "preference_rule_limit_reached"
+
+    def __init__(self) -> None:
+        super().__init__("你已经有 3 条自定义规则，可以先删除或替换一条。")
+
+
 class InteractionPreferenceRepository:
     def __init__(self, database: Database, *, max_rules: int = 3) -> None:
         self.database = database
@@ -65,11 +72,10 @@ class InteractionPreferenceRepository:
             active = session.execute(select(ParticipantInteractionRule).where(
                 ParticipantInteractionRule.participant_id == participant_id,
                 ParticipantInteractionRule.status == "active",
+                ParticipantInteractionRule.normalized_category != category,
             ).order_by(ParticipantInteractionRule.created_at).with_for_update()).scalars().all()
-            while len(active) >= self.max_rules:
-                old = active.pop(0)
-                old.status = "superseded"
-                old.updated_at = now
+            if len(active) >= self.max_rules:
+                raise PreferenceRuleLimitReached()
             row = ParticipantInteractionRule(
                 participant_id=participant_id, raw_text=safe_text[:200],
                 normalized_category=category, normalized_value=stored_value,
