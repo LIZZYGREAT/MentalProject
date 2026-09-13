@@ -28,23 +28,23 @@ class WebSearchRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def record_failure(self, participant_id, *, query_hash: str, normalized_query: str, freshness: str, error_code: str, ttl_minutes: int) -> None:
+    def record_failure(self, participant_id, *, query_hash: str, freshness: str, error_code: str, ttl_minutes: int) -> None:
         now = utc_now()
         with self.database.session() as session:
             session.add(WebSearchRun(
                 participant_id=participant_id, query_hash=query_hash,
-                normalized_query=normalized_query, freshness=freshness,
+                normalized_query=None, freshness=freshness,
                 status="failed", error_code=str(error_code)[:64],
                 expires_at=now + timedelta(minutes=ttl_minutes),
             ))
 
-    def record_success(self, participant_id, *, query_hash: str, normalized_query: str, freshness: str, items: list[dict[str, Any]], ttl_minutes: int) -> list[dict[str, Any]]:
+    def record_success(self, participant_id, *, query_hash: str, freshness: str, items: list[dict[str, Any]], ttl_minutes: int) -> list[dict[str, Any]]:
         now = utc_now()
         expires = now + timedelta(minutes=ttl_minutes)
         with self.database.session() as session:
             run = WebSearchRun(
                 participant_id=participant_id, query_hash=query_hash,
-                normalized_query=normalized_query, freshness=freshness,
+                normalized_query=None, freshness=freshness,
                 status="succeeded", expires_at=expires,
             )
             session.add(run)

@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from app.agent.sdk_adapter import DISALLOWED_TOOLS, SYSTEM_RULES
+from app.models import WebSearchRun
 from app.repositories_web_search import WebSearchRepository
 from app.services.web_search_service import (
     DisabledSearchProvider,
@@ -63,3 +64,39 @@ def test_provider_failure_is_explicit_and_builtin_web_tools_stay_disabled():
     assert {"WebSearch", "WebFetch"} <= set(DISALLOWED_TOOLS)
     assert "external_web_evidence" in SYSTEM_RULES
     assert "could not be verified" in SYSTEM_RULES
+
+
+def test_private_context_without_punctuation_fails_closed_and_is_not_persisted():
+    database = memory_database()
+    user = participant(database, "WEB-PRIVATE")
+    provider = _Provider()
+    result = asyncio.run(WebSearchService(
+        WebSearchRepository(database), provider
+    ).search(
+        user.id,
+        query="我最近压力很大想知道 DeepSeek 最新版本",
+        freshness="month",
+    ))
+
+    assert result == {
+        "ok": False,
+        "error": "search_query_requires_public_topic",
+        "verified": False,
+    }
+    assert provider.queries == []
+    with database.session() as session:
+        assert session.query(WebSearchRun).count() == 0
+
+
+def test_successful_search_persists_only_query_hash_not_query_plaintext():
+    database = memory_database()
+    user = participant(database, "WEB-HASH")
+    result = asyncio.run(WebSearchService(
+        WebSearchRepository(database), _Provider()
+    ).search(user.id, query="DeepSeek latest model", freshness="month"))
+
+    assert result["ok"] is True
+    with database.session() as session:
+        row = session.query(WebSearchRun).one()
+        assert len(row.query_hash) == 64
+        assert row.normalized_query is None

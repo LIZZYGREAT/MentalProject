@@ -21,6 +21,15 @@ _PRIVATE_PREFIX = re.compile(
     r"(?:我|本人|我的).{0,24}?(?:压力|焦虑|抑郁|心理|日程|聊天|记录|学号|手机号).{0,40}?[，,。；;]\s*",
     re.I,
 )
+_PRIVATE_CONTEXT = re.compile(
+    r"(?:压力|焦虑|抑郁|心理(?:记录|状态)?|日程|课程表|聊天|记忆|学号|手机号|"
+    r"睡眠|情绪|我的状态|my\s+(?:stress|anxiety|depression|schedule|messages?|memory))",
+    re.I,
+)
+
+
+class SearchQueryRequiresPublicTopic(ValueError):
+    """The outbound query still contains participant-private context."""
 
 
 def normalize_search_query(query: str, *, now: datetime | None = None) -> str:
@@ -33,6 +42,10 @@ def normalize_search_query(query: str, *, now: datetime | None = None) -> str:
     value = re.sub(r"\s+", " ", value).strip(" ，,。；;")
     if not value:
         raise ValueError("search query contains no public topic after privacy minimization")
+    if _PRIVATE_CONTEXT.search(value):
+        raise SearchQueryRequiresPublicTopic(
+            "search query must contain only the public topic"
+        )
     current = now or datetime.now(timezone.utc)
     if re.search(r"最新|当前|现在|today|latest|current", value, re.I):
         value = f"{value} {current:%B %Y}"
@@ -88,21 +101,28 @@ class WebSearchService:
         if freshness not in {"day", "week", "month", "year", "any"}:
             raise ValueError("unsupported freshness")
         count = max(1, min(int(max_results), 10))
-        normalized = normalize_search_query(query)
+        try:
+            normalized = normalize_search_query(query)
+        except SearchQueryRequiresPublicTopic:
+            return {
+                "ok": False,
+                "error": "search_query_requires_public_topic",
+                "verified": False,
+            }
         query_hash = hashlib.sha256(normalized.casefold().encode("utf-8")).hexdigest()
         try:
             items = await self.provider.search(normalized, freshness, count)
         except Exception as exc:
             await asyncio.to_thread(
                 self.repository.record_failure, participant_id,
-                query_hash=query_hash, normalized_query=normalized,
+                query_hash=query_hash,
                 freshness=freshness, error_code=type(exc).__name__,
                 ttl_minutes=self.ttl_minutes,
             )
             return {"ok": False, "error": "web_search_unavailable", "verified": False}
         results = await asyncio.to_thread(
             self.repository.record_success, participant_id,
-            query_hash=query_hash, normalized_query=normalized,
+            query_hash=query_hash,
             freshness=freshness, items=items[:count], ttl_minutes=self.ttl_minutes,
         )
         return {

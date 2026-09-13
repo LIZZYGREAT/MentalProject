@@ -2013,7 +2013,7 @@ class WebSearchRun(Base):
         Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
     )
     query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    normalized_query: Mapped[str] = mapped_column(String(500), nullable=False)
+    normalized_query: Mapped[str | None] = mapped_column(String(500), nullable=True)
     freshness: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
