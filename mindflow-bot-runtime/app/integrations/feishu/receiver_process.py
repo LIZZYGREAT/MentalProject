@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import threading
+import time
+import types
 from typing import Any, Callable
 
 
@@ -162,6 +164,19 @@ def receiver_process_main(
         channel.on("message", on_message)
 
         if card_action_enabled:
+            def enqueue_card_action(event: Any) -> None:
+                started = time.monotonic()
+                output_queue.put(
+                    {"kind": "card_action", "payload": event.to_ipc_payload()}
+                )
+                logger.info(
+                    "feishu_receiver_card_action_ack_ready event_id=%s "
+                    "message_id=%s receiver_ack_ms=%.3f",
+                    event.event_id,
+                    event.message_id,
+                    (time.monotonic() - started) * 1000,
+                )
+
             def on_card_action(card_action: Any) -> None:
                 try:
                     event = card_action_adapter.adapt(card_action)
@@ -177,11 +192,42 @@ def receiver_process_main(
                     event.event_id,
                     event.message_id,
                 )
-                output_queue.put(
-                    {"kind": "card_action", "payload": event.to_ipc_payload()}
+                enqueue_card_action(event)
+
+            # lark-channel-sdk 1.2.0 schedules its public ``cardAction``
+            # callback asynchronously and discards the callback's return value.
+            # Bind its typed dispatcher entry before ``start()`` constructs the
+            # dispatcher, so the ACK is emitted only after IPC enqueue succeeds.
+            if (
+                hasattr(channel, "_on_p2_card_action_trigger")
+                and getattr(channel, "_dispatcher", None) is None
+            ):
+                from lark_channel.event.callback.model.p2_card_action_trigger import (
+                    P2CardActionTriggerResponse,
                 )
 
-            channel.on("cardAction", on_card_action)
+                def on_p2_card_action(_channel: Any, callback: Any) -> Any:
+                    try:
+                        event = card_action_adapter.adapt_p2(callback)
+                        enqueue_card_action(event)
+                    except InvalidBotEvent as exc:
+                        logger.info(
+                            "feishu_receiver_card_action_ignored reason=%s",
+                            str(exc) or type(exc).__name__,
+                        )
+                        return P2CardActionTriggerResponse(
+                            {"toast": {"type": "error", "content": "操作无法识别，请刷新后重试。"}}
+                        )
+                    return P2CardActionTriggerResponse(
+                        {"toast": {"type": "info", "content": "处理中…"}}
+                    )
+
+                channel._on_p2_card_action_trigger = types.MethodType(
+                    on_p2_card_action, channel
+                )
+            else:
+                # Test doubles and non-SDK factories retain the public contract.
+                channel.on("cardAction", on_card_action)
 
         def monitor_lifecycle() -> None:
             ready_sent = False

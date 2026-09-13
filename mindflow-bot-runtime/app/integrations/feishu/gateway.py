@@ -154,11 +154,12 @@ class CardActionEvent:
     action_tag: str
     action_value: dict[str, Any]
     form_value: dict[str, Any]
+    callback_token: str | None = None
 
     def to_ipc_payload(self) -> dict[str, Any]:
         """Return the SDK-free CardAction contract shared with the receiver."""
 
-        return {
+        payload = {
             "event_id": self.event_id,
             "message_id": self.message_id,
             "app_id": self.app_id,
@@ -168,6 +169,9 @@ class CardActionEvent:
             "action_value": dict(self.action_value),
             "form_value": dict(self.form_value),
         }
+        if self.callback_token:
+            payload["callback_token"] = self.callback_token
+        return payload
 
     @classmethod
     def from_ipc_payload(cls, payload: dict[str, Any]) -> "CardActionEvent":
@@ -188,6 +192,9 @@ class CardActionEvent:
             action_tag=str(payload.get("action_tag") or "")[:64],
             action_value=dict(action_value),
             form_value=dict(form_value),
+            callback_token=(
+                str(payload.get("callback_token") or "").strip() or None
+            ),
         )
 
 
@@ -202,6 +209,7 @@ class FeishuCardActionAdapter:
             chat_id=getattr(event, "chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=getattr(event, "token", None),
         )
 
     def adapt_p2(self, callback: Any) -> CardActionEvent:
@@ -213,11 +221,12 @@ class FeishuCardActionAdapter:
             chat_id=getattr(context, "open_chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=getattr(event, "token", None),
         )
 
     def _build(
         self, *, callback_event_id: Any, message_id: Any, chat_id: Any,
-        open_id: Any, action: Any
+        open_id: Any, action: Any, callback_token: Any = None,
     ) -> CardActionEvent:
         message_id = str(message_id or "").strip()
         chat_id = str(chat_id or "").strip()
@@ -255,6 +264,7 @@ class FeishuCardActionAdapter:
             action_tag=tag,
             action_value=dict(value),
             form_value=dict(form_value),
+            callback_token=str(callback_token or "").strip() or None,
         )
 
 
@@ -270,12 +280,17 @@ class FeishuChannelCardActionAdapter(FeishuCardActionAdapter):
             if isinstance(header, dict)
             else None
         ) or raw.get("event_id")
+        raw_event = raw.get("event") or {}
+        callback_token = (
+            raw_event.get("token") if isinstance(raw_event, dict) else None
+        )
         return self._build(
             callback_event_id=provider_event_id,
             message_id=getattr(event, "message_id", ""),
             chat_id=getattr(event, "chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=callback_token,
         )
 
 
