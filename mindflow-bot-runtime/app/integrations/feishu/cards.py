@@ -1490,7 +1490,8 @@ def morning_brief_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
                         "initial_option": current, "options": options,
                     },
                     {
-                        "tag": "button", "text": {"tag": "plain_text", "content": "保存时间"},
+                        "tag": "button", "name": "morning_brief_settings_submit",
+                        "text": {"tag": "plain_text", "content": "保存时间"},
                         "type": "primary", "action_type": "form_submit",
                         "value": {"mindflow_action": "morning_brief_time_update", "version": "1"},
                     },
@@ -1577,7 +1578,8 @@ def memory_edit_card(memory: dict[str, Any]) -> dict[str, Any]:
                     "placeholder": {"tag": "plain_text", "content": "输入新的记忆内容"},
                 },
                 {
-                    "tag": "button", "text": {"tag": "plain_text", "content": "保存修改"},
+                    "tag": "button", "name": "memory_edit_submit",
+                    "text": {"tag": "plain_text", "content": "保存修改"},
                     "type": "primary", "action_type": "form_submit",
                     "value": {"mindflow_action": "memory_edit_save", "version": "1", "memory_id": str(memory.get("id") or "")},
                 },
@@ -1633,7 +1635,7 @@ def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
                 {"tag": "select_static", "name": "tone", "placeholder": {"tag": "plain_text", "content": "语气"}, "initial_option": str(preferences.get("tone") or "warm"), "options": options(("neutral", "warm", "direct"))},
                 {"tag": "select_static", "name": "suggestion_style", "placeholder": {"tag": "plain_text", "content": "建议方式"}, "initial_option": str(preferences.get("suggestion_style") or "light_suggestions"), "options": options(("ask_first", "light_suggestions", "proactive_suggestions"))},
                 {"tag": "select_static", "name": "max_suggestions", "placeholder": {"tag": "plain_text", "content": "每次最多建议数"}, "initial_option": str(support.get("max_suggestions") or 3), "options": options(("1", "2", "3"))},
-                {"tag": "button", "text": {"tag": "plain_text", "content": "保存"}, "type": "primary", "action_type": "form_submit", "value": {"mindflow_action": "preference_settings_save", "version": "1"}},
+                {"tag": "button", "name": "interaction_preference_settings_submit", "text": {"tag": "plain_text", "content": "保存"}, "type": "primary", "action_type": "form_submit", "value": {"mindflow_action": "preference_settings_save", "version": "1"}},
             ]},
             {"tag": "action", "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "先听我说，再建议"}, "value": {"mindflow_action": "support_acknowledge_first", "version": "1"}},
