@@ -59,6 +59,21 @@ class ReminderRepository:
             ).order_by(Reminder.next_fire_at).limit(self.active_limit)).scalars().all()
             return [self._view(row) for row in rows]
 
+    def list_for_user(
+        self, participant_id: uuid.UUID, *, failed_within_days: int = 7
+    ) -> list[dict[str, Any]]:
+        """Return active reminders plus recent terminal delivery failures."""
+
+        active = self.list_active(participant_id)
+        cutoff = utc_now() - timedelta(days=max(1, int(failed_within_days)))
+        with self.database.session() as session:
+            failed = session.execute(select(Reminder).where(
+                Reminder.participant_id == participant_id,
+                Reminder.status == "delivery_failed",
+                Reminder.updated_at >= cutoff,
+            ).order_by(Reminder.updated_at.desc()).limit(self.active_limit)).scalars().all()
+            return active + [self._view(row) for row in failed]
+
     def cancel(self, participant_id: uuid.UUID, reminder_id: uuid.UUID) -> bool:
         reminder_id = uuid.UUID(str(reminder_id))
         with self.database.session() as session:

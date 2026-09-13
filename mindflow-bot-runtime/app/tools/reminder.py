@@ -116,7 +116,7 @@ class ReminderTools:
             self.create, effect="internal_write", authorization_requirement="direct_request",
         )
         registry.register(
-            "reminder_list", "List this participant's active reminders.",
+            "reminder_list", "List this participant's active reminders and recent delivery failures.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             self.list, effect="read", authorization_requirement="none",
         )
@@ -158,8 +158,17 @@ class ReminderTools:
         }
 
     def list(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
-        rows = self.reminders.list_active(ctx.participant_id)
-        return {"ok": True, "reminders": [{key: value for key, value in row.items() if key not in {"participant_id", "claim_token"}} for row in rows]}
+        reminders = []
+        for row in self.reminders.list_for_user(ctx.participant_id):
+            item = {
+                key: value
+                for key, value in row.items()
+                if key not in {"participant_id", "claim_token"}
+            }
+            if row.get("status") == "delivery_failed":
+                item["delivery_notice"] = "这条提醒未能成功送达"
+            reminders.append(item)
+        return {"ok": True, "reminders": reminders}
 
     def cancel(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
         cancelled = self.reminders.cancel(ctx.participant_id, uuid.UUID(args["reminder_id"]))
