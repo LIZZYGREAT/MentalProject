@@ -64,3 +64,44 @@ def test_clear_all_is_participant_scoped():
     assert service.clear_all(first.id) == 1
     assert service.list(first.id) == []
     assert len(service.list(second.id)) == 1
+
+
+def test_chinese_retrieval_matches_related_memory_and_excludes_unrelated_memory():
+    database = memory_database()
+    user = participant(database, "MEMORY-5")
+    service = MemoryService(ParticipantMemoryRepository(database))
+    service.remember_explicit(user.id, memory_type="goal", content="下个月要论文答辩")
+
+    related = service.retrieve(user.id, "论文答辩要准备什么")
+    unrelated = service.retrieve(user.id, "今天天气怎么样")
+
+    assert [row["content"] for row in related] == ["下个月要论文答辩"]
+    assert unrelated == []
+
+
+def test_retrieval_returns_empty_when_all_memories_are_irrelevant():
+    database = memory_database()
+    user = participant(database, "MEMORY-6")
+    repository = ParticipantMemoryRepository(database)
+    service = MemoryService(repository)
+    stored = service.remember_explicit(user.id, memory_type="routine", content="我一般十一点睡")
+
+    assert service.retrieve(user.id, "Transformer 是谁提出的") == []
+    assert repository.list_active(user.id)[0]["last_used_at"] is None
+    assert repository.list_active(user.id)[0]["id"] == stored["id"]
+
+
+def test_retrieval_never_exceeds_character_budget_even_for_first_item():
+    database = memory_database()
+    user = participant(database, "MEMORY-7")
+    repository = ParticipantMemoryRepository(database)
+    repository.remember(
+        user.id, memory_type="context", content="论文答辩",
+        normalized_content="论文答辩", conflict_key=None,
+        source="user_explicit", consent_basis="user_requested_memory",
+    )
+
+    retrieved = repository.retrieve(user.id, query="论文", max_chars=3)
+
+    assert retrieved == []
+    assert sum(len(row["content"]) for row in retrieved) <= 3

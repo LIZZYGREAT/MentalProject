@@ -3,12 +3,48 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import uuid
 
 from sqlalchemy import desc, select
 
 from app.db import Database
 from app.models import ParticipantMemoryItem, utc_now
+
+
+_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_ASCII_TOKEN = re.compile(r"[a-z0-9]+")
+_TYPE_HINTS = {
+    "goal": ("目标", "计划", "准备", "完成", "考试", "答辩", "项目"),
+    "routine": ("通常", "一般", "每天", "每周", "作息", "睡", "起床"),
+    "preferred_name": ("名字", "叫", "称呼"),
+}
+
+
+def _search_parts(value: str) -> tuple[str, set[str], set[str]]:
+    text = str(value).casefold()
+    compact = "".join(character for character in text if character.isalnum())
+    cjk_grams: set[str] = set()
+    for run in _CJK_RUN.findall(text):
+        for width in (2, 3):
+            cjk_grams.update(run[index:index + width] for index in range(len(run) - width + 1))
+    ascii_tokens = {token for token in _ASCII_TOKEN.findall(text) if len(token) > 1}
+    return compact, cjk_grams, ascii_tokens
+
+
+def _relevance(query: str, row: dict) -> int:
+    query_compact, query_cjk, query_ascii = _search_parts(query)
+    memory_compact, memory_cjk, memory_ascii = _search_parts(row["normalized_content"])
+    score = 0
+    if min(len(query_compact), len(memory_compact)) >= 2 and (
+        query_compact in memory_compact or memory_compact in query_compact
+    ):
+        score += 100
+    score += 3 * len(query_cjk & memory_cjk)
+    score += 4 * len(query_ascii & memory_ascii)
+    if score and any(hint in query for hint in _TYPE_HINTS.get(row["memory_type"], ())):
+        score += 1
+    return score
 
 
 class ParticipantMemoryRepository:
@@ -74,17 +110,19 @@ class ParticipantMemoryRepository:
             return len(rows)
 
     def retrieve(self, participant_id: uuid.UUID, *, query: str, limit: int = 5, max_chars: int = 1200) -> list[dict]:
-        keywords = {part.casefold() for part in str(query).split() if len(part) > 1}
+        query = str(query).strip()
+        if not query or max_chars <= 0:
+            return []
         rows = self.list_active(participant_id, limit=100)
-        rows.sort(key=lambda row: (
-            -sum(word in row["normalized_content"].casefold() for word in keywords),
-            row["last_used_at"] or "",
-            row["updated_at"],
-        ), reverse=False)
+        scored = [(_relevance(query, row), row) for row in rows]
+        scored = [(score, row) for score, row in scored if score > 0]
+        scored.sort(key=lambda item: (
+            item[0], item[1]["last_used_at"] or "", item[1]["updated_at"]
+        ), reverse=True)
         selected, total = [], 0
-        for row in rows:
+        for _, row in scored:
             size = len(row["content"])
-            if selected and total + size > max_chars:
+            if total + size > max_chars:
                 continue
             selected.append(row)
             total += size
