@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import logging
 import uuid
 
 
@@ -12,6 +13,8 @@ MESSAGES = {
     "task_transition": "刚才的事情告一段落了吗？可以先给自己一点转换时间。",
     "recovery": "记得给自己留一点恢复时间，不需要马上做更多。",
 }
+
+logger = logging.getLogger(__name__)
 
 
 class SupportiveFollowupScheduler:
@@ -71,7 +74,10 @@ class SupportiveFollowupScheduler:
     async def run_forever(self) -> None:
         self.started.set()
         while not self._stop.is_set():
-            await self.run_once()
+            try:
+                await self.run_once()
+            except Exception:
+                logger.exception("supportive_followup_iteration_failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval_seconds)
             except asyncio.TimeoutError:
