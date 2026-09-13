@@ -163,3 +163,58 @@ def test_reminder_time_must_be_grounded_in_user_words():
     assert has_exact_time_grounding(vague) is False
     assert has_exact_time_grounding(exact) is True
     assert has_exact_time_grounding(clarified) is True
+
+
+def test_natural_chinese_exact_reminder_times_are_grounded():
+    base = dict(
+        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+    )
+    allowed = (
+        "明天下午三点提醒我交作业",
+        "周三三点半提醒我开会",
+        "一小时后提醒我喝水",
+        "半小时后提醒我休息",
+        "两天后提醒我复习",
+    )
+    rejected = (
+        "周三下午提醒我交作业",
+        "明天提醒我交作业",
+        "晚上提醒我",
+    )
+
+    for text in allowed:
+        assert has_exact_time_grounding(
+            AgentContext(**base, user_request_text=text)
+        ) is True
+    for text in rejected:
+        assert has_exact_time_grounding(
+            AgentContext(**base, user_request_text=text)
+        ) is False
+
+
+def test_reminder_grounding_does_not_compose_unrelated_historical_time():
+    base = dict(
+        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+    )
+    vague_current = AgentContext(
+        **base,
+        user_request_text="周三下午提醒我交作业",
+        authorization_semantic_context=(
+            AuthorizationSemanticTurn("user", "明天15:00我有课"),
+            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
+        ),
+    )
+    valid_clarification = AgentContext(
+        **base,
+        user_request_text="15:00",
+        authorization_semantic_context=(
+            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
+            AuthorizationSemanticTurn("assistant", "具体几点提醒你？"),
+            AuthorizationSemanticTurn("user", "15:00"),
+        ),
+    )
+
+    assert has_exact_time_grounding(vague_current) is False
+    assert has_exact_time_grounding(valid_clarification) is True

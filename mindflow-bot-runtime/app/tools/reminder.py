@@ -24,18 +24,73 @@ _DATE = re.compile(
     r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)",
     re.I,
 )
-_DURATION = re.compile(r"\d+\s*(?:分钟|小时|天|minutes?|hours?|days?)\s*(?:后|later)", re.I)
+_DURATION = re.compile(
+    r"(?:\d+\s*(?:分钟|小时|天)\s*后|半\s*小时\s*后|"
+    r"\d+\s*(?:minutes?|hours?|days?)\s*later)",
+    re.I,
+)
+_REMINDER_INTENT = re.compile(r"(?:提醒|叫我|通知我|remind\s+me)", re.I)
+_CHINESE_TIME_NUMBER = re.compile(
+    r"(?<![周期])([零〇一二两三四五六七八九十]{1,3})"
+    r"(?=\s*(?:点|分钟|小时|天))"
+)
+_CHINESE_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+    "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _chinese_number(value: str) -> int:
+    if "十" not in value:
+        digits = "".join(str(_CHINESE_DIGITS[char]) for char in value)
+        return int(digits)
+    left, right = value.split("十", 1)
+    tens = _CHINESE_DIGITS[left] if left else 1
+    ones = _CHINESE_DIGITS[right] if right else 0
+    return tens * 10 + ones
+
+
+def _normalize_time_words(value: str) -> str:
+    return _CHINESE_TIME_NUMBER.sub(
+        lambda match: str(_chinese_number(match.group(1))), str(value)
+    )
+
+
+def _clock_only_clarification(value: str) -> bool:
+    candidate = _normalize_time_words(value).strip()
+    candidate = re.sub(
+        r"^(?:就|那就|定在|改成|时间(?:是|为)?)\s*", "", candidate
+    )
+    candidate = re.sub(
+        r"\s*(?:吧|可以|就好|谢谢)?[。！!]?$", "", candidate
+    ).strip()
+    return bool(_CLOCK.fullmatch(candidate))
 
 
 def has_exact_time_grounding(ctx: AgentContext) -> bool:
-    texts = [ctx.user_request_text]
-    texts.extend(
-        item.text
+    current = _normalize_time_words(ctx.user_request_text)
+    if _DURATION.search(current) or (
+        _DATE.search(current) and _CLOCK.search(current)
+    ):
+        return True
+    if not _clock_only_clarification(current):
+        return False
+
+    prior_user_turns = [
+        str(item.text)
         for item in ctx.authorization_semantic_context
-        if getattr(item, "role", None) == "user"
-    )
-    combined = " ".join(str(value) for value in texts if str(value).strip())
-    return bool(_DURATION.search(combined) or (_DATE.search(combined) and _CLOCK.search(combined)))
+        if getattr(item, "role", None) == "user" and str(item.text).strip()
+    ]
+    # Production semantic context normally includes the current turn last.
+    # Never use it as its own clarification predecessor.
+    if prior_user_turns and prior_user_turns[-1].strip() == str(
+        ctx.user_request_text
+    ).strip():
+        prior_user_turns.pop()
+    if not prior_user_turns:
+        return False
+    previous = _normalize_time_words(prior_user_turns[-1])
+    return bool(_REMINDER_INTENT.search(previous) and _DATE.search(previous))
 
 
 class ReminderTools:
