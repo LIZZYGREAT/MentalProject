@@ -1541,13 +1541,41 @@ def memory_detail_card(memory: dict[str, Any]) -> dict[str, Any]:
             {"tag": "markdown", "content": (
                 f"类型：{str(memory.get('memory_type') or '')}\n\n"
                 f"内容：{str(memory.get('content') or '')[:500]}\n\n"
-                "如需修改，可以在对话中明确告诉我新的内容；保存成功后会替代冲突的旧记忆。"
+                "修改保存成功后，旧记忆会被替代。"
             )},
             {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "修改"}, "type": "primary", "value": {"mindflow_action": "memory_edit_open", "version": "1", "memory_id": str(memory.get("id") or "")}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "删除"}, "type": "danger", "value": {"mindflow_action": "memory_delete_prompt", "version": "1", "memory_id": str(memory.get("id") or "")}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "返回"}, "value": {"mindflow_action": "memory_center_refresh", "version": "1"}},
             ]},
         ],
+    }
+
+
+def memory_edit_card(memory: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "修改记忆"}},
+        "elements": [{
+            "tag": "form", "name": "memory_edit",
+            "elements": [
+                {
+                    "tag": "input", "name": "content",
+                    "label": {"tag": "plain_text", "content": "记忆内容"},
+                    "default_value": str(memory.get("content") or "")[:500],
+                    "placeholder": {"tag": "plain_text", "content": "输入新的记忆内容"},
+                },
+                {
+                    "tag": "button", "text": {"tag": "plain_text", "content": "保存修改"},
+                    "type": "primary", "action_type": "form_submit",
+                    "value": {"mindflow_action": "memory_edit_save", "version": "1", "memory_id": str(memory.get("id") or "")},
+                },
+            ],
+        }, {
+            "tag": "action", "actions": [{
+                "tag": "button", "text": {"tag": "plain_text", "content": "取消"},
+                "value": {"mindflow_action": "memory_detail_open", "version": "1", "memory_id": str(memory.get("id") or "")},
+            }],
+        }],
     }
 
 

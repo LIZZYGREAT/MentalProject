@@ -31,6 +31,7 @@ from app.integrations.feishu.cards import (
     memory_clear_all_confirmation_card,
     memory_delete_confirmation_card,
     memory_detail_card,
+    memory_edit_card,
     preference_settings_card,
     today_calendar_card,
 )
@@ -290,6 +291,7 @@ class CardActionService:
             "memory_clear_prompt", "memory_clear_confirm",
             "memory_center_refresh",
             "memory_detail_open",
+            "memory_edit_open", "memory_edit_save",
         }:
             if str(action.get("version") or "") != "1":
                 return {"ok": False, "error": "unsupported_card_action_version"}
@@ -312,6 +314,22 @@ class CardActionService:
                 return {"ok": False, "error": "memory_not_found"}
             if action_name == "memory_detail_open":
                 return {"ok": True, "reply_text": "已打开记忆详情。", "card": memory_detail_card(target)}
+            if action_name == "memory_edit_open":
+                return {"ok": True, "reply_text": "请修改这条记忆。", "card": memory_edit_card(target)}
+            if action_name == "memory_edit_save":
+                content = str((form_value or {}).get("content") or "").strip()
+                try:
+                    replacement = self.memory.replace(
+                        participant_id, memory_id, content=content
+                    )
+                except ValueError as exc:
+                    return {"ok": False, "error": "invalid_memory_content", "reply_text": str(exc)}
+                if replacement is None:
+                    return {"ok": False, "error": "memory_not_found"}
+                return {
+                    "ok": True, "reply_text": "这条记忆已修改。",
+                    "card": memory_detail_card(replacement),
+                }
             if action_name == "memory_delete_prompt":
                 return {"ok": True, "reply_text": "请确认是否删除这条记忆。", "card": memory_delete_confirmation_card(target)}
             deleted = self.memory.delete(participant_id, memory_id)

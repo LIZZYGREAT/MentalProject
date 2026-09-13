@@ -97,6 +97,39 @@ class ParticipantMemoryRepository:
             row.updated_at = utc_now()
             return True
 
+    def replace(self, participant_id: uuid.UUID, memory_id: uuid.UUID, *, content: str, normalized_content: str, conflict_key: str | None) -> dict | None:
+        now = utc_now()
+        with self.database.session() as session:
+            old = session.execute(select(ParticipantMemoryItem).where(
+                ParticipantMemoryItem.id == memory_id,
+                ParticipantMemoryItem.participant_id == participant_id,
+                ParticipantMemoryItem.status == "active",
+            ).with_for_update()).scalar_one_or_none()
+            if old is None:
+                return None
+            row = ParticipantMemoryItem(
+                participant_id=participant_id, memory_type=old.memory_type,
+                content=content, normalized_content=normalized_content,
+                conflict_key=conflict_key, source="user_explicit",
+                consent_basis="user_requested_memory", confidence=1.0,
+                status="active", created_at=now, updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            superseded = [old]
+            if conflict_key:
+                superseded.extend(session.execute(select(ParticipantMemoryItem).where(
+                    ParticipantMemoryItem.participant_id == participant_id,
+                    ParticipantMemoryItem.status == "active",
+                    ParticipantMemoryItem.conflict_key == conflict_key,
+                    ParticipantMemoryItem.id.not_in((old.id, row.id)),
+                ).with_for_update()).scalars().all())
+            for previous in superseded:
+                previous.status = "superseded"
+                previous.superseded_by = row.id
+                previous.updated_at = now
+            return self._view(row)
+
     def clear_all(self, participant_id: uuid.UUID) -> int:
         with self.database.session() as session:
             rows = session.execute(select(ParticipantMemoryItem).where(

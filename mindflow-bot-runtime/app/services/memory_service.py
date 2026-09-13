@@ -72,6 +72,19 @@ class MemoryService:
     def delete(self, participant_id: uuid.UUID, memory_id: uuid.UUID) -> bool:
         return self.repository.delete(participant_id, memory_id)
 
+    def replace(self, participant_id: uuid.UUID, memory_id: uuid.UUID, *, content: str) -> dict | None:
+        active = next(
+            (row for row in self.repository.list_active(participant_id) if row["id"] == str(memory_id)),
+            None,
+        )
+        if active is None:
+            return None
+        normalized, conflict_key = normalize_memory(content, active["memory_type"])
+        return self.repository.replace(
+            participant_id, memory_id, content=" ".join(str(content).split())[:500],
+            normalized_content=normalized, conflict_key=conflict_key,
+        )
+
     def clear_all(self, participant_id: uuid.UUID) -> int:
         return self.repository.clear_all(participant_id)
 

@@ -45,6 +45,18 @@ class MemoryTools:
             self.delete, effect="internal_write", authorization_requirement="direct_request",
         )
         registry.register(
+            "memory_replace", "Replace one exact active memory after an explicit edit request; the old memory is superseded.",
+            {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string", "format": "uuid"},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+                "required": ["memory_id", "content"], "additionalProperties": False,
+            },
+            self.replace, effect="internal_write", authorization_requirement="direct_request",
+        )
+        registry.register(
             "memory_clear_all", "Clear all participant memories, without changing profile, calendar, observations, forecasts, or consent.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             self.clear_all, effect="internal_write", authorization_requirement="direct_request",
@@ -67,6 +79,15 @@ class MemoryTools:
     def delete(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
         deleted = self.memory.delete(ctx.participant_id, uuid.UUID(args["memory_id"]))
         return {"ok": deleted, "error": None if deleted else "memory_not_found"}
+
+    def replace(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
+        row = self.memory.replace(
+            ctx.participant_id, uuid.UUID(args["memory_id"]), content=args["content"]
+        )
+        return {
+            "ok": row is not None, "error": None if row else "memory_not_found",
+            "memory": self._public(row) if row else None,
+        }
 
     def clear_all(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
         return {"ok": True, "deleted_count": self.memory.clear_all(ctx.participant_id)}
