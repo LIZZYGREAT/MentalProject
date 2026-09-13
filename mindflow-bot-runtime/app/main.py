@@ -133,7 +133,15 @@ def _build_card_action_handler(
     incidents: Any = None,
     receipts: Any = None,
 ) -> Any:
-    """Build CardAction business execution with optional WS delivery."""
+    """Compatibility constructor composed from executor and WS delivery."""
+
+    if sender is not None:
+        from app.card_actions.delivery import build_card_action_delivery
+
+        executor = _build_card_action_handler(
+            identity, card_actions, None, incidents, receipts
+        )
+        return build_card_action_delivery(executor, sender, incidents)
 
     from app.integrations.feishu.cards import card_action_result_card
     from app.card_actions.delivery import card_update_failure_policy
@@ -617,6 +625,19 @@ def _build_card_action_handler(
     return handle_card_action
 
 
+def _build_card_action_executor(
+    identity: Any,
+    card_actions: Any,
+    incidents: Any = None,
+    receipts: Any = None,
+) -> Any:
+    """Build the transport-agnostic identity/business/idempotency executor."""
+
+    return _build_card_action_handler(
+        identity, card_actions, None, incidents, receipts
+    )
+
+
 async def _run_gateway_until_shutdown(gateway: Any, on_ready: Any = None) -> None:
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
@@ -821,11 +842,13 @@ async def run() -> None:
     from app.repositories_card_action import CardActionReceiptRepository
 
     card_action_receipts = CardActionReceiptRepository(database)
-    handle_card_action = _build_card_action_handler(
-        identity, business.card_actions, sender, incidents, card_action_receipts
+    execute_card_action = _build_card_action_executor(
+        identity, business.card_actions, incidents, card_action_receipts
     )
-    execute_card_action = _build_card_action_handler(
-        identity, business.card_actions, None, incidents, card_action_receipts
+    from app.card_actions.delivery import build_card_action_delivery
+
+    handle_card_action = build_card_action_delivery(
+        execute_card_action, sender, incidents
     )
     sender, gateway = _build_bot_transport(
         settings,

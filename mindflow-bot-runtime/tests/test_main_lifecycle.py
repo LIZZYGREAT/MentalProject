@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -125,6 +126,29 @@ def test_card_action_handler_updates_original_card_after_success():
     assert result["card_update_ok"] is True
     assert card_actions.calls == 1
     assert sender.updated == [("om-card", result["card"])]
+
+
+def test_card_action_executor_never_calls_delivery_transport():
+    participant = SimpleNamespace(id="participant-1")
+
+    executor = app_main._build_card_action_executor(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        SimpleNamespace(
+            handle=lambda *_args, **_kwargs: {
+                "ok": True,
+                "reply_text": "已完成",
+                "card": {"schema": "2.0"},
+            }
+        ),
+    )
+    assert "sender" not in inspect.signature(
+        app_main._build_card_action_executor
+    ).parameters
+    assert executor(_card_action_event()) == {
+        "ok": True,
+        "reply_text": "已完成",
+        "card": {"schema": "2.0"},
+    }
 
 
 def test_card_action_handler_uses_callback_token_for_single_delayed_update():
