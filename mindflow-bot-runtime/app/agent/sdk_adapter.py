@@ -372,7 +372,10 @@ def _text_transport_prompt(
         )
     user_text = str(turn_input.text).strip()
     timezone_value = ZoneInfo(timezone_name)
-    local_now = current_datetime or datetime.now(timezone_value)
+    reference_time = turn_input.reference_time_utc
+    if reference_time is not None and reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    local_now = reference_time or current_datetime or datetime.now(timezone_value)
     if local_now.tzinfo is None:
         local_now = local_now.replace(tzinfo=timezone_value)
     else:

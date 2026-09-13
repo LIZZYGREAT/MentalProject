@@ -2249,6 +2249,14 @@ class BotWorker:
         run_generation: int,
     ) -> None:
         turn_input = turn_input or AgentTurnInput(text=event.text)
+        if turn_input.reference_time_utc is None:
+            reference_time = event.create_time
+            if reference_time.tzinfo is None:
+                reference_time = reference_time.replace(tzinfo=timezone.utc)
+            turn_input = replace(
+                turn_input,
+                reference_time_utc=reference_time.astimezone(timezone.utc),
+            )
         turn_input = await self._with_backend_context(ctx, turn_input)
         started = time.monotonic()
         progress = ProgressState(

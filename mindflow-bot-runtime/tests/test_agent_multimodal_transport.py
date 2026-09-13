@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -34,6 +34,22 @@ def test_text_only_turn_includes_authoritative_local_time_context():
     assert "local_datetime=2026-09-11T00:30:00+08:00" in prompt
     assert "local_date=2026-09-11" in prompt
     assert prompt.endswith("User request:\n今天有什么安排？")
+
+
+def test_turn_reference_time_overrides_later_transport_wall_clock():
+    ingress = datetime(2026, 9, 13, 0, 0, 8, tzinfo=timezone.utc)
+
+    prompt = _text_transport_prompt(
+        AgentTurnInput(text="一小时后提醒我", reference_time_utc=ingress),
+        timezone_name="Asia/Shanghai",
+        current_datetime=datetime(
+            2026, 9, 13, 8, 0, 28, tzinfo=ZoneInfo("Asia/Shanghai")
+        ),
+    )
+
+    assert "local_datetime=2026-09-13T08:00:08+08:00" in prompt
+    assert "local_date=2026-09-13" in prompt
+    assert "08:00:28" not in prompt
 
 
 def test_generic_image_context_is_framed_as_untrusted_evidence_without_base64():

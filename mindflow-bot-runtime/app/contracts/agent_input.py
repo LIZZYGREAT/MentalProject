@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, Mapping
 
 
@@ -31,6 +32,9 @@ class AgentTurnInput:
     participant_memory: tuple[Mapping[str, Any], ...] = ()
     interaction_preferences: Mapping[str, Any] | None = None
     psychological_context: Mapping[str, Any] | None = None
+    # Backend-authoritative ingress timestamp for this turn. It is context,
+    # never user input, a model assertion, or a permission.
+    reference_time_utc: datetime | None = None
 
     def __str__(self) -> str:
         """Preserve text behavior at legacy adapter/test-double boundaries."""

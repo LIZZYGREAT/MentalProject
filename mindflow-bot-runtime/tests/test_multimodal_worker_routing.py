@@ -2552,6 +2552,7 @@ def test_generic_false_positive_course_schedule_falls_back_to_normal_image_agent
     assert ctx.turn_effect_policy == "verify_on_demand"
     assert ctx.source_kind == "generic_image"
     assert ctx.user_request_text == "把这个讲座添加到日历"
+    assert turn_input.reference_time_utc == ctx.received_at_utc
     assert turn_input.trusted_image_context == {
         "image_kind": "other",
         "summary": "图片摘要",
