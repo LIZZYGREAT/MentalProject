@@ -41,9 +41,9 @@ class SupportPreferenceRepository:
         if "max_suggestions" in changes and (
             not isinstance(changes["max_suggestions"], int)
             or isinstance(changes["max_suggestions"], bool)
-            or not 1 <= changes["max_suggestions"] <= 5
+            or not 1 <= changes["max_suggestions"] <= 3
         ):
-            raise ValueError("max_suggestions must be between 1 and 5")
+            raise ValueError("max_suggestions must be between 1 and 3")
         if "preferred_support_style" in changes and changes["preferred_support_style"] not in {"gentle", "listening", "practical"}:
             raise ValueError("unsupported support style")
         for key in ("acknowledge_before_advice", "ask_before_suggestion", "allow_supportive_follow_up"):

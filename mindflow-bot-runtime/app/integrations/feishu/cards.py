@@ -1620,7 +1620,7 @@ def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
                 {"tag": "select_static", "name": "verbosity", "placeholder": {"tag": "plain_text", "content": "回答长度"}, "initial_option": str(preferences.get("verbosity") or "balanced"), "options": options(("concise", "balanced", "detailed"))},
                 {"tag": "select_static", "name": "tone", "placeholder": {"tag": "plain_text", "content": "语气"}, "initial_option": str(preferences.get("tone") or "warm"), "options": options(("neutral", "warm", "direct"))},
                 {"tag": "select_static", "name": "suggestion_style", "placeholder": {"tag": "plain_text", "content": "建议方式"}, "initial_option": str(preferences.get("suggestion_style") or "light_suggestions"), "options": options(("ask_first", "light_suggestions", "proactive_suggestions"))},
-                {"tag": "select_static", "name": "max_suggestions", "placeholder": {"tag": "plain_text", "content": "每次最多建议数"}, "initial_option": str(support.get("max_suggestions") or 3), "options": options(("1", "2", "3", "4", "5"))},
+                {"tag": "select_static", "name": "max_suggestions", "placeholder": {"tag": "plain_text", "content": "每次最多建议数"}, "initial_option": str(support.get("max_suggestions") or 3), "options": options(("1", "2", "3"))},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "保存"}, "type": "primary", "action_type": "form_submit", "value": {"mindflow_action": "preference_settings_save", "version": "1"}},
             ]},
             {"tag": "action", "actions": [

@@ -2086,6 +2086,20 @@ class ParticipantMemoryItem(Base):
 
 class ParticipantInteractionStyle(Base):
     __tablename__ = "participant_interaction_styles"
+    __table_args__ = (
+        CheckConstraint(
+            "verbosity IN ('concise', 'balanced', 'detailed')",
+            name="ck_interaction_style_verbosity",
+        ),
+        CheckConstraint(
+            "tone IN ('neutral', 'warm', 'direct')",
+            name="ck_interaction_style_tone",
+        ),
+        CheckConstraint(
+            "suggestion_style IN ('ask_first', 'light_suggestions', 'proactive_suggestions')",
+            name="ck_interaction_style_suggestion",
+        ),
+    )
 
     participant_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
@@ -2099,6 +2113,10 @@ class ParticipantInteractionStyle(Base):
 class ParticipantInteractionRule(Base):
     __tablename__ = "participant_interaction_rules"
     __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted')",
+            name="ck_interaction_rule_status",
+        ),
         Index("ix_interaction_rule_active", "participant_id", "status"),
     )
 
@@ -2116,6 +2134,16 @@ class ParticipantInteractionRule(Base):
 
 class ParticipantSupportPreference(Base):
     __tablename__ = "participant_support_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "max_suggestions BETWEEN 1 AND 3",
+            name="ck_support_preference_max_suggestions",
+        ),
+        CheckConstraint(
+            "preferred_support_style IN ('gentle', 'practical', 'listening')",
+            name="ck_support_preference_style",
+        ),
+    )
 
     participant_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True

@@ -53,7 +53,7 @@ class InteractionPreferenceTools:
                 "properties": {
                     "acknowledge_before_advice": {"type": "boolean"},
                     "ask_before_suggestion": {"type": "boolean"},
-                    "max_suggestions": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "max_suggestions": {"type": "integer", "minimum": 1, "maximum": 3},
                     "allow_supportive_follow_up": {"type": "boolean"},
                     "preferred_support_style": {"type": "string", "enum": ["gentle", "listening", "practical"]},
                 },

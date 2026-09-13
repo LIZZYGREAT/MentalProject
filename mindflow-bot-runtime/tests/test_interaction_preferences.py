@@ -1,3 +1,6 @@
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from app.models import ParticipantInteractionRule, ParticipantMemoryItem
 from app.repositories_preferences import (
     InteractionPreferenceRepository,
@@ -85,6 +88,28 @@ def test_structured_style_enums_are_validated():
         pass
     else:
         raise AssertionError("unsafe free-form style was accepted")
+
+
+def test_support_preference_limits_are_enforced_by_service_and_database():
+    database = memory_database()
+    user = participant(database, "PREF-8")
+    support = SupportPreferenceRepository(database)
+    try:
+        support.update(user.id, {"max_suggestions": 4})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("service accepted more than three suggestions")
+
+    from app.models import ParticipantSupportPreference
+
+    with pytest.raises(IntegrityError):
+        with database.session() as session:
+            session.add(ParticipantSupportPreference(
+                participant_id=user.id, max_suggestions=4,
+                preferred_support_style="gentle",
+            ))
+            session.flush()
 
 
 def test_support_preference_is_separate_from_memory_and_normalized():
