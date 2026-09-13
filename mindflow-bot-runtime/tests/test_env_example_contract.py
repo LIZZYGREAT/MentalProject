@@ -19,6 +19,17 @@ def _example_keys() -> set[str]:
     return keys
 
 
+def _example_values() -> dict[str, str]:
+    values = {}
+    for line in (RUNTIME_ROOT / ".env.example").read_text(
+        encoding="utf-8-sig"
+    ).splitlines():
+        parsed = sync_env.parse_env_assignment(line)
+        if parsed:
+            values[parsed["key"]] = sync_env.normalize_value(parsed["value"])
+    return values
+
+
 def test_env_example_contains_critical_runtime_capabilities():
     required = {
         "SEMANTIC_API_ENABLED",
@@ -39,6 +50,41 @@ def test_env_example_contains_critical_runtime_capabilities():
         "CLAUDE_PARTIAL_MESSAGES_ENABLED",
     }
     assert required <= _example_keys()
+
+
+def test_enabled_mutation_intent_has_nonempty_model_in_env_example():
+    values = _example_values()
+
+    assert values["MUTATION_INTENT_API_ENABLED"] == "true"
+    assert values["MUTATION_INTENT_API_MODEL"] == "deepseek-v4-flash"
+
+
+def test_env_example_feature_flags_are_internally_consistent():
+    values = _example_values()
+
+    def enabled(key: str) -> bool:
+        return values.get(key, "").lower() == "true"
+
+    if enabled("SEMANTIC_API_ENABLED"):
+        assert values["SEMANTIC_API_URL"]
+        assert values["SEMANTIC_API_MODEL"]
+    if enabled("WEB_SEARCH_ENABLED"):
+        assert values["WEB_SEARCH_PROVIDER"]
+        assert values["WEB_SEARCH_MODEL"]
+        assert "WEB_SEARCH_API_KEY" not in values
+    if enabled("MUTATION_INTENT_API_ENABLED"):
+        assert values["MUTATION_INTENT_API_URL"]
+        assert values["MUTATION_INTENT_API_MODEL"]
+    if enabled("VISION_API_ENABLED"):
+        assert values["VISION_API_URL"]
+        assert values["VISION_API_MODEL"]
+    if enabled("DAILY_REVIEW_ENABLED"):
+        assert values["DAILY_REVIEW_LOCAL_TIME"]
+        assert values["DAILY_REVIEW_TIMEZONE"]
+        assert (
+            values["FEISHU_CARD_ACTION_TRANSPORT"] == "ws"
+            or enabled("FEISHU_CARD_CALLBACK_ENABLED")
+        )
 
 
 def test_sync_env_adds_new_fields_without_overwriting_existing_secret(
