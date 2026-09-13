@@ -37,7 +37,7 @@ class InteractionPreferenceTools:
         )
         registry.register(
             "interaction_rule_set",
-            "Normalize a participant's explicit response-style rule. Unsafe authorization or safety fragments are rejected and never injected.",
+            "Normalize an explicit response-style, assistant display-name, or self-reference rule. Unsafe authorization or safety fragments are rejected and never injected.",
             {
                 "type": "object",
                 "properties": {"rule": {"type": "string", "minLength": 1, "maxLength": 500}},

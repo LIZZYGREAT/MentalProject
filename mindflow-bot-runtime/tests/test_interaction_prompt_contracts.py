@@ -99,6 +99,30 @@ def test_preference_block_absent_without_preferences():
     assert "<backend_interaction_preferences>" not in prompt
 
 
+def test_custom_name_rules_enter_prompt_only_as_category_and_value():
+    prompt = _text_transport_prompt(
+        AgentTurnInput(
+            text="你好",
+            participant_stage="active",
+            interaction_preferences={
+                "verbosity": "concise",
+                "rules": [{
+                    "id": "private-row-id",
+                    "category": "assistant_self_reference",
+                    "value": "蜗",
+                    "raw_text": "raw user instruction",
+                }],
+            },
+        ),
+        timezone_name="Asia/Shanghai",
+    )
+    assert '"category": "assistant_self_reference"' in prompt
+    assert '"value": "蜗"' in prompt
+    assert "private-row-id" not in prompt
+    assert "raw user instruction" not in prompt
+    assert "presentation labels only" in prompt
+
+
 def _skill_example(keyword: str) -> str:
     """Return one style-example bullet block from the production SKILL.md."""
 

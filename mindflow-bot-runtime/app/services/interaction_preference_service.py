@@ -32,6 +32,14 @@ class InteractionPreferenceService:
     def apply_rule(self, participant_id, raw_text: str):
         result = normalize_rule(raw_text)
         stored = []
+        if not result["accepted"]:
+            return {
+                "accepted": [],
+                "rejected": result["rejected"],
+                "error": "unsupported_interaction_rule",
+                "reason_code": "rule_not_normalized",
+                "preferences": self.get(participant_id),
+            }
         for accepted in result["accepted"]:
             if accepted["category"] in STYLE_FIELDS:
                 self.repository.update_style(
@@ -52,11 +60,13 @@ class InteractionPreferenceService:
                 except PreferenceRuleLimitReached as exc:
                     return {
                         "accepted": stored, "rejected": result["rejected"],
-                        "error": exc.code, "message": str(exc),
+                        "error": exc.code, "reason_code": exc.code,
+                        "message": str(exc),
                         "preferences": self.get(participant_id),
                     }
         return {
             "accepted": stored, "rejected": result["rejected"], "error": None,
+            "reason_code": None,
             "preferences": self.get(participant_id),
         }
 
