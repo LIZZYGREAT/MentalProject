@@ -99,6 +99,20 @@ def test_preference_block_absent_without_preferences():
     assert "<backend_interaction_preferences>" not in prompt
 
 
+def test_legacy_preferences_do_not_gain_an_empty_rules_field():
+    prompt = _text_transport_prompt(
+        AgentTurnInput(
+            text="你好",
+            participant_stage="active",
+            interaction_preferences={"tone": "concise"},
+        ),
+        timezone_name="Asia/Shanghai",
+    )
+
+    assert '{"tone": "concise"}' in prompt
+    assert '"rules"' not in prompt
+
+
 def test_custom_name_rules_enter_prompt_only_as_category_and_value():
     prompt = _text_transport_prompt(
         AgentTurnInput(

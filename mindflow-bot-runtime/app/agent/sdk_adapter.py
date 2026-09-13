@@ -423,15 +423,19 @@ def _text_transport_prompt(
         )
     if turn_input.interaction_preferences is not None:
         raw_preferences = dict(turn_input.interaction_preferences)
-        safe_rules = []
-        for item in raw_preferences.get("rules") or []:
-            if not isinstance(item, dict):
-                continue
-            category = str(item.get("category") or "")
-            value = str(item.get("value") or "")
-            if category in {"assistant_display_name", "assistant_self_reference"}:
-                safe_rules.append({"category": category, "value": value[:20]})
-        raw_preferences["rules"] = safe_rules
+        if "rules" in raw_preferences:
+            safe_rules = []
+            for item in raw_preferences.get("rules") or []:
+                if not isinstance(item, dict):
+                    continue
+                category = str(item.get("category") or "")
+                value = str(item.get("value") or "")
+                if category in {
+                    "assistant_display_name",
+                    "assistant_self_reference",
+                }:
+                    safe_rules.append({"category": category, "value": value[:20]})
+            raw_preferences["rules"] = safe_rules
         preferences = json.dumps(
             raw_preferences,
             ensure_ascii=False,
