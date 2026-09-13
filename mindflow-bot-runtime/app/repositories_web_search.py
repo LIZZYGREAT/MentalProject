@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.db import Database
 from app.models import WebSearchResult, WebSearchRun, utc_now
@@ -80,6 +80,25 @@ class WebSearchRepository:
                 WebSearchResult.expires_at > utc_now(),
             )).scalar_one_or_none()
             return self._view(row) if row else None
+
+    def purge_expired(self, now: datetime | None = None) -> dict[str, int]:
+        """Physically remove expired evidence and its parent audit rows."""
+
+        instant = now or utc_now()
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone.utc)
+        else:
+            instant = instant.astimezone(timezone.utc)
+        with self.database.session() as session:
+            # Delete children explicitly because SQLite does not always enable
+            # foreign-key cascades in lightweight/test deployments.
+            result_count = session.execute(
+                delete(WebSearchResult).where(WebSearchResult.expires_at <= instant)
+            ).rowcount or 0
+            run_count = session.execute(
+                delete(WebSearchRun).where(WebSearchRun.expires_at <= instant)
+            ).rowcount or 0
+        return {"results": result_count, "runs": run_count}
 
     @staticmethod
     def _view(row: WebSearchResult) -> dict[str, Any]:

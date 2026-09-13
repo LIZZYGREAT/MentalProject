@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from app.agent.sdk_adapter import DISALLOWED_TOOLS, SYSTEM_RULES
-from app.models import WebSearchRun
+from app.models import WebSearchResult, WebSearchRun
 from app.repositories_web_search import WebSearchRepository
 from app.services.web_search_service import (
     DisabledSearchProvider,
@@ -100,3 +100,20 @@ def test_successful_search_persists_only_query_hash_not_query_plaintext():
         row = session.query(WebSearchRun).one()
         assert len(row.query_hash) == 64
         assert row.normalized_query is None
+
+
+def test_expired_search_evidence_is_physically_purged():
+    database = memory_database()
+    user = participant(database, "WEB-PURGE")
+    repository = WebSearchRepository(database)
+    asyncio.run(WebSearchService(repository, _Provider()).search(
+        user.id, query="DeepSeek latest model", freshness="month"
+    ))
+    future = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    counts = repository.purge_expired(future)
+
+    assert counts == {"results": 1, "runs": 1}
+    with database.session() as session:
+        assert session.query(WebSearchResult).count() == 0
+        assert session.query(WebSearchRun).count() == 0
