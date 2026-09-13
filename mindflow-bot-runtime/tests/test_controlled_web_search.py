@@ -6,6 +6,7 @@ from app.models import WebSearchResult, WebSearchRun
 from app.repositories_web_search import WebSearchRepository
 from app.services.web_search_service import (
     DisabledSearchProvider,
+    SearchQueryRequiresPublicTopic,
     WebSearchService,
     normalize_search_query,
 )
@@ -25,16 +26,16 @@ class _Provider:
         }]
 
 
-def test_query_rewrite_removes_private_context_and_identifiers():
-    rewritten = normalize_search_query(
-        "我 P003 最近两周压力很大，DeepSeek 最新版本是什么？邮箱 a@example.com",
-        now=datetime(2026, 9, 12, tzinfo=timezone.utc),
-    )
-    assert "P003" not in rewritten
-    assert "压力" not in rewritten
-    assert "a@example.com" not in rewritten
-    assert "DeepSeek" in rewritten
-    assert "September 2026" in rewritten
+def test_query_rewrite_rejects_participant_context_instead_of_sending_it():
+    try:
+        normalize_search_query(
+            "我 P003 最近两周压力很大，DeepSeek 最新版本是什么？邮箱 a@example.com",
+            now=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        )
+    except SearchQueryRequiresPublicTopic:
+        pass
+    else:
+        raise AssertionError("participant context was allowed into outbound search")
 
 
 def test_external_evidence_is_marked_untrusted_and_participant_bound():
@@ -77,6 +78,61 @@ def test_private_context_without_punctuation_fails_closed_and_is_not_persisted()
         query="我最近压力很大想知道 DeepSeek 最新版本",
         freshness="month",
     ))
+
+    assert result == {
+        "ok": False,
+        "error": "search_query_requires_public_topic",
+        "verified": False,
+    }
+    assert provider.queries == []
+    with database.session() as session:
+        assert session.query(WebSearchRun).count() == 0
+
+
+def test_public_sensitive_topics_are_allowed_without_private_attribution():
+    public_topics = (
+        "大学生睡眠研究最新进展",
+        "心理学最新研究",
+        "焦虑症最新治疗指南",
+        "日程管理软件推荐",
+        "大学生压力研究",
+    )
+    for topic in public_topics:
+        assert normalize_search_query(topic)
+
+
+def test_private_attribution_variants_fail_without_provider_or_database_write():
+    private_queries = (
+        "我最近压力很大想知道 DeepSeek 最新版本",
+        "帮我搜索我的睡眠问题",
+        "我的日程里有考试，查一下相关资料",
+        "P003 最近焦虑，搜索一下治疗指南",
+    )
+    database = memory_database()
+    user = participant(database, "WEB-PRIVATE-VARIANTS")
+    provider = _Provider()
+    service = WebSearchService(WebSearchRepository(database), provider)
+
+    for query in private_queries:
+        result = asyncio.run(service.search(user.id, query=query))
+        assert result == {
+            "ok": False,
+            "error": "search_query_requires_public_topic",
+            "verified": False,
+        }
+
+    assert provider.queries == []
+    with database.session() as session:
+        assert session.query(WebSearchRun).count() == 0
+
+
+def test_query_with_no_public_topic_has_stable_privacy_error_and_no_side_effects():
+    database = memory_database()
+    user = participant(database, "WEB-NO-TOPIC")
+    provider = _Provider()
+    result = asyncio.run(WebSearchService(
+        WebSearchRepository(database), provider
+    ).search(user.id, query="a@example.com"))
 
     assert result == {
         "ok": False,

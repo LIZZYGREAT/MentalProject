@@ -16,14 +16,24 @@ import httpx
 _UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,36}\b")
 _EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _PHONE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
-_PARTICIPANT = re.compile(r"\b(?:participant[_ -]?(?:id|code)?|P)\s*[:#-]?\s*\d{2,}\b", re.I)
-_PRIVATE_PREFIX = re.compile(
-    r"(?:我|本人|我的).{0,24}?(?:压力|焦虑|抑郁|心理|日程|聊天|记录|学号|手机号).{0,40}?[，,。；;]\s*",
+_PARTICIPANT = re.compile(
+    r"(?:\bparticipant[_ -]?(?:id|code)?\s*[:=#-]\s*[a-z0-9_-]+\b|"
+    r"\bP\s*[:#-]?\s*\d{2,}\b)",
     re.I,
 )
-_PRIVATE_CONTEXT = re.compile(
-    r"(?:压力|焦虑|抑郁|心理(?:记录|状态)?|日程|课程表|聊天|记忆|学号|手机号|"
-    r"睡眠|情绪|我的状态|my\s+(?:stress|anxiety|depression|schedule|messages?|memory))",
+_SENSITIVE_CONTEXT = (
+    r"(?:压力|焦虑|抑郁|心理(?:记录|状态)?|日程|课程表|聊天(?:记录)?|记忆|"
+    r"学号|手机号|睡眠|情绪)"
+)
+_PRIVATE_ATTRIBUTION = re.compile(
+    rf"(?:我的|本人(?:的)?|我(?:最近|目前|现在|这段时间)(?:的)?)\s*.{{0,12}}?"
+    rf"{_SENSITIVE_CONTEXT}|my\s+(?:stress|anxiety|depression|schedule|"
+    rf"messages?|memory|sleep|mood)",
+    re.I,
+)
+_PARTICIPANT_PRIVATE_CONTEXT = re.compile(
+    rf"(?:\bP\s*[:#-]?\s*\d{{2,}}\b|\bparticipant[_ -]?(?:id|code)?\b)"
+    rf".{{0,32}}?{_SENSITIVE_CONTEXT}",
     re.I,
 )
 
@@ -34,17 +44,21 @@ class SearchQueryRequiresPublicTopic(ValueError):
 
 def normalize_search_query(query: str, *, now: datetime | None = None) -> str:
     value = " ".join(str(query).split())[:1000]
+    if (
+        _PARTICIPANT.search(value)
+        or _PRIVATE_ATTRIBUTION.search(value)
+        or _PARTICIPANT_PRIVATE_CONTEXT.search(value)
+    ):
+        raise SearchQueryRequiresPublicTopic(
+            "search query contains participant-private context"
+        )
     value = _UUID.sub(" ", value)
     value = _EMAIL.sub(" ", value)
     value = _PHONE.sub(" ", value)
-    value = _PARTICIPANT.sub(" ", value)
-    value = _PRIVATE_PREFIX.sub("", value)
     value = re.sub(r"\s+", " ", value).strip(" ，,。；;")
     if not value:
-        raise ValueError("search query contains no public topic after privacy minimization")
-    if _PRIVATE_CONTEXT.search(value):
         raise SearchQueryRequiresPublicTopic(
-            "search query must contain only the public topic"
+            "search query contains no public topic after privacy minimization"
         )
     current = now or datetime.now(timezone.utc)
     if re.search(r"最新|当前|现在|today|latest|current", value, re.I):
@@ -103,7 +117,7 @@ class WebSearchService:
         count = max(1, min(int(max_results), 10))
         try:
             normalized = normalize_search_query(query)
-        except SearchQueryRequiresPublicTopic:
+        except (SearchQueryRequiresPublicTopic, ValueError):
             return {
                 "ok": False,
                 "error": "search_query_requires_public_topic",
