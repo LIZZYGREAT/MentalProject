@@ -47,6 +47,19 @@ def test_system_rules_keep_conversation_as_the_default_path():
     assert "concise, calm, and optional" in SYSTEM_RULES
 
 
+def test_system_rules_keep_durable_memory_separate_from_preferences():
+    assert "durable personal fact, goal, routine, preferred name" in SYSTEM_RULES
+    for category in (
+        "response style", "suggestion style", "support style",
+        "follow-up preference", "notification preference",
+    ):
+        assert category in SYSTEM_RULES
+    memory_rule = SYSTEM_RULES.split("Call memory_remember_explicit", 1)[1].split(
+        "Keep participant_memory", 1
+    )[0]
+    assert "sets a lasting personalization preference" not in memory_rule
+
+
 def test_system_rules_are_one_structured_constant_without_appends():
     source = (RUNTIME_ROOT / "app" / "agent" / "sdk_adapter.py").read_text(
         encoding="utf-8"

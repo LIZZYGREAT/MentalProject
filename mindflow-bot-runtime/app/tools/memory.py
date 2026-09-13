@@ -19,7 +19,7 @@ class MemoryTools:
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "memory_remember_explicit",
-            "Remember durable participant context only when the current user explicitly says to remember it or sets a lasting preference.",
+            "Remember a durable personal fact, goal, routine, preferred name, or background context only when the current user explicitly asks. Never use this for response style, suggestion style, support style, follow-up preference, or notification preference.",
             {
                 "type": "object",
                 "properties": {
