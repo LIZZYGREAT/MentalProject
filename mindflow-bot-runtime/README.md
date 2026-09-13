@@ -176,6 +176,16 @@ docker compose -f compose.yaml -f compose.smoke.yaml up -d --no-deps bot
 docker compose run --rm bot python3 -m app.smoke.feishu_gateway --seconds 30
 ```
 
+可直接验证 DeepSeek Native Web Search 的真实 provider contract。该脚本只发送固定
+公共查询，不连接数据库，也不会打印 API Key：
+
+```bash
+python3 scripts/smoke_deepseek_web_search.py
+```
+
+成功时输出 `PASS provider=deepseek_native sources=N`，失败时输出稳定的
+`reason_code` 供部署排查。
+
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
 `claude`。Compose 把 `/home/mindflow/.claude` 挂到 `claude_state` volume，确保
 container recreate 后 transcript 仍可用于 `resume=session_id`。
