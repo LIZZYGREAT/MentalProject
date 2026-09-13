@@ -125,9 +125,11 @@ class Settings:
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
     web_search_enabled: bool = False
-    web_search_api_url: str = ""
-    web_search_api_key: str = ""
+    web_search_provider: str = "deepseek_native"
+    web_search_model: str = "deepseek-v4-flash"
     web_search_timeout_seconds: float = 10.0
+    web_search_max_uses: int = 3
+    web_search_max_output_tokens: int = 1200
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -382,10 +384,18 @@ class Settings:
             ),
             semantic_api_enabled=_bool(values, "SEMANTIC_API_ENABLED", False),
             web_search_enabled=_bool(values, "WEB_SEARCH_ENABLED", False),
-            web_search_api_url=values.get("WEB_SEARCH_API_URL", "").strip(),
-            web_search_api_key=values.get("WEB_SEARCH_API_KEY", "").strip(),
+            web_search_provider=values.get(
+                "WEB_SEARCH_PROVIDER", "deepseek_native"
+            ).strip(),
+            web_search_model=values.get(
+                "WEB_SEARCH_MODEL", "deepseek-v4-flash"
+            ).strip(),
             web_search_timeout_seconds=_float(
                 values, "WEB_SEARCH_TIMEOUT_SECONDS", 10.0, minimum=1.0
+            ),
+            web_search_max_uses=_int(values, "WEB_SEARCH_MAX_USES", 3),
+            web_search_max_output_tokens=_int(
+                values, "WEB_SEARCH_MAX_OUTPUT_TOKENS", 1200, minimum=256
             ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
@@ -551,11 +561,17 @@ class Settings:
                 "MUTATION_INTENT_API_URL and MUTATION_INTENT_API_MODEL are required "
                 "when mutation intent verification is enabled"
             )
-        if self.web_search_enabled and (
-            not self.web_search_api_url or not self.web_search_api_key
-        ):
+        if self.web_search_provider != "deepseek_native":
+            raise ValueError("WEB_SEARCH_PROVIDER must be deepseek_native")
+        if not self.web_search_model:
+            raise ValueError("WEB_SEARCH_MODEL must be non-empty")
+        if self.web_search_max_uses > 5:
+            raise ValueError("WEB_SEARCH_MAX_USES must be <= 5")
+        if self.web_search_max_output_tokens < 256:
+            raise ValueError("WEB_SEARCH_MAX_OUTPUT_TOKENS must be >= 256")
+        if self.web_search_enabled and not self.deepseek_api_key:
             raise ValueError(
-                "WEB_SEARCH_API_URL and WEB_SEARCH_API_KEY are required when web search is enabled"
+                "DEEPSEEK_API_KEY is required when web search is enabled"
             )
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")

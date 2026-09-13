@@ -91,8 +91,8 @@ from app.services.interaction_preference_service import InteractionPreferenceSer
 from app.services.psychological_context_builder import PsychologicalContextBuilder
 from app.services.research_aggregate_service import ResearchAggregateService
 from app.services.web_search_service import (
+    DeepSeekNativeSearchProvider,
     DisabledSearchProvider,
-    HttpJsonSearchProvider,
     WebSearchService,
 )
 from mindflow_core.assessment import AssessmentModel
@@ -217,15 +217,21 @@ def build_business_services(
     morning_brief_schedules = MorningBriefScheduleRepository(database)
     reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
     followup_candidates = CareFollowupCandidateRepository(database)
-    search_provider = (
-        HttpJsonSearchProvider(
-            settings.web_search_api_url,
-            settings.web_search_api_key,
+    if not settings.web_search_enabled:
+        search_provider = DisabledSearchProvider()
+    elif settings.web_search_provider == "deepseek_native":
+        search_provider = DeepSeekNativeSearchProvider(
+            base_url=settings.claude_anthropic_base_url,
+            api_key=settings.deepseek_api_key,
+            model=settings.web_search_model,
             timeout_seconds=settings.web_search_timeout_seconds,
+            max_uses=settings.web_search_max_uses,
+            max_output_tokens=settings.web_search_max_output_tokens,
         )
-        if settings.web_search_enabled
-        else DisabledSearchProvider()
-    )
+    else:
+        raise ValueError(
+            f"Unsupported WEB_SEARCH_PROVIDER: {settings.web_search_provider}"
+        )
     web_search = WebSearchService(WebSearchRepository(database), search_provider)
     memory = MemoryService(ParticipantMemoryRepository(database))
     interaction_preferences = InteractionPreferenceService(

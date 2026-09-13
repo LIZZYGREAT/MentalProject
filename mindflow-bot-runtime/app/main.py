@@ -25,11 +25,11 @@ def _log_startup_phase(name: str) -> None:
 
 def _log_web_search_config(settings: Any) -> None:
     logging.getLogger(__name__).info(
-        "web_search_config enabled=%s provider=http_json "
-        "url_configured=%s key_configured=%s",
+        "web_search_config enabled=%s provider=%s model=%s key_configured=%s",
         bool(settings.web_search_enabled),
-        bool(str(settings.web_search_api_url or "").strip()),
-        bool(str(settings.web_search_api_key or "").strip()),
+        str(settings.web_search_provider),
+        str(settings.web_search_model),
+        bool(str(settings.deepseek_api_key or "").strip()),
     )
 
 

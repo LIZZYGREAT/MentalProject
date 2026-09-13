@@ -38,6 +38,40 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_web_search_uses_deepseek_credential_and_native_defaults():
+    environment = valid_environment()
+    environment["WEB_SEARCH_ENABLED"] = "true"
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.web_search_enabled is True
+    assert settings.web_search_provider == "deepseek_native"
+    assert settings.web_search_model == "deepseek-v4-flash"
+    assert settings.web_search_timeout_seconds == 10
+    assert settings.web_search_max_uses == 3
+    assert settings.web_search_max_output_tokens == 1200
+    assert not hasattr(settings, "web_search_api_url")
+    assert not hasattr(settings, "web_search_api_key")
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("WEB_SEARCH_PROVIDER", "http_json", "WEB_SEARCH_PROVIDER"),
+        ("WEB_SEARCH_MAX_USES", "6", "WEB_SEARCH_MAX_USES"),
+        ("WEB_SEARCH_MAX_OUTPUT_TOKENS", "255", "WEB_SEARCH_MAX_OUTPUT_TOKENS"),
+    ],
+)
+def test_web_search_settings_reject_unsupported_provider_limits(name, value, message):
+    environment = valid_environment()
+    environment[name] = value
+    with pytest.raises(ValueError, match=message):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
 def test_mutation_intent_verifier_has_independent_on_demand_configuration():
     settings = Settings.from_env(
         valid_environment(), base_dir=Path(__file__).resolve().parents[1]

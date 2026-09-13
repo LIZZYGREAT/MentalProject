@@ -25,9 +25,11 @@ def test_env_example_contains_critical_runtime_capabilities():
         "SEMANTIC_API_URL",
         "SEMANTIC_API_MODEL",
         "WEB_SEARCH_ENABLED",
-        "WEB_SEARCH_API_URL",
-        "WEB_SEARCH_API_KEY",
+        "WEB_SEARCH_PROVIDER",
+        "WEB_SEARCH_MODEL",
         "WEB_SEARCH_TIMEOUT_SECONDS",
+        "WEB_SEARCH_MAX_USES",
+        "WEB_SEARCH_MAX_OUTPUT_TOKENS",
         "MUTATION_INTENT_API_ENABLED",
         "VISION_API_ENABLED",
         "PROFILE_CALIBRATION_ENABLED",
@@ -47,13 +49,15 @@ def test_sync_env_adds_new_fields_without_overwriting_existing_secret(
     backup = tmp_path / ".env.bak"
     example.write_text(
         "WEB_SEARCH_ENABLED=false\n"
-        "WEB_SEARCH_API_URL=\n"
-        "WEB_SEARCH_API_KEY=\n"
-        "WEB_SEARCH_TIMEOUT_SECONDS=10\n",
+        "WEB_SEARCH_PROVIDER=deepseek_native\n"
+        "WEB_SEARCH_MODEL=deepseek-v4-flash\n"
+        "WEB_SEARCH_TIMEOUT_SECONDS=20\n"
+        "WEB_SEARCH_MAX_USES=3\n"
+        "WEB_SEARCH_MAX_OUTPUT_TOKENS=1200\n",
         encoding="utf-8",
     )
     environment.write_text(
-        "WEB_SEARCH_API_KEY=deployment-secret\n",
+        "DEEPSEEK_API_KEY=deployment-secret\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(sync_env, "ENV_EXAMPLE", example)
@@ -64,10 +68,11 @@ def test_sync_env_adds_new_fields_without_overwriting_existing_secret(
 
     merged = environment.read_text(encoding="utf-8")
     output = capsys.readouterr().out
-    assert "WEB_SEARCH_API_KEY=deployment-secret" in merged
+    assert "DEEPSEEK_API_KEY=deployment-secret" in merged
     assert "WEB_SEARCH_ENABLED=false" in merged
-    assert "WEB_SEARCH_TIMEOUT_SECONDS=10" in merged
+    assert "WEB_SEARCH_PROVIDER=deepseek_native" in merged
+    assert "WEB_SEARCH_TIMEOUT_SECONDS=20" in merged
     assert "deployment-secret" not in output
-    assert "WEB_SEARCH_API_KEY" in output
-    assert ".env         = <configured>" in output
+    assert "DEEPSEEK_API_KEY" in output
+    assert "! DEEPSEEK_API_KEY=<configured>" in output
     assert backup.exists()

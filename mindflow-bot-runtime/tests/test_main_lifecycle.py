@@ -9,18 +9,18 @@ from app import main as app_main
 def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
     settings = SimpleNamespace(
         web_search_enabled=True,
-        web_search_api_url="https://search.example.test/path?private=value",
-        web_search_api_key="secret-key-value",
+        web_search_provider="deepseek_native",
+        web_search_model="deepseek-v4-flash",
+        deepseek_api_key="secret-key-value",
     )
 
     with caplog.at_level("INFO"):
         app_main._log_web_search_config(settings)
 
     assert (
-        "web_search_config enabled=True provider=http_json "
-        "url_configured=True key_configured=True"
+        "web_search_config enabled=True provider=deepseek_native "
+        "model=deepseek-v4-flash key_configured=True"
     ) in caplog.text
-    assert "search.example.test" not in caplog.text
     assert "secret-key-value" not in caplog.text
 
 
