@@ -47,6 +47,14 @@ def test_system_rules_keep_conversation_as_the_default_path():
     assert "concise, calm, and optional" in SYSTEM_RULES
 
 
+def test_system_rules_require_structured_search_evidence_and_no_fallback():
+    assert "summary_evidence.external_web_evidence" in SYSTEM_RULES
+    assert "sources array contains at least one source" in SYSTEM_RULES
+    assert "Never invent or recover a URL from summary prose" in SYSTEM_RULES
+    assert "fall back to built-in" in SYSTEM_RULES
+    assert "provider_no_sources" in SYSTEM_RULES
+
+
 def test_system_rules_keep_durable_memory_separate_from_preferences():
     assert "durable personal fact, goal, routine, preferred name" in SYSTEM_RULES
     for category in (

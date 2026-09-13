@@ -15,7 +15,7 @@ class WebTools:
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "web_search",
-            "Search public current information through MindFlow's privacy-minimizing backend. The tool remains registered when its provider is disabled and then returns web_search_unavailable with reason_code=provider_not_configured. Never include private schedules, mental-health records, memory, participant codes, or internal IDs in query.",
+            "Search public current information through MindFlow's privacy-minimizing backend. A successful result includes untrusted summary_evidence and structured sources; cite only those sources. The tool remains registered when its provider is disabled and then returns web_search_unavailable with reason_code=provider_not_configured. Never include private schedules, mental-health records, memory, participant codes, or internal IDs in query.",
             {
                 "type": "object",
                 "properties": {
