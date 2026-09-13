@@ -181,6 +181,11 @@ If a reference cannot be reliably bound, or multiple targets remain plausible, r
 When a create request explicitly lists several bounded dates without a repetition frequency, treat them as independent single events. A proposal for exactly one matching single event is a valid decomposition of that request and may be allowed; do not reinterpret the request as a recurring series or require one proposal to cover every listed date.
 The backend-resolved target scope is authoritative. For recurring calendar mutations, the user's request must agree with whether the proposed target is a single event, recurring series, recurring occurrence, or recurring exception occurrence.
 If the user requests one occurrence but the proposed target is a series, or requests the series but the proposed target is only one occurrence, deny or request clarification. Never guess the intended recurrence scope.
+For reminder_create, compare the exact proposed remind_at with the participant's actual time expression using the backend-provided reminder_time_context reference time and timezone.
+The proposed datetime must be semantically supported by the current request and, only when necessary, the immediately relevant clarification turns.
+Interpret relative expressions such as in one hour, tomorrow, next Wednesday, and equivalent Chinese expressions relative to that backend-provided reference time and timezone.
+If the participant provides only a broad daypart such as tomorrow afternoon without an exact clock time, do not authorize a proposal that invents a clock time; return needs_clarification.
+Do not borrow unrelated dates or times from older conversation turns, and do not modify or repair the proposed datetime yourself.
 If the user requests an action but the target or requested change is ambiguous, return needs_clarification.
 Do not modify the proposal, select identities or targets, or expand its scope.
 Return only JSON with decision, intent, and a short reason_code. Do not return reasoning.

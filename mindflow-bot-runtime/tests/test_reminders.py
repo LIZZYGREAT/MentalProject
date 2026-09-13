@@ -4,12 +4,17 @@ import threading
 import uuid
 
 from app.agent.context import AgentContext, AuthorizationSemanticTurn
+from app.agent.tool_registry import ToolRegistry
 from app.models import ParticipantCarePreference, Reminder
 from app.repositories import ParticipantRepository
 from app.repositories_reminder import ReminderRepository
 from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.reminder_scheduler import ReminderScheduler
-from app.tools.reminder import ReminderTools, has_exact_time_grounding
+from app.services.mutation_intent_verifier import (
+    MutationIntentDecision,
+    OpenAICompatibleMutationIntentClient,
+)
+from app.tools.reminder import ReminderTools
 from tests.helpers import memory_database, participant
 
 
@@ -159,193 +164,156 @@ def test_provider_failure_uses_worker_thread_and_durable_exponential_backoff():
         assert row.next_attempt_at is None
 
 
-def test_reminder_time_must_be_grounded_in_user_words():
-    base = dict(
+def _reminder_context(text: str, *, semantic_turns=()) -> AgentContext:
+    return AgentContext(
         participant_id=uuid.uuid4(), participant_code="P", open_id="open",
         chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-    )
-    vague = AgentContext(
-        **base, user_request_text="周三下午提醒我交作业"
-    )
-    exact = AgentContext(
-        **base, user_request_text="周三15:00提醒我交作业"
-    )
-    clarified = AgentContext(
-        **base,
-        user_request_text="15:00",
-        authorization_semantic_context=(
-            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
-        ),
+        user_request_text=text,
+        received_at_utc=datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc),
+        authorization_semantic_context=tuple(semantic_turns),
     )
 
-    assert has_exact_time_grounding(vague) is False
-    assert has_exact_time_grounding(exact) is True
-    assert has_exact_time_grounding(clarified) is True
 
-
-def test_natural_chinese_exact_reminder_times_are_grounded():
-    base = dict(
-        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-    )
-    allowed = (
-        "明天下午三点提醒我交作业",
-        "周三三点半提醒我开会",
-        "一小时后提醒我喝水",
-        "半小时后提醒我休息",
-        "两天后提醒我复习",
-    )
-    rejected = (
-        "周三下午提醒我交作业",
-        "明天提醒我交作业",
-        "晚上提醒我",
-    )
-
-    for text in allowed:
-        assert has_exact_time_grounding(
-            AgentContext(**base, user_request_text=text)
-        ) is True
-    for text in rejected:
-        assert has_exact_time_grounding(
-            AgentContext(**base, user_request_text=text)
-        ) is False
-
-
-def test_reminder_grounding_does_not_compose_unrelated_historical_time():
-    base = dict(
-        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-    )
-    vague_current = AgentContext(
-        **base,
-        user_request_text="周三下午提醒我交作业",
-        authorization_semantic_context=(
-            AuthorizationSemanticTurn("user", "明天15:00我有课"),
-            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
-        ),
-    )
-    valid_clarification = AgentContext(
-        **base,
-        user_request_text="15:00",
-        authorization_semantic_context=(
-            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
-            AuthorizationSemanticTurn("assistant", "具体几点提醒你？"),
-            AuthorizationSemanticTurn("user", "15:00"),
-        ),
-    )
-
-    assert has_exact_time_grounding(vague_current) is False
-    assert has_exact_time_grounding(valid_clarification) is True
-
-
-def test_reminder_tool_persists_only_backend_grounded_absolute_time():
-    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
-    base = dict(
-        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-        user_request_text="明天15:00提醒我交作业", received_at_utc=received_at,
-    )
-    store = _ReminderStore()
-    tools = ReminderTools(
-        store, _QuietPolicy(), timezone_name="Asia/Shanghai"
-    )
-
-    accepted = tools.create(AgentContext(**base), {
-        "message": "交作业", "remind_at": "2026-09-14T15:00:00+08:00",
-        "recurrence_type": "none",
-    })
-    wrong_day = tools.create(AgentContext(**base), {
-        "message": "交作业", "remind_at": "2026-09-15T15:00:00+08:00",
-        "recurrence_type": "none",
-    })
-    wrong_clock = tools.create(AgentContext(**base), {
-        "message": "交作业", "remind_at": "2026-09-14T16:00:00+08:00",
-        "recurrence_type": "none",
-    })
-
-    assert accepted["ok"] is True
-    assert wrong_day["error"] == "reminder_time_not_grounded"
-    assert wrong_clock["error"] == "reminder_time_not_grounded"
-    assert len(store.created) == 1
-    assert store.created[0][2].isoformat() == "2026-09-14T15:00:00+08:00"
-
-
-def test_relative_reminder_ignores_agent_execution_delay_and_lost_seconds():
-    received_at = datetime(2026, 9, 13, 8, 0, 8, tzinfo=timezone.utc)
-    ctx = AgentContext(
-        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-        user_request_text="一小时后提醒我喝水", received_at_utc=received_at,
-    )
+def test_reminder_tool_accepts_timezone_aware_future_datetime():
     store = _ReminderStore()
     tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
 
-    accepted = tools.create(ctx, {
-        "message": "喝水", "remind_at": "2026-09-13T17:00:20+08:00",
-        "recurrence_type": "none",
-    })
-    minute_precision = tools.create(ctx, {
-        "message": "喝水", "remind_at": "2026-09-13T17:00:00+08:00",
+    result = tools.create(_reminder_context("下周三下午三点提醒我交作业"), {
+        "message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00",
         "recurrence_type": "none",
     })
 
-    assert accepted["ok"] is True
-    assert minute_precision["ok"] is True
-    assert len(store.created) == 2
-    assert all(
-        created[2] == received_at + timedelta(hours=1)
-        for created in store.created
-    )
+    assert result["ok"] is True
+    assert len(store.created) == 1
+    assert store.created[0][2].isoformat() == "2099-09-23T15:00:00+08:00"
 
 
-def test_reminder_clarification_inherits_daypart_without_overriding_24h_clock():
-    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
-    cases = (
-        ("周三下午提醒我交作业", "三点", "2026-09-16T15:00:00+08:00"),
-        ("明天晚上提醒我复习", "八点半", "2026-09-14T20:30:00+08:00"),
-        ("周三下午提醒我交作业", "15:00", "2026-09-16T15:00:00+08:00"),
-    )
-    for previous, current, expected in cases:
+def test_reminder_tool_rejects_invalid_naive_and_past_datetimes():
+    store = _ReminderStore()
+    tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
+    ctx = _reminder_context("提醒我")
+
+    invalid = tools.create(ctx, {
+        "message": "测试", "remind_at": "not-a-datetime", "recurrence_type": "none",
+    })
+    naive = tools.create(ctx, {
+        "message": "测试", "remind_at": "2099-09-23T15:00:00", "recurrence_type": "none",
+    })
+    past = tools.create(ctx, {
+        "message": "测试", "remind_at": "2000-01-01T00:00:00Z", "recurrence_type": "none",
+    })
+
+    assert invalid["error"] == "invalid_reminder_datetime"
+    assert naive["error"] == "reminder_timezone_required"
+    assert past["error"] == "reminder_time_in_past"
+    assert store.created == []
+
+
+def test_reminder_authorization_context_contains_only_semantic_time_authority():
+    tools = ReminderTools(_ReminderStore(), _QuietPolicy(), timezone_name="Asia/Shanghai")
+
+    resolved = tools.authorization_context(_reminder_context("明天15:00提醒我"), {})
+
+    assert resolved == {
+        "reminder_time_context": {
+            "reference_time_utc": "2026-09-13T02:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "reminder_semantic_contract": {
+            "exact_time_required": True,
+            "ambiguous_time_requires_clarification": True,
+        },
+    }
+    serialized = str(resolved)
+    assert "participant" not in serialized
+    assert "open_id" not in serialized
+    assert "chat_id" not in serialized
+
+
+class _SemanticVerifier:
+    def __init__(self, decision: str):
+        self.decision = decision
+        self.calls = []
+
+    async def verify(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.decision == "allow":
+            return MutationIntentDecision("allow", "direct_action", "exact_reminder")
+        if self.decision == "deny":
+            return MutationIntentDecision("deny", "direct_action", "time_mismatch")
+        return MutationIntentDecision("needs_clarification", "ambiguous", "time_ambiguous")
+
+
+def test_reminder_registry_sends_proposal_reference_time_and_timezone_to_verifier():
+    verifier = _SemanticVerifier("allow")
+    registry = ToolRegistry(mutation_verifier=verifier)
+    store = _ReminderStore()
+    ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
+
+    result = asyncio.run(registry.execute(
+        _reminder_context("明天15:00提醒我交作业"),
+        "reminder_create",
+        {"message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00", "recurrence_type": "none"},
+    ))
+
+    proposal = verifier.calls[0]["proposal_summary"]
+    assert result.status == "succeeded"
+    assert proposal["requested_values"]["remind_at"] == "2099-09-23T15:00:00+08:00"
+    assert proposal["reminder_time_context"] == {
+        "reference_time_utc": "2026-09-13T02:00:00+00:00",
+        "timezone": "Asia/Shanghai",
+    }
+    assert len(store.created) == 1
+
+
+def test_reminder_registry_blocks_ambiguous_or_mismatched_proposal_before_write():
+    for decision, text, expected_status in (
+        ("needs_clarification", "明天下午提醒我交作业", "mutation_needs_clarification"),
+        ("deny", "明天15:00提醒我交作业", "tool_effect_not_authorized"),
+    ):
+        verifier = _SemanticVerifier(decision)
+        registry = ToolRegistry(mutation_verifier=verifier)
         store = _ReminderStore()
-        tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
-        ctx = AgentContext(
-            participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-            chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-            user_request_text=current, received_at_utc=received_at,
-            authorization_semantic_context=(
-                AuthorizationSemanticTurn("user", previous),
-                AuthorizationSemanticTurn("assistant", "具体几点提醒你？"),
-                AuthorizationSemanticTurn("user", current),
-            ),
-        )
+        ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
 
-        result = tools.create(ctx, {
-            "message": "测试", "remind_at": expected, "recurrence_type": "none",
-        })
+        result = asyncio.run(registry.execute(
+            _reminder_context(text),
+            "reminder_create",
+            {"message": "交作业", "remind_at": "2099-09-24T16:00:00+08:00", "recurrence_type": "none"},
+        ))
 
-        assert result["ok"] is True
-        assert store.created[0][2].isoformat() == expected
+        assert result.status == expected_status
+        assert store.created == []
 
 
-def test_reminder_colon_clock_applies_explicit_chinese_daypart_first():
-    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
-    cases = (
-        ("明天下午3:00提醒我", "2026-09-14T15:00:00+08:00"),
-        ("明天晚上8:30提醒我", "2026-09-14T20:30:00+08:00"),
-        ("明天03:00提醒我", "2026-09-14T03:00:00+08:00"),
+def test_reminder_clarification_turns_are_forwarded_to_semantic_verifier():
+    turns = (
+        AuthorizationSemanticTurn("user", "下周三下午提醒我交作业"),
+        AuthorizationSemanticTurn("assistant", "具体几点？"),
+        AuthorizationSemanticTurn("user", "三点"),
     )
-    for request_text, expected in cases:
-        store = _ReminderStore()
-        tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
-        ctx = AgentContext(
-            participant_id=uuid.uuid4(), participant_code="P", open_id="open",
-            chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
-            user_request_text=request_text, received_at_utc=received_at,
-        )
+    verifier = _SemanticVerifier("allow")
+    registry = ToolRegistry(mutation_verifier=verifier)
+    ReminderTools(_ReminderStore(), _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
 
-        result = tools.create(ctx, {
-            "message": "测试", "remind_at": expected, "recurrence_type": "none",
-        })
+    asyncio.run(registry.execute(
+        _reminder_context("三点", semantic_turns=turns),
+        "reminder_create",
+        {"message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00", "recurrence_type": "none"},
+    ))
 
-        assert result["ok"] is True
-        assert store.created[0][2].isoformat() == expected
+    assert verifier.calls[0]["semantic_turn_context"] == (
+        {"role": "user", "text": "下周三下午提醒我交作业"},
+        {"role": "assistant", "text": "具体几点？"},
+        {"role": "user", "text": "三点"},
+    )
+
+
+def test_mutation_verifier_prompt_keeps_reminder_semantics_out_of_backend_parser():
+    prompt = OpenAICompatibleMutationIntentClient.SYSTEM_PROMPT
+
+    assert "For reminder_create" in prompt
+    assert "exact proposed remind_at" in prompt
+    assert "backend-provided reference time and timezone" in prompt
+    assert "return needs_clarification" in prompt
+    assert "Do not borrow unrelated dates or times" in prompt
