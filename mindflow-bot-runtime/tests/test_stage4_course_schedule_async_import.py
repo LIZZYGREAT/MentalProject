@@ -518,8 +518,8 @@ def test_completion_update_failure_resends_result_card_with_retry_action():
         def update_card(self, _message_id, _card):
             raise RuntimeError("original card cannot be updated")
 
-        def send_card(self, chat_id, card):
-            self.cards.append((chat_id, card))
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.cards.append((chat_id, card, message_uuid))
 
         def send_text(self, chat_id, text):
             self.texts.append((chat_id, text))
@@ -540,11 +540,13 @@ def test_completion_update_failure_resends_result_card_with_retry_action():
     assert len(sender.cards) == 1
     assert sender.cards[0][0] == "chat"
     assert "course_schedule_import_confirm" in str(sender.cards[0][1])
+    assert sender.cards[0][2]
+    assert len(sender.cards[0][2]) <= 50
     assert sender.texts == []
     assert imports.drafts.presented == [draft["id"]]
 
 
-def test_cancelled_completion_updates_status_card_and_pushes_new_notice():
+def test_cancelled_completion_update_success_does_not_push_duplicate_notice():
     class Drafts:
         def __init__(self):
             self.presented = []
@@ -569,7 +571,7 @@ def test_cancelled_completion_updates_status_card_and_pushes_new_notice():
         def update_card(self, message_id, card):
             self.updated.append((message_id, card))
 
-        def send_card(self, chat_id, card):
+        def send_card(self, chat_id, card, **_kwargs):
             self.sent.append((chat_id, card))
 
     imports = Imports()
@@ -585,7 +587,7 @@ def test_cancelled_completion_updates_status_card_and_pushes_new_notice():
     asyncio.run(runner._present_completion(draft))
 
     assert sender.updated[0][0] == "old-status-card"
-    assert sender.sent[0][0] == "request-chat"
+    assert sender.sent == []
     assert imports.drafts.presented == [draft["id"]]
 
 

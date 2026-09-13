@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime
+import hashlib
 import logging
 from typing import Any
 import uuid
@@ -31,6 +32,7 @@ class CourseScheduleImportRunner:
         sender: Any = None,
         max_concurrency: int = 1,
         poll_interval_seconds: float = 1.0,
+        incidents: Any = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("course schedule import concurrency must be positive")
@@ -40,6 +42,7 @@ class CourseScheduleImportRunner:
         self.sender = sender
         self.max_concurrency = min(2, int(max_concurrency))
         self.poll_interval_seconds = max(0.05, float(poll_interval_seconds))
+        self.incidents = incidents
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
@@ -163,6 +166,35 @@ class CourseScheduleImportRunner:
         cancellation_recovered = await asyncio.to_thread(
             self.drafts.recover_stale_cancellation_work
         )
+        abandon = getattr(
+            self.drafts, "abandon_missing_completion_presentations", None
+        )
+        abandoned = await asyncio.to_thread(abandon) if callable(abandon) else []
+        for item in abandoned:
+            logger.error(
+                "course_schedule_completion_presentation_abandoned import_id=%s",
+                item.get("id"),
+            )
+            if self.incidents is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.incidents.record,
+                        severity="error",
+                        subsystem="course_schedule_import",
+                        event_name="completion_presentation_abandoned",
+                        summary=(
+                            "A terminal course import has no durable presentation target."
+                        ),
+                        participant_id=item.get("participant_id"),
+                        error_code="presentation_target_missing",
+                        error_class=None,
+                        details={"import_id": str(item.get("id"))},
+                    )
+                except Exception:
+                    logger.exception(
+                        "course_schedule_completion_abandon_incident_failed import_id=%s",
+                        item.get("id"),
+                    )
         pending_presentations = await asyncio.to_thread(
             self.drafts.pending_completion_presentations
         )
@@ -610,57 +642,41 @@ class CourseScheduleImportRunner:
         if not message_id and not chat_id:
             await fail("presentation_target_missing")
             return
-        card_error: Exception | None = None
-        presented = False
-        chat_notice_presented = False
-        requires_chat_notice = str(draft.get("status") or "") in {
-            "cancelled",
-            "cleanup_failed",
-        }
-        try:
-            if message_id:
-                await asyncio.to_thread(sender.update_card, message_id, card)
-                presented = True
-        except Exception as exc:
-            card_error = exc
-            logger.exception(
-                "course_schedule_import_completion_card_update_failed import_id=%s",
-                draft.get("id"),
-            )
-        fallback_card_error: Exception | None = None
-        if chat_id and (not presented or requires_chat_notice):
+        if message_id:
             try:
-                await asyncio.to_thread(sender.send_card, chat_id, card)
-                presented = True
-                chat_notice_presented = True
-            except Exception as exc:
-                fallback_card_error = exc
+                await asyncio.to_thread(sender.update_card, message_id, card)
+            except Exception:
+                logger.exception(
+                    "course_schedule_import_completion_card_update_failed import_id=%s",
+                    draft.get("id"),
+                )
+            else:
+                await succeed()
+                return
+        if chat_id:
+            try:
+                await asyncio.to_thread(
+                    sender.send_card,
+                    chat_id,
+                    card,
+                    message_uuid=self._completion_message_uuid(str(import_id)),
+                )
+            except Exception:
                 logger.exception(
                     "course_schedule_import_completion_card_send_failed import_id=%s",
                     draft.get("id"),
                 )
-        if chat_id and (
-            not presented or (requires_chat_notice and not chat_notice_presented)
-        ):
-            try:
-                await asyncio.to_thread(
-                    sender.send_text, chat_id, message["reply_text"]
-                )
-                presented = True
-                chat_notice_presented = True
-            except Exception:
-                logger.exception(
-                    "course_schedule_import_completion_text_notice_failed import_id=%s",
-                    draft.get("id"),
-                )
-        if presented and (not requires_chat_notice or chat_notice_presented):
-            await succeed()
-        else:
-            await fail(
-                "completion_card_delivery_failed"
-                if card_error is not None or fallback_card_error is not None
-                else "completion_text_notice_failed"
-            )
+            else:
+                await succeed()
+                return
+        await fail("completion_card_delivery_failed")
+
+    @staticmethod
+    def _completion_message_uuid(import_id: str) -> str:
+        digest = hashlib.sha256(
+            f"mindflow:course-completion:{import_id}".encode("utf-8")
+        ).hexdigest()
+        return f"mindflow-{digest[:40]}"
 
     async def close(self) -> None:
         self._closed = True

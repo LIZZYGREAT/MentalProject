@@ -10,7 +10,7 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.contracts.course_schedule import ScheduleVisionResult
@@ -1035,11 +1035,57 @@ class CourseScheduleImportRepository:
                 .where(
                     CourseScheduleImport.status.in_(FINAL_PRESENTATION_STATUSES),
                     CourseScheduleImport.completion_presented_at.is_(None),
+                    or_(
+                        and_(
+                            CourseScheduleImport.status_card_message_id.is_not(None),
+                            CourseScheduleImport.status_card_message_id != "",
+                        ),
+                        and_(
+                            CourseScheduleImport.status_card_chat_id.is_not(None),
+                            CourseScheduleImport.status_card_chat_id != "",
+                        ),
+                    ),
                 )
                 .order_by(CourseScheduleImport.completed_at, CourseScheduleImport.created_at)
                 .limit(max(1, min(int(limit), 500)))
             ).scalars().all()
             return [self._view(session, row) for row in rows]
+
+    def abandon_missing_completion_presentations(
+        self, *, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Durably stop startup replay when no presentation target exists."""
+
+        abandoned_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            rows = list(session.execute(
+                select(CourseScheduleImport).where(
+                    CourseScheduleImport.status.in_(FINAL_PRESENTATION_STATUSES),
+                    CourseScheduleImport.completion_presented_at.is_(None),
+                    or_(
+                        CourseScheduleImport.status_card_message_id.is_(None),
+                        CourseScheduleImport.status_card_message_id == "",
+                    ),
+                    or_(
+                        CourseScheduleImport.status_card_chat_id.is_(None),
+                        CourseScheduleImport.status_card_chat_id == "",
+                    ),
+                    or_(
+                        CourseScheduleImport.completion_presentation_error.is_(None),
+                        CourseScheduleImport.completion_presentation_error
+                        != "presentation_target_missing",
+                    ),
+                ).with_for_update()
+            ).scalars())
+            abandoned = []
+            for row in rows:
+                row.completion_presentation_error = "presentation_target_missing"
+                row.last_progress_at = abandoned_at
+                abandoned.append({
+                    "id": str(row.id),
+                    "participant_id": row.participant_id,
+                })
+            return abandoned
 
     def mark_completion_presented(
         self, import_id: uuid.UUID | str, *, now: datetime | None = None

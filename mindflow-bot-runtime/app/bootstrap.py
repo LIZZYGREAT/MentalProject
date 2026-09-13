@@ -306,6 +306,7 @@ def build_business_services(
     course_schedule_import_runner = CourseScheduleImportRunner(
         course_schedule_imports,
         max_concurrency=1,
+        incidents=RuntimeIncidentRepository(database),
     )
     course_schedule_imports.queue_notifier = course_schedule_import_runner.wake
     course_schedule_vision = CourseScheduleVisionService(
