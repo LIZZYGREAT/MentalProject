@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.repositories_preferences import PreferenceRuleLimitReached
-from app.services.preference_validator import normalize_rule, validate_style_changes
+from app.repositories_support_preferences import validate_support_changes
+from app.services.preference_validator import (
+    normalize_rule,
+    validate_identity_changes,
+    validate_style_changes,
+)
 
 
 STYLE_FIELDS = frozenset({"verbosity", "tone", "suggestion_style"})
@@ -27,7 +32,32 @@ class InteractionPreferenceService:
         }
 
     def update_style(self, participant_id, changes: dict):
-        return self.repository.update_style(participant_id, validate_style_changes(changes))
+        return self.update_preferences(
+            participant_id, style_changes=changes
+        )
+
+    def update_preferences(
+        self,
+        participant_id,
+        *,
+        style_changes: dict | None = None,
+        support_changes: dict | None = None,
+        identity_changes: dict | None = None,
+    ):
+        validated_style = (
+            validate_style_changes(style_changes) if style_changes else {}
+        )
+        validated_support = (
+            validate_support_changes(support_changes) if support_changes else {}
+        )
+        validated_identity = validate_identity_changes(identity_changes or {})
+        self.repository.update_atomic(
+            participant_id,
+            style_changes=validated_style,
+            support_changes=validated_support,
+            identity_changes=validated_identity,
+        )
+        return self.get(participant_id)
 
     def apply_rule(self, participant_id, raw_text: str):
         result = normalize_rule(raw_text)
@@ -40,35 +70,39 @@ class InteractionPreferenceService:
                 "reason_code": "rule_not_normalized",
                 "preferences": self.get(participant_id),
             }
+        style_changes = {}
+        support_changes = {}
+        identity_changes = {}
         for accepted in result["accepted"]:
-            if accepted["category"] in STYLE_FIELDS:
-                self.repository.update_style(
-                    participant_id, {accepted["category"]: accepted["value"]}
-                )
-                stored.append(dict(accepted))
-            elif accepted["category"] in SUPPORT_FIELDS:
-                self.support_repository.update(
-                    participant_id, {accepted["category"]: accepted["value"]}
-                )
-                stored.append(dict(accepted))
+            category = accepted["category"]
+            if category in STYLE_FIELDS:
+                style_changes[category] = accepted["value"]
+            elif category in SUPPORT_FIELDS:
+                support_changes[category] = accepted["value"]
             else:
-                try:
-                    stored.append(self.repository.add_rule(
-                        participant_id, safe_text=accepted["safe_text"],
-                        category=accepted["category"], value=accepted["value"],
-                    ))
-                except PreferenceRuleLimitReached as exc:
-                    return {
-                        "accepted": stored, "rejected": result["rejected"],
-                        "error": exc.code, "reason_code": exc.code,
-                        "message": str(exc),
-                        "preferences": self.get(participant_id),
-                    }
+                identity_changes[category] = accepted["value"]
+            stored.append(dict(accepted))
+        try:
+            preferences = self.update_preferences(
+                participant_id,
+                style_changes=style_changes,
+                support_changes=support_changes,
+                identity_changes=identity_changes,
+            )
+        except PreferenceRuleLimitReached as exc:
+            return {
+                "accepted": [], "rejected": result["rejected"],
+                "error": exc.code, "reason_code": exc.code,
+                "message": str(exc),
+                "preferences": self.get(participant_id),
+            }
         return {
             "accepted": stored, "rejected": result["rejected"], "error": None,
             "reason_code": None,
-            "preferences": self.get(participant_id),
+            "preferences": preferences,
         }
 
     def update_support(self, participant_id, changes: dict):
-        return self.support_repository.update(participant_id, changes)
+        return self.update_preferences(
+            participant_id, support_changes=changes
+        )["support"]

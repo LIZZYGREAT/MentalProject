@@ -271,10 +271,17 @@ class CardActionService:
                     max_suggestions = int(values.get("max_suggestions"))
                 except (TypeError, ValueError):
                     return {"ok": False, "error": "invalid_support_preferences"}
-                self.interaction_preferences.update_style(participant_id, style)
-                self.interaction_preferences.update_support(
-                    participant_id, {"max_suggestions": max_suggestions}
-                )
+                try:
+                    self.interaction_preferences.update_preferences(
+                        participant_id,
+                        style_changes=style,
+                        support_changes={"max_suggestions": max_suggestions},
+                    )
+                except ValueError:
+                    return {
+                        "ok": False,
+                        "error": "invalid_interaction_preferences",
+                    }
             elif action_name == "support_acknowledge_first":
                 self.interaction_preferences.update_support(
                     participant_id,

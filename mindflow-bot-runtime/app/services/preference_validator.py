@@ -60,6 +60,29 @@ def validate_style_changes(changes: dict) -> dict:
     return dict(changes)
 
 
+def validate_identity_changes(changes: dict) -> dict[str, str]:
+    """Validate already-understood identity values without doing NLP."""
+
+    allowed = {"assistant_display_name", "assistant_self_reference"}
+    if set(changes) - allowed:
+        raise ValueError("unsupported interaction identity field")
+    validated: dict[str, str] = {}
+    for key, raw_value in changes.items():
+        value = str(raw_value).strip()
+        if (
+            not value
+            or len(value) > 20
+            or "\n" in value
+            or "\r" in value
+            or "<" in value
+            or ">" in value
+            or _CUSTOM_VALUE_UNSAFE.search(value)
+        ):
+            raise ValueError(f"unsafe {key}")
+        validated[key] = value
+    return validated
+
+
 def normalize_rule(raw_text: str) -> dict:
     raw = str(raw_text)
     text = " ".join(raw.split())[:500]

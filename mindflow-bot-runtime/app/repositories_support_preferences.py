@@ -17,6 +17,32 @@ DEFAULT_SUPPORT_PREFERENCES = {
 }
 
 
+def validate_support_changes(changes: dict) -> dict:
+    allowed = set(DEFAULT_SUPPORT_PREFERENCES)
+    if not changes or set(changes) - allowed:
+        raise ValueError("unsupported support preference field")
+    if "max_suggestions" in changes and (
+        not isinstance(changes["max_suggestions"], int)
+        or isinstance(changes["max_suggestions"], bool)
+        or not 1 <= changes["max_suggestions"] <= 3
+    ):
+        raise ValueError("max_suggestions must be between 1 and 3")
+    if (
+        "preferred_support_style" in changes
+        and changes["preferred_support_style"]
+        not in {"gentle", "listening", "practical"}
+    ):
+        raise ValueError("unsupported support style")
+    for key in (
+        "acknowledge_before_advice",
+        "ask_before_suggestion",
+        "allow_supportive_follow_up",
+    ):
+        if key in changes and not isinstance(changes[key], bool):
+            raise ValueError(f"{key} must be boolean")
+    return dict(changes)
+
+
 class SupportPreferenceRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -35,20 +61,7 @@ class SupportPreferenceRepository:
             }
 
     def update(self, participant_id: uuid.UUID, changes: dict) -> dict:
-        allowed = set(DEFAULT_SUPPORT_PREFERENCES)
-        if not changes or set(changes) - allowed:
-            raise ValueError("unsupported support preference field")
-        if "max_suggestions" in changes and (
-            not isinstance(changes["max_suggestions"], int)
-            or isinstance(changes["max_suggestions"], bool)
-            or not 1 <= changes["max_suggestions"] <= 3
-        ):
-            raise ValueError("max_suggestions must be between 1 and 3")
-        if "preferred_support_style" in changes and changes["preferred_support_style"] not in {"gentle", "listening", "practical"}:
-            raise ValueError("unsupported support style")
-        for key in ("acknowledge_before_advice", "ask_before_suggestion", "allow_supportive_follow_up"):
-            if key in changes and not isinstance(changes[key], bool):
-                raise ValueError(f"{key} must be boolean")
+        changes = validate_support_changes(changes)
         with self.database.session() as session:
             row = session.get(ParticipantSupportPreference, participant_id, with_for_update=True)
             if row is None:

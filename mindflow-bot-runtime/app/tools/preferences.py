@@ -23,27 +23,19 @@ class InteractionPreferenceTools:
         )
         registry.register(
             "interaction_preferences_update",
-            "Update only response length, tone, or suggestion presentation after an explicit lasting preference request.",
+            "Update structured response style and assistant identity after an explicit lasting preference request. Natural-language interpretation is complete before this call.",
             {
                 "type": "object",
                 "properties": {
                     "verbosity": {"type": "string", "enum": ["concise", "balanced", "detailed"]},
                     "tone": {"type": "string", "enum": ["neutral", "warm", "direct"]},
                     "suggestion_style": {"type": "string", "enum": ["ask_first", "light_suggestions", "proactive_suggestions"]},
+                    "assistant_display_name": {"type": "string", "minLength": 1, "maxLength": 20},
+                    "assistant_self_reference": {"type": "string", "minLength": 1, "maxLength": 20},
                 },
                 "minProperties": 1, "additionalProperties": False,
             },
             self.update, effect="internal_write", authorization_requirement="direct_request",
-        )
-        registry.register(
-            "interaction_rule_set",
-            "Normalize an explicit response-style, assistant display-name, or self-reference rule. Unsafe authorization or safety fragments are rejected and never injected.",
-            {
-                "type": "object",
-                "properties": {"rule": {"type": "string", "minLength": 1, "maxLength": 500}},
-                "required": ["rule"], "additionalProperties": False,
-            },
-            self.set_rule, effect="internal_write", authorization_requirement="direct_request",
         )
         registry.register(
             "support_preferences_update",
@@ -71,9 +63,36 @@ class InteractionPreferenceTools:
         return {"ok": True, "interaction_preferences": self.service.get(ctx.participant_id)}
 
     def update(self, ctx: AgentContext, args: dict[str, Any]):
-        return {"ok": True, "interaction_preferences": self.service.update_style(ctx.participant_id, args)}
+        style = {
+            key: args[key]
+            for key in ("verbosity", "tone", "suggestion_style")
+            if key in args
+        }
+        identity = {
+            key: args[key]
+            for key in ("assistant_display_name", "assistant_self_reference")
+            if key in args
+        }
+        try:
+            preferences = self.service.update_preferences(
+                ctx.participant_id,
+                style_changes=style,
+                identity_changes=identity,
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "invalid_interaction_preferences"),
+                "reason_code": getattr(
+                    exc, "code", "invalid_interaction_preferences"
+                ),
+                "message": str(exc),
+            }
+        return {"ok": True, "interaction_preferences": preferences}
 
     def set_rule(self, ctx: AgentContext, args: dict[str, Any]):
+        """Legacy direct-call compatibility; intentionally not Agent-registered."""
+
         result = self.service.apply_rule(ctx.participant_id, args["rule"])
         return {"ok": bool(result["accepted"]) and not result.get("error"), **result}
 
