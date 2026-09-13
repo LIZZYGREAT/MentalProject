@@ -1322,6 +1322,7 @@ def _consent_button(
     *,
     primary: bool = False,
     bind_consent_version: bool = False,
+    feature_key: str | None = None,
 ) -> dict[str, Any]:
     """Consent callback values carry only action/schema versions.
 
@@ -1340,6 +1341,8 @@ def _consent_button(
     }
     if bind_consent_version:
         value["consent_version"] = EXTERNAL_LLM_CONSENT_VERSION
+    if feature_key is not None:
+        value["feature_key"] = feature_key
     return {
         "tag": "button",
         "type": "primary" if primary else "default",
@@ -1363,6 +1366,15 @@ def _consent_card_shell(
     }
 
 
+def _consent_navigation_buttons() -> list[dict[str, Any]]:
+    return [
+        _consent_button(
+            "feature_open", "返回「数据与隐私」", feature_key="data_privacy"
+        ),
+        _consent_button("feature_back", "返回全部功能", feature_key="overview"),
+    ]
+
+
 def external_llm_consent_card() -> dict[str, Any]:
     """Fixed user-consent prompt; one consent covers conversation and images."""
 
@@ -1382,7 +1394,7 @@ def external_llm_consent_card() -> dict[str, Any]:
         ),
         _consent_button("external_llm_consent_decline", "暂不使用"),
         _consent_button("external_llm_consent_details_open", "了解详情"),
-    ]
+    ] + _consent_navigation_buttons()
     return _consent_card_shell("外部 AI 处理", content, elements)
 
 
@@ -1410,8 +1422,8 @@ def external_llm_consent_details_card() -> dict[str, Any]:
             primary=True,
             bind_consent_version=True,
         ),
-        _consent_button("external_llm_consent_prompt_open", "返回"),
-    ]
+        _consent_button("external_llm_consent_prompt_open", "返回外部 AI 设置"),
+    ] + _consent_navigation_buttons()
     return _consent_card_shell("外部 AI 处理 · 数据范围", content, elements)
 
 
@@ -1445,7 +1457,7 @@ def external_llm_consent_status_card(status: dict[str, Any]) -> dict[str, Any]:
     )
     elements = actions + [
         _consent_button("external_llm_consent_details_open", "了解数据范围"),
-    ]
+    ] + _consent_navigation_buttons()
     return _consent_card_shell("数据与隐私 · 外部 AI 处理", content, elements)
 
 

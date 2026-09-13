@@ -251,6 +251,8 @@ def test_consent_status_and_details_are_navigation_only_and_participant_bound():
         if value["mindflow_action"] == "external_llm_consent_accept":
             assert set(value) == {"mindflow_action", "version", "consent_version"}
             assert value["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
+        elif value["mindflow_action"] in {"feature_open", "feature_back"}:
+            assert set(value) == {"mindflow_action", "version", "feature_key"}
         else:
             assert set(value) == {"mindflow_action", "version"}
 
@@ -617,6 +619,37 @@ def test_consent_card_buttons_carry_current_disclosure_version():
         assert len(accepts) == 1
         assert accepts[0]["consent_version"] == EXTERNAL_LLM_CONSENT_VERSION
         assert accepts[0]["version"] == "1"
+
+
+def test_all_external_llm_cards_have_stable_privacy_navigation():
+    from app.integrations.feishu.cards import (
+        external_llm_consent_card,
+        external_llm_consent_details_card,
+        external_llm_consent_status_card,
+    )
+
+    cards = (
+        external_llm_consent_card(),
+        external_llm_consent_details_card(),
+        external_llm_consent_status_card({"active": False}),
+        external_llm_consent_status_card({"active": True}),
+    )
+    expected = {
+        ("feature_open", "data_privacy"),
+        ("feature_back", "overview"),
+    }
+    for card in cards:
+        values = [
+            element["behaviors"][0]["value"]
+            for element in card["body"]["elements"]
+            if element.get("tag") == "button"
+        ]
+        navigation = {
+            (value["mindflow_action"], value.get("feature_key"))
+            for value in values
+            if value["mindflow_action"] in {"feature_open", "feature_back"}
+        }
+        assert navigation == expected
 
 
 def test_forecast_coordinator_rejects_legacy_flag_only_participant():
