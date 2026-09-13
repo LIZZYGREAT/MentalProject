@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import re
 from typing import Any
 
 
@@ -18,6 +19,22 @@ def _level(value: float) -> str:
     if value >= 4:
         return "elevated"
     return "low"
+
+
+_PSYCHOLOGICAL_RELEVANCE = re.compile(
+    r"(?:情绪|心情|状态|难受|焦虑|紧张|烦躁|沮丧|低落|崩溃|孤独|压力|"
+    r"疲劳|疲惫|累(?:了|坏|死|得)?|睡眠|失眠|没睡好|休息|恢复|"
+    r"负荷|忙不过来|喘不过气|关心我|陪我|安慰我|听我说|"
+    r"压力曲线|状态总结|总结.{0,6}状态|为什么.{0,8}提醒我)",
+    re.I,
+)
+
+
+def psych_context_relevant(text: str, route_or_tool_intent: str | None = None) -> bool:
+    """Use research state only when the current turn clearly needs it."""
+
+    combined = " ".join((str(text), str(route_or_tool_intent or ""))).strip()
+    return bool(combined and _PSYCHOLOGICAL_RELEVANCE.search(combined))
 
 
 class PsychologicalContextBuilder:

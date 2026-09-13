@@ -83,6 +83,7 @@ from app.services.presentation_service import (
     PendingImageCard,
     PresentationOutbox,
 )
+from app.services.psychological_context_builder import psych_context_relevant
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
     CourseScheduleVisionUnavailable,
@@ -2207,16 +2208,23 @@ class BotWorker:
                 )
                 return None
 
+        psychological_service = (
+            self.psychological_context_builder
+            if psych_context_relevant(turn_input.text)
+            else None
+        )
         memories, preferences, psychological = await asyncio.gather(
             load(self.memory_service, "retrieve", ctx.participant_id, turn_input.text),
             load(self.interaction_preferences, "get", ctx.participant_id),
             load(
-                self.psychological_context_builder,
+                psychological_service,
                 "build",
                 ctx.participant_id,
                 current_text=turn_input.text,
             ),
         )
+        if not (psychological or {}).get("features"):
+            psychological = None
         safe_memories = tuple(
             {"memory_type": row.get("memory_type"), "content": row.get("content")}
             for row in (memories or [])

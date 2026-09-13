@@ -4,7 +4,10 @@ import uuid
 
 from app.agent.sdk_adapter import _text_transport_prompt
 from app.contracts.agent_input import AgentTurnInput
-from app.services.psychological_context_builder import PsychologicalContextBuilder
+from app.services.psychological_context_builder import (
+    PsychologicalContextBuilder,
+    psych_context_relevant,
+)
 
 
 class _Rows:
@@ -21,6 +24,26 @@ class _Rows:
 class _Profiles:
     def runtime_active(self, participant_id):
         return {"model_version": "test-model-v2", "confidence": 0.8}
+
+
+def test_psychological_context_relevance_gate_is_conservative():
+    for text in (
+        "我最近压力很大",
+        "今天真的很累",
+        "帮我总结一下最近的状态",
+        "为什么提醒我休息？",
+        "我没睡好，想让你听我说",
+    ):
+        assert psych_context_relevant(text) is True
+
+    for text in (
+        "帮我查明天几点上课",
+        "Transformer 是谁提出的？",
+        "谢谢",
+        "介绍一下你能做什么",
+        "绑定一下日历",
+    ):
+        assert psych_context_relevant(text) is False
 
 
 def test_builder_emits_small_time_bounded_non_diagnostic_context():
