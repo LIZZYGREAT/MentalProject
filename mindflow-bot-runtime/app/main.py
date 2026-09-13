@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import signal
@@ -129,6 +130,7 @@ def _build_card_action_handler(
     card_actions: Any,
     sender: Any = None,
     incidents: Any = None,
+    receipts: Any = None,
 ) -> Any:
     """Build CardAction business execution with optional WS delivery."""
 
@@ -165,6 +167,30 @@ def _build_card_action_handler(
             f"mindflow:card-action-result:{event_id}".encode("utf-8")
         ).hexdigest()
         return f"mindflow-{digest[:40]}"
+
+    def receipt_identity(event: Any) -> tuple[str, str, str, str]:
+        action_name = safe_action_name(event) or "unknown"
+        action_version = str(
+            (event.action_value or {}).get("version") or "1"
+        )[:16]
+        canonical = json.dumps(
+            {
+                "message_id": event.message_id,
+                "action_tag": event.action_tag,
+                "action_value": event.action_value,
+                "form_value": event.form_value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return (
+            action_name,
+            action_version,
+            hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            hashlib.sha256(str(event.message_id).encode("utf-8")).hexdigest(),
+        )
 
     def log_stage(
         event: Any,
@@ -285,20 +311,77 @@ def _build_card_action_handler(
 
     def handle_card_action(event: Any) -> dict[str, Any]:
         participant = None
+        receipt_fingerprint = None
+        receipt_claimed = False
         log_stage(event, "card_action_received")
         try:
             participant = identity.resolve(event.app_id, event.open_id)
             if participant is None:
                 raise ValueError("card operator is not bound to a participant")
-            result = card_actions.handle(
-                participant.id,
-                message_id=event.message_id,
-                chat_id=event.chat_id,
-                callback_event_id=event.event_id,
-                action_value=event.action_value,
-                form_value=event.form_value,
-            )
+            if receipts is not None:
+                (
+                    action_name,
+                    action_version,
+                    receipt_fingerprint,
+                    message_id_hash,
+                ) = receipt_identity(event)
+                claim = receipts.claim(
+                    event_id=event.event_id,
+                    participant_id=participant.id,
+                    action_name=action_name,
+                    action_version=action_version,
+                    action_fingerprint=receipt_fingerprint,
+                    message_id_hash=message_id_hash,
+                )
+                if claim.outcome == "conflict":
+                    raise PermissionError("CardAction event identity conflict")
+                receipt_claimed = claim.outcome == "claimed"
+                if claim.outcome == "replay":
+                    log_stage(
+                        event,
+                        "card_action_receipt_replayed",
+                        participant_id=participant.id,
+                        result_ok=claim.status == "succeeded",
+                    )
+                    if claim.status == "processing":
+                        return {
+                            "ok": False,
+                            "error": "card_action_processing",
+                            "reply_text": "操作正在处理中，请勿重复点击。",
+                            "receipt_replayed": True,
+                        }
+                    result = dict(claim.result or {
+                        "ok": False,
+                        "error": claim.error_code or "card_action_failed",
+                    })
+                    result["receipt_replayed"] = True
+                else:
+                    result = card_actions.handle(
+                        participant.id,
+                        message_id=event.message_id,
+                        chat_id=event.chat_id,
+                        callback_event_id=event.event_id,
+                        action_value=event.action_value,
+                        form_value=event.form_value,
+                    )
+            else:
+                result = card_actions.handle(
+                    participant.id,
+                    message_id=event.message_id,
+                    chat_id=event.chat_id,
+                    callback_event_id=event.event_id,
+                    action_value=event.action_value,
+                    form_value=event.form_value,
+                )
         except Exception as exc:
+            if receipt_claimed and receipt_fingerprint is not None:
+                receipts.complete(
+                    event.event_id,
+                    action_fingerprint=receipt_fingerprint,
+                    status="failed",
+                    result={"ok": False, "error": "business_failed"},
+                    error_code="business_failed",
+                )
             error_id = uuid.uuid4().hex
             record_failure(
                 event,
@@ -321,6 +404,14 @@ def _build_card_action_handler(
             raise
 
         if not result.get("ok"):
+            if receipt_claimed and receipt_fingerprint is not None:
+                receipts.complete(
+                    event.event_id,
+                    action_fingerprint=receipt_fingerprint,
+                    status="rejected",
+                    result=result,
+                    error_code=str(result.get("error") or "action_rejected"),
+                )
             error_id = uuid.uuid4().hex
             log_stage(
                 event,
@@ -364,6 +455,13 @@ def _build_card_action_handler(
                 message=str(result.get("reply_text") or "已提交")
             )
             result = {**result, "card": card}
+        if receipt_claimed and receipt_fingerprint is not None:
+            receipts.complete(
+                event.event_id,
+                action_fingerprint=receipt_fingerprint,
+                status="succeeded",
+                result=result,
+            )
         if sender is None:
             log_stage(
                 event,
@@ -719,11 +817,14 @@ async def run() -> None:
         timeout_seconds=settings.vision_api_timeout_seconds,
         max_concurrency=settings.vision_max_concurrency,
     )
+    from app.repositories_card_action import CardActionReceiptRepository
+
+    card_action_receipts = CardActionReceiptRepository(database)
     handle_card_action = _build_card_action_handler(
-        identity, business.card_actions, sender, incidents
+        identity, business.card_actions, sender, incidents, card_action_receipts
     )
     execute_card_action = _build_card_action_handler(
-        identity, business.card_actions, None, incidents
+        identity, business.card_actions, None, incidents, card_action_receipts
     )
     sender, gateway = _build_bot_transport(
         settings,

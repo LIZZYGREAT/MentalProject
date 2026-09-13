@@ -1902,6 +1902,46 @@ class AdminUser(Base):
     )
 
 
+class CardActionReceipt(Base):
+    """Durable replay barrier for provider CardAction retries."""
+
+    __tablename__ = "card_action_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('processing', 'succeeded', 'rejected', 'failed')",
+            name="ck_card_action_receipt_status",
+        ),
+        Index(
+            "ix_card_action_receipt_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    action_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="processing"
+    )
+    result_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class AdminResearchDetailAccessAudit(Base):
     __tablename__ = "admin_research_detail_access_audit"
     __table_args__ = (

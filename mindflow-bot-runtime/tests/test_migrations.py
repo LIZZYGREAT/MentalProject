@@ -1079,3 +1079,50 @@ def test_0067_adds_nullable_web_search_provider_audit_fields(monkeypatch):
         ("web_search_runs", "provider_summary"),
         ("web_search_runs", "provider"),
     ]
+
+
+def test_0068_adds_durable_card_action_receipts(monkeypatch):
+    migration = _migration(VERSIONS / "0068_card_action_receipts.py")
+    tables = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *columns, **_kwargs: tables.append((name, columns)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, columns, **_kwargs: indexes.append(
+            (name, table, columns)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0067_web_search_provider_audit"
+    assert tables[0][0] == "card_action_receipts"
+    column_names = {
+        column.name for column in tables[0][1] if hasattr(column, "name")
+    }
+    assert {
+        "event_id",
+        "participant_id",
+        "action_name",
+        "action_version",
+        "action_fingerprint",
+        "message_id_hash",
+        "status",
+        "result_kind",
+        "result_json",
+        "error_code",
+        "created_at",
+        "completed_at",
+    } <= column_names
+    assert indexes == [
+        (
+            "ix_card_action_receipt_participant_created",
+            "card_action_receipts",
+            ["participant_id", "created_at"],
+        )
+    ]
