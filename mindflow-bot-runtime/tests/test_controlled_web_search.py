@@ -167,6 +167,38 @@ def test_query_with_no_public_topic_has_stable_privacy_error_and_no_side_effects
         assert session.query(WebSearchRun).count() == 0
 
 
+def test_provider_summary_is_required_before_verified_success():
+    class _EmptySummaryProvider:
+        provider_name = "test_provider"
+
+        async def search(self, query, freshness, max_results):
+            return SearchProviderResult(
+                summary="",
+                sources=(SearchSource(
+                    title="A source",
+                    url="https://example.test/a",
+                ),),
+                provider=self.provider_name,
+            )
+
+    database = memory_database()
+    user = participant(database, "WEB-EMPTY-SUMMARY")
+    result = asyncio.run(WebSearchService(
+        WebSearchRepository(database), _EmptySummaryProvider()
+    ).search(user.id, query="public topic"))
+
+    assert result == {
+        "ok": False,
+        "error": "web_search_unavailable",
+        "reason_code": "provider_invalid_response",
+        "verified": False,
+    }
+    with database.session() as session:
+        run = session.query(WebSearchRun).one()
+        assert run.status == "failed"
+        assert run.error_code == "provider_invalid_response"
+
+
 def test_successful_search_persists_only_query_hash_not_query_plaintext():
     database = memory_database()
     user = participant(database, "WEB-HASH")

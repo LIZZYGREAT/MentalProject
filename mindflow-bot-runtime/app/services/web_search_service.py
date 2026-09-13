@@ -127,6 +127,7 @@ Do not invent sources.
 """
 
 WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
+MAX_CONTINUATIONS = 3
 
 
 def _canonical_url(value: Any) -> str | None:
@@ -194,17 +195,10 @@ class DeepSeekNativeSearchProvider:
             f"Public search topic:\n{safe_query}\n\n"
             f"Freshness preference:\n{FRESHNESS_INSTRUCTIONS[freshness]}"
         )
-        body = {
-            "model": self.model,
-            "max_tokens": self.max_output_tokens,
-            "system": SEARCH_ONLY_SYSTEM,
-            "messages": [{"role": "user", "content": user_content}],
-            "tools": [{
-                "type": WEB_SEARCH_TOOL_TYPE,
-                "name": "web_search",
-                "max_uses": self.max_uses,
-            }],
-        }
+        messages: list[dict[str, Any]] = [{
+            "role": "user",
+            "content": user_content,
+        }]
         logger.info(
             "web_search_provider_started provider=%s freshness=%s max_results=%s query_hash=%s",
             self.provider_name,
@@ -213,12 +207,56 @@ class DeepSeekNativeSearchProvider:
             hashlib.sha256(safe_query.casefold().encode("utf-8")).hexdigest(),
         )
         started = asyncio.get_running_loop().time()
+        payloads: list[dict[str, Any]] = []
+        continuation_count = 0
+        while True:
+            payload = await self._request(messages)
+            payloads.append(payload)
+            if payload.get("stop_reason") != "pause_turn":
+                break
+            if continuation_count >= MAX_CONTINUATIONS:
+                raise SearchUnavailable("provider_continuation_limit")
+            assistant_content = payload.get("content")
+            if not isinstance(assistant_content, list):
+                raise SearchUnavailable("provider_invalid_response")
+            messages = [
+                *messages,
+                {"role": "assistant", "content": assistant_content},
+            ]
+            continuation_count += 1
+
+        result = self._parse_responses(payloads, max_results=max_results)
+        latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+        logger.info(
+            "web_search_provider_completed provider=%s source_count=%s search_request_count=%s input_tokens=%s output_tokens=%s latency_ms=%s provider_request_id=%s",
+            self.provider_name,
+            len(result.sources),
+            len(payloads),
+            (result.usage or {}).get("input_tokens"),
+            (result.usage or {}).get("output_tokens"),
+            latency_ms,
+            result.request_id,
+        )
+        return result
+
+    async def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "max_tokens": self.max_output_tokens,
+            "system": SEARCH_ONLY_SYSTEM,
+            "messages": messages,
+            "tools": [{
+                "type": WEB_SEARCH_TOOL_TYPE,
+                "name": "web_search",
+                "max_uses": self.max_uses,
+            }],
+        }
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(
                     self.api_url,
                     headers={
-                        "Authorization": f"Bearer {self.api_key}",
+                        "x-api-key": self.api_key,
                         "Content-Type": "application/json",
                         "anthropic-version": "2023-06-01",
                     },
@@ -246,24 +284,56 @@ class DeepSeekNativeSearchProvider:
             payload = response.json()
         except (ValueError, TypeError) as exc:
             raise SearchUnavailable("provider_invalid_response") from exc
-        result = self._parse_response(payload, max_results=max_results)
-        latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        logger.info(
-            "web_search_provider_completed provider=%s source_count=%s search_request_count=1 input_tokens=%s output_tokens=%s latency_ms=%s provider_request_id=%s",
-            self.provider_name,
-            len(result.sources),
-            (result.usage or {}).get("input_tokens"),
-            (result.usage or {}).get("output_tokens"),
-            latency_ms,
-            result.request_id,
-        )
-        return result
+        if not isinstance(payload, dict):
+            raise SearchUnavailable("provider_invalid_response")
+        return payload
 
-    def _parse_response(self, payload: Any, *, max_results: int) -> SearchProviderResult:
+    def _parse_responses(
+        self, payloads: list[dict[str, Any]], *, max_results: int
+    ) -> SearchProviderResult:
+        sources: list[SearchSource] = []
+        seen: set[str] = set()
+        usage_totals: dict[str, int] = {}
+        request_id: str | None = None
+        final_summary_parts: list[str] = []
+        limit = max(1, min(int(max_results), 10))
+        for index, payload in enumerate(payloads):
+            parsed_sources, summary_parts, usage, parsed_request_id = (
+                self._parse_content(payload)
+            )
+            for source in parsed_sources:
+                if source.url in seen or len(sources) >= limit:
+                    continue
+                seen.add(source.url)
+                sources.append(source)
+            if index == len(payloads) - 1:
+                final_summary_parts = summary_parts
+            if usage:
+                for key, value in usage.items():
+                    usage_totals[key] = usage_totals.get(key, 0) + value
+            if parsed_request_id:
+                request_id = parsed_request_id
+        if not sources:
+            raise SearchUnavailable("provider_no_sources")
+        summary = "\n".join(
+            part.strip() for part in final_summary_parts if part.strip()
+        )[:8000]
+        if not summary:
+            raise SearchUnavailable("provider_invalid_response")
+        return SearchProviderResult(
+            summary=summary,
+            sources=tuple(sources),
+            provider=self.provider_name,
+            request_id=request_id,
+            usage=usage_totals or None,
+        )
+
+    def _parse_content(
+        self, payload: dict[str, Any]
+    ) -> tuple[list[SearchSource], list[str], dict[str, int] | None, str | None]:
         if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
             raise SearchUnavailable("provider_invalid_response")
         sources: list[SearchSource] = []
-        seen: set[str] = set()
         summary_parts: list[str] = []
         for block in payload["content"]:
             if not isinstance(block, dict):
@@ -288,20 +358,13 @@ class DeepSeekNativeSearchProvider:
                 if item.get("type") != "web_search_result":
                     continue
                 url = _canonical_url(item.get("url"))
-                if not url or url in seen:
+                if not url:
                     continue
-                seen.add(url)
                 sources.append(SearchSource(
                     title=str(item.get("title") or "Untitled")[:300],
                     url=url,
                     page_age=(str(item["page_age"])[:128] if item.get("page_age") else None),
                 ))
-                if len(sources) >= max(1, min(int(max_results), 10)):
-                    break
-            if len(sources) >= max(1, min(int(max_results), 10)):
-                break
-        if not sources:
-            raise SearchUnavailable("provider_no_sources")
         usage = payload.get("usage")
         safe_usage = None
         if isinstance(usage, dict):
@@ -312,13 +375,7 @@ class DeepSeekNativeSearchProvider:
                 and isinstance(value, int)
             } or None
         request_id = str(payload.get("id") or "")[:128] or None
-        return SearchProviderResult(
-            summary="\n".join(part.strip() for part in summary_parts if part.strip())[:8000],
-            sources=tuple(sources),
-            provider=self.provider_name,
-            request_id=request_id,
-            usage=safe_usage,
-        )
+        return sources, summary_parts, safe_usage, request_id
 
 
 class WebSearchService:
@@ -375,11 +432,27 @@ class WebSearchService:
                 "ok": False, "error": "web_search_unavailable",
                 "reason_code": "provider_unavailable", "verified": False,
             }
+        failure_reason = None
         if not provider_result.sources:
+            failure_reason = "provider_no_sources"
+        elif not str(provider_result.summary or "").strip():
+            failure_reason = "provider_invalid_response"
+        if failure_reason:
+            await asyncio.to_thread(
+                self.repository.record_failure,
+                participant_id,
+                query_hash=query_hash,
+                freshness=freshness,
+                error_code=failure_reason,
+                provider=getattr(
+                    self.provider, "provider_name", provider_result.provider
+                ),
+                ttl_minutes=self.ttl_minutes,
+            )
             return {
                 "ok": False,
                 "error": "web_search_unavailable",
-                "reason_code": "provider_no_sources",
+                "reason_code": failure_reason,
                 "verified": False,
             }
         items = [

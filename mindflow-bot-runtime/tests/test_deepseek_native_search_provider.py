@@ -37,6 +37,22 @@ class _Client:
         return self.response
 
 
+class _SequenceClient:
+    def __init__(self, responses, calls):
+        self.responses = list(responses)
+        self.calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def post(self, url, *, headers, json):
+        self.calls.append((url, headers, json))
+        return self.responses.pop(0)
+
+
 def _payload():
     return {
         "id": "msg_search_123",
@@ -94,7 +110,8 @@ def test_request_uses_derived_anthropic_endpoint_and_sanitized_query(monkeypatch
 
     url, headers, body = calls[0]
     assert url == "https://api.deepseek.com/anthropic/v1/messages"
-    assert headers["Authorization"] == "Bearer deepseek-secret"
+    assert headers["x-api-key"] == "deepseek-secret"
+    assert "Authorization" not in headers
     assert headers["anthropic-version"] == "2023-06-01"
     assert body["tools"] == [{
         "type": WEB_SEARCH_TOOL_TYPE,
@@ -193,3 +210,109 @@ def test_timeout_maps_without_returning_raw_provider_details(monkeypatch):
     with pytest.raises(SearchUnavailable, match="provider_timeout") as exc_info:
         asyncio.run(_provider().search("public topic", "any", 5))
     assert "private raw" not in str(exc_info.value)
+
+
+def _pause_payload(*content):
+    return _Response({
+        "id": "pause-message",
+        "stop_reason": "pause_turn",
+        "content": list(content),
+    })
+
+
+def _source_block(url="https://example.com/source"):
+    return {
+        "type": "web_search_tool_result",
+        "content": [{
+            "type": "web_search_result",
+            "url": url,
+            "title": "Structured source",
+        }],
+    }
+
+
+def _complete_payload(*content):
+    return _Response({
+        "id": "complete-message",
+        "stop_reason": "end_turn",
+        "content": list(content),
+    })
+
+
+def test_pause_turn_continues_with_same_tools_and_raw_assistant_content(monkeypatch):
+    server_tool_use = {"type": "server_tool_use", "name": "web_search"}
+    pause = _pause_payload(server_tool_use)
+    complete = _complete_payload(
+        _source_block(),
+        {"type": "text", "text": "Final search summary."},
+    )
+    calls = []
+    client = _SequenceClient([pause, complete], calls)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+
+    result = asyncio.run(_provider().search("public topic", "any", 5))
+
+    assert result.summary == "Final search summary."
+    assert result.sources[0].url == "https://example.com/source"
+    assert len(calls) == 2
+    assert calls[1][2]["messages"][:1] == calls[0][2]["messages"]
+    assert calls[1][2]["messages"][1]["role"] == "assistant"
+    assert calls[1][2]["messages"][1]["content"] is pause._payload["content"]
+    assert calls[1][2]["tools"] == calls[0][2]["tools"]
+
+
+def test_multiple_pause_turns_accumulate_sources_until_final_summary(monkeypatch):
+    pause_one = _pause_payload({"type": "server_tool_use", "name": "web_search"})
+    pause_two = _pause_payload(_source_block("https://example.com/from-pause"))
+    complete = _complete_payload(
+        _source_block("https://example.com/final"),
+        {"type": "text", "text": "Completed after continuation."},
+    )
+    calls = []
+    client = _SequenceClient([pause_one, pause_two, complete], calls)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+
+    result = asyncio.run(_provider().search("public topic", "any", 5))
+
+    assert len(calls) == 3
+    assert {source.url for source in result.sources} == {
+        "https://example.com/from-pause",
+        "https://example.com/final",
+    }
+
+
+def test_pause_turn_limit_has_stable_reason_code(monkeypatch):
+    pause = _pause_payload({"type": "server_tool_use", "name": "web_search"})
+    calls = []
+    client = _SequenceClient([pause, pause, pause, pause], calls)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+
+    with pytest.raises(SearchUnavailable, match="provider_continuation_limit"):
+        asyncio.run(_provider().search("public topic", "any", 5))
+    assert len(calls) == 4
+
+
+def test_pause_turn_without_intermediate_source_does_not_report_no_sources(monkeypatch):
+    pause = _pause_payload({"type": "server_tool_use", "name": "web_search"})
+    complete = _complete_payload(
+        _source_block(),
+        {"type": "text", "text": "Search completed after a pause."},
+    )
+    client = _SequenceClient([pause, complete], [])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+
+    result = asyncio.run(_provider().search("public topic", "any", 5))
+
+    assert result.sources
+
+
+def test_final_summary_is_required_even_when_structured_source_exists(monkeypatch):
+    payload = _complete_payload(_source_block())
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(payload, []),
+    )
+
+    with pytest.raises(SearchUnavailable, match="provider_invalid_response"):
+        asyncio.run(_provider().search("public topic", "any", 5))

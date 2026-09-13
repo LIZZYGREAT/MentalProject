@@ -163,7 +163,8 @@ These are safety and authorization invariants; they are never negotiable.
   The tool exists but its provider is unavailable. For provider_unavailable,
   provider_auth_failed, provider_rate_limited, provider_timeout,
   provider_invalid_query, provider_limit_exceeded, provider_invalid_response,
-  or provider_no_sources, say the current fact could not be verified. Never
+  provider_no_sources, or provider_continuation_limit, say the current fact
+  could not be verified. Never
   fill in a claimed latest answer from model memory or fall back to built-in
   WebSearch/WebFetch. When the participant asked for latest information,
   list the returned sources briefly after the answer.
