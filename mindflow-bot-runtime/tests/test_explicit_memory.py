@@ -75,6 +75,31 @@ def test_memory_validator_routes_structured_preferences_out_of_memory():
             raise AssertionError(f"preference-shaped memory accepted: {content}")
 
 
+def test_memory_validator_rejects_medication_facts_without_blocking_daily_routines():
+    rejected = (
+        "记住我每天晚上吃舍曲林",
+        "记住我在服用氟西汀",
+        "记住医生给我开了奥氮平",
+        "记住我最近在减药",
+        "记住我每天吃50mg",
+    )
+    allowed = (
+        ("routine", "记住我每天吃早餐"),
+        ("routine", "记住我每天十一点睡"),
+        ("goal", "记住我最近在准备考研"),
+    )
+    for content in rejected:
+        try:
+            normalize_memory(content, "context")
+        except ValueError as exc:
+            assert "medication" in str(exc) or "health" in str(exc)
+        else:
+            raise AssertionError(f"medication memory accepted: {content}")
+    for memory_type, content in allowed:
+        normalized, _ = normalize_memory(content, memory_type)
+        assert normalized
+
+
 def test_clear_all_is_participant_scoped():
     database = memory_database()
     first = participant(database, "MEMORY-3")

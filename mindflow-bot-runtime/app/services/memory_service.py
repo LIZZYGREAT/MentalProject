@@ -22,6 +22,14 @@ _SENSITIVE_HEALTH_DATA = re.compile(
     r"(?:我|本人|用户|他|她).{0,12}(?:确诊|诊断为|患有).{0,12}(?:精神|心理|情绪)",
     re.I,
 )
+_MEDICATION_OR_TREATMENT_FACT = re.compile(
+    r"(?:服用|用药|停药|换药|加药|减药)|"
+    r"(?:舍曲林|氟西汀|帕罗西汀|艾司西酞普兰|文拉法辛|度洛西汀|"
+    r"奥氮平|喹硫平|锂盐|碳酸锂)|"
+    r"(?:医生|医师).{0,8}(?:给我)?开(?:了|的)?.{0,12}(?:药|片|胶囊)|"
+    r"(?:吃|服).{0,10}\d+(?:\.\d+)?\s*(?:mg|毫克)",
+    re.I,
+)
 _STRUCTURED_PREFERENCE_REQUEST = re.compile(
     r"(?:以后|请|希望你|你要|回答时).{0,20}(?:回答|回复|表达|语气|建议|听我说|"
     r"关心我|跟进|提醒).{0,20}(?:短|简洁|详细|直接|温和|先问|先听|不要|最多|主动)|"
@@ -42,6 +50,8 @@ def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
         raise ValueError("memory cannot alter system, safety, authorization, or secrets")
     if _SENSITIVE_HEALTH_DATA.search(normalized):
         raise ValueError("sensitive clinical or health data cannot become durable memory")
+    if _MEDICATION_OR_TREATMENT_FACT.search(normalized):
+        raise ValueError("medication or treatment facts cannot become durable memory")
     if _STRUCTURED_PREFERENCE_REQUEST.search(normalized):
         raise ValueError("interaction or support preferences cannot become durable memory")
     key = None
