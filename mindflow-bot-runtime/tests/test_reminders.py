@@ -296,3 +296,56 @@ def test_relative_reminder_ignores_agent_execution_delay_and_lost_seconds():
         created[2] == received_at + timedelta(hours=1)
         for created in store.created
     )
+
+
+def test_reminder_clarification_inherits_daypart_without_overriding_24h_clock():
+    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
+    cases = (
+        ("周三下午提醒我交作业", "三点", "2026-09-16T15:00:00+08:00"),
+        ("明天晚上提醒我复习", "八点半", "2026-09-14T20:30:00+08:00"),
+        ("周三下午提醒我交作业", "15:00", "2026-09-16T15:00:00+08:00"),
+    )
+    for previous, current, expected in cases:
+        store = _ReminderStore()
+        tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
+        ctx = AgentContext(
+            participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+            chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+            user_request_text=current, received_at_utc=received_at,
+            authorization_semantic_context=(
+                AuthorizationSemanticTurn("user", previous),
+                AuthorizationSemanticTurn("assistant", "具体几点提醒你？"),
+                AuthorizationSemanticTurn("user", current),
+            ),
+        )
+
+        result = tools.create(ctx, {
+            "message": "测试", "remind_at": expected, "recurrence_type": "none",
+        })
+
+        assert result["ok"] is True
+        assert store.created[0][2].isoformat() == expected
+
+
+def test_reminder_colon_clock_applies_explicit_chinese_daypart_first():
+    received_at = datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc)
+    cases = (
+        ("明天下午3:00提醒我", "2026-09-14T15:00:00+08:00"),
+        ("明天晚上8:30提醒我", "2026-09-14T20:30:00+08:00"),
+        ("明天03:00提醒我", "2026-09-14T03:00:00+08:00"),
+    )
+    for request_text, expected in cases:
+        store = _ReminderStore()
+        tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
+        ctx = AgentContext(
+            participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+            chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+            user_request_text=request_text, received_at_utc=received_at,
+        )
+
+        result = tools.create(ctx, {
+            "message": "测试", "remind_at": expected, "recurrence_type": "none",
+        })
+
+        assert result["ok"] is True
+        assert store.created[0][2].isoformat() == expected

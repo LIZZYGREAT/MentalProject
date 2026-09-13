@@ -55,6 +55,17 @@ class ReminderTimeGrounding:
     delta: timedelta | None = None
 
 
+@dataclass(frozen=True)
+class ParsedReminderClock:
+    hour: int
+    minute: int
+    daypart_source: Literal["explicit", "inherited", "none"]
+
+    @property
+    def value(self) -> time:
+        return time(self.hour, self.minute)
+
+
 def _chinese_number(value: str) -> int:
     if "十" not in value:
         digits = "".join(str(_CHINESE_DIGITS[char]) for char in value)
@@ -108,10 +119,10 @@ def has_exact_time_grounding(ctx: AgentContext) -> bool:
     return bool(_REMINDER_INTENT.search(previous) and _DATE.search(previous))
 
 
-def _grounding_text(ctx: AgentContext) -> str | None:
+def _grounding_turns(ctx: AgentContext) -> tuple[str, str | None] | None:
     current = _normalize_time_words(ctx.user_request_text)
     if _DURATION.search(current) or (_DATE.search(current) and _CLOCK.search(current)):
-        return current
+        return current, None
     if not _clock_only_clarification(current):
         return None
     prior_user_turns = [
@@ -125,35 +136,60 @@ def _grounding_text(ctx: AgentContext) -> str | None:
     previous = _normalize_time_words(prior_user_turns[-1])
     if not (_REMINDER_INTENT.search(previous) and _DATE.search(previous)):
         return None
-    return f"{previous} {current}"
+    return current, previous
 
 
-def _parse_clock(text_value: str) -> time | None:
-    colon = re.search(r"(?<!\d)([01]?\d|2[0-3])[:：]([0-5]\d)(?!\d)", text_value)
+def _daypart(value: str) -> str | None:
+    match = re.search(r"上午|下午|晚上|中午|凌晨", value)
+    return match.group(0) if match else None
+
+
+def _apply_daypart(hour: int, daypart: str | None) -> int:
+    if daypart in {"下午", "晚上"} and hour < 12:
+        return hour + 12
+    if daypart == "中午" and hour < 11:
+        return hour + 12
+    if daypart in {"上午", "凌晨"} and hour == 12:
+        return 0
+    return hour
+
+
+def _parse_clock(
+    text_value: str, *, inherited_daypart: str | None = None,
+) -> ParsedReminderClock | None:
+    colon = re.search(
+        r"(?:(上午|下午|晚上|中午|凌晨)\s*)?"
+        r"(?<!\d)([01]?\d|2[0-3])[:：]([0-5]\d)(?!\d)",
+        text_value,
+    )
     if colon:
-        return time(int(colon.group(1)), int(colon.group(2)))
+        explicit_daypart = colon.group(1)
+        chosen_daypart = explicit_daypart or inherited_daypart
+        return ParsedReminderClock(
+            _apply_daypart(int(colon.group(2)), chosen_daypart),
+            int(colon.group(3)),
+            "explicit" if explicit_daypart else "inherited" if inherited_daypart else "none",
+        )
     english = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", text_value, re.I)
     if english:
         hour = int(english.group(1)) % 12 + (12 if english.group(3).lower() == "pm" else 0)
-        return time(hour, int(english.group(2) or 0))
+        return ParsedReminderClock(hour, int(english.group(2) or 0), "explicit")
     chinese = re.search(
         r"(上午|下午|晚上|中午|凌晨)?\s*(\d{1,2})\s*点(?:\s*(半|\d{1,2}\s*分?))?",
         text_value,
     )
     if chinese is None:
         return None
-    period, raw_hour, raw_minute = chinese.groups()
-    hour = int(raw_hour)
+    explicit_daypart, raw_hour, raw_minute = chinese.groups()
+    chosen_daypart = explicit_daypart or inherited_daypart
+    hour = _apply_daypart(int(raw_hour), chosen_daypart)
     minute = 30 if raw_minute == "半" else int((raw_minute or "0").rstrip("分 "))
-    if period in {"下午", "晚上"} and hour < 12:
-        hour += 12
-    elif period == "中午" and hour < 11:
-        hour += 12
-    elif period in {"上午", "凌晨"} and hour == 12:
-        hour = 0
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
-    return time(hour, minute)
+    return ParsedReminderClock(
+        hour, minute,
+        "explicit" if explicit_daypart else "inherited" if inherited_daypart else "none",
+    )
 
 
 def _parse_local_date(text_value: str, reference: datetime, clock: time) -> date | None:
@@ -190,9 +226,11 @@ def _parse_local_date(text_value: str, reference: datetime, clock: time) -> date
 def resolve_reminder_time_grounding(
     ctx: AgentContext, *, now: datetime, timezone_name: str,
 ) -> tuple[ReminderTimeGrounding, datetime] | None:
-    source = _grounding_text(ctx)
-    if source is None:
+    grounding_turns = _grounding_turns(ctx)
+    if grounding_turns is None:
         return None
+    current, previous = grounding_turns
+    source = f"{previous or ''} {current}".strip()
     project_timezone = ZoneInfo(timezone_name)
     reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     local_reference = reference.astimezone(project_timezone)
@@ -214,10 +252,14 @@ def resolve_reminder_time_grounding(
             delta = None
     if delta is not None:
         return ReminderTimeGrounding(kind="relative", delta=delta), reference + delta
-    clock = _parse_clock(source)
-    if clock is None:
+    parsed_clock = _parse_clock(
+        current, inherited_daypart=_daypart(previous or ""),
+    )
+    if parsed_clock is None:
         return None
-    local_date = _parse_local_date(source, local_reference, clock)
+    clock = parsed_clock.value
+    date_source = current if _DATE.search(current) else previous or current
+    local_date = _parse_local_date(date_source, local_reference, clock)
     if local_date is None:
         return None
     expected = datetime.combine(local_date, clock, project_timezone)
