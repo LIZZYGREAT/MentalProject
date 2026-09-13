@@ -1,11 +1,15 @@
 import asyncio
 from datetime import datetime, time, timedelta, timezone
+import threading
+import uuid
 
+from app.agent.context import AgentContext, AuthorizationSemanticTurn
 from app.models import ParticipantCarePreference, Reminder
 from app.repositories import ParticipantRepository
 from app.repositories_reminder import ReminderRepository
 from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.reminder_scheduler import ReminderScheduler
+from app.tools.reminder import has_exact_time_grounding
 from tests.helpers import memory_database, participant
 
 
@@ -21,6 +25,15 @@ class _Sender:
     def send_text(self, chat_id, text, *, message_uuid=None):
         self.messages.append((chat_id, text, message_uuid))
         return "provider-id"
+
+
+class _FailingSender:
+    def __init__(self):
+        self.thread_ids = []
+
+    def send_text(self, *_args, **_kwargs):
+        self.thread_ids.append(threading.get_ident())
+        raise RuntimeError("provider unavailable")
 
 
 def test_reminder_repository_is_participant_bound_and_limited():
@@ -89,3 +102,64 @@ def test_weekly_recurrence_preserves_local_clock():
     assert repo.mark_fired(claimed[0]["id"], claimed[0]["claim_token"], fired_at=now)
     remaining = repo.list_active(user.id)
     assert datetime.fromisoformat(remaining[0]["next_fire_at"]) == now + timedelta(days=7)
+
+
+def test_provider_failure_uses_worker_thread_and_durable_exponential_backoff():
+    database = memory_database()
+    user = participant(database, "REMINDER-RETRY")
+    now = datetime(2026, 9, 12, 1, 0, tzinfo=timezone.utc)
+    with database.session() as session:
+        session.add(Reminder(
+            participant_id=user.id, message="交作业", remind_at_utc=now,
+            next_fire_at=now, recurrence_type="none", status="active",
+        ))
+    repo = ReminderRepository(database, timezone_name="Asia/Shanghai")
+    sender = _FailingSender()
+    scheduler = ReminderScheduler(
+        reminders=repo, participants=ParticipantRepository(database),
+        bindings=_Bindings(),
+        proactive_policy=ProactiveNotificationPolicy(
+            database, timezone_name="Asia/Shanghai", default_system_budget=0
+        ),
+        sender=sender, retry_base_seconds=60, max_attempts=2,
+    )
+    event_loop_thread = threading.get_ident()
+
+    assert asyncio.run(scheduler.run_once(now))["failed"] == 1
+    pending = repo.list_active(user.id)[0]
+    assert pending["attempt_count"] == 1
+    assert datetime.fromisoformat(pending["next_attempt_at"]) == now + timedelta(seconds=60)
+    assert sender.thread_ids[0] != event_loop_thread
+    assert asyncio.run(scheduler.run_once(now + timedelta(seconds=30)))["failed"] == 0
+    assert len(sender.thread_ids) == 1
+
+    assert asyncio.run(scheduler.run_once(now + timedelta(seconds=60)))["failed"] == 1
+    with database.session() as session:
+        row = session.query(Reminder).filter_by(participant_id=user.id).one()
+        assert row.status == "delivery_failed"
+        assert row.attempt_count == 2
+        assert row.next_attempt_at is None
+
+
+def test_reminder_time_must_be_grounded_in_user_words():
+    base = dict(
+        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
+    )
+    vague = AgentContext(
+        **base, user_request_text="周三下午提醒我交作业"
+    )
+    exact = AgentContext(
+        **base, user_request_text="周三15:00提醒我交作业"
+    )
+    clarified = AgentContext(
+        **base,
+        user_request_text="15:00",
+        authorization_semantic_context=(
+            AuthorizationSemanticTurn("user", "周三下午提醒我交作业"),
+        ),
+    )
+
+    assert has_exact_time_grounding(vague) is False
+    assert has_exact_time_grounding(exact) is True
+    assert has_exact_time_grounding(clarified) is True

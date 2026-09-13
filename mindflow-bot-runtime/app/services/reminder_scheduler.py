@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReminderScheduler:
-    def __init__(self, *, reminders, participants, bindings, proactive_policy, sender, poll_interval_seconds: int = 30, claim_lease_seconds: int = 120) -> None:
+    def __init__(self, *, reminders, participants, bindings, proactive_policy, sender, poll_interval_seconds: int = 30, claim_lease_seconds: int = 120, retry_base_seconds: int = 60, max_attempts: int = 5) -> None:
         self.reminders = reminders
         self.participants = participants
         self.bindings = bindings
@@ -20,6 +20,8 @@ class ReminderScheduler:
         self.sender = sender
         self.poll_interval_seconds = max(1, poll_interval_seconds)
         self.claim_lease_seconds = max(1, claim_lease_seconds)
+        self.retry_base_seconds = max(1, retry_base_seconds)
+        self.max_attempts = max(1, max_attempts)
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -33,7 +35,13 @@ class ReminderScheduler:
             participant = await asyncio.to_thread(self.participants.get, participant_id)
             binding = await asyncio.to_thread(self.bindings.get_for_participant, participant_id)
             if participant is None or participant.status != "active" or not binding or not binding.get("chat_id"):
-                await asyncio.to_thread(self.reminders.release, item["id"], item["claim_token"])
+                await asyncio.to_thread(
+                    self.reminders.record_delivery_failure,
+                    item["id"], item["claim_token"], now=instant,
+                    error_code="delivery_binding_unavailable",
+                    max_attempts=self.max_attempts,
+                    retry_base_seconds=self.retry_base_seconds,
+                )
                 counts["failed"] += 1
                 continue
             decision = await asyncio.to_thread(
@@ -42,18 +50,32 @@ class ReminderScheduler:
                 scheduled_at=datetime.fromisoformat(item["next_fire_at"]), now=instant,
             )
             if not decision.allowed:
-                await asyncio.to_thread(self.reminders.release, item["id"], item["claim_token"])
+                await asyncio.to_thread(
+                    self.reminders.record_delivery_failure,
+                    item["id"], item["claim_token"], now=instant,
+                    error_code=f"proactive_{decision.reason}",
+                    max_attempts=self.max_attempts,
+                    retry_base_seconds=self.retry_base_seconds,
+                )
                 counts["failed"] += 1
                 continue
             try:
-                self.sender.send_text(
-                    binding["chat_id"], f"提醒：{item['message']}",
+                await asyncio.to_thread(
+                    self.sender.send_text,
+                    binding["chat_id"],
+                    f"提醒：{item['message']}",
                     message_uuid=str(decision.reservation_id),
                 )
             except Exception:
                 logger.warning("reminder_send_failed", exc_info=True)
                 await asyncio.to_thread(self.proactive_policy.release, decision.reservation_id, reason="provider_failed")
-                await asyncio.to_thread(self.reminders.release, item["id"], item["claim_token"])
+                await asyncio.to_thread(
+                    self.reminders.record_delivery_failure,
+                    item["id"], item["claim_token"], now=instant,
+                    error_code="provider_failed",
+                    max_attempts=self.max_attempts,
+                    retry_base_seconds=self.retry_base_seconds,
+                )
                 counts["failed"] += 1
                 continue
             await asyncio.to_thread(self.proactive_policy.mark_sent, decision.reservation_id, now=instant)

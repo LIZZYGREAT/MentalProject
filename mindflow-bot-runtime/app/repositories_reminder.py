@@ -79,6 +79,10 @@ class ReminderRepository:
         with self.database.session() as session:
             ids = session.execute(select(Reminder.id).where(
                 Reminder.status == "active", Reminder.next_fire_at <= instant,
+                or_(
+                    Reminder.next_attempt_at.is_(None),
+                    Reminder.next_attempt_at <= instant,
+                ),
                 or_(Reminder.claim_token.is_(None), Reminder.lease_until <= instant),
             ).order_by(Reminder.next_fire_at).limit(max(1, limit))).scalars().all()
             results = []
@@ -103,6 +107,9 @@ class ReminderRepository:
                 return False
             row.last_fired_at = instant
             row.fired_count += 1
+            row.attempt_count = 0
+            row.next_attempt_at = None
+            row.last_error_code = None
             row.claim_token = None
             row.lease_until = None
             if row.recurrence_type == "none":
@@ -113,6 +120,41 @@ class ReminderRepository:
                 days = 1 if row.recurrence_type == "daily" else 7
                 next_local = datetime.combine(local.date() + timedelta(days=days), local.timetz().replace(tzinfo=None), self.timezone)
                 row.next_fire_at = next_local.astimezone(timezone.utc)
+            row.updated_at = instant
+            return True
+
+    def record_delivery_failure(
+        self,
+        reminder_id: str,
+        claim_token: str,
+        *,
+        now: datetime,
+        error_code: str,
+        max_attempts: int,
+        retry_base_seconds: int,
+    ) -> bool:
+        instant = _aware(now)
+        with self.database.session() as session:
+            row = session.execute(select(Reminder).where(
+                Reminder.id == uuid.UUID(reminder_id),
+                Reminder.claim_token == uuid.UUID(claim_token),
+                Reminder.status == "active",
+            ).with_for_update()).scalar_one_or_none()
+            if row is None:
+                return False
+            row.attempt_count += 1
+            row.last_error_code = str(error_code)[:128]
+            row.claim_token = None
+            row.lease_until = None
+            if row.attempt_count >= max(1, int(max_attempts)):
+                row.status = "delivery_failed"
+                row.next_attempt_at = None
+                row.next_fire_at = None
+            else:
+                delay = max(1, int(retry_base_seconds)) * (
+                    2 ** max(0, row.attempt_count - 1)
+                )
+                row.next_attempt_at = instant + timedelta(seconds=delay)
             row.updated_at = instant
             return True
 
@@ -146,5 +188,11 @@ class ReminderRepository:
             "next_fire_at": _aware(row.next_fire_at).isoformat() if row.next_fire_at else None,
             "recurrence_type": row.recurrence_type, "weekday": row.weekday,
             "status": row.status, "fired_count": int(row.fired_count),
+            "attempt_count": int(row.attempt_count),
+            "next_attempt_at": (
+                _aware(row.next_attempt_at).isoformat()
+                if row.next_attempt_at else None
+            ),
+            "last_error_code": row.last_error_code,
             "claim_token": str(row.claim_token) if row.claim_token else None,
         }

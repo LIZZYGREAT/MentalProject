@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from zoneinfo import ZoneInfo
 import uuid
 from typing import Any
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
+
+
+_CLOCK = re.compile(
+    r"(?:(?<!\d)(?:[01]?\d|2[0-3])[:：][0-5]\d(?!\d)|"
+    r"(?:上午|下午|晚上|中午|凌晨)?\s*\d{1,2}\s*点(?:半|\s*\d{1,2}\s*分)?|"
+    r"\b\d{1,2}(?::[0-5]\d)?\s*(?:am|pm)\b)",
+    re.I,
+)
+_DATE = re.compile(
+    r"(?:今天|明天|后天|大后天|周[一二三四五六日天]|星期[一二三四五六日天]|"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}月\d{1,2}[日号]?|"
+    r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)",
+    re.I,
+)
+_DURATION = re.compile(r"\d+\s*(?:分钟|小时|天|minutes?|hours?|days?)\s*(?:后|later)", re.I)
+
+
+def has_exact_time_grounding(ctx: AgentContext) -> bool:
+    texts = [ctx.user_request_text]
+    texts.extend(
+        item.text
+        for item in ctx.authorization_semantic_context
+        if getattr(item, "role", None) == "user"
+    )
+    combined = " ".join(str(value) for value in texts if str(value).strip())
+    return bool(_DURATION.search(combined) or (_DATE.search(combined) and _CLOCK.search(combined)))
 
 
 class ReminderTools:
@@ -49,6 +76,12 @@ class ReminderTools:
         )
 
     def create(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+        if not has_exact_time_grounding(ctx):
+            return {
+                "ok": False,
+                "error": "reminder_time_needs_clarification",
+                "detail": "The user's own words do not contain an exact reminder time.",
+            }
         raw = str(args["remind_at"])
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"

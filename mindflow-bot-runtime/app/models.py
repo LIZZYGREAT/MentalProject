@@ -1951,7 +1951,7 @@ class MorningBriefSchedule(Base):
 class Reminder(Base):
     __tablename__ = "reminders"
     __table_args__ = (
-        Index("ix_reminder_due", "status", "next_fire_at"),
+        Index("ix_reminder_due", "status", "next_attempt_at", "next_fire_at"),
         CheckConstraint("recurrence_type IN ('none', 'daily', 'weekly')", name="ck_reminder_recurrence"),
     )
 
@@ -1967,6 +1967,11 @@ class Reminder(Base):
     last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
