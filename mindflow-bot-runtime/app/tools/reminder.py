@@ -20,7 +20,7 @@ class ReminderTools:
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "reminder_create",
-            "Create a participant-owned reminder only after message and exact date-time are explicit. If time is vague, ask one clarification question instead of calling this tool.",
+            "Create a participant-owned reminder when the message and reminder time are explicit or unambiguously resolvable from the user's words using backend_time_context. If the time remains ambiguous, ask one clarification question instead of calling this tool.",
             {
                 "type": "object",
                 "properties": {
