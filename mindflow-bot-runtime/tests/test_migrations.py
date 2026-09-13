@@ -1049,3 +1049,33 @@ def test_0017_adds_calendar_state_and_safe_snooze_backfill(monkeypatch):
     assert "intervention.id::text" in snooze_backfill
     assert "candidate.candidate_rank = 1" in snooze_backfill
     assert "::uuid" not in snooze_backfill
+
+
+def test_0067_adds_nullable_web_search_provider_audit_fields(monkeypatch):
+    migration = _migration(VERSIONS / "0067_web_search_provider_audit.py")
+    columns = []
+    dropped = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name, column.nullable)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_column",
+        lambda table, name: dropped.append((table, name)),
+    )
+
+    migration.upgrade()
+    assert columns == [
+        ("web_search_runs", "provider", True),
+        ("web_search_runs", "provider_summary", True),
+        ("web_search_runs", "provider_request_id", True),
+    ]
+
+    migration.downgrade()
+    assert dropped == [
+        ("web_search_runs", "provider_request_id"),
+        ("web_search_runs", "provider_summary"),
+        ("web_search_runs", "provider"),
+    ]
