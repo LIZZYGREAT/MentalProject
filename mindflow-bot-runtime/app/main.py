@@ -898,6 +898,17 @@ async def run() -> None:
         progress_presenter=ProgressPresenter(),
         response_orchestrator=response_orchestrator,
         max_retries=settings.feishu_send_max_retries,
+        streaming_card_enabled=settings.feishu_streaming_card_enabled,
+        streaming_update_interval_ms=settings.feishu_streaming_update_interval_ms,
+        streaming_min_chars_per_update=(
+            settings.feishu_streaming_min_chars_per_update
+        ),
+        streaming_max_update_interval_ms=(
+            settings.feishu_streaming_max_update_interval_ms
+        ),
+        streaming_finalize_timeout_seconds=(
+            settings.feishu_streaming_finalize_timeout_seconds
+        ),
         generic_progress_delay_seconds=(
             settings.generic_progress_delay_seconds
         ),

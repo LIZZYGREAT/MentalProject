@@ -478,6 +478,15 @@ class BotEvent(Base):
     reply_message_ids_json: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     reply_plan_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     reply_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_element_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    streaming_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    streaming_final_text_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    streaming_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     telemetry_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

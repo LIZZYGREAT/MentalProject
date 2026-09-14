@@ -207,6 +207,18 @@ class PendingReplyPlan:
 
 
 @dataclass(frozen=True)
+class PendingStreamingReplyPlan:
+    event_id: str
+    final_text: str | None
+    card_id: str
+    message_id: str
+    element_id: str
+    state: str
+    sequence: int
+    final_text_hash: str | None
+
+
+@dataclass(frozen=True)
 class ClaudeSessionView:
     participant_id: uuid.UUID
     session_id: str
@@ -4210,6 +4222,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id)
             if row is None or row.status != "reply_pending":
                 return None
+            if str(row.reply_plan_version or "").startswith("streaming-card"):
+                return None
             raw_segments = row.reply_segments_json
             if isinstance(raw_segments, list) and raw_segments:
                 segments = tuple(str(item) for item in raw_segments if str(item))
@@ -4235,6 +4249,107 @@ class BotEventRepository:
                 message_ids=message_ids,
                 plan_version=version,
             )
+
+    def pending_streaming_reply_plan(
+        self, event_id: str
+    ) -> PendingStreamingReplyPlan | None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id)
+            if (
+                row is None
+                or row.status != "reply_pending"
+                or not str(row.reply_plan_version or "").startswith("streaming-card")
+                or not row.streaming_card_id
+                or not row.streaming_message_id
+                or not row.streaming_element_id
+            ):
+                return None
+            return PendingStreamingReplyPlan(
+                event_id=row.event_id,
+                final_text=str(row.reply_text) if row.reply_text is not None else None,
+                card_id=str(row.streaming_card_id),
+                message_id=str(row.streaming_message_id),
+                element_id=str(row.streaming_element_id),
+                state=str(row.streaming_state or "progress"),
+                sequence=int(row.streaming_sequence or 0),
+                final_text_hash=(
+                    str(row.streaming_final_text_hash)
+                    if row.streaming_final_text_hash
+                    else None
+                ),
+            )
+
+    def stage_streaming_progress(
+        self,
+        event_id: str,
+        *,
+        card_id: str,
+        message_id: str,
+        element_id: str,
+    ) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status in {"completed", "interrupted"}:
+                return
+            if row.streaming_card_id and row.streaming_card_id != str(card_id):
+                raise ValueError("streaming card is already bound")
+            row.streaming_card_id = str(card_id)[:128]
+            row.streaming_message_id = str(message_id)[:128]
+            row.streaming_element_id = str(element_id)[:128]
+            row.streaming_state = "progress"
+            row.streaming_sequence = int(row.streaming_sequence or 0)
+            row.reply_plan_version = "streaming-card-v1"
+            row.status = "reply_pending"
+            row.error_code = None
+
+    def stage_streaming_final(self, event_id: str, *, full_text: str) -> None:
+        value = str(full_text)
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            if not row.streaming_card_id:
+                raise ValueError("streaming card must be bound before final staging")
+            row.reply_text = value
+            row.reply_segments_json = None
+            row.reply_next_segment = 0
+            row.reply_plan_version = "streaming-card-v1"
+            row.streaming_final_text_hash = hashlib.sha256(
+                value.encode("utf-8")
+            ).hexdigest()
+            row.streaming_state = "final_ready"
+            row.status = "reply_pending"
+            row.error_code = None
+
+    def reserve_streaming_sequence(self, event_id: str) -> int:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or not row.streaming_card_id:
+                raise ValueError("streaming card is not bound")
+            row.streaming_sequence = int(row.streaming_sequence or 0) + 1
+            return row.streaming_sequence
+
+    def finish_streaming_reply(self, event_id: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.streaming_state = "finalized"
+            row.streaming_finalized_at = utc_now()
+            row.reply_message_id = row.streaming_message_id
+            row.status = "completed"
+            row.error_code = None
+            row.image_key = None
+            row.processed_at = utc_now()
+
+    def note_streaming_failure(self, event_id: str, error_code: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.streaming_state = "failed"
+            row.status = "reply_pending"
+            row.error_code = str(error_code)[:64]
 
     def stage_reply_plan(
         self,

@@ -57,6 +57,11 @@ def test_env_example_contains_critical_runtime_capabilities():
         "FEISHU_CARD_CALLBACK_ENABLED",
         "CARD_ACTION_RECEIPT_TTL_HOURS",
         "CLAUDE_PARTIAL_MESSAGES_ENABLED",
+        "FEISHU_STREAMING_CARD_ENABLED",
+        "FEISHU_STREAMING_UPDATE_INTERVAL_MS",
+        "FEISHU_STREAMING_MIN_CHARS_PER_UPDATE",
+        "FEISHU_STREAMING_MAX_UPDATE_INTERVAL_MS",
+        "FEISHU_STREAMING_FINALIZE_TIMEOUT_SECONDS",
     }
     assert required <= _example_keys()
 

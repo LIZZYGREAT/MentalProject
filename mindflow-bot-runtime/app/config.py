@@ -113,6 +113,11 @@ class Settings:
     presentation_agent_max_segments: int = 3
     presentation_model: str = ""
     claude_partial_messages_enabled: bool = False
+    feishu_streaming_card_enabled: bool = True
+    feishu_streaming_update_interval_ms: int = 120
+    feishu_streaming_min_chars_per_update: int = 30
+    feishu_streaming_max_update_interval_ms: int = 300
+    feishu_streaming_finalize_timeout_seconds: float = 5.0
     feishu_send_max_retries: int = 1
     feishu_gateway_start_timeout_seconds: int = 30
     feishu_gateway_stop_timeout_seconds: int = 8
@@ -373,6 +378,24 @@ class Settings:
             ),
             claude_partial_messages_enabled=_bool(
                 values, "CLAUDE_PARTIAL_MESSAGES_ENABLED", False
+            ),
+            feishu_streaming_card_enabled=_bool(
+                values, "FEISHU_STREAMING_CARD_ENABLED", True
+            ),
+            feishu_streaming_update_interval_ms=_int(
+                values, "FEISHU_STREAMING_UPDATE_INTERVAL_MS", 120, minimum=50
+            ),
+            feishu_streaming_min_chars_per_update=_int(
+                values, "FEISHU_STREAMING_MIN_CHARS_PER_UPDATE", 30, minimum=10
+            ),
+            feishu_streaming_max_update_interval_ms=_int(
+                values, "FEISHU_STREAMING_MAX_UPDATE_INTERVAL_MS", 300, minimum=100
+            ),
+            feishu_streaming_finalize_timeout_seconds=_float(
+                values,
+                "FEISHU_STREAMING_FINALIZE_TIMEOUT_SECONDS",
+                5.0,
+                minimum=0.5,
             ),
             feishu_send_max_retries=_int(
                 values, "FEISHU_SEND_MAX_RETRIES", 1, minimum=0

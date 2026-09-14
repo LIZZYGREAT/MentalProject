@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 from typing import Any
+from urllib.parse import quote
 
 
 class FeishuSendError(RuntimeError):
@@ -94,6 +95,160 @@ class FeishuClient:
                 # generic validation failures must not create another card.
                 replacement_allowed=code in {230003, 230006},
             )
+
+    def create_card_instance(self, card: dict[str, Any]) -> str:
+        if not isinstance(card, dict) or not card:
+            raise ValueError("Feishu CardKit card must be a non-empty object")
+        response = self._cardkit_request(
+            "POST",
+            "/open-apis/cardkit/v1/cards",
+            {"type": "card_json", "data": json.dumps(card, ensure_ascii=False)},
+            operation="create_card_instance",
+        )
+        data = getattr(response, "data", None)
+        card_id = (
+            data.get("card_id") if isinstance(data, dict) else getattr(data, "card_id", None)
+        )
+        if not card_id:
+            raise FeishuSendError(
+                "Feishu CardKit response has no card_id",
+                retryable=False,
+                operation="create_card_instance",
+            )
+        return str(card_id)
+
+    def send_card_by_reference(
+        self,
+        chat_id: str,
+        card_id: str,
+        *,
+        message_uuid: str | None = None,
+    ) -> str:
+        reference = {"type": "card", "data": {"card_id": str(card_id)}}
+        return self._send_message(
+            chat_id,
+            "interactive",
+            reference,
+            message_uuid=message_uuid,
+        )
+
+    def update_card_element_content(
+        self,
+        card_id: str,
+        element_id: str,
+        content: str,
+        sequence: int,
+    ) -> None:
+        self._cardkit_request(
+            "PUT",
+            "/open-apis/cardkit/v1/cards/"
+            f"{quote(str(card_id), safe='')}/elements/"
+            f"{quote(str(element_id), safe='')}/content",
+            {"content": str(content), "sequence": int(sequence)},
+            operation="update_card_element_content",
+        )
+
+    def finish_streaming_card(self, card_id: str, sequence: int) -> None:
+        self._cardkit_request(
+            "PATCH",
+            f"/open-apis/cardkit/v1/cards/{quote(str(card_id), safe='')}/settings",
+            {
+                "settings": json.dumps(
+                    {"config": {"streaming_mode": False}}, ensure_ascii=False
+                ),
+                "sequence": int(sequence),
+            },
+            operation="finish_streaming_card",
+        )
+
+    async def start_streaming_card(
+        self,
+        chat_id: str,
+        initial_content: str = "正在整理结果…",
+        *,
+        message_uuid: str | None = None,
+        update_interval_ms: int = 120,
+        min_update_chars: int = 30,
+        max_update_interval_ms: int = 300,
+    ):
+        import asyncio
+
+        from app.integrations.feishu.streaming_card import (
+            ANSWER_ELEMENT_ID,
+            FeishuStreamingCardSession,
+            streaming_answer_card,
+        )
+
+        card_id = await asyncio.to_thread(
+            self.create_card_instance,
+            streaming_answer_card(initial_content),
+        )
+        try:
+            message_id = await asyncio.to_thread(
+                self.send_card_by_reference,
+                chat_id,
+                card_id,
+                message_uuid=message_uuid,
+            )
+        except Exception:
+            try:
+                await asyncio.to_thread(self.finish_streaming_card, card_id, 1)
+            except Exception:
+                pass
+            raise
+        return FeishuStreamingCardSession(
+            client=self,
+            card_id=card_id,
+            message_id=message_id,
+            element_id=ANSWER_ELEMENT_ID,
+            visible_content=str(initial_content),
+            update_interval_ms=update_interval_ms,
+            min_update_chars=min_update_chars,
+            max_update_interval_ms=max_update_interval_ms,
+        )
+
+    def _cardkit_request(
+        self,
+        method: str,
+        uri: str,
+        body: dict[str, Any],
+        *,
+        operation: str,
+    ):
+        from lark_oapi.core.const import APPLICATION_JSON, CONTENT_TYPE
+        from lark_oapi.core.enum import AccessTokenType, HttpMethod
+        from lark_oapi.core.model import BaseRequest
+
+        http_method = {
+            "POST": HttpMethod.POST,
+            "PUT": HttpMethod.PUT,
+            "PATCH": HttpMethod.PATCH,
+        }[method]
+        request = (
+            BaseRequest.builder()
+            .http_method(http_method)
+            .uri(uri)
+            .token_types({AccessTokenType.TENANT})
+            .headers({CONTENT_TYPE: f"{APPLICATION_JSON}; charset=utf-8"})
+            .body(body)
+            .build()
+        )
+        try:
+            response = self._client.request(request)
+        except Exception as exc:
+            raise FeishuSendError(
+                f"Feishu CardKit {operation} request failed",
+                operation=operation,
+            ) from exc
+        if not response or not response.success():
+            code = getattr(response, "code", None)
+            raise FeishuSendError(
+                str(getattr(response, "msg", f"Feishu CardKit {operation} failed")),
+                code=code,
+                retryable=code not in {230001, 230003, 230006, 99991672},
+                operation=operation,
+            )
+        return response
 
     def update_card_from_callback(
         self,

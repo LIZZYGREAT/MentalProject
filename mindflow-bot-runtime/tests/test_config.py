@@ -189,6 +189,11 @@ def test_response_ux_defaults_and_presentation_model_fallback():
     assert settings.presentation_agent_timeout_seconds == 4
     assert settings.presentation_model == "deepseek-v4-flash"
     assert settings.claude_partial_messages_enabled is False
+    assert settings.feishu_streaming_card_enabled is True
+    assert settings.feishu_streaming_update_interval_ms == 120
+    assert settings.feishu_streaming_min_chars_per_update == 30
+    assert settings.feishu_streaming_max_update_interval_ms == 300
+    assert settings.feishu_streaming_finalize_timeout_seconds == 5
 
 
 def test_progress_timers_have_independent_configuration():

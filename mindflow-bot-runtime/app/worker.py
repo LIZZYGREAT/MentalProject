@@ -36,6 +36,7 @@ from app.integrations.feishu.message_resources import (
     UnsupportedImageFormat,
 )
 from app.integrations.feishu.oauth import DeviceFlowService
+from app.integrations.feishu.streaming_card import FeishuStreamingCardSession
 from app.repositories import (
     AgentRunRepository,
     BotEventRepository,
@@ -109,6 +110,12 @@ logger = logging.getLogger(__name__)
 _CARD_DELIVERED_CLAIM = re.compile(
     r"(?:卡片|设置卡片?|功能卡片?)(?:已经|已)(?:成功)?(?:发出|发送|投递)(?:了)?"
 )
+_STREAMING_WEB_TOOLS = {
+    "web_search",
+    "web_read_result",
+    "web_read_url",
+    "web_read_url_chunk",
+}
 
 
 def _with_card_delivery_failure(response: RuntimeResponse | str) -> RuntimeResponse:
@@ -365,6 +372,11 @@ class BotWorker:
         progress_presenter: ProgressPresenter | None = None,
         response_orchestrator: ResponseOrchestrator | None = None,
         max_retries: int = 1,
+        streaming_card_enabled: bool = True,
+        streaming_update_interval_ms: int = 120,
+        streaming_min_chars_per_update: int = 30,
+        streaming_max_update_interval_ms: int = 300,
+        streaming_finalize_timeout_seconds: float = 5.0,
         generic_progress_delay_seconds: float = 10.0,
         tool_progress_grace_seconds: float = 1.2,
         progress_cooldown_seconds: int = 3,
@@ -414,6 +426,18 @@ class BotWorker:
         self.response_orchestrator = response_orchestrator or ResponseOrchestrator()
         self.model = model
         self.max_retries = max_retries
+        self.streaming_card_enabled = bool(streaming_card_enabled)
+        self.streaming_update_interval_ms = max(50, int(streaming_update_interval_ms))
+        self.streaming_min_chars_per_update = max(
+            10, int(streaming_min_chars_per_update)
+        )
+        self.streaming_max_update_interval_ms = max(
+            self.streaming_update_interval_ms,
+            int(streaming_max_update_interval_ms),
+        )
+        self.streaming_finalize_timeout_seconds = max(
+            0.5, float(streaming_finalize_timeout_seconds)
+        )
         self.generic_progress_delay_seconds = max(
             0.0, float(generic_progress_delay_seconds)
         )
@@ -642,6 +666,21 @@ class BotWorker:
             participant = await asyncio.to_thread(
                 self.identity.resolve, event.app_id, event.open_id
             )
+            pending_streaming_reader = getattr(
+                self.events, "pending_streaming_reply_plan", None
+            )
+            pending_streaming = (
+                await asyncio.to_thread(pending_streaming_reader, event.event_id)
+                if callable(pending_streaming_reader)
+                else None
+            )
+            if pending_streaming is not None:
+                await self._resume_streaming_reply(
+                    event,
+                    pending_streaming,
+                    participant_id=(participant.id if participant is not None else None),
+                )
+                return
             pending_plan = await asyncio.to_thread(
                 self.events.pending_reply_plan, event.event_id
             )
@@ -2289,6 +2328,61 @@ class BotWorker:
         progress = ProgressState(
             force_silent=should_force_silent_progress(turn_input.text)
         )
+        streaming_session: FeishuStreamingCardSession | None = None
+        streaming_session_lock = asyncio.Lock()
+
+        async def ensure_streaming_progress(
+            tool_name: str,
+        ) -> FeishuStreamingCardSession | None:
+            nonlocal streaming_session
+            start_streaming = getattr(self.sender, "start_streaming_card", None)
+            if (
+                not self.streaming_card_enabled
+                or tool_name not in _STREAMING_WEB_TOOLS
+                or not callable(start_streaming)
+                or not callable(getattr(self.events, "stage_streaming_progress", None))
+            ):
+                return None
+            async with streaming_session_lock:
+                if streaming_session is not None:
+                    return streaming_session
+                initial = (
+                    "正在搜索公开网页…"
+                    if tool_name == "web_search"
+                    else "正在读取网页内容…"
+                )
+                try:
+                    created = await start_streaming(
+                        event.chat_id,
+                        initial,
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:stream:{event.event_id}"
+                        ),
+                        update_interval_ms=self.streaming_update_interval_ms,
+                        min_update_chars=self.streaming_min_chars_per_update,
+                        max_update_interval_ms=self.streaming_max_update_interval_ms,
+                    )
+                    await asyncio.to_thread(
+                        self.events.stage_streaming_progress,
+                        event.event_id,
+                        card_id=created.card_id,
+                        message_id=created.message_id,
+                        element_id=created.element_id,
+                    )
+                    self._attach_streaming_sequence_allocator(
+                        event.event_id, created
+                    )
+                except Exception:
+                    logger.warning(
+                        "streaming_progress_card_start_failed event_id=%s",
+                        event.event_id,
+                        exc_info=True,
+                    )
+                    return None
+                streaming_session = created
+                async with progress.lock:
+                    progress.force_silent = True
+                return streaming_session
         message_created_at = event.create_time
         if message_created_at.tzinfo is None:
             message_created_at = message_created_at.replace(tzinfo=timezone.utc)
@@ -2387,11 +2481,14 @@ class BotWorker:
 
         async def on_activity(activity: AgentActivityEvent) -> None:
             nonlocal tool_timer
+            activity_tool_name = str(activity.tool_name or "")
+            if activity.kind == "tool_started":
+                await ensure_streaming_progress(activity_tool_name)
             async with progress.lock:
                 now = time.monotonic()
                 if progress.first_activity_at is None:
                     progress.first_activity_at = now
-                tool_name = str(activity.tool_name or "")
+                tool_name = activity_tool_name
                 if tool_name:
                     progress.used_tools.add(tool_name)
                 if activity.evidence is not None:
@@ -2430,6 +2527,19 @@ class BotWorker:
                         name=f"tool-progress-{event.event_id}-{generation}",
                     )
                     tool_timers.add(tool_timer)
+            if (
+                streaming_session is not None
+                and activity.kind in {"tool_succeeded", "tool_failed"}
+                and tool_name in _STREAMING_WEB_TOOLS
+            ):
+                try:
+                    await streaming_session.set_progress("正在整理结果…")
+                except Exception:
+                    logger.warning(
+                        "streaming_progress_card_update_failed event_id=%s",
+                        event.event_id,
+                        exc_info=True,
+                    )
 
         async def close_progress_before_final() -> None:
             # If a processing send already owns the lock, wait until the
@@ -2554,6 +2664,7 @@ class BotWorker:
                 metrics=metrics,
                 delivery_started_at=started,
                 run_generation=run_generation,
+                streaming_session=streaming_session,
             )
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
@@ -2615,6 +2726,22 @@ class BotWorker:
             for pending_timer in tool_timers:
                 pending_timer.cancel()
             await asyncio.gather(*timers, return_exceptions=True)
+            if streaming_session is not None and not streaming_session.closed:
+                try:
+                    await streaming_session.fail("本次回复中断，请重新发送。")
+                    finish_streaming = getattr(
+                        self.events, "finish_streaming_reply", None
+                    )
+                    if callable(finish_streaming):
+                        await asyncio.to_thread(
+                            finish_streaming, event.event_id
+                        )
+                except Exception:
+                    logger.warning(
+                        "streaming_card_shutdown_finalize_failed event_id=%s",
+                        event.event_id,
+                        exc_info=True,
+                    )
             participant_events = self._active_agent_events.get(
                 ctx.participant_id
             )
@@ -2855,6 +2982,7 @@ class BotWorker:
         metrics: dict[str, object] | None = None,
         delivery_started_at: float | None = None,
         run_generation: int | None = None,
+        streaming_session: FeishuStreamingCardSession | None = None,
     ) -> bool:
         if (
             participant_id is not None
@@ -2870,6 +2998,29 @@ class BotWorker:
                 self.events.finish, event.event_id, status="completed"
             )
             return True
+        if (
+            self.streaming_card_enabled
+            and plan.presentation_mode == "streaming_markdown"
+        ):
+            streamed = await self._deliver_streaming_plan(
+                event,
+                plan,
+                session=streaming_session,
+                participant_id=participant_id,
+                metrics=metrics,
+                delivery_started_at=delivery_started_at,
+            )
+            if streamed is not None:
+                return streamed
+        if streaming_session is not None and not streaming_session.closed:
+            try:
+                await streaming_session.fail("结果已通过普通消息发送。")
+            except Exception:
+                logger.warning(
+                    "unused_streaming_card_finalize_failed event_id=%s",
+                    event.event_id,
+                    exc_info=True,
+                )
         await asyncio.to_thread(
             self.events.stage_reply_plan,
             event.event_id,
@@ -2889,6 +3040,182 @@ class BotWorker:
             delivery_started_at=delivery_started_at,
             run_generation=run_generation,
         )
+
+    async def _deliver_streaming_plan(
+        self,
+        event: BotEvent,
+        plan: ResponsePlan,
+        *,
+        session: FeishuStreamingCardSession | None,
+        participant_id=None,
+        metrics: dict[str, object] | None = None,
+        delivery_started_at: float | None = None,
+    ) -> bool | None:
+        start_streaming = getattr(self.sender, "start_streaming_card", None)
+        if session is None:
+            if not callable(start_streaming):
+                return None
+            try:
+                session = await start_streaming(
+                    event.chat_id,
+                    "正在整理结果…",
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:stream:{event.event_id}"
+                    ),
+                    update_interval_ms=self.streaming_update_interval_ms,
+                    min_update_chars=self.streaming_min_chars_per_update,
+                    max_update_interval_ms=self.streaming_max_update_interval_ms,
+                )
+                await asyncio.to_thread(
+                    self.events.stage_streaming_progress,
+                    event.event_id,
+                    card_id=session.card_id,
+                    message_id=session.message_id,
+                    element_id=session.element_id,
+                )
+            except Exception:
+                logger.warning(
+                    "streaming_card_start_failed event_id=%s",
+                    event.event_id,
+                    exc_info=True,
+                )
+                return None
+        self._attach_streaming_sequence_allocator(event.event_id, session)
+        await asyncio.to_thread(
+            self.events.stage_streaming_final,
+            event.event_id,
+            full_text=plan.full_text,
+        )
+        delivery_started = time.monotonic()
+        try:
+            await self._stream_validated_text(session, plan.full_text)
+            await asyncio.wait_for(
+                session.finalize(plan.full_text),
+                timeout=self.streaming_finalize_timeout_seconds,
+            )
+        except Exception:
+            logger.warning(
+                "streaming_card_final_delivery_failed event_id=%s visible_chars=%s",
+                event.event_id,
+                session.answer_visible_chars,
+                exc_info=True,
+            )
+            try:
+                await asyncio.wait_for(
+                    session.finalize(plan.full_text),
+                    timeout=self.streaming_finalize_timeout_seconds,
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    self.events.note_streaming_failure,
+                    event.event_id,
+                    "streaming_card_failed",
+                )
+                if session.answer_visible_chars == 0:
+                    try:
+                        await session.fail("卡片更新失败，以下改用普通消息发送。")
+                    except Exception:
+                        pass
+                    return None
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                try:
+                    await self._send(
+                        event.chat_id,
+                        "回复展示中断，请重新发送这条问题。",
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:stream-interrupted:{event.event_id}"
+                        ),
+                    )
+                except FeishuSendError:
+                    return False
+                await asyncio.to_thread(
+                    self.events.finish_streaming_reply, event.event_id
+                )
+                return True
+        await asyncio.to_thread(self.events.finish_streaming_reply, event.event_id)
+        if metrics is not None:
+            metrics["first_final_send_ms"] = round(
+                (delivery_started - (delivery_started_at or delivery_started)) * 1000,
+                1,
+            )
+            metrics["total_delivery_ms"] = round(
+                (time.monotonic() - delivery_started) * 1000,
+                1,
+            )
+        return True
+
+    async def _stream_validated_text(
+        self,
+        session: FeishuStreamingCardSession,
+        text: str,
+    ) -> None:
+        value = str(text)
+        if not value:
+            return
+        max_updates = 60
+        chunk_size = max(
+            self.streaming_min_chars_per_update,
+            (len(value) + max_updates - 1) // max_updates,
+        )
+        for end in range(chunk_size, len(value), chunk_size):
+            await session.update(value[:end])
+
+    def _attach_streaming_sequence_allocator(
+        self,
+        event_id: str,
+        session: FeishuStreamingCardSession,
+    ) -> None:
+        async def allocate() -> int:
+            return await asyncio.to_thread(
+                self.events.reserve_streaming_sequence, event_id
+            )
+
+        session.sequence_allocator = allocate
+
+    async def _resume_streaming_reply(
+        self,
+        event: BotEvent,
+        pending,
+        *,
+        participant_id=None,
+    ) -> bool:
+        session = FeishuStreamingCardSession(
+            client=self.sender,
+            card_id=pending.card_id,
+            message_id=pending.message_id,
+            element_id=pending.element_id,
+            sequence=pending.sequence,
+            visible_content="",
+            update_interval_ms=self.streaming_update_interval_ms,
+            min_update_chars=self.streaming_min_chars_per_update,
+            max_update_interval_ms=self.streaming_max_update_interval_ms,
+        )
+        self._attach_streaming_sequence_allocator(event.event_id, session)
+        if pending.final_text is None:
+            try:
+                await session.fail("本次回复中断，请重新发送。")
+            finally:
+                await asyncio.to_thread(
+                    self.events.finish_streaming_reply, event.event_id
+                )
+            return True
+        plan = ResponsePlan(
+            kind="analysis",
+            full_text=pending.final_text,
+            segments=(ResponseSegment(0, pending.final_text),),
+            use_cards=True,
+            presentation_mode="streaming_markdown",
+        )
+        result = await self._deliver_streaming_plan(
+            event,
+            plan,
+            session=session,
+            participant_id=participant_id,
+        )
+        return bool(result)
 
     async def _resume_delivery_plan(
         self,

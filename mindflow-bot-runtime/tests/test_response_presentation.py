@@ -7,6 +7,7 @@ import pytest
 
 from app.integrations.feishu.client import FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
+from app.integrations.feishu.streaming_card import FeishuStreamingCardSession
 from app.presentation.contracts import (
     AgentActivityEvent,
     ExternalEvidenceSource,
@@ -665,6 +666,48 @@ class ProviderSender:
         return message_id
 
 
+class StreamingProviderSender(ProviderSender):
+    def __init__(self, *, fail_after_updates=None):
+        super().__init__()
+        self.card_operations = []
+        self.fail_after_updates = fail_after_updates
+
+    async def start_streaming_card(
+        self,
+        _chat_id,
+        initial_content,
+        **options,
+    ):
+        self.card_operations.append(("create", initial_content))
+        return FeishuStreamingCardSession(
+            client=self,
+            card_id="card-1",
+            message_id="card-message-1",
+            visible_content=initial_content,
+            update_interval_ms=options["update_interval_ms"],
+            min_update_chars=options["min_update_chars"],
+            max_update_interval_ms=options["max_update_interval_ms"],
+        )
+
+    def update_card_element_content(
+        self, card_id, element_id, content, sequence
+    ):
+        update_count = sum(
+            operation[0] == "update" for operation in self.card_operations
+        )
+        if (
+            self.fail_after_updates is not None
+            and update_count >= self.fail_after_updates
+        ):
+            raise FeishuSendError("stream failed", retryable=False)
+        self.card_operations.append(
+            ("update", card_id, element_id, content, sequence)
+        )
+
+    def finish_streaming_card(self, card_id, sequence):
+        self.card_operations.append(("close", card_id, sequence))
+
+
 def _event_and_repository(event_id="delivery-1"):
     database = memory_database()
     repository = BotEventRepository(database)
@@ -717,6 +760,121 @@ def _three_segment_plan():
         ),
         use_cards=False,
     )
+
+
+def _streaming_plan(text):
+    return ResponsePlan(
+        kind="analysis",
+        full_text=text,
+        segments=(ResponseSegment(0, text),),
+        use_cards=True,
+        presentation_mode="streaming_markdown",
+    )
+
+
+def test_validated_streaming_delivery_is_cumulative_durable_and_closed():
+    repository, event = _event_and_repository("stream-success")
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    worker.streaming_update_interval_ms = 10
+    worker.streaming_min_chars_per_update = 10
+    worker.streaming_max_update_interval_ms = 30
+    final = "**结论**\n\n" + ("完整且已经通过安全检查的回答。" * 12)
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    updates = [item for item in sender.card_operations if item[0] == "update"]
+    contents = [item[3] for item in updates]
+    sequences = [item[-1] for item in sender.card_operations if item[0] != "create"]
+    assert contents
+    assert contents[-1] == final
+    assert all(new.startswith(old) for old, new in zip(contents, contents[1:]))
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+    assert sender.card_operations[-1][0] == "close"
+    assert repository.pending_streaming_reply_plan(event.event_id) is None
+    with repository.database.session() as session:
+        row = session.get(BotEventRow, event.event_id)
+        assert row.streaming_state == "finalized"
+        assert row.streaming_finalized_at is not None
+        assert row.reply_text == final
+
+
+def test_streaming_failure_before_answer_falls_back_to_durable_text_once():
+    repository, event = _event_and_repository("stream-fallback")
+    sender = StreamingProviderSender(fail_after_updates=0)
+    worker = _worker(repository, sender)
+    final = "validated full answer"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert [item[1] for item in sender.visible] == [final]
+    assert sum(item[1] == final for item in sender.visible) == 1
+
+
+def test_progress_card_is_closed_when_final_uses_plain_text_fallback():
+    repository, event = _event_and_repository("stream-plain-final")
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    session = asyncio.run(sender.start_streaming_card(
+        event.chat_id,
+        "正在搜索公开网页…",
+        update_interval_ms=10,
+        min_update_chars=10,
+        max_update_interval_ms=30,
+    ))
+    repository.stage_streaming_progress(
+        event.event_id,
+        card_id=session.card_id,
+        message_id=session.message_id,
+        element_id=session.element_id,
+    )
+    worker._attach_streaming_sequence_allocator(event.event_id, session)
+    plan = ResponsePlan(
+        kind="error",
+        full_text="安全的降级答复",
+        segments=(ResponseSegment(0, "安全的降级答复"),),
+        use_cards=False,
+        presentation_mode="plain_text",
+    )
+
+    delivered = asyncio.run(
+        worker._deliver_plan(event, plan, streaming_session=session)
+    )
+
+    assert delivered is True
+    assert session.closed is True
+    assert sender.card_operations[-1][0] == "close"
+    assert [item[1] for item in sender.visible] == ["安全的降级答复"]
+
+
+def test_streaming_recovery_finishes_durable_final_without_full_text_duplicate():
+    repository, event = _event_and_repository("stream-recovery")
+    repository.stage_streaming_progress(
+        event.event_id,
+        card_id="card-1",
+        message_id="card-message-1",
+        element_id="mindflow_stream_answer",
+    )
+    final = "recovered validated answer"
+    repository.stage_streaming_final(event.event_id, full_text=final)
+    assert repository.reserve_streaming_sequence(event.event_id) == 1
+    pending = repository.pending_streaming_reply_plan(event.event_id)
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    worker.streaming_update_interval_ms = 10
+    worker.streaming_min_chars_per_update = 5
+
+    delivered = asyncio.run(worker._resume_streaming_reply(event, pending))
+
+    assert delivered is True
+    assert sender.visible == []
+    updates = [item for item in sender.card_operations if item[0] == "update"]
+    assert updates[-1][3] == final
+    assert min(item[-1] for item in updates) >= 2
+    assert sender.card_operations[-1][0] == "close"
 
 
 def test_crash_after_send_reuses_provider_uuid_and_does_not_duplicate_visible_segment():

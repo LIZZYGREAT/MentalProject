@@ -209,6 +209,9 @@ def test_production_client_sends_rendered_context_as_text_only():
             result = "ok"
             session_id = "session"
 
+        class StreamEvent:
+            event = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "unsafe draft"}}
+
         class ClaudeSDKClient:
             def __init__(self, options):
                 self.options = options
@@ -222,6 +225,7 @@ def test_production_client_sends_rendered_context_as_text_only():
 
         async def receive_response(self):
             yield SDK.SystemMessage()
+            yield SDK.StreamEvent()
             yield SDK.ResultMessage()
 
     async def scenario():
