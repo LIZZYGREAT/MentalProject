@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 import uuid
 
+import pytest
 from sqlalchemy import func, select
 
 from app.agent.context import AgentContext
@@ -13,7 +14,7 @@ from app.integrations.feishu.calendar import (
     CalendarProviderUnavailable,
 )
 from app.integrations.feishu.client import FeishuSendError
-from app.models import CalendarMutationPlan, RuntimeIncident
+from app.models import CalendarMutationPlan, CalendarMutationPlanItem, RuntimeIncident
 from app.repositories import ObservationRepository
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
 from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
@@ -146,6 +147,157 @@ def test_plan_repository_is_participant_bound_single_claim_and_expires():
     assert repository.claim(
         owner.id, expired["id"], now=now + timedelta(minutes=2)
     )["claim_status"] == "expired"
+
+
+def test_pending_create_plan_time_update_is_atomic_and_participant_bound():
+    database = memory_database()
+    owner = participant(database, "PLAN-EDIT-OWNER")
+    other = participant(database, "PLAN-EDIT-OTHER")
+    repository = CalendarMutationPlanRepository(database)
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[
+            {
+                "summary": "first",
+                "description": "keep me",
+                "start_time": "2030-01-02T08:00:00+08:00",
+                "end_time": "2030-01-02T09:00:00+08:00",
+            },
+            {
+                "summary": "second",
+                "start_time": "2030-01-03T08:00:00+08:00",
+                "end_time": "2030-01-03T09:00:00+08:00",
+            },
+        ],
+        now=now,
+    )
+    item_id = plan["ledger_items"][0]["id"]
+    updated_at = now + timedelta(minutes=1)
+    start = datetime.fromisoformat("2030-01-02T10:15:00+08:00")
+    end = datetime.fromisoformat("2030-01-02T11:45:00+08:00")
+
+    assert repository.update_pending_item_time(
+        other.id,
+        plan["id"],
+        item_id,
+        start_time=start,
+        end_time=end,
+        now=updated_at,
+    ) is None
+    result = repository.update_pending_item_time(
+        owner.id,
+        plan["id"],
+        item_id,
+        start_time=start,
+        end_time=end,
+        now=updated_at,
+    )
+
+    assert result["update_status"] == "updated"
+    assert result["items"][0]["start_time"] == start.isoformat()
+    assert result["items"][0]["end_time"] == end.isoformat()
+    assert result["items"][0]["description"] == "keep me"
+    assert result["items"][1] == plan["items"][1]
+    assert result["ledger_items"][0]["payload"] == result["items"][0]
+    assert result["ledger_items"][0]["source_identity"] == (
+        plan["ledger_items"][0]["source_identity"]
+    )
+
+    # Re-open a session so this assertion covers JSON dirty tracking and commit.
+    with database.session() as session:
+        stored_plan = session.get(CalendarMutationPlan, uuid.UUID(plan["id"]))
+        stored_item = session.get(CalendarMutationPlanItem, uuid.UUID(item_id))
+        assert stored_plan.items_json[0]["start_time"] == start.isoformat()
+        assert stored_item.payload_json == stored_plan.items_json[0]
+        assert stored_plan.updated_at.replace(tzinfo=timezone.utc) == updated_at
+        assert stored_item.updated_at.replace(tzinfo=timezone.utc) == updated_at
+
+
+def test_pending_plan_time_update_rejects_delete_expired_and_queued_plans():
+    database = memory_database()
+    owner = participant(database, "PLAN-EDIT-STATES")
+    repository = CalendarMutationPlanRepository(database)
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    times = {
+        "start_time": datetime.fromisoformat("2030-01-02T10:00:00+08:00"),
+        "end_time": datetime.fromisoformat("2030-01-02T11:00:00+08:00"),
+    }
+    delete_plan = repository.create(
+        owner.id,
+        operation="delete",
+        items=[{"event_id": "a"}, {"event_id": "b"}],
+        now=now,
+    )
+    assert repository.update_pending_item_time(
+        owner.id,
+        delete_plan["id"],
+        delete_plan["ledger_items"][0]["id"],
+        now=now,
+        **times,
+    )["update_status"] == "not_editable"
+
+    expired = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": "a"}, {"summary": "b"}],
+        ttl_minutes=1,
+        now=now,
+    )
+    expired_result = repository.update_pending_item_time(
+        owner.id,
+        expired["id"],
+        expired["ledger_items"][0]["id"],
+        now=now + timedelta(minutes=2),
+        **times,
+    )
+    assert expired_result["update_status"] == "expired"
+    assert repository.get(expired["id"])["status"] == "expired"
+
+    queued = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": "a"}, {"summary": "b"}],
+        now=now,
+    )
+    repository.request_execution(owner.id, queued["id"], now=now)
+    assert repository.update_pending_item_time(
+        owner.id,
+        queued["id"],
+        queued["ledger_items"][0]["id"],
+        now=now,
+        **times,
+    )["update_status"] == "not_editable"
+
+
+def test_pending_plan_time_update_requires_aware_increasing_times():
+    database = memory_database()
+    owner = participant(database, "PLAN-EDIT-VALIDATION")
+    repository = CalendarMutationPlanRepository(database)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": "a"}, {"summary": "b"}],
+    )
+    item_id = plan["ledger_items"][0]["id"]
+
+    with pytest.raises(ValueError, match="timezone"):
+        repository.update_pending_item_time(
+            owner.id,
+            plan["id"],
+            item_id,
+            start_time=datetime(2030, 1, 2, 10),
+            end_time=datetime(2030, 1, 2, 11),
+        )
+    with pytest.raises(ValueError, match="after start"):
+        repository.update_pending_item_time(
+            owner.id,
+            plan["id"],
+            item_id,
+            start_time=datetime.fromisoformat("2030-01-02T11:00:00+08:00"),
+            end_time=datetime.fromisoformat("2030-01-02T10:00:00+08:00"),
+        )
 
 
 def test_multi_date_create_uses_one_plan_card_and_executes_once():

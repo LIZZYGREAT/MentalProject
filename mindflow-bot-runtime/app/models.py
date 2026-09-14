@@ -954,7 +954,7 @@ class CalendarMutationReconciliation(Base):
 
 
 class CalendarMutationPlan(Base):
-    """Participant-bound, immutable batch Calendar proposal awaiting a card action."""
+    """Participant-bound batch Calendar proposal, editable only before queuing."""
 
     __tablename__ = "calendar_mutation_plans"
     __table_args__ = (
@@ -1020,7 +1020,7 @@ class CalendarMutationPlan(Base):
 
 
 class CalendarMutationPlanItem(Base):
-    """One durable, idempotently recoverable provider effect in a batch plan."""
+    """One durable effect; its payload is editable only while its plan is pending."""
 
     __tablename__ = "calendar_mutation_plan_items"
     __table_args__ = (

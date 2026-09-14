@@ -268,6 +268,116 @@ class CalendarMutationPlanRepository:
             session.flush()
             return self._view(row, self._items(session, row.id))
 
+    def get_for_participant(
+        self,
+        participant_id: uuid.UUID,
+        plan_id: uuid.UUID | str,
+    ) -> dict[str, Any] | None:
+        """Read a plan without exposing whether another participant owns it."""
+
+        try:
+            parsed_plan_id = uuid.UUID(str(plan_id))
+        except (TypeError, ValueError):
+            return None
+        with self.database.session() as session:
+            row = session.get(CalendarMutationPlan, parsed_plan_id)
+            if row is None or str(row.participant_id) != str(participant_id):
+                return None
+            return self._view(row, self._items(session, row.id))
+
+    def update_pending_item_time(
+        self,
+        participant_id: uuid.UUID,
+        plan_id: uuid.UUID | str,
+        item_id: uuid.UUID | str,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically update both pending-plan payload copies for one item."""
+
+        if (
+            not isinstance(start_time, datetime)
+            or start_time.tzinfo is None
+            or start_time.utcoffset() is None
+            or not isinstance(end_time, datetime)
+            or end_time.tzinfo is None
+            or end_time.utcoffset() is None
+        ):
+            raise ValueError("calendar plan item times must include a timezone")
+        normalized_start = start_time.astimezone(timezone.utc)
+        normalized_end = end_time.astimezone(timezone.utc)
+        if normalized_end <= normalized_start:
+            raise ValueError("calendar plan item end time must be after start time")
+        try:
+            parsed_plan_id = uuid.UUID(str(plan_id))
+            parsed_item_id = uuid.UUID(str(item_id))
+        except (TypeError, ValueError):
+            return None
+        updated_at = _aware(now or datetime.now(timezone.utc))
+
+        with self.database.session() as session:
+            row = session.get(
+                CalendarMutationPlan, parsed_plan_id, with_for_update=True
+            )
+            if row is None or str(row.participant_id) != str(participant_id):
+                return None
+            if (
+                row.status == "awaiting_confirmation"
+                and _aware(row.expires_at) <= updated_at
+            ):
+                row.status = "expired"
+                row.updated_at = updated_at
+                row.completed_at = updated_at
+                session.flush()
+                value = self._view(row, self._items(session, row.id))
+                value["update_status"] = "expired"
+                return value
+            if row.operation != "create" or row.status != "awaiting_confirmation":
+                value = self._view(row, self._items(session, row.id))
+                value["update_status"] = "not_editable"
+                return value
+
+            item = session.scalar(
+                select(CalendarMutationPlanItem)
+                .where(
+                    CalendarMutationPlanItem.id == parsed_item_id,
+                    CalendarMutationPlanItem.plan_id == row.id,
+                )
+                .with_for_update()
+            )
+            if item is None:
+                return None
+            if item.status != "pending":
+                value = self._view(row, self._items(session, row.id))
+                value["update_status"] = "not_editable"
+                return value
+
+            items = [dict(value) for value in list(row.items_json or [])]
+            item_index = int(item.item_index)
+            if item_index < 0 or item_index >= len(items):
+                raise RuntimeError("calendar plan aggregate and ledger are inconsistent")
+            start_iso = start_time.isoformat()
+            end_iso = end_time.isoformat()
+            items[item_index] = {
+                **items[item_index],
+                "start_time": start_iso,
+                "end_time": end_iso,
+            }
+            row.items_json = items
+            row.updated_at = updated_at
+            item.payload_json = {
+                **dict(item.payload_json or {}),
+                "start_time": start_iso,
+                "end_time": end_iso,
+            }
+            item.updated_at = updated_at
+            session.flush()
+            value = self._view(row, self._items(session, row.id))
+            value["update_status"] = "updated"
+            return value
+
     def recover_stale(self, *, now: datetime | None = None) -> int:
         recovered_at = _aware(now or datetime.now(timezone.utc))
         count = 0
