@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -159,7 +159,8 @@ class CardActionEvent:
     action_value: dict[str, Any]
     form_value: dict[str, Any]
     callback_token: str | None = None
-    received_monotonic: float | None = None
+    # Transport timing is diagnostic metadata, not part of the event identity.
+    received_monotonic: float | None = field(default=None, compare=False)
 
     def to_ipc_payload(self) -> dict[str, Any]:
         """Return the SDK-free CardAction contract shared with the receiver."""

@@ -475,6 +475,38 @@ def test_card_action_rejects_oversized_callback_token():
         CardActionEvent.from_ipc_payload(payload)
 
 
+def test_card_action_identity_ignores_receive_timing_but_ipc_preserves_it():
+    first = CardActionEvent(
+        event_id="event-1",
+        message_id="message-1",
+        app_id="app-1",
+        open_id="user-1",
+        chat_id="chat-1",
+        action_tag="button",
+        action_value={"mindflow_action": "care_helpful", "version": "1"},
+        form_value={"note": "private"},
+        callback_token="callback-token",
+        received_monotonic=10.25,
+    )
+    second = CardActionEvent(
+        event_id=first.event_id,
+        message_id=first.message_id,
+        app_id=first.app_id,
+        open_id=first.open_id,
+        chat_id=first.chat_id,
+        action_tag=first.action_tag,
+        action_value=first.action_value,
+        form_value=first.form_value,
+        callback_token=first.callback_token,
+        received_monotonic=11.75,
+    )
+
+    assert first == second
+    restored = CardActionEvent.from_ipc_payload(first.to_ipc_payload())
+    assert restored == first
+    assert restored.received_monotonic == 10.25
+
+
 def test_receiver_registers_card_action():
     output = sync_queue.Queue()
     stop_event = threading.Event()
