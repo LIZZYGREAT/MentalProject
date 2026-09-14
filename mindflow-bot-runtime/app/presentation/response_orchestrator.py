@@ -45,7 +45,7 @@ class ResponseOrchestrator:
         presentation_agent_min_chars: int = 600,
         presentation_agent_timeout_seconds: float = 4.0,
         presentation_agent_max_segments: int = 3,
-        presentation_agent_mode: str = "adaptive",
+        presentation_agent_mode: str = "off",
         presentation_agent_max_pending_cleanups: int = 1,
         rich_presentation_enabled: bool = True,
     ):

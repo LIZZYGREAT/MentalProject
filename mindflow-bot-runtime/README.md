@@ -305,12 +305,13 @@ contracts，不能声称已完成随机 MRT 或证明了因果干预效果。
 
 ## Response Presentation 性能策略
 
-生产默认使用 `PRESENTATION_AGENT_MODE=adaptive`：本地 sanitizer 与确定性分段
-已经可以无损生成 1–3 段时，不再串行等待第二个模型。只有本地结果超出投递容量
-才尝试 PresentationAgent；超时采用硬截止，SDK 断连清理不会继续阻塞最终回复。
+生产默认使用 `PRESENTATION_AGENT_MODE=off`：联网、URL 读取和长分析回答由确定性
+PresentationCompiler 编译，并在最终安全检查后通过 CardKit 累积展示；普通短对话直接发送，
+不再串行等待第二个模型。旧 PresentationAgent 实现暂时保留，可显式设置 `adaptive` 或
+`always` 用于受控对比；超时采用硬截止，SDK 断连清理不会继续阻塞最终回复。
 
 诊断时查看 BotEvent telemetry 的 `presentation_agent_outcome`，可区分
-`skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
+`disabled`、`skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
 `cleanup_backpressure` 和 `used`。当前运行边界、模型版本和各持久化链路统一见
 [`CURRENT_ARCHITECTURE.md`](../docs/CURRENT_ARCHITECTURE.md)。
 

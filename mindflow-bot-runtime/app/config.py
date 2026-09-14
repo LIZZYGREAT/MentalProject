@@ -49,7 +49,7 @@ def _presentation_agent_mode(env: Mapping[str, str]) -> str:
     if explicit:
         return explicit
     if "PRESENTATION_AGENT_ENABLED" not in env:
-        return "adaptive"
+        return "off"
 
     global _legacy_presentation_warning_emitted
     if not _legacy_presentation_warning_emitted:
@@ -105,7 +105,7 @@ class Settings:
     response_segment_target_chars: int = 260
     response_segment_max_chars: int = 650
     response_max_segments: int = 3
-    presentation_agent_mode: str = "adaptive"
+    presentation_agent_mode: str = "off"
     presentation_agent_min_chars: int = 600
     presentation_agent_timeout_seconds: float = 4.0
     presentation_agent_disconnect_timeout_seconds: float = 0.5

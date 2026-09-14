@@ -216,12 +216,12 @@ authorization、有效 claim lease、current Forecast 且 `sent_at >= authorized
 
 ## Response、Admin 与历史兼容
 
-最终回复先经安全检查、清理与确定性分段，再按展示模式决定是否调用展示模型。回复计划、
-稳定消息 UUID 与发送进度均持久化，可在重启后恢复。`reply_text` 保存当前回复计划的
-authoritative full text，`reply_segments_json` 保存当前分段；只有历史行缺少 segments 时，
-`reply_text` 才额外承担 legacy single-segment recovery。
-展示模型只能选择 SemanticSegmenter 批准的边界，权威 slice 不执行 `strip`，各段拼接后与
-清理后的权威正文逐字一致，且不会切断 URL、链接或未闭合结构。
+最终回复先经安全检查，再进入确定性 PresentationCompiler。联网、URL 读取和长分析回答
+使用 Feishu-safe Markdown，并在检查完成后通过同一张 CardKit 卡片累积更新；原始模型 delta
+只用于首 token telemetry，不会在安全检查前对用户可见。卡片 ID、严格递增 sequence、最终
+正文 hash 与 finalize 状态均持久化，可在重启后恢复。普通消息继续使用稳定消息 UUID 与分段
+发送进度恢复；`reply_text` 保存 authoritative full text，只有历史行缺少 segments 时才额外
+承担 legacy single-segment recovery。旧 PresentationAgent 默认关闭，只保留显式诊断开关。
 
 Admin 是独立 HTTP 服务，提供参与者、Forecast、Warning、Calendar、Daily Review、Care
 Timeline 和运行事件查询。研究评估页按日期窗口展示 cohort 数据完整性、Forecast 误差、
@@ -232,7 +232,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0066_admin_research_detail_scope`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0071_streaming_reply_plan`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot

@@ -415,7 +415,7 @@ def test_presentation_agent_performance_policy_defaults_and_validation():
     settings = Settings.from_env(
         environment, base_dir=Path(__file__).resolve().parents[1]
     )
-    assert settings.presentation_agent_mode == "adaptive"
+    assert settings.presentation_agent_mode == "off"
     assert settings.presentation_agent_timeout_seconds == 4.0
     assert settings.presentation_agent_disconnect_timeout_seconds == 0.5
     assert settings.presentation_agent_max_pending_cleanups == 1
