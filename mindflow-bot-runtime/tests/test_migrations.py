@@ -1126,3 +1126,52 @@ def test_0068_adds_durable_card_action_receipts(monkeypatch):
             ["participant_id", "created_at"],
         )
     ]
+
+
+def test_0069_minimizes_receipts_and_backfills_expiry(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0069_card_action_receipt_minimization.py"
+    )
+    added = []
+    altered = []
+    dropped = []
+    statements = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: added.append((table, column.name, column.nullable)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda table, name, **kwargs: altered.append((table, name, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_column",
+        lambda table, name: dropped.append((table, name)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, columns, **kwargs: indexes.append(
+            (name, table, columns, kwargs)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0068_card_action_receipts"
+    assert added == [("card_action_receipts", "expires_at", True)]
+    assert "created_at + INTERVAL '168 hours'" in statements[0]
+    assert altered[0][0:2] == ("card_action_receipts", "expires_at")
+    assert altered[0][2]["nullable"] is False
+    assert dropped == [("card_action_receipts", "result_json")]
+    assert indexes == [(
+        "ix_card_action_receipt_expiry",
+        "card_action_receipts",
+        ["expires_at"],
+        {"unique": False},
+    )]

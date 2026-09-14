@@ -47,9 +47,16 @@ def test_env_example_contains_critical_runtime_capabilities():
         "DAILY_REVIEW_ENABLED",
         "FEISHU_CARD_ACTION_TRANSPORT",
         "FEISHU_CARD_CALLBACK_ENABLED",
+        "CARD_ACTION_RECEIPT_TTL_HOURS",
         "CLAUDE_PARTIAL_MESSAGES_ENABLED",
     }
     assert required <= _example_keys()
+
+
+def test_card_action_receipt_ttl_example_is_bounded():
+    value = int(_example_values()["CARD_ACTION_RECEIPT_TTL_HOURS"])
+
+    assert 24 <= value <= 720
 
 
 def test_enabled_mutation_intent_has_nonempty_model_in_env_example():

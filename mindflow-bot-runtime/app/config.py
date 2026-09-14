@@ -87,6 +87,7 @@ class Settings:
     feishu_card_callback_path: str = "/feishu/card/callback"
     feishu_card_verification_token: str = ""
     feishu_card_encrypt_key: str = ""
+    card_action_receipt_ttl_hours: int = 168
     timezone_name: str = "Asia/Shanghai"
     queue_max_size: int = 100
     participant_input_queue_size: int = 20
@@ -295,6 +296,9 @@ class Settings:
             feishu_card_encrypt_key=values.get(
                 "FEISHU_CARD_ENCRYPT_KEY", ""
             ).strip(),
+            card_action_receipt_ttl_hours=_int(
+                values, "CARD_ACTION_RECEIPT_TTL_HOURS", 168, minimum=24
+            ),
             timezone_name=values.get("APP_TIMEZONE", "Asia/Shanghai").strip(),
             queue_max_size=_int(values, "BOT_QUEUE_MAX_SIZE", 100),
             participant_input_queue_size=_int(
@@ -575,6 +579,8 @@ class Settings:
             )
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
+        if self.card_action_receipt_ttl_hours > 720:
+            raise ValueError("CARD_ACTION_RECEIPT_TTL_HOURS must be <= 720")
         if (
             self.feishu_card_action_transport == "ws"
             and self.feishu_card_callback_enabled

@@ -862,7 +862,9 @@ async def run() -> None:
     )
     from app.repositories_card_action import CardActionReceiptRepository
 
-    card_action_receipts = CardActionReceiptRepository(database)
+    card_action_receipts = CardActionReceiptRepository(
+        database, ttl_hours=settings.card_action_receipt_ttl_hours
+    )
     execute_card_action = _build_card_action_executor(
         identity, business.card_actions, incidents, card_action_receipts
     )

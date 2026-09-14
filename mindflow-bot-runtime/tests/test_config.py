@@ -38,6 +38,23 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_card_action_receipt_ttl_defaults_and_bounds():
+    base = valid_environment()
+    settings = Settings.from_env(
+        base, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.card_action_receipt_ttl_hours == 168
+
+    base["CARD_ACTION_RECEIPT_TTL_HOURS"] = "24"
+    assert Settings.from_env(
+        base, base_dir=Path(__file__).resolve().parents[1]
+    ).card_action_receipt_ttl_hours == 24
+    for invalid in ("23", "721"):
+        base["CARD_ACTION_RECEIPT_TTL_HOURS"] = invalid
+        with pytest.raises(ValueError, match="CARD_ACTION_RECEIPT_TTL_HOURS"):
+            Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])
+
+
 def test_web_search_uses_deepseek_credential_and_native_defaults():
     environment = valid_environment()
     environment["WEB_SEARCH_ENABLED"] = "true"

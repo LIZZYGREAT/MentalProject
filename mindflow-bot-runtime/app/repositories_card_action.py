@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import uuid
 
 from sqlalchemy.exc import IntegrityError
@@ -21,8 +21,11 @@ class CardActionClaim:
 
 
 class CardActionReceiptRepository:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, ttl_hours: int = 168):
+        if not 24 <= int(ttl_hours) <= 720:
+            raise ValueError("CardAction receipt TTL must be between 24 and 720 hours")
         self.database = database
+        self.ttl_hours = int(ttl_hours)
 
     def claim(
         self,
@@ -33,7 +36,12 @@ class CardActionReceiptRepository:
         action_version: str,
         action_fingerprint: str,
         message_id_hash: str,
+        now: datetime | None = None,
     ) -> CardActionClaim:
+        created_at = now or datetime.now(timezone.utc)
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("CardAction receipt timestamp must include a timezone")
+        created_at = created_at.astimezone(timezone.utc)
         try:
             with self.database.session() as session:
                 session.add(
@@ -45,6 +53,8 @@ class CardActionReceiptRepository:
                         action_fingerprint=action_fingerprint,
                         message_id_hash=message_id_hash,
                         status="processing",
+                        created_at=created_at,
+                        expires_at=created_at + timedelta(hours=self.ttl_hours),
                     )
                 )
                 session.flush()

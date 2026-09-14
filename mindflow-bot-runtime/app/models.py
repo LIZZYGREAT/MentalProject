@@ -1916,6 +1916,7 @@ class CardActionReceipt(Base):
             "participant_id",
             "created_at",
         ),
+        Index("ix_card_action_receipt_expiry", "expires_at"),
     )
 
     event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
@@ -1932,13 +1933,15 @@ class CardActionReceipt(Base):
         String(16), nullable=False, default="processing"
     )
     result_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
     )
 
 

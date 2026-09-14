@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -74,12 +75,37 @@ def test_duplicate_success_uses_generic_replay_without_persisting_business_resul
                 receipt.action_name,
                 receipt.action_fingerprint,
                 receipt.message_id_hash,
-                receipt.result_json,
+                receipt.result_kind,
             )
         )
         assert "must-not-be-persisted" not in persisted
         assert "PRIVATE" not in persisted
-        assert receipt.result_json is None
+        assert not hasattr(receipt, "result_json")
+
+
+def test_write_receipt_has_bounded_expiry_and_no_business_payload_column():
+    database = memory_database()
+    bound = participant(database, "CARD-TTL")
+    repository = CardActionReceiptRepository(database, ttl_hours=48)
+    created_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    repository.claim(
+        event_id="ttl-event",
+        participant_id=bound.id,
+        action_name="submit_checkin",
+        action_version="1",
+        action_fingerprint="fingerprint",
+        message_id_hash="message-hash",
+        now=created_at,
+    )
+
+    with database.session() as session:
+        receipt = session.get(CardActionReceipt, "ttl-event")
+        assert receipt.created_at.replace(tzinfo=timezone.utc) == created_at
+        assert receipt.expires_at.replace(tzinfo=timezone.utc) == (
+            created_at + timedelta(hours=48)
+        )
+        assert "result_json" not in CardActionReceipt.__table__.columns
 
 
 @pytest.mark.parametrize(
