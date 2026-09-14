@@ -388,9 +388,30 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
     visible = json.dumps(preview, ensure_ascii=False)
     assert "1. **计算机体系结构(0965)**" in visible
     assert "2. **计算机体系结构(0965)**" in visible
-    assert "修改第 1 门课时间" in visible
-    assert "修改第 2 门课时间" in visible
+    assert "修改第 1 门课时间" not in visible
+    assert "修改第 2 门课时间" not in visible
     assert "修改 计算机体系结构" not in visible
+    elements = preview["body"]["elements"]
+    first_course = next(
+        index
+        for index, element in enumerate(elements)
+        if element.get("tag") == "markdown"
+        and "1. **计算机体系结构(0965)**" in element.get("content", "")
+    )
+    second_course = next(
+        index
+        for index, element in enumerate(elements)
+        if element.get("tag") == "markdown"
+        and "2. **计算机体系结构(0965)**" in element.get("content", "")
+    )
+    assert elements[first_course + 1]["text"]["content"] == "修改时间"
+    assert elements[second_course + 1]["text"]["content"] == "修改时间"
+    assert elements[first_course + 1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][0]["id"]
+    )
+    assert elements[second_course + 1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][1]["id"]
+    )
     form = course_schedule_item_time_card(draft, target_item_id)
     form_json = json.dumps(form, ensure_ascii=False)
     assert "mindflow_course_schedule_item_time" in form_json
@@ -467,8 +488,8 @@ def test_course_edit_button_keeps_visual_index_when_middle_item_is_not_editable(
     ]
 
     assert [button["text"]["content"] for button in buttons] == [
-        "修改第 1 门课时间",
-        "修改第 3 门课时间",
+        "修改时间",
+        "修改时间",
     ]
     assert buttons[0]["behaviors"][0]["value"]["item_id"] == (
         draft["items"][0]["id"]
@@ -477,6 +498,19 @@ def test_course_edit_button_keeps_visual_index_when_middle_item_is_not_editable(
         draft["items"][2]["id"]
     )
     assert all(len(button["text"]["content"]) < 20 for button in buttons)
+    elements = card["body"]["elements"]
+    course_positions = [
+        next(
+            index
+            for index, element in enumerate(elements)
+            if element.get("tag") == "markdown"
+            and f"{display_index}. **" in element.get("content", "")
+        )
+        for display_index in (1, 2, 3)
+    ]
+    assert elements[course_positions[0] + 1] is buttons[0]
+    assert elements[course_positions[1] + 1].get("tag") == "markdown"
+    assert elements[course_positions[2] + 1] is buttons[1]
 
 
 def test_legacy_time_card_submission_accepts_unpadded_and_full_width_colon():
