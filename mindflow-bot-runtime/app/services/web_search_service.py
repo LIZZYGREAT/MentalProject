@@ -85,6 +85,8 @@ class SearchProviderResult:
     provider: str
     request_id: str | None = None
     usage: dict[str, int] | None = None
+    stop_reason: str | None = None
+    summary_truncated: bool = False
 
 
 class SearchProvider(Protocol):
@@ -122,8 +124,14 @@ Search only for the public topic explicitly provided.
 
 Do not infer or request participant identity or private context.
 Do not perform any non-search tool action.
-Return a concise factual synthesis based only on web search results.
+Return a complete but high-density factual synthesis based only on web search results.
+Target 5 to 8 key facts, use complete sentences, and do not write a long article.
 Do not invent sources.
+"""
+
+RETRY_COMPLETENESS_INSTRUCTION = """
+The previous synthesis hit the output limit. Repeat the same public search and
+produce a concise, complete synthesis that ends cleanly within the token budget.
 """
 
 WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
@@ -176,6 +184,8 @@ class DeepSeekNativeSearchProvider:
         timeout_seconds: float,
         max_uses: int,
         max_output_tokens: int,
+        retry_max_output_tokens: int | None = None,
+        summary_max_chars: int = 12000,
     ) -> None:
         base = str(base_url).strip().rstrip("/")
         self.api_url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
@@ -184,6 +194,11 @@ class DeepSeekNativeSearchProvider:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_uses = max(1, min(int(max_uses), 5))
         self.max_output_tokens = max(256, int(max_output_tokens))
+        self.retry_max_output_tokens = max(
+            self.max_output_tokens,
+            int(retry_max_output_tokens or self.max_output_tokens),
+        )
+        self.summary_max_chars = max(1000, int(summary_max_chars))
 
     async def search(
         self, query: str, freshness: str, max_results: int
@@ -195,10 +210,6 @@ class DeepSeekNativeSearchProvider:
             f"Public search topic:\n{safe_query}\n\n"
             f"Freshness preference:\n{FRESHNESS_INSTRUCTIONS[freshness]}"
         )
-        messages: list[dict[str, Any]] = [{
-            "role": "user",
-            "content": user_content,
-        }]
         logger.info(
             "web_search_provider_started provider=%s freshness=%s max_results=%s query_hash=%s",
             self.provider_name,
@@ -207,10 +218,66 @@ class DeepSeekNativeSearchProvider:
             hashlib.sha256(safe_query.casefold().encode("utf-8")).hexdigest(),
         )
         started = asyncio.get_running_loop().time()
+        try:
+            result, request_count = await self._search_once(
+                user_content,
+                max_results=max_results,
+                max_output_tokens=self.max_output_tokens,
+                system_prompt=SEARCH_ONLY_SYSTEM,
+            )
+        except SearchUnavailable as exc:
+            if str(exc) != "provider_truncated":
+                raise
+            logger.warning(
+                "web_search_provider_retrying provider=%s reason_code=provider_truncated "
+                "retry_max_output_tokens=%s query_hash=%s",
+                self.provider_name,
+                self.retry_max_output_tokens,
+                hashlib.sha256(safe_query.casefold().encode("utf-8")).hexdigest(),
+            )
+            result, request_count = await self._search_once(
+                user_content,
+                max_results=max_results,
+                max_output_tokens=self.retry_max_output_tokens,
+                system_prompt=f"{SEARCH_ONLY_SYSTEM}\n{RETRY_COMPLETENESS_INSTRUCTION}",
+            )
+        latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+        logger.info(
+            "web_search_provider_completed provider=%s source_count=%s "
+            "search_request_count=%s input_tokens=%s output_tokens=%s "
+            "latency_ms=%s provider_request_id=%s stop_reason=%s summary_truncated=%s",
+            self.provider_name,
+            len(result.sources),
+            request_count,
+            (result.usage or {}).get("input_tokens"),
+            (result.usage or {}).get("output_tokens"),
+            latency_ms,
+            result.request_id,
+            result.stop_reason,
+            result.summary_truncated,
+        )
+        return result
+
+    async def _search_once(
+        self,
+        user_content: str,
+        *,
+        max_results: int,
+        max_output_tokens: int,
+        system_prompt: str,
+    ) -> tuple[SearchProviderResult, int]:
+        messages: list[dict[str, Any]] = [{
+            "role": "user",
+            "content": user_content,
+        }]
         payloads: list[dict[str, Any]] = []
         continuation_count = 0
         while True:
-            payload = await self._request(messages)
+            payload = await self._request(
+                messages,
+                max_output_tokens=max_output_tokens,
+                system_prompt=system_prompt,
+            )
             payloads.append(payload)
             if payload.get("stop_reason") != "pause_turn":
                 break
@@ -225,25 +292,21 @@ class DeepSeekNativeSearchProvider:
             ]
             continuation_count += 1
 
-        result = self._parse_responses(payloads, max_results=max_results)
-        latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        logger.info(
-            "web_search_provider_completed provider=%s source_count=%s search_request_count=%s input_tokens=%s output_tokens=%s latency_ms=%s provider_request_id=%s",
-            self.provider_name,
-            len(result.sources),
-            len(payloads),
-            (result.usage or {}).get("input_tokens"),
-            (result.usage or {}).get("output_tokens"),
-            latency_ms,
-            result.request_id,
-        )
-        return result
+        if str(payloads[-1].get("stop_reason") or "") == "max_tokens":
+            raise SearchUnavailable("provider_truncated")
+        return self._parse_responses(payloads, max_results=max_results), len(payloads)
 
-    async def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _request(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_output_tokens: int,
+        system_prompt: str,
+    ) -> dict[str, Any]:
         body = {
             "model": self.model,
-            "max_tokens": self.max_output_tokens,
-            "system": SEARCH_ONLY_SYSTEM,
+            "max_tokens": max_output_tokens,
+            "system": system_prompt,
             "messages": messages,
             "tools": [{
                 "type": WEB_SEARCH_TOOL_TYPE,
@@ -295,10 +358,10 @@ class DeepSeekNativeSearchProvider:
         seen: set[str] = set()
         usage_totals: dict[str, int] = {}
         request_id: str | None = None
-        final_summary_parts: list[str] = []
+        summary_parts: list[str] = []
         limit = max(1, min(int(max_results), 10))
-        for index, payload in enumerate(payloads):
-            parsed_sources, summary_parts, usage, parsed_request_id = (
+        for payload in payloads:
+            parsed_sources, parsed_summary_parts, usage, parsed_request_id = (
                 self._parse_content(payload)
             )
             for source in parsed_sources:
@@ -306,8 +369,7 @@ class DeepSeekNativeSearchProvider:
                     continue
                 seen.add(source.url)
                 sources.append(source)
-            if index == len(payloads) - 1:
-                final_summary_parts = summary_parts
+            summary_parts.extend(parsed_summary_parts)
             if usage:
                 for key, value in usage.items():
                     usage_totals[key] = usage_totals.get(key, 0) + value
@@ -315,18 +377,41 @@ class DeepSeekNativeSearchProvider:
                 request_id = parsed_request_id
         if not sources:
             raise SearchUnavailable("provider_no_sources")
-        summary = "\n".join(
-            part.strip() for part in final_summary_parts if part.strip()
-        )[:8000]
+        summary = "\n".join(part.strip() for part in summary_parts if part.strip())
         if not summary:
             raise SearchUnavailable("provider_invalid_response")
+        summary, summary_truncated = self._limit_summary(summary)
+        stop_reason = str(payloads[-1].get("stop_reason") or "") or None
         return SearchProviderResult(
             summary=summary,
             sources=tuple(sources),
             provider=self.provider_name,
             request_id=request_id,
             usage=usage_totals or None,
+            stop_reason=stop_reason,
+            summary_truncated=summary_truncated,
         )
+
+    def _limit_summary(self, summary: str) -> tuple[str, bool]:
+        value = str(summary).strip()
+        if len(value) <= self.summary_max_chars:
+            return value, False
+        window = value[: self.summary_max_chars + 1]
+        boundaries = [
+            match.end()
+            for match in re.finditer(
+                r"(?:\n\s*\n|[。！？.!?；;](?=\s|$))",
+                window,
+            )
+        ]
+        useful = [
+            position
+            for position in boundaries
+            if position >= self.summary_max_chars // 2
+        ]
+        if not useful:
+            raise SearchUnavailable("provider_summary_too_long")
+        return value[: useful[-1]].rstrip(), True
 
     def _parse_content(
         self, payload: dict[str, Any]
@@ -479,6 +564,7 @@ class WebSearchService:
         return {
             "ok": True,
             "verified": True,
+            "summary_truncated": provider_result.summary_truncated,
             "search_run_id": results[0]["run_id"] if results else None,
             "normalized_query": normalized,
             "summary_evidence": {

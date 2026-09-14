@@ -86,14 +86,18 @@ def _payload():
     }
 
 
-def _provider():
+def _provider(**overrides):
+    options = {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key": "deepseek-secret",
+        "model": "deepseek-v4-flash",
+        "timeout_seconds": 20,
+        "max_uses": 3,
+        "max_output_tokens": 1200,
+    }
+    options.update(overrides)
     return DeepSeekNativeSearchProvider(
-        base_url="https://api.deepseek.com/anthropic",
-        api_key="deepseek-secret",
-        model="deepseek-v4-flash",
-        timeout_seconds=20,
-        max_uses=3,
-        max_output_tokens=1200,
+        **options,
     )
 
 
@@ -259,6 +263,88 @@ def test_pause_turn_continues_with_same_tools_and_raw_assistant_content(monkeypa
     assert calls[1][2]["messages"][1]["role"] == "assistant"
     assert calls[1][2]["messages"][1]["content"] is pause._payload["content"]
     assert calls[1][2]["tools"] == calls[0][2]["tools"]
+
+
+def test_search_accumulates_text_across_continuations(monkeypatch):
+    pause = _pause_payload(
+        _source_block("https://example.com/first"),
+        {"type": "text", "text": "First complete sentence."},
+    )
+    complete = _complete_payload(
+        _source_block("https://example.com/final"),
+        {"type": "text", "text": "Second complete sentence."},
+    )
+    client = _SequenceClient([pause, complete], [])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+
+    result = asyncio.run(_provider().search("public topic", "any", 5))
+
+    assert result.summary == "First complete sentence.\nSecond complete sentence."
+    assert result.stop_reason == "end_turn"
+
+
+def test_search_retries_once_after_truncation(monkeypatch):
+    truncated = _Response({
+        "id": "truncated",
+        "stop_reason": "max_tokens",
+        "content": [_source_block(), {"type": "text", "text": "cut off"}],
+    })
+    complete = _complete_payload(
+        _source_block(),
+        {"type": "text", "text": "Concise complete retry."},
+    )
+    calls = []
+    client = _SequenceClient([truncated, complete], calls)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **_kwargs: client,
+    )
+
+    result = asyncio.run(_provider(
+        retry_max_output_tokens=2400,
+    ).search("public topic", "any", 5))
+
+    assert result.summary == "Concise complete retry."
+    assert [call[2]["max_tokens"] for call in calls] == [1200, 2400]
+    assert "previous synthesis hit the output limit" in calls[1][2]["system"]
+
+
+def test_search_rejects_final_max_tokens_as_verified(monkeypatch):
+    truncated = _Response({
+        "stop_reason": "max_tokens",
+        "content": [_source_block(), {"type": "text", "text": "cut off"}],
+    })
+    calls = []
+    client = _SequenceClient([truncated, truncated], calls)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **_kwargs: client,
+    )
+
+    with pytest.raises(SearchUnavailable, match="provider_truncated"):
+        asyncio.run(_provider(
+            retry_max_output_tokens=2400,
+        ).search("public topic", "any", 5))
+    assert len(calls) == 2
+
+
+def test_search_never_cuts_summary_mid_sentence_silently():
+    first = f"{'a' * 800}."
+    second = f" {'b' * 500}."
+    payload = {
+        "stop_reason": "end_turn",
+        "content": [_source_block(), {"type": "text", "text": first + second}],
+    }
+
+    result = _provider(summary_max_chars=1000)._parse_responses(
+        [payload], max_results=5
+    )
+
+    assert result.summary == first
+    assert result.summary.endswith(".")
+    assert result.summary_truncated is True
 
 
 def test_multiple_pause_turns_accumulate_sources_until_final_summary(monkeypatch):

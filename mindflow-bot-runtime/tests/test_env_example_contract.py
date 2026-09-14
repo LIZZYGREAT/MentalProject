@@ -41,6 +41,8 @@ def test_env_example_contains_critical_runtime_capabilities():
         "WEB_SEARCH_TIMEOUT_SECONDS",
         "WEB_SEARCH_MAX_USES",
         "WEB_SEARCH_MAX_OUTPUT_TOKENS",
+        "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS",
+        "WEB_SEARCH_SUMMARY_MAX_CHARS",
         "MUTATION_INTENT_API_ENABLED",
         "VISION_API_ENABLED",
         "PROFILE_CALIBRATION_ENABLED",

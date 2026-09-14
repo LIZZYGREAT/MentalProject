@@ -130,7 +130,9 @@ class Settings:
     web_search_model: str = "deepseek-v4-flash"
     web_search_timeout_seconds: float = 10.0
     web_search_max_uses: int = 3
-    web_search_max_output_tokens: int = 1200
+    web_search_max_output_tokens: int = 4096
+    web_search_retry_max_output_tokens: int = 6144
+    web_search_summary_max_chars: int = 12000
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -399,7 +401,13 @@ class Settings:
             ),
             web_search_max_uses=_int(values, "WEB_SEARCH_MAX_USES", 3),
             web_search_max_output_tokens=_int(
-                values, "WEB_SEARCH_MAX_OUTPUT_TOKENS", 1200, minimum=256
+                values, "WEB_SEARCH_MAX_OUTPUT_TOKENS", 4096, minimum=256
+            ),
+            web_search_retry_max_output_tokens=_int(
+                values, "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS", 6144, minimum=256
+            ),
+            web_search_summary_max_chars=_int(
+                values, "WEB_SEARCH_SUMMARY_MAX_CHARS", 12000, minimum=1000
             ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
@@ -573,6 +581,10 @@ class Settings:
             raise ValueError("WEB_SEARCH_MAX_USES must be <= 5")
         if self.web_search_max_output_tokens < 256:
             raise ValueError("WEB_SEARCH_MAX_OUTPUT_TOKENS must be >= 256")
+        if self.web_search_retry_max_output_tokens < self.web_search_max_output_tokens:
+            raise ValueError(
+                "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS must be >= WEB_SEARCH_MAX_OUTPUT_TOKENS"
+            )
         if self.web_search_enabled and not self.deepseek_api_key:
             raise ValueError(
                 "DEEPSEEK_API_KEY is required when web search is enabled"

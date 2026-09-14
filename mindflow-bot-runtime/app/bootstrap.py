@@ -229,6 +229,8 @@ def build_business_services(
             timeout_seconds=settings.web_search_timeout_seconds,
             max_uses=settings.web_search_max_uses,
             max_output_tokens=settings.web_search_max_output_tokens,
+            retry_max_output_tokens=settings.web_search_retry_max_output_tokens,
+            summary_max_chars=settings.web_search_summary_max_chars,
         )
     else:
         raise ValueError(
