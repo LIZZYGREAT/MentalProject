@@ -16,7 +16,9 @@ from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.tools.care import _creation_recurrence_from_args, _recurrence_from_args
 from app.integrations.feishu.cards import (
+    _format_calendar_datetime_range,
     calendar_delete_confirmation_card,
+    calendar_mutation_plan_confirmation_card,
     care_intervention_card,
     care_intervention_result_card,
     daily_checkin_card,
@@ -80,6 +82,72 @@ def test_calendar_delete_confirmation_card_uses_fixed_backend_actions():
         },
         {"mindflow_action": "calendar_delete_cancel", "version": "1"},
     ]
+
+
+def test_calendar_cards_format_same_day_and_never_render_raw_iso():
+    plan = {
+        "id": str(uuid.uuid4()),
+        "operation": "create",
+        "items": [
+            {
+                "summary": "第一项",
+                "start_time": "2026-09-14T04:00:00Z",
+                "end_time": "2026-09-14T05:40:00Z",
+            },
+            {
+                "summary": "第二项",
+                "start_time": "2026-09-14T10:30:00+00:00",
+                "end_time": "2026-09-14T11:00:00+00:00",
+            },
+        ],
+    }
+
+    card_text = json.dumps(
+        calendar_mutation_plan_confirmation_card(plan), ensure_ascii=False
+    )
+
+    assert "2026-09-14 12:00–13:40" in card_text
+    assert "2026-09-14T04:00:00Z" not in card_text
+    assert "+00:00" not in card_text
+
+
+def test_calendar_cards_format_cross_day_in_configured_timezone():
+    event = {
+        "id": "event/1",
+        "summary": "跨日任务",
+        "start_time": "2026-09-14T15:30:00Z",
+        "end_time": "2026-09-14T16:30:00Z",
+    }
+
+    card_text = json.dumps(
+        calendar_delete_confirmation_card(event), ensure_ascii=False
+    )
+
+    assert "2026-09-14 23:30 – 2026-09-15 00:30" in card_text
+    assert "2026-09-14T15:30:00Z" not in card_text
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("", "2026-09-14T10:00:00+08:00"),
+        ("not-a-date", "2026-09-14T10:00:00+08:00"),
+        ("2026-09-14T09:00:00", "2026-09-14T10:00:00+08:00"),
+        ("2026-09-14T10:00:00+08:00", "2026-09-14T09:00:00+08:00"),
+    ],
+)
+def test_calendar_time_formatter_fails_closed(start, end):
+    with pytest.raises(ValueError):
+        _format_calendar_datetime_range(start, end)
+
+
+def test_today_calendar_card_converts_start_to_configured_timezone():
+    card = today_calendar_card(
+        [{"summary": "午间日程", "start_time": "2026-09-14T04:15:00Z"}],
+        local_date="2026-09-14",
+    )
+
+    assert "**12:15**" in card["body"]["elements"][0]["content"]
 
 
 def test_calendar_delete_callback_executes_only_on_confirm():

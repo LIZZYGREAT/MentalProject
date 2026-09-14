@@ -1605,7 +1605,9 @@ class CareTools:
         )
         self.presentations.stage_card(
             ctx.agent_run_id,
-            calendar_mutation_plan_confirmation_card(plan),
+            calendar_mutation_plan_confirmation_card(
+                plan, timezone_name=self.timezone.key
+            ),
         )
         return {
             "ok": True,
@@ -1819,7 +1821,9 @@ class CareTools:
             return {"ok": False, "error": "rich_reply_delivery_unavailable"}
         self.presentations.stage_card(
             ctx.agent_run_id,
-            calendar_delete_confirmation_card(previous),
+            calendar_delete_confirmation_card(
+                previous, timezone_name=self.timezone.key
+            ),
         )
         return {
             "ok": True,
@@ -1860,7 +1864,9 @@ class CareTools:
         )
         self.presentations.stage_card(
             ctx.agent_run_id,
-            calendar_mutation_plan_confirmation_card(plan),
+            calendar_mutation_plan_confirmation_card(
+                plan, timezone_name=self.timezone.key
+            ),
         )
         return {
             "ok": True,

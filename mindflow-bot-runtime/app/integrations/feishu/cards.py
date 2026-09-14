@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,45 @@ _UNCERTAIN_FIELD_LABELS = {
     "location": "地点",
     "teacher": "教师",
 }
+
+
+def _calendar_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("calendar datetime is required")
+        if raw.endswith(("Z", "z")):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError("calendar datetime is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("calendar datetime must include a timezone")
+    return parsed
+
+
+def _format_calendar_datetime_range(
+    start: object,
+    end: object,
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> str:
+    """Format an aware Calendar range without exposing transport syntax."""
+
+    display_timezone = ZoneInfo(timezone_name)
+    local_start = _calendar_datetime(start).astimezone(display_timezone)
+    local_end = _calendar_datetime(end).astimezone(display_timezone)
+    if local_end <= local_start:
+        raise ValueError("calendar end time must be after start time")
+    if local_start.date() == local_end.date():
+        return (
+            f"{local_start:%Y-%m-%d %H:%M}"
+            f"–{local_end:%H:%M}"
+        )
+    return f"{local_start:%Y-%m-%d %H:%M} – {local_end:%Y-%m-%d %H:%M}"
 
 
 def _natural_uncertain_fields(fields: list[Any]) -> list[str]:
@@ -1025,15 +1065,22 @@ def card_action_result_card(*, message: str) -> dict[str, Any]:
     }
 
 
-def calendar_delete_confirmation_card(event: dict[str, Any]) -> dict[str, Any]:
+def calendar_delete_confirmation_card(
+    event: dict[str, Any],
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
     """Fixed confirmation card for one backend-resolved Calendar event."""
 
     event_id = str(event.get("id") or "").strip()
     if not event_id or len(event_id) > 256:
         raise ValueError("calendar event id is invalid")
     summary = str(event.get("summary") or "未命名日程")[:200]
-    start = str(event.get("start_time") or "")[:40]
-    end = str(event.get("end_time") or "")[:40]
+    date_range = _format_calendar_datetime_range(
+        event.get("start_time"),
+        event.get("end_time"),
+        timezone_name=timezone_name,
+    )
     return {
         "schema": "2.0",
         "config": {
@@ -1052,7 +1099,7 @@ def calendar_delete_confirmation_card(event: dict[str, Any]) -> dict[str, Any]:
                 {
                     "tag": "markdown",
                     "content": (
-                        f"**{summary}**\n{start} – {end}\n\n"
+                        f"**{summary}**\n{date_range}\n\n"
                         "删除后无法恢复，请确认是否继续。"
                     ),
                 },
@@ -1088,6 +1135,8 @@ def calendar_delete_confirmation_card(event: dict[str, Any]) -> dict[str, Any]:
 
 def calendar_mutation_plan_confirmation_card(
     plan: dict[str, Any],
+    *,
+    timezone_name: str = "Asia/Shanghai",
 ) -> dict[str, Any]:
     """One fixed card for an immutable backend-owned batch mutation plan."""
 
@@ -1102,9 +1151,12 @@ def calendar_mutation_plan_confirmation_card(
     lines = []
     for index, item in enumerate(items, start=1):
         summary = str(item.get("summary") or "未命名日程")[:80]
-        start = str(item.get("start_time") or "")[:40]
-        end = str(item.get("end_time") or "")[:40]
-        lines.append(f"{index}. **{summary}**\n   {start} – {end}")
+        date_range = _format_calendar_datetime_range(
+            item.get("start_time"),
+            item.get("end_time"),
+            timezone_name=timezone_name,
+        )
+        lines.append(f"{index}. **{summary}**\n   {date_range}")
     return {
         "schema": "2.0",
         "config": {
@@ -1276,11 +1328,18 @@ def today_calendar_card(
     *,
     local_date: str,
     requested_date_is_today: bool = True,
+    timezone_name: str = "Asia/Shanghai",
 ) -> dict[str, Any]:
     lines = []
     for event in events[:20]:
-        start = str(event.get("start_time") or "")
-        label = start.split("T", 1)[-1][:5] if start else "全天"
+        raw_start = event.get("start_time")
+        label = (
+            _calendar_datetime(raw_start)
+            .astimezone(ZoneInfo(timezone_name))
+            .strftime("%H:%M")
+            if raw_start
+            else "全天"
+        )
         summary = str(event.get("summary") or "未命名日程")[:80]
         lines.append(f"• **{label}** {summary}")
     day_label = "今日" if requested_date_is_today else "当日"

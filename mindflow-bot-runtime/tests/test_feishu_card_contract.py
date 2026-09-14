@@ -162,8 +162,16 @@ def _reviewed_interactive_cards():
             "id": import_id,
             "operation": "delete",
             "items": [
-                {"summary": "一", "start_time": "09:00", "end_time": "10:00"},
-                {"summary": "二", "start_time": "10:00", "end_time": "11:00"},
+                {
+                    "summary": "一",
+                    "start_time": "2026-09-14T09:00:00+08:00",
+                    "end_time": "2026-09-14T10:00:00+08:00",
+                },
+                {
+                    "summary": "二",
+                    "start_time": "2026-09-14T10:00:00+08:00",
+                    "end_time": "2026-09-14T11:00:00+08:00",
+                },
             ],
         }),
         "pressure_curve": pressure_curve_card(

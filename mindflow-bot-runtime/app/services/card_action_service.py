@@ -840,6 +840,7 @@ class CardActionService:
                     events,
                     local_date=requested_date.isoformat(),
                     requested_date_is_today=requested_date_is_today,
+                    timezone_name=self.timezone.key,
                 ),
             }
         if action_name == "daily_review_submit":
