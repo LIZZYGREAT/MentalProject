@@ -241,6 +241,51 @@ def test_long_document_chunks_are_participant_bound_and_prompt_injection_is_data
     }
 
 
+def test_long_document_can_return_three_consecutive_participant_bound_chunks():
+    database = memory_database()
+    user = participant(database, "URL-CHUNK-BATCH")
+    body = "\n".join(f"段落 {index}: " + ("evidence " * 1000) for index in range(6))
+    reader = service(database, FakeFetcher([response(body)]))
+
+    initial = asyncio.run(reader.read_url(user.id, url="https://example.com/long-batch"))
+    batch = asyncio.run(reader.read_chunk(
+        user.id,
+        document_id=initial["document_id"],
+        chunk_index=1,
+        count=3,
+    ))
+
+    assert initial["chunk_count"] >= 4
+    assert batch["ok"] is True
+    assert batch["chunk_index"] == 1
+    assert batch["returned_chunk_count"] == 3
+    assert batch["next_chunk_index"] == 4
+    assert batch["has_more"] is True
+    assert "[Chunk 2]" in batch["content"]
+    assert "[Chunk 4]" in batch["content"]
+
+
+@pytest.mark.parametrize("count", [0, 4, "bad"])
+def test_chunk_batch_count_is_bounded(count):
+    database = memory_database()
+    user = participant(database, f"URL-COUNT-{count}")
+    result = asyncio.run(service(
+        database,
+        FakeFetcher([]),
+    ).read_chunk(
+        user.id,
+        document_id="00000000-0000-0000-0000-000000000000",
+        chunk_index=0,
+        count=count,
+    ))
+
+    assert result == {
+        "ok": False,
+        "error": "web_document_chunk_count_invalid",
+        "verified": False,
+    }
+
+
 def test_expired_documents_are_physically_purged():
     database = memory_database()
     user = participant(database, "URL-PURGE")

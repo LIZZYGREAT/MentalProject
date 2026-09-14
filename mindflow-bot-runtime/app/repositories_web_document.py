@@ -74,29 +74,68 @@ class WebDocumentRepository:
             return self._view(document, chunk.content) if chunk else None
 
     def get_chunk(self, participant_id, document_id: str, chunk_index: int) -> dict | None:
+        result = self.get_chunks(
+            participant_id,
+            document_id,
+            start_index=chunk_index,
+            count=1,
+        )
+        if result is None:
+            return None
+        content = result["chunks"][0]["content"]
+        return self._view(result["document"], content, chunk_index=int(chunk_index))
+
+    def get_chunks(
+        self,
+        participant_id,
+        document_id: str,
+        *,
+        start_index: int,
+        count: int,
+    ) -> dict | None:
         try:
             parsed_id = uuid.UUID(str(document_id))
         except ValueError:
             return None
+        start = int(start_index)
+        requested_count = int(count)
+        if start < 0 or requested_count < 1:
+            return None
         with self.database.session() as session:
-            row = session.execute(
-                select(WebDocument, WebDocumentChunk)
-                .join(
-                    WebDocumentChunk,
-                    WebDocumentChunk.document_id == WebDocument.id,
-                )
+            document = session.execute(
+                select(WebDocument)
                 .where(
                     WebDocument.id == parsed_id,
                     WebDocument.participant_id == participant_id,
-                    WebDocumentChunk.participant_id == participant_id,
-                    WebDocumentChunk.chunk_index == int(chunk_index),
                     WebDocument.expires_at > utc_now(),
+                )
+            ).scalar_one_or_none()
+            if document is None or start >= document.chunk_count:
+                return None
+            rows = session.execute(
+                select(WebDocumentChunk)
+                .where(
+                    WebDocumentChunk.document_id == document.id,
+                    WebDocumentChunk.participant_id == participant_id,
+                    WebDocumentChunk.chunk_index >= start,
+                    WebDocumentChunk.chunk_index < min(
+                        start + requested_count,
+                        document.chunk_count,
+                    ),
                     WebDocumentChunk.expires_at > utc_now(),
                 )
-            ).one_or_none()
-            if row is None:
+                .order_by(WebDocumentChunk.chunk_index.asc())
+            ).scalars().all()
+            expected = list(range(start, start + len(rows)))
+            if not rows or [row.chunk_index for row in rows] != expected:
                 return None
-            return self._view(row[0], row[1].content, chunk_index=int(chunk_index))
+            return {
+                "document": document,
+                "chunks": [
+                    {"chunk_index": row.chunk_index, "content": row.content}
+                    for row in rows
+                ],
+            }
 
     def purge_expired(self, now: datetime | None = None) -> dict[str, int]:
         instant = now or utc_now()

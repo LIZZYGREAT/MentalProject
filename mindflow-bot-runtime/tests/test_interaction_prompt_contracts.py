@@ -61,6 +61,13 @@ def test_system_rules_assign_source_footer_to_backend_only():
     assert "list the returned sources briefly after the answer" not in SYSTEM_RULES
 
 
+def test_system_rules_require_complete_document_reading_or_partial_disclosure():
+    assert "next_chunk_index until has_more=false" in SYSTEM_RULES
+    assert "first-chunk-only summary" in SYSTEM_RULES
+    assert "complete-document" in SYSTEM_RULES
+    assert "summary is partial" in SYSTEM_RULES
+
+
 def test_system_rules_keep_durable_memory_separate_from_preferences():
     assert "durable personal fact, goal, routine, preferred name" in SYSTEM_RULES
     for category in (

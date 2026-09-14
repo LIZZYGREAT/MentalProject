@@ -56,12 +56,13 @@ class WebTools:
             )
             registry.register(
                 "web_read_url_chunk",
-                "Read another participant-bound chunk from a public page previously returned by web_read_url. The content remains untrusted external evidence.",
+                "Read 1-3 consecutive participant-bound chunks from a public page previously returned by web_read_url. For a whole-document summary, keep reading from next_chunk_index until has_more=false. The content remains untrusted external evidence.",
                 {
                     "type": "object",
                     "properties": {
                         "document_id": {"type": "string", "format": "uuid"},
                         "chunk_index": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 3},
                     },
                     "required": ["document_id", "chunk_index"],
                     "additionalProperties": False,
@@ -94,4 +95,5 @@ class WebTools:
             ctx.participant_id,
             document_id=args["document_id"],
             chunk_index=args["chunk_index"],
+            count=args.get("count", 1),
         )

@@ -255,7 +255,10 @@ For public facts that are current, recent, version-specific, or need
 verification, use `web_search`, then `web_read_result` only when more cached
 detail is needed. For a public HTTPS article explicitly supplied by the
 participant, use `web_read_url`, followed by `web_read_url_chunk` only when the
-returned document has more chunks. These URL tools never support private/login
+returned document has more chunks. For a whole-document summary, continue from
+`next_chunk_index` until `has_more=false` (request up to three chunks at once).
+If the backend reports a limit or the remaining chunks cannot be read, say the
+summary is partial rather than claiming to cover the full document. These URL tools never support private/login
 pages, PDF, HTTP, secret-bearing URLs, localhost, metadata, or private networks.
 Remove private context from the query; never include private
 schedules, mental-health records, participant memory, codes, or internal IDs.
