@@ -8,6 +8,7 @@ from app.integrations.feishu.streaming_card import (
     FeishuStreamingCardSession,
     streaming_answer_card,
 )
+from app.presentation.streaming_boundaries import safe_stream_prefix_boundaries
 
 
 class RecordingCardClient:
@@ -73,6 +74,37 @@ def test_streaming_card_schema_has_one_noninteractive_markdown_element():
         "element_id": ANSWER_ELEMENT_ID,
         "content": "正在整理结果…",
     }]
+
+
+def test_stream_prefix_never_splits_markdown_link_or_raw_url():
+    text = (
+        "先给结论：[已验证来源](https://example.com/very/long/article?q=1) "
+        "随后参考 https://another.example.com/a/long/path?x=1 ，最后结束。"
+    )
+    boundaries = safe_stream_prefix_boundaries(text, max_updates=60, min_chars=1)
+    link_start = text.index("[已验证来源]")
+    link_end = text.index(")", link_start) + 1
+    url_start = text.index("https://another")
+    url_end = text.index(" ，", url_start)
+
+    assert boundaries[-1] == len(text)
+    assert all(not link_start < end < link_end for end in boundaries)
+    assert all(not url_start < end < url_end for end in boundaries)
+
+
+def test_stream_prefix_keeps_balanced_bold_marker_when_possible():
+    text = "开头说明，**这一段强调内容不能在中间闪烁**，然后给出结论。"
+    boundaries = safe_stream_prefix_boundaries(text, max_updates=60, min_chars=1)
+
+    assert all(text[:end].count("**") % 2 == 0 for end in boundaries)
+
+
+def test_stream_final_prefix_equals_full_compiled_text():
+    text = "**结论**\n\n1. 第一项\n2. [来源](https://example.com/article)"
+    boundaries = safe_stream_prefix_boundaries(text, max_updates=60, min_chars=1)
+
+    assert text[:boundaries[-1]] == text
+    assert len(boundaries) <= 60
 
 
 def test_failed_close_remains_retryable_and_uses_a_new_sequence():
@@ -145,10 +177,44 @@ def test_feishu_client_uses_cardkit_preallocation_element_and_settings_endpoints
     assert requests[1].uri.endswith(
         f"/cards/card-1/elements/{ANSWER_ELEMENT_ID}/content"
     )
-    assert requests[1].body == {"content": "answer", "sequence": 1}
+    assert requests[1].body["content"] == "answer"
+    assert requests[1].body["sequence"] == 1
+    assert requests[1].body["uuid"] == client._cardkit_operation_uuid(
+        "content", card_id, ANSWER_ELEMENT_ID, 1
+    )
     assert requests[2].uri.endswith("/cards/card-1/settings")
     assert requests[2].body["sequence"] == 2
     assert json.loads(requests[2].body["settings"])["config"]["streaming_mode"] is False
+    assert requests[2].body["uuid"] == client._cardkit_operation_uuid(
+        "settings", card_id, "", 2
+    )
+
+
+def test_cardkit_update_and_finalize_use_stable_uuid_for_retries():
+    requests = []
+
+    class Response:
+        code = 0
+        msg = "ok"
+
+        @staticmethod
+        def success():
+            return True
+
+    class SDK:
+        def request(self, request):
+            requests.append(request)
+            return Response()
+
+    client = FeishuClient("app", "secret", sdk_client=SDK())
+    client.update_card_element_content("card-1", "answer", "body", 7)
+    client.update_card_element_content("card-1", "answer", "body", 7)
+    client.finish_streaming_card("card-1", 8)
+    client.finish_streaming_card("card-1", 8)
+
+    assert requests[0].body["uuid"] == requests[1].body["uuid"]
+    assert requests[2].body["uuid"] == requests[3].body["uuid"]
+    assert requests[0].body["uuid"] != requests[2].body["uuid"]
 
 
 def test_send_reference_failure_still_closes_preallocated_streaming_mode():

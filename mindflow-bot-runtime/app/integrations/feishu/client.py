@@ -6,6 +6,7 @@ import json
 from io import BytesIO
 from typing import Any
 from urllib.parse import quote
+import uuid
 
 
 class FeishuSendError(RuntimeError):
@@ -144,7 +145,13 @@ class FeishuClient:
             "/open-apis/cardkit/v1/cards/"
             f"{quote(str(card_id), safe='')}/elements/"
             f"{quote(str(element_id), safe='')}/content",
-            {"content": str(content), "sequence": int(sequence)},
+            {
+                "content": str(content),
+                "sequence": int(sequence),
+                "uuid": self._cardkit_operation_uuid(
+                    "content", card_id, element_id, sequence
+                ),
+            },
             operation="update_card_element_content",
         )
 
@@ -157,6 +164,9 @@ class FeishuClient:
                     {"config": {"streaming_mode": False}}, ensure_ascii=False
                 ),
                 "sequence": int(sequence),
+                "uuid": self._cardkit_operation_uuid(
+                    "settings", card_id, "", sequence
+                ),
             },
             operation="finish_streaming_card",
         )
@@ -206,6 +216,19 @@ class FeishuClient:
             min_update_chars=min_update_chars,
             max_update_interval_ms=max_update_interval_ms,
         )
+
+    @staticmethod
+    def _cardkit_operation_uuid(
+        operation: str,
+        card_id: str,
+        element_id: str,
+        sequence: int,
+    ) -> str:
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "mindflow-cardkit:"
+            f"{operation}:{card_id}:{element_id}:{int(sequence)}",
+        ))
 
     def _cardkit_request(
         self,

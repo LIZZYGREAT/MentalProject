@@ -81,6 +81,7 @@ from app.presentation.onboarding import (
 )
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
+from app.presentation.streaming_boundaries import safe_stream_prefix_boundaries
 from app.services.presentation_service import (
     PendingCardUpdate,
     PendingImageCard,
@@ -3155,13 +3156,13 @@ class BotWorker:
         value = str(text)
         if not value:
             return
-        max_updates = 60
-        chunk_size = max(
-            self.streaming_min_chars_per_update,
-            (len(value) + max_updates - 1) // max_updates,
-        )
-        for end in range(chunk_size, len(value), chunk_size):
-            await session.update(value[:end])
+        for end in safe_stream_prefix_boundaries(
+            value,
+            max_updates=60,
+            min_chars=self.streaming_min_chars_per_update,
+        ):
+            if end < len(value):
+                await session.update(value[:end])
 
     def _attach_streaming_sequence_allocator(
         self,
