@@ -5,6 +5,7 @@ from app.card_actions.registry import card_action_spec
 from app.integrations.feishu.cards import (
     calendar_delete_confirmation_card,
     calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_time_card,
     care_intervention_card,
     course_schedule_preview_card,
     course_schedule_result_card,
@@ -102,6 +103,25 @@ def _reviewed_interactive_cards():
         "structured_result": {"courses": [], "missing_context": []},
         "items": [],
     }
+    calendar_plan_id = "00000000-0000-0000-0000-000000000004"
+    calendar_item_id = "00000000-0000-0000-0000-000000000005"
+    calendar_item = {
+        "summary": "测试日程",
+        "start_time": "2026-09-14T09:00:00+08:00",
+        "end_time": "2026-09-14T10:00:00+08:00",
+    }
+    editable_calendar_plan = {
+        "id": calendar_plan_id,
+        "operation": "create",
+        "status": "awaiting_confirmation",
+        "items": [calendar_item],
+        "ledger_items": [{
+            "id": calendar_item_id,
+            "item_index": 0,
+            "status": "pending",
+            "payload": calendar_item,
+        }],
+    }
     memory = {
         "id": "00000000-0000-0000-0000-000000000003",
         "memory_type": "preference",
@@ -174,6 +194,9 @@ def _reviewed_interactive_cards():
                 },
             ],
         }),
+        "calendar_mutation_plan_item_time": calendar_mutation_plan_item_time_card(
+            editable_calendar_plan, calendar_item_id
+        ),
         "pressure_curve": pressure_curve_card(
             analysis, image_key="img-key", local_date="2026-09-14"
         ),

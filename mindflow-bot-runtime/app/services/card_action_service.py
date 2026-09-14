@@ -6,7 +6,7 @@ validation here are the authority for any state change triggered by a card.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -16,6 +16,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
+    calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_time_card,
     card_action_result_card,
     care_intervention_result_card,
     course_schedule_context_card,
@@ -82,6 +84,62 @@ def _legacy_clock(value: Any) -> str:
     if len(pieces) == 2 and all(piece.isdigit() for piece in pieces):
         normalized = f"{int(pieces[0]):02d}:{int(pieces[1]):02d}"
     return normalized
+
+
+def _aware_calendar_datetime(value: object) -> datetime:
+    raw = str(value or "").strip()
+    if raw.endswith(("Z", "z")):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("日程原始时间无效，请重新发起添加。") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("日程原始时间缺少时区，请重新发起添加。")
+    return parsed
+
+
+def _replace_local_clock(
+    original: datetime,
+    clock: str,
+    display_timezone: ZoneInfo,
+) -> datetime:
+    local_date = original.astimezone(display_timezone).date()
+    naive = datetime.combine(local_date, time.fromisoformat(clock))
+    candidate = naive.replace(tzinfo=display_timezone, fold=0)
+    alternative = naive.replace(tzinfo=display_timezone, fold=1)
+    if candidate.utcoffset() != alternative.utcoffset():
+        raise ValueError("所选时间处于夏令时切换区间，请选择其他时间。")
+    round_trip = (
+        candidate.astimezone(timezone.utc)
+        .astimezone(display_timezone)
+        .replace(tzinfo=None)
+    )
+    if round_trip != naive:
+        raise ValueError("所选本地时间不存在，请选择其他时间。")
+    return candidate
+
+
+def _calendar_plan_state_result(
+    plan_id: str,
+    *,
+    error: str,
+    status: str | None = None,
+) -> dict[str, Any]:
+    if error == "calendar_mutation_plan_expired":
+        reply_text = "该确认已过期，请重新发起日程添加。"
+    elif error == "calendar_mutation_plan_not_editable":
+        reply_text = "这批日程已经开始处理，不能再修改时间。"
+    else:
+        reply_text = "没有找到这批待确认日程，请重新发起添加。"
+    return {
+        "ok": True,
+        "error": error,
+        "status": status,
+        "plan_id": plan_id,
+        "reply_text": reply_text,
+        "card": card_action_result_card(message=reply_text),
+    }
 
 
 def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
@@ -198,6 +256,7 @@ class CardActionService:
         course_schedule_imports: Any = None,
         calendar_delete_executor: Any = None,
         calendar_mutation_plan_executor: Any = None,
+        calendar_mutation_plans: Any = None,
         feature_capabilities: Any = None,
         consent_service: Any = None,
         care_preferences: Any = None,
@@ -214,6 +273,7 @@ class CardActionService:
         self.course_schedule_imports = course_schedule_imports
         self.calendar_delete_executor = calendar_delete_executor
         self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
+        self.calendar_mutation_plans = calendar_mutation_plans
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.consent_service = consent_service
         self.care_preferences = care_preferences
@@ -444,6 +504,134 @@ class CardActionService:
                 "status": corrected.get("status"),
                 "reply_text": "课程时间已修改，请核对更新后的预览。",
                 "card": course_schedule_preview_card(corrected),
+            }
+        if action_name in {
+            "calendar_mutation_plan_item_time_open",
+            "calendar_mutation_plan_item_time_submit",
+            "calendar_mutation_plan_view",
+        }:
+            if self.calendar_mutation_plans is None:
+                raise RuntimeError("calendar mutation plans are unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            item_id = ""
+            if action_name != "calendar_mutation_plan_view":
+                try:
+                    item_id = str(uuid.UUID(str(action.get("item_id") or "")))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "calendar mutation plan item target is invalid"
+                    ) from exc
+            plan = self.calendar_mutation_plans.get_for_participant(
+                participant_id, plan_id
+            )
+            if plan is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            expires_at = _aware_calendar_datetime(plan.get("expires_at"))
+            if (
+                str(plan.get("status") or "") == "expired"
+                or expires_at <= datetime.now(timezone.utc)
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if (
+                str(plan.get("operation") or "") != "create"
+                or str(plan.get("status") or "") != "awaiting_confirmation"
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(plan.get("status") or ""),
+                )
+            if action_name == "calendar_mutation_plan_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "已返回最新的日程确认内容。",
+                    "card": calendar_mutation_plan_confirmation_card(
+                        plan, timezone_name=self.timezone.key
+                    ),
+                }
+            try:
+                edit_card = calendar_mutation_plan_item_time_card(
+                    plan, item_id, timezone_name=self.timezone.key
+                )
+            except (LookupError, ValueError):
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if action_name == "calendar_mutation_plan_item_time_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请修改这项日程的起止时间。",
+                    "card": edit_card,
+                }
+
+            values = dict(form_value or {})
+            try:
+                start_clock = _structured_clock(values, "start")
+                end_clock = _structured_clock(values, "end")
+                ledger_item = next(
+                    value
+                    for value in list(plan.get("ledger_items") or [])
+                    if str(value.get("id") or "") == item_id
+                )
+                payload = dict(ledger_item.get("payload") or {})
+                original_start = _aware_calendar_datetime(
+                    payload.get("start_time")
+                )
+                original_end = _aware_calendar_datetime(payload.get("end_time"))
+                new_start = _replace_local_clock(
+                    original_start, start_clock, self.timezone
+                )
+                new_end = _replace_local_clock(original_end, end_clock, self.timezone)
+                if new_end <= new_start:
+                    raise ValueError("结束时间必须晚于开始时间。")
+            except (StopIteration, ValueError) as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_calendar_plan_item_time",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            updated = self.calendar_mutation_plans.update_pending_item_time(
+                participant_id,
+                plan_id,
+                item_id,
+                start_time=new_start,
+                end_time=new_end,
+            )
+            if updated is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if updated.get("update_status") == "expired":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if updated.get("update_status") != "updated":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(updated.get("status") or ""),
+                )
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "日程时间已修改，请核对更新后的确认内容。",
+                "card": calendar_mutation_plan_confirmation_card(
+                    updated, timezone_name=self.timezone.key
+                ),
             }
         if action_name in {
             "calendar_mutation_plan_confirm",

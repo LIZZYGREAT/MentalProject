@@ -21,6 +21,8 @@ class CardActionSpec:
 _NAVIGATION = {
     "course_schedule_import_context_open",
     "course_schedule_item_time_open",
+    "calendar_mutation_plan_item_time_open",
+    "calendar_mutation_plan_view",
     "external_llm_consent_decline",
     "external_llm_consent_details_open",
     "external_llm_consent_prompt_open",
@@ -40,6 +42,7 @@ _NAVIGATION = {
 _INTERNAL_WRITE = {
     "calendar_delete_cancel",
     "calendar_mutation_plan_cancel",
+    "calendar_mutation_plan_item_time_submit",
     "course_schedule_import_context_submit",
     "course_schedule_item_time_submit",
     "daily_review_submit",

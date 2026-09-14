@@ -107,6 +107,7 @@ def _card_service(database, tools):
             on_observation_committed=lambda **_values: None
         ),
         calendar_mutation_plan_executor=tools.execute_calendar_mutation_plan,
+        calendar_mutation_plans=tools.calendar_mutation_plans,
     )
 
 
@@ -334,6 +335,19 @@ def test_multi_date_create_uses_one_plan_card_and_executes_once():
     assert len(cards) == 1
     confirm = _plan_action(cards[0], "_confirm")
     assert "events" not in confirm and "event_ids" not in confirm
+    edit_actions = [
+        element["behaviors"][0]["value"]
+        for element in cards[0]["body"]["elements"]
+        if element.get("tag") == "button"
+        and element["behaviors"][0]["value"]["mindflow_action"].endswith(
+            "_time_open"
+        )
+    ]
+    assert len(edit_actions) == 2
+    assert all(
+        set(action) == {"mindflow_action", "version", "plan_id", "item_id"}
+        for action in edit_actions
+    )
 
     service = _card_service(database, tools)
     first = service.handle(
@@ -383,6 +397,7 @@ def test_multi_event_delete_binds_all_targets_to_one_card_before_deleting():
     card = outbox.take_cards(ctx.agent_run_id)[0]
     serialized = json.dumps(card, ensure_ascii=False)
     assert "weekend-1" not in serialized and "weekend-2" not in serialized
+    assert "calendar_mutation_plan_item_time_open" not in serialized
 
     result = _card_service(database, tools).handle(
         owner.id,
@@ -398,6 +413,250 @@ def test_multi_event_delete_binds_all_targets_to_one_card_before_deleting():
         (owner.id, "weekend-1"),
         (owner.id, "weekend-2"),
     ]
+
+
+def test_calendar_plan_time_actions_update_pending_plan_without_provider_write():
+    database = memory_database()
+    owner = participant(database, "PLAN-CARD-EDIT")
+    calendar = _Calendar()
+    verifier = _Verifier()
+    plans, outbox, tools, registry, _runner = _stack(database, calendar, verifier)
+    ctx = _context(owner.id, "添加两个日程")
+    asyncio.run(
+        registry.execute(
+            ctx,
+            "calendar_create_events_plan",
+            {
+                "events": [
+                    {
+                        "summary": "同日任务",
+                        "start_time": "2030-01-12T13:43:12+08:00",
+                        "end_time": "2030-01-12T14:17:59+08:00",
+                    },
+                    {
+                        "summary": "跨日任务",
+                        "start_time": "2030-01-13T23:00:00+08:00",
+                        "end_time": "2030-01-14T01:00:00+08:00",
+                    },
+                ]
+            },
+        )
+    )
+    confirmation = outbox.take_cards(ctx.agent_run_id)[0]
+    edit = next(
+        element["behaviors"][0]["value"]
+        for element in confirmation["body"]["elements"]
+        if element.get("tag") == "button"
+        and element["behaviors"][0]["value"]["mindflow_action"].endswith(
+            "_time_open"
+        )
+    )
+    service = _card_service(database, tools)
+
+    opened = service.handle(
+        owner.id,
+        message_id="plan-card",
+        action_value=edit,
+        form_value={},
+    )
+    assert opened["navigation_only"] is True
+    form = opened["card"]["body"]["elements"][0]
+    submit = next(
+        element["behaviors"][0]["value"]
+        for element in form["elements"]
+        if element.get("tag") == "button"
+    )
+    result = service.handle(
+        owner.id,
+        message_id="plan-card",
+        callback_event_id="edit-event-1",
+        action_value=submit,
+        form_value={
+            "start_hour": "15",
+            "start_minute": "11",
+            "end_hour": "16",
+            "end_minute": "22",
+        },
+    )
+
+    assert result["ok"] is True
+    assert calendar.created == []
+    stored = plans.get(edit["plan_id"])
+    assert stored["items"][0]["start_time"] == "2030-01-12T15:11:00+08:00"
+    assert stored["items"][0]["end_time"] == "2030-01-12T16:22:00+08:00"
+    assert stored["ledger_items"][0]["payload"] == stored["items"][0]
+    rendered = json.dumps(result["card"], ensure_ascii=False)
+    assert "2030-01-12 15:11–16:22" in rendered
+
+    queued = service.handle(
+        owner.id,
+        message_id="plan-card",
+        callback_event_id="confirm-after-edit",
+        action_value=_plan_action(result["card"], "_confirm"),
+        form_value={},
+    )
+    assert queued["status"] == "queued"
+    asyncio.run(_runner.run_once())
+    assert calendar.created[0][1]["start_time"].isoformat() == (
+        "2030-01-12T15:11:00+08:00"
+    )
+    assert calendar.created[0][1]["end_time"].isoformat() == (
+        "2030-01-12T16:22:00+08:00"
+    )
+
+
+def test_calendar_plan_time_edit_preserves_cross_day_dates_and_rejects_stale_card():
+    database = memory_database()
+    owner = participant(database, "PLAN-CARD-CROSS-DAY")
+    repository = CalendarMutationPlanRepository(database)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[
+            {
+                "summary": "cross day",
+                "start_time": "2030-01-12T23:00:00+08:00",
+                "end_time": "2030-01-13T01:00:00+08:00",
+            },
+            {
+                "summary": "other",
+                "start_time": "2030-01-14T10:00:00+08:00",
+                "end_time": "2030-01-14T11:00:00+08:00",
+            },
+        ],
+    )
+    service = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+        calendar_mutation_plans=repository,
+    )
+    action = {
+        "mindflow_action": "calendar_mutation_plan_item_time_submit",
+        "version": "1",
+        "plan_id": plan["id"],
+        "item_id": plan["ledger_items"][0]["id"],
+    }
+    result = service.handle(
+        owner.id,
+        message_id="cross-day-card",
+        action_value=action,
+        form_value={
+            "start_hour": "22",
+            "start_minute": "30",
+            "end_hour": "02",
+            "end_minute": "15",
+        },
+    )
+    updated = repository.get(plan["id"])
+
+    assert result["ok"] is True
+    assert updated["items"][0]["start_time"].startswith("2030-01-12T22:30:00")
+    assert updated["items"][0]["end_time"].startswith("2030-01-13T02:15:00")
+
+    repository.request_execution(owner.id, plan["id"])
+    stale = service.handle(
+        owner.id,
+        message_id="cross-day-card",
+        action_value=action,
+        form_value={
+            "start_hour": "20",
+            "start_minute": "00",
+            "end_hour": "21",
+            "end_minute": "00",
+        },
+    )
+    assert stale["error"] == "calendar_mutation_plan_not_editable"
+    assert repository.get(plan["id"])["items"] == updated["items"]
+
+
+def test_calendar_plan_time_edit_is_participant_bound_and_validates_range():
+    database = memory_database()
+    owner = participant(database, "PLAN-CARD-OWNER")
+    other = participant(database, "PLAN-CARD-OTHER")
+    repository = CalendarMutationPlanRepository(database)
+    plan = repository.create(
+        owner.id,
+        operation="create",
+        items=[
+            {
+                "summary": "a",
+                "start_time": "2030-01-12T09:00:00+08:00",
+                "end_time": "2030-01-12T10:00:00+08:00",
+            },
+            {
+                "summary": "b",
+                "start_time": "2030-01-12T11:00:00+08:00",
+                "end_time": "2030-01-12T12:00:00+08:00",
+            },
+        ],
+    )
+    service = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+        calendar_mutation_plans=repository,
+    )
+    action = {
+        "mindflow_action": "calendar_mutation_plan_item_time_submit",
+        "version": "1",
+        "plan_id": plan["id"],
+        "item_id": plan["ledger_items"][0]["id"],
+    }
+
+    hidden = service.handle(
+        other.id,
+        message_id="foreign-card",
+        action_value=action,
+        form_value={},
+    )
+    invalid = service.handle(
+        owner.id,
+        message_id="owner-card",
+        action_value=action,
+        form_value={
+            "start_hour": "11",
+            "start_minute": "00",
+            "end_hour": "10",
+            "end_minute": "00",
+        },
+    )
+
+    assert hidden["error"] == "calendar_mutation_plan_not_found"
+    assert invalid["error"] == "invalid_calendar_plan_item_time"
+    assert "结束时间必须晚于开始时间" in invalid["reply_text"]
+
+
+def test_calendar_plan_confirmation_fails_closed_on_ledger_mismatch():
+    plan = {
+        "id": str(uuid.uuid4()),
+        "operation": "create",
+        "items": [
+            {
+                "summary": "visible",
+                "start_time": "2030-01-12T09:00:00+08:00",
+                "end_time": "2030-01-12T10:00:00+08:00",
+            },
+            {
+                "summary": "other",
+                "start_time": "2030-01-12T11:00:00+08:00",
+                "end_time": "2030-01-12T12:00:00+08:00",
+            },
+        ],
+        "ledger_items": [{
+            "id": str(uuid.uuid4()),
+            "item_index": 0,
+            "status": "pending",
+            "payload": {"summary": "different"},
+        }],
+    }
+
+    from app.integrations.feishu.cards import calendar_mutation_plan_confirmation_card
+
+    with pytest.raises(ValueError, match="aggregate and ledger"):
+        calendar_mutation_plan_confirmation_card(plan)
 
 
 def _durable_plan(repository, participant_id, operation, items, now):

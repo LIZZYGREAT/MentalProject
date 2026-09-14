@@ -382,6 +382,57 @@ def _schedule_context_button(import_id: str) -> dict[str, Any]:
     }
 
 
+def _clock_select(
+    field: str,
+    label: str,
+    selected: str,
+    values: list[str],
+    suffix: str,
+) -> dict[str, Any]:
+    return {
+        "tag": "select_static",
+        "name": field,
+        "required": True,
+        "placeholder": {"tag": "plain_text", "content": label},
+        "initial_option": selected,
+        "options": [
+            {
+                "text": {
+                    "tag": "plain_text",
+                    "content": f"{value} {suffix}",
+                },
+                "value": value,
+            }
+            for value in values
+        ],
+    }
+
+
+def _clock_form_fields(start: str, end: str) -> list[dict[str, Any]]:
+    try:
+        start_hour, start_minute = start.split(":", 1)
+        end_hour, end_minute = end.split(":", 1)
+    except ValueError as exc:
+        raise ValueError("clock values must use HH:MM") from exc
+    hours = [f"{value:02d}" for value in range(24)]
+    start_minutes = sorted(
+        {f"{value:02d}" for value in range(0, 60, 5)} | {start_minute}
+    )
+    end_minutes = sorted(
+        {f"{value:02d}" for value in range(0, 60, 5)} | {end_minute}
+    )
+    return [
+        {"tag": "markdown", "content": "**开始时间**"},
+        _clock_select("start_hour", "选择小时", start_hour, hours, "时"),
+        _clock_select(
+            "start_minute", "选择分钟", start_minute, start_minutes, "分"
+        ),
+        {"tag": "markdown", "content": "**结束时间**"},
+        _clock_select("end_hour", "选择小时", end_hour, hours, "时"),
+        _clock_select("end_minute", "选择分钟", end_minute, end_minutes, "分"),
+    ]
+
+
 def _schedule_item_edit_button(
     import_id: str, item: dict[str, Any]
 ) -> dict[str, Any]:
@@ -422,41 +473,6 @@ def course_schedule_item_time_card(
     name = _safe_schedule_text(item.get("course_name") or "未命名课程")
     start = str(item.get("start_time") or "08:00")
     end = str(item.get("end_time") or "09:00")
-    start_hour, start_minute = start.split(":", 1)
-    end_hour, end_minute = end.split(":", 1)
-
-    def select(
-        field: str,
-        label: str,
-        selected: str,
-        values: list[str],
-        suffix: str,
-    ) -> dict[str, Any]:
-        return {
-            "tag": "select_static",
-            "name": field,
-            "required": True,
-            "placeholder": {"tag": "plain_text", "content": label},
-            "initial_option": selected,
-            "options": [
-                {
-                    "text": {
-                        "tag": "plain_text",
-                        "content": f"{value} {suffix}",
-                    },
-                    "value": value,
-                }
-                for value in values
-            ],
-        }
-
-    hours = [f"{value:02d}" for value in range(24)]
-    start_minutes = sorted(
-        {f"{value:02d}" for value in range(0, 60, 5)} | {start_minute}
-    )
-    end_minutes = sorted(
-        {f"{value:02d}" for value in range(0, 60, 5)} | {end_minute}
-    )
     form_elements = [
         {
             "tag": "markdown",
@@ -465,12 +481,7 @@ def course_schedule_item_time_card(
                 "修改只会刷新课程表预览，不会写入日历。"
             ),
         },
-        {"tag": "markdown", "content": "**开始时间**"},
-        select("start_hour", "选择小时", start_hour, hours, "时"),
-        select("start_minute", "选择分钟", start_minute, start_minutes, "分"),
-        {"tag": "markdown", "content": "**结束时间**"},
-        select("end_hour", "选择小时", end_hour, hours, "时"),
-        select("end_minute", "选择分钟", end_minute, end_minutes, "分"),
+        *_clock_form_fields(start, end),
         {
             "tag": "button",
             "name": "course_schedule_item_time_submit",
@@ -1148,15 +1159,90 @@ def calendar_mutation_plan_confirmation_card(
     if operation not in {"create", "delete"} or not 2 <= len(items) <= 20:
         raise ValueError("calendar mutation plan is invalid")
     verb = "添加" if operation == "create" else "删除"
-    lines = []
-    for index, item in enumerate(items, start=1):
+    ledger_by_index: dict[int, dict[str, Any]] = {}
+    if operation == "create":
+        ledger_items = [dict(item) for item in list(plan.get("ledger_items") or [])]
+        for ledger_item in ledger_items:
+            try:
+                item_index = int(ledger_item.get("item_index"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar plan ledger index is invalid") from exc
+            item_id = str(ledger_item.get("id") or "").strip()
+            if (
+                not item_id
+                or item_index in ledger_by_index
+                or item_index < 0
+                or item_index >= len(items)
+            ):
+                raise ValueError("calendar plan aggregate and ledger are inconsistent")
+            if dict(ledger_item.get("payload") or {}) != items[item_index]:
+                raise ValueError("calendar plan aggregate and ledger are inconsistent")
+            ledger_by_index[item_index] = ledger_item
+        if len(ledger_by_index) != len(items):
+            raise ValueError("calendar plan aggregate and ledger are inconsistent")
+
+    elements: list[dict[str, Any]] = []
+    for item_offset, item in enumerate(items):
+        display_index = item_offset + 1
         summary = str(item.get("summary") or "未命名日程")[:80]
         date_range = _format_calendar_datetime_range(
             item.get("start_time"),
             item.get("end_time"),
             timezone_name=timezone_name,
         )
-        lines.append(f"{index}. **{summary}**\n   {date_range}")
+        elements.append({
+            "tag": "markdown",
+            "content": f"{display_index}. **{summary}**\n   {date_range}",
+        })
+        if operation == "create":
+            elements.append({
+                "tag": "button",
+                "type": "default",
+                "text": {
+                    "tag": "plain_text",
+                    "content": f"修改第 {display_index} 项时间",
+                },
+                "behaviors": [{
+                    "type": "callback",
+                    "value": {
+                        "mindflow_action": "calendar_mutation_plan_item_time_open",
+                        "version": "1",
+                        "plan_id": plan_id,
+                        "item_id": str(ledger_by_index[item_offset]["id"]),
+                    },
+                }],
+            })
+    elements.extend([
+        {
+            "tag": "button",
+            "type": "danger" if operation == "delete" else "primary",
+            "text": {
+                "tag": "plain_text",
+                "content": f"确认{verb}这 {len(items)} 个",
+            },
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_mutation_plan_confirm",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+        {
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "取消"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_mutation_plan_cancel",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+    ])
     return {
         "schema": "2.0",
         "config": {
@@ -1174,32 +1260,110 @@ def calendar_mutation_plan_confirmation_card(
         },
         "body": {
             "direction": "vertical",
+            "elements": elements,
+        },
+    }
+
+
+def calendar_mutation_plan_item_time_card(
+    plan: dict[str, Any],
+    item_id: str,
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Fixed time form bound to one participant-owned pending plan item."""
+
+    plan_id = str(plan.get("id") or "").strip()
+    if (
+        not plan_id
+        or str(plan.get("operation") or "") != "create"
+        or str(plan.get("status") or "") != "awaiting_confirmation"
+    ):
+        raise ValueError("calendar mutation plan is not editable")
+    target_id = str(item_id or "").strip()
+    ledger_item = next(
+        (
+            dict(value)
+            for value in list(plan.get("ledger_items") or [])
+            if str(value.get("id") or "") == target_id
+        ),
+        None,
+    )
+    if ledger_item is None or str(ledger_item.get("status") or "") != "pending":
+        raise LookupError("calendar mutation plan item not found")
+    try:
+        item_index = int(ledger_item.get("item_index"))
+        item = dict(list(plan.get("items") or [])[item_index])
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError("calendar plan aggregate and ledger are inconsistent") from exc
+    if dict(ledger_item.get("payload") or {}) != item:
+        raise ValueError("calendar plan aggregate and ledger are inconsistent")
+
+    display_timezone = ZoneInfo(timezone_name)
+    local_start = _calendar_datetime(item.get("start_time")).astimezone(
+        display_timezone
+    )
+    local_end = _calendar_datetime(item.get("end_time")).astimezone(display_timezone)
+    date_range = _format_calendar_datetime_range(
+        local_start, local_end, timezone_name=timezone_name
+    )
+    summary = str(item.get("summary") or "未命名日程")[:80]
+    form_elements = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{summary}**\n当前时间：{date_range}\n"
+                "保存只会更新待确认内容，不会立即写入日历。"
+            ),
+        },
+        *_clock_form_fields(
+            local_start.strftime("%H:%M"), local_end.strftime("%H:%M")
+        ),
+        {
+            "tag": "button",
+            "name": "calendar_mutation_plan_item_time_submit",
+            "type": "primary",
+            "text": {"tag": "plain_text", "content": "保存修改"},
+            "form_action_type": "submit",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_mutation_plan_item_time_submit",
+                    "version": "1",
+                    "plan_id": plan_id,
+                    "item_id": target_id,
+                },
+            }],
+        },
+    ]
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "修改日程时间"},
+        },
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "修改日程时间"},
+        },
+        "body": {
+            "direction": "vertical",
             "elements": [
-                {"tag": "markdown", "content": "\n\n".join(lines)},
                 {
-                    "tag": "button",
-                    "type": "danger" if operation == "delete" else "primary",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": f"确认{verb}这 {len(items)} 个",
-                    },
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "mindflow_action": "calendar_mutation_plan_confirm",
-                            "version": "1",
-                            "plan_id": plan_id,
-                        },
-                    }],
+                    "tag": "form",
+                    "name": "mindflow_calendar_mutation_plan_item_time",
+                    "elements": form_elements,
                 },
                 {
                     "tag": "button",
                     "type": "default",
-                    "text": {"tag": "plain_text", "content": "取消"},
+                    "text": {"tag": "plain_text", "content": "返回确认"},
                     "behaviors": [{
                         "type": "callback",
                         "value": {
-                            "mindflow_action": "calendar_mutation_plan_cancel",
+                            "mindflow_action": "calendar_mutation_plan_view",
                             "version": "1",
                             "plan_id": plan_id,
                         },

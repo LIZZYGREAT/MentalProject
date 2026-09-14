@@ -408,6 +408,7 @@ def build_business_services(
         calendar_mutation_plan_executor=(
             care_tools.execute_calendar_mutation_plan
         ),
+        calendar_mutation_plans=calendar_mutation_plans,
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
             "web_search_enabled": settings.web_search_enabled,

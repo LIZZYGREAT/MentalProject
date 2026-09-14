@@ -19,6 +19,16 @@ def test_registry_covers_action_families_and_failure_semantics():
     assert card_action_spec("course_schedule_item_time_submit").versions == frozenset(
         {"1", "2"}
     )
+    assert card_action_spec("calendar_mutation_plan_item_time_open").kind == (
+        "navigation"
+    )
+    assert card_action_spec("calendar_mutation_plan_view").replay_policy == "safe"
+    assert card_action_spec("calendar_mutation_plan_item_time_submit").kind == (
+        "internal_write"
+    )
+    assert card_action_spec(
+        "calendar_mutation_plan_item_time_submit"
+    ).replay_policy == "receipt_required"
     assert all(spec.versions for spec in CARD_ACTION_REGISTRY.values())
 
 

@@ -19,6 +19,7 @@ from app.integrations.feishu.cards import (
     _format_calendar_datetime_range,
     calendar_delete_confirmation_card,
     calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_time_card,
     care_intervention_card,
     care_intervention_result_card,
     daily_checkin_card,
@@ -101,6 +102,15 @@ def test_calendar_cards_format_same_day_and_never_render_raw_iso():
             },
         ],
     }
+    plan["ledger_items"] = [
+        {
+            "id": str(uuid.uuid4()),
+            "item_index": index,
+            "status": "pending",
+            "payload": item,
+        }
+        for index, item in enumerate(plan["items"])
+    ]
 
     card_text = json.dumps(
         calendar_mutation_plan_confirmation_card(plan), ensure_ascii=False
@@ -148,6 +158,55 @@ def test_today_calendar_card_converts_start_to_configured_timezone():
     )
 
     assert "**12:15**" in card["body"]["elements"][0]["content"]
+
+
+def test_calendar_plan_time_card_preserves_off_grid_minute_and_opaque_callback():
+    plan_id = str(uuid.uuid4())
+    item_id = str(uuid.uuid4())
+    item = {
+        "summary": "非整五分钟日程",
+        "start_time": "2026-09-14T13:43:12+08:00",
+        "end_time": "2026-09-14T14:17:59+08:00",
+    }
+    plan = {
+        "id": plan_id,
+        "operation": "create",
+        "status": "awaiting_confirmation",
+        "items": [item],
+        "ledger_items": [{
+            "id": item_id,
+            "item_index": 0,
+            "status": "pending",
+            "payload": item,
+        }],
+    }
+
+    card = calendar_mutation_plan_item_time_card(plan, item_id)
+    form = card["body"]["elements"][0]
+    selects = {
+        element["name"]: element
+        for element in form["elements"]
+        if element.get("tag") == "select_static"
+    }
+    minute_values = {
+        option["value"] for option in selects["start_minute"]["options"]
+    }
+    submit = next(
+        element
+        for element in form["elements"]
+        if element.get("tag") == "button"
+    )
+    callback = submit["behaviors"][0]["value"]
+
+    assert selects["start_minute"]["initial_option"] == "43"
+    assert "43" in minute_values
+    assert callback == {
+        "mindflow_action": "calendar_mutation_plan_item_time_submit",
+        "version": "1",
+        "plan_id": plan_id,
+        "item_id": item_id,
+    }
+    assert "summary" not in callback and "start_time" not in callback
 
 
 def test_calendar_delete_callback_executes_only_on_confirm():
