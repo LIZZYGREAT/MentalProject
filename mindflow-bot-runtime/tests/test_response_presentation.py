@@ -249,6 +249,49 @@ def test_source_footer_uses_only_backend_sources_and_deduplicates_urls():
     assert "Duplicate" not in compiled
 
 
+def test_rich_web_answer_strips_hallucinated_markdown_link():
+    compiled = PresentationCompiler().compile(
+        "请看[不可信页面](https://hallucinated.example/claim)。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "[不可信页面]" not in compiled
+    assert "不可信页面" in compiled
+    assert "hallucinated.example" not in compiled
+
+
+def test_rich_web_answer_keeps_backend_verified_link():
+    compiled = PresentationCompiler().compile(
+        "可查看[原始报道](https://Verified.example/article#section)。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "[原始报道](https://verified.example/article)" in compiled
+
+
+def test_rich_web_answer_does_not_expose_unverified_raw_url():
+    compiled = PresentationCompiler().compile(
+        "模型给出了 https://hallucinated.example/path ，请不要采用。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "https://hallucinated.example/path" not in compiled
+    assert "链接已省略" in compiled
+    assert "https://verified.example/article" in compiled
+
+
 def test_streaming_rich_path_does_not_call_presentation_agent():
     agent = GoodPresentationAgent()
     plan = asyncio.run(ResponseOrchestrator(

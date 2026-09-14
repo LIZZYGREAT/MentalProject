@@ -55,6 +55,12 @@ def test_system_rules_require_structured_search_evidence_and_no_fallback():
     assert "provider_no_sources" in SYSTEM_RULES
 
 
+def test_system_rules_assign_source_footer_to_backend_only():
+    assert "Do not create a source footer" in SYSTEM_RULES
+    assert "backend presentation layer appends verified sources" in SYSTEM_RULES
+    assert "list the returned sources briefly after the answer" not in SYSTEM_RULES
+
+
 def test_system_rules_keep_durable_memory_separate_from_preferences():
     assert "durable personal fact, goal, routine, preferred name" in SYSTEM_RULES
     for category in (

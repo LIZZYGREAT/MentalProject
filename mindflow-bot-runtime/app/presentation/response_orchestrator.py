@@ -124,6 +124,7 @@ class ResponseOrchestrator:
                 authoritative.text,
                 mode=mode,
                 evidence=evidence,
+                restrict_body_urls=bool(tools & _WEB_TOOLS),
             )
             return self._plan(
                 kind,

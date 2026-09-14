@@ -20,12 +20,25 @@ class PresentationCompiler:
         *,
         mode: PresentationMode,
         evidence: PresentationEvidence | None = None,
+        restrict_body_urls: bool = False,
     ) -> str:
         if mode not in {"rich_markdown", "streaming_markdown"}:
             return str(answer)
-        body = self.markdown.compile(answer)
-        footer = self._source_footer(evidence or PresentationEvidence())
+        verified_evidence = evidence or PresentationEvidence()
+        allowed_urls = (
+            self._allowed_urls(verified_evidence) if restrict_body_urls else None
+        )
+        body = self.markdown.compile(answer, allowed_urls=allowed_urls)
+        footer = self._source_footer(verified_evidence)
         return "\n\n".join(part for part in (body, footer) if part)
+
+    @staticmethod
+    def _allowed_urls(evidence: PresentationEvidence) -> set[str]:
+        return {
+            url
+            for source in evidence.sources
+            if (url := canonical_public_url(source.url)) is not None
+        }
 
     @staticmethod
     def _source_footer(evidence: PresentationEvidence) -> str:
