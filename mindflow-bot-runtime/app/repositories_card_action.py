@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 import uuid
-from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 
@@ -18,7 +16,7 @@ from app.models import CardActionReceipt
 class CardActionClaim:
     outcome: str
     status: str
-    result: dict[str, Any] | None = None
+    result_kind: str | None = None
     error_code: str | None = None
 
 
@@ -67,7 +65,7 @@ class CardActionReceiptRepository:
                 return CardActionClaim(
                     outcome="replay",
                     status=row.status,
-                    result=dict(row.result_json) if row.result_json else None,
+                    result_kind=row.result_kind,
                     error_code=row.error_code,
                 )
 
@@ -77,11 +75,13 @@ class CardActionReceiptRepository:
         *,
         action_fingerprint: str,
         status: str,
-        result: dict[str, Any] | None,
+        result_kind: str,
         error_code: str | None = None,
     ) -> None:
         if status not in {"succeeded", "rejected", "failed"}:
             raise ValueError("invalid CardAction receipt status")
+        if result_kind not in {"navigation", "mutation", "error"}:
+            raise ValueError("invalid CardAction receipt result kind")
         with self.database.session() as session:
             row = session.get(CardActionReceipt, event_id, with_for_update=True)
             if row is None or row.action_fingerprint != action_fingerprint:
@@ -89,15 +89,6 @@ class CardActionReceiptRepository:
             if row.status != "processing":
                 return
             row.status = status
-            row.result_kind = (
-                "navigation"
-                if result and result.get("navigation_only")
-                else "mutation" if result and result.get("ok") else "error"
-            )
-            row.result_json = (
-                json.loads(json.dumps(result, ensure_ascii=False, default=str))
-                if result is not None
-                else None
-            )
+            row.result_kind = result_kind
             row.error_code = str(error_code)[:64] if error_code else None
             row.completed_at = datetime.now(timezone.utc)

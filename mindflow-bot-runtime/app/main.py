@@ -316,7 +316,17 @@ def _build_card_action_handler(
             participant = identity.resolve(event.app_id, event.open_id)
             if participant is None:
                 raise ValueError("card operator is not bound to a participant")
-            if receipts is not None:
+            action_spec = card_action_spec(safe_action_name(event))
+            action_version = str(
+                (event.action_value or {}).get("version") or ""
+            ).strip()
+            receipt_required = bool(
+                receipts is not None
+                and action_spec is not None
+                and action_version in action_spec.versions
+                and action_spec.replay_policy == "receipt_required"
+            )
+            if receipt_required:
                 (
                     action_name,
                     action_version,
@@ -348,11 +358,22 @@ def _build_card_action_handler(
                             "reply_text": "操作正在处理中，请勿重复点击。",
                             "receipt_replayed": True,
                         }
-                    result = dict(claim.result or {
+                    if claim.status == "succeeded":
+                        reply_text = "该操作已经处理，无需重复点击。"
+                        return {
+                            "ok": True,
+                            "receipt_replayed": True,
+                            "reply_text": reply_text,
+                            "card": card_action_result_card(message=reply_text),
+                        }
+                    return {
                         "ok": False,
                         "error": claim.error_code or "card_action_failed",
-                    })
-                    result["receipt_replayed"] = True
+                        "receipt_replayed": True,
+                        "reply_text": (
+                            "该操作此前未完成，请重新打开最新卡片后重试。"
+                        ),
+                    }
                 else:
                     result = card_actions.handle(
                         participant.id,
@@ -377,7 +398,7 @@ def _build_card_action_handler(
                     event.event_id,
                     action_fingerprint=receipt_fingerprint,
                     status="failed",
-                    result={"ok": False, "error": "business_failed"},
+                    result_kind="error",
                     error_code="business_failed",
                 )
             error_id = uuid.uuid4().hex
@@ -407,7 +428,7 @@ def _build_card_action_handler(
                     event.event_id,
                     action_fingerprint=receipt_fingerprint,
                     status="rejected",
-                    result=result,
+                    result_kind="error",
                     error_code=str(result.get("error") or "action_rejected"),
                 )
             error_id = uuid.uuid4().hex
@@ -463,7 +484,7 @@ def _build_card_action_handler(
                 event.event_id,
                 action_fingerprint=receipt_fingerprint,
                 status="succeeded",
-                result=result,
+                result_kind="mutation",
             )
         if sender is None:
             log_stage(
