@@ -7,7 +7,15 @@ import pytest
 
 from app.integrations.feishu.client import FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
-from app.presentation.contracts import AgentActivityEvent, ResponsePlan, ResponseSegment, RuntimeResponse
+from app.presentation.contracts import (
+    AgentActivityEvent,
+    ExternalEvidenceSource,
+    PresentationEvidence,
+    ResponsePlan,
+    ResponseSegment,
+    RuntimeResponse,
+)
+from app.presentation.presentation_compiler import PresentationCompiler
 from app.presentation.markdown_sanitizer import MarkdownSanitizer
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.presentation_agent import ProductionPresentationAgent
@@ -175,6 +183,90 @@ def test_generic_progress_copy_uses_a_bounded_deterministic_template_pool():
     assert all("已完成" not in message for message in first_pass)
 
 
+def test_presentation_v2_routes_web_long_and_fixed_card_modes():
+    orchestrator = ResponseOrchestrator(segmenter=SemanticSegmenter(min_total_chars=20))
+
+    web = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("**结论**\n\n1. 第一项\n2. 第二项"),
+        cards=[],
+        used_tools={"web_search"},
+    ))
+    url_read = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("链接摘要"),
+        cards=[],
+        used_tools={"web_read_url"},
+    ))
+    short = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("你好呀"),
+        cards=[],
+        used_tools=set(),
+    ))
+    calendar = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("请在卡片中确认"),
+        cards=[{"schema": "2.0"}],
+        used_tools={"calendar_delete_event"},
+    ))
+
+    assert web.presentation_mode == "streaming_markdown"
+    assert url_read.presentation_mode == "streaming_markdown"
+    assert short.presentation_mode == "plain_text"
+    assert calendar.presentation_mode == "fixed_card"
+
+
+def test_feishu_rich_markdown_preserves_structure_and_rejects_html():
+    compiled = PresentationCompiler().compile(
+        "# 结论\n\n**重点**\n\n1. 第一项\n2. 第二项\n<script>alert(1)</script>",
+        mode="rich_markdown",
+    )
+
+    assert "**结论**" in compiled
+    assert "**重点**" in compiled
+    assert "1. 第一项" in compiled
+    assert "2. 第二项" in compiled
+    assert "<script>" not in compiled
+    assert "</script>" not in compiled
+
+
+def test_source_footer_uses_only_backend_sources_and_deduplicates_urls():
+    evidence = PresentationEvidence((
+        ExternalEvidenceSource("Official", "https://Example.com/a#fragment"),
+        ExternalEvidenceSource("Duplicate", "https://example.com/a"),
+        ExternalEvidenceSource("Unsafe", "javascript:alert(1)"),
+        ExternalEvidenceSource("Second", "https://example.com/b"),
+    ))
+
+    compiled = PresentationCompiler().compile(
+        "正文不包含来源。",
+        mode="streaming_markdown",
+        evidence=evidence,
+    )
+
+    assert compiled.count("https://example.com/a") == 1
+    assert "javascript:" not in compiled
+    assert "[Official](https://example.com/a)" in compiled
+    assert "[Second](https://example.com/b)" in compiled
+    assert "Duplicate" not in compiled
+
+
+def test_streaming_rich_path_does_not_call_presentation_agent():
+    agent = GoodPresentationAgent()
+    plan = asyncio.run(ResponseOrchestrator(
+        presentation_agent=agent,
+        presentation_agent_mode="always",
+        presentation_agent_min_chars=1,
+        segmenter=SemanticSegmenter(min_total_chars=1),
+    ).build_plan(
+        RuntimeResponse("**结论**\n\n1. 完整回答", response_kind="analysis"),
+        cards=[],
+        used_tools={"web_search"},
+    ))
+
+    assert plan.presentation_mode == "streaming_markdown"
+    assert plan.presentation_agent_attempted is False
+    assert plan.presentation_agent_outcome == "bypassed_rich"
+    assert agent.calls == 0
+
+
 class GoodPresentationAgent:
     def __init__(self):
         self.calls = 0
@@ -214,6 +306,7 @@ def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent()
         presentation_agent_mode="always",
         presentation_agent_min_chars=10,
         segmenter=SemanticSegmenter(min_total_chars=10, max_chars=650),
+        rich_presentation_enabled=False,
     )
     source = RuntimeResponse(
         "下午的分析比较长，峰值在 15:45，数值为 74.06。",
@@ -269,6 +362,7 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     bad_plan = asyncio.run(bad.build_plan(source, cards=[], used_tools=set()))
     assert bad_plan.presentation_agent_used is False
@@ -284,6 +378,7 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
         presentation_agent_min_chars=1,
         presentation_agent_timeout_seconds=0.01,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     slow_plan = asyncio.run(slow.build_plan(source, cards=[], used_tools=set()))
     assert slow_plan.presentation_agent_used is False
@@ -302,6 +397,7 @@ def test_presentation_rejects_free_text_even_when_all_numbers_are_preserved():
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     ).build_plan(source, cards=[], used_tools=set()))
 
     assert plan.presentation_agent_used is False
@@ -316,6 +412,7 @@ def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     plan = asyncio.run(
         orchestrator.build_plan(
@@ -349,6 +446,7 @@ def test_invalid_presentation_fallback_keeps_complete_authoritative_answer():
         presentation_agent=BadNumericPresentationAgent(),
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
+        rich_presentation_enabled=False,
     )
     plan = asyncio.run(
         orchestrator.build_plan(
@@ -379,6 +477,7 @@ def test_adaptive_mode_skips_secondary_model_when_local_plan_is_lossless_and_bou
         segmenter=SemanticSegmenter(
             min_total_chars=100, target_chars=260, max_chars=650, max_segments=3
         ),
+        rich_presentation_enabled=False,
     )
 
     plan = asyncio.run(orchestrator.build_plan(
@@ -411,6 +510,7 @@ def test_timeout_is_a_hard_user_visible_deadline_and_cleanup_applies_backpressur
             presentation_agent_timeout_seconds=0.01,
             presentation_agent_max_pending_cleanups=1,
             segmenter=SemanticSegmenter(min_total_chars=1),
+            rich_presentation_enabled=False,
         )
         source = RuntimeResponse(
             "完整权威结论：15:45 的数值是 74.06。", response_kind="analysis"

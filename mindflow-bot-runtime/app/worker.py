@@ -51,6 +51,8 @@ from app.repositories_course_schedule_image import (
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
+    ExternalEvidenceSource,
+    PresentationEvidence,
     ResponsePlan,
     ResponseSegment,
     RuntimeResponse,
@@ -297,6 +299,7 @@ class ProgressState:
     sent: int = 0
     last_sent_at: float = 0.0
     used_tools: set[str] = field(default_factory=set)
+    evidence_sources: list[ExternalEvidenceSource] = field(default_factory=list)
     sent_keys: set[str] = field(default_factory=set)
     last_stage: str | None = None
     first_activity_at: float | None = None
@@ -2391,6 +2394,8 @@ class BotWorker:
                 tool_name = str(activity.tool_name or "")
                 if tool_name:
                     progress.used_tools.add(tool_name)
+                if activity.evidence is not None:
+                    progress.evidence_sources.extend(activity.evidence.sources)
                 if activity.kind == "tool_started" and tool_name:
                     if progress.first_tool_started_at is None:
                         progress.first_tool_started_at = now
@@ -2520,6 +2525,7 @@ class BotWorker:
                 response,
                 cards=delivered_cards,
                 used_tools=progress.used_tools,
+                evidence=PresentationEvidence(tuple(progress.evidence_sources)),
             )
             metrics["presentation_ms"] = round(
                 (time.monotonic() - presentation_started) * 1000, 1

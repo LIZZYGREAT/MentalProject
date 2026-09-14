@@ -15,6 +15,28 @@ ResponseKind = Literal[
     "error",
 ]
 
+PresentationMode = Literal[
+    "plain_text",
+    "rich_markdown",
+    "streaming_markdown",
+    "fixed_card",
+]
+
+EvidenceKind = Literal["search", "url_read"]
+
+
+@dataclass(frozen=True)
+class ExternalEvidenceSource:
+    title: str
+    url: str
+    published_at: str | None = None
+    kind: EvidenceKind = "search"
+
+
+@dataclass(frozen=True)
+class PresentationEvidence:
+    sources: tuple[ExternalEvidenceSource, ...] = ()
+
 ActivityKind = Literal[
     "thinking",
     "tool_started",
@@ -28,6 +50,7 @@ class AgentActivityEvent:
     kind: ActivityKind
     tool_name: str | None = None
     status: str | None = None
+    evidence: PresentationEvidence | None = None
 
 
 AgentActivityCallback = Callable[[AgentActivityEvent], Awaitable[None]]
@@ -75,6 +98,7 @@ class ResponsePlan:
     full_text: str
     segments: tuple[ResponseSegment, ...]
     use_cards: bool
+    presentation_mode: PresentationMode = "plain_text"
     presentation_agent_used: bool = False
     presentation_agent_attempted: bool = False
     presentation_agent_outcome: str = "not_eligible"
