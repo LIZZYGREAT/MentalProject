@@ -461,6 +461,20 @@ def test_gateway_preserves_card_action_identity():
     assert CardActionEvent.from_ipc_payload(event.to_ipc_payload()) == event
 
 
+def test_card_action_rejects_oversized_callback_token():
+    action = channel_card_action()
+    action.raw["event"]["token"] = "x" * 4097
+    with pytest.raises(InvalidBotEvent, match="token is too long"):
+        FeishuChannelCardActionAdapter("cli_test").adapt(action)
+
+    payload = FeishuChannelCardActionAdapter("cli_test").adapt(
+        channel_card_action()
+    ).to_ipc_payload()
+    payload["callback_token"] = "x" * 4097
+    with pytest.raises(InvalidBotEvent, match="token is too long"):
+        CardActionEvent.from_ipc_payload(payload)
+
+
 def test_receiver_registers_card_action():
     output = sync_queue.Queue()
     stop_event = threading.Event()

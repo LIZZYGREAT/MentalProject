@@ -618,6 +618,9 @@ def test_feishu_client_prefers_callback_token_without_message_patch():
 
     assert len(delayed_requests) == 1
     assert delayed_requests[0].uri == "/open-apis/interactive/v1/card/update"
+    assert delayed_requests[0].headers["Content-Type"] == (
+        "application/json; charset=utf-8"
+    )
     assert delayed_requests[0].body == {"token": "callback-token", "card": card}
 
 

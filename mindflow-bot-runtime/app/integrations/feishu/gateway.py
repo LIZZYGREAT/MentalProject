@@ -145,6 +145,9 @@ class BotEvent:
         )
 
 
+_MAX_CALLBACK_TOKEN_LENGTH = 4096
+
+
 @dataclass(frozen=True)
 class CardActionEvent:
     event_id: str
@@ -198,6 +201,9 @@ class CardActionEvent:
             raise InvalidBotEvent(
                 "card action IPC monotonic timestamp is invalid"
             ) from exc
+        callback_token = str(payload.get("callback_token") or "").strip()
+        if len(callback_token) > _MAX_CALLBACK_TOKEN_LENGTH:
+            raise InvalidBotEvent("card action callback token is too long")
         return cls(
             event_id=values["event_id"],
             message_id=values["message_id"],
@@ -207,9 +213,7 @@ class CardActionEvent:
             action_tag=str(payload.get("action_tag") or "")[:64],
             action_value=dict(action_value),
             form_value=dict(form_value),
-            callback_token=(
-                str(payload.get("callback_token") or "").strip() or None
-            ),
+            callback_token=callback_token or None,
             received_monotonic=received_monotonic,
         )
 
@@ -250,10 +254,13 @@ class FeishuCardActionAdapter:
         tag = str(getattr(action, "tag", "") or "")[:64]
         value = getattr(action, "value", None) or {}
         form_value = getattr(action, "form_value", None) or {}
+        normalized_callback_token = str(callback_token or "").strip()
         if not all((message_id, chat_id, open_id)):
             raise InvalidBotEvent("card action is missing routing fields")
         if not isinstance(value, dict) or not isinstance(form_value, dict):
             raise InvalidBotEvent("card action values must be objects")
+        if len(normalized_callback_token) > _MAX_CALLBACK_TOKEN_LENGTH:
+            raise InvalidBotEvent("card action callback token is too long")
         identity_payload = json.dumps(
             {
                 "message_id": message_id,
@@ -280,7 +287,7 @@ class FeishuCardActionAdapter:
             action_tag=tag,
             action_value=dict(value),
             form_value=dict(form_value),
-            callback_token=str(callback_token or "").strip() or None,
+            callback_token=normalized_callback_token or None,
             received_monotonic=time.monotonic(),
         )
 

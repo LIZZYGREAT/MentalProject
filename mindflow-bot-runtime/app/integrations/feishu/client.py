@@ -110,6 +110,7 @@ class FeishuClient:
         if not isinstance(card, dict) or not card:
             raise ValueError("Feishu card must be a non-empty object")
 
+        from lark_oapi.core.const import APPLICATION_JSON, CONTENT_TYPE
         from lark_oapi.core.enum import AccessTokenType, HttpMethod
         from lark_oapi.core.model import BaseRequest
 
@@ -118,6 +119,7 @@ class FeishuClient:
             .http_method(HttpMethod.POST)
             .uri("/open-apis/interactive/v1/card/update")
             .token_types({AccessTokenType.TENANT})
+            .headers({CONTENT_TYPE: f"{APPLICATION_JSON}; charset=utf-8"})
             .body({"token": normalized_token, "card": card})
             .build()
         )
