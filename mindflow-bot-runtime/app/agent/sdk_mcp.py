@@ -21,11 +21,16 @@ logger = logging.getLogger(__name__)
 
 
 def _presentation_evidence(tool_name: str, value: Any) -> PresentationEvidence | None:
-    if tool_name not in {"web_search", "web_read_result", "web_read_url"}:
+    if tool_name not in {
+        "web_search",
+        "web_read_result",
+        "web_read_url",
+        "web_read_url_chunk",
+    }:
         return None
     if not isinstance(value, dict) or value.get("ok") is not True:
         return None
-    kind = "url_read" if tool_name == "web_read_url" else "search"
+    kind = "url_read" if tool_name.startswith("web_read_url") else "search"
     raw_sources: list[Any] = []
     if isinstance(value.get("sources"), list):
         raw_sources.extend(value["sources"])

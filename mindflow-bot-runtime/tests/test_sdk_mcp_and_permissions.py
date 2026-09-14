@@ -537,7 +537,8 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         assert spec.parameters["type"] == "object"
         assert spec.parameters["additionalProperties"] is False
         properties = set(spec.parameters.get("properties", {}))
-        assert properties.isdisjoint(FORBIDDEN_FIELDS)
+        allowed = {"url"} if spec.name == "web_read_url" else set()
+        assert properties.isdisjoint(FORBIDDEN_FIELDS - allowed)
 
     classifications = {
         spec.name: (spec.effect, spec.authorization_requirement)

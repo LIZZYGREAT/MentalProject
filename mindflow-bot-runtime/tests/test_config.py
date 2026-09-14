@@ -70,6 +70,12 @@ def test_web_search_uses_deepseek_credential_and_native_defaults():
     assert settings.web_search_max_output_tokens == 4096
     assert settings.web_search_retry_max_output_tokens == 6144
     assert settings.web_search_summary_max_chars == 12000
+    assert settings.web_read_url_enabled is True
+    assert settings.web_read_url_timeout_seconds == 10
+    assert settings.web_read_url_max_bytes == 2097152
+    assert settings.web_read_url_max_redirects == 3
+    assert settings.web_read_url_max_extracted_chars == 60000
+    assert settings.web_read_url_cache_ttl_minutes == 30
     assert not hasattr(settings, "web_search_api_url")
     assert not hasattr(settings, "web_search_api_key")
 

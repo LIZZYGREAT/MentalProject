@@ -43,7 +43,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 <!-- BUSINESS_TOOL_COUNT: 20 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0069_card_action_receipt_minimization -->
+<!-- ALEMBIC_HEAD: 0070_web_document_cache -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -185,6 +185,12 @@ python3 scripts/smoke_deepseek_web_search.py
 
 成功时输出 `PASS provider=deepseek_native sources=N`，失败时输出稳定的
 `reason_code` 供部署排查。
+
+公开链接读取由 `web_read_url` / `web_read_url_chunk` 提供，只接受不含凭据或
+敏感 query 参数的公开 HTTPS HTML/纯文本页面。每一跳重定向都会重新进行 DNS
+与 SSRF 校验，正文通过 Trafilatura 抽取后按 participant 隔离并仅缓存 30 分钟；
+私网、metadata、登录页面、PDF 和其他二进制内容均会稳定拒绝。生产网络层仍应
+使用安全组或出站防火墙阻止容器访问 loopback、link-local 和 VPC 私网服务。
 
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
 `claude`。Compose 把 `/home/mindflow/.claude` 挂到 `claude_state` volume，确保

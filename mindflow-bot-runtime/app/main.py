@@ -996,7 +996,8 @@ async def run() -> None:
         support_preferences=business.interaction_preferences,
     )
     web_search_maintenance_scheduler = WebSearchMaintenanceScheduler(
-        business.web_search.repository
+        business.web_search.repository,
+        business.public_web_documents.repository,
     )
     card_action_receipt_maintenance_scheduler = (
         CardActionReceiptMaintenanceScheduler(card_action_receipts)

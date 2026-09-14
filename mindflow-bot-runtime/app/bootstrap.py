@@ -36,6 +36,7 @@ from app.repositories_morning_brief import MorningBriefScheduleRepository
 from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
+from app.repositories_web_document import WebDocumentRepository
 from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_preferences import InteractionPreferenceRepository
 from app.repositories_support_preferences import SupportPreferenceRepository
@@ -96,6 +97,7 @@ from app.services.web_search_service import (
     DisabledSearchProvider,
     WebSearchService,
 )
+from app.services.public_web_document_service import PublicWebDocumentService
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -142,6 +144,7 @@ class BusinessServices:
     reminders: ReminderRepository
     followup_candidates: CareFollowupCandidateRepository
     web_search: WebSearchService
+    public_web_documents: PublicWebDocumentService
     memory: MemoryService
     interaction_preferences: InteractionPreferenceService
     psychological_context: PsychologicalContextBuilder
@@ -237,6 +240,15 @@ def build_business_services(
             f"Unsupported WEB_SEARCH_PROVIDER: {settings.web_search_provider}"
         )
     web_search = WebSearchService(WebSearchRepository(database), search_provider)
+    public_web_documents = PublicWebDocumentService(
+        WebDocumentRepository(database),
+        enabled=settings.web_read_url_enabled,
+        timeout_seconds=settings.web_read_url_timeout_seconds,
+        max_bytes=settings.web_read_url_max_bytes,
+        max_redirects=settings.web_read_url_max_redirects,
+        max_extracted_chars=settings.web_read_url_max_extracted_chars,
+        cache_ttl_minutes=settings.web_read_url_cache_ttl_minutes,
+    )
     memory = MemoryService(ParticipantMemoryRepository(database))
     interaction_preferences = InteractionPreferenceService(
         InteractionPreferenceRepository(database),
@@ -388,7 +400,7 @@ def build_business_services(
     ReminderTools(
         reminders, proactive_notifications, timezone_name=settings.timezone_name
     ).register(registry)
-    WebTools(web_search).register(registry)
+    WebTools(web_search, public_web_documents).register(registry)
     MemoryTools(memory, presentations).register(registry)
     InteractionPreferenceTools(interaction_preferences, presentations).register(registry)
     ResearchTools(research_aggregates).register(registry)
@@ -468,6 +480,7 @@ def build_business_services(
         reminders=reminders,
         followup_candidates=followup_candidates,
         web_search=web_search,
+        public_web_documents=public_web_documents,
         memory=memory,
         interaction_preferences=interaction_preferences,
         psychological_context=psychological_context,

@@ -133,6 +133,12 @@ class Settings:
     web_search_max_output_tokens: int = 4096
     web_search_retry_max_output_tokens: int = 6144
     web_search_summary_max_chars: int = 12000
+    web_read_url_enabled: bool = True
+    web_read_url_timeout_seconds: float = 10.0
+    web_read_url_max_bytes: int = 2 * 1024 * 1024
+    web_read_url_max_redirects: int = 3
+    web_read_url_max_extracted_chars: int = 60000
+    web_read_url_cache_ttl_minutes: int = 30
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -409,6 +415,22 @@ class Settings:
             web_search_summary_max_chars=_int(
                 values, "WEB_SEARCH_SUMMARY_MAX_CHARS", 12000, minimum=1000
             ),
+            web_read_url_enabled=_bool(values, "WEB_READ_URL_ENABLED", True),
+            web_read_url_timeout_seconds=_float(
+                values, "WEB_READ_URL_TIMEOUT_SECONDS", 10.0, minimum=1.0
+            ),
+            web_read_url_max_bytes=_int(
+                values, "WEB_READ_URL_MAX_BYTES", 2 * 1024 * 1024, minimum=1024
+            ),
+            web_read_url_max_redirects=_int(
+                values, "WEB_READ_URL_MAX_REDIRECTS", 3, minimum=1
+            ),
+            web_read_url_max_extracted_chars=_int(
+                values, "WEB_READ_URL_MAX_EXTRACTED_CHARS", 60000, minimum=1000
+            ),
+            web_read_url_cache_ttl_minutes=_int(
+                values, "WEB_READ_URL_CACHE_TTL_MINUTES", 30, minimum=5
+            ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
             ).strip(),
@@ -585,6 +607,10 @@ class Settings:
             raise ValueError(
                 "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS must be >= WEB_SEARCH_MAX_OUTPUT_TOKENS"
             )
+        if self.web_read_url_max_redirects > 10:
+            raise ValueError("WEB_READ_URL_MAX_REDIRECTS must be <= 10")
+        if self.web_read_url_cache_ttl_minutes > 120:
+            raise ValueError("WEB_READ_URL_CACHE_TTL_MINUTES must be <= 120")
         if self.web_search_enabled and not self.deepseek_api_key:
             raise ValueError(
                 "DEEPSEEK_API_KEY is required when web search is enabled"

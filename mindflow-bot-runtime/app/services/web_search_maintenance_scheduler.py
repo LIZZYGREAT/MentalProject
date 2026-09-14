@@ -11,15 +11,25 @@ logger = logging.getLogger(__name__)
 
 
 class WebSearchMaintenanceScheduler:
-    def __init__(self, repository, *, interval_seconds: int = 3600) -> None:
-        self.repository = repository
+    def __init__(
+        self,
+        repository,
+        *additional_repositories,
+        interval_seconds: int = 3600,
+    ) -> None:
+        self.repositories = (repository, *additional_repositories)
         self.interval_seconds = max(60, int(interval_seconds))
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
     async def run_once(self, now: datetime | None = None) -> dict[str, int]:
         instant = now or datetime.now(timezone.utc)
-        return await asyncio.to_thread(self.repository.purge_expired, instant)
+        totals: dict[str, int] = {}
+        for repository in self.repositories:
+            counts = await asyncio.to_thread(repository.purge_expired, instant)
+            for key, value in counts.items():
+                totals[key] = totals.get(key, 0) + int(value)
+        return totals
 
     async def run_forever(self) -> None:
         self.started.set()
