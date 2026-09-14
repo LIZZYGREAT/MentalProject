@@ -385,10 +385,18 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
     assert len(edit_actions) == 2
     target_item_id = draft["items"][0]["id"]
     assert edit_actions[0]["item_id"] == target_item_id
+    visible = json.dumps(preview, ensure_ascii=False)
+    assert "1. **计算机体系结构(0965)**" in visible
+    assert "2. **计算机体系结构(0965)**" in visible
+    assert "修改第 1 门课时间" in visible
+    assert "修改第 2 门课时间" in visible
+    assert "修改 计算机体系结构" not in visible
     form = course_schedule_item_time_card(draft, target_item_id)
     form_json = json.dumps(form, ensure_ascii=False)
     assert "mindflow_course_schedule_item_time" in form_json
     assert '"tag": "input"' not in form_json
+
+
     assert form_json.count('"tag": "select_static"') == 4
     assert "HH:MM" not in form_json
 
@@ -424,6 +432,51 @@ def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write(
         "12:00",
         "13:40",
     )
+
+
+def test_course_edit_button_keeps_visual_index_when_middle_item_is_not_editable():
+    course = dict(vision_payload()["courses"][0])
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": {
+            "courses": [
+                {**course, "course_name": "同名长课程" * 10},
+                {**course, "course_name": "同名长课程" * 10},
+                {**course, "course_name": "同名长课程" * 10},
+            ],
+            "missing_context": ["weekday"],
+        },
+        "items": [
+            {"id": str(uuid.uuid4())},
+            {"id": ""},
+            {"id": str(uuid.uuid4())},
+        ],
+    }
+
+    card = course_schedule_preview_card(draft)
+    buttons = [
+        element
+        for element in card["body"]["elements"]
+        if element.get("tag") == "button"
+        and element.get("behaviors", [{}])[0]
+        .get("value", {})
+        .get("mindflow_action") == "course_schedule_item_time_open"
+    ]
+
+    assert [button["text"]["content"] for button in buttons] == [
+        "修改第 1 门课时间",
+        "修改第 3 门课时间",
+    ]
+    assert buttons[0]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][0]["id"]
+    )
+    assert buttons[1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][2]["id"]
+    )
+    assert all(len(button["text"]["content"]) < 20 for button in buttons)
 
 
 def test_legacy_time_card_submission_accepts_unpadded_and_full_width_colon():

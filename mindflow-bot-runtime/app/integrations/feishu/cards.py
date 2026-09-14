@@ -113,7 +113,7 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         location = _safe_schedule_text(course.get("location") or "地点待确认")
         lines.extend([
             "",
-            f"**{name}**",
+            f"{index + 1}. **{name}**",
             f"{day} · {period} · {actual_time} · {week_text} · {location}",
         ])
         source = time_sources[index] if index < len(time_sources) else None
@@ -204,7 +204,9 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
         "recurrence_strategy"
     ):
         editable_items = [
-            item for item in items[:20] if str(item.get("id") or "").strip()
+            (index + 1, item)
+            for index, item in enumerate(items[:20])
+            if index < len(courses) and str(item.get("id") or "").strip()
         ]
         if editable_items:
             elements.append({
@@ -212,8 +214,10 @@ def course_schedule_preview_card(draft: dict[str, Any]) -> dict[str, Any]:
                 "content": "如单门课程时间有误，可直接修改对应课程：",
             })
             elements.extend(
-                _schedule_item_edit_button(draft["id"], item)
-                for item in editable_items
+                _schedule_item_edit_button(
+                    draft["id"], item, display_index=display_index
+                )
+                for display_index, item in editable_items
             )
     if missing and status == "pending_context":
         lines.append("\n填写关键信息后，我会先给出完整预览；确认前不会添加到日历。")
@@ -434,20 +438,19 @@ def _clock_form_fields(start: str, end: str) -> list[dict[str, Any]]:
 
 
 def _schedule_item_edit_button(
-    import_id: str, item: dict[str, Any]
+    import_id: str,
+    item: dict[str, Any],
+    *,
+    display_index: int,
 ) -> dict[str, Any]:
-    name = _safe_schedule_text(item.get("course_name") or "未命名课程")[:40]
-    period = (
-        f" · {item.get('start_time')}–{item.get('end_time')}"
-        if item.get("start_time") and item.get("end_time")
-        else ""
-    )
+    if display_index < 1:
+        raise ValueError("course display index must be positive")
     return {
         "tag": "button",
         "type": "default",
         "text": {
             "tag": "plain_text",
-            "content": f"修改 {name}{period}",
+            "content": f"修改第 {display_index} 门课时间",
         },
         "behaviors": [{"type": "callback", "value": {
             "mindflow_action": "course_schedule_item_time_open",
