@@ -11,10 +11,9 @@ import inspect
 import ipaddress
 import re
 import socket
+import ssl
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
-
-import httpx
 
 
 _SECRET_QUERY_KEYS = {
@@ -51,52 +50,214 @@ class FetchedWebDocument:
 
 
 class LimitedWebFetcher(Protocol):
-    async def fetch(self, url: str, *, timeout_seconds: float, max_bytes: int) -> RawWebResponse: ...
-
-
-class HttpxLimitedWebFetcher:
     async def fetch(
         self,
         url: str,
         *,
+        resolved_addresses: tuple[str, ...],
+        server_hostname: str,
+        timeout_seconds: float,
+        max_bytes: int,
+    ) -> RawWebResponse: ...
+
+
+class PinnedHttpsWebFetcher:
+    """HTTPS-only HTTP/1.1 fetcher that never resolves the URL hostname itself.
+
+    The caller supplies public addresses already validated for this exact URL.
+    TCP connects to those literal addresses, while TLS SNI and certificate
+    validation continue to use the original hostname.
+    """
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        resolved_addresses: tuple[str, ...],
+        server_hostname: str,
         timeout_seconds: float,
         max_bytes: int,
     ) -> RawWebResponse:
+        addresses = tuple(dict.fromkeys(str(item) for item in resolved_addresses))
+        if not addresses:
+            raise PublicWebReadError("dns_resolution_failed")
+        for address in addresses:
+            _assert_public_ip(address)
+        parsed = urlsplit(url)
+        target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        request = self._request_bytes(target, server_hostname)
+        deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+        last_error: BaseException | None = None
+        for address in addresses:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise PublicWebReadError("fetch_timeout") from last_error
+            try:
+                return await asyncio.wait_for(
+                    self._fetch_from_address(
+                        address,
+                        server_hostname=server_hostname,
+                        request=request,
+                        max_bytes=max_bytes,
+                    ),
+                    timeout=remaining,
+                )
+            except PublicWebReadError:
+                raise
+            except asyncio.TimeoutError as exc:
+                last_error = exc
+            except (OSError, ssl.SSLError, ValueError, asyncio.IncompleteReadError) as exc:
+                last_error = exc
+        if isinstance(last_error, asyncio.TimeoutError):
+            raise PublicWebReadError("fetch_timeout") from last_error
+        raise PublicWebReadError("fetch_unavailable") from last_error
+
+    @staticmethod
+    def _request_bytes(target: str, server_hostname: str) -> bytes:
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout_seconds,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "Accept": "text/html,text/plain;q=0.9",
-                        "User-Agent": "MindFlow-PublicWebReader/1.0",
-                    },
-                ) as response:
-                    declared = response.headers.get("content-length")
-                    if declared:
-                        try:
-                            if int(declared) > max_bytes:
-                                raise PublicWebReadError("response_too_large")
-                        except ValueError:
-                            pass
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > max_bytes:
-                            raise PublicWebReadError("response_too_large")
-                    return RawWebResponse(
-                        status_code=response.status_code,
-                        headers={key.casefold(): value for key, value in response.headers.items()},
-                        body=bytes(body),
-                    )
-        except httpx.TimeoutException as exc:
-            raise PublicWebReadError("fetch_timeout") from exc
-        except httpx.RequestError as exc:
+            hostname = ipaddress.ip_address(server_hostname).compressed
+        except ValueError:
+            hostname = str(server_hostname).encode("idna").decode("ascii")
+        else:
+            if ":" in hostname:
+                hostname = f"[{hostname}]"
+        return (
+            f"GET {target} HTTP/1.1\r\n"
+            f"Host: {hostname}\r\n"
+            "Accept: text/html,text/plain;q=0.9\r\n"
+            "Accept-Encoding: identity\r\n"
+            "User-Agent: MindFlow-PublicWebReader/1.0\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+
+    async def _fetch_from_address(
+        self,
+        address: str,
+        *,
+        server_hostname: str,
+        request: bytes,
+        max_bytes: int,
+    ) -> RawWebResponse:
+        reader = writer = None
+        try:
+            reader, writer = await asyncio.open_connection(
+                host=address,
+                port=443,
+                ssl=ssl.create_default_context(),
+                server_hostname=server_hostname,
+            )
+            writer.write(request)
+            await writer.drain()
+            status_code, headers = await self._read_headers(reader)
+            body = await self._read_body(
+                reader,
+                headers=headers,
+                status_code=status_code,
+                max_bytes=max_bytes,
+            )
+            return RawWebResponse(status_code=status_code, headers=headers, body=body)
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (OSError, ssl.SSLError):
+                    pass
+
+    @staticmethod
+    async def _read_headers(reader) -> tuple[int, dict[str, str]]:
+        status_line = await reader.readline()
+        if not status_line or len(status_line) > 8192:
+            raise PublicWebReadError("fetch_unavailable")
+        try:
+            _protocol, raw_status, _reason = status_line.decode("iso-8859-1").rstrip("\r\n").split(" ", 2)
+            status_code = int(raw_status)
+        except (UnicodeDecodeError, ValueError) as exc:
             raise PublicWebReadError("fetch_unavailable") from exc
+        headers: dict[str, str] = {}
+        total = len(status_line)
+        while True:
+            line = await reader.readline()
+            total += len(line)
+            if not line or total > 65536:
+                raise PublicWebReadError("fetch_unavailable")
+            if line in {b"\r\n", b"\n"}:
+                return status_code, headers
+            try:
+                key, value = line.decode("iso-8859-1").rstrip("\r\n").split(":", 1)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise PublicWebReadError("fetch_unavailable") from exc
+            normalized = key.strip().casefold()
+            if not normalized:
+                raise PublicWebReadError("fetch_unavailable")
+            headers[normalized] = value.strip()
+
+    @classmethod
+    async def _read_body(
+        cls,
+        reader,
+        *,
+        headers: dict[str, str],
+        status_code: int,
+        max_bytes: int,
+    ) -> bytes:
+        if status_code in {204, 304} or 100 <= status_code < 200:
+            return b""
+        transfer_encoding = headers.get("transfer-encoding", "").casefold()
+        if "chunked" in transfer_encoding:
+            return await cls._read_chunked_body(reader, max_bytes=max_bytes)
+        declared = headers.get("content-length")
+        if declared:
+            try:
+                length = int(declared)
+            except ValueError:
+                length = None
+            if length is not None:
+                if length < 0:
+                    raise PublicWebReadError("fetch_unavailable")
+                if length > max_bytes:
+                    raise PublicWebReadError("response_too_large")
+                return await reader.readexactly(length)
+        return await cls._read_until_eof(reader, max_bytes=max_bytes)
+
+    @staticmethod
+    async def _read_until_eof(reader, *, max_bytes: int) -> bytes:
+        body = bytearray()
+        while True:
+            chunk = await reader.read(min(65536, max_bytes + 1))
+            if not chunk:
+                return bytes(body)
+            body.extend(chunk)
+            if len(body) > max_bytes:
+                raise PublicWebReadError("response_too_large")
+
+    @staticmethod
+    async def _read_chunked_body(reader, *, max_bytes: int) -> bytes:
+        body = bytearray()
+        while True:
+            line = await reader.readline()
+            if not line or len(line) > 8192:
+                raise PublicWebReadError("fetch_unavailable")
+            try:
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError as exc:
+                raise PublicWebReadError("fetch_unavailable") from exc
+            if size < 0 or len(body) + size > max_bytes:
+                raise PublicWebReadError("response_too_large")
+            if size == 0:
+                while True:
+                    trailer = await reader.readline()
+                    if not trailer or len(trailer) > 8192:
+                        raise PublicWebReadError("fetch_unavailable")
+                    if trailer in {b"\r\n", b"\n"}:
+                        return bytes(body)
+            body.extend(await reader.readexactly(size))
+            if await reader.readexactly(2) != b"\r\n":
+                raise PublicWebReadError("fetch_unavailable")
+
+
+# Retain the old import name for integrations that imported the implementation.
+HttpxLimitedWebFetcher = PinnedHttpsWebFetcher
 
 
 def validate_public_https_url(value: str) -> str:
@@ -267,8 +428,12 @@ class PublicWebDocumentService:
                     raise PublicWebReadError("dns_resolution_failed")
                 for address in addresses:
                     _assert_public_ip(address)
+            else:
+                raise PublicWebReadError("dns_resolution_failed")
             response = await self.fetcher.fetch(
                 current,
+                resolved_addresses=addresses,
+                server_hostname=str(parsed.hostname),
                 timeout_seconds=self.timeout_seconds,
                 max_bytes=self.max_bytes,
             )

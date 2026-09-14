@@ -18,8 +18,22 @@ class FakeFetcher:
         self.responses = list(responses)
         self.calls = []
 
-    async def fetch(self, url, *, timeout_seconds, max_bytes):
-        self.calls.append((url, timeout_seconds, max_bytes))
+    async def fetch(
+        self,
+        url,
+        *,
+        resolved_addresses,
+        server_hostname,
+        timeout_seconds,
+        max_bytes,
+    ):
+        self.calls.append((
+            url,
+            tuple(resolved_addresses),
+            server_hostname,
+            timeout_seconds,
+            max_bytes,
+        ))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
