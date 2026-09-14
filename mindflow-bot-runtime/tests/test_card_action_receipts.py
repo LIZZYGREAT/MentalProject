@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -6,6 +7,9 @@ import pytest
 from app import main as app_main
 from app.models import CardActionReceipt
 from app.repositories_card_action import CardActionReceiptRepository
+from app.services.card_action_receipt_maintenance_scheduler import (
+    CardActionReceiptMaintenanceScheduler,
+)
 from tests.helpers import memory_database, participant
 
 
@@ -220,3 +224,84 @@ def test_processing_receipt_returns_in_progress_without_business_execution():
     )
     assert replay.outcome == "replay"
     assert replay.status == "processing"
+
+
+def test_sensitive_form_and_callback_values_are_not_persisted():
+    database = memory_database()
+    bound = participant(database, "CARD-PRIVATE-FORM")
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: bound),
+        SimpleNamespace(
+            handle=lambda *_args, **_kwargs: {
+                "ok": True,
+                "reply_text": "saved",
+                "card": {"schema": "2.0"},
+            }
+        ),
+        None,
+        receipts=CardActionReceiptRepository(database),
+    )
+    event = _event(event_id="private-form", action="memory_edit_save")
+    event.form_value = {
+        "content": "PRIVATE-MEMORY-BODY-DO-NOT-PERSIST",
+        "title": "PRIVATE-TITLE-DO-NOT-PERSIST",
+    }
+    event.callback_token = "PRIVATE-CALLBACK-TOKEN-DO-NOT-PERSIST"
+
+    assert handler(event)["ok"] is True
+
+    with database.session() as session:
+        receipt = session.get(CardActionReceipt, event.event_id)
+        stored_values = " ".join(
+            str(getattr(receipt, column.name))
+            for column in CardActionReceipt.__table__.columns
+        )
+    assert "PRIVATE-" not in stored_values
+
+
+def test_expired_receipts_are_purged_in_bounded_batches():
+    database = memory_database()
+    bound = participant(database, "CARD-PURGE")
+    repository = CardActionReceiptRepository(database, ttl_hours=24)
+    base = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    for event_id, created_at in (
+        ("expired-1", base),
+        ("expired-2", base + timedelta(hours=1)),
+        ("live", base + timedelta(hours=48)),
+    ):
+        repository.claim(
+            event_id=event_id,
+            participant_id=bound.id,
+            action_name="submit_checkin",
+            action_version="1",
+            action_fingerprint=f"fingerprint-{event_id}",
+            message_id_hash=f"message-{event_id}",
+            now=created_at,
+        )
+
+    now = base + timedelta(hours=36)
+    assert repository.purge_expired(now=now, limit=1) == 1
+    assert repository.purge_expired(now=now, limit=1) == 1
+    assert repository.purge_expired(now=now, limit=1) == 0
+
+    with database.session() as session:
+        assert session.get(CardActionReceipt, "live") is not None
+        assert session.query(CardActionReceipt).count() == 1
+
+
+def test_receipt_maintenance_scheduler_runs_repository_cleanup_off_loop():
+    calls = []
+
+    class Repository:
+        def purge_expired(self, *, now, limit):
+            calls.append((now, limit))
+            return 3
+
+    scheduler = CardActionReceiptMaintenanceScheduler(
+        Repository(), interval_seconds=1, batch_size=125
+    )
+    instant = datetime(2030, 1, 2, tzinfo=timezone.utc)
+
+    assert asyncio.run(scheduler.run_once(instant)) == 3
+    assert calls == [(instant, 125)]
+    assert scheduler.interval_seconds == 60

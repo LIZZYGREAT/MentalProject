@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import uuid
 
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
@@ -102,3 +103,36 @@ class CardActionReceiptRepository:
             row.result_kind = result_kind
             row.error_code = str(error_code)[:64] if error_code else None
             row.completed_at = datetime.now(timezone.utc)
+
+    def purge_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 500,
+    ) -> int:
+        if not 1 <= int(limit) <= 5000:
+            raise ValueError(
+                "CardAction receipt purge limit must be between 1 and 5000"
+            )
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("CardAction receipt purge timestamp must include a timezone")
+        instant = instant.astimezone(timezone.utc)
+        with self.database.session() as session:
+            event_ids = list(
+                session.scalars(
+                    select(CardActionReceipt.event_id)
+                    .where(CardActionReceipt.expires_at <= instant)
+                    .order_by(CardActionReceipt.expires_at, CardActionReceipt.event_id)
+                    .limit(int(limit))
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            if not event_ids:
+                return 0
+            session.execute(
+                delete(CardActionReceipt).where(
+                    CardActionReceipt.event_id.in_(event_ids)
+                )
+            )
+            return len(event_ids)
