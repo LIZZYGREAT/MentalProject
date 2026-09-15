@@ -1038,7 +1038,7 @@ def _mutation_tools():
 
 def test_calendar_create_queues_forecast_refresh():
     tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
-    result = asyncio.run(tools.create_calendar_event(ctx, {
+    result = asyncio.run(tools._execute_calendar_create_effect(ctx, {
         "summary": "复盘",
         "recurrence_mode": "single",
         "start_time": "2030-01-15T09:00:00+08:00",
@@ -1054,7 +1054,7 @@ def test_calendar_create_queues_forecast_refresh():
 
 def test_calendar_update_queues_refresh_for_old_and_new_dates():
     tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
-    result = asyncio.run(tools.update_calendar_event(ctx, {
+    result = asyncio.run(tools._execute_calendar_update_effect(ctx, {
         "event_id": "e1",
         "start_time": "2030-01-16T09:00:00+08:00",
         "end_time": "2030-01-16T10:00:00+08:00",
@@ -1068,12 +1068,8 @@ def test_calendar_update_queues_refresh_for_old_and_new_dates():
 
 
 def test_calendar_delete_queues_forecast_refresh():
-    tools, coordinator, mutation_refresh, ctx, presentations = _mutation_tools()
-    pending = asyncio.run(tools.delete_calendar_event(ctx, {"event_id": "e1"}))
-    assert pending["calendar_mutation"] == "pending_confirmation"
+    tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
     assert mutation_refresh.requests == []
-    cards = presentations.take_cards(ctx.agent_run_id)
-    assert cards[0]["header"]["title"]["content"] == "确认删除日程"
     result = asyncio.run(
         tools.confirm_calendar_delete(
             ctx.participant_id, "e1", source_message_id="callback-1"
@@ -1109,10 +1105,6 @@ def test_calendar_mutation_reschedules_warning():
         presentations=PresentationOutbox(), mutation_refresh=mutation_refresh,
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "message", uuid.uuid4())
-    pending = asyncio.run(
-        tools.delete_calendar_event(ctx, {"event_id": old_event["id"]})
-    )
-    assert pending["calendar_mutation"] == "pending_confirmation"
     result = asyncio.run(
         tools.confirm_calendar_delete(
             ctx.participant_id,

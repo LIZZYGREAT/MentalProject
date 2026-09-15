@@ -34,11 +34,23 @@ class ReplyEvents:
     def set_processing(self, _event_id, _participant_id):
         return None
 
-    def stage_reply_plan(self, _event_id, *, full_text, segments):
+    def stage_reply_plan(
+        self,
+        _event_id,
+        *,
+        full_text,
+        segments,
+        presentation_mode="plain_text",
+        rich_text=None,
+        plain_text_fallback=None,
+    ):
         self.plan = SimpleNamespace(
             full_text=full_text,
             segments=tuple(segments),
             next_segment=0,
+            presentation_mode=presentation_mode,
+            rich_text=rich_text,
+            plain_text_fallback=plain_text_fallback,
         )
 
     def mark_reply_segment_sent(self, _event_id, *, segment_index, message_id):

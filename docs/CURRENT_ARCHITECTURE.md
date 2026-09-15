@@ -2,7 +2,7 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 20 -->
+<!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
 <!-- ALEMBIC_HEAD: 0074_calendar_plan_update -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
@@ -32,7 +32,7 @@ Vision 请求、严格解析与 Draft 创建共享同一并发上限；同步图
 
 ## Agent 与业务工具
 
-每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 16 个封闭 schema
+每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 21 个封闭 schema
 的 participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线和 Calendar。工具
 Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 
@@ -55,6 +55,7 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `calendar_create_event`
 - `calendar_create_events_plan`
 - `calendar_update_event`
+- `calendar_update_events_plan`
 - `calendar_delete_event`
 - `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
