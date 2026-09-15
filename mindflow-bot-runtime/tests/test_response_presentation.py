@@ -709,6 +709,32 @@ class ProviderSender:
         return message_id
 
 
+class RichFallbackSender(ProviderSender):
+    def __init__(self, *, fail_card=False):
+        super().__init__()
+        self.fail_card = fail_card
+        self.cards = []
+
+    def send_card(self, chat_id, card, *, message_uuid=None):
+        if self.fail_card:
+            raise FeishuSendError(
+                "planned rich card failure",
+                retryable=False,
+                operation="send_card",
+            )
+        self.cards.append((chat_id, card, message_uuid))
+        return f"card-out-{len(self.cards)}"
+
+
+class StreamingStartFailureSender(RichFallbackSender):
+    async def start_streaming_card(self, *_args, **_kwargs):
+        raise FeishuSendError(
+            "planned streaming start failure",
+            retryable=False,
+            operation="create_card_instance",
+        )
+
+
 class StreamingProviderSender(ProviderSender):
     def __init__(self, *, fail_after_updates=None):
         super().__init__()
@@ -855,6 +881,64 @@ def test_streaming_failure_before_answer_falls_back_to_durable_text_once():
     assert delivered is True
     assert [item[1] for item in sender.visible] == [final]
     assert sum(item[1] == final for item in sender.visible) == 1
+
+
+def test_streaming_start_failure_falls_back_to_rich_card():
+    repository, event = _event_and_repository("stream-start-rich-fallback")
+    sender = StreamingStartFailureSender()
+    worker = _worker(repository, sender)
+    final = "**结论**\n\n1. [来源](https://example.com/article)"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert sender.visible == []
+    assert len(sender.cards) == 1
+    markdown = sender.cards[0][1]["body"]["elements"][0]
+    assert markdown == {"tag": "markdown", "content": final}
+
+
+def test_rich_card_failure_falls_back_to_clean_plain_text():
+    repository, event = _event_and_repository("rich-clean-plain-fallback")
+    sender = RichFallbackSender(fail_card=True)
+    worker = _worker(repository, sender)
+    final = "**来源**\n\n1. [公开页面](https://example.com/article)"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert [item[1] for item in sender.visible] == [
+        "来源\n\n• 公开页面：https://example.com/article"
+    ]
+    assert "**" not in sender.visible[0][1]
+    assert "[公开页面](" not in sender.visible[0][1]
+
+
+def test_streaming_markdown_never_reaches_send_text_raw():
+    repository, event = _event_and_repository("stream-no-raw-text")
+    sender = RichFallbackSender(fail_card=True)
+    worker = _worker(repository, sender)
+    raw_markdown = "**来源**\n\n- [文档](https://example.com/doc)"
+
+    asyncio.run(worker._deliver_plan(event, _streaming_plan(raw_markdown)))
+
+    sent_texts = [item[1] for item in sender.calls]
+    assert raw_markdown not in sent_texts
+    assert sent_texts == ["来源\n\n• 文档：https://example.com/doc"]
+
+
+def test_source_footer_is_rendered_in_rich_card_not_literal_plain_text():
+    repository, event = _event_and_repository("source-footer-rich-card")
+    sender = RichFallbackSender()
+    worker = _worker(repository, sender)
+    final = "回答。\n\n**来源**\n\n1. [文档](https://example.com/doc)"
+
+    asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert sender.visible == []
+    assert sender.cards[0][1]["body"]["elements"] == [
+        {"tag": "markdown", "content": final}
+    ]
 
 
 def test_progress_card_is_closed_when_final_uses_plain_text_fallback():

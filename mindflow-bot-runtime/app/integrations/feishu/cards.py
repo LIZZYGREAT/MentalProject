@@ -27,6 +27,24 @@ _UNCERTAIN_FIELD_LABELS = {
 }
 
 
+def rich_answer_card(markdown_text: str) -> dict[str, Any]:
+    """Non-streaming Card 2.0 fallback for a validated Markdown answer."""
+
+    content = str(markdown_text or "").strip()
+    if not content:
+        raise ValueError("rich answer markdown is required")
+    return {
+        "schema": "2.0",
+        "config": {"summary": {"content": "MindFlow"}},
+        "header": {
+            "title": {"tag": "plain_text", "content": "MindFlow"},
+        },
+        "body": {
+            "elements": [{"tag": "markdown", "content": content}],
+        },
+    }
+
+
 def _calendar_datetime(value: object) -> datetime:
     if isinstance(value, datetime):
         parsed = value

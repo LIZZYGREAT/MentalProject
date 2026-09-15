@@ -204,6 +204,9 @@ class PendingReplyPlan:
     next_segment: int
     message_ids: tuple[str, ...]
     plan_version: str
+    presentation_mode: str = "plain_text"
+    rich_text: str | None = None
+    plain_text_fallback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -4248,6 +4251,13 @@ class BotEventRepository:
                 next_segment=next_segment,
                 message_ids=message_ids,
                 plan_version=version,
+                presentation_mode=str(row.reply_presentation_mode or "plain_text"),
+                rich_text=(str(row.reply_rich_text) if row.reply_rich_text else None),
+                plain_text_fallback=(
+                    str(row.reply_plain_text_fallback)
+                    if row.reply_plain_text_fallback
+                    else None
+                ),
             )
 
     def pending_streaming_reply_plan(
@@ -4358,6 +4368,9 @@ class BotEventRepository:
         full_text: str,
         segments: list[str] | tuple[str, ...],
         plan_version: str = "response-plan-v1",
+        presentation_mode: str = "plain_text",
+        rich_text: str | None = None,
+        plain_text_fallback: str | None = None,
     ) -> None:
         normalized = [str(item) for item in segments if str(item)]
         if not normalized:
@@ -4375,6 +4388,13 @@ class BotEventRepository:
             row.reply_next_segment = 0
             row.reply_message_ids_json = []
             row.reply_plan_version = str(plan_version)[:32]
+            row.reply_presentation_mode = str(presentation_mode)[:32]
+            row.reply_rich_text = str(rich_text) if rich_text is not None else None
+            row.reply_plain_text_fallback = (
+                str(plain_text_fallback)
+                if plain_text_fallback is not None
+                else None
+            )
             row.status = "reply_pending"
             row.error_code = None
 

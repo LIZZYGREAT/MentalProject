@@ -61,7 +61,9 @@ from app.presentation.contracts import (
 from app.integrations.feishu.cards import (
     course_schedule_preview_card,
     external_llm_consent_card,
+    rich_answer_card,
 )
+from app.presentation.markdown_sanitizer import sanitize_markdown
 from app.presentation.consent_texts import external_llm_consent_prompt_text
 from app.repositories_consent import ParticipantConsentRepository
 from app.services.consent_service import ConsentService
@@ -3027,6 +3029,21 @@ class BotWorker:
             event.event_id,
             full_text=plan.full_text,
             segments=[segment.text for segment in plan.segments],
+            presentation_mode=(
+                "rich_markdown"
+                if plan.presentation_mode == "streaming_markdown"
+                else plan.presentation_mode
+            ),
+            rich_text=(
+                plan.full_text
+                if plan.presentation_mode in {"rich_markdown", "streaming_markdown"}
+                else None
+            ),
+            plain_text_fallback=(
+                sanitize_markdown(plan.full_text)
+                if plan.presentation_mode in {"rich_markdown", "streaming_markdown"}
+                else plan.full_text
+            ),
         )
         pending = await asyncio.to_thread(
             self.events.pending_reply_plan, event.event_id
@@ -3241,13 +3258,43 @@ class BotWorker:
                 )
                 return False
             try:
-                message_id = await self._send(
-                    event.chat_id,
-                    pending_plan.segments[index],
-                    message_uuid=self._stable_message_uuid(
-                        f"mindflow:reply:{event.event_id}:{index}"
-                    ),
+                message_uuid = self._stable_message_uuid(
+                    f"mindflow:reply:{event.event_id}:{index}"
                 )
+                if (
+                    index == 0
+                    and pending_plan.presentation_mode == "rich_markdown"
+                    and pending_plan.rich_text
+                ):
+                    try:
+                        message_id = await self._send_card(
+                            event.chat_id,
+                            rich_answer_card(pending_plan.rich_text),
+                            message_uuid=message_uuid,
+                        )
+                    except FeishuSendError as exc:
+                        logger.warning(
+                            "rich_answer_card_send_failed event_id=%s "
+                            "error_code=%s retryable=%s operation=%s",
+                            event.event_id,
+                            exc.code,
+                            exc.retryable,
+                            exc.operation,
+                        )
+                        message_id = await self._send(
+                            event.chat_id,
+                            pending_plan.plain_text_fallback
+                            or sanitize_markdown(pending_plan.rich_text),
+                            message_uuid=self._stable_message_uuid(
+                                f"mindflow:reply-plain:{event.event_id}:{index}"
+                            ),
+                        )
+                else:
+                    message_id = await self._send(
+                        event.chat_id,
+                        pending_plan.segments[index],
+                        message_uuid=message_uuid,
+                    )
             except FeishuSendError as exc:
                 await asyncio.to_thread(
                     self.events.note_reply_failure, event.event_id
