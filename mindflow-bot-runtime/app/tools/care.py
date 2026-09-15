@@ -1917,11 +1917,13 @@ class CareTools:
             if args.get("end_time") is not None
             else None
         )
-        recurrence = (
-            str(args["recurrence"])
-            if args.get("recurrence")
-            else _recurrence_from_args(args, self.timezone)
-        )
+        clear_recurrence = bool(args.get("clear_recurrence", False))
+        if clear_recurrence:
+            recurrence = None
+        elif "recurrence" in args:
+            recurrence = str(args.get("recurrence") or "").strip() or None
+        else:
+            recurrence = _recurrence_from_args(args, self.timezone)
         try:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])
@@ -1929,7 +1931,6 @@ class CareTools:
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
         previous_event = dict(previous or {})
-        clear_recurrence = bool(args.get("clear_recurrence", False))
         requested_event = {
             **previous_event,
             **({"summary": args["summary"]} if args.get("summary") is not None else {}),
@@ -1995,7 +1996,7 @@ class CareTools:
                 end_time=end_time,
                 reminder_minutes=args.get("reminder_minutes"),
                 recurrence=recurrence,
-                clear_recurrence=bool(args.get("clear_recurrence", False)),
+                clear_recurrence=clear_recurrence,
             )
         except PermissionError as exc:
             await self._finish_remote_mutation_intent(

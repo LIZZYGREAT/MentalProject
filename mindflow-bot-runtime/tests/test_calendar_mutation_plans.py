@@ -1063,6 +1063,166 @@ def test_recurring_create_plan_preserves_recurrence_until_runner_execution():
     assert created["description"] == "保留说明"
 
 
+def test_update_plan_applies_new_weekly_recurrence_after_confirmation():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-RECURRENCE")
+    calendar = _Calendar()
+    calendar.events["weekend-1"]["start_time"] = "2030-01-07T17:30:00+08:00"
+    calendar.events["weekend-1"]["end_time"] = "2030-01-07T19:00:00+08:00"
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "把周一活动改成每周一重复，共四次")
+    expected_rule = "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;COUNT=4"
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_event",
+        {
+            "event_id": "weekend-1",
+            "recurrence_frequency": "WEEKLY",
+            "recurrence_weekdays": ["MO"],
+            "recurrence_count": 4,
+        },
+    ))
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert calendar.updated == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    assert plans.get(plan_id)["items"][0]["recurrence"] == expected_rule
+    plans.request_execution(owner.id, plan_id)
+    asyncio.run(runner.run_once())
+
+    assert calendar.updated[0][2]["recurrence"] == expected_rule
+
+
+def test_batch_update_plan_applies_normalized_recurrence():
+    database = memory_database()
+    owner = participant(database, "PLAN-BATCH-UPDATE-RECURRENCE")
+    calendar = _Calendar()
+    calendar.events["weekend-1"]["start_time"] = "2030-01-07T17:30:00+08:00"
+    calendar.events["weekend-1"]["end_time"] = "2030-01-07T19:00:00+08:00"
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "把两个活动改为不同的重复规则")
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_events_plan",
+        {
+            "updates": [
+                {
+                    "event_id": "weekend-1",
+                    "recurrence_frequency": "WEEKLY",
+                    "recurrence_weekdays": ["MO"],
+                    "recurrence_count": 4,
+                },
+                {
+                    "event_id": "weekend-2",
+                    "recurrence_frequency": "DAILY",
+                    "recurrence_count": 2,
+                },
+            ]
+        },
+    ))
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert calendar.updated == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    plans.request_execution(owner.id, plan_id)
+    asyncio.run(runner.run_once())
+
+    assert [call[2]["recurrence"] for call in calendar.updated] == [
+        "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;COUNT=4",
+        "FREQ=DAILY;INTERVAL=1;COUNT=2",
+    ]
+
+
+def test_update_plan_preserves_existing_recurrence_when_not_requested():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-KEEP-RECURRENCE")
+    calendar = _Calendar()
+    existing_rule = "FREQ=WEEKLY;INTERVAL=1;BYDAY=SA"
+    calendar.events["weekend-1"]["recurrence"] = existing_rule
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "只修改活动名称")
+
+    asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_event",
+        {"event_id": "weekend-1", "summary": "新名称"},
+    ))
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    plans.request_execution(owner.id, plan_id)
+    asyncio.run(runner.run_once())
+
+    assert calendar.updated[0][2]["recurrence"] == existing_rule
+    assert calendar.updated[0][2]["clear_recurrence"] is False
+
+
+def test_update_plan_clear_recurrence_still_clears_rule():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-CLEAR-RECURRENCE")
+    calendar = _Calendar()
+    calendar.events["weekend-1"]["recurrence"] = (
+        "FREQ=WEEKLY;INTERVAL=1;BYDAY=SA"
+    )
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "取消活动重复")
+
+    asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_event",
+        {"event_id": "weekend-1", "clear_recurrence": True},
+    ))
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    plans.request_execution(owner.id, plan_id)
+    asyncio.run(runner.run_once())
+
+    update_args = calendar.updated[0][2]
+    assert update_args["recurrence"] is None
+    assert update_args["clear_recurrence"] is True
+
+
+def test_update_plan_recurrence_change_waits_for_confirmation():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-RECURRENCE-WAIT")
+    calendar = _Calendar()
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "把活动改成每天重复两次")
+
+    asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_event",
+        {
+            "event_id": "weekend-1",
+            "recurrence_frequency": "DAILY",
+            "recurrence_count": 2,
+        },
+    ))
+
+    assert asyncio.run(runner.run_once()) == 0
+    assert calendar.updated == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    plans.request_execution(owner.id, plan_id)
+    assert asyncio.run(runner.run_once()) == 1
+    assert calendar.updated[0][2]["recurrence"] == (
+        "FREQ=DAILY;INTERVAL=1;COUNT=2"
+    )
+
+
 def test_single_update_stages_then_runner_executes_after_confirmation():
     database = memory_database()
     owner = participant(database, "PLAN-SINGLE-UPDATE")
