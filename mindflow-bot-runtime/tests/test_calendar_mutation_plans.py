@@ -441,10 +441,7 @@ def test_multi_date_create_uses_one_plan_card_and_executes_once():
 
     assert planned.result["calendar_mutation"] == "pending_confirmation"
     assert calendar.created == []
-    assert len(verifier.calls) == 1
-    assert len(
-        verifier.calls[0]["proposal_summary"]["requested_values"]["events"]
-    ) == 2
+    assert verifier.calls == []
     cards = outbox.take_cards(ctx.agent_run_id)
     assert len(cards) == 1
     confirm = _plan_action(cards[0], "_confirm")
@@ -504,10 +501,7 @@ def test_multi_event_delete_binds_all_targets_to_one_card_before_deleting():
 
     assert planned.result["item_count"] == 2
     assert calendar.deleted == []
-    assert len(verifier.calls) == 1
-    proposal = verifier.calls[0]["proposal_summary"]
-    assert proposal["exact_target_count"] == 2
-    assert "weekend-1" not in json.dumps(proposal)
+    assert verifier.calls == []
     card = outbox.take_cards(ctx.agent_run_id)[0]
     serialized = json.dumps(card, ensure_ascii=False)
     assert "weekend-1" not in serialized and "weekend-2" not in serialized
@@ -1388,7 +1382,7 @@ def test_polite_question_with_concrete_delete_action_stages_one_plan():
     assert calendar.deleted == []
 
 
-def test_batch_delete_capability_question_creates_no_plan_or_provider_effect():
+def test_calendar_stage_does_not_call_mutation_verifier_or_provider():
     database = memory_database()
     owner = participant(database, "PLAN-CAPABILITY")
     calendar = _Calendar()
@@ -1414,10 +1408,10 @@ def test_batch_delete_capability_question_creates_no_plan_or_provider_effect():
         plan_count = session.scalar(
             select(func.count()).select_from(CalendarMutationPlan)
         )
-    assert result.status == "tool_effect_not_authorized"
-    assert result.result["reason_code"] == "capability_question"
-    assert plan_count == 0
-    assert outbox.take_cards(ctx.agent_run_id) == []
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert verifier.calls == []
+    assert plan_count == 1
+    assert len(outbox.take_cards(ctx.agent_run_id)) == 1
     assert calendar.deleted == []
 
 

@@ -564,20 +564,20 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "calendar_connection_status": ("read", "none"),
         "calendar_list_calendars": ("read", "none"),
         "calendar_list_events": ("read", "none"),
-        "calendar_create_event": ("external_write", "direct_request"),
-        "calendar_create_events_plan": ("external_write", "direct_request"),
-            "calendar_update_event": ("external_write", "direct_request"),
+        "calendar_create_event": ("confirmation_stage", "none"),
+        "calendar_create_events_plan": ("confirmation_stage", "none"),
+            "calendar_update_event": ("confirmation_stage", "none"),
             "calendar_update_events_plan": (
-                "external_write",
-                "direct_request",
+                "confirmation_stage",
+                "none",
             ),
         "calendar_delete_event": (
-            "destructive_external_write",
-            "explicit_destructive_request",
+            "confirmation_stage",
+            "none",
         ),
         "calendar_delete_events_plan": (
-            "destructive_external_write",
-            "explicit_destructive_request",
+            "confirmation_stage",
+            "none",
         ),
     }
 
@@ -592,11 +592,11 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
     assert delete_spec.parameters["required"] == ["event_id"]
     assert "confirmed" not in delete_spec.parameters["properties"]
     assert "scope_kind" not in delete_spec.parameters["properties"]
-    assert delete_spec.authorization_context_resolver is not None
+    assert delete_spec.authorization_context_resolver is None
     update_spec = next(
         spec for spec in registry.specs if spec.name == "calendar_update_event"
     )
-    assert update_spec.authorization_context_resolver is not None
+    assert update_spec.authorization_context_resolver is None
     assert "scope_kind" not in update_spec.parameters["properties"]
     assert update_spec.parameters["dependentRequired"] == {
         "start_time": ["end_time"],

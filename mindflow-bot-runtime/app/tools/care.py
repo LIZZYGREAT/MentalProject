@@ -661,8 +661,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.create_calendar_event,
-            effect="external_write",
-            authorization_requirement="direct_request",
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_create_events_plan",
@@ -681,8 +681,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.create_calendar_events_plan,
-            effect="external_write",
-            authorization_requirement="direct_request",
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_update_event",
@@ -707,9 +707,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_event,
-            effect="external_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_update_events_plan",
@@ -728,11 +727,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_events_plan,
-            effect="external_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_calendar_updates_plan_authorization_context
-            ),
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_delete_event",
@@ -746,9 +742,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.delete_calendar_event,
-            effect="destructive_external_write",
-            authorization_requirement="explicit_destructive_request",
-            authorization_context_resolver=self.resolve_calendar_event_authorization_context,
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "calendar_delete_events_plan",
@@ -772,11 +767,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.delete_calendar_events_plan,
-            effect="destructive_external_write",
-            authorization_requirement="explicit_destructive_request",
-            authorization_context_resolver=(
-                self.resolve_calendar_events_plan_authorization_context
-            ),
+            effect="confirmation_stage",
+            authorization_requirement="none",
         )
 
     def get_today_context(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
