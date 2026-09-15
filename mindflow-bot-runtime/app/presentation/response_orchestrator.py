@@ -23,9 +23,11 @@ from app.presentation.semantic_segmenter import SemanticSegmenter
 
 _TRANSACTIONAL_TOOLS = {
     "calendar_create_event",
+    "calendar_create_events_plan",
     "calendar_update_event",
     "calendar_update_events_plan",
     "calendar_delete_event",
+    "calendar_delete_events_plan",
 }
 _ANALYSIS_TOOLS = {
     "care_run_today_assessment",

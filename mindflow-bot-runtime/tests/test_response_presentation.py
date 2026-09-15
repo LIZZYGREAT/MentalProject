@@ -214,6 +214,29 @@ def test_presentation_v2_routes_web_long_and_fixed_card_modes():
     assert calendar.presentation_mode == "fixed_card"
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "calendar_create_event",
+        "calendar_create_events_plan",
+        "calendar_update_event",
+        "calendar_update_events_plan",
+        "calendar_delete_event",
+        "calendar_delete_events_plan",
+    ],
+)
+def test_all_calendar_mutation_tools_share_fixed_card_transaction_policy(tool_name):
+    plan = asyncio.run(ResponseOrchestrator().build_plan(
+        RuntimeResponse("请在卡片中确认"),
+        cards=[{"schema": "2.0"}],
+        used_tools={tool_name},
+    ))
+
+    assert plan.kind == "transactional"
+    assert plan.presentation_mode == "fixed_card"
+    assert plan.presentation_agent_used is False
+
+
 def test_feishu_rich_markdown_preserves_structure_and_rejects_html():
     compiled = PresentationCompiler().compile(
         "# 结论\n\n**重点**\n\n1. 第一项\n2. 第二项\n<script>alert(1)</script>",
