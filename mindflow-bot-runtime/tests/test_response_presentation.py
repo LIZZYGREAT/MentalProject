@@ -235,6 +235,43 @@ def test_all_calendar_mutation_tools_share_fixed_card_transaction_policy(tool_na
     assert plan.kind == "transactional"
     assert plan.presentation_mode == "fixed_card"
     assert plan.presentation_agent_used is False
+    assert plan.use_cards is True
+    assert plan.segments == ()
+    assert plan.full_text == ""
+
+
+def test_calendar_confirmation_card_failure_keeps_text_fallback():
+    plan = asyncio.run(ResponseOrchestrator().build_plan(
+        RuntimeResponse("已生成待确认方案，请确认。"),
+        cards=[],
+        used_tools={"calendar_update_event"},
+    ))
+
+    assert plan.kind == "transactional"
+    assert plan.presentation_mode == "plain_text"
+    assert [segment.text for segment in plan.segments] == [
+        "已生成待确认方案，请确认。"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    [
+        ("calendar_create_event", "我在核对日程信息并准备确认卡。"),
+        ("calendar_update_event", "我在核对修改内容并准备确认卡。"),
+        ("calendar_delete_event", "我在核对要删除的日程并准备确认卡。"),
+        ("calendar_create_events_plan", "我在整理这些日程并准备确认卡。"),
+        ("calendar_update_events_plan", "我在整理这些日程并准备确认卡。"),
+        ("calendar_delete_events_plan", "我在整理这些日程并准备确认卡。"),
+    ],
+)
+def test_calendar_progress_copy_prepares_confirmation_without_claiming_write(
+    tool_name, expected
+):
+    assert ProgressPresenter().present(
+        AgentActivityEvent(kind="tool_started", tool_name=tool_name),
+        state=ProgressState(),
+    ) == expected
 
 
 def test_feishu_rich_markdown_preserves_structure_and_rejects_html():

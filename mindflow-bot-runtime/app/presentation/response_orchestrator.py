@@ -103,6 +103,14 @@ class ResponseOrchestrator:
 
         sanitized = self.sanitizer.sanitize(authoritative.text)
         if kind == "transactional":
+            if mode == "fixed_card" and cards:
+                return self._plan(
+                    kind,
+                    (),
+                    True,
+                    False,
+                    presentation_mode="fixed_card",
+                )
             return self._plan(
                 kind,
                 (sanitized,),

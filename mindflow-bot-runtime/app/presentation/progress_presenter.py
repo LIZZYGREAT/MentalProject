@@ -83,13 +83,13 @@ class ProgressPresenter:
             if stage == "intervention_feedback":
                 return "我正在记录这次反馈。"
             if tool_name == "calendar_create_event":
-                return "我正在核对时间并创建这条日程。"
+                return "我在核对日程信息并准备确认卡。"
             if tool_name == "calendar_update_event":
-                return "我正在修改这条日程。"
+                return "我在核对修改内容并准备确认卡。"
             if tool_name == "calendar_delete_event":
-                return "我正在处理这条已确认的删除操作。"
+                return "我在核对要删除的日程并准备确认卡。"
             if stage == "calendar_mutation_plan":
-                return "我正在核对这些日程并准备确认卡片。"
+                return "我在整理这些日程并准备确认卡。"
         return None
 
     def delayed(
