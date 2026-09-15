@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.domain.course_schedule_recurrence import (
     EXPAND_ALL_OCCURRENCES,
@@ -1285,6 +1285,96 @@ def calendar_mutation_plan_confirmation_card(
         "body": {
             "direction": "vertical",
             "elements": elements,
+        },
+    }
+
+
+def reminder_proposal_confirmation_card(
+    proposal: dict[str, Any],
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Fixed review card whose callback carries only a backend proposal id."""
+
+    proposal_id = str(proposal.get("id") or "").strip()
+    operation = str(proposal.get("operation") or "").strip()
+    payload = dict(proposal.get("payload") or {})
+    if not proposal_id or len(proposal_id) > 64 or operation not in {"create", "cancel"}:
+        raise ValueError("reminder proposal is invalid")
+    message = str(payload.get("message") or "").strip()[:500]
+    raw_time = str(payload.get("remind_at") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
+        display_time = parsed.astimezone(ZoneInfo(timezone_name)).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("reminder proposal time is invalid") from exc
+    recurrence = {
+        "none": "仅一次",
+        "daily": "每天",
+        "weekly": "每周",
+    }.get(str(payload.get("recurrence_type") or ""))
+    if recurrence is None or not message:
+        raise ValueError("reminder proposal payload is invalid")
+    cancelling = operation == "cancel"
+    title = "确认取消提醒" if cancelling else "确认创建提醒"
+    confirm_label = "确认取消" if cancelling else "确认提醒"
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": title},
+        },
+        "header": {
+            "template": "orange" if cancelling else "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**{message}**\n时间：{display_time}\n重复：{recurrence}\n\n"
+                        + (
+                            "确认后这条提醒将停止。"
+                            if cancelling
+                            else "确认前不会保存或发送这条提醒。"
+                        )
+                    ),
+                },
+                {
+                    "tag": "button",
+                    "type": "danger" if cancelling else "primary",
+                    "text": {"tag": "plain_text", "content": confirm_label},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "reminder_proposal_confirm",
+                            "version": "1",
+                            "proposal_id": proposal_id,
+                        },
+                    }],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "reminder_proposal_cancel",
+                            "version": "1",
+                            "proposal_id": proposal_id,
+                        },
+                    }],
+                },
+            ],
         },
     }
 

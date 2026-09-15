@@ -8,19 +8,28 @@ from zoneinfo import ZoneInfo
 import uuid
 
 from app.agent.context import AgentContext
-from app.agent.tool_registry import AuthorizationContextResolutionError, ToolRegistry
+from app.agent.tool_registry import ToolRegistry
+from app.integrations.feishu.cards import reminder_proposal_confirmation_card
 
 
 class ReminderTools:
-    def __init__(self, reminders: Any, proactive_policy: Any, *, timezone_name: str) -> None:
+    def __init__(
+        self,
+        reminders: Any,
+        proactive_policy: Any,
+        presentations: Any = None,
+        *,
+        timezone_name: str,
+    ) -> None:
         self.reminders = reminders
         self.proactive_policy = proactive_policy
+        self.presentations = presentations
         self.timezone = ZoneInfo(timezone_name)
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "reminder_create",
-            "Create a participant-owned reminder when the message and reminder time are explicit or unambiguously resolvable from the user's words using backend_time_context. If the time remains ambiguous, ask one clarification question instead of calling this tool.",
+            "Stage a participant-owned reminder proposal after interpreting the message, exact RFC3339 reminder time, and recurrence. If the time remains ambiguous, ask one clarification question. The reminder is persisted only after the participant confirms the fixed review card.",
             {
                 "type": "object",
                 "properties": {
@@ -31,8 +40,9 @@ class ReminderTools:
                 "required": ["message", "remind_at", "recurrence_type"],
                 "additionalProperties": False,
             },
-            self.create, effect="internal_write", authorization_requirement="direct_request",
-            authorization_context_resolver=self.authorization_context,
+            self.create,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "reminder_list", "List this participant's active reminders and recent delivery failures.",
@@ -40,13 +50,15 @@ class ReminderTools:
             self.list, effect="read", authorization_requirement="none",
         )
         registry.register(
-            "reminder_cancel", "Cancel one exact participant-owned reminder after a direct request.",
+            "reminder_cancel", "Stage cancellation of one exact participant-owned reminder. The reminder remains active until the participant confirms the fixed review card.",
             {
                 "type": "object",
                 "properties": {"reminder_id": {"type": "string", "format": "uuid"}},
                 "required": ["reminder_id"], "additionalProperties": False,
             },
-            self.cancel, effect="internal_write", authorization_requirement="direct_request",
+            self.cancel,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
 
     def create(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -77,7 +89,7 @@ class ReminderTools:
                 "error": "reminder_time_in_past",
                 "detail": "remind_at must be in the future.",
             }
-        row = self.reminders.create(
+        proposal = self.reminders.stage_create(
             ctx.participant_id, message=args["message"], remind_at=remind_at,
             recurrence_type=args["recurrence_type"],
         )
@@ -85,31 +97,22 @@ class ReminderTools:
         quiet_warning = self.proactive_policy.user_requested_quiet_hours_warning(
             ctx.participant_id, remind_at
         )
+        if self.presentations is None:
+            raise RuntimeError("reminder proposal presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            reminder_proposal_confirmation_card(
+                proposal, timezone_name=self.timezone.key
+            ),
+        )
         return {
-            "ok": True, "reminder": {key: value for key, value in row.items() if key not in {"participant_id", "claim_token"}},
+            "ok": True,
+            "reminder_proposal": "pending_confirmation",
+            "proposal_id": proposal["id"],
+            "confirmation_required": True,
+            "persisted": False,
             "quiet_hours_warning": quiet_warning,
-            "confirmation": f"已设置在 {local_time.strftime('%Y-%m-%d %H:%M')} 提醒。",
-        }
-
-    def authorization_context(
-        self, ctx: AgentContext, _args: dict[str, Any]
-    ) -> dict[str, Any]:
-        reference = ctx.received_at_utc
-        if reference is None:
-            raise AuthorizationContextResolutionError(
-                "reminder_reference_time_unavailable"
-            )
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=timezone.utc)
-        return {
-            "reminder_time_context": {
-                "reference_time_utc": reference.astimezone(timezone.utc).isoformat(),
-                "timezone": self.timezone.key,
-            },
-            "reminder_semantic_contract": {
-                "exact_time_required": True,
-                "ambiguous_time_requires_clarification": True,
-            },
+            "review": f"请在卡片中核对 {local_time.strftime('%Y-%m-%d %H:%M')} 的提醒。",
         }
 
     def list(self, ctx: AgentContext, _args: dict[str, Any]) -> dict[str, Any]:
@@ -126,5 +129,23 @@ class ReminderTools:
         return {"ok": True, "reminders": reminders}
 
     def cancel(self, ctx: AgentContext, args: dict[str, Any]) -> dict[str, Any]:
-        cancelled = self.reminders.cancel(ctx.participant_id, uuid.UUID(args["reminder_id"]))
-        return {"ok": cancelled, "error": None if cancelled else "reminder_not_found"}
+        proposal = self.reminders.stage_cancel(
+            ctx.participant_id, uuid.UUID(args["reminder_id"])
+        )
+        if proposal is None:
+            return {"ok": False, "error": "reminder_not_found"}
+        if self.presentations is None:
+            raise RuntimeError("reminder proposal presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            reminder_proposal_confirmation_card(
+                proposal, timezone_name=self.timezone.key
+            ),
+        )
+        return {
+            "ok": True,
+            "reminder_proposal": "pending_confirmation",
+            "proposal_id": proposal["id"],
+            "confirmation_required": True,
+            "persisted": False,
+        }

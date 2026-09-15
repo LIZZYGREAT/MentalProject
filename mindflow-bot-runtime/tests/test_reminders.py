@@ -1,19 +1,20 @@
 import asyncio
 from datetime import datetime, time, timedelta, timezone
+import json
+from types import SimpleNamespace
 import threading
 import uuid
 
-from app.agent.context import AgentContext, AuthorizationSemanticTurn
+from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
-from app.models import ParticipantCarePreference, Reminder
-from app.repositories import ParticipantRepository
+from app.card_actions.registry import card_action_spec
+from app.models import ParticipantCarePreference, Reminder, ReminderProposal
+from app.repositories import ObservationRepository, ParticipantRepository
 from app.repositories_reminder import ReminderRepository
+from app.services.card_action_service import CardActionService
+from app.services.presentation_service import PresentationOutbox
 from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.reminder_scheduler import ReminderScheduler
-from app.services.mutation_intent_verifier import (
-    MutationIntentDecision,
-    OpenAICompatibleMutationIntentClient,
-)
 from app.tools.reminder import ReminderTools
 from tests.helpers import memory_database, participant
 
@@ -39,19 +40,6 @@ class _FailingSender:
     def send_text(self, *_args, **_kwargs):
         self.thread_ids.append(threading.get_ident())
         raise RuntimeError("provider unavailable")
-
-
-class _ReminderStore:
-    def __init__(self):
-        self.created = []
-
-    def create(self, participant_id, *, message, remind_at, recurrence_type):
-        self.created.append((participant_id, message, remind_at, recurrence_type))
-        return {
-            "id": str(uuid.uuid4()), "participant_id": str(participant_id),
-            "message": message, "remind_at": remind_at.isoformat(),
-            "recurrence_type": recurrence_type,
-        }
 
 
 class _QuietPolicy:
@@ -164,34 +152,239 @@ def test_provider_failure_uses_worker_thread_and_durable_exponential_backoff():
         assert row.next_attempt_at is None
 
 
-def _reminder_context(text: str, *, semantic_turns=()) -> AgentContext:
+def _reminder_context(participant_id: uuid.UUID, text: str) -> AgentContext:
     return AgentContext(
-        participant_id=uuid.uuid4(), participant_code="P", open_id="open",
+        participant_id=participant_id, participant_code="P", open_id="open",
         chat_id="chat", message_id="message", agent_run_id=uuid.uuid4(),
         user_request_text=text,
         received_at_utc=datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc),
-        authorization_semantic_context=tuple(semantic_turns),
     )
 
 
-def test_reminder_tool_accepts_timezone_aware_future_datetime():
-    store = _ReminderStore()
-    tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
+def _proposal_stack(database, participant_id, *, verifier=None):
+    repository = ReminderRepository(database, timezone_name="Asia/Shanghai")
+    outbox = PresentationOutbox()
+    tools = ReminderTools(
+        repository, _QuietPolicy(), outbox, timezone_name="Asia/Shanghai"
+    )
+    registry = ToolRegistry(mutation_verifier=verifier)
+    tools.register(registry)
+    card_actions = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(),
+        reminders=repository,
+        timezone_name="Asia/Shanghai",
+    )
+    return repository, outbox, registry, card_actions
 
-    result = tools.create(_reminder_context("下周三下午三点提醒我交作业"), {
-        "message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00",
-        "recurrence_type": "none",
-    })
 
-    assert result["ok"] is True
-    assert len(store.created) == 1
-    assert store.created[0][2].isoformat() == "2099-09-23T15:00:00+08:00"
+def _proposal_action(card, action_name: str):
+    for element in card["body"]["elements"]:
+        for behavior in element.get("behaviors") or []:
+            value = dict(behavior.get("value") or {})
+            if value.get("mindflow_action") == action_name:
+                return value
+    raise AssertionError(f"missing {action_name}")
+
+
+class _FailIfCalledVerifier:
+    def __init__(self):
+        self.calls = []
+
+    async def verify(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AssertionError("proposal staging must not invoke semantic verifier")
+
+
+def test_reminder_agent_semantics_are_reviewed_before_persist():
+    database = memory_database()
+    owner = participant(database, "REMINDER-PROPOSAL")
+    verifier = _FailIfCalledVerifier()
+    repository, outbox, registry, _card_actions = _proposal_stack(
+        database, owner.id, verifier=verifier
+    )
+    context = _reminder_context(owner.id, "下周三下午三点提醒我交作业")
+
+    result = asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "交作业",
+                "remind_at": "2099-09-23T15:00:00+08:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+
+    assert result.result["reminder_proposal"] == "pending_confirmation"
+    assert result.result["persisted"] is False
+    assert repository.list_active(owner.id) == []
+    assert verifier.calls == []
+    spec = next(spec for spec in registry.specs if spec.name == "reminder_create")
+    assert spec.effect == "proposal_stage"
+    assert spec.authorization_requirement == "none"
+    assert spec.authorization_context_resolver is None
+    with database.session() as session:
+        assert session.query(ReminderProposal).count() == 1
+
+
+def test_reminder_confirmation_displays_resolved_local_time_then_persists():
+    database = memory_database()
+    owner = participant(database, "REMINDER-CONFIRM")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    context = _reminder_context(owner.id, "明天下午三点提醒我交作业")
+    staged = asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "交作业",
+                "remind_at": "2099-09-23T07:00:00+00:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+    card = outbox.take_cards(context.agent_run_id)[0]
+    serialized = json.dumps(card, ensure_ascii=False)
+    assert "交作业" in serialized
+    assert "2099-09-23 15:00" in serialized
+    assert repository.list_active(owner.id) == []
+
+    confirmed = card_actions.handle(
+        owner.id,
+        message_id="reminder-card",
+        callback_event_id="reminder-confirm-event",
+        action_value=_proposal_action(card, "reminder_proposal_confirm"),
+        form_value={},
+    )
+
+    assert confirmed["ok"] is True
+    assert confirmed["status"] == "confirmed"
+    assert [item["message"] for item in repository.list_active(owner.id)] == [
+        "交作业"
+    ]
+
+
+def test_reminder_cancel_before_confirm_persists_nothing():
+    database = memory_database()
+    owner = participant(database, "REMINDER-PROPOSAL-CANCEL")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    context = _reminder_context(owner.id, "明天下午三点提醒我交作业")
+    asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "交作业",
+                "remind_at": "2099-09-23T15:00:00+08:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+    card = outbox.take_cards(context.agent_run_id)[0]
+
+    cancelled = card_actions.handle(
+        owner.id,
+        message_id="reminder-card",
+        callback_event_id="reminder-cancel-event",
+        action_value=_proposal_action(card, "reminder_proposal_cancel"),
+        form_value={},
+    )
+
+    assert cancelled["ok"] is True
+    assert cancelled["persisted"] is False
+    assert repository.list_active(owner.id) == []
+
+
+def test_reminder_cancel_tool_stages_before_cancelling_active_reminder():
+    database = memory_database()
+    owner = participant(database, "REMINDER-CANCEL-REVIEW")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    active = repository.create(
+        owner.id,
+        message="喝水",
+        remind_at=datetime.now(timezone.utc) + timedelta(days=10),
+    )
+    context = _reminder_context(owner.id, "取消喝水提醒")
+
+    staged = asyncio.run(
+        registry.execute(
+            context,
+            "reminder_cancel",
+            {"reminder_id": active["id"]},
+        )
+    )
+    assert staged.result["persisted"] is False
+    assert len(repository.list_active(owner.id)) == 1
+    card = outbox.take_cards(context.agent_run_id)[0]
+    assert "喝水" in json.dumps(card, ensure_ascii=False)
+
+    confirmed = card_actions.handle(
+        owner.id,
+        message_id="cancel-card",
+        callback_event_id="cancel-confirm-event",
+        action_value=_proposal_action(card, "reminder_proposal_confirm"),
+        form_value={},
+    )
+    assert confirmed["operation"] == "cancel"
+    assert repository.list_active(owner.id) == []
+
+
+def test_reminder_proposal_is_participant_bound_and_confirm_action_needs_receipt():
+    database = memory_database()
+    owner = participant(database, "REMINDER-PROPOSAL-OWNER")
+    other = participant(database, "REMINDER-PROPOSAL-OTHER")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    context = _reminder_context(owner.id, "提醒我")
+    staged = asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "测试",
+                "remind_at": "2099-09-23T15:00:00+08:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+    card = outbox.take_cards(context.agent_run_id)[0]
+    denied = card_actions.handle(
+        other.id,
+        message_id="copied-card",
+        action_value=_proposal_action(card, "reminder_proposal_confirm"),
+        form_value={},
+    )
+
+    assert denied["error"] == "reminder_proposal_not_found"
+    assert repository.list_active(owner.id) == []
+    with database.session() as session:
+        proposal_id = session.query(ReminderProposal.id).scalar()
+    assert repository.get_proposal_for_participant(
+        owner.id, proposal_id
+    )["status"] == "awaiting_confirmation"
+    assert card_action_spec("reminder_proposal_confirm").replay_policy == "receipt_required"
 
 
 def test_reminder_tool_rejects_invalid_naive_and_past_datetimes():
-    store = _ReminderStore()
-    tools = ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai")
-    ctx = _reminder_context("提醒我")
+    database = memory_database()
+    owner = participant(database, "REMINDER-INVALID")
+    repository = ReminderRepository(database, timezone_name="Asia/Shanghai")
+    tools = ReminderTools(
+        repository,
+        _QuietPolicy(),
+        PresentationOutbox(),
+        timezone_name="Asia/Shanghai",
+    )
+    ctx = _reminder_context(owner.id, "提醒我")
 
     invalid = tools.create(ctx, {
         "message": "测试", "remind_at": "not-a-datetime", "recurrence_type": "none",
@@ -206,114 +399,4 @@ def test_reminder_tool_rejects_invalid_naive_and_past_datetimes():
     assert invalid["error"] == "invalid_reminder_datetime"
     assert naive["error"] == "reminder_timezone_required"
     assert past["error"] == "reminder_time_in_past"
-    assert store.created == []
-
-
-def test_reminder_authorization_context_contains_only_semantic_time_authority():
-    tools = ReminderTools(_ReminderStore(), _QuietPolicy(), timezone_name="Asia/Shanghai")
-
-    resolved = tools.authorization_context(_reminder_context("明天15:00提醒我"), {})
-
-    assert resolved == {
-        "reminder_time_context": {
-            "reference_time_utc": "2026-09-13T02:00:00+00:00",
-            "timezone": "Asia/Shanghai",
-        },
-        "reminder_semantic_contract": {
-            "exact_time_required": True,
-            "ambiguous_time_requires_clarification": True,
-        },
-    }
-    serialized = str(resolved)
-    assert "participant" not in serialized
-    assert "open_id" not in serialized
-    assert "chat_id" not in serialized
-
-
-class _SemanticVerifier:
-    def __init__(self, decision: str):
-        self.decision = decision
-        self.calls = []
-
-    async def verify(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.decision == "allow":
-            return MutationIntentDecision("allow", "direct_action", "exact_reminder")
-        if self.decision == "deny":
-            return MutationIntentDecision("deny", "direct_action", "time_mismatch")
-        return MutationIntentDecision("needs_clarification", "ambiguous", "time_ambiguous")
-
-
-def test_reminder_registry_sends_proposal_reference_time_and_timezone_to_verifier():
-    verifier = _SemanticVerifier("allow")
-    registry = ToolRegistry(mutation_verifier=verifier)
-    store = _ReminderStore()
-    ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
-
-    result = asyncio.run(registry.execute(
-        _reminder_context("明天15:00提醒我交作业"),
-        "reminder_create",
-        {"message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00", "recurrence_type": "none"},
-    ))
-
-    proposal = verifier.calls[0]["proposal_summary"]
-    assert result.status == "succeeded"
-    assert proposal["requested_values"]["remind_at"] == "2099-09-23T15:00:00+08:00"
-    assert proposal["reminder_time_context"] == {
-        "reference_time_utc": "2026-09-13T02:00:00+00:00",
-        "timezone": "Asia/Shanghai",
-    }
-    assert len(store.created) == 1
-
-
-def test_reminder_registry_blocks_ambiguous_or_mismatched_proposal_before_write():
-    for decision, text, expected_status in (
-        ("needs_clarification", "明天下午提醒我交作业", "mutation_needs_clarification"),
-        ("deny", "明天15:00提醒我交作业", "tool_effect_not_authorized"),
-    ):
-        verifier = _SemanticVerifier(decision)
-        registry = ToolRegistry(mutation_verifier=verifier)
-        store = _ReminderStore()
-        ReminderTools(store, _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
-
-        result = asyncio.run(registry.execute(
-            _reminder_context(text),
-            "reminder_create",
-            {"message": "交作业", "remind_at": "2099-09-24T16:00:00+08:00", "recurrence_type": "none"},
-        ))
-
-        assert result.status == expected_status
-        assert store.created == []
-
-
-def test_reminder_clarification_turns_are_forwarded_to_semantic_verifier():
-    turns = (
-        AuthorizationSemanticTurn("user", "下周三下午提醒我交作业"),
-        AuthorizationSemanticTurn("assistant", "具体几点？"),
-        AuthorizationSemanticTurn("user", "三点"),
-    )
-    verifier = _SemanticVerifier("allow")
-    registry = ToolRegistry(mutation_verifier=verifier)
-    ReminderTools(_ReminderStore(), _QuietPolicy(), timezone_name="Asia/Shanghai").register(registry)
-
-    asyncio.run(registry.execute(
-        _reminder_context("三点", semantic_turns=turns),
-        "reminder_create",
-        {"message": "交作业", "remind_at": "2099-09-23T15:00:00+08:00", "recurrence_type": "none"},
-    ))
-
-    assert verifier.calls[0]["semantic_turn_context"] == (
-        {"role": "user", "text": "下周三下午提醒我交作业"},
-        {"role": "assistant", "text": "具体几点？"},
-        {"role": "user", "text": "三点"},
-    )
-
-
-def test_mutation_verifier_prompt_keeps_reminder_semantics_out_of_backend_parser():
-    prompt = OpenAICompatibleMutationIntentClient.SYSTEM_PROMPT
-
-    assert "For reminder_create" in prompt
-    assert "exact proposed remind_at" in prompt
-    assert "backend-provided reference time and timezone" in prompt
-    assert "return needs_clarification" in prompt
-    assert "Do not borrow unrelated dates or times" in prompt
+    assert repository.list_active(owner.id) == []

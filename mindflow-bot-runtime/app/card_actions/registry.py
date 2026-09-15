@@ -60,6 +60,8 @@ _INTERNAL_WRITE = {
     "morning_brief_time_update",
     "morning_brief_toggle",
     "preference_settings_save",
+    "reminder_proposal_cancel",
+    "reminder_proposal_confirm",
     "submit_checkin",
     "support_acknowledge_first",
     "support_followup_disable",

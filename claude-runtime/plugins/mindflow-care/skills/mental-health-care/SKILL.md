@@ -90,6 +90,11 @@ Use only these tools:
   selected event represents a single occurrence or a recurring series when that
   distinction is available. Do not treat capability questions, hypotheticals,
   status questions, or "maybe remove it" as a destructive request.
+- `reminder_create` after interpreting an explicit or unambiguously resolved
+  message, timezone-aware RFC3339 time, and recurrence. Ask one clarification
+  when the exact time remains unknown. `reminder_create` and `reminder_cancel`
+  only stage participant-bound review cards; do not report the durable change
+  until the participant confirms the card action.
 - `course_schedule_get_active_draft` for questions or status about this
   participant's latest active schedule Preview.
 - `course_schedule_get_last_failure` when the participant asks why the latest

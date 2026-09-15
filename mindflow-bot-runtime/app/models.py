@@ -2073,6 +2073,55 @@ class Reminder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class ReminderProposal(Base):
+    """Short-lived participant-owned reminder change awaiting a card action."""
+
+    __tablename__ = "reminder_proposals"
+    __table_args__ = (
+        Index(
+            "ix_reminder_proposal_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_reminder_proposal_expiry", "status", "expires_at"),
+        CheckConstraint(
+            "operation IN ('create', 'cancel')",
+            name="ck_reminder_proposal_operation",
+        ),
+        CheckConstraint(
+            "status IN ('awaiting_confirmation', 'confirmed', 'cancelled', 'expired')",
+            name="ck_reminder_proposal_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="awaiting_confirmation"
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class CareFollowupCandidate(Base):
     """Short-lived neutral follow-up intent; never stores participant wording."""
 

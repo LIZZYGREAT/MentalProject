@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0075_calendar_plan_presentation_context -->
+<!-- ALEMBIC_HEAD: 0076_reminder_proposals -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -70,6 +70,11 @@ participant-bound pending plan 并生成固定确认卡，不调用 Calendar Pro
 MutationIntent 的二次 LLM 语义校验。操作类型仍受 Backend operation gate 约束；真正的
 external write 只能由原参与者点击确认卡后，通过 receipt/idempotency 与 durable runner
 触发。取消、过期及重复确认均不会重复写 Provider。
+
+Reminder 的创建与取消同样采用 `proposal_stage`。Agent 只提交结构化 message、RFC3339
+时间与 recurrence，Backend 验证格式并保存短期 participant-bound proposal；固定卡展示
+解析后的本地时间。只有原参与者的 CardAction 才能原子地创建或取消 Reminder，取消审核
+卡不会写入或改变 Reminder，Agent 路径不再经过 MutationIntent 的第二次时间语义判断。
 
 ## Forecast、Calendar 与 freshness
 

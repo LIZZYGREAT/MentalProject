@@ -404,7 +404,10 @@ def build_business_services(
     )
     care_tools.register(registry)
     ReminderTools(
-        reminders, proactive_notifications, timezone_name=settings.timezone_name
+        reminders,
+        proactive_notifications,
+        presentations,
+        timezone_name=settings.timezone_name,
     ).register(registry)
     WebTools(web_search, public_web_documents).register(registry)
     MemoryTools(memory, presentations).register(registry)
@@ -437,6 +440,7 @@ def build_business_services(
         care_preferences=care_preferences,
         memory=memory,
         interaction_preferences=interaction_preferences,
+        reminders=reminders,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,

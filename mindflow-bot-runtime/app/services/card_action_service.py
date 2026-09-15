@@ -265,6 +265,7 @@ class CardActionService:
         care_preferences: Any = None,
         memory: Any = None,
         interaction_preferences: Any = None,
+        reminders: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -282,6 +283,7 @@ class CardActionService:
         self.care_preferences = care_preferences
         self.memory = memory
         self.interaction_preferences = interaction_preferences
+        self.reminders = reminders
 
     @staticmethod
     def _fallback_event_id(
@@ -363,6 +365,39 @@ class CardActionService:
                 )
             updated = self.interaction_preferences.get(participant_id)
             return {"ok": True, "reply_text": "表达与支持偏好已更新。", "card": preference_settings_card(updated)}
+        if action_name in {
+            "reminder_proposal_confirm", "reminder_proposal_cancel"
+        }:
+            if self.reminders is None:
+                raise RuntimeError("reminder proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_reminder_proposal_id"}
+            result = self.reminders.resolve_proposal(
+                participant_id,
+                proposal_id,
+                confirmed=action_name == "reminder_proposal_confirm",
+            )
+            if not result.get("ok"):
+                return result
+            if result.get("status") == "cancelled":
+                reply_text = "已取消，提醒没有发生变化。"
+            elif result.get("operation") == "cancel":
+                reply_text = "提醒已取消。"
+            else:
+                reminder = dict(result.get("reminder") or {})
+                local_time = datetime.fromisoformat(
+                    str(reminder.get("remind_at") or "")
+                ).astimezone(self.timezone)
+                reply_text = (
+                    f"提醒已创建，将在 {local_time.strftime('%Y-%m-%d %H:%M')} 提醒。"
+                )
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
         if action_name in {
             "memory_delete_prompt", "memory_delete_confirm",
             "memory_clear_prompt", "memory_clear_confirm",
