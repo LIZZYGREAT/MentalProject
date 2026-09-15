@@ -18,7 +18,7 @@ from app.models import CalendarMutationPlan, CalendarMutationPlanItem, RuntimeIn
 from app.repositories import ObservationRepository
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
 from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
-from app.services.card_action_service import CardActionService
+from app.services.card_action_service import CardActionService, _aware_calendar_datetime
 from app.services.mutation_intent_verifier import MutationIntentDecision
 from app.services.presentation_service import PresentationOutbox
 from app.tools.care import CareTools
@@ -743,6 +743,15 @@ def test_calendar_plan_time_edit_is_participant_bound_and_validates_range():
     assert hidden["error"] == "calendar_mutation_plan_not_found"
     assert invalid["error"] == "invalid_calendar_plan_item_time"
     assert "结束时间必须晚于开始时间" in invalid["reply_text"]
+
+
+@pytest.mark.parametrize("value", ["invalid-time", "2030-01-12T09:00:00"])
+def test_update_plan_invalid_original_time_uses_generic_retry_copy(value):
+    with pytest.raises(ValueError) as error:
+        _aware_calendar_datetime(value)
+
+    assert "重新发起日程操作" in str(error.value)
+    assert "重新发起添加" not in str(error.value)
 
 
 def test_calendar_plan_confirmation_fails_closed_on_ledger_mismatch():

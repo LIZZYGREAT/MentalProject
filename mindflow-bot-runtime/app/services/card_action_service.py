@@ -94,9 +94,9 @@ def _aware_calendar_datetime(value: object) -> datetime:
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError as exc:
-        raise ValueError("日程原始时间无效，请重新发起添加。") from exc
+        raise ValueError("日程原始时间无效，请重新发起日程操作。") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("日程原始时间缺少时区，请重新发起添加。")
+        raise ValueError("日程原始时间缺少时区，请重新发起日程操作。")
     return parsed
 
 
