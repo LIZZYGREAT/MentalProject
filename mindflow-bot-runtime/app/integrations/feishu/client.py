@@ -145,16 +145,21 @@ class FeishuClient:
         content: str,
         sequence: int,
     ) -> None:
+        from app.integrations.feishu.streaming_card import (
+            validate_cardkit_element_id,
+        )
+
+        normalized_element_id = validate_cardkit_element_id(element_id)
         self._cardkit_request(
             "PUT",
             "/open-apis/cardkit/v1/cards/"
             f"{quote(str(card_id), safe='')}/elements/"
-            f"{quote(str(element_id), safe='')}/content",
+            f"{quote(normalized_element_id, safe='')}/content",
             {
                 "content": str(content),
                 "sequence": int(sequence),
                 "uuid": self._cardkit_operation_uuid(
-                    "content", card_id, element_id, sequence
+                    "content", card_id, normalized_element_id, sequence
                 ),
             },
             operation="update_card_element_content",

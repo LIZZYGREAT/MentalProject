@@ -9,6 +9,7 @@ from app.integrations.feishu.streaming_card import (
     ANSWER_ELEMENT_ID,
     FeishuStreamingCardSession,
     streaming_answer_card,
+    validate_cardkit_element_id,
 )
 from app.presentation.streaming_boundaries import safe_stream_prefix_boundaries
 
@@ -76,6 +77,25 @@ def test_streaming_card_schema_has_one_noninteractive_markdown_element():
         "element_id": ANSWER_ELEMENT_ID,
         "content": "正在整理结果…",
     }]
+
+
+def test_streaming_element_id_matches_feishu_contract():
+    assert validate_cardkit_element_id(ANSWER_ELEMENT_ID) == ANSWER_ELEMENT_ID
+    assert len(ANSWER_ELEMENT_ID) <= 20
+
+
+@pytest.mark.parametrize(
+    "element_id",
+    ["1answer", "answer-with-dash", "answer space", "a" * 21, ""],
+)
+def test_client_rejects_invalid_cardkit_element_id_before_request(element_id):
+    class SDK:
+        def request(self, _request):
+            raise AssertionError("invalid element_id must fail before HTTP")
+
+    client = FeishuClient("app", "secret", sdk_client=SDK())
+    with pytest.raises(ValueError, match="element_id"):
+        client.update_card_element_content("card-1", element_id, "answer", 1)
 
 
 def test_stream_prefix_never_splits_markdown_link_or_raw_url():

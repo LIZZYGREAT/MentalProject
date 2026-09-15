@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 from typing import Awaitable, Callable
 
 
-ANSWER_ELEMENT_ID = "mindflow_stream_answer"
+ANSWER_ELEMENT_ID = "mindflow_answer"
+_CARDKIT_ELEMENT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,19}$")
+
+
+def validate_cardkit_element_id(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not _CARDKIT_ELEMENT_ID.fullmatch(normalized):
+        raise ValueError(
+            "CardKit element_id must start with a letter, contain only letters, "
+            "numbers, or underscores, and be at most 20 characters"
+        )
+    return normalized
 
 
 def streaming_answer_card(content: str = "正在整理结果…") -> dict:
+    element_id = validate_cardkit_element_id(ANSWER_ELEMENT_ID)
     return {
         "schema": "2.0",
         "config": {
@@ -24,7 +37,7 @@ def streaming_answer_card(content: str = "正在整理结果…") -> dict:
         "body": {
             "elements": [{
                 "tag": "markdown",
-                "element_id": ANSWER_ELEMENT_ID,
+                "element_id": element_id,
                 "content": str(content),
             }]
         },
@@ -52,7 +65,7 @@ class FeishuStreamingCardSession:
         self.client = client
         self.card_id = str(card_id)
         self.message_id = str(message_id)
-        self.element_id = str(element_id)
+        self.element_id = validate_cardkit_element_id(element_id)
         self.sequence = max(0, int(sequence))
         self.visible_content = str(visible_content)
         self.closed = False

@@ -1006,7 +1006,7 @@ def test_streaming_recovery_finishes_durable_final_without_full_text_duplicate()
         event.event_id,
         card_id="card-1",
         message_id="card-message-1",
-        element_id="mindflow_stream_answer",
+        element_id="mindflow_answer",
     )
     final = "recovered validated answer"
     repository.stage_streaming_final(event.event_id, full_text=final)
