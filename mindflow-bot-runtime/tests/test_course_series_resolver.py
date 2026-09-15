@@ -189,3 +189,33 @@ def test_single_occurrence_never_expands_or_queries_calendar():
 
     assert resolved.occurrence_event_ids == ("one-off",)
     assert calendar.windows == []
+
+
+def test_deterministic_fallback_requires_boundary_and_exact_slot_signature():
+    anchor = {
+        **_event("theory-1", date(2026, 9, 22), parent=""),
+        "semester_end_date": "2026-10-20",
+    }
+    theory_2 = _event("theory-2", date(2026, 9, 29), parent="")
+    lab = _event(
+        "lab-2",
+        date(2026, 9, 29),
+        parent="",
+        start="18:30",
+        end="20:10",
+    )
+    calendar = _Calendar([anchor, theory_2, lab])
+    resolver = CourseSeriesResolver(calendar, timezone_name="Asia/Shanghai")
+
+    resolved = asyncio.run(
+        resolver.resolve(
+            OWNER,
+            anchor_event=anchor,
+            scope="current_semester_remainder",
+            reference_local_date=date(2026, 9, 22),
+        )
+    )
+
+    assert resolved.resolution_source == "deterministic_signature"
+    assert resolved.occurrence_event_ids == ("theory-1", "theory-2")
+    assert "lab-2" not in resolved.occurrence_event_ids

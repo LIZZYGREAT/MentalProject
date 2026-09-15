@@ -280,7 +280,12 @@ class CourseSeriesResolver:
         elif str(anchor.get("recurrence") or "").strip():
             series_id = str(anchor.get("id") or "").strip()
         else:
-            raise CourseSeriesResolutionError("course_series_ambiguous")
+            return await self._resolve_deterministic(
+                participant_id,
+                anchor=anchor,
+                scope=scope,
+                reference_local_date=reference_local_date,
+            )
         series_start = _event_datetime(series.get("start_time"), self.timezone)
         series_end = _recurrence_end(
             series.get("recurrence"), series_start=series_start
@@ -311,6 +316,65 @@ class CourseSeriesResolver:
             scope_start=scope_start,
             scope_end=series_end,
             source="provider_series",
+        )
+
+    async def _resolve_deterministic(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        anchor: dict[str, Any],
+        scope: CourseSeriesScope,
+        reference_local_date: date,
+    ) -> ResolvedCourseSeries:
+        raw_end = anchor.get("semester_end_date") or anchor.get("semester_end")
+        raw_start = anchor.get("semester_start_date") or anchor.get("semester_start")
+        if not raw_end:
+            raise CourseSeriesResolutionError("course_series_ambiguous")
+        try:
+            semester_end_date = date.fromisoformat(str(raw_end))
+            semester_start_date = (
+                date.fromisoformat(str(raw_start)) if raw_start else None
+            )
+        except ValueError as exc:
+            raise CourseSeriesResolutionError(
+                "course_semester_boundary_required"
+            ) from exc
+        if scope == "entire_series" and semester_start_date is None:
+            raise CourseSeriesResolutionError("course_semester_boundary_required")
+        anchor_start = _event_datetime(anchor.get("start_time"), self.timezone)
+        anchor_end = _event_datetime(anchor.get("end_time"), self.timezone)
+        scope_start = (
+            datetime.combine(semester_start_date, time.min, self.timezone)
+            if scope == "entire_series" and semester_start_date is not None
+            else max(
+                anchor_start,
+                datetime.combine(reference_local_date, time.min, self.timezone),
+            )
+        )
+        scope_end = datetime.combine(
+            semester_end_date, anchor_end.timetz().replace(tzinfo=None), self.timezone
+        )
+        expected_signature = _signature(anchor, self.timezone)
+        events = await self._events_between(participant_id, scope_start, scope_end)
+        matches = [
+            event
+            for event in events
+            if _signature(event, self.timezone) == expected_signature
+        ]
+        dates = [
+            _event_datetime(event.get("start_time"), self.timezone).date()
+            for event in matches
+        ]
+        if len(dates) != len(set(dates)):
+            raise CourseSeriesResolutionError("course_series_ambiguous")
+        return self._resolved(
+            anchor=anchor,
+            events=matches,
+            identity=f"deterministic-signature:{expected_signature}",
+            display_name=str(anchor.get("summary") or "未命名课程"),
+            scope_start=scope_start,
+            scope_end=scope_end,
+            source="deterministic_signature",
         )
 
     async def _events_between(
