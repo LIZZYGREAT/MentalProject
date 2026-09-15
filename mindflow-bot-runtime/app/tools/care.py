@@ -2050,12 +2050,16 @@ class CareTools:
                     "course_series_occurrences_not_found",
                 },
             }
-        return await self._stage_calendar_mutation_plan(
+        staged = await self._stage_calendar_mutation_plan(
             ctx,
             operation="update",
             items=items,
             presentation_context={
-                "kind": "course_series_update",
+                "kind": (
+                    "course_series_update"
+                    if scope != "single_occurrence"
+                    else "calendar_occurrence_update"
+                ),
                 "scope": scope,
                 "course_identity": resolved.course_identity,
                 "display_name": resolved.display_name,
@@ -2070,6 +2074,18 @@ class CareTools:
                 },
             },
         )
+        return {
+            **staged,
+            "operation": "update",
+            "scope": scope,
+            "course_series": {
+                "display_name": resolved.display_name,
+                "occurrence_count": len(items),
+                "scope_start": resolved.scope_start.isoformat(),
+                "scope_end": resolved.scope_end.isoformat(),
+            },
+            "card_queued": bool(staged.get("ok")),
+        }
 
     async def update_calendar_events_plan(
         self, ctx: AgentContext, args: dict[str, Any]

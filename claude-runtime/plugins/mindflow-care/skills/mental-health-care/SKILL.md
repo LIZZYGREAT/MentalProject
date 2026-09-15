@@ -70,6 +70,19 @@ Use only these tools:
 - `calendar_update_event` only for one exact event returned by a calendar tool,
   after the participant directly requests the change. If the intended event is
   ambiguous, list the relevant range and ask which event before writing.
+  For an already-resolved course occurrence, “这节课 / 这一次” means
+  `scope=single_occurrence`; “这个课以后都改 / 每一个这个课都改 / 从今天开始后面的都改 /
+  这个学期剩下的都改” means `scope=current_semester_remainder` for the same
+  backend-resolved course series. Use `scope=entire_series` only when the
+  participant explicitly includes past occurrences or says the whole/all
+  series. Never broaden the target by a similar title, shared course code, or
+  neighboring lab/tutorial. If “改一下这个课” leaves scope genuinely unknown,
+  ask once whether they mean this occurrence or the rest of this semester.
+  Treat course clock fields independently: “截止时间 / 下课时间 / 结束时间改到 15:40”
+  changes only `end_clock`, while “开始时间改到 15:40” changes only
+  `start_clock`. Move both clocks only for an explicit duration-preserving
+  shift such as “整体往后推 30 分钟”. Never turn an explicit end-clock change
+  into a duration-preserving shift or ask about duration again.
 - `calendar_delete_event` only for one exact event returned by a calendar tool
   and when the participant explicitly requests its deletion. State whether the
   selected event represents a single occurrence or a recurring series when that

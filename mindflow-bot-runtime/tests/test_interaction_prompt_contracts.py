@@ -222,3 +222,24 @@ def test_reminder_complaint_is_not_treated_as_a_direct_preference_request():
     assert "care_update_preferences" in explicit
     assert "direct request" in explicit
     assert "ok: true" in explicit
+
+
+def test_course_series_scope_and_clock_semantics_match_system_and_skill():
+    skill_path = (
+        Path(__file__).resolve().parents[2]
+        / "claude-runtime"
+        / "plugins"
+        / "mindflow-care"
+        / "skills"
+        / "mental-health-care"
+        / "SKILL.md"
+    )
+    skill = skill_path.read_text(encoding="utf-8")
+    for text in (SYSTEM_RULES, skill):
+        assert "scope=single_occurrence" in text
+        assert "scope=current_semester_remainder" in text
+        assert "scope=entire_series" in text
+        assert "shared course code" in text
+        assert "end_clock" in text
+        assert "start_clock" in text
+        assert "duration-preserving shift" in text

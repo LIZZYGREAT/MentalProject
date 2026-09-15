@@ -598,6 +598,13 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
     )
     assert update_spec.authorization_context_resolver is None
     assert "scope_kind" not in update_spec.parameters["properties"]
+    assert update_spec.parameters["properties"]["scope"]["enum"] == [
+        "single_occurrence",
+        "current_semester_remainder",
+        "entire_series",
+    ]
+    assert "start_clock" in update_spec.parameters["properties"]
+    assert "end_clock" in update_spec.parameters["properties"]
     assert update_spec.parameters["dependentRequired"] == {
         "start_time": ["end_time"],
         "end_time": ["start_time"],

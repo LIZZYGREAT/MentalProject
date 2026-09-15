@@ -246,6 +246,10 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
 
     assert result["ok"] is True
     assert result["item_count"] == 2
+    assert result["operation"] == "update"
+    assert result["scope"] == "current_semester_remainder"
+    assert result["course_series"]["occurrence_count"] == 2
+    assert result["card_queued"] is True
     assert calendar.updated == []
     confirmation = outbox.take_cards(ctx.agent_run_id)[0]
     serialized = json.dumps(confirmation, ensure_ascii=False)
