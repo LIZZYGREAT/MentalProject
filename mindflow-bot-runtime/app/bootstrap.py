@@ -52,6 +52,7 @@ from app.repositories_course_schedule_image import (
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
+from app.services.course_series_resolver import CourseSeriesResolver
 from app.services.course_schedule_vision import CourseScheduleVisionService
 from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
@@ -391,6 +392,11 @@ def build_business_services(
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
         calendar_mutation_plans=calendar_mutation_plans,
+        course_series_resolver=CourseSeriesResolver(
+            calendar,
+            timezone_name=settings.timezone_name,
+            course_imports=course_schedule_import_repository,
+        ),
         feature_capabilities={
             "daily_review_enabled": settings.daily_review_enabled,
             "web_search_enabled": settings.web_search_enabled,

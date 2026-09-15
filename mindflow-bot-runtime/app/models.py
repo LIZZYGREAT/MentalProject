@@ -988,6 +988,9 @@ class CalendarMutationPlan(Base):
     )
     operation: Mapped[str] = mapped_column(String(16), nullable=False)
     items_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    presentation_context_json: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="awaiting_confirmation"
     )

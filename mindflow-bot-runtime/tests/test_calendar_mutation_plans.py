@@ -19,6 +19,7 @@ from app.repositories import ObservationRepository
 from app.repositories_calendar_plan import CalendarMutationPlanRepository
 from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
 from app.services.card_action_service import CardActionService, _aware_calendar_datetime
+from app.services.course_series_resolver import ResolvedCourseSeries
 from app.services.mutation_intent_verifier import MutationIntentDecision
 from app.services.presentation_service import PresentationOutbox
 from app.tools.care import CareTools
@@ -189,6 +190,75 @@ def test_plan_accepts_one_to_twenty_items_and_update_operation():
             operation="delete",
             items=[{"event_id": str(index)} for index in range(21)],
         )
+
+
+def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
+    database = memory_database()
+    owner = participant(database, "PLAN-COURSE-SERIES")
+    calendar = _Calendar()
+    calendar.events.update(
+        {
+            "course-1": {
+                "id": "course-1",
+                "summary": "操作系统(0955)",
+                "start_time": "2030-01-15T12:55:00+08:00",
+                "end_time": "2030-01-15T14:30:00+08:00",
+            },
+            "course-2": {
+                "id": "course-2",
+                "summary": "操作系统(0955)",
+                "start_time": "2030-01-22T12:55:00+08:00",
+                "end_time": "2030-01-22T14:30:00+08:00",
+            },
+        }
+    )
+    plans, _outbox, tools, _registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+
+    class _Resolver:
+        async def resolve(self, *_args, **_kwargs):
+            return ResolvedCourseSeries(
+                anchor_event_id="course-1",
+                course_identity="course-import:import-1:item-1",
+                display_name="操作系统(0955)",
+                scope_start=datetime.fromisoformat("2030-01-15T12:55:00+08:00"),
+                scope_end=datetime.fromisoformat("2030-01-22T14:30:00+08:00"),
+                occurrence_events=(
+                    dict(calendar.events["course-1"]),
+                    dict(calendar.events["course-2"]),
+                ),
+                resolution_source="course_import",
+            )
+
+    tools.course_series_resolver = _Resolver()
+    result = asyncio.run(
+        tools.update_calendar_event(
+            _context(owner.id, "以后这个课下课时间改为15:40"),
+            {
+                "event_id": "course-1",
+                "scope": "current_semester_remainder",
+                "end_clock": "15:40",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["item_count"] == 2
+    assert calendar.updated == []
+    with database.session() as session:
+        plan_id = str(session.scalar(select(CalendarMutationPlan.id)))
+    plan = plans.get_for_participant(owner.id, plan_id)
+    assert [item["start_time"] for item in plan["items"]] == [
+        "2030-01-15T12:55:00+08:00",
+        "2030-01-22T12:55:00+08:00",
+    ]
+    assert [item["end_time"] for item in plan["items"]] == [
+        "2030-01-15T15:40:00+08:00",
+        "2030-01-22T15:40:00+08:00",
+    ]
+    assert plan["presentation_context"]["scope"] == "current_semester_remainder"
+    assert plan["presentation_context"]["changes"] == {"end_clock": "15:40"}
 
 
 def test_update_plan_uses_updating_item_state():

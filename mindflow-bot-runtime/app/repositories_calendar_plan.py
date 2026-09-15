@@ -84,6 +84,7 @@ class CalendarMutationPlanRepository:
             # Confirmation rendering can use this immutable aggregate copy.
             # Durable execution always reads the item ledger below.
             "items": [dict(item) for item in list(row.items_json or [])],
+            "presentation_context": dict(row.presentation_context_json or {}),
             "status": row.status,
             "result": dict(row.result_json or {}),
             "expires_at": _aware(row.expires_at).isoformat(),
@@ -140,6 +141,7 @@ class CalendarMutationPlanRepository:
         *,
         operation: str,
         items: list[dict[str, Any]],
+        presentation_context: dict[str, Any] | None = None,
         ttl_minutes: int = 15,
         now: datetime | None = None,
     ) -> dict[str, Any]:
@@ -153,6 +155,7 @@ class CalendarMutationPlanRepository:
             participant_id=participant_id,
             operation=normalized_operation,
             items_json=[dict(item) for item in items],
+            presentation_context_json=dict(presentation_context or {}),
             status="awaiting_confirmation",
             expires_at=created_at + timedelta(minutes=max(1, int(ttl_minutes))),
             created_at=created_at,
