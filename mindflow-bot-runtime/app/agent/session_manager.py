@@ -72,8 +72,19 @@ class ParticipantSessionManager:
         self.input_queue_size = max(1, int(input_queue_size))
         self._sessions: dict[uuid.UUID, ParticipantAgentSession] = {}
         self._connecting: set[uuid.UUID] = set()
+        self._recovery_needed: set[uuid.UUID] = set()
         self._lock = asyncio.Lock()
         self._closing = False
+
+    async def needs_recovery_context(self, participant_id: uuid.UUID) -> bool:
+        async with self._lock:
+            session = self._sessions.get(participant_id)
+            if session is not None and session.client is not None:
+                return False
+            if participant_id in self._recovery_needed:
+                return True
+        saved = await asyncio.to_thread(self.repository.get, participant_id)
+        return saved is None or saved.status != "active"
 
     async def submit(
         self,
@@ -252,10 +263,12 @@ class ParticipantSessionManager:
                         result.session_id,
                         last_message_id=request.ctx.message_id,
                     )
+                    self._recovery_needed.discard(session.participant_id)
                     if not request.future.done():
                         request.future.set_result(result)
                 except asyncio.TimeoutError as exc:
                     await self._interrupt_and_drop(session)
+                    self._recovery_needed.add(session.participant_id)
                     await asyncio.to_thread(
                         self.repository.mark_stale, session.participant_id
                     )
@@ -269,6 +282,10 @@ class ParticipantSessionManager:
                         request.future.set_exception(exc)
                 except Exception as exc:
                     await self._drop_client(session)
+                    self._recovery_needed.add(session.participant_id)
+                    await asyncio.to_thread(
+                        self.repository.mark_stale, session.participant_id
+                    )
                     if not request.future.done():
                         request.future.set_exception(
                             exc
@@ -343,6 +360,7 @@ class ParticipantSessionManager:
                 await asyncio.to_thread(
                     self.repository.mark_stale, session.participant_id
                 )
+            self._recovery_needed.add(session.participant_id)
             raise
         async with self._lock:
             self._connecting.discard(session.participant_id)

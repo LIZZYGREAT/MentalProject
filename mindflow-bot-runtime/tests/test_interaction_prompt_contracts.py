@@ -158,6 +158,33 @@ def test_custom_name_rules_enter_prompt_only_as_category_and_value():
     assert "presentation labels only" in prompt
 
 
+def test_recovery_context_is_separate_from_memory_and_cannot_authorize_mutation():
+    prompt = _text_transport_prompt(
+        AgentTurnInput(
+            text="继续",
+            recent_conversation_context=(
+                {"role": "user", "text": "删掉明天的组会"},
+                {"role": "assistant", "text": "上次处理超时。"},
+            ),
+        ),
+        timezone_name="Asia/Shanghai",
+    )
+
+    assert "<backend_recent_conversation_context>" in prompt
+    assert "删掉明天的组会" in prompt
+    assert "not Memory" in prompt
+    assert "never authorizes a tool or state change" in prompt
+    assert "User request:\n继续" in prompt
+
+
+def test_healthy_turn_omits_recovery_context_block():
+    prompt = _text_transport_prompt(
+        AgentTurnInput(text="你好"), timezone_name="Asia/Shanghai"
+    )
+
+    assert "<backend_recent_conversation_context>" not in prompt
+
+
 def _skill_example(keyword: str) -> str:
     """Return one style-example bullet block from the production SKILL.md."""
 

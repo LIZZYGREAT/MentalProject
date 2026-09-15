@@ -545,6 +545,86 @@ def test_runtime_supplies_backend_owned_recent_turns_to_agent_context():
     ]
 
 
+def test_recovery_session_receives_bounded_recent_conversation_context():
+    class Conversations:
+        def add(self, *_args, **_kwargs):
+            return uuid.uuid4()
+
+        def recent(self, _participant_id, limit, **_kwargs):
+            if limit == 6:
+                return [
+                    {"role": "user", "content": "把周二的课都改到15:40下课"},
+                    {"role": "assistant", "content": "这次处理超时了，可以继续。"},
+                ]
+            return []
+
+    class Sessions:
+        def __init__(self):
+            self.turn_input = None
+
+        async def needs_recovery_context(self, _participant_id):
+            return True
+
+        async def submit(self, _ctx, turn_input, **_kwargs):
+            self.turn_input = turn_input
+            return ClaudeTurnResult("继续处理", "session-recovered")
+
+    sessions = Sessions()
+    runtime = ClaudeAgentRuntime(sessions, Conversations(), SafetyService())
+    asyncio.run(runtime.handle_message(context(uuid.uuid4(), "recovery"), "继续"))
+
+    assert sessions.turn_input.recent_conversation_context == (
+        {"role": "user", "text": "把周二的课都改到15:40下课"},
+        {"role": "assistant", "text": "这次处理超时了，可以继续。"},
+    )
+
+
+def test_healthy_resumed_session_does_not_repeat_recent_context():
+    class Conversations:
+        def add(self, *_args, **_kwargs):
+            return uuid.uuid4()
+
+        def recent(self, *_args, **_kwargs):
+            return []
+
+    class Sessions:
+        def __init__(self):
+            self.turn_input = None
+
+        async def needs_recovery_context(self, _participant_id):
+            return False
+
+        async def submit(self, _ctx, turn_input, **_kwargs):
+            self.turn_input = turn_input
+            return ClaudeTurnResult("正常继续", "session-active")
+
+    sessions = Sessions()
+    runtime = ClaudeAgentRuntime(sessions, Conversations(), SafetyService())
+    asyncio.run(runtime.handle_message(context(uuid.uuid4(), "active"), "继续"))
+
+    assert sessions.turn_input.recent_conversation_context == ()
+
+
+def test_timeout_marks_session_for_recovery_context():
+    database = memory_database()
+    person = participant(database, "P-TIMEOUT-RECOVERY")
+    factory = FakeFactory()
+    factory.block_next = True
+    manager = ParticipantSessionManager(
+        factory,
+        ClaudeSessionRepository(database),
+        turn_timeout_seconds=1,
+    )
+
+    async def scenario():
+        with pytest.raises(ClaudeSDKInvocationError, match="timed out"):
+            await manager.submit(context(person.id, "timeout"), "long turn")
+        assert await manager.needs_recovery_context(person.id) is True
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_conversation_authorization_history_is_chat_scoped():
     database = memory_database()
     person = participant(database, "P-CONTEXT-CHAT")

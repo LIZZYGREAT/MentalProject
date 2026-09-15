@@ -32,6 +32,9 @@ class AgentTurnInput:
     participant_memory: tuple[Mapping[str, Any], ...] = ()
     interaction_preferences: Mapping[str, Any] | None = None
     psychological_context: Mapping[str, Any] | None = None
+    # Bounded, backend-owned short-term context injected only when a model
+    # session cannot be resumed. It is neither durable Memory nor authority.
+    recent_conversation_context: tuple[Mapping[str, str], ...] = ()
     # Backend-authoritative ingress timestamp for this turn. It is context,
     # never user input, a model assertion, or a permission.
     reference_time_utc: datetime | None = None
