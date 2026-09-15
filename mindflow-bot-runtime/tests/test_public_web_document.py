@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -96,7 +97,8 @@ def test_url_gate_rejects_unsafe_targets(url, reason):
             database,
             FakeFetcher([]),
         ).read_url(user.id, url=url))
-        assert result["error"] == reason
+        assert result["error"] == "public_url_not_readable"
+        assert result["reason_code"] == reason
         return
     with pytest.raises(PublicWebReadError, match=reason):
         validate_public_https_url(url)
@@ -161,13 +163,15 @@ def test_dns_private_address_and_redirect_to_private_address_are_rejected():
         FakeFetcher([]),
         resolver=private_resolver,
     ).read_url(user.id, url="https://public.example/a"))
-    assert direct["error"] == "url_private_address"
+    assert direct["error"] == "public_url_not_readable"
+    assert direct["reason_code"] == "url_private_address"
 
     redirected = asyncio.run(service(
         database,
         FakeFetcher([response("", status=302, location="https://127.0.0.1/a")]),
     ).read_url(user.id, url="https://public.example/a"))
-    assert redirected["error"] == "url_private_address"
+    assert redirected["error"] == "public_url_not_readable"
+    assert redirected["reason_code"] == "url_private_address"
 
 
 def test_redirect_limit_is_manual_and_bounded():
@@ -184,7 +188,8 @@ def test_redirect_limit_is_manual_and_bounded():
         max_redirects=1,
     ).read_url(user.id, url="https://example.com/a"))
 
-    assert result["error"] == "too_many_redirects"
+    assert result["error"] == "public_url_not_readable"
+    assert result["reason_code"] == "too_many_redirects"
     assert len(fetcher.calls) == 2
 
 
@@ -194,7 +199,7 @@ def test_redirect_limit_is_manual_and_bounded():
         (response(b"x" * 2049), "response_too_large"),
         (response("binary", content_type="application/octet-stream"), "unsupported_content_type"),
         (PublicWebReadError("fetch_timeout"), "fetch_timeout"),
-        (response("login", status=401), "public_url_not_readable"),
+        (response("login", status=401), "authentication_required"),
     ],
 )
 def test_fetch_limits_return_stable_failures(raw_response, reason):
@@ -205,7 +210,121 @@ def test_fetch_limits_return_stable_failures(raw_response, reason):
         FakeFetcher([raw_response]),
         max_bytes=2048,
     ).read_url(user.id, url="https://example.com/a"))
-    assert result == {"ok": False, "error": reason, "verified": False}
+    assert result["ok"] is False
+    assert result["error"] == "public_url_not_readable"
+    assert result["reason_code"] == reason
+    assert result["reason_text"]
+    assert result["verified"] is False
+
+
+def test_url_failure_returns_safe_reason_text():
+    database = memory_database()
+    user = participant(database, "URL-SAFE-REASON")
+    result = asyncio.run(service(
+        database,
+        FakeFetcher([response("login", status=401)]),
+    ).read_url(user.id, url="https://example.com/private"))
+
+    assert result == {
+        "ok": False,
+        "error": "public_url_not_readable",
+        "reason_code": "authentication_required",
+        "reason_text": "这个网页拒绝未登录/自动访问，无法直接读取正文。",
+        "verified": False,
+    }
+
+
+def test_html_metadata_fallback_when_article_body_empty():
+    database = memory_database()
+    user = participant(database, "URL-METADATA")
+    markup = """
+    <html><head>
+      <title>普通标题</title>
+      <meta property="og:title" content="视频标题">
+      <meta name="description" content="公开视频简介">
+      <link rel="canonical" href="/canonical-video">
+    </head><body><div id="app"></div></body></html>
+    """
+    reader = service(
+        database,
+        FakeFetcher([response(markup, content_type="text/html")]),
+        extractor=lambda _markup: None,
+    )
+
+    first = asyncio.run(reader.read_url(user.id, url="https://example.com/video"))
+    cached = asyncio.run(reader.read_url(user.id, url="https://example.com/video"))
+
+    assert first["ok"] is True
+    assert first["readability"] == "metadata_only"
+    assert first["title"] == "视频标题"
+    assert first["source_url"] == "https://example.com/canonical-video"
+    assert "页面标题：视频标题" in first["content"]
+    assert "页面简介：公开视频简介" in first["content"]
+    assert cached["readability"] == "metadata_only"
+
+
+def test_metadata_only_never_claims_video_transcript():
+    database = memory_database()
+    user = participant(database, "URL-METADATA-NOTICE")
+    reader = service(
+        database,
+        FakeFetcher([response(
+            "<title>Video</title>", content_type="text/html"
+        )]),
+        extractor=lambda _markup: "",
+    )
+
+    result = asyncio.run(reader.read_url(user.id, url="https://example.com/video"))
+
+    assert result["readability"] == "metadata_only"
+    assert result["reading_notice"] == (
+        "我读取到了页面标题/简介，但没有读取到视频正文或字幕。"
+    )
+    assert "看完" not in result["reading_notice"]
+
+
+def test_empty_html_without_metadata_reports_empty_extracted_text():
+    database = memory_database()
+    user = participant(database, "URL-EMPTY")
+    reader = service(
+        database,
+        FakeFetcher([response("<html></html>", content_type="text/html")]),
+        extractor=lambda _markup: None,
+    )
+
+    result = asyncio.run(reader.read_url(user.id, url="https://example.com/empty"))
+
+    assert result["error"] == "public_url_not_readable"
+    assert result["reason_code"] == "empty_extracted_text"
+
+
+def test_url_reader_does_not_guess_dynamic_page_instruction_is_runtime_bound():
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "agent" / "sdk_adapter.py"
+    ).read_text(encoding="utf-8")
+
+    assert "explain only the backend" in source
+    assert "Do not infer that a page is dynamic" in source
+    assert "never claim to have" in source
+    assert "watched the video" in source
+
+
+def test_url_observability_never_logs_full_url_or_query_value(caplog):
+    database = memory_database()
+    user = participant(database, "URL-LOG-MINIMIZED")
+    reader = service(database, FakeFetcher([response("public body")]))
+
+    with caplog.at_level("INFO"):
+        result = asyncio.run(reader.read_url(
+            user.id,
+            url="https://example.com/article?topic=sensitive-value",
+        ))
+
+    assert result["ok"] is True
+    assert "web_read_url_started" in caplog.text
+    assert "web_read_url_succeeded" in caplog.text
+    assert "sensitive-value" not in caplog.text
+    assert "https://example.com" not in caplog.text
 
 
 def test_long_document_chunks_are_participant_bound_and_prompt_injection_is_data():

@@ -2160,6 +2160,9 @@ class WebDocument(Base):
     canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    extraction_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="article"
+    )
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

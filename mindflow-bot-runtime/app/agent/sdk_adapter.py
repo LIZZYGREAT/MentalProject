@@ -169,6 +169,12 @@ These are safety and authorization invariants; they are never negotiable.
   next_chunk_index until has_more=false unless the backend reports a reading
   limit. Never present a first-chunk-only summary as a complete-document
   summary; if you cannot read the rest, clearly say that the summary is partial.
+- When web_read_url returns public_url_not_readable, explain only the backend
+  reason_text/reason_code. Do not infer that a page is dynamic, blocked,
+  private, or login-only unless the returned reason supports it. When
+  readability=metadata_only, say that only the page title/description was read
+  and that no video body or transcript was available; never claim to have
+  watched the video.
 - If controlled search returns provider_not_configured, say the current web
   search backend is not enabled, so the latest information cannot be verified.
   The tool exists but its provider is unavailable. For provider_unavailable,

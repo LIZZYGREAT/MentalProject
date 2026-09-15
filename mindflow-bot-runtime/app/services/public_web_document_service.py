@@ -9,9 +9,12 @@ import hashlib
 import html
 import inspect
 import ipaddress
+import logging
 import re
 import socket
 import ssl
+import time
+from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
@@ -27,10 +30,28 @@ _SECRET_QUERY_KEYS = {
 }
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _ALLOWED_CONTENT_TYPES = {"text/html", "text/plain"}
+_PUBLIC_READ_REASON_TEXT = {
+    "authentication_required": "这个网页拒绝未登录/自动访问，无法直接读取正文。",
+    "fetch_failed": "网页服务器没有返回可读取的公开内容。",
+    "unsupported_content_type": "这个链接不是当前支持的公开 HTML/文本页面。",
+    "empty_extracted_text": "页面可以访问，但没有提取到可阅读正文。",
+    "response_too_large": "页面内容超过当前安全读取上限。",
+    "fetch_timeout": "网页读取超时。",
+    "url_private_address": "出于安全限制不能读取该链接。",
+    "secret_query_not_allowed": "出于安全限制不能读取该链接。",
+}
+
+
+logger = logging.getLogger(__name__)
 
 
 class PublicWebReadError(RuntimeError):
     """Stable, participant-safe public URL failure reason."""
+
+    def __init__(self, reason_code: str, **telemetry: Any) -> None:
+        super().__init__(str(reason_code))
+        self.reason_code = str(reason_code)
+        self.telemetry = dict(telemetry)
 
 
 @dataclass(frozen=True)
@@ -47,6 +68,41 @@ class FetchedWebDocument:
     text: str
     fetched_at: datetime
     content_type: str
+    extraction_mode: str = "article"
+    status_code_class: str | None = None
+    redirect_count: int = 0
+
+
+class _MetadataParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_title = False
+        self.title_parts: list[str] = []
+        self.metadata: dict[str, str] = {}
+        self.canonical_url: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        name = str(tag).casefold()
+        values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        if name == "title":
+            self.in_title = True
+        elif name == "meta":
+            key = (values.get("name") or values.get("property") or "").casefold()
+            content = values.get("content", "").strip()
+            if key in {"description", "og:title", "og:description"} and content:
+                self.metadata.setdefault(key, content)
+        elif name == "link" and "canonical" in values.get("rel", "").casefold().split():
+            href = values.get("href", "").strip()
+            if href:
+                self.canonical_url = href
+
+    def handle_endtag(self, tag: str) -> None:
+        if str(tag).casefold() == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_parts.append(str(data))
 
 
 class LimitedWebFetcher(Protocol):
@@ -363,22 +419,66 @@ class PublicWebDocumentService:
         self.extractor = extractor or self._extract_article
 
     async def read_url(self, participant_id, *, url: str) -> dict[str, Any]:
+        started = time.monotonic()
+        raw_url = str(url or "").strip()
+        raw_hash = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()
+        try:
+            raw_hostname = str(urlsplit(raw_url).hostname or "")[:253]
+        except ValueError:
+            raw_hostname = ""
+        logger.info(
+            "web_read_url_started participant_id=%s url_hash=%s hostname=%s",
+            participant_id,
+            raw_hash,
+            raw_hostname,
+        )
         if not self.enabled:
-            return self._failure("web_read_url_disabled")
+            return self._read_failure(
+                "web_read_url_disabled",
+                participant_id=participant_id,
+                url_hash=raw_hash,
+                hostname=raw_hostname,
+                started=started,
+            )
         try:
             requested_url = validate_public_https_url(url)
         except PublicWebReadError as exc:
-            return self._failure(str(exc))
+            return self._read_failure(
+                exc.reason_code,
+                participant_id=participant_id,
+                url_hash=raw_hash,
+                hostname=raw_hostname,
+                started=started,
+                **exc.telemetry,
+            )
         url_hash = hashlib.sha256(requested_url.encode("utf-8")).hexdigest()
+        hostname = str(urlsplit(requested_url).hostname or "")[:253]
         cached = await asyncio.to_thread(
             self.repository.get_by_url_hash,
             participant_id,
             url_hash,
         )
         if cached is not None:
+            self._log_success(
+                "web_read_url_metadata_only"
+                if cached.get("extraction_mode") == "metadata_only"
+                else "web_read_url_succeeded",
+                participant_id=participant_id,
+                url_hash=url_hash,
+                hostname=hostname,
+                started=started,
+                extraction_mode=str(cached.get("extraction_mode") or "article"),
+                content_type=str(cached.get("content_type") or ""),
+                redirect_count=0,
+                status_code_class=None,
+            )
             return self._success(cached, cache_hit=True)
         try:
-            document = await self._fetch_document(requested_url)
+            document = await self._fetch_document(
+                requested_url,
+                participant_id=participant_id,
+                url_hash=url_hash,
+            )
             chunks = self._chunk(document.text)
             stored = await asyncio.to_thread(
                 self.repository.store,
@@ -387,14 +487,47 @@ class PublicWebDocumentService:
                 canonical_url=document.canonical_url,
                 title=document.title,
                 content_type=document.content_type,
+                extraction_mode=document.extraction_mode,
                 chunks=chunks,
                 fetched_at=document.fetched_at,
                 ttl_minutes=self.cache_ttl_minutes,
             )
         except PublicWebReadError as exc:
-            return self._failure(str(exc))
+            return self._read_failure(
+                exc.reason_code,
+                participant_id=participant_id,
+                url_hash=url_hash,
+                hostname=hostname,
+                started=started,
+                **exc.telemetry,
+            )
         except Exception:
-            return self._failure("fetch_unavailable")
+            logger.exception(
+                "web_read_url_internal_failure participant_id=%s url_hash=%s hostname=%s",
+                participant_id,
+                url_hash,
+                hostname,
+            )
+            return self._read_failure(
+                "fetch_failed",
+                participant_id=participant_id,
+                url_hash=url_hash,
+                hostname=hostname,
+                started=started,
+            )
+        self._log_success(
+            "web_read_url_metadata_only"
+            if document.extraction_mode == "metadata_only"
+            else "web_read_url_succeeded",
+            participant_id=participant_id,
+            url_hash=url_hash,
+            hostname=hostname,
+            started=started,
+            extraction_mode=document.extraction_mode,
+            content_type=document.content_type,
+            redirect_count=document.redirect_count,
+            status_code_class=document.status_code_class,
+        )
         return self._success(stored, cache_hit=False)
 
     async def read_chunk(
@@ -423,7 +556,13 @@ class PublicWebDocumentService:
             return self._failure("web_document_chunk_not_found")
         return self._success_chunks(item, cache_hit=True)
 
-    async def _fetch_document(self, url: str) -> FetchedWebDocument:
+    async def _fetch_document(
+        self,
+        url: str,
+        *,
+        participant_id: Any = None,
+        url_hash: str = "",
+    ) -> FetchedWebDocument:
         current = url
         for redirect_count in range(self.max_redirects + 1):
             current = validate_public_https_url(current)
@@ -458,36 +597,74 @@ class PublicWebDocumentService:
             if response.status_code in _REDIRECT_STATUSES:
                 location = response.headers.get("location")
                 if not location:
-                    raise PublicWebReadError("public_url_not_readable")
+                    raise PublicWebReadError(
+                        "fetch_failed",
+                        status_code_class=f"{response.status_code // 100}xx",
+                        redirect_count=redirect_count,
+                    )
                 if redirect_count >= self.max_redirects:
                     raise PublicWebReadError("too_many_redirects")
                 current = urljoin(current, location)
+                logger.info(
+                    "web_read_url_redirected participant_id=%s url_hash=%s "
+                    "hostname=%s status_code_class=%s redirect_count=%s",
+                    participant_id,
+                    url_hash,
+                    str(urlsplit(current).hostname or "")[:253],
+                    f"{response.status_code // 100}xx",
+                    redirect_count + 1,
+                )
                 continue
             if response.status_code in {401, 403, 407}:
-                raise PublicWebReadError("public_url_not_readable")
+                raise PublicWebReadError(
+                    "authentication_required",
+                    status_code_class=f"{response.status_code // 100}xx",
+                    redirect_count=redirect_count,
+                )
             if response.status_code < 200 or response.status_code >= 300:
-                raise PublicWebReadError("public_url_not_readable")
+                raise PublicWebReadError(
+                    "fetch_failed",
+                    status_code_class=f"{response.status_code // 100}xx",
+                    redirect_count=redirect_count,
+                )
             content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
             if content_type not in _ALLOWED_CONTENT_TYPES:
                 raise PublicWebReadError("unsupported_content_type")
             encoding = self._encoding(response.headers.get("content-type", ""))
             body = response.body.decode(encoding, errors="replace")
             if content_type == "text/html":
-                title = self._html_title(body)
+                metadata = self._extract_metadata(body, current)
+                title = metadata["title"] or self._html_title(body)
                 extracted = self.extractor(body)
+                extraction_mode = "article"
+                canonical_url = metadata["canonical_url"] or current
             else:
                 title = str(parsed.hostname or "Public document")
                 extracted = body
+                extraction_mode = "plain_text"
+                canonical_url = current
             text = self._normalize_text(extracted or "")
             if not text:
-                raise PublicWebReadError("public_url_not_readable")
+                metadata_text = self._metadata_text(metadata) if content_type == "text/html" else ""
+                if not metadata_text:
+                    raise PublicWebReadError(
+                        "empty_extracted_text",
+                        status_code_class=f"{response.status_code // 100}xx",
+                        content_type=content_type,
+                        redirect_count=redirect_count,
+                    )
+                text = metadata_text
+                extraction_mode = "metadata_only"
             text = self._limit_extracted_text(text)
             return FetchedWebDocument(
                 title=title,
-                canonical_url=current,
+                canonical_url=canonical_url,
                 text=text,
                 fetched_at=datetime.now(timezone.utc),
                 content_type=content_type,
+                extraction_mode=extraction_mode,
+                status_code_class=f"{response.status_code // 100}xx",
+                redirect_count=redirect_count,
             )
         raise PublicWebReadError("too_many_redirects")
 
@@ -512,6 +689,44 @@ class PublicWebDocumentService:
             return "Public web page"
         title = re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()
         return title[:300] or "Public web page"
+
+    @staticmethod
+    def _extract_metadata(markup: str, page_url: str) -> dict[str, str | None]:
+        parser = _MetadataParser()
+        try:
+            parser.feed(str(markup))
+        except Exception:
+            return {"title": None, "description": None, "canonical_url": None}
+        title = PublicWebDocumentService._normalize_text(
+            parser.metadata.get("og:title") or " ".join(parser.title_parts)
+        )[:300]
+        description = PublicWebDocumentService._normalize_text(
+            parser.metadata.get("og:description")
+            or parser.metadata.get("description")
+            or ""
+        )[:2000]
+        canonical_url = None
+        if parser.canonical_url:
+            try:
+                canonical_url = validate_public_https_url(
+                    urljoin(page_url, parser.canonical_url)
+                )
+            except PublicWebReadError:
+                canonical_url = None
+        return {
+            "title": title or None,
+            "description": description or None,
+            "canonical_url": canonical_url,
+        }
+
+    @staticmethod
+    def _metadata_text(metadata: dict[str, str | None]) -> str:
+        lines = []
+        if metadata.get("title"):
+            lines.append(f"页面标题：{metadata['title']}")
+        if metadata.get("description"):
+            lines.append(f"页面简介：{metadata['description']}")
+        return "\n".join(lines)
 
     @staticmethod
     def _encoding(content_type: str) -> str:
@@ -564,6 +779,70 @@ class PublicWebDocumentService:
         return {"ok": False, "error": str(reason), "verified": False}
 
     @staticmethod
+    def _read_failure(
+        reason: str,
+        *,
+        participant_id: Any,
+        url_hash: str,
+        hostname: str,
+        started: float,
+        **telemetry: Any,
+    ) -> dict[str, Any]:
+        reason_code = "fetch_failed" if reason == "fetch_unavailable" else str(reason)
+        reason_text = _PUBLIC_READ_REASON_TEXT.get(
+            reason_code,
+            "无法读取这个公开网页。",
+        )
+        logger.warning(
+            "web_read_url_failed participant_id=%s url_hash=%s hostname=%s "
+            "reason_code=%s status_code_class=%s content_type=%s "
+            "redirect_count=%s latency_ms=%s",
+            participant_id,
+            url_hash,
+            hostname,
+            reason_code,
+            telemetry.get("status_code_class"),
+            telemetry.get("content_type"),
+            telemetry.get("redirect_count", 0),
+            round((time.monotonic() - started) * 1000, 1),
+        )
+        return {
+            "ok": False,
+            "error": "public_url_not_readable",
+            "reason_code": reason_code,
+            "reason_text": reason_text,
+            "verified": False,
+        }
+
+    @staticmethod
+    def _log_success(
+        event_name: str,
+        *,
+        participant_id: Any,
+        url_hash: str,
+        hostname: str,
+        started: float,
+        extraction_mode: str,
+        content_type: str,
+        redirect_count: int,
+        status_code_class: str | None,
+    ) -> None:
+        logger.info(
+            "%s participant_id=%s url_hash=%s hostname=%s "
+            "status_code_class=%s content_type=%s redirect_count=%s "
+            "latency_ms=%s extraction_mode=%s",
+            event_name,
+            participant_id,
+            url_hash,
+            hostname,
+            status_code_class,
+            content_type,
+            redirect_count,
+            round((time.monotonic() - started) * 1000, 1),
+            extraction_mode,
+        )
+
+    @staticmethod
     def _success(item: dict[str, Any], *, cache_hit: bool) -> dict[str, Any]:
         return PublicWebDocumentService._success_parts(
             item,
@@ -584,6 +863,7 @@ class PublicWebDocumentService:
                 "title": document.title,
                 "source_url": document.canonical_url,
                 "content_type": document.content_type,
+                "extraction_mode": document.extraction_mode,
                 "chunk_count": document.chunk_count,
                 "fetched_at": document.fetched_at.isoformat(),
             },
@@ -621,6 +901,7 @@ class PublicWebDocumentService:
             "title": item["title"],
             "source_url": item["source_url"],
             "content_type": item["content_type"],
+            "readability": str(item.get("extraction_mode") or "article"),
             "chunk_index": chunk_index,
             "chunk_count": chunk_count,
             "returned_chunk_count": len(chunks),
@@ -629,4 +910,9 @@ class PublicWebDocumentService:
             "has_more": has_more,
             "fetched_at": item["fetched_at"],
             "cache_hit": cache_hit,
+            "reading_notice": (
+                "我读取到了页面标题/简介，但没有读取到视频正文或字幕。"
+                if item.get("extraction_mode") == "metadata_only"
+                else None
+            ),
         }
