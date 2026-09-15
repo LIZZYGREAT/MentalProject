@@ -158,9 +158,13 @@ Tomorrow 解析 Today terminal 时使用 `refresh_calendar=False`；Today 无快
 ## Course classification
 
 事件分类先执行确定性规则与有界课程目录检索，再在已授权时使用同一次 semantic API 完成
-语义增强。`event_type_locked` 与 `course_identity_locked` 是独立事实：例如“高数”可以锁定
-为 course，但 canonical identity 仍由 API 从 Top-K 候选中选择；“线代”精确解析为“线性
-代数”时才锁定 identity。API 返回的课程必须属于候选集合。
+语义增强。只有用户显式提供的结构化 `event_type`、精确课程目录身份或 Backend 已知的课程
+导入 provenance 可以 hard-lock 事件类型。routine/task/course keyword 等宽泛词法命中只保存为
+带低置信度的 `rule_candidate`，在 rules-only 模式下作为保守的 provisional fallback，并允许
+专用 semantic model 在 allowlisted enum 内纠正。`event_type_locked` 与
+`course_identity_locked` 是独立事实：“高数”只形成可纠正的 course 候选，canonical identity
+仍由 API 从 Top-K 候选中选择；“线代”精确解析为“线性代数”时才锁定类型和 identity。
+API 返回的课程必须属于候选集合。
 
 `高数A/高数B` 会分别把 semantic candidate set 限制为 A/B-compatible 课程，API 不能反转
 用户明确写出的类别。`高数I/II/1/2/3` 仅作为模糊检索提示，不会用

@@ -221,6 +221,61 @@ def test_explicit_task_type_wins_over_api_course_classification():
     assert not prepared.get("course_name")
 
 
+def test_rule_candidate_does_not_hard_lock_ambiguous_event_type():
+    event = prepare_event_instances([_raw_event("学会动态规划")], TARGET_DATE)[0]
+    classification = event["metadata"]["classification"]
+
+    assert classification["source"] == "task_rule"
+    assert classification["rule_candidate"]["task_type"] == "meeting"
+    assert classification["event_type_locked"] is False
+    assert classification["authority"] == "semantic_correctable"
+    assert classification["confidence"] < 0.70
+
+
+def test_explicit_event_type_remains_locked():
+    event = prepare_event_instances(
+        [_raw_event("学会动态规划", event_type="other")], TARGET_DATE
+    )[0]
+    classification = event["metadata"]["classification"]
+
+    assert event["event_type"] == "other"
+    assert classification["lock"] == "explicit"
+    assert classification["event_type_locked"] is True
+    assert classification["rule_candidate"] is None
+
+
+def test_exact_course_identity_remains_locked():
+    event = prepare_event_instances([_raw_event("线代")], TARGET_DATE)[0]
+    classification = event["metadata"]["classification"]
+
+    assert event["event_type"] == "course"
+    assert event["course_code"] == "SCIE0038"
+    assert classification["lock"] == "catalog_exact"
+    assert classification["event_type_locked"] is True
+    assert classification["course_identity_locked"] is True
+
+
+def test_semantic_model_can_correct_weak_rule_classification():
+    response = _semantic_response(event_type="other", task_type="general")
+    response["course_match"] = {
+        "matched": False,
+        "canonical_name": None,
+        "code": None,
+        "confidence": 0.0,
+    }
+    client = SemanticClient(response)
+    _database, participant, preprocessor = _preprocessor(client)
+    event = prepare_event_instances([_raw_event("学会动态规划")], TARGET_DATE)[0]
+
+    assert event["metadata"]["classification"]["source"] == "task_rule"
+    asyncio.run(_enrich(preprocessor, participant.id, event))
+    prepared = preprocessor.prepare(participant.id, [event], consent=True)[0][0]
+
+    assert prepared["event_type"] == "other"
+    assert prepared["task_type"] == "general"
+    assert prepared["metadata"]["classification"]["source"] == "semantic_api"
+
+
 def test_exact_catalog_course_wins_over_api_task_classification():
     client = SemanticClient(
         _semantic_response(event_type="task", task_type="homework")
