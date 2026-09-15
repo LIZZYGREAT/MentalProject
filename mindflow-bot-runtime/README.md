@@ -71,6 +71,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `calendar_create_event`
 - `calendar_create_events_plan`
 - `calendar_update_event`
+- `calendar_update_events_plan`
 - `calendar_delete_event`
 - `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->

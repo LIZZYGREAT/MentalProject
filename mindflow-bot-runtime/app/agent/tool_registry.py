@@ -86,6 +86,7 @@ CALENDAR_MUTATION_TOOLS: dict[str, CalendarMutationOperation] = {
     "calendar_create_event": "create",
     "calendar_create_events_plan": "create",
     "calendar_update_event": "update",
+    "calendar_update_events_plan": "update",
     "calendar_delete_event": "delete",
     "calendar_delete_events_plan": "delete",
 }
@@ -193,6 +194,8 @@ def _verifier_proposal_summary(name: str, arguments: dict[str, Any]) -> dict[str
         summary["exact_target_supplied"] = exact_target
     if name == "calendar_delete_events_plan":
         summary["exact_target_count"] = len(arguments.get("event_ids") or [])
+    if name == "calendar_update_events_plan":
+        summary["exact_target_count"] = len(arguments.get("updates") or [])
     if semantic_arguments:
         summary["requested_values"] = semantic_arguments
     return summary

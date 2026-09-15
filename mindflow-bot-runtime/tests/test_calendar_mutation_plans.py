@@ -40,6 +40,7 @@ class _Verifier:
 class _Calendar:
     def __init__(self):
         self.created = []
+        self.updated = []
         self.deleted = []
         self.events = {
             "weekend-1": {
@@ -60,12 +61,23 @@ class _Calendar:
         self.created.append((participant_id, kwargs))
         return {"id": f"created-{len(self.created)}", **kwargs}
 
+    async def create_recurring_event(self, participant_id, **kwargs):
+        self.created.append((participant_id, kwargs))
+        return {"id": f"created-{len(self.created)}", **kwargs}
+
     async def get_event(self, _participant_id, event_id):
         return dict(self.events[event_id])
 
     async def delete_event(self, participant_id, event_id):
         self.deleted.append((participant_id, event_id))
         return True
+
+    async def update_event(self, participant_id, event_id, **kwargs):
+        self.updated.append((participant_id, event_id, kwargs))
+        updated = {**self.events[event_id]}
+        updated.update({key: value for key, value in kwargs.items() if value is not None})
+        self.events[event_id] = updated
+        return updated
 
 
 def _context(participant_id, text):
@@ -930,6 +942,202 @@ def test_polite_question_with_concrete_create_action_stages_one_plan():
     assert result.result["calendar_mutation"] == "pending_confirmation"
     assert len(outbox.take_cards(ctx.agent_run_id)) == 1
     assert calendar.created == []
+
+
+def test_single_create_stages_confirmation_plan_without_provider_write():
+    database = memory_database()
+    owner = participant(database, "PLAN-SINGLE-CREATE")
+    calendar = _Calendar()
+    _plans, outbox, _tools, registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "明天下午加一个组会")
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_create_event",
+        {
+            "summary": "组会",
+            "recurrence_mode": "single",
+            "start_time": "2030-01-12T15:00:00+08:00",
+            "end_time": "2030-01-12T16:00:00+08:00",
+        },
+    ))
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert result.result["item_count"] == 1
+    assert calendar.created == []
+    assert len(outbox.take_cards(ctx.agent_run_id)) == 1
+
+
+def test_recurring_create_plan_preserves_recurrence_until_runner_execution():
+    database = memory_database()
+    owner = participant(database, "PLAN-RECURRING-CREATE")
+    calendar = _Calendar()
+    plans, _outbox, _tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "每周一上午九点开组会，共四次")
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_create_event",
+        {
+            "summary": "组会",
+            "recurrence_mode": "recurring",
+            "recurrence_frequency": "WEEKLY",
+            "recurrence_weekdays": ["MO"],
+            "recurrence_count": 4,
+            "start_time": "2030-01-07T09:00:00+08:00",
+            "end_time": "2030-01-07T10:00:00+08:00",
+            "reminder_minutes": 15,
+            "description": "保留说明",
+        },
+    ))
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert calendar.created == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    stored = plans.get(plan_id)
+    expected_rule = "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;COUNT=4"
+    assert stored["items"][0]["recurrence"] == expected_rule
+    plans.request_execution(owner.id, plan_id)
+
+    asyncio.run(runner.run_once())
+
+    created = calendar.created[0][1]
+    assert created["recurrence"] == expected_rule
+    assert created["reminder_minutes"] == 15
+    assert created["description"] == "保留说明"
+
+
+def test_single_update_stages_then_runner_executes_after_confirmation():
+    database = memory_database()
+    owner = participant(database, "PLAN-SINGLE-UPDATE")
+    calendar = _Calendar()
+    plans, outbox, tools, registry, runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "把周六的活动改名")
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_update_event",
+        {"event_id": "weekend-1", "summary": "项目讨论"},
+    ))
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert calendar.updated == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    plan = plans.get(plan_id)
+    card = outbox.take_cards(ctx.agent_run_id)[0]
+    confirmation = _plan_action(card, "_confirm")
+    handled = _card_service(database, tools).handle(
+        owner.id,
+        message_id="update-plan-card",
+        callback_event_id="confirm-update",
+        action_value=confirmation,
+        form_value={},
+    )
+    assert handled["status"] == "queued"
+    asyncio.run(runner.run_once())
+
+    assert len(calendar.updated) == 1
+    assert calendar.updated[0][2]["summary"] == "项目讨论"
+    assert plans.get(plan["id"])["status"] == "succeeded"
+
+
+def test_single_delete_uses_generic_plan_and_waits_for_confirmation():
+    database = memory_database()
+    owner = participant(database, "PLAN-SINGLE-DELETE")
+    calendar = _Calendar()
+    plans, outbox, _tools, registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "删除周六的志愿服务")
+
+    result = asyncio.run(registry.execute(
+        ctx,
+        "calendar_delete_event",
+        {"event_id": "weekend-1"},
+    ))
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    assert calendar.deleted == []
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    assert plans.get(plan_id)["operation"] == "delete"
+    serialized = json.dumps(outbox.take_cards(ctx.agent_run_id)[0])
+    assert "calendar_mutation_plan_confirm" in serialized
+    assert "calendar_delete_confirm" not in serialized
+
+
+def test_update_outcome_unknown_reads_back_and_never_blindly_retries_divergent_state():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-UNKNOWN")
+    calendar = _Calendar()
+    plans, _outbox, tools, _registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+    previous = dict(calendar.events["weekend-1"])
+    proposed = {**previous, "summary": "项目讨论"}
+    plan = plans.create(
+        owner.id,
+        operation="update",
+        items=[{
+            "event_id": "weekend-1",
+            "previous": previous,
+            "proposed": proposed,
+            "summary": "项目讨论",
+            "start_time": proposed["start_time"],
+            "end_time": proposed["end_time"],
+        }],
+    )
+    calendar.events["weekend-1"]["summary"] = "第三方已改名"
+    item = {**plan["ledger_items"][0], "reconcile": True}
+
+    with pytest.raises(CalendarMutationOutcomeUnknown):
+        asyncio.run(tools.execute_calendar_mutation_plan_item(plan, item))
+
+    assert calendar.updated == []
+
+
+def test_runner_completion_uses_modified_verb():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-VERB")
+    repository = CalendarMutationPlanRepository(database)
+    plan = repository.create(
+        owner.id,
+        operation="update",
+        items=[{"event_id": "one", "summary": "updated"}],
+    )
+    repository.request_execution(
+        owner.id,
+        plan["id"],
+        status_card_message_id="om-update",
+        status_card_chat_id="oc-update",
+    )
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+
+        def update_card(self, message_id, card):
+            self.cards.append((message_id, card))
+
+    sender = Sender()
+
+    async def execute(_plan, _item):
+        return {"ok": True, "updated": {"id": "one"}}
+
+    asyncio.run(
+        CalendarMutationPlanRunner(repository, execute, sender=sender).run_once()
+    )
+
+    visible = json.dumps(sender.cards[0][1], ensure_ascii=False)
+    assert "已修改 1 个日程" in visible
+    assert "已删除" not in visible
 
 
 def test_polite_question_with_concrete_delete_action_stages_one_plan():

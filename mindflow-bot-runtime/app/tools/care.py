@@ -16,7 +16,6 @@ from app.agent.tool_registry import (
     ToolRegistry,
 )
 from app.integrations.feishu.cards import (
-    calendar_delete_confirmation_card,
     calendar_mutation_plan_confirmation_card,
     daily_checkin_card,
     morning_brief_settings_card,
@@ -99,8 +98,39 @@ def _calendar_plan_item_schema() -> dict[str, Any]:
                 "minimum": 0,
                 "maximum": 1440,
             },
+            "recurrence_mode": {
+                "type": "string",
+                "enum": ["single", "recurring"],
+            },
+            **_recurrence_schema_properties(),
         },
         "required": ["summary", "start_time", "end_time"],
+        "additionalProperties": False,
+    }
+
+
+def _calendar_update_plan_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 200},
+            "start_time": {"type": "string", "format": "date-time"},
+            "end_time": {"type": "string", "format": "date-time"},
+            "description": {"type": "string", "maxLength": 1000},
+            "reminder_minutes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1440,
+            },
+            "clear_recurrence": {"type": "boolean"},
+            **_recurrence_schema_properties(),
+        },
+        "required": ["event_id"],
+        "dependentRequired": {
+            "start_time": ["end_time"],
+            "end_time": ["start_time"],
+        },
         "additionalProperties": False,
     }
 
@@ -593,7 +623,7 @@ class CareTools:
         )
         registry.register(
             "calendar_create_event",
-            "Create one event in this participant's primary Feishu calendar after an explicit user request.",
+            "Create one participant-confirmed pending Calendar mutation plan and fixed confirmation card. The tool call itself never writes to Calendar; provider creation happens only after the participant confirms and the durable runner executes it.",
             {
                 "type": "object",
                 "properties": {
@@ -631,14 +661,14 @@ class CareTools:
         )
         registry.register(
             "calendar_create_events_plan",
-            "Create one backend-owned confirmation plan for 2 to 20 explicit, bounded single events. Use this instead of repeated calendar_create_event calls when one user request names multiple dates. It stages one fixed card and writes no Calendar event until the user clicks Confirm.",
+            "Create one participant-confirmed pending Calendar mutation plan for 1 to 20 explicit events. The tool call itself never writes to Calendar and always stages a fixed confirmation card.",
             {
                 "type": "object",
                 "properties": {
                     "events": {
                         "type": "array",
                         "items": _calendar_plan_item_schema(),
-                        "minItems": 2,
+                        "minItems": 1,
                         "maxItems": 20,
                     }
                 },
@@ -651,7 +681,7 @@ class CareTools:
         )
         registry.register(
             "calendar_update_event",
-            "Update one exact event in this participant's primary calendar after a direct user request authorized by the backend.",
+            "Create one participant-confirmed pending plan for updating one exact event. The tool call itself never writes to Calendar and always stages a fixed confirmation card; the durable runner updates only after confirmation.",
             {
                 "type": "object",
                 "properties": {
@@ -677,8 +707,31 @@ class CareTools:
             authorization_context_resolver=self.resolve_calendar_event_authorization_context,
         )
         registry.register(
+            "calendar_update_events_plan",
+            "Create one participant-confirmed pending Calendar mutation plan for 1 to 20 exact participant-bound updates. The tool call itself never writes to Calendar and always stages a fixed confirmation card.",
+            {
+                "type": "object",
+                "properties": {
+                    "updates": {
+                        "type": "array",
+                        "items": _calendar_update_plan_item_schema(),
+                        "minItems": 1,
+                        "maxItems": 20,
+                    }
+                },
+                "required": ["updates"],
+                "additionalProperties": False,
+            },
+            self.update_calendar_events_plan,
+            effect="external_write",
+            authorization_requirement="direct_request",
+            authorization_context_resolver=(
+                self.resolve_calendar_updates_plan_authorization_context
+            ),
+        )
+        registry.register(
             "calendar_delete_event",
-            "Queue a fixed confirmation card for deleting one exact event. The event is not deleted until the user clicks Confirm Delete and the backend callback succeeds.",
+            "Create one participant-confirmed pending plan for deleting one exact event. The tool call itself never writes to Calendar and always stages the generic fixed confirmation card; the durable runner deletes only after confirmation.",
             {
                 "type": "object",
                 "properties": {
@@ -694,7 +747,7 @@ class CareTools:
         )
         registry.register(
             "calendar_delete_events_plan",
-            "Create one backend-owned confirmation plan for deleting 2 to 20 exact participant-owned events. Use this instead of repeated calendar_delete_event calls for one multi-event request. It stages one fixed card and deletes nothing until the user clicks Confirm.",
+            "Create one participant-confirmed pending Calendar mutation plan for deleting 1 to 20 exact participant-owned events. The tool call itself never writes to Calendar and always stages the generic fixed confirmation card.",
             {
                 "type": "object",
                 "properties": {
@@ -705,7 +758,7 @@ class CareTools:
                             "minLength": 1,
                             "maxLength": 256,
                         },
-                        "minItems": 2,
+                        "minItems": 1,
                         "maxItems": 20,
                         "uniqueItems": True,
                     }
@@ -1494,14 +1547,78 @@ class CareTools:
             "events": events,
         }
 
+    def _normalize_calendar_create_plan_item(
+        self, raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        item = dict(raw)
+        start_time = _parse_datetime(item["start_time"], self.timezone)
+        end_time = _parse_datetime(item["end_time"], self.timezone)
+        if end_time <= start_time:
+            raise ValueError("calendar event end_time must be after start_time")
+        recurrence_mode = str(item.get("recurrence_mode") or "single")
+        recurrence_mode, recurrence = _creation_recurrence_from_args(
+            {**item, "recurrence_mode": recurrence_mode}, self.timezone
+        )
+        return {
+            "summary": str(item["summary"]),
+            "recurrence_mode": recurrence_mode,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "description": str(item.get("description") or ""),
+            "reminder_minutes": item.get("reminder_minutes"),
+            "recurrence": recurrence or "",
+        }
+
+    async def _stage_calendar_mutation_plan(
+        self,
+        ctx: AgentContext,
+        *,
+        operation: str,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
+        if self.calendar_mutation_plans is None:
+            return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
+        plan = await asyncio.to_thread(
+            self.calendar_mutation_plans.create,
+            ctx.participant_id,
+            operation=operation,
+            items=items,
+        )
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            calendar_mutation_plan_confirmation_card(
+                plan, timezone_name=self.timezone.key
+            ),
+        )
+        return {
+            "ok": True,
+            "calendar_mutation": "pending_confirmation",
+            "confirmation_required": True,
+            "item_count": len(items),
+        }
+
     async def create_calendar_event(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        item = self._normalize_calendar_create_plan_item(args)
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="create", items=[item]
+        )
+
+    async def _execute_calendar_create_effect(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
         start_time = _parse_datetime(args["start_time"], self.timezone)
         end_time = _parse_datetime(args["end_time"], self.timezone)
-        recurrence_mode, recurrence = _creation_recurrence_from_args(
-            args, self.timezone
-        )
+        if args.get("recurrence"):
+            recurrence_mode = str(args.get("recurrence_mode") or "recurring")
+            recurrence = str(args["recurrence"])
+        else:
+            recurrence_mode, recurrence = _creation_recurrence_from_args(
+                args, self.timezone
+            )
         requested_event = {
             "summary": str(args["summary"]),
             "recurrence_mode": recurrence_mode,
@@ -1579,42 +1696,13 @@ class CareTools:
     async def create_calendar_events_plan(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        if self.presentations is None:
-            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
-        if self.calendar_mutation_plans is None:
-            return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
-        items: list[dict[str, Any]] = []
-        for raw in list(args.get("events") or []):
-            item = dict(raw)
-            start_time = _parse_datetime(item["start_time"], self.timezone)
-            end_time = _parse_datetime(item["end_time"], self.timezone)
-            if end_time <= start_time:
-                raise ValueError("calendar event end_time must be after start_time")
-            items.append({
-                "summary": str(item["summary"]),
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "description": str(item.get("description") or ""),
-                "reminder_minutes": item.get("reminder_minutes"),
-            })
-        plan = await asyncio.to_thread(
-            self.calendar_mutation_plans.create,
-            ctx.participant_id,
-            operation="create",
-            items=items,
+        items = [
+            self._normalize_calendar_create_plan_item(dict(raw))
+            for raw in list(args.get("events") or [])
+        ]
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="create", items=items
         )
-        self.presentations.stage_card(
-            ctx.agent_run_id,
-            calendar_mutation_plan_confirmation_card(
-                plan, timezone_name=self.timezone.key
-            ),
-        )
-        return {
-            "ok": True,
-            "calendar_mutation": "pending_confirmation",
-            "confirmation_required": True,
-            "item_count": len(items),
-        }
 
     async def resolve_calendar_event_authorization_context(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -1685,7 +1773,136 @@ class CareTools:
             }
         }
 
+    async def resolve_calendar_updates_plan_authorization_context(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        targets = []
+        for update in list(args.get("updates") or []):
+            resolved = await self.resolve_calendar_event_authorization_context(
+                ctx, {"event_id": str(dict(update)["event_id"])}
+            )
+            targets.append(dict(resolved["target"]))
+        return {
+            "target": {
+                "count": len(targets),
+                "events": targets,
+                "timezone": str(self.timezone),
+            }
+        }
+
+    async def _normalize_calendar_update_plan_item(
+        self, ctx: AgentContext, raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        args = dict(raw)
+        if ("start_time" in args) != ("end_time" in args):
+            raise ValueError("start_time and end_time must be provided together")
+        start_time = (
+            _parse_datetime(args["start_time"], self.timezone)
+            if args.get("start_time") is not None
+            else None
+        )
+        end_time = (
+            _parse_datetime(args["end_time"], self.timezone)
+            if args.get("end_time") is not None
+            else None
+        )
+        if start_time is not None and end_time <= start_time:
+            raise ValueError("calendar event end_time must be after start_time")
+        recurrence = _recurrence_from_args(args, self.timezone)
+        try:
+            previous = await self.calendar.get_event(
+                ctx.participant_id, str(args["event_id"])
+            )
+        except PermissionError:
+            raise
+        previous_event = dict(previous or {})
+        if not str(previous_event.get("id") or args.get("event_id") or "").strip():
+            raise CalendarMutationRejected(
+                "event not found", status_code=404, request_kind="get_event"
+            )
+        clear_recurrence = bool(args.get("clear_recurrence", False))
+        proposed = {
+            **previous_event,
+            **({"summary": args["summary"]} if args.get("summary") is not None else {}),
+            **(
+                {"description": args["description"]}
+                if args.get("description") is not None
+                else {}
+            ),
+            "start_time": (
+                start_time.isoformat()
+                if start_time is not None
+                else previous_event.get("start_time")
+            ),
+            "end_time": (
+                end_time.isoformat()
+                if end_time is not None
+                else previous_event.get("end_time")
+            ),
+            "recurrence": (
+                "" if clear_recurrence
+                else recurrence
+                if recurrence is not None
+                else previous_event.get("recurrence") or ""
+            ),
+            **(
+                {"reminder_minutes": args.get("reminder_minutes")}
+                if "reminder_minutes" in args
+                else {}
+            ),
+        }
+        if recurrence is not None and start_time is None and proposed.get("start_time"):
+            _validate_generated_weekly_recurrence(
+                recurrence,
+                _parse_datetime(proposed["start_time"], self.timezone),
+            )
+        return {
+            "event_id": str(args["event_id"]),
+            "previous": previous_event,
+            "proposed": proposed,
+            "summary": str(proposed.get("summary") or "未命名日程")[:200],
+            "description": str(proposed.get("description") or "")[:1000],
+            "start_time": str(proposed.get("start_time") or ""),
+            "end_time": str(proposed.get("end_time") or ""),
+            "reminder_minutes": proposed.get("reminder_minutes"),
+            "recurrence": str(proposed.get("recurrence") or ""),
+            "clear_recurrence": clear_recurrence,
+        }
+
     async def update_calendar_event(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            item = await self._normalize_calendar_update_plan_item(ctx, args)
+        except PermissionError:
+            return {
+                "ok": False,
+                "error": "calendar_not_connected",
+                "command": "/calendar",
+            }
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="update", items=[item]
+        )
+
+    async def update_calendar_events_plan(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            items = [
+                await self._normalize_calendar_update_plan_item(ctx, dict(raw))
+                for raw in list(args.get("updates") or [])
+            ]
+        except PermissionError:
+            return {
+                "ok": False,
+                "error": "calendar_not_connected",
+                "command": "/calendar",
+            }
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="update", items=items
+        )
+
+    async def _execute_calendar_update_effect(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
         if ("start_time" in args) != ("end_time" in args):
@@ -1700,7 +1917,11 @@ class CareTools:
             if args.get("end_time") is not None
             else None
         )
-        recurrence = _recurrence_from_args(args, self.timezone)
+        recurrence = (
+            str(args["recurrence"])
+            if args.get("recurrence")
+            else _recurrence_from_args(args, self.timezone)
+        )
         try:
             previous = await self.calendar.get_event(
                 ctx.participant_id, str(args["event_id"])
@@ -1817,19 +2038,16 @@ class CareTools:
             )
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
-        if self.presentations is None:
-            return {"ok": False, "error": "rich_reply_delivery_unavailable"}
-        self.presentations.stage_card(
-            ctx.agent_run_id,
-            calendar_delete_confirmation_card(
-                previous, timezone_name=self.timezone.key
-            ),
-        )
-        return {
-            "ok": True,
-            "calendar_mutation": "pending_confirmation",
-            "confirmation_required": True,
+        item = {
+            "event_id": str(args["event_id"]),
+            "summary": str(previous.get("summary") or "未命名日程")[:200],
+            "start_time": str(previous.get("start_time") or "")[:64],
+            "end_time": str(previous.get("end_time") or "")[:64],
+            "previous": dict(previous or {}),
         }
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="delete", items=[item]
+        )
 
     async def delete_calendar_events_plan(
         self, ctx: AgentContext, args: dict[str, Any]
@@ -1849,6 +2067,7 @@ class CareTools:
                     "summary": str(event.get("summary") or "未命名日程")[:200],
                     "start_time": str(event.get("start_time") or "")[:64],
                     "end_time": str(event.get("end_time") or "")[:64],
+                    "previous": dict(event or {}),
                 })
         except PermissionError:
             return {
@@ -1856,24 +2075,9 @@ class CareTools:
                 "error": "calendar_not_connected",
                 "command": "/calendar",
             }
-        plan = await asyncio.to_thread(
-            self.calendar_mutation_plans.create,
-            ctx.participant_id,
-            operation="delete",
-            items=items,
+        return await self._stage_calendar_mutation_plan(
+            ctx, operation="delete", items=items
         )
-        self.presentations.stage_card(
-            ctx.agent_run_id,
-            calendar_mutation_plan_confirmation_card(
-                plan, timezone_name=self.timezone.key
-            ),
-        )
-        return {
-            "ok": True,
-            "calendar_mutation": "pending_confirmation",
-            "confirmation_required": True,
-            "item_count": len(items),
-        }
 
     async def confirm_calendar_delete(
         self,
@@ -1883,6 +2087,21 @@ class CareTools:
         source_message_id: str,
     ) -> dict[str, Any]:
         """Execute deletion only after the fixed participant-bound callback."""
+
+        return await self._execute_calendar_delete_effect(
+            participant_id,
+            event_id,
+            source_message_id=source_message_id,
+        )
+
+    async def _execute_calendar_delete_effect(
+        self,
+        participant_id,
+        event_id: str,
+        *,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        """Private provider effect used by legacy callbacks and the runner."""
 
         try:
             previous = await self.calendar.get_event(participant_id, event_id)
@@ -2030,10 +2249,41 @@ class CareTools:
                 agent_run_id=uuid.uuid4(),
                 turn_effect_policy="deterministic_backend_action",
             )
-            return await self.create_calendar_event(
-                item_ctx,
-                {**payload, "recurrence_mode": "single"},
+            return await self._execute_calendar_create_effect(item_ctx, payload)
+        if item["operation"] == "update":
+            if item.get("reconcile"):
+                try:
+                    current = await self.calendar.get_event(
+                        participant_id, str(payload["event_id"])
+                    )
+                except CalendarMutationRejected as exc:
+                    if exc.status_code == 404:
+                        return {"ok": False, "error": "calendar_event_not_found"}
+                    raise
+                proposed = dict(payload.get("proposed") or payload)
+                previous = dict(payload.get("previous") or {})
+                if self._calendar_event_matches(current, proposed):
+                    return {
+                        "ok": True,
+                        "calendar_mutation": "succeeded",
+                        "updated": current,
+                        "read_back": True,
+                    }
+                if previous and not self._calendar_event_matches(current, previous):
+                    raise CalendarMutationOutcomeUnknown(
+                        "Calendar update read-back matches neither previous nor proposed state",
+                        request_kind="update_event",
+                    )
+            item_ctx = AgentContext(
+                participant_id=participant_id,
+                participant_code="",
+                open_id="",
+                chat_id="",
+                message_id=source_identity,
+                agent_run_id=uuid.uuid4(),
+                turn_effect_policy="deterministic_backend_action",
             )
+            return await self._execute_calendar_update_effect(item_ctx, payload)
         if item["operation"] != "delete":
             raise ValueError("unsupported calendar mutation plan operation")
         event_id = str(payload["event_id"])
@@ -2049,8 +2299,31 @@ class CareTools:
                         "read_back": True,
                     }
                 raise
-        return await self.confirm_calendar_delete(
+        return await self._execute_calendar_delete_effect(
             participant_id,
             event_id,
             source_message_id=source_identity,
         )
+
+    def _calendar_event_matches(
+        self, current: dict[str, Any], expected: dict[str, Any]
+    ) -> bool:
+        for field in (
+            "summary",
+            "description",
+            "recurrence",
+            "reminder_minutes",
+        ):
+            if field in expected and (current.get(field) or "") != (expected.get(field) or ""):
+                return False
+        for field in ("start_time", "end_time"):
+            if not expected.get(field):
+                continue
+            try:
+                current_time = _parse_datetime(current.get(field), self.timezone)
+                expected_time = _parse_datetime(expected.get(field), self.timezone)
+            except ValueError:
+                return False
+            if current_time != expected_time:
+                return False
+        return True

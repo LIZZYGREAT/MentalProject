@@ -281,7 +281,7 @@ def test_calendar_create_persists_preintent_before_remote_call_and_resolves():
         )
 
         queue.start()
-        result = await tools.create_calendar_event(
+        result = await tools._execute_calendar_create_effect(
             ctx,
             {
                 "summary": "课程",
@@ -347,7 +347,7 @@ def test_calendar_remote_failure_resolves_preintent_as_remote_failed():
         )
 
         with pytest.raises(RuntimeError, match="provider rejected"):
-            await tools.create_calendar_event(
+            await tools._execute_calendar_create_effect(
                 ctx,
                 {
                     "summary": "课程",
@@ -491,7 +491,7 @@ def test_timeout_after_mutation_request_stays_recoverable_and_is_fenced():
         )
 
         with pytest.raises(CalendarMutationOutcomeUnknown):
-            await tools.create_calendar_event(
+            await tools._execute_calendar_create_effect(
                 ctx,
                 {
                     "summary": "课程",
@@ -885,7 +885,7 @@ def test_preflight_failure_is_terminal_and_never_enters_replay_queue():
         )
 
         with pytest.raises(CalendarMutationNotSent):
-            await tools.create_calendar_event(
+            await tools._execute_calendar_create_effect(
                 ctx,
                 {
                     "summary": "课程",
@@ -987,7 +987,7 @@ def test_cancel_after_remote_commit_is_immediately_recoverable():
             person.id, "P", "open", "chat", "commit-cancel-source", uuid.uuid4()
         )
         task = asyncio.create_task(
-            tools.create_calendar_event(
+            tools._execute_calendar_create_effect(
                 ctx,
                 {
                     "summary": "课程",

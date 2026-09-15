@@ -25,6 +25,7 @@ TOOL_STAGE = {
     "calendar_create_event": "calendar_mutation",
     "calendar_create_events_plan": "calendar_mutation_plan",
     "calendar_update_event": "calendar_mutation",
+    "calendar_update_events_plan": "calendar_mutation_plan",
     "calendar_delete_event": "calendar_mutation",
     "calendar_delete_events_plan": "calendar_mutation_plan",
 }

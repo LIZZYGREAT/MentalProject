@@ -1171,11 +1171,11 @@ def calendar_mutation_plan_confirmation_card(
     items = [dict(item) for item in list(plan.get("items") or [])]
     if not plan_id or len(plan_id) > 64:
         raise ValueError("calendar mutation plan id is invalid")
-    if operation not in {"create", "delete"} or not 2 <= len(items) <= 20:
+    if operation not in {"create", "update", "delete"} or not 1 <= len(items) <= 20:
         raise ValueError("calendar mutation plan is invalid")
-    verb = "添加" if operation == "create" else "删除"
+    verb = {"create": "添加", "update": "修改", "delete": "删除"}[operation]
     ledger_by_index: dict[int, dict[str, Any]] = {}
-    if operation == "create":
+    if operation in {"create", "update"}:
         ledger_items = [dict(item) for item in list(plan.get("ledger_items") or [])]
         for ledger_item in ledger_items:
             try:
@@ -1209,7 +1209,7 @@ def calendar_mutation_plan_confirmation_card(
             "tag": "markdown",
             "content": f"{display_index}. **{summary}**\n   {date_range}",
         })
-        if operation == "create":
+        if operation in {"create", "update"}:
             elements.append({
                 "tag": "button",
                 "type": "default",

@@ -158,6 +158,12 @@ class CalendarMutationPlanRunner:
                             "Calendar create returned no event id",
                             request_kind="create_event",
                         )
+                elif item["operation"] == "update":
+                    provider_event_id = str(
+                        dict(result.get("updated") or {}).get("id")
+                        or item.get("payload", {}).get("event_id")
+                        or ""
+                    ).strip() or None
                 await asyncio.to_thread(
                     self.plans.record_item_success,
                     plan_id,
@@ -326,7 +332,11 @@ class CalendarMutationPlanRunner:
         result = dict(plan.get("result") or {})
         succeeded_count = int(result.get("succeeded_count") or 0)
         failed_count = int(result.get("failed_count") or 0)
-        verb = "添加" if plan.get("operation") == "create" else "删除"
+        verb = {
+            "create": "添加",
+            "update": "修改",
+            "delete": "删除",
+        }[str(plan.get("operation"))]
         message = (
             f"已{verb} {succeeded_count} 个日程。"
             if failed_count == 0
