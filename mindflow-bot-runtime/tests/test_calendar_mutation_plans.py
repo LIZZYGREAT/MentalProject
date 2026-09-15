@@ -353,6 +353,66 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
     assert len(calendar.updated) == 2
 
 
+def test_backend_uses_structured_calendar_scope_not_raw_user_text():
+    database = memory_database()
+    owner = participant(database, "PLAN-SCOPE-AUTHORITY")
+    calendar = _Calendar()
+    calendar.events.update(
+        {
+            "course-1": {
+                "id": "course-1",
+                "summary": "操作系统(0955)",
+                "start_time": "2030-01-15T12:55:00+08:00",
+                "end_time": "2030-01-15T14:30:00+08:00",
+            },
+            "course-2": {
+                "id": "course-2",
+                "summary": "操作系统(0955)",
+                "start_time": "2030-01-22T12:55:00+08:00",
+                "end_time": "2030-01-22T14:30:00+08:00",
+            },
+        }
+    )
+    plans, _outbox, tools, registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+
+    class _Resolver:
+        async def resolve(self, *_args, **_kwargs):
+            return ResolvedCourseSeries(
+                anchor_event_id="course-1",
+                course_identity="course-import:import-1:item-1",
+                display_name="操作系统(0955)",
+                scope_start=datetime.fromisoformat("2030-01-15T12:55:00+08:00"),
+                scope_end=datetime.fromisoformat("2030-01-22T14:30:00+08:00"),
+                occurrence_events=(
+                    dict(calendar.events["course-1"]),
+                    dict(calendar.events["course-2"]),
+                ),
+                resolution_source="course_import",
+            )
+
+    tools.course_series_resolver = _Resolver()
+    result = asyncio.run(
+        registry.execute(
+            _context(owner.id, "只改这一次，不要改后面的课"),
+            "calendar_update_event",
+            {
+                "event_ref": "course-1",
+                "scope": "current_semester_remainder",
+                "changes": {"end_clock": "15:40"},
+            },
+        )
+    )
+
+    assert result.result["item_count"] == 2
+    with database.session() as session:
+        plan_id = str(session.scalar(select(CalendarMutationPlan.id)))
+    assert plans.get_for_participant(owner.id, plan_id)["presentation_context"][
+        "scope"
+    ] == "current_semester_remainder"
+
+
 def test_update_plan_uses_updating_item_state():
     database = memory_database()
     owner = participant(database, "PLAN-UPDATING-STATE")
@@ -1244,10 +1304,12 @@ def test_update_plan_applies_new_weekly_recurrence_after_confirmation():
         ctx,
         "calendar_update_event",
         {
-            "event_id": "weekend-1",
-            "recurrence_frequency": "WEEKLY",
-            "recurrence_weekdays": ["MO"],
-            "recurrence_count": 4,
+            "event_ref": "weekend-1",
+            "changes": {
+                "recurrence_frequency": "WEEKLY",
+                "recurrence_weekdays": ["MO"],
+                "recurrence_count": 4,
+            },
         },
     ))
 
@@ -1279,15 +1341,19 @@ def test_batch_update_plan_applies_normalized_recurrence():
         {
             "updates": [
                 {
-                    "event_id": "weekend-1",
-                    "recurrence_frequency": "WEEKLY",
-                    "recurrence_weekdays": ["MO"],
-                    "recurrence_count": 4,
+                    "event_ref": "weekend-1",
+                    "changes": {
+                        "recurrence_frequency": "WEEKLY",
+                        "recurrence_weekdays": ["MO"],
+                        "recurrence_count": 4,
+                    },
                 },
                 {
-                    "event_id": "weekend-2",
-                    "recurrence_frequency": "DAILY",
-                    "recurrence_count": 2,
+                    "event_ref": "weekend-2",
+                    "changes": {
+                        "recurrence_frequency": "DAILY",
+                        "recurrence_count": 2,
+                    },
                 },
             ]
         },
@@ -1320,7 +1386,7 @@ def test_update_plan_preserves_existing_recurrence_when_not_requested():
     asyncio.run(registry.execute(
         ctx,
         "calendar_update_event",
-        {"event_id": "weekend-1", "summary": "新名称"},
+        {"event_ref": "weekend-1", "changes": {"summary": "新名称"}},
     ))
     with database.session() as session:
         plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
@@ -1329,6 +1395,64 @@ def test_update_plan_preserves_existing_recurrence_when_not_requested():
 
     assert calendar.updated[0][2]["recurrence"] == existing_rule
     assert calendar.updated[0][2]["clear_recurrence"] is False
+
+
+def test_calendar_patch_updates_one_time_field_and_preserves_omitted_fields():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-PATCH")
+    calendar = _Calendar()
+    calendar.events["weekend-1"]["description"] = "原说明"
+    plans, _outbox, _tools, registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+    ctx = _context(owner.id, "只把结束时间改到晚上八点")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "calendar_update_event",
+            {
+                "event_ref": "weekend-1",
+                "changes": {"end_time": "2030-01-12T20:00:00+08:00"},
+            },
+        )
+    )
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    proposed = plans.get(plan_id)["items"][0]["proposed"]
+    assert proposed["start_time"] == "2030-01-12T17:30:00+08:00"
+    assert proposed["end_time"] == "2030-01-12T20:00:00+08:00"
+    assert proposed["summary"] == "军训服回收志愿服务"
+    assert proposed["description"] == "原说明"
+
+
+def test_calendar_patch_start_only_preserves_existing_end():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-PATCH-START")
+    calendar = _Calendar()
+    plans, _outbox, _tools, registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            _context(owner.id, "只把开始时间改到下午六点"),
+            "calendar_update_event",
+            {
+                "event_ref": "weekend-1",
+                "changes": {"start_time": "2030-01-12T18:00:00+08:00"},
+            },
+        )
+    )
+
+    assert result.result["calendar_mutation"] == "pending_confirmation"
+    with database.session() as session:
+        plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
+    proposed = plans.get(plan_id)["items"][0]["proposed"]
+    assert proposed["start_time"] == "2030-01-12T18:00:00+08:00"
+    assert proposed["end_time"] == "2030-01-12T19:00:00+08:00"
 
 
 def test_update_plan_clear_recurrence_still_clears_rule():
@@ -1346,7 +1470,7 @@ def test_update_plan_clear_recurrence_still_clears_rule():
     asyncio.run(registry.execute(
         ctx,
         "calendar_update_event",
-        {"event_id": "weekend-1", "clear_recurrence": True},
+        {"event_ref": "weekend-1", "changes": {"clear_recurrence": True}},
     ))
     with database.session() as session:
         plan_id = str(session.scalars(select(CalendarMutationPlan)).one().id)
@@ -1371,9 +1495,11 @@ def test_update_plan_recurrence_change_waits_for_confirmation():
         ctx,
         "calendar_update_event",
         {
-            "event_id": "weekend-1",
-            "recurrence_frequency": "DAILY",
-            "recurrence_count": 2,
+            "event_ref": "weekend-1",
+            "changes": {
+                "recurrence_frequency": "DAILY",
+                "recurrence_count": 2,
+            },
         },
     ))
 
@@ -1400,7 +1526,7 @@ def test_single_update_stages_then_runner_executes_after_confirmation():
     result = asyncio.run(registry.execute(
         ctx,
         "calendar_update_event",
-        {"event_id": "weekend-1", "summary": "项目讨论"},
+        {"event_ref": "weekend-1", "changes": {"summary": "项目讨论"}},
     ))
 
     assert result.result["calendar_mutation"] == "pending_confirmation"

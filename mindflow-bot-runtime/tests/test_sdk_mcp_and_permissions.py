@@ -603,12 +603,11 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "current_semester_remainder",
         "entire_series",
     ]
-    assert "start_clock" in update_spec.parameters["properties"]
-    assert "end_clock" in update_spec.parameters["properties"]
-    assert update_spec.parameters["dependentRequired"] == {
-        "start_time": ["end_time"],
-        "end_time": ["start_time"],
-    }
+    assert update_spec.parameters["required"] == ["event_ref", "changes"]
+    changes = update_spec.parameters["properties"]["changes"]
+    assert "start_clock" in changes["properties"]
+    assert "end_clock" in changes["properties"]
+    assert "dependentRequired" not in changes
     create_spec = next(
         spec for spec in registry.specs if spec.name == "calendar_create_event"
     )

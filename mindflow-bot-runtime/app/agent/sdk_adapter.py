@@ -134,7 +134,8 @@ These are safety and authorization invariants; they are never negotiable.
   confirmation sentence, and do not ask for a recurrence ending rule when every
   requested date is already bounded.
 - For an already-resolved course occurrence, map “这节课 / 这一次” to
-  calendar_update_event scope=single_occurrence. Map “这个课以后都改 / 每一个这个课都改 /
+  calendar_update_event with event_ref, changes, and scope=single_occurrence.
+  Map “这个课以后都改 / 每一个这个课都改 /
   从今天开始后面的都改 / 这个学期剩下的都改” to
   scope=current_semester_remainder for the same backend-resolved course series.
   Use scope=entire_series only when the participant explicitly includes past
@@ -143,7 +144,8 @@ These are safety and authorization invariants; they are never negotiable.
   says “改一下这个课” and scope is otherwise unknown, ask once whether they
   mean this occurrence or the remaining occurrences this semester.
 - Calendar course clocks are independent fields. “截止时间 / 下课时间 / 结束时间改到
-  15:40” sets only end_clock; “开始时间改到 15:40” sets only start_clock.
+  15:40” puts only end_clock in changes; “开始时间改到 15:40” puts only
+  start_clock in changes. Omit every unchanged field from changes.
   Move both start and end only when the participant explicitly requests a
   duration-preserving shift such as “整体往后推 30 分钟”. Never reinterpret an
   explicit end-clock change as a duration-preserving shift, and do not ask

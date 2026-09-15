@@ -118,19 +118,10 @@ def _calendar_plan_item_schema() -> dict[str, Any]:
     }
 
 
-def _calendar_update_plan_item_schema() -> dict[str, Any]:
+def _calendar_update_changes_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "scope": {
-                "type": "string",
-                "enum": [
-                    "single_occurrence",
-                    "current_semester_remainder",
-                    "entire_series",
-                ],
-            },
             "summary": {"type": "string", "minLength": 1, "maxLength": 200},
             "start_time": {"type": "string", "format": "date-time"},
             "end_time": {"type": "string", "format": "date-time"},
@@ -145,11 +136,29 @@ def _calendar_update_plan_item_schema() -> dict[str, Any]:
             "clear_recurrence": {"type": "boolean"},
             **_recurrence_schema_properties(),
         },
-        "required": ["event_id"],
-        "dependentRequired": {
-            "start_time": ["end_time"],
-            "end_time": ["start_time"],
-        },
+        "minProperties": 1,
+        "additionalProperties": False,
+    }
+
+
+def _calendar_update_plan_item_schema(*, include_scope: bool = False) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "event_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+        "changes": _calendar_update_changes_schema(),
+    }
+    if include_scope:
+        properties["scope"] = {
+            "type": "string",
+            "enum": [
+                "single_occurrence",
+                "current_semester_remainder",
+                "entire_series",
+            ],
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["event_ref", "changes"],
         "additionalProperties": False,
     }
 
@@ -704,36 +713,8 @@ class CareTools:
         )
         registry.register(
             "calendar_update_event",
-            "Create a participant-confirmed pending plan for one occurrence or an exact backend-resolved course series. Use current_semester_remainder for phrases such as '以后这个课都改'; use entire_series only when past/all occurrences are explicit. start_clock and end_clock are independent: an omitted field stays unchanged. The tool call never writes to Calendar.",
-            {
-                "type": "object",
-                "properties": {
-                    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "scope": {
-                        "type": "string",
-                        "enum": [
-                            "single_occurrence",
-                            "current_semester_remainder",
-                            "entire_series",
-                        ],
-                    },
-                    "summary": {"type": "string", "minLength": 1, "maxLength": 200},
-                    "start_time": {"type": "string", "format": "date-time"},
-                    "end_time": {"type": "string", "format": "date-time"},
-                    "start_clock": {"type": "string", "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$"},
-                    "end_clock": {"type": "string", "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$"},
-                    "description": {"type": "string", "maxLength": 1000},
-                    "reminder_minutes": {"type": "integer", "minimum": 0, "maximum": 1440},
-                    "clear_recurrence": {"type": "boolean"},
-                    **_recurrence_schema_properties(),
-                },
-                "required": ["event_id"],
-                "dependentRequired": {
-                    "start_time": ["end_time"],
-                    "end_time": ["start_time"],
-                },
-                "additionalProperties": False,
-            },
+            "Stage a participant-confirmed PATCH proposal for one occurrence or an exact backend-resolved course series. event_ref identifies the anchor; changes contains only fields the participant wants changed, and omitted fields stay unchanged. Use current_semester_remainder for phrases such as '以后这个课都改'; use entire_series only when past/all occurrences are explicit. start_clock and end_clock are independent. The tool call never writes to Calendar.",
+            _calendar_update_plan_item_schema(include_scope=True),
             self.update_calendar_event,
             effect="proposal_stage",
             authorization_requirement="none",
@@ -1805,7 +1786,8 @@ class CareTools:
 
         try:
             event = await self.calendar.get_event(
-                ctx.participant_id, str(args["event_id"])
+                ctx.participant_id,
+                str(args.get("event_ref") or args.get("event_id")),
             )
         except PermissionError as exc:
             raise AuthorizationContextResolutionError(
@@ -1872,8 +1854,15 @@ class CareTools:
     ) -> dict[str, Any]:
         targets = []
         for update in list(args.get("updates") or []):
+            update_value = dict(update)
             resolved = await self.resolve_calendar_event_authorization_context(
-                ctx, {"event_id": str(dict(update)["event_id"])}
+                ctx,
+                {
+                    "event_ref": str(
+                        update_value.get("event_ref")
+                        or update_value.get("event_id")
+                    )
+                },
             )
             targets.append(dict(resolved["target"]))
         return {
@@ -1882,6 +1871,22 @@ class CareTools:
                 "events": targets,
                 "timezone": str(self.timezone),
             }
+        }
+
+    @staticmethod
+    def _calendar_update_patch_args(raw: dict[str, Any]) -> dict[str, Any]:
+        """Convert the Agent PATCH envelope to the internal update shape."""
+
+        value = dict(raw)
+        if "changes" not in value:
+            # Private executors and already-persisted legacy plans use the
+            # internal complete shape; it is not exposed in the Agent schema.
+            return value
+        changes = dict(value.get("changes") or {})
+        return {
+            "event_id": str(value.get("event_ref") or ""),
+            **({"scope": value["scope"]} if "scope" in value else {}),
+            **changes,
         }
 
     async def _normalize_calendar_update_plan_item(
@@ -1896,8 +1901,6 @@ class CareTools:
             raise ValueError("start_clock and start_time cannot both be provided")
         if "end_clock" in args and "end_time" in args:
             raise ValueError("end_clock and end_time cannot both be provided")
-        if ("start_time" in args) != ("end_time" in args):
-            raise ValueError("start_time and end_time must be provided together")
         if previous_event is None:
             try:
                 previous = await self.calendar.get_event(
@@ -1952,8 +1955,6 @@ class CareTools:
             if args.get("end_time") is not None
             else None
         )
-        if start_time is not None and end_time <= start_time:
-            raise ValueError("calendar event end_time must be after start_time")
         recurrence = _recurrence_from_args(args, self.timezone)
         clear_recurrence = bool(args.get("clear_recurrence", False))
         proposed = {
@@ -1986,6 +1987,10 @@ class CareTools:
                 else {}
             ),
         }
+        proposed_start = _parse_datetime(proposed.get("start_time"), self.timezone)
+        proposed_end = _parse_datetime(proposed.get("end_time"), self.timezone)
+        if proposed_end <= proposed_start:
+            raise ValueError("calendar event end_time must be after start_time")
         if recurrence is not None and start_time is None and proposed.get("start_time"):
             _validate_generated_weekly_recurrence(
                 recurrence,
@@ -2007,11 +2012,12 @@ class CareTools:
     async def update_calendar_event(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        scope = str(args.get("scope") or "single_occurrence")
+        patch_args = self._calendar_update_patch_args(args)
+        scope = str(patch_args.pop("scope", "single_occurrence"))
         try:
             anchor = dict(
                 await self.calendar.get_event(
-                    ctx.participant_id, str(args["event_id"])
+                    ctx.participant_id, str(patch_args["event_id"])
                 )
                 or {}
             )
@@ -2021,9 +2027,15 @@ class CareTools:
                 scope=scope,
                 reference_local_date=datetime.now(self.timezone).date(),
             )
-            normalized_args = {
-                key: value for key, value in args.items() if key != "scope"
-            }
+            normalized_args = dict(patch_args)
+            if scope != "single_occurrence":
+                for field in ("start", "end"):
+                    datetime_field = f"{field}_time"
+                    clock_field = f"{field}_clock"
+                    if datetime_field in normalized_args:
+                        normalized_args[clock_field] = _parse_datetime(
+                            normalized_args.pop(datetime_field), self.timezone
+                        ).strftime("%H:%M")
             items = [
                 await self._normalize_calendar_update_plan_item(
                     ctx,
@@ -2068,9 +2080,9 @@ class CareTools:
                 "scope_start": resolved.scope_start.isoformat(),
                 "scope_end": resolved.scope_end.isoformat(),
                 "changes": {
-                    key: args[key]
-                    for key in ("summary", "start_clock", "end_clock")
-                    if key in args
+                    key: value
+                    for key, value in normalized_args.items()
+                    if key != "event_id"
                 },
             },
         )
@@ -2092,7 +2104,9 @@ class CareTools:
     ) -> dict[str, Any]:
         try:
             items = [
-                await self._normalize_calendar_update_plan_item(ctx, dict(raw))
+                await self._normalize_calendar_update_plan_item(
+                    ctx, self._calendar_update_patch_args(dict(raw))
+                )
                 for raw in list(args.get("updates") or [])
             ]
         except PermissionError:

@@ -60,8 +60,10 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
 
-`calendar_update_event` 的 `start_time` 与 `end_time` 是互相依赖字段：两者同时提供或同时
-省略。底层 handler 也执行相同校验，避免 schema 与实现合同漂移。
+`calendar_update_event` 与批量更新采用 PATCH 合同：Agent 提供 `event_ref`、结构化 `scope`
+以及只包含目标字段的 `changes`。Backend 先绑定 participant-owned 当前对象，再把 partial
+changes 与当前状态合成为完整 proposal；未出现的字段保持原值，`start_time` 与 `end_time`
+可独立修改。Backend 不读取原始聊天文本来推断范围或变更字段。
 
 六个 Calendar mutation Agent 工具统一归类为 `proposal_stage`：它们只保存有 TTL 的
 participant-bound pending plan 并生成固定确认卡，不调用 Calendar Provider，也不经过
