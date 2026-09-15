@@ -84,6 +84,26 @@ class MemoryService:
         self.repository = repository
         self.policy_guard = policy_guard or DurableMemoryPolicyGuard()
 
+    def validate_explicit(
+        self,
+        *,
+        memory_type: str,
+        content: str,
+        memory_subtype: str | None = None,
+    ) -> dict[str, Any]:
+        normalized, conflict_key = normalize_memory(
+            content,
+            memory_type,
+            memory_subtype,
+            policy_guard=self.policy_guard,
+        )
+        return {
+            "memory_type": memory_type,
+            "memory_subtype": conflict_key,
+            "content": " ".join(str(content).split())[:500],
+            "normalized_content": normalized,
+        }
+
     def remember_explicit(
         self,
         participant_id: uuid.UUID,
@@ -92,16 +112,16 @@ class MemoryService:
         content: str,
         memory_subtype: str | None = None,
     ) -> dict:
-        normalized, conflict_key = normalize_memory(
-            content,
-            memory_type,
-            memory_subtype,
-            policy_guard=self.policy_guard,
+        validated = self.validate_explicit(
+            memory_type=memory_type,
+            content=content,
+            memory_subtype=memory_subtype,
         )
         return self.repository.remember(
             participant_id, memory_type=memory_type,
-            content=" ".join(str(content).split())[:500],
-            normalized_content=normalized, conflict_key=conflict_key,
+            content=validated["content"],
+            normalized_content=validated["normalized_content"],
+            conflict_key=validated["memory_subtype"],
             source="user_explicit", consent_basis="user_requested_memory",
             confidence=1.0,
         )

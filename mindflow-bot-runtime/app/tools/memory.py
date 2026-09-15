@@ -8,18 +8,27 @@ from typing import Any
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.services.memory_service import MEMORY_SUBTYPES, MEMORY_TYPES
-from app.integrations.feishu.cards import memory_center_card
+from app.integrations.feishu.cards import (
+    memory_center_card,
+    personalization_proposal_confirmation_card,
+)
 
 
 class MemoryTools:
-    def __init__(self, memory: Any, presentations: Any = None) -> None:
+    def __init__(
+        self,
+        memory: Any,
+        presentations: Any = None,
+        proposal_service: Any = None,
+    ) -> None:
         self.memory = memory
         self.presentations = presentations
+        self.proposal_service = proposal_service
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             "memory_remember_explicit",
-            "Remember a durable personal fact, goal, routine, preferred name, or background context only when the current user explicitly asks. Never use this for response style, suggestion style, support style, follow-up preference, or notification preference.",
+            "Stage a review proposal for a durable personal fact, goal, routine, preferred name, or background context only when the current user explicitly asks. The tool does not persist memory. Never use this for response style, suggestion style, support style, follow-up preference, or notification preference.",
             {
                 "type": "object",
                 "properties": {
@@ -32,7 +41,9 @@ class MemoryTools:
                 },
                 "required": ["memory_type", "content"], "additionalProperties": False,
             },
-            self.remember, effect="internal_write", authorization_requirement="direct_request",
+            self.remember,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "memory_list", "List this participant's active explicit memories.",
@@ -40,16 +51,18 @@ class MemoryTools:
             self.list, effect="read", authorization_requirement="none",
         )
         registry.register(
-            "memory_delete", "Delete one exact memory belonging to this participant.",
+            "memory_delete", "Stage participant review for deleting one exact active memory; the tool itself does not delete it.",
             {
                 "type": "object",
                 "properties": {"memory_id": {"type": "string", "format": "uuid"}},
                 "required": ["memory_id"], "additionalProperties": False,
             },
-            self.delete, effect="internal_write", authorization_requirement="direct_request",
+            self.delete,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
-            "memory_replace", "Replace one exact active memory after an explicit edit request; the old memory is superseded.",
+            "memory_replace", "Stage participant review for replacing one exact active memory; the tool itself does not supersede it.",
             {
                 "type": "object",
                 "properties": {
@@ -58,12 +71,16 @@ class MemoryTools:
                 },
                 "required": ["memory_id", "content"], "additionalProperties": False,
             },
-            self.replace, effect="internal_write", authorization_requirement="direct_request",
+            self.replace,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
-            "memory_clear_all", "Clear all participant memories, without changing profile, calendar, observations, forecasts, or consent.",
+            "memory_clear_all", "Stage participant review for clearing the currently listed memories, without changing profile, calendar, observations, forecasts, or consent.",
             {"type": "object", "properties": {}, "additionalProperties": False},
-            self.clear_all, effect="internal_write", authorization_requirement="direct_request",
+            self.clear_all,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "memory_center_show", "Generate the participant's fixed Memory Center card for backend delivery. card_queued means generated, not delivered to Feishu.",
@@ -72,32 +89,65 @@ class MemoryTools:
         )
 
     def remember(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
-        row = self.memory.remember_explicit(
+        proposal = self._proposals().stage_memory_remember(
             ctx.participant_id,
             memory_type=args["memory_type"],
             memory_subtype=args.get("memory_subtype"),
             content=args["content"],
         )
-        return {"ok": True, "memory": self._public(row)}
+        return self._stage(ctx, proposal)
 
     def list(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
         return {"ok": True, "memories": [self._public(row) for row in self.memory.list(ctx.participant_id)]}
 
     def delete(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
-        deleted = self.memory.delete(ctx.participant_id, uuid.UUID(args["memory_id"]))
-        return {"ok": deleted, "error": None if deleted else "memory_not_found"}
+        proposal = self._proposals().stage_memory_target(
+            ctx.participant_id,
+            operation="delete",
+            memory_id=uuid.UUID(args["memory_id"]),
+        )
+        return (
+            self._stage(ctx, proposal)
+            if proposal is not None
+            else {"ok": False, "error": "memory_not_found"}
+        )
 
     def replace(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
-        row = self.memory.replace(
-            ctx.participant_id, uuid.UUID(args["memory_id"]), content=args["content"]
+        proposal = self._proposals().stage_memory_target(
+            ctx.participant_id,
+            operation="replace",
+            memory_id=uuid.UUID(args["memory_id"]),
+            content=args["content"],
         )
-        return {
-            "ok": row is not None, "error": None if row else "memory_not_found",
-            "memory": self._public(row) if row else None,
-        }
+        return (
+            self._stage(ctx, proposal)
+            if proposal is not None
+            else {"ok": False, "error": "memory_not_found"}
+        )
 
     def clear_all(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
-        return {"ok": True, "deleted_count": self.memory.clear_all(ctx.participant_id)}
+        return self._stage(
+            ctx, self._proposals().stage_memory_clear(ctx.participant_id)
+        )
+
+    def _proposals(self):
+        if self.proposal_service is None:
+            raise RuntimeError("memory proposal service is unavailable")
+        return self.proposal_service
+
+    def _stage(self, ctx: AgentContext, proposal: dict[str, Any]) -> dict:
+        if self.presentations is None:
+            raise RuntimeError("memory proposal presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            personalization_proposal_confirmation_card(proposal),
+        )
+        return {
+            "ok": True,
+            "personalization_proposal": "pending_confirmation",
+            "confirmation_required": True,
+            "persisted": False,
+        }
 
     def show_center(self, ctx: AgentContext, _args: dict[str, Any]) -> dict:
         if self.presentations is None:

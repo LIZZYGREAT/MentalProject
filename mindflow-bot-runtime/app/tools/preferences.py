@@ -6,13 +6,22 @@ from typing import Any
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
-from app.integrations.feishu.cards import preference_settings_card
+from app.integrations.feishu.cards import (
+    personalization_proposal_confirmation_card,
+    preference_settings_card,
+)
 
 
 class InteractionPreferenceTools:
-    def __init__(self, service: Any, presentations: Any = None) -> None:
+    def __init__(
+        self,
+        service: Any,
+        presentations: Any = None,
+        proposal_service: Any = None,
+    ) -> None:
         self.service = service
         self.presentations = presentations
+        self.proposal_service = proposal_service
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -23,7 +32,7 @@ class InteractionPreferenceTools:
         )
         registry.register(
             "interaction_preferences_update",
-            "Update structured response style and assistant identity after an explicit lasting preference request. Natural-language interpretation is complete before this call.",
+            "Stage a fixed review card for structured response style and assistant identity after an explicit lasting preference request. Natural-language interpretation is complete before this call; the tool itself does not persist preferences.",
             {
                 "type": "object",
                 "properties": {
@@ -35,11 +44,13 @@ class InteractionPreferenceTools:
                 },
                 "minProperties": 1, "additionalProperties": False,
             },
-            self.update, effect="internal_write", authorization_requirement="direct_request",
+            self.update,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "support_preferences_update",
-            "Update explicit support presentation and supportive follow-up preferences. This never records psychological state.",
+            "Stage a fixed review card for explicit support presentation and supportive follow-up preferences. This tool does not persist settings or record psychological state.",
             {
                 "type": "object",
                 "properties": {
@@ -51,7 +62,9 @@ class InteractionPreferenceTools:
                 },
                 "minProperties": 1, "additionalProperties": False,
             },
-            self.update_support, effect="internal_write", authorization_requirement="direct_request",
+            self.update_support,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "preference_settings_show", "Generate the fixed interaction and support preference settings card for backend delivery. card_queued means generated, not delivered to Feishu.",
@@ -74,8 +87,9 @@ class InteractionPreferenceTools:
             if key in args
         }
         try:
-            preferences = self.service.update_preferences(
+            proposal = self._proposals().stage_preferences(
                 ctx.participant_id,
+                domain="interaction_preferences",
                 style_changes=style,
                 identity_changes=identity,
             )
@@ -88,10 +102,42 @@ class InteractionPreferenceTools:
                 ),
                 "message": str(exc),
             }
-        return {"ok": True, "interaction_preferences": preferences}
+        return self._stage(ctx, proposal)
 
     def update_support(self, ctx: AgentContext, args: dict[str, Any]):
-        return {"ok": True, "support_preferences": self.service.update_support(ctx.participant_id, args)}
+        try:
+            proposal = self._proposals().stage_preferences(
+                ctx.participant_id,
+                domain="support_preferences",
+                support_changes=args,
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": "invalid_support_preferences",
+                "reason_code": "invalid_support_preferences",
+                "message": str(exc),
+            }
+        return self._stage(ctx, proposal)
+
+    def _proposals(self):
+        if self.proposal_service is None:
+            raise RuntimeError("personalization proposal service is unavailable")
+        return self.proposal_service
+
+    def _stage(self, ctx: AgentContext, proposal: dict[str, Any]):
+        if self.presentations is None:
+            raise RuntimeError("preference proposal presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            personalization_proposal_confirmation_card(proposal),
+        )
+        return {
+            "ok": True,
+            "personalization_proposal": "pending_confirmation",
+            "confirmation_required": True,
+            "persisted": False,
+        }
 
     def show_settings(self, ctx: AgentContext, _args: dict[str, Any]):
         if self.presentations is None:

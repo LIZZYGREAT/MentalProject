@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0076_reminder_proposals -->
+<!-- ALEMBIC_HEAD: 0077_personalization_proposals -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -80,6 +80,10 @@ Memory 与表达偏好的自然语言 routing 由 Agent 完成。生产代码不
 rule parser；偏好工具只接受 enum/boolean/受限文本字段。Memory 的 `preferred_name` 与
 `sleep_routine` 冲突键由固定 `memory_type`/`memory_subtype` 决定，而非中文 Regex。密钥、
 系统/权限覆盖、临床健康与用药内容仍由独立 `DurableMemoryPolicyGuard` fail-closed 拒绝。
+Agent-facing Memory remember/replace/delete/clear 和 interaction/support preference update
+统一写入有 TTL 的 `PersonalizationProposal` 并生成固定审核卡。卡片只携带 proposal id，
+原参与者确认后才由 deterministic executor 调用相应 service；取消审核不改变耐久状态。
+Memory Center 与 Settings 表单本身是用户提交入口，因此继续作为直接 CardAction executor。
 
 ## Forecast、Calendar 与 freshness
 

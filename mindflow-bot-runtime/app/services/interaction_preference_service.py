@@ -27,6 +27,23 @@ class InteractionPreferenceService:
             participant_id, style_changes=changes
         )
 
+    @staticmethod
+    def validate_changes(
+        *,
+        style_changes: dict | None = None,
+        support_changes: dict | None = None,
+        identity_changes: dict | None = None,
+    ) -> dict[str, dict]:
+        return {
+            "style_changes": (
+                validate_style_changes(style_changes) if style_changes else {}
+            ),
+            "support_changes": (
+                validate_support_changes(support_changes) if support_changes else {}
+            ),
+            "identity_changes": validate_identity_changes(identity_changes or {}),
+        }
+
     def update_preferences(
         self,
         participant_id,
@@ -35,18 +52,16 @@ class InteractionPreferenceService:
         support_changes: dict | None = None,
         identity_changes: dict | None = None,
     ):
-        validated_style = (
-            validate_style_changes(style_changes) if style_changes else {}
+        validated = self.validate_changes(
+            style_changes=style_changes,
+            support_changes=support_changes,
+            identity_changes=identity_changes,
         )
-        validated_support = (
-            validate_support_changes(support_changes) if support_changes else {}
-        )
-        validated_identity = validate_identity_changes(identity_changes or {})
         self.repository.update_atomic(
             participant_id,
-            style_changes=validated_style,
-            support_changes=validated_support,
-            identity_changes=validated_identity,
+            style_changes=validated["style_changes"],
+            support_changes=validated["support_changes"],
+            identity_changes=validated["identity_changes"],
         )
         return self.get(participant_id)
 

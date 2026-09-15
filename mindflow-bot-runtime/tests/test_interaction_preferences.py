@@ -4,7 +4,6 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
-from app.agent.context import AgentContext
 from app.integrations.feishu.cards import preference_settings_card
 from app.models import ParticipantInteractionStyle, ParticipantSupportPreference
 from app.repositories_preferences import (
@@ -98,24 +97,14 @@ def test_typed_interaction_update_stores_identity_without_backend_nlp():
     database = memory_database()
     user = participant(database, "PREF-TYPED-IDENTITY")
     service = _service(database)
-    tools = InteractionPreferenceTools(service)
-    result = tools.update(
-        AgentContext(
-            participant_id=user.id,
-            participant_code="PREF-TYPED-IDENTITY",
-            open_id="ou-test",
-            chat_id="oc-test",
-            message_id="om-test",
-            agent_run_id=user.id,
-        ),
-        {
-            "verbosity": "concise",
+    preferences = service.update_preferences(
+        user.id,
+        style_changes={"verbosity": "concise"},
+        identity_changes={
             "assistant_display_name": "哈基蜗",
             "assistant_self_reference": "蜗",
         },
     )
-    assert result["ok"] is True
-    preferences = result["interaction_preferences"]
     assert preferences["verbosity"] == "concise"
     assert {row["category"]: row["value"] for row in preferences["rules"]} == {
         "assistant_display_name": "哈基蜗",

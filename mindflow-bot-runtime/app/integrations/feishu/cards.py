@@ -2240,6 +2240,115 @@ def memory_clear_all_confirmation_card() -> dict[str, Any]:
     }
 
 
+def personalization_proposal_confirmation_card(
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    """Fixed review card for typed memory and preference proposals."""
+
+    proposal_id = str(proposal.get("id") or "").strip()
+    domain = str(proposal.get("domain") or "").strip()
+    operation = str(proposal.get("operation") or "").strip()
+    payload = dict(proposal.get("payload") or {})
+    if not proposal_id or len(proposal_id) > 64:
+        raise ValueError("personalization proposal id is invalid")
+    lines: list[str]
+    destructive = False
+    if domain == "memory" and operation == "remember":
+        title = "确认保存长期记忆"
+        lines = [
+            f"**内容：** {str(payload.get('content') or '')[:500]}",
+            f"**类型：** {str(payload.get('memory_type') or '')[:40]}",
+            "确认前不会写入长期记忆。",
+        ]
+    elif domain == "memory" and operation == "replace":
+        title = "确认修改长期记忆"
+        lines = [
+            f"**原内容：** {str(payload.get('previous_content') or '')[:500]}",
+            f"**新内容：** {str(payload.get('content') or '')[:500]}",
+        ]
+    elif domain == "memory" and operation == "delete":
+        title = "确认删除长期记忆"
+        destructive = True
+        lines = [f"**将删除：** {str(payload.get('previous_content') or '')[:500]}"]
+    elif domain == "memory" and operation == "clear":
+        title = "确认清空长期记忆"
+        destructive = True
+        items = [dict(item) for item in list(payload.get("items") or [])]
+        lines = [f"将删除当前审核列表中的 **{len(items)}** 条长期记忆："]
+        lines.extend(f"- {str(item.get('content') or '')[:120]}" for item in items[:10])
+        if len(items) > 10:
+            lines.append(f"- 以及其余 {len(items) - 10} 条")
+    elif domain in {"interaction_preferences", "support_preferences"} and operation == "update":
+        title = "确认修改表达与支持偏好"
+        labels = {
+            "verbosity": "回答长度",
+            "tone": "语气",
+            "suggestion_style": "建议方式",
+            "assistant_display_name": "助手显示名",
+            "assistant_self_reference": "助手自称",
+            "acknowledge_before_advice": "建议前先回应感受",
+            "ask_before_suggestion": "建议前先询问",
+            "max_suggestions": "每次最多建议数",
+            "allow_supportive_follow_up": "允许支持性跟进",
+            "preferred_support_style": "支持方式",
+        }
+        changes = {}
+        for group in ("style_changes", "identity_changes", "support_changes"):
+            changes.update(dict(payload.get(group) or {}))
+        lines = [
+            f"- **{labels.get(key, key)}：** {value}"
+            for key, value in changes.items()
+        ]
+        lines.append("这些设置不能改变安全、授权或权限规则。")
+    else:
+        raise ValueError("personalization proposal is invalid")
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": title},
+        },
+        "header": {
+            "template": "red" if destructive else "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": "\n\n".join(lines)},
+                {
+                    "tag": "button",
+                    "type": "danger" if destructive else "primary",
+                    "text": {"tag": "plain_text", "content": "确认"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "personalization_proposal_confirm",
+                            "version": "1",
+                            "proposal_id": proposal_id,
+                        },
+                    }],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "personalization_proposal_cancel",
+                            "version": "1",
+                            "proposal_id": proposal_id,
+                        },
+                    }],
+                },
+            ],
+        },
+    }
+
+
 def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
     support = dict(preferences.get("support") or {})
 

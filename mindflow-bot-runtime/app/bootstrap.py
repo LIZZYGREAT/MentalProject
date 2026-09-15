@@ -39,6 +39,9 @@ from app.repositories_web_search import WebSearchRepository
 from app.repositories_web_document import WebDocumentRepository
 from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_personalization_proposal import (
+    PersonalizationProposalRepository,
+)
 from app.repositories_support_preferences import SupportPreferenceRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
@@ -91,6 +94,9 @@ from app.tools.preferences import InteractionPreferenceTools
 from app.tools.research import ResearchTools
 from app.services.memory_service import MemoryService
 from app.services.interaction_preference_service import InteractionPreferenceService
+from app.services.personalization_proposal_service import (
+    PersonalizationProposalService,
+)
 from app.services.psychological_context_builder import PsychologicalContextBuilder
 from app.services.research_aggregate_service import ResearchAggregateService
 from app.services.web_search_service import (
@@ -148,6 +154,7 @@ class BusinessServices:
     public_web_documents: PublicWebDocumentService
     memory: MemoryService
     interaction_preferences: InteractionPreferenceService
+    personalization_proposals: PersonalizationProposalService
     psychological_context: PsychologicalContextBuilder
     research_aggregates: ResearchAggregateService
 
@@ -254,6 +261,11 @@ def build_business_services(
     interaction_preferences = InteractionPreferenceService(
         InteractionPreferenceRepository(database),
         SupportPreferenceRepository(database),
+    )
+    personalization_proposals = PersonalizationProposalService(
+        PersonalizationProposalRepository(database),
+        memory,
+        interaction_preferences,
     )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
@@ -410,8 +422,10 @@ def build_business_services(
         timezone_name=settings.timezone_name,
     ).register(registry)
     WebTools(web_search, public_web_documents).register(registry)
-    MemoryTools(memory, presentations).register(registry)
-    InteractionPreferenceTools(interaction_preferences, presentations).register(registry)
+    MemoryTools(memory, presentations, personalization_proposals).register(registry)
+    InteractionPreferenceTools(
+        interaction_preferences, presentations, personalization_proposals
+    ).register(registry)
     ResearchTools(research_aggregates).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
@@ -441,6 +455,7 @@ def build_business_services(
         memory=memory,
         interaction_preferences=interaction_preferences,
         reminders=reminders,
+        personalization_proposals=personalization_proposals,
     )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
@@ -493,6 +508,7 @@ def build_business_services(
         public_web_documents=public_web_documents,
         memory=memory,
         interaction_preferences=interaction_preferences,
+        personalization_proposals=personalization_proposals,
         psychological_context=psychological_context,
         research_aggregates=research_aggregates,
     )

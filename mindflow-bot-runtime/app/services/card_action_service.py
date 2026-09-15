@@ -266,6 +266,7 @@ class CardActionService:
         memory: Any = None,
         interaction_preferences: Any = None,
         reminders: Any = None,
+        personalization_proposals: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -284,6 +285,7 @@ class CardActionService:
         self.memory = memory
         self.interaction_preferences = interaction_preferences
         self.reminders = reminders
+        self.personalization_proposals = personalization_proposals
 
     @staticmethod
     def _fallback_event_id(
@@ -393,6 +395,38 @@ class CardActionService:
                 reply_text = (
                     f"提醒已创建，将在 {local_time.strftime('%Y-%m-%d %H:%M')} 提醒。"
                 )
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {
+            "personalization_proposal_confirm",
+            "personalization_proposal_cancel",
+        }:
+            if self.personalization_proposals is None:
+                raise RuntimeError("personalization proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_personalization_proposal_id"}
+            result = self.personalization_proposals.resolve(
+                participant_id,
+                proposal_id,
+                confirmed=action_name == "personalization_proposal_confirm",
+            )
+            if not result.get("ok"):
+                return result
+            if result.get("status") == "cancelled":
+                reply_text = "已取消，长期记忆与偏好没有变化。"
+            else:
+                reply_text = {
+                    "remember": "长期记忆已保存。",
+                    "replace": "长期记忆已修改。",
+                    "delete": "长期记忆已删除。",
+                    "clear": "已清理审核卡中列出的长期记忆。",
+                    "update": "表达与支持偏好已更新。",
+                }.get(str(result.get("operation") or ""), "设置已更新。")
             return {
                 **result,
                 "reply_text": reply_text,
