@@ -10,6 +10,7 @@ from typing import Any
 MEMORY_TYPES = frozenset({
     "stable_fact", "goal", "routine", "context", "preferred_name",
 })
+MEMORY_SUBTYPES = frozenset({"preferred_name", "sleep_routine"})
 _FORBIDDEN = re.compile(
     r"(?:忽略|绕过|覆盖|取消).{0,12}(?:系统|安全|权限|授权|规则)|"
     r"(?:token|secret|password|api[_ -]?key|密码|密钥)\s*[:=]",
@@ -30,44 +31,73 @@ _MEDICATION_OR_TREATMENT_FACT = re.compile(
     r"(?:吃|服).{0,10}\d+(?:\.\d+)?\s*(?:mg|毫克)",
     re.I,
 )
-_STRUCTURED_PREFERENCE_REQUEST = re.compile(
-    r"(?:以后|请|希望你|你要|回答时).{0,20}(?:回答|回复|表达|语气|建议|听我说|"
-    r"关心我|跟进|提醒).{0,20}(?:短|简洁|详细|直接|温和|先问|先听|不要|最多|主动)|"
-    r"(?:以后|请).{0,8}(?:直接|温和|简短|详细).{0,8}(?:一点|回复|回答)|"
-    r"(?:先问我.{0,8}(?:要不要|想不想).{0,6}建议|先听我说完|"
-    r"压力大时别一次给很多建议)",
-    re.I,
-)
+class DurableMemoryPolicyGuard:
+    """Fail-closed content policy, deliberately separate from semantic routing."""
+
+    def validate(self, content: str) -> None:
+        if _FORBIDDEN.search(content):
+            raise ValueError(
+                "memory cannot alter system, safety, authorization, or secrets"
+            )
+        if _SENSITIVE_HEALTH_DATA.search(content):
+            raise ValueError(
+                "sensitive clinical or health data cannot become durable memory"
+            )
+        if _MEDICATION_OR_TREATMENT_FACT.search(content):
+            raise ValueError(
+                "medication or treatment facts cannot become durable memory"
+            )
 
 
-def normalize_memory(content: str, memory_type: str) -> tuple[str, str | None]:
+def normalize_memory(
+    content: str,
+    memory_type: str,
+    memory_subtype: str | None = None,
+    *,
+    policy_guard: DurableMemoryPolicyGuard | None = None,
+) -> tuple[str, str | None]:
     normalized = " ".join(str(content).split()).strip("。 ")
     if not 1 <= len(normalized) <= 500:
         raise ValueError("memory content must contain 1 to 500 characters")
     if memory_type not in MEMORY_TYPES:
         raise ValueError("unsupported memory type")
-    if _FORBIDDEN.search(normalized):
-        raise ValueError("memory cannot alter system, safety, authorization, or secrets")
-    if _SENSITIVE_HEALTH_DATA.search(normalized):
-        raise ValueError("sensitive clinical or health data cannot become durable memory")
-    if _MEDICATION_OR_TREATMENT_FACT.search(normalized):
-        raise ValueError("medication or treatment facts cannot become durable memory")
-    if _STRUCTURED_PREFERENCE_REQUEST.search(normalized):
-        raise ValueError("interaction or support preferences cannot become durable memory")
-    key = None
-    if memory_type == "preferred_name" or re.search(r"(?:叫我|称呼我|我的名字|我叫)", normalized):
-        key = "preferred_name"
-    elif memory_type == "routine" and re.search(r"(?:睡|起床|作息)", normalized):
-        key = "sleep_routine"
-    return normalized.casefold(), key
+    subtype = str(memory_subtype or "").strip() or None
+    if subtype is not None and subtype not in MEMORY_SUBTYPES:
+        raise ValueError("unsupported memory subtype")
+    if subtype == "preferred_name" and memory_type != "preferred_name":
+        raise ValueError("preferred_name subtype requires preferred_name memory type")
+    if subtype == "sleep_routine" and memory_type != "routine":
+        raise ValueError("sleep_routine subtype requires routine memory type")
+    (policy_guard or DurableMemoryPolicyGuard()).validate(normalized)
+    conflict_key = subtype
+    if memory_type == "preferred_name":
+        conflict_key = "preferred_name"
+    return normalized.casefold(), conflict_key
 
 
 class MemoryService:
-    def __init__(self, repository: Any) -> None:
+    def __init__(
+        self,
+        repository: Any,
+        policy_guard: DurableMemoryPolicyGuard | None = None,
+    ) -> None:
         self.repository = repository
+        self.policy_guard = policy_guard or DurableMemoryPolicyGuard()
 
-    def remember_explicit(self, participant_id: uuid.UUID, *, memory_type: str, content: str) -> dict:
-        normalized, conflict_key = normalize_memory(content, memory_type)
+    def remember_explicit(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        memory_type: str,
+        content: str,
+        memory_subtype: str | None = None,
+    ) -> dict:
+        normalized, conflict_key = normalize_memory(
+            content,
+            memory_type,
+            memory_subtype,
+            policy_guard=self.policy_guard,
+        )
         return self.repository.remember(
             participant_id, memory_type=memory_type,
             content=" ".join(str(content).split())[:500],
@@ -89,7 +119,12 @@ class MemoryService:
         )
         if active is None:
             return None
-        normalized, conflict_key = normalize_memory(content, active["memory_type"])
+        normalized, conflict_key = normalize_memory(
+            content,
+            active["memory_type"],
+            active.get("conflict_key"),
+            policy_guard=self.policy_guard,
+        )
         return self.repository.replace(
             participant_id, memory_id, content=" ".join(str(content).split())[:500],
             normalized_content=normalized, conflict_key=conflict_key,

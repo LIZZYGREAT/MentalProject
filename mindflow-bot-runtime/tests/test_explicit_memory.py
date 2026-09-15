@@ -2,7 +2,12 @@ import uuid
 
 from app.models import ParticipantMemoryItem
 from app.repositories_memory import ParticipantMemoryRepository
-from app.services.memory_service import MemoryService, normalize_memory
+from app.services.memory_service import (
+    DurableMemoryPolicyGuard,
+    MemoryService,
+    normalize_memory,
+)
+from app.tools.memory import MemoryTools
 from tests.helpers import memory_database, participant
 
 
@@ -27,10 +32,16 @@ def test_conflicting_preference_supersedes_old_active_item():
     user = participant(database, "MEMORY-2")
     service = MemoryService(ParticipantMemoryRepository(database))
     first = service.remember_explicit(
-        user.id, memory_type="routine", content="我一般十一点睡"
+        user.id,
+        memory_type="routine",
+        memory_subtype="sleep_routine",
+        content="我一般十一点睡",
     )
     second = service.remember_explicit(
-        user.id, memory_type="routine", content="我通常一点睡"
+        user.id,
+        memory_type="routine",
+        memory_subtype="sleep_routine",
+        content="我通常一点睡",
     )
     active = service.list(user.id)
     assert [row["id"] for row in active] == [second["id"]]
@@ -60,19 +71,57 @@ def test_memory_validator_rejects_authorization_and_clinical_inference():
             raise AssertionError(f"unsafe memory accepted: {content}")
 
 
-def test_memory_validator_routes_structured_preferences_out_of_memory():
+def test_memory_backend_does_not_parse_preference_semantics_from_raw_text():
     for content in (
         "以后回答短一点",
         "以后直接一点回复我",
         "先问我要不要建议",
         "我压力大时别一次给很多建议",
     ):
+        normalized, conflict_key = normalize_memory(content, "context")
+        assert normalized
+        assert conflict_key is None
+
+
+def test_memory_subtype_is_structured_and_validated_without_content_regex():
+    _, generic_key = normalize_memory("每天十一点休息", "routine")
+    _, sleep_key = normalize_memory(
+        "固定的晚间安排", "routine", "sleep_routine"
+    )
+    assert generic_key is None
+    assert sleep_key == "sleep_routine"
+    try:
+        normalize_memory("任意文本", "goal", "sleep_routine")
+    except ValueError as exc:
+        assert "requires routine" in str(exc)
+    else:
+        raise AssertionError("incompatible memory subtype was accepted")
+
+    class Registry:
+        def __init__(self):
+            self.schema = None
+
+        def register(self, name, _description, schema, _handler, **_kwargs):
+            if name == "memory_remember_explicit":
+                self.schema = schema
+
+    registry = Registry()
+    MemoryTools(object()).register(registry)
+    assert registry.schema["properties"]["memory_subtype"]["enum"] == [
+        "preferred_name",
+        "sleep_routine",
+    ]
+
+
+def test_memory_policy_guard_remains_fail_closed():
+    guard = DurableMemoryPolicyGuard()
+    for unsafe in ("API_KEY=secret", "我确诊为精神疾病", "我每天服用舍曲林"):
         try:
-            normalize_memory(content, "context")
-        except ValueError as exc:
-            assert "preferences" in str(exc)
+            guard.validate(unsafe)
+        except ValueError:
+            pass
         else:
-            raise AssertionError(f"preference-shaped memory accepted: {content}")
+            raise AssertionError(f"unsafe durable memory accepted: {unsafe}")
 
 
 def test_memory_validator_rejects_medication_facts_without_blocking_daily_routines():

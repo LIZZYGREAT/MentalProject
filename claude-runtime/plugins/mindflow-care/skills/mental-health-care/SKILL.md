@@ -54,6 +54,12 @@ Use only these tools:
 - `support_preferences_update` after an explicit lasting request about
   acknowledgement, asking before suggestions, suggestion count, follow-up, or
   support style.
+- `memory_remember_explicit` only for an explicitly requested durable fact,
+  goal, routine, preferred name, or background context. Use
+  `memory_subtype=sleep_routine` for sleep routines and
+  `memory_subtype=preferred_name` for preferred names. Route expression,
+  support, follow-up, and notification semantics to their typed preference
+  tools; Backend does not inspect the original sentence to reroute it.
 - `preference_settings_show` when the participant asks for the reviewed
   expression/support preference settings card.
 - `calendar_connection_status` for calendar connection questions.

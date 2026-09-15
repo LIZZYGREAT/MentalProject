@@ -76,6 +76,11 @@ Reminder 的创建与取消同样采用 `proposal_stage`。Agent 只提交结构
 解析后的本地时间。只有原参与者的 CardAction 才能原子地创建或取消 Reminder，取消审核
 卡不会写入或改变 Reminder，Agent 路径不再经过 MutationIntent 的第二次时间语义判断。
 
+Memory 与表达偏好的自然语言 routing 由 Agent 完成。生产代码不再提供 raw preference
+rule parser；偏好工具只接受 enum/boolean/受限文本字段。Memory 的 `preferred_name` 与
+`sleep_routine` 冲突键由固定 `memory_type`/`memory_subtype` 决定，而非中文 Regex。密钥、
+系统/权限覆盖、临床健康与用药内容仍由独立 `DurableMemoryPolicyGuard` fail-closed 拒绝。
+
 ## Forecast、Calendar 与 freshness
 
 `ForecastCoordinator` 是正式评估入口。它准备显式/学习画像、Calendar、Observation、

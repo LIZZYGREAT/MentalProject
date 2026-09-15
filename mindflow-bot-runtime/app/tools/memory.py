@@ -7,7 +7,7 @@ from typing import Any
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
-from app.services.memory_service import MEMORY_TYPES
+from app.services.memory_service import MEMORY_SUBTYPES, MEMORY_TYPES
 from app.integrations.feishu.cards import memory_center_card
 
 
@@ -24,6 +24,10 @@ class MemoryTools:
                 "type": "object",
                 "properties": {
                     "memory_type": {"type": "string", "enum": sorted(MEMORY_TYPES)},
+                    "memory_subtype": {
+                        "type": "string",
+                        "enum": sorted(MEMORY_SUBTYPES),
+                    },
                     "content": {"type": "string", "minLength": 1, "maxLength": 500},
                 },
                 "required": ["memory_type", "content"], "additionalProperties": False,
@@ -69,7 +73,10 @@ class MemoryTools:
 
     def remember(self, ctx: AgentContext, args: dict[str, Any]) -> dict:
         row = self.memory.remember_explicit(
-            ctx.participant_id, memory_type=args["memory_type"], content=args["content"]
+            ctx.participant_id,
+            memory_type=args["memory_type"],
+            memory_subtype=args.get("memory_subtype"),
+            content=args["content"],
         )
         return {"ok": True, "memory": self._public(row)}
 
