@@ -1196,6 +1196,15 @@ def calendar_mutation_plan_confirmation_card(
         if len(ledger_by_index) != len(items):
             raise ValueError("calendar plan aggregate and ledger are inconsistent")
 
+    context = dict(plan.get("presentation_context") or {})
+    if operation == "update" and context.get("kind") == "course_series_update":
+        return _course_series_update_confirmation_card(
+            plan,
+            items,
+            context,
+            timezone_name=timezone_name,
+        )
+
     elements: list[dict[str, Any]] = []
     for item_offset, item in enumerate(items):
         display_index = item_offset + 1
@@ -1276,6 +1285,248 @@ def calendar_mutation_plan_confirmation_card(
         "body": {
             "direction": "vertical",
             "elements": elements,
+        },
+    }
+
+
+def _course_series_update_confirmation_card(
+    plan: dict[str, Any],
+    items: list[dict[str, Any]],
+    context: dict[str, Any],
+    *,
+    timezone_name: str,
+) -> dict[str, Any]:
+    plan_id = str(plan["id"])
+    scope_label = {
+        "single_occurrence": "仅这一节",
+        "current_semester_remainder": "从当前场次到本学期结束",
+        "entire_series": "本系列全部场次（含过去）",
+    }.get(str(context.get("scope") or ""), "已解析范围")
+    first = items[0]
+    previous = dict(first.get("previous") or {})
+    proposed = dict(first.get("proposed") or first)
+    old_start = _calendar_datetime(previous.get("start_time") or first["start_time"])
+    old_end = _calendar_datetime(previous.get("end_time") or first["end_time"])
+    new_start = _calendar_datetime(proposed.get("start_time") or first["start_time"])
+    new_end = _calendar_datetime(proposed.get("end_time") or first["end_time"])
+    display_timezone = ZoneInfo(timezone_name)
+    changes = dict(context.get("changes") or {})
+    lines = [
+        f"**课程：** {str(context.get('display_name') or first.get('summary') or '未命名课程')[:200]}",
+        f"**范围：** {scope_label}",
+        f"**场次：** {len(items)} 节",
+    ]
+    if "summary" in changes:
+        lines.append(
+            f"**名称：** {str(previous.get('summary') or '未命名课程')[:80]} → "
+            f"{str(proposed.get('summary') or first.get('summary'))[:80]}"
+        )
+    if "start_clock" in changes or new_start != old_start:
+        lines.append(
+            "**开始时间：** "
+            f"{old_start.astimezone(display_timezone).strftime('%H:%M')} → "
+            f"{new_start.astimezone(display_timezone).strftime('%H:%M')}"
+        )
+    if "end_clock" in changes or new_end != old_end:
+        lines.append(
+            "**结束时间：** "
+            f"{old_end.astimezone(display_timezone).strftime('%H:%M')} → "
+            f"{new_end.astimezone(display_timezone).strftime('%H:%M')}"
+        )
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": "\n".join(lines)},
+        {
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "修改信息"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_course_series_edit_open",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+        {
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "查看场次"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_course_series_occurrences_view",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+        {
+            "tag": "button",
+            "type": "primary",
+            "text": {"tag": "plain_text", "content": "确认修改"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_mutation_plan_confirm",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+        {
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "取消"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "calendar_mutation_plan_cancel",
+                    "version": "1",
+                    "plan_id": plan_id,
+                },
+            }],
+        },
+    ]
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "确认批量修改课程"},
+        },
+        "header": {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": f"确认修改 {len(items)} 节课程",
+            },
+        },
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def calendar_course_series_occurrences_card(
+    plan: dict[str, Any], *, timezone_name: str = "Asia/Shanghai"
+) -> dict[str, Any]:
+    plan_id = str(plan.get("id") or "")
+    items = [dict(item) for item in list(plan.get("items") or [])]
+    if not plan_id or not items:
+        raise ValueError("calendar course series plan is invalid")
+    elements = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"{index}. **{str(item.get('summary') or '未命名课程')[:80]}**\n"
+                f"   {_format_calendar_datetime_range(item.get('start_time'), item.get('end_time'), timezone_name=timezone_name)}"
+            ),
+        }
+        for index, item in enumerate(items, start=1)
+    ]
+    elements.append({
+        "tag": "button",
+        "type": "default",
+        "text": {"tag": "plain_text", "content": "返回确认"},
+        "behaviors": [{
+            "type": "callback",
+            "value": {
+                "mindflow_action": "calendar_mutation_plan_view",
+                "version": "1",
+                "plan_id": plan_id,
+            },
+        }],
+    })
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill", "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": f"将修改的 {len(items)} 节课程"},
+        },
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def calendar_course_series_edit_card(
+    plan: dict[str, Any], *, timezone_name: str = "Asia/Shanghai"
+) -> dict[str, Any]:
+    plan_id = str(plan.get("id") or "")
+    items = [dict(item) for item in list(plan.get("items") or [])]
+    context = dict(plan.get("presentation_context") or {})
+    if (
+        not plan_id
+        or not items
+        or str(plan.get("status") or "") != "awaiting_confirmation"
+        or context.get("kind") != "course_series_update"
+    ):
+        raise ValueError("calendar course series plan is not editable")
+    first = items[0]
+    display_timezone = ZoneInfo(timezone_name)
+    local_start = _calendar_datetime(first.get("start_time")).astimezone(display_timezone)
+    local_end = _calendar_datetime(first.get("end_time")).astimezone(display_timezone)
+    summary = str(first.get("summary") or "未命名课程")[:200]
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill", "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "统一修改课程信息"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "form",
+                    "name": "mindflow_calendar_course_series_edit",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": f"保存后会统一更新待确认的 {len(items)} 节课程，不会立即写入日历。",
+                        },
+                        {
+                            "tag": "input",
+                            "name": "summary",
+                            "default_value": summary,
+                            "required": True,
+                            "max_length": 200,
+                            "label": {"tag": "plain_text", "content": "课程名称"},
+                        },
+                        *_clock_form_fields(
+                            local_start.strftime("%H:%M"),
+                            local_end.strftime("%H:%M"),
+                        ),
+                        {
+                            "tag": "button",
+                            "name": "calendar_course_series_edit_submit",
+                            "type": "primary",
+                            "text": {"tag": "plain_text", "content": "保存修改"},
+                            "form_action_type": "submit",
+                            "behaviors": [{
+                                "type": "callback",
+                                "value": {
+                                    "mindflow_action": "calendar_course_series_edit_submit",
+                                    "version": "1",
+                                    "plan_id": plan_id,
+                                },
+                            }],
+                        },
+                    ],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "返回确认"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "calendar_mutation_plan_view",
+                            "version": "1",
+                            "plan_id": plan_id,
+                        },
+                    }],
+                },
+            ],
         },
     }
 

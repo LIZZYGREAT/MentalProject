@@ -16,6 +16,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
+    calendar_course_series_edit_card,
+    calendar_course_series_occurrences_card,
     calendar_mutation_plan_confirmation_card,
     calendar_mutation_plan_item_edit_card,
     calendar_mutation_plan_item_time_card,
@@ -505,6 +507,114 @@ class CardActionService:
                 "status": corrected.get("status"),
                 "reply_text": "课程时间已修改，请核对更新后的预览。",
                 "card": course_schedule_preview_card(corrected),
+            }
+        if action_name in {
+            "calendar_course_series_edit_open",
+            "calendar_course_series_edit_submit",
+            "calendar_course_series_occurrences_view",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.calendar_mutation_plans is None:
+                raise RuntimeError("calendar mutation plans are unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            plan = self.calendar_mutation_plans.get_for_participant(
+                participant_id, plan_id
+            )
+            if plan is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            expires_at = _aware_calendar_datetime(plan.get("expires_at"))
+            if (
+                str(plan.get("status") or "") == "expired"
+                or expires_at <= datetime.now(timezone.utc)
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if (
+                str(plan.get("operation") or "") != "update"
+                or str(plan.get("status") or "") != "awaiting_confirmation"
+                or dict(plan.get("presentation_context") or {}).get("kind")
+                != "course_series_update"
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(plan.get("status") or ""),
+                )
+            if action_name == "calendar_course_series_occurrences_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "已列出这次修改包含的课程场次。",
+                    "card": calendar_course_series_occurrences_card(
+                        plan, timezone_name=self.timezone.key
+                    ),
+                }
+            edit_card = calendar_course_series_edit_card(
+                plan, timezone_name=self.timezone.key
+            )
+            if action_name == "calendar_course_series_edit_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请统一修改课程名称和起止时间。",
+                    "card": edit_card,
+                }
+            values = dict(form_value or {})
+            try:
+                summary = str(values.get("summary") or "").strip()
+                if not summary or len(summary) > 200:
+                    raise ValueError("课程名称不能为空且不能超过 200 个字符。")
+                start_clock = _structured_clock(values, "start")
+                end_clock = _structured_clock(values, "end")
+                if end_clock <= start_clock:
+                    raise ValueError("结束时间必须晚于开始时间。")
+                updated = self.calendar_mutation_plans.update_pending_course_series(
+                    participant_id,
+                    plan_id,
+                    summary=summary,
+                    start_clock=start_clock,
+                    end_clock=end_clock,
+                    timezone_name=self.timezone.key,
+                )
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_calendar_course_series_edit",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            if updated is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if updated.get("update_status") == "expired":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if updated.get("update_status") != "updated":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(updated.get("status") or ""),
+                )
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "课程系列信息已统一修改，请核对确认内容。",
+                "card": calendar_mutation_plan_confirmation_card(
+                    updated, timezone_name=self.timezone.key
+                ),
             }
         if action_name in {
             "calendar_mutation_plan_item_edit_open",

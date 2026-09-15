@@ -212,7 +212,7 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
             },
         }
     )
-    plans, _outbox, tools, _registry, _runner = _stack(
+    plans, outbox, tools, _registry, _runner = _stack(
         database, calendar, _Verifier()
     )
 
@@ -232,9 +232,10 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
             )
 
     tools.course_series_resolver = _Resolver()
+    ctx = _context(owner.id, "以后这个课下课时间改为15:40")
     result = asyncio.run(
         tools.update_calendar_event(
-            _context(owner.id, "以后这个课下课时间改为15:40"),
+            ctx,
             {
                 "event_id": "course-1",
                 "scope": "current_semester_remainder",
@@ -246,6 +247,11 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
     assert result["ok"] is True
     assert result["item_count"] == 2
     assert calendar.updated == []
+    confirmation = outbox.take_cards(ctx.agent_run_id)[0]
+    serialized = json.dumps(confirmation, ensure_ascii=False)
+    assert serialized.count("修改信息") == 1
+    assert "查看场次" in serialized
+    assert "结束时间" in serialized and "14:30" in serialized and "15:40" in serialized
     with database.session() as session:
         plan_id = str(session.scalar(select(CalendarMutationPlan.id)))
     plan = plans.get_for_participant(owner.id, plan_id)
@@ -259,6 +265,57 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
     ]
     assert plan["presentation_context"]["scope"] == "current_semester_remainder"
     assert plan["presentation_context"]["changes"] == {"end_clock": "15:40"}
+
+    service = _card_service(database, tools)
+    occurrence_action = _plan_action(confirmation, "occurrences_view")
+    occurrence_view = service.handle(
+        owner.id,
+        message_id="series-card",
+        action_value=occurrence_action,
+        form_value={},
+    )
+    assert occurrence_view["navigation_only"] is True
+    assert "course-1" not in json.dumps(occurrence_view["card"])
+    assert "2030-01-15" in json.dumps(occurrence_view["card"], ensure_ascii=False)
+
+    edit_action = _plan_action(confirmation, "series_edit_open")
+    edit_view = service.handle(
+        owner.id,
+        message_id="series-card",
+        action_value=edit_action,
+        form_value={},
+    )
+    form = edit_view["card"]["body"]["elements"][0]
+    submit_action = next(
+        element["behaviors"][0]["value"]
+        for element in form["elements"]
+        if element.get("tag") == "button"
+    )
+    edited = service.handle(
+        owner.id,
+        message_id="series-card",
+        callback_event_id="series-edit-1",
+        action_value=submit_action,
+        form_value={
+            "summary": "操作系统（新）",
+            "start_hour": "13",
+            "start_minute": "10",
+            "end_hour": "15",
+            "end_minute": "50",
+        },
+    )
+    assert edited["ok"] is True
+    assert calendar.updated == []
+    updated = plans.get_for_participant(owner.id, plan_id)
+    assert {item["summary"] for item in updated["items"]} == {"操作系统（新）"}
+    assert [item["start_time"] for item in updated["items"]] == [
+        "2030-01-15T13:10:00+08:00",
+        "2030-01-22T13:10:00+08:00",
+    ]
+    assert [item["end_time"] for item in updated["items"]] == [
+        "2030-01-15T15:50:00+08:00",
+        "2030-01-22T15:50:00+08:00",
+    ]
 
 
 def test_update_plan_uses_updating_item_state():

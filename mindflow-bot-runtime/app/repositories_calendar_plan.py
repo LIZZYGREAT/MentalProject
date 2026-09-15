@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, exists, or_, select
 
@@ -446,6 +447,114 @@ class CalendarMutationPlanRepository:
             end_time=end_time,
             now=now,
         )
+
+    def update_pending_course_series(
+        self,
+        participant_id: uuid.UUID,
+        plan_id: uuid.UUID | str,
+        *,
+        summary: str,
+        start_clock: str,
+        end_clock: str,
+        timezone_name: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically apply one edit form to every pending course occurrence."""
+
+        normalized_summary = str(summary or "").strip()
+        if not normalized_summary or len(normalized_summary) > 200:
+            raise ValueError("calendar plan item summary must be 1 to 200 characters")
+        try:
+            start_value = time.fromisoformat(str(start_clock))
+            end_value = time.fromisoformat(str(end_clock))
+            display_timezone = ZoneInfo(timezone_name)
+            parsed_plan_id = uuid.UUID(str(plan_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("calendar course series edit is invalid") from exc
+        updated_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            row = session.get(
+                CalendarMutationPlan, parsed_plan_id, with_for_update=True
+            )
+            if row is None or str(row.participant_id) != str(participant_id):
+                return None
+            if row.status == "awaiting_confirmation" and _aware(row.expires_at) <= updated_at:
+                row.status = "expired"
+                row.updated_at = updated_at
+                row.completed_at = updated_at
+                session.flush()
+                value = self._view(row, self._items(session, row.id))
+                value["update_status"] = "expired"
+                return value
+            context = dict(row.presentation_context_json or {})
+            ledger = self._items(session, row.id)
+            if (
+                row.operation != "update"
+                or row.status != "awaiting_confirmation"
+                or context.get("kind") != "course_series_update"
+                or not ledger
+                or any(item.status != "pending" for item in ledger)
+            ):
+                value = self._view(row, ledger)
+                value["update_status"] = "not_editable"
+                return value
+
+            aggregate = [dict(value) for value in list(row.items_json or [])]
+            if len(aggregate) != len(ledger):
+                raise RuntimeError("calendar plan aggregate and ledger are inconsistent")
+            replacements: list[tuple[str, str]] = []
+            for item, payload in zip(ledger, aggregate):
+                if int(item.item_index) >= len(aggregate):
+                    raise RuntimeError("calendar plan aggregate and ledger are inconsistent")
+                original_start = datetime.fromisoformat(str(payload["start_time"]))
+                original_end = datetime.fromisoformat(str(payload["end_time"]))
+                if original_start.tzinfo is None or original_end.tzinfo is None:
+                    raise ValueError("calendar plan item times must include a timezone")
+                local_start = original_start.astimezone(display_timezone)
+                local_end = original_end.astimezone(display_timezone)
+                changed_start = datetime.combine(
+                    local_start.date(), start_value, display_timezone
+                )
+                changed_end = datetime.combine(
+                    local_end.date(), end_value, display_timezone
+                )
+                if changed_end <= changed_start:
+                    raise ValueError("calendar plan item end time must be after start time")
+                replacements.append((changed_start.isoformat(), changed_end.isoformat()))
+
+            for item, payload, (start_iso, end_iso) in zip(
+                ledger, aggregate, replacements
+            ):
+                changed = {
+                    **payload,
+                    "summary": normalized_summary,
+                    "start_time": start_iso,
+                    "end_time": end_iso,
+                }
+                if isinstance(changed.get("proposed"), dict):
+                    changed["proposed"] = {
+                        **dict(changed["proposed"]),
+                        "summary": normalized_summary,
+                        "start_time": start_iso,
+                        "end_time": end_iso,
+                    }
+                aggregate[int(item.item_index)] = changed
+                item.payload_json = changed
+                item.updated_at = updated_at
+            row.items_json = aggregate
+            context["display_name"] = normalized_summary
+            context["changes"] = {
+                **dict(context.get("changes") or {}),
+                "summary": normalized_summary,
+                "start_clock": str(start_clock),
+                "end_clock": str(end_clock),
+            }
+            row.presentation_context_json = context
+            row.updated_at = updated_at
+            session.flush()
+            value = self._view(row, ledger)
+            value["update_status"] = "updated"
+            return value
 
     def recover_stale(self, *, now: datetime | None = None) -> int:
         recovered_at = _aware(now or datetime.now(timezone.utc))
