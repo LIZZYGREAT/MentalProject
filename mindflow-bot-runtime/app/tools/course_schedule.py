@@ -170,11 +170,8 @@ class CourseScheduleTools:
             "Retry the latest retained participant-owned course-schedule image and create or resend its reviewed Preview. This never writes Calendar data.",
             _empty_schema(),
             self.import_from_recent_image,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_recent_image_import_authorization_context
-            ),
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_update_active_draft",
@@ -189,19 +186,16 @@ class CourseScheduleTools:
                 "additionalProperties": False,
             },
             self.update_active_draft,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_cancel_pending_draft",
             "Cancel this participant's latest pending course-schedule draft. Use only when the user directly asks to cancel the pending import. This does not delete Calendar data.",
             _empty_schema(),
             self.cancel_pending_draft,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_pending_cancel_authorization_context
-            ),
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_get_recent_imports",
@@ -266,8 +260,8 @@ class CourseScheduleTools:
                 "additionalProperties": False,
             },
             self.update_active_context,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            effect="draft_write",
+            authorization_requirement="none",
         )
 
     def get_active_draft(

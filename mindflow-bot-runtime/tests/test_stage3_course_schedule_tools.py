@@ -189,8 +189,15 @@ def test_participant_bound_tools_read_update_and_stage_preview_without_calendar_
     cards = presentations.take_cards(run_id)
     assert len(cards) == 1
     assert "学校默认作息" in str(cards[0])
-    assert len(verifier.calls) == 1
-    assert "participant" not in str(verifier.calls[0]["proposal_summary"]).lower()
+    assert verifier.calls == []
+    draft_spec = next(
+        spec
+        for spec in registry.specs
+        if spec.name == "course_schedule_update_active_draft"
+    )
+    assert draft_spec.effect == "draft_write"
+    assert draft_spec.authorization_requirement == "none"
+    assert draft_spec.authorization_context_resolver is None
 
 
 def test_draft_correction_updates_bound_preview_instead_of_sending_another_card():
@@ -264,7 +271,7 @@ def test_preview_card_rebind_uses_expected_old_message_compare_and_set():
     assert stale_race["status_card_message_id"] == "om-replacement"
 
 
-def test_hypothetical_correction_is_denied_before_draft_mutation():
+def test_draft_write_uses_typed_fields_without_reparsing_raw_user_text():
     database = memory_database()
     owner = participant(database, "STAGE3-HYPOTHETICAL")
     repo = CourseScheduleImportRepository(database)
@@ -288,10 +295,11 @@ def test_hypothetical_correction_is_denied_before_draft_mutation():
         )
     )
 
-    assert result.status == "tool_effect_not_authorized"
-    unchanged = repo.get(original["id"])["structured_result"]["courses"][0]
-    assert (unchanged["period_start"], unchanged["period_end"]) == (1, 2)
-    assert presentations.take_cards(ctx.agent_run_id) == []
+    assert result.status == "succeeded"
+    changed = repo.get(original["id"])["structured_result"]["courses"][0]
+    assert (changed["period_start"], changed["period_end"]) == (3, 4)
+    assert len(presentations.take_cards(ctx.agent_run_id)) == 1
+    assert verifier.calls == []
 
 
 def test_recent_image_failure_is_readable_and_retry_uses_bound_session():

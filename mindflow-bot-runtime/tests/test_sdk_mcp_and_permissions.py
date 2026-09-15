@@ -564,19 +564,19 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "calendar_connection_status": ("read", "none"),
         "calendar_list_calendars": ("read", "none"),
         "calendar_list_events": ("read", "none"),
-        "calendar_create_event": ("confirmation_stage", "none"),
-        "calendar_create_events_plan": ("confirmation_stage", "none"),
-            "calendar_update_event": ("confirmation_stage", "none"),
+        "calendar_create_event": ("proposal_stage", "none"),
+        "calendar_create_events_plan": ("proposal_stage", "none"),
+        "calendar_update_event": ("proposal_stage", "none"),
             "calendar_update_events_plan": (
-                "confirmation_stage",
+                "proposal_stage",
                 "none",
             ),
         "calendar_delete_event": (
-            "confirmation_stage",
+            "proposal_stage",
             "none",
         ),
         "calendar_delete_events_plan": (
-            "confirmation_stage",
+            "proposal_stage",
             "none",
         ),
     }
@@ -613,8 +613,6 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         spec for spec in registry.specs if spec.name == "calendar_create_event"
     )
     assert create_spec.authorization_context_resolver is None
-
-
 def test_production_options_expose_only_skill_and_mindflow_tools(monkeypatch):
     registry = ToolRegistry()
     registry.register(

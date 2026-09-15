@@ -679,7 +679,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.create_calendar_event,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
         registry.register(
@@ -699,7 +699,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.create_calendar_events_plan,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
         registry.register(
@@ -735,7 +735,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_event,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
         registry.register(
@@ -755,7 +755,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_calendar_events_plan,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
         registry.register(
@@ -770,7 +770,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.delete_calendar_event,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
         registry.register(
@@ -795,7 +795,7 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.delete_calendar_events_plan,
-            effect="confirmation_stage",
+            effect="proposal_stage",
             authorization_requirement="none",
         )
 

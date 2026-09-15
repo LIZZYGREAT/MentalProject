@@ -48,7 +48,9 @@ ToolEffect = Literal[
     "read",
     "compute",
     "ui_effect",
-    "confirmation_stage",
+    "draft_write",
+    "proposal_stage",
+    "confirmed_effect",
     "internal_write",
     "external_write",
     "destructive_external_write",
@@ -76,7 +78,8 @@ _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
             "read",
             "compute",
             "ui_effect",
-            "confirmation_stage",
+            "draft_write",
+            "proposal_stage",
             "internal_write",
             "external_write",
             "destructive_external_write",
@@ -327,12 +330,18 @@ class ToolRegistry:
             "read",
             "compute",
             "ui_effect",
-            "confirmation_stage",
+            "draft_write",
+            "proposal_stage",
+            "confirmed_effect",
             "internal_write",
             "external_write",
             "destructive_external_write",
         }:
             raise ValueError("invalid tool effect")
+        if effect == "confirmed_effect":
+            raise ValueError(
+                "confirmed_effect executors cannot be exposed through ToolRegistry"
+            )
         if authorization_requirement not in {
             "none",
             "direct_request",

@@ -97,7 +97,7 @@ def register(
     )
 
 
-def test_read_compute_and_ui_effects_never_call_mutation_verifier():
+def test_read_compute_ui_draft_and_proposal_effects_never_call_mutation_verifier():
     verifier = StaticVerifier(error=AssertionError("verifier must not run"))
     registry = ToolRegistry(mutation_verifier=verifier)
     calls = []
@@ -105,6 +105,8 @@ def test_read_compute_and_ui_effects_never_call_mutation_verifier():
         ("read_tool", "read"),
         ("compute_tool", "compute"),
         ("ui_tool", "ui_effect"),
+        ("draft_tool", "draft_write"),
+        ("proposal_tool", "proposal_stage"),
     ):
         register(
             registry,
@@ -119,7 +121,13 @@ def test_read_compute_and_ui_effects_never_call_mutation_verifier():
 
     results = asyncio.run(scenario())
     assert all(result.status == "succeeded" for result in results)
-    assert calls == ["read_tool", "compute_tool", "ui_tool"]
+    assert calls == [
+        "read_tool",
+        "compute_tool",
+        "ui_tool",
+        "draft_tool",
+        "proposal_tool",
+    ]
     assert verifier.calls == []
 
 
@@ -129,6 +137,8 @@ def test_read_compute_and_ui_effects_never_call_mutation_verifier():
         ("read_compute_only", "read", True),
         ("read_compute_only", "compute", True),
         ("read_compute_only", "ui_effect", False),
+        ("read_compute_only", "draft_write", False),
+        ("read_compute_only", "proposal_stage", False),
         ("read_compute_only", "internal_write", False),
         ("read_compute_only", "external_write", False),
         ("read_compute_only", "destructive_external_write", False),
@@ -1017,6 +1027,19 @@ def test_deterministic_backend_actions_cannot_be_replayed_as_agent_tools():
     )
     assert verifier.calls == []
     assert handled == []
+
+
+def test_confirmed_effect_executor_cannot_be_registered_for_agent_use():
+    registry = ToolRegistry()
+
+    with pytest.raises(ValueError, match="cannot be exposed"):
+        register(
+            registry,
+            "private_confirmed_executor",
+            lambda _ctx, _args: {"ok": True},
+            effect="confirmed_effect",
+            authorization_requirement="none",
+        )
 
 
 def test_calendar_operation_gate_remains_after_verifier_allow():
