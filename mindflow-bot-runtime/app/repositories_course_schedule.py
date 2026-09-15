@@ -115,6 +115,86 @@ class CourseScheduleImportRepository:
         self.database = database
         self.run_lease_seconds = max(1, int(run_lease_seconds))
 
+    def resolve_calendar_event_provenance(
+        self,
+        participant_id: uuid.UUID,
+        event_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve an imported Calendar event to its exact course item."""
+
+        normalized_event_id = str(event_id or "").strip()
+        if not normalized_event_id:
+            return None
+        with self.database.session() as session:
+            match = session.execute(
+                select(
+                    CourseScheduleImport,
+                    CourseScheduleImportItem,
+                    CourseScheduleImportWrite,
+                )
+                .join(
+                    CourseScheduleImportItem,
+                    CourseScheduleImportItem.import_id == CourseScheduleImport.id,
+                )
+                .join(
+                    CourseScheduleImportWrite,
+                    CourseScheduleImportWrite.item_id == CourseScheduleImportItem.id,
+                )
+                .where(
+                    CourseScheduleImport.participant_id == participant_id,
+                    CourseScheduleImportWrite.provider_event_id
+                    == normalized_event_id,
+                    CourseScheduleImportWrite.status == "created",
+                )
+                .limit(1)
+            ).first()
+            if match is None:
+                return None
+            import_row, item_row, _write_row = match
+            provider_event_ids = tuple(
+                str(value)
+                for value in session.scalars(
+                    select(CourseScheduleImportWrite.provider_event_id)
+                    .where(
+                        CourseScheduleImportWrite.import_id == import_row.id,
+                        CourseScheduleImportWrite.item_id == item_row.id,
+                        CourseScheduleImportWrite.status == "created",
+                        CourseScheduleImportWrite.provider_event_id.is_not(None),
+                    )
+                    .order_by(
+                        CourseScheduleImportWrite.created_at,
+                        CourseScheduleImportWrite.id,
+                    )
+                )
+                if value
+            )
+            return {
+                "import_id": str(import_row.id),
+                "course_item_id": str(item_row.id),
+                "display_name": item_row.course_name,
+                "semester_start_date": (
+                    import_row.semester_start_date.isoformat()
+                    if import_row.semester_start_date
+                    else None
+                ),
+                "timezone": import_row.timezone,
+                "weekday": item_row.weekday,
+                "start_time": (
+                    item_row.start_time.strftime("%H:%M")
+                    if item_row.start_time
+                    else None
+                ),
+                "end_time": (
+                    item_row.end_time.strftime("%H:%M")
+                    if item_row.end_time
+                    else None
+                ),
+                "location": item_row.location,
+                "week_rule": dict(item_row.week_rule_json or {}),
+                "recurrence_strategy": import_row.recurrence_strategy,
+                "provider_event_ids": provider_event_ids,
+            }
+
     def create_draft(
         self,
         participant_id: uuid.UUID,
