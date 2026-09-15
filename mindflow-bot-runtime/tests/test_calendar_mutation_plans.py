@@ -150,6 +150,58 @@ def test_plan_repository_is_participant_bound_single_claim_and_expires():
     )["claim_status"] == "expired"
 
 
+def test_plan_accepts_one_to_twenty_items_and_update_operation():
+    database = memory_database()
+    owner = participant(database, "PLAN-CARDINALITY")
+    repository = CalendarMutationPlanRepository(database)
+
+    single = repository.create(
+        owner.id,
+        operation="update",
+        items=[{"event_id": "one", "summary": "updated"}],
+    )
+    twenty = repository.create(
+        owner.id,
+        operation="create",
+        items=[{"summary": str(index)} for index in range(20)],
+    )
+
+    assert single["operation"] == "update"
+    assert len(single["ledger_items"]) == 1
+    assert len(twenty["ledger_items"]) == 20
+    with pytest.raises(ValueError, match="1 to 20"):
+        repository.create(owner.id, operation="delete", items=[])
+    with pytest.raises(ValueError, match="1 to 20"):
+        repository.create(
+            owner.id,
+            operation="delete",
+            items=[{"event_id": str(index)} for index in range(21)],
+        )
+
+
+def test_update_plan_uses_updating_item_state():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATING-STATE")
+    repository = CalendarMutationPlanRepository(database)
+    plan = repository.create(
+        owner.id,
+        operation="update",
+        items=[{"event_id": "one", "summary": "updated"}],
+    )
+    repository.request_execution(owner.id, plan["id"])
+    claimed_plan = repository.claim_next_plan(lease_owner="runner")
+    item = repository.claim_next_item(
+        claimed_plan["id"], lease_owner="runner"
+    )
+
+    assert item["operation"] == "update"
+    assert item["status"] == "updating"
+    completed = repository.record_item_success(
+        plan["id"], item["id"], lease_owner="runner"
+    )
+    assert completed["status"] == "succeeded"
+
+
 def test_pending_create_plan_time_update_is_atomic_and_participant_bound():
     database = memory_database()
     owner = participant(database, "PLAN-EDIT-OWNER")

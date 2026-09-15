@@ -144,10 +144,10 @@ class CalendarMutationPlanRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         normalized_operation = str(operation).strip().lower()
-        if normalized_operation not in {"create", "delete"}:
+        if normalized_operation not in {"create", "update", "delete"}:
             raise ValueError("unsupported calendar mutation plan operation")
-        if not 2 <= len(items) <= 20:
-            raise ValueError("calendar mutation plan requires 2 to 20 items")
+        if not 1 <= len(items) <= 20:
+            raise ValueError("calendar mutation plan requires 1 to 20 items")
         created_at = _aware(now or datetime.now(timezone.utc))
         row = CalendarMutationPlan(
             participant_id=participant_id,
@@ -397,7 +397,7 @@ class CalendarMutationPlanRepository:
             )
             for row in rows:
                 for item in self._items(session, row.id):
-                    if item.status in {"creating", "deleting"}:
+                    if item.status in {"creating", "updating", "deleting"}:
                         item.status = "outcome_unknown"
                         item.error_code = "runner_interrupted"
                         item.next_retry_at = self._next_retry_at(
@@ -455,7 +455,7 @@ class CalendarMutationPlanRepository:
                 return None
             if row.status == "running":
                 for item in self._items(session, row.id):
-                    if item.status in {"creating", "deleting"}:
+                    if item.status in {"creating", "updating", "deleting"}:
                         item.status = "outcome_unknown"
                         item.error_code = "runner_lease_expired"
                         item.next_retry_at = self._next_retry_at(
@@ -520,7 +520,11 @@ class CalendarMutationPlanRepository:
             if item is None:
                 return None
             reconcile = item.status == "outcome_unknown"
-            item.status = "creating" if item.operation == "create" else "deleting"
+            item.status = {
+                "create": "creating",
+                "update": "updating",
+                "delete": "deleting",
+            }[item.operation]
             item.attempt_count = int(item.attempt_count or 0) + 1
             item.last_attempt_at = claimed_at
             item.next_retry_at = None
@@ -559,7 +563,7 @@ class CalendarMutationPlanRepository:
                 or item.plan_id != plan.id
                 or plan.status != "running"
                 or plan.lease_owner != str(lease_owner)[:64]
-                or item.status not in {"creating", "deleting"}
+                or item.status not in {"creating", "updating", "deleting"}
             ):
                 return None
             normalized_provider_id = str(provider_event_id or "").strip() or None
@@ -603,7 +607,7 @@ class CalendarMutationPlanRepository:
                 or item.plan_id != plan.id
                 or plan.status != "running"
                 or plan.lease_owner != str(lease_owner)[:64]
-                or item.status not in {"creating", "deleting"}
+                or item.status not in {"creating", "updating", "deleting"}
             ):
                 return None
             item.status = "outcome_unknown" if outcome_unknown else "failed"
@@ -649,7 +653,8 @@ class CalendarMutationPlanRepository:
             if any(status == "outcome_unknown" for status in statuses):
                 row.status = "recovery_required"
             elif any(
-                status in {"pending", "creating", "deleting"} for status in statuses
+                status in {"pending", "creating", "updating", "deleting"}
+                for status in statuses
             ):
                 return self._view(row, items)
             else:
