@@ -14,12 +14,16 @@ class FeishuSendError(RuntimeError):
         self, message: str, *, code: int | None = None,
         retryable: bool = True, operation: str = "send_message",
         replacement_allowed: bool = False,
+        provider_request_id: str | None = None,
     ):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.operation = operation
         self.replacement_allowed = bool(replacement_allowed)
+        self.provider_request_id = (
+            str(provider_request_id)[:128] if provider_request_id else None
+        )
         self.error_class = type(self).__name__
 
 
@@ -91,6 +95,7 @@ class FeishuClient:
                 code=code,
                 retryable=retryable,
                 operation="update_card",
+                provider_request_id=self._response_request_id(response),
                 # These provider responses mean the original message target
                 # is gone or can no longer be patched. Authentication and
                 # generic validation failures must not create another card.
@@ -270,8 +275,21 @@ class FeishuClient:
                 code=code,
                 retryable=code not in {230001, 230003, 230006, 99991672},
                 operation=operation,
+                provider_request_id=self._response_request_id(response),
             )
         return response
+
+    @staticmethod
+    def _response_request_id(response: Any) -> str | None:
+        request_id = getattr(response, "request_id", None)
+        if not request_id:
+            getter = getattr(response, "get_request_id", None)
+            if callable(getter):
+                try:
+                    request_id = getter()
+                except Exception:
+                    request_id = None
+        return str(request_id)[:128] if request_id else None
 
     def update_card_from_callback(
         self,
@@ -440,6 +458,7 @@ class FeishuClient:
                 str(getattr(response, "msg", "Feishu send failed")),
                 code=code,
                 retryable=retryable,
+                provider_request_id=self._response_request_id(response),
             )
         message_id = str(getattr(getattr(response, "data", None), "message_id", ""))
         if not message_id:

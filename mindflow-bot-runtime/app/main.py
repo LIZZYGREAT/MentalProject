@@ -35,6 +35,28 @@ def _log_web_search_config(settings: Any) -> None:
     )
 
 
+def _record_streaming_capability(settings: Any, sender: Any, incidents: Any) -> None:
+    enabled = bool(settings.feishu_streaming_card_enabled)
+    sender_supported = callable(getattr(sender, "start_streaming_card", None))
+    logging.getLogger(__name__).info(
+        "feishu_streaming_capability enabled=%s sender_supported=%s",
+        enabled,
+        sender_supported,
+    )
+    if not enabled or sender_supported:
+        return
+    logging.getLogger(__name__).warning(
+        "feishu_streaming_capability_unavailable enabled=true sender_supported=false"
+    )
+    incidents.record(
+        severity="warning",
+        subsystem="feishu",
+        event_name="feishu_streaming_capability_unavailable",
+        summary="Streaming is enabled but the configured sender has no CardKit capability.",
+        details={"enabled": True, "sender_supported": False},
+    )
+
+
 def _should_start_daily_review_scheduler(
     settings: Any, card_action_transport_available: bool
 ) -> bool:
@@ -884,6 +906,7 @@ async def run() -> None:
         sender=sender,
         card_action_handler=handle_card_action,
     )
+    _record_streaming_capability(settings, sender, incidents)
     worker = BotWorker(
         queue,
         identity,

@@ -26,6 +26,41 @@ def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
     assert "secret-key-value" not in caplog.text
 
 
+def test_streaming_capability_preflight_logs_supported_sender(caplog):
+    settings = SimpleNamespace(feishu_streaming_card_enabled=True)
+    sender = SimpleNamespace(start_streaming_card=lambda *_args, **_kwargs: None)
+    incidents = SimpleNamespace(record=lambda **_kwargs: pytest.fail("unexpected"))
+
+    with caplog.at_level("INFO"):
+        app_main._record_streaming_capability(settings, sender, incidents)
+
+    assert (
+        "feishu_streaming_capability enabled=True sender_supported=True"
+        in caplog.text
+    )
+
+
+def test_streaming_capability_preflight_records_enabled_but_unsupported(caplog):
+    records = []
+    settings = SimpleNamespace(feishu_streaming_card_enabled=True)
+    sender = SimpleNamespace()
+    incidents = SimpleNamespace(record=lambda **values: records.append(values))
+
+    with caplog.at_level("INFO"):
+        app_main._record_streaming_capability(settings, sender, incidents)
+
+    assert "enabled=True sender_supported=False" in caplog.text
+    assert records == [{
+        "severity": "warning",
+        "subsystem": "feishu",
+        "event_name": "feishu_streaming_capability_unavailable",
+        "summary": (
+            "Streaming is enabled but the configured sender has no CardKit capability."
+        ),
+        "details": {"enabled": True, "sender_supported": False},
+    }]
+
+
 def test_daily_review_scheduler_fails_closed_without_card_action_transport():
     disabled = SimpleNamespace(daily_review_enabled=False)
     enabled = SimpleNamespace(daily_review_enabled=True)

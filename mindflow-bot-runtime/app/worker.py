@@ -113,6 +113,27 @@ logger = logging.getLogger(__name__)
 _CARD_DELIVERED_CLAIM = re.compile(
     r"(?:卡片|设置卡片?|功能卡片?)(?:已经|已)(?:成功)?(?:发出|发送|投递)(?:了)?"
 )
+
+
+def _streaming_failure_fields(
+    exc: BaseException,
+    *,
+    default_stage: str,
+) -> dict[str, object | None]:
+    operation = str(getattr(exc, "operation", "") or "unknown")
+    stage = {
+        "create_card_instance": "create_card",
+        "send_message": "send_reference",
+        "update_card_element_content": "update",
+        "finish_streaming_card": "finalize",
+    }.get(operation, default_stage)
+    return {
+        "operation": operation,
+        "provider_error_code": getattr(exc, "code", None),
+        "provider_request_id": getattr(exc, "provider_request_id", None),
+        "retryable": bool(getattr(exc, "retryable", False)),
+        "stage": stage,
+    }
 _STREAMING_WEB_TOOLS = {
     "web_search",
     "web_read_result",
@@ -2375,11 +2396,36 @@ class BotWorker:
                     self._attach_streaming_sequence_allocator(
                         event.event_id, created
                     )
-                except Exception:
+                except Exception as exc:
+                    failure = _streaming_failure_fields(
+                        exc, default_stage="create_card"
+                    )
                     logger.warning(
-                        "streaming_progress_card_start_failed event_id=%s",
+                        "streaming_progress_start_failed event_id=%s "
+                        "operation=%s provider_error_code=%s "
+                        "provider_request_id=%s retryable=%s stage=%s",
                         event.event_id,
+                        failure["operation"],
+                        failure["provider_error_code"],
+                        failure["provider_request_id"],
+                        failure["retryable"],
+                        failure["stage"],
                         exc_info=True,
+                    )
+                    await self._record_incident(
+                        severity="warning",
+                        subsystem="feishu",
+                        event_name="streaming_progress_start_failed",
+                        participant_id=ctx.participant_id,
+                        bot_event_id=event.event_id,
+                        error_code=(
+                            str(failure["provider_error_code"])
+                            if failure["provider_error_code"] is not None
+                            else None
+                        ),
+                        error_class=type(exc).__name__,
+                        summary="CardKit progress card could not be started.",
+                        details=failure,
                     )
                     return None
                 streaming_session = created
@@ -3091,11 +3137,36 @@ class BotWorker:
                     message_id=session.message_id,
                     element_id=session.element_id,
                 )
-            except Exception:
+            except Exception as exc:
+                failure = _streaming_failure_fields(
+                    exc, default_stage="create_card"
+                )
                 logger.warning(
-                    "streaming_card_start_failed event_id=%s",
+                    "streaming_card_start_failed event_id=%s operation=%s "
+                    "provider_error_code=%s provider_request_id=%s "
+                    "retryable=%s stage=%s",
                     event.event_id,
+                    failure["operation"],
+                    failure["provider_error_code"],
+                    failure["provider_request_id"],
+                    failure["retryable"],
+                    failure["stage"],
                     exc_info=True,
+                )
+                await self._record_incident(
+                    severity="warning",
+                    subsystem="feishu",
+                    event_name="streaming_card_start_failed",
+                    participant_id=participant_id,
+                    bot_event_id=event.event_id,
+                    error_code=(
+                        str(failure["provider_error_code"])
+                        if failure["provider_error_code"] is not None
+                        else None
+                    ),
+                    error_class=type(exc).__name__,
+                    summary="CardKit answer card could not be started.",
+                    details=failure,
                 )
                 return None
         self._attach_streaming_sequence_allocator(event.event_id, session)
@@ -3111,11 +3182,19 @@ class BotWorker:
                 session.finalize(plan.full_text),
                 timeout=self.streaming_finalize_timeout_seconds,
             )
-        except Exception:
+        except Exception as exc:
+            failure = _streaming_failure_fields(exc, default_stage="update")
             logger.warning(
-                "streaming_card_final_delivery_failed event_id=%s visible_chars=%s",
+                "streaming_card_final_delivery_failed event_id=%s visible_chars=%s "
+                "operation=%s provider_error_code=%s provider_request_id=%s "
+                "retryable=%s stage=%s",
                 event.event_id,
                 session.answer_visible_chars,
+                failure["operation"],
+                failure["provider_error_code"],
+                failure["provider_request_id"],
+                failure["retryable"],
+                failure["stage"],
                 exc_info=True,
             )
             try:

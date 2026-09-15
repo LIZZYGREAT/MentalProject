@@ -2,7 +2,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from app.integrations.feishu.client import FeishuClient
+import pytest
+
+from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.streaming_card import (
     ANSWER_ELEMENT_ID,
     FeishuStreamingCardSession,
@@ -215,6 +217,32 @@ def test_cardkit_update_and_finalize_use_stable_uuid_for_retries():
     assert requests[0].body["uuid"] == requests[1].body["uuid"]
     assert requests[2].body["uuid"] == requests[3].body["uuid"]
     assert requests[0].body["uuid"] != requests[2].body["uuid"]
+
+
+def test_cardkit_error_preserves_provider_code_request_id_and_operation():
+    class Response:
+        code = 230001
+        msg = "permission denied"
+        request_id = "req-cardkit-1"
+
+        @staticmethod
+        def success():
+            return False
+
+    class SDK:
+        @staticmethod
+        def request(_request):
+            return Response()
+
+    client = FeishuClient("app", "secret", sdk_client=SDK())
+
+    with pytest.raises(FeishuSendError) as raised:
+        client.update_card_element_content("card-1", "answer", "body", 1)
+
+    assert raised.value.code == 230001
+    assert raised.value.provider_request_id == "req-cardkit-1"
+    assert raised.value.retryable is False
+    assert raised.value.operation == "update_card_element_content"
 
 
 def test_send_reference_failure_still_closes_preallocated_streaming_mode():
