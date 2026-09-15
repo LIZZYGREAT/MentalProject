@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+import json
 import logging
 from typing import Any, Literal
 import uuid
@@ -58,6 +59,10 @@ from app.services.token_service import TokenRepository
 
 
 logger = logging.getLogger(__name__)
+
+CALENDAR_AGENT_READ_MAX_DAYS = 180
+CALENDAR_PROVIDER_WINDOW_DAYS = 31
+CALENDAR_AGENT_READ_MAX_EVENTS = 200
 
 
 CalendarTargetScope = Literal[
@@ -599,7 +604,7 @@ class CareTools:
         )
         registry.register(
             "calendar_list_events",
-            "List this participant's primary-calendar events in an explicit ISO 8601 time range.",
+            "List this participant's primary-calendar events across an explicit range. The backend automatically windows long ranges up to 180 days into provider-safe intervals.",
             {
                 "type": "object",
                 "properties": {
@@ -1533,18 +1538,85 @@ class CareTools:
     async def list_calendar_events(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        start_time = _parse_datetime(args["start_time"], self.timezone)
-        end_time = _parse_datetime(args["end_time"], self.timezone)
         try:
-            events = await self.calendar.get_events(
-                ctx.participant_id, start_time, end_time
-            )
+            start_time = _parse_datetime(args["start_time"], self.timezone)
+            end_time = _parse_datetime(args["end_time"], self.timezone)
+        except (KeyError, TypeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "error": "calendar_invalid_range",
+                "reason_code": "invalid_datetime_range",
+                "retryable": False,
+                "do_not_retry": True,
+                "reason_text": str(exc)[:200],
+            }
+        duration = end_time - start_time
+        if duration <= timedelta(0):
+            return {
+                "ok": False,
+                "error": "calendar_invalid_range",
+                "reason_code": "range_not_positive",
+                "retryable": False,
+                "do_not_retry": True,
+            }
+        if duration > timedelta(days=CALENDAR_AGENT_READ_MAX_DAYS):
+            return {
+                "ok": False,
+                "error": "calendar_range_too_large",
+                "reason_code": "calendar_range_too_large",
+                "max_days": CALENDAR_AGENT_READ_MAX_DAYS,
+                "retryable": False,
+                "do_not_retry": True,
+            }
+        events: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        window_count = 0
+        window_start = start_time
+        try:
+            while window_start < end_time:
+                window_end = min(
+                    window_start + timedelta(days=CALENDAR_PROVIDER_WINDOW_DAYS),
+                    end_time,
+                )
+                window_count += 1
+                values = await self.calendar.get_events(
+                    ctx.participant_id, window_start, window_end
+                )
+                for raw in list(values or []):
+                    event = dict(raw)
+                    identity = str(event.get("id") or "").strip()
+                    if not identity:
+                        identity = json.dumps(
+                            {
+                                "summary": event.get("summary"),
+                                "start_time": event.get("start_time"),
+                                "end_time": event.get("end_time"),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    events.append(event)
+                window_start = window_end
         except PermissionError:
             return {"ok": False, "error": "calendar_not_connected", "command": "/calendar"}
+        truncated = len(events) > CALENDAR_AGENT_READ_MAX_EVENTS
+        if truncated:
+            events = events[:CALENDAR_AGENT_READ_MAX_EVENTS]
         return {
             "ok": True,
             "range": {"start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
             "events": events,
+            "window_count": window_count,
+            "truncated": truncated,
+            **(
+                {"reason_code": "calendar_event_limit_reached"}
+                if truncated
+                else {}
+            ),
         }
 
     def _normalize_calendar_create_plan_item(
