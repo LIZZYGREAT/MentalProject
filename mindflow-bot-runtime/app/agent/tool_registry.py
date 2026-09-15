@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -90,6 +92,15 @@ CALENDAR_MUTATION_TOOLS: dict[str, CalendarMutationOperation] = {
     "calendar_delete_event": "delete",
     "calendar_delete_events_plan": "delete",
 }
+
+_DETERMINISTIC_TOOL_ERRORS = frozenset({
+    "invalid_arguments",
+    "calendar_invalid_range",
+    "calendar_range_too_large",
+    "mutation_needs_clarification",
+    "tool_effect_not_authorized",
+    "calendar_mutation_not_authorized",
+})
 
 
 @dataclass(frozen=True)
@@ -245,6 +256,38 @@ class ToolRegistry:
         self.incidents = incidents
         self.mutation_verifier = mutation_verifier
         self._sync_slots = asyncio.Semaphore(max(1, int(sync_max_concurrency)))
+        self._non_retryable_failures: dict[tuple[str, str, str], str] = {}
+
+    @staticmethod
+    def _tool_call_key(
+        ctx: AgentContext, name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str, str]:
+        canonical = json.dumps(
+            arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return str(ctx.agent_run_id), str(name), digest
+
+    def _remember_non_retryable(
+        self,
+        ctx: AgentContext,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        error = str(result.get("error") or "")
+        if not (
+            result.get("do_not_retry") is True
+            or result.get("retryable") is False
+            or error in _DETERMINISTIC_TOOL_ERRORS
+        ):
+            return
+        if len(self._non_retryable_failures) >= 2048:
+            self._non_retryable_failures.pop(next(iter(self._non_retryable_failures)))
+        self._non_retryable_failures[
+            self._tool_call_key(ctx, name, arguments)
+        ] = str(result.get("reason_code") or error or "non_retryable_failure")[:80]
 
     def register(
         self,
@@ -405,6 +448,28 @@ class ToolRegistry:
                 "arguments_not_object",
             )
             return ToolExecution(result, "invalid_arguments")
+        repeated_reason = self._non_retryable_failures.get(
+            self._tool_call_key(ctx, name, arguments)
+        )
+        if repeated_reason is not None:
+            result = {
+                "ok": False,
+                "error": "repeated_non_retryable_tool_call",
+                "reason_code": repeated_reason,
+                "retryable": False,
+                "do_not_retry": True,
+            }
+            await self._log(
+                ctx,
+                name,
+                spec,
+                arguments,
+                result,
+                "repeated_non_retryable_tool_call",
+                "not_evaluated",
+                repeated_reason,
+            )
+            return ToolExecution(result, "repeated_non_retryable_tool_call")
         errors = sorted(
             Draft202012Validator(
                 spec.parameters, format_checker=FormatChecker()
@@ -416,7 +481,10 @@ class ToolRegistry:
                 "ok": False,
                 "error": "invalid_arguments",
                 "detail": errors[0].message[:300],
+                "retryable": False,
+                "do_not_retry": True,
             }
+            self._remember_non_retryable(ctx, name, arguments, result)
             await self._log(
                 ctx,
                 name,
@@ -631,6 +699,7 @@ class ToolRegistry:
                 value = await value
             result = value if isinstance(value, dict) else {"value": value}
             safe = _safe_summary(result)
+            self._remember_non_retryable(ctx, name, arguments, result)
             await self._log(
                 ctx,
                 name,

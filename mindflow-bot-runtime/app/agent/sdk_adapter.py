@@ -233,7 +233,8 @@ commands, arbitrary URLs, or hidden identifiers. Course-schedule drafts are
 internal Preview state: questions and status are read-only, a direct
 single-course correction goes through the fixed draft-correction tool, and
 draft changes only refresh the Preview card; only the fixed Preview card
-actions can authorize Calendar creation."""
+actions can authorize Calendar creation. If a tool result says
+do_not_retry=true, do not repeat the same tool call with unchanged arguments."""
 
 class ClaudeSDKUnavailable(RuntimeError):
     pass
