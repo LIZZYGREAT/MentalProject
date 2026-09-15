@@ -91,6 +91,12 @@ MutationIntent verifier，且不会写 Calendar。已完成/部分完成导入�
 固定卡展示课程数与待清理日程数；只有 receipt-protected external CardAction 才调用 `revert()`
 安装 cleanup Saga fence。Agent Registry 不再暴露混合 cancel/revert executor。
 
+Safety 由独立 `SafetySemanticGate` 分类为 first-person imminent/non-imminent、third-party、
+quoted/academic 或 ordinary，再由 Backend 固定 policy 决定是否锁定回复。明确第一人称风险
+仍不会进入主 Agent；论文、新闻、引用与第三方关切不会仅因关键词被当作本人即时风险。
+分类器异常或无外部语义能力时，未能归类的风险主题继续走保守固定响应，主 Agent 与用户
+都不能覆盖这一门控。
+
 ## Forecast、Calendar 与 freshness
 
 `ForecastCoordinator` 是正式评估入口。它准备显式/学习画像、Calendar、Observation、
