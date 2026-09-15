@@ -124,9 +124,12 @@ Use only these tools:
   asks to cancel the pending Preview. It does not remove Calendar data.
 - `course_schedule_get_recent_imports` when the participant asks about recent
   completed or reverted schedule imports.
-- `course_schedule_cancel_or_revert_import` only when the participant directly
-  asks to cancel a pending import or revert one exact recent import. If the
-  intended import is ambiguous, inspect recent imports and ask which one.
+- `course_schedule_cancel_pending_draft` handles only a latest pending Preview
+  with no Calendar effect. For a completed or partially completed import, use
+  `course_schedule_stage_revert_import` only after the participant asks to
+  revert one exact recent import. It stages a destructive review card and does
+  not start cleanup. If the intended import is ambiguous, inspect recent
+  imports and ask which one.
 
 For recurrence, use only the structured fields exposed by the tools. Never
 invent or pass raw RRULE text. `recurrence_weekdays` uses `MO` through `SU`.
@@ -258,7 +261,8 @@ examples are shown in Chinese.
   `course_schedule_get_last_failure` and summarize its returned error and missing
   information without exposing internal fields.
 - “撤销刚才导入的课表” → inspect recent imports when needed, then call
-  `course_schedule_cancel_or_revert_import` for one exact import.
+  `course_schedule_stage_revert_import` for one exact completed import and
+  wait for the participant's fixed-card confirmation before reporting cleanup.
 - A failed or unauthorized calendar tool → explain briefly and, for missing
   authorization, tell the participant to use `/calendar`; never report success.
 

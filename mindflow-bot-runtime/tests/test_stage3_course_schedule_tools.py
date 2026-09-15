@@ -12,6 +12,8 @@ from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
 )
 from app.services.mutation_intent_verifier import MutationIntentDecision
+from app.services.card_action_service import CardActionService
+from app.card_actions.registry import card_action_spec
 from app.tools.course_schedule import CourseScheduleTools
 from helpers import memory_database, participant
 
@@ -448,53 +450,100 @@ def test_participant_bound_pending_cancel_without_provider_effect_skips_verifier
     assert verifier.calls == []
 
 
-def test_cancel_with_provider_effect_still_requires_semantic_verification():
+def test_completed_import_revert_stages_fixed_review_without_starting_cleanup():
+    import_id = uuid.uuid4()
+
     class Drafts:
         def resolve_cancel_selector(self, participant_id, selector):
             assert participant_id == owner.id
             assert selector == {"latest": True}
             return {
-                "id": "private-import-id",
+                "id": str(import_id),
                 "status": "succeeded",
                 "created_at": "2026-09-10T08:00:00+00:00",
                 "created_local_datetime": "2026-09-10T16:00:00+08:00",
                 "created_local_date": "2026-09-10",
                 "timezone": "Asia/Shanghai",
                 "course_names": ["高等数学"],
+                "course_count": 1,
+                "provider_effect_count": 16,
                 "has_provider_effect": True,
             }
 
     class Imports:
         drafts = Drafts()
 
-        def cancel_or_revert(self, participant_id, selector, **_kwargs):
-            assert participant_id == owner.id
-            return {"ok": True, "status": "cancelling", "cancel_mode": "revert"}
-
     database = memory_database()
     owner = participant(database, "STAGE3-REVERT-VERIFY")
-    verifier = _Verifier(
-        MutationIntentDecision("allow", "cancel_or_revert", "explicit_cleanup")
-    )
+    verifier = _Verifier(None)
     registry = ToolRegistry(mutation_verifier=verifier)
-    CourseScheduleTools(Imports(), PresentationOutbox()).register(registry)
+    outbox = PresentationOutbox()
+    CourseScheduleTools(Imports(), outbox).register(registry)
     ctx = _context(owner.id, uuid.uuid4(), "撤销刚才导入到日历的课程")
 
     result = asyncio.run(
         registry.execute(
             ctx,
-            "course_schedule_cancel_or_revert_import",
+            "course_schedule_stage_revert_import",
             {"selector": {"latest": True}},
         )
     )
 
     assert result.status == "succeeded"
-    assert result.result["status"] == "cancelling"
-    assert len(verifier.calls) == 1
-    serialized = str(verifier.calls[0]["proposal_summary"])
-    assert "private-import-id" not in serialized
-    assert "2026-09-10T08:00:00+00:00" not in serialized
-    assert "2026-09-10T16:00:00+08:00" in serialized
+    assert result.result["course_schedule_revert"] == "pending_confirmation"
+    assert result.result["provider_effect_started"] is False
+    assert verifier.calls == []
+    serialized = str(outbox.take_cards(ctx.agent_run_id)[0])
+    assert str(import_id) in serialized
+    assert "16" in serialized
+
+
+def test_course_revert_card_action_is_the_only_cleanup_executor():
+    import_id = uuid.uuid4()
+
+    class Imports:
+        def __init__(self):
+            self.calls = []
+
+        def revert(self, participant_id, selected_id, **kwargs):
+            self.calls.append((participant_id, selected_id, kwargs))
+            return {
+                "ok": True,
+                "status": "cancelling",
+                "import_id": str(selected_id),
+                "cancel_mode": "revert",
+                "reply_text": "正在清理。",
+            }
+
+    database = memory_database()
+    owner = participant(database, "STAGE3-REVERT-CARD")
+    imports = Imports()
+    actions = CardActionService(
+        observations=None,
+        observation_refresh=None,
+        course_schedule_imports=imports,
+    )
+    result = actions.handle(
+        owner.id,
+        message_id="revert-card",
+        chat_id="chat",
+        callback_event_id="revert-confirm",
+        action_value={
+            "mindflow_action": "course_schedule_revert_confirm",
+            "version": "1",
+            "import_id": str(import_id),
+        },
+        form_value={},
+    )
+
+    assert result["ok"] is True
+    assert imports.calls == [
+        (owner.id, import_id, {"status_card_chat_id": "chat"})
+    ]
+    assert card_action_spec("course_schedule_revert_confirm").kind == "external_write"
+    assert card_action_spec(
+        "course_schedule_revert_confirm"
+    ).replay_policy == "receipt_required"
 
 
 def test_recent_imports_expose_local_timestamp_without_raw_utc():

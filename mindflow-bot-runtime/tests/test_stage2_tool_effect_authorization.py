@@ -1270,7 +1270,7 @@ def test_verifier_decision_intent_authorization_matrix(
     decision, intent, authorization_requirement
 ):
     tool_name = (
-        "course_schedule_cancel_or_revert_import"
+        "course_schedule_cancel_pending_draft"
         if authorization_requirement == "direct_request"
         else "calendar_delete_event"
     )

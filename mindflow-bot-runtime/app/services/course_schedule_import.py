@@ -213,25 +213,23 @@ class CourseScheduleImportService:
         self._wake_runner()
         return self._cancel_result(draft)
 
-    def cancel_or_revert(
+    def revert(
         self,
         participant_id: uuid.UUID,
-        selector: dict[str, Any],
+        import_id: uuid.UUID | str,
         *,
         status_card_chat_id: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve a participant-bound selector and install the Saga fence."""
+        """Start provider cleanup only from the fixed CardAction boundary."""
 
-        candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
         result = self.drafts.request_cancel(
             participant_id,
-            candidate["id"],
+            import_id,
+            mode="revert",
             status_card_chat_id=status_card_chat_id,
         )
         self._wake_runner()
-        return {**self._cancel_result(result), "selector": dict(selector)}
-
-    cancel_or_revert_import = cancel_or_revert
+        return self._cancel_result(result)
 
     def _wake_runner(self) -> None:
         notifier = self.queue_notifier

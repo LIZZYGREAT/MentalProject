@@ -44,7 +44,6 @@ _INTENT_ALIASES: dict[str, MutationIntent] = {
 _CANCEL_OR_REVERT_TOOLS = frozenset(
     {
         "course_schedule_cancel_pending_draft",
-        "course_schedule_cancel_or_revert_import",
     }
 )
 _FORBIDDEN_CONTEXT_FIELDS = frozenset(

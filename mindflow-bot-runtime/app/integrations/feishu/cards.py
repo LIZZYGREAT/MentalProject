@@ -402,6 +402,71 @@ def _schedule_context_button(import_id: str) -> dict[str, Any]:
     }
 
 
+def course_schedule_revert_confirmation_card(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Fixed destructive review for one backend-resolved completed import."""
+
+    import_id = str(candidate.get("id") or "").strip()
+    if not import_id or len(import_id) > 64:
+        raise ValueError("course schedule import id is invalid")
+    names = [str(name)[:80] for name in list(candidate.get("course_names") or [])]
+    course_count = int(candidate.get("course_count") or len(names))
+    event_count = int(candidate.get("provider_effect_count") or 0)
+    lines = [
+        f"将撤销 **{course_count}** 门课程对应的 **{event_count}** 个日程。",
+        *(f"- {name}" for name in names[:10]),
+    ]
+    if course_count > len(names[:10]):
+        lines.append(f"- 以及其余 {course_count - len(names[:10])} 门课程")
+    lines.append("确认后会启动可恢复的 Calendar 清理流程。")
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "确认撤销课程表导入"},
+        },
+        "header": {
+            "template": "red",
+            "title": {"tag": "plain_text", "content": "确认撤销课程表导入"},
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {"tag": "markdown", "content": "\n".join(lines)},
+                {
+                    "tag": "button",
+                    "type": "danger",
+                    "text": {"tag": "plain_text", "content": "确认撤销"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "course_schedule_revert_confirm",
+                            "version": "1",
+                            "import_id": import_id,
+                        },
+                    }],
+                },
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "course_schedule_revert_cancel",
+                            "version": "1",
+                            "import_id": import_id,
+                        },
+                    }],
+                },
+            ],
+        },
+    }
+
+
 def _clock_select(
     field: str,
     label: str,

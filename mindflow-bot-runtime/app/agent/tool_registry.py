@@ -66,7 +66,6 @@ STATE_CHANGING_EFFECTS = frozenset(
 )
 _SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS = {
     "course_schedule_cancel_pending_draft": "cancel_or_revert",
-    "course_schedule_cancel_or_revert_import": "cancel_or_revert",
     "course_schedule_import_from_recent_image": "schedule_image_import",
 }
 

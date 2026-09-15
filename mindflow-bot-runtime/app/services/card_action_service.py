@@ -905,6 +905,38 @@ class CardActionService:
                 "card": card_action_result_card(message=reply_text),
             }
         if action_name in {
+            "course_schedule_revert_confirm", "course_schedule_revert_cancel"
+        }:
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule import id is invalid") from exc
+            if action_name == "course_schedule_revert_cancel":
+                reply_text = "已取消撤销，课程日程没有变化。"
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": reply_text,
+                    "card": card_action_result_card(message=reply_text),
+                }
+            result = self.course_schedule_imports.revert(
+                participant_id,
+                import_id,
+                status_card_chat_id=chat_id,
+            )
+            reply_text = str(result.get("reply_text") or "课程表撤销已开始。")
+            return {
+                **result,
+                "card": course_schedule_result_card(
+                    reply_text,
+                    status=str(result.get("status") or "") or None,
+                    import_id=str(result.get("import_id") or import_id),
+                    error=str(result.get("error") or "") or None,
+                ),
+            }
+        if action_name in {
             "course_schedule_import_confirm",
             "course_schedule_import_cancel",
             "course_schedule_import_context_open",

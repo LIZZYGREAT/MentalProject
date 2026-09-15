@@ -85,6 +85,12 @@ Agent-facing Memory remember/replace/delete/clear 和 interaction/support prefer
 原参与者确认后才由 deterministic executor 调用相应 service；取消审核不改变耐久状态。
 Memory Center 与 Settings 表单本身是用户提交入口，因此继续作为直接 CardAction executor。
 
+Course Schedule 的 Draft correction 与 pending-draft cancel 属于 `draft_write`，不经过
+MutationIntent verifier，且不会写 Calendar。已完成/部分完成导入的 provider revert 使用
+独立 `course_schedule_stage_revert_import`：Backend 先解析唯一 participant-owned import，
+固定卡展示课程数与待清理日程数；只有 receipt-protected external CardAction 才调用 `revert()`
+安装 cleanup Saga fence。Agent Registry 不再暴露混合 cancel/revert executor。
+
 ## Forecast、Calendar 与 freshness
 
 `ForecastCoordinator` 是正式评估入口。它准备显式/学习画像、Calendar、Observation、

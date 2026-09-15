@@ -10,7 +10,10 @@ from app.agent.tool_registry import (
     AuthorizationContextResolutionError,
     ToolRegistry,
 )
-from app.integrations.feishu.cards import course_schedule_preview_card
+from app.integrations.feishu.cards import (
+    course_schedule_preview_card,
+    course_schedule_revert_confirmation_card,
+)
 from app.repositories_course_schedule import (
     CourseCorrectionAmbiguityError,
     CourseScheduleImportAmbiguityError,
@@ -206,20 +209,17 @@ class CourseScheduleTools:
             authorization_requirement="none",
         )
         registry.register(
-            "course_schedule_cancel_or_revert_import",
-            "Cancel a pending/running course-schedule import or revert one completed/partially completed import. Resolve exactly one participant-owned import using latest, course_name, or created_date. This starts a durable cleanup Saga and never accepts a raw import id.",
+            "course_schedule_stage_revert_import",
+            "Stage a fixed destructive review card for reverting one completed or partially completed participant-owned import selected by latest, course_name, or created_date. This tool never starts Calendar cleanup and never accepts a raw import id.",
             {
                 "type": "object",
                 "properties": {"selector": _cancel_selector_schema()},
                 "required": ["selector"],
                 "additionalProperties": False,
             },
-            self.cancel_or_revert_import,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_cancel_or_revert_authorization_context
-            ),
+            self.stage_revert_import,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_update_active_context",
@@ -444,15 +444,13 @@ class CourseScheduleTools:
             ],
         }
 
-    def cancel_or_revert_import(
+    def stage_revert_import(
         self, ctx: AgentContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         selector = dict(arguments.get("selector") or {})
         try:
-            result = self.imports.cancel_or_revert(
-                ctx.participant_id,
-                selector,
-                status_card_chat_id=ctx.chat_id,
+            candidate = self.imports.drafts.resolve_cancel_selector(
+                ctx.participant_id, selector
             )
         except CourseScheduleImportAmbiguityError as exc:
             return {
@@ -471,43 +469,25 @@ class CourseScheduleTools:
                 "error": "invalid_import_selector",
                 "detail": str(exc)[:200],
             }
+        if (
+            not bool(candidate.get("has_provider_effect"))
+            or str(candidate.get("status") or "")
+            not in {"succeeded", "partial_failed", "cleanup_failed"}
+        ):
+            return {"ok": False, "error": "import_has_no_revertible_effect"}
+        if self.presentations is None:
+            raise RuntimeError("course schedule revert presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            course_schedule_revert_confirmation_card(candidate),
+        )
         return {
-            "ok": bool(result.get("ok")),
-            "status": result.get("status"),
-            "cancel_mode": result.get("cancel_mode"),
-            "already_cancelled": bool(result.get("already_cancelled")),
-            "reply_text": result.get("reply_text"),
-        }
-
-    def resolve_cancel_or_revert_authorization_context(
-        self, ctx: AgentContext, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        selector = dict(arguments.get("selector") or {})
-        try:
-            candidate = self.imports.drafts.resolve_cancel_selector(
-                ctx.participant_id, selector
-            )
-        except CourseScheduleImportAmbiguityError as exc:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_ambiguous"
-            ) from exc
-        except (LookupError, ValueError) as exc:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_not_found"
-            ) from exc
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "cancel_or_revert",
-            "has_provider_effect": bool(candidate.get("has_provider_effect")),
-            "target": {
-                "status": candidate.get("status"),
-                "created_local_datetime": candidate.get(
-                    "created_local_datetime"
-                ),
-                "created_local_date": candidate.get("created_local_date"),
-                "timezone": candidate.get("timezone"),
-                "course_names": list(candidate.get("course_names") or [])[:10],
-            },
+            "ok": True,
+            "course_schedule_revert": "pending_confirmation",
+            "confirmation_required": True,
+            "provider_effect_started": False,
+            "course_count": int(candidate.get("course_count") or 0),
+            "event_count": int(candidate.get("provider_effect_count") or 0),
         }
 
     def update_active_context(

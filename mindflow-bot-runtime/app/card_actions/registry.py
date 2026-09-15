@@ -20,6 +20,7 @@ class CardActionSpec:
 
 _NAVIGATION = {
     "course_schedule_import_context_open",
+    "course_schedule_revert_cancel",
     "course_schedule_item_time_open",
     "calendar_mutation_plan_item_time_open",
     "calendar_mutation_plan_item_edit_open",
@@ -80,6 +81,7 @@ _EXTERNAL_WRITE = {
     "calendar_mutation_plan_confirm",
     "course_schedule_import_cancel",
     "course_schedule_import_confirm",
+    "course_schedule_revert_confirm",
 }
 
 

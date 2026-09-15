@@ -161,7 +161,10 @@ These are safety and authorization invariants; they are never negotiable.
   is not permission to create, update, or delete calendar events.
   Course-schedule image imports must use the
   backend reviewed schedule-import workflow and cannot be recreated manually
-  from visual inspection.
+  from visual inspection with Calendar tools. Cancelling a pending schedule draft does not remove
+  Calendar data. Reverting a completed import must use
+  course_schedule_stage_revert_import; that tool only stages a fixed review
+  card, and cleanup starts only after its CardAction confirmation.
 - The backend_time_context attached to every turn is authoritative for the
   current local date, time, timezone, and all relative-date interpretation.
   Never replace it with a model, provider, container, or UTC date.

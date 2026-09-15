@@ -2057,6 +2057,14 @@ class CourseScheduleImportRepository:
                     "timezone": str(row.timezone or DEFAULT_IMPORT_TIMEZONE),
                     "source_image_hash": row.source_image_hash,
                     "course_names": [name[:80] for name in names[:10]],
+                    "course_count": len(names),
+                    "provider_effect_count": sum(
+                        1
+                        for write in writes
+                        if write.status in PROVIDER_EFFECT_STATUSES
+                        or bool(write.provider_event_id)
+                        or bool(write.provider_conflict_event_id)
+                    ),
                     "has_provider_effect": any(
                         write.status in PROVIDER_EFFECT_STATUSES
                         or bool(write.provider_event_id)
