@@ -285,17 +285,22 @@ class CalendarMutationPlanRepository:
                 return None
             return self._view(row, self._items(session, row.id))
 
-    def update_pending_item_time(
+    def update_pending_item(
         self,
         participant_id: uuid.UUID,
         plan_id: uuid.UUID | str,
         item_id: uuid.UUID | str,
         *,
+        summary: str,
         start_time: datetime,
         end_time: datetime,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically update both pending-plan payload copies for one item."""
+        """Atomically edit both pending proposal copies without provider I/O."""
+
+        normalized_summary = str(summary or "").strip()
+        if not normalized_summary or len(normalized_summary) > 200:
+            raise ValueError("calendar plan item summary must be 1 to 200 characters")
 
         if (
             not isinstance(start_time, datetime)
@@ -334,7 +339,10 @@ class CalendarMutationPlanRepository:
                 value = self._view(row, self._items(session, row.id))
                 value["update_status"] = "expired"
                 return value
-            if row.operation != "create" or row.status != "awaiting_confirmation":
+            if (
+                row.operation not in {"create", "update"}
+                or row.status != "awaiting_confirmation"
+            ):
                 value = self._view(row, self._items(session, row.id))
                 value["update_status"] = "not_editable"
                 return value
@@ -362,21 +370,79 @@ class CalendarMutationPlanRepository:
             end_iso = end_time.isoformat()
             items[item_index] = {
                 **items[item_index],
+                "summary": normalized_summary,
                 "start_time": start_iso,
                 "end_time": end_iso,
             }
+            if isinstance(items[item_index].get("proposed"), dict):
+                items[item_index]["proposed"] = {
+                    **dict(items[item_index]["proposed"]),
+                    "summary": normalized_summary,
+                    "start_time": start_iso,
+                    "end_time": end_iso,
+                }
             row.items_json = items
             row.updated_at = updated_at
             item.payload_json = {
                 **dict(item.payload_json or {}),
+                "summary": normalized_summary,
                 "start_time": start_iso,
                 "end_time": end_iso,
             }
+            if isinstance(item.payload_json.get("proposed"), dict):
+                item.payload_json = {
+                    **dict(item.payload_json),
+                    "proposed": {
+                        **dict(item.payload_json["proposed"]),
+                        "summary": normalized_summary,
+                        "start_time": start_iso,
+                        "end_time": end_iso,
+                    },
+                }
             item.updated_at = updated_at
             session.flush()
             value = self._view(row, self._items(session, row.id))
             value["update_status"] = "updated"
             return value
+
+    def update_pending_item_time(
+        self,
+        participant_id: uuid.UUID,
+        plan_id: uuid.UUID | str,
+        item_id: uuid.UUID | str,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Compatibility entry point for already-delivered legacy time cards."""
+
+        plan = self.get_for_participant(participant_id, plan_id)
+        if plan is None:
+            return None
+        if plan.get("operation") not in {"create", "update"}:
+            plan["update_status"] = "not_editable"
+            return plan
+        ledger_item = next(
+            (
+                item
+                for item in list(plan.get("ledger_items") or [])
+                if str(item.get("id") or "") == str(item_id)
+            ),
+            None,
+        )
+        if ledger_item is None:
+            return None
+        summary = str(dict(ledger_item.get("payload") or {}).get("summary") or "")
+        return self.update_pending_item(
+            participant_id,
+            plan_id,
+            item_id,
+            summary=summary,
+            start_time=start_time,
+            end_time=end_time,
+            now=now,
+        )
 
     def recover_stale(self, *, now: datetime | None = None) -> int:
         recovered_at = _aware(now or datetime.now(timezone.utc))

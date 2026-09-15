@@ -2207,12 +2207,12 @@ class CareTools:
         request_status = str(plan.get("request_status") or "")
         if not plan.get("newly_queued"):
             replies = {
-                "expired": "这张确认卡已过期，请重新发起操作。",
+                "expired": "该确认已过期，请重新发起日程操作。",
                 "cancelled": "这项操作已经取消，日程未更改。",
                 "queued": "这项操作已经排队，请勿重复提交。",
                 "running": "正在处理这项操作，请勿重复提交。",
                 "recovery_required": "这项操作正在核对执行结果，请勿重复提交。",
-                "succeeded": "这些日程已经处理完成。",
+                "succeeded": "该日程操作已经处理完成。",
                 "partial_failed": "这项操作已处理，部分日程未能完成。",
             }
             return {
@@ -2228,7 +2228,7 @@ class CareTools:
             "ok": True,
             "status": "queued",
             "calendar_mutation": "queued",
-            "reply_text": "已提交，正在处理这些日程。",
+            "reply_text": "已提交，正在处理该日程操作。",
         }
 
     async def execute_calendar_mutation_plan_item(

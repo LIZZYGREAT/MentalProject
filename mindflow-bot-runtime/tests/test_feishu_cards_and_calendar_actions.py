@@ -19,6 +19,7 @@ from app.integrations.feishu.cards import (
     _format_calendar_datetime_range,
     calendar_delete_confirmation_card,
     calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_edit_card,
     calendar_mutation_plan_item_time_card,
     care_intervention_card,
     care_intervention_result_card,
@@ -207,6 +208,73 @@ def test_calendar_plan_time_card_preserves_off_grid_minute_and_opaque_callback()
         "item_id": item_id,
     }
     assert "summary" not in callback and "start_time" not in callback
+
+
+def test_calendar_plan_confirmation_and_edit_cards_use_opaque_item_identity():
+    plan_id = str(uuid.uuid4())
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    items = [
+        {
+            "summary": "同名日程",
+            "start_time": "2026-09-14T13:43:12+08:00",
+            "end_time": "2026-09-14T14:17:59+08:00",
+        },
+        {
+            "summary": "同名日程",
+            "start_time": "2026-09-15T09:05:00+08:00",
+            "end_time": "2026-09-15T10:10:00+08:00",
+        },
+    ]
+    plan = {
+        "id": plan_id,
+        "operation": "update",
+        "status": "awaiting_confirmation",
+        "items": items,
+        "ledger_items": [
+            {"id": first_id, "item_index": 0, "status": "pending", "payload": items[0]},
+            {"id": second_id, "item_index": 1, "status": "pending", "payload": items[1]},
+        ],
+    }
+
+    confirmation = calendar_mutation_plan_confirmation_card(plan)
+    edit_values = [
+        element["behaviors"][0]["value"]
+        for element in confirmation["body"]["elements"]
+        if element.get("tag") == "button"
+        and element["behaviors"][0]["value"]["mindflow_action"]
+        == "calendar_mutation_plan_item_edit_open"
+    ]
+    edit_card = calendar_mutation_plan_item_edit_card(plan, second_id)
+    form = edit_card["body"]["elements"][0]
+    summary_input = next(
+        element for element in form["elements"] if element.get("name") == "summary"
+    )
+    submit = next(
+        element for element in form["elements"] if element.get("tag") == "button"
+    )["behaviors"][0]["value"]
+
+    assert edit_values == [
+        {
+            "mindflow_action": "calendar_mutation_plan_item_edit_open",
+            "version": "1",
+            "plan_id": plan_id,
+            "item_id": first_id,
+        },
+        {
+            "mindflow_action": "calendar_mutation_plan_item_edit_open",
+            "version": "1",
+            "plan_id": plan_id,
+            "item_id": second_id,
+        },
+    ]
+    assert summary_input["default_value"] == "同名日程"
+    assert submit["mindflow_action"] == "calendar_mutation_plan_item_edit_submit"
+    assert submit["item_id"] == second_id
+
+    delete_plan = {**plan, "operation": "delete", "ledger_items": []}
+    delete_card = calendar_mutation_plan_confirmation_card(delete_plan)
+    assert "calendar_mutation_plan_item_edit_open" not in json.dumps(delete_card)
 
 
 def test_calendar_delete_callback_executes_only_on_confirm():

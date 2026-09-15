@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
     calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_edit_card,
     calendar_mutation_plan_item_time_card,
     card_action_result_card,
     care_intervention_result_card,
@@ -127,11 +128,11 @@ def _calendar_plan_state_result(
     status: str | None = None,
 ) -> dict[str, Any]:
     if error == "calendar_mutation_plan_expired":
-        reply_text = "该确认已过期，请重新发起日程添加。"
+        reply_text = "该确认已过期，请重新发起日程操作。"
     elif error == "calendar_mutation_plan_not_editable":
-        reply_text = "这批日程已经开始处理，不能再修改时间。"
+        reply_text = "该日程操作已经开始处理，不能再修改信息。"
     else:
-        reply_text = "没有找到这批待确认日程，请重新发起添加。"
+        reply_text = "没有找到这项待确认的日程操作。"
     return {
         "ok": True,
         "error": error,
@@ -506,6 +507,8 @@ class CardActionService:
                 "card": course_schedule_preview_card(corrected),
             }
         if action_name in {
+            "calendar_mutation_plan_item_edit_open",
+            "calendar_mutation_plan_item_edit_submit",
             "calendar_mutation_plan_item_time_open",
             "calendar_mutation_plan_item_time_submit",
             "calendar_mutation_plan_view",
@@ -542,7 +545,7 @@ class CardActionService:
                     status="expired",
                 )
             if (
-                str(plan.get("operation") or "") != "create"
+                str(plan.get("operation") or "") not in {"create", "update"}
                 or str(plan.get("status") or "") != "awaiting_confirmation"
             ):
                 return _calendar_plan_state_result(
@@ -560,18 +563,24 @@ class CardActionService:
                     ),
                 }
             try:
-                edit_card = calendar_mutation_plan_item_time_card(
-                    plan, item_id, timezone_name=self.timezone.key
+                builder = (
+                    calendar_mutation_plan_item_edit_card
+                    if action_name.startswith("calendar_mutation_plan_item_edit_")
+                    else calendar_mutation_plan_item_time_card
                 )
+                edit_card = builder(plan, item_id, timezone_name=self.timezone.key)
             except (LookupError, ValueError):
                 return _calendar_plan_state_result(
                     plan_id, error="calendar_mutation_plan_not_found"
                 )
-            if action_name == "calendar_mutation_plan_item_time_open":
+            if action_name in {
+                "calendar_mutation_plan_item_edit_open",
+                "calendar_mutation_plan_item_time_open",
+            }:
                 return {
                     "ok": True,
                     "navigation_only": True,
-                    "reply_text": "请修改这项日程的起止时间。",
+                    "reply_text": "请修改这项日程的名称和起止时间。",
                     "card": edit_card,
                 }
 
@@ -585,6 +594,14 @@ class CardActionService:
                     if str(value.get("id") or "") == item_id
                 )
                 payload = dict(ledger_item.get("payload") or {})
+                summary = str(
+                    values.get("summary")
+                    if values.get("summary") is not None
+                    else payload.get("summary")
+                    or ""
+                ).strip()
+                if not summary or len(summary) > 200:
+                    raise ValueError("日程名称不能为空且不能超过 200 个字符。")
                 original_start = _aware_calendar_datetime(
                     payload.get("start_time")
                 )
@@ -602,10 +619,11 @@ class CardActionService:
                     "reply_text": str(exc),
                     "card": edit_card,
                 }
-            updated = self.calendar_mutation_plans.update_pending_item_time(
+            updated = self.calendar_mutation_plans.update_pending_item(
                 participant_id,
                 plan_id,
                 item_id,
+                summary=summary,
                 start_time=new_start,
                 end_time=new_end,
             )
@@ -628,7 +646,7 @@ class CardActionService:
             return {
                 "ok": True,
                 "status": updated.get("status"),
-                "reply_text": "日程时间已修改，请核对更新后的确认内容。",
+                "reply_text": "日程信息已修改，请核对更新后的确认内容。",
                 "card": calendar_mutation_plan_confirmation_card(
                     updated, timezone_name=self.timezone.key
                 ),

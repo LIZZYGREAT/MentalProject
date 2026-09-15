@@ -1215,12 +1215,12 @@ def calendar_mutation_plan_confirmation_card(
                 "type": "default",
                 "text": {
                     "tag": "plain_text",
-                    "content": f"修改第 {display_index} 项时间",
+                    "content": "修改信息",
                 },
                 "behaviors": [{
                     "type": "callback",
                     "value": {
-                        "mindflow_action": "calendar_mutation_plan_item_time_open",
+                        "mindflow_action": "calendar_mutation_plan_item_edit_open",
                         "version": "1",
                         "plan_id": plan_id,
                         "item_id": str(ledger_by_index[item_offset]["id"]),
@@ -1233,7 +1233,7 @@ def calendar_mutation_plan_confirmation_card(
             "type": "danger" if operation == "delete" else "primary",
             "text": {
                 "tag": "plain_text",
-                "content": f"确认{verb}这 {len(items)} 个",
+                "content": f"确认{verb}",
             },
             "behaviors": [{
                 "type": "callback",
@@ -1264,7 +1264,7 @@ def calendar_mutation_plan_confirmation_card(
             "update_multi": True,
             "width_mode": "fill",
             "enable_forward": False,
-            "summary": {"content": f"确认批量{verb}日程"},
+            "summary": {"content": f"确认{verb}日程"},
         },
         "header": {
             "template": "red" if operation == "delete" else "blue",
@@ -1280,18 +1280,20 @@ def calendar_mutation_plan_confirmation_card(
     }
 
 
-def calendar_mutation_plan_item_time_card(
+def _calendar_mutation_plan_item_edit_card(
     plan: dict[str, Any],
     item_id: str,
     *,
     timezone_name: str = "Asia/Shanghai",
+    submit_action: str,
+    form_name: str,
 ) -> dict[str, Any]:
-    """Fixed time form bound to one participant-owned pending plan item."""
+    """Fixed summary/time form bound to one pending plan ledger item."""
 
     plan_id = str(plan.get("id") or "").strip()
     if (
         not plan_id
-        or str(plan.get("operation") or "") != "create"
+        or str(plan.get("operation") or "") not in {"create", "update"}
         or str(plan.get("status") or "") != "awaiting_confirmation"
     ):
         raise ValueError("calendar mutation plan is not editable")
@@ -1322,28 +1324,36 @@ def calendar_mutation_plan_item_time_card(
     date_range = _format_calendar_datetime_range(
         local_start, local_end, timezone_name=timezone_name
     )
-    summary = str(item.get("summary") or "未命名日程")[:80]
+    summary = str(item.get("summary") or "未命名日程")[:200]
     form_elements = [
         {
             "tag": "markdown",
             "content": (
-                f"**{summary}**\n当前时间：{date_range}\n"
+                f"当前信息：**{summary}**\n{date_range}\n"
                 "保存只会更新待确认内容，不会立即写入日历。"
             ),
+        },
+        {
+            "tag": "input",
+            "name": "summary",
+            "default_value": summary,
+            "required": True,
+            "max_length": 200,
+            "label": {"tag": "plain_text", "content": "日程名称"},
         },
         *_clock_form_fields(
             local_start.strftime("%H:%M"), local_end.strftime("%H:%M")
         ),
         {
             "tag": "button",
-            "name": "calendar_mutation_plan_item_time_submit",
+            "name": submit_action,
             "type": "primary",
             "text": {"tag": "plain_text", "content": "保存修改"},
             "form_action_type": "submit",
             "behaviors": [{
                 "type": "callback",
                 "value": {
-                    "mindflow_action": "calendar_mutation_plan_item_time_submit",
+                    "mindflow_action": submit_action,
                     "version": "1",
                     "plan_id": plan_id,
                     "item_id": target_id,
@@ -1357,18 +1367,18 @@ def calendar_mutation_plan_item_time_card(
             "update_multi": True,
             "width_mode": "fill",
             "enable_forward": False,
-            "summary": {"content": "修改日程时间"},
+            "summary": {"content": "修改日程信息"},
         },
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "修改日程时间"},
+            "title": {"tag": "plain_text", "content": "修改信息"},
         },
         "body": {
             "direction": "vertical",
             "elements": [
                 {
                     "tag": "form",
-                    "name": "mindflow_calendar_mutation_plan_item_time",
+                    "name": form_name,
                     "elements": form_elements,
                 },
                 {
@@ -1387,6 +1397,38 @@ def calendar_mutation_plan_item_time_card(
             ],
         },
     }
+
+
+def calendar_mutation_plan_item_edit_card(
+    plan: dict[str, Any],
+    item_id: str,
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    return _calendar_mutation_plan_item_edit_card(
+        plan,
+        item_id,
+        timezone_name=timezone_name,
+        submit_action="calendar_mutation_plan_item_edit_submit",
+        form_name="mindflow_calendar_mutation_plan_item_edit",
+    )
+
+
+def calendar_mutation_plan_item_time_card(
+    plan: dict[str, Any],
+    item_id: str,
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Compatibility builder for callbacks from already-delivered cards."""
+
+    return _calendar_mutation_plan_item_edit_card(
+        plan,
+        item_id,
+        timezone_name=timezone_name,
+        submit_action="calendar_mutation_plan_item_time_submit",
+        form_name="mindflow_calendar_mutation_plan_item_time",
+    )
 
 
 def pressure_curve_card(

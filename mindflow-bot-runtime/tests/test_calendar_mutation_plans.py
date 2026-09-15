@@ -214,7 +214,7 @@ def test_update_plan_uses_updating_item_state():
     assert completed["status"] == "succeeded"
 
 
-def test_pending_create_plan_time_update_is_atomic_and_participant_bound():
+def test_pending_create_plan_info_update_is_atomic_and_participant_bound():
     database = memory_database()
     owner = participant(database, "PLAN-EDIT-OWNER")
     other = participant(database, "PLAN-EDIT-OTHER")
@@ -251,16 +251,18 @@ def test_pending_create_plan_time_update_is_atomic_and_participant_bound():
         end_time=end,
         now=updated_at,
     ) is None
-    result = repository.update_pending_item_time(
+    result = repository.update_pending_item(
         owner.id,
         plan["id"],
         item_id,
+        summary="renamed first",
         start_time=start,
         end_time=end,
         now=updated_at,
     )
 
     assert result["update_status"] == "updated"
+    assert result["items"][0]["summary"] == "renamed first"
     assert result["items"][0]["start_time"] == start.isoformat()
     assert result["items"][0]["end_time"] == end.isoformat()
     assert result["items"][0]["description"] == "keep me"
@@ -275,9 +277,57 @@ def test_pending_create_plan_time_update_is_atomic_and_participant_bound():
         stored_plan = session.get(CalendarMutationPlan, uuid.UUID(plan["id"]))
         stored_item = session.get(CalendarMutationPlanItem, uuid.UUID(item_id))
         assert stored_plan.items_json[0]["start_time"] == start.isoformat()
+        assert stored_plan.items_json[0]["summary"] == "renamed first"
         assert stored_item.payload_json == stored_plan.items_json[0]
         assert stored_plan.updated_at.replace(tzinfo=timezone.utc) == updated_at
         assert stored_item.updated_at.replace(tzinfo=timezone.utc) == updated_at
+
+
+def test_pending_update_plan_info_edit_updates_proposed_snapshot_by_item_id():
+    database = memory_database()
+    owner = participant(database, "PLAN-UPDATE-EDIT")
+    repository = CalendarMutationPlanRepository(database)
+    previous = {
+        "event_id": "event-1",
+        "summary": "同名日程",
+        "start_time": "2030-01-02T08:00:00+08:00",
+        "end_time": "2030-01-02T09:00:00+08:00",
+    }
+    proposed = {**previous, "summary": "同名日程"}
+    plan = repository.create(
+        owner.id,
+        operation="update",
+        items=[
+            {
+                "event_id": "event-1",
+                "previous": previous,
+                "proposed": proposed,
+                **proposed,
+            },
+            {
+                "event_id": "event-2",
+                "previous": {**previous, "event_id": "event-2"},
+                "proposed": {**proposed, "event_id": "event-2"},
+                **proposed,
+                "event_id": "event-2",
+            },
+        ],
+    )
+    target_id = plan["ledger_items"][1]["id"]
+
+    result = repository.update_pending_item(
+        owner.id,
+        plan["id"],
+        target_id,
+        summary="只修改第二项",
+        start_time=datetime.fromisoformat("2030-01-02T10:30:00+08:00"),
+        end_time=datetime.fromisoformat("2030-01-02T11:30:00+08:00"),
+    )
+
+    assert result["items"][0]["summary"] == "同名日程"
+    assert result["items"][1]["summary"] == "只修改第二项"
+    assert result["items"][1]["proposed"]["summary"] == "只修改第二项"
+    assert result["ledger_items"][1]["payload"] == result["items"][1]
 
 
 def test_pending_plan_time_update_rejects_delete_expired_and_queued_plans():
@@ -404,7 +454,7 @@ def test_multi_date_create_uses_one_plan_card_and_executes_once():
         for element in cards[0]["body"]["elements"]
         if element.get("tag") == "button"
         and element["behaviors"][0]["value"]["mindflow_action"].endswith(
-            "_time_open"
+            "_edit_open"
         )
     ]
     assert len(edit_actions) == 2
@@ -512,7 +562,7 @@ def test_calendar_plan_time_actions_update_pending_plan_without_provider_write()
         for element in confirmation["body"]["elements"]
         if element.get("tag") == "button"
         and element["behaviors"][0]["value"]["mindflow_action"].endswith(
-            "_time_open"
+            "_edit_open"
         )
     )
     service = _card_service(database, tools)
@@ -536,6 +586,7 @@ def test_calendar_plan_time_actions_update_pending_plan_without_provider_write()
         callback_event_id="edit-event-1",
         action_value=submit,
         form_value={
+            "summary": "修改后的名称",
             "start_hour": "15",
             "start_minute": "11",
             "end_hour": "16",
@@ -546,6 +597,7 @@ def test_calendar_plan_time_actions_update_pending_plan_without_provider_write()
     assert result["ok"] is True
     assert calendar.created == []
     stored = plans.get(edit["plan_id"])
+    assert stored["items"][0]["summary"] == "修改后的名称"
     assert stored["items"][0]["start_time"] == "2030-01-12T15:11:00+08:00"
     assert stored["items"][0]["end_time"] == "2030-01-12T16:22:00+08:00"
     assert stored["ledger_items"][0]["payload"] == stored["items"][0]
