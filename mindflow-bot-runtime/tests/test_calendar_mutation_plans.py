@@ -212,7 +212,7 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
             },
         }
     )
-    plans, outbox, tools, _registry, _runner = _stack(
+    plans, outbox, tools, _registry, runner = _stack(
         database, calendar, _Verifier()
     )
 
@@ -320,6 +320,37 @@ def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
         "2030-01-15T15:50:00+08:00",
         "2030-01-22T15:50:00+08:00",
     ]
+
+    confirm = _plan_action(edited["card"], "_confirm")
+    queued = service.handle(
+        owner.id,
+        message_id="series-card",
+        callback_event_id="series-confirm-1",
+        action_value=confirm,
+        form_value={},
+    )
+    assert queued["status"] == "queued"
+    asyncio.run(runner.run_once())
+    assert [event_id for _owner, event_id, _kwargs in calendar.updated] == [
+        "course-1",
+        "course-2",
+    ]
+    assert all(
+        kwargs["start_time"].strftime("%H:%M") == "13:10"
+        and kwargs["end_time"].strftime("%H:%M") == "15:50"
+        for _owner, _event_id, kwargs in calendar.updated
+    )
+
+    duplicate = service.handle(
+        owner.id,
+        message_id="series-card",
+        callback_event_id="series-confirm-2",
+        action_value=confirm,
+        form_value={},
+    )
+    assert duplicate["already_handled"] is True
+    asyncio.run(runner.run_once())
+    assert len(calendar.updated) == 2
 
 
 def test_update_plan_uses_updating_item_state():
