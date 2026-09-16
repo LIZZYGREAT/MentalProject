@@ -56,6 +56,7 @@ from app.services.pressure_curve_service import (
     HistoricalForecastNotFoundError,
     PressureCurveService,
 )
+from app.services.runtime_clock import RuntimeClock
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PresentationOutbox,
@@ -68,6 +69,21 @@ logger = logging.getLogger(__name__)
 CALENDAR_AGENT_READ_MAX_DAYS = 180
 CALENDAR_PROVIDER_WINDOW_DAYS = 31
 CALENDAR_AGENT_READ_MAX_EVENTS = 200
+
+
+def participant_reference_local_date(
+    ctx: AgentContext,
+    runtime_clock: RuntimeClock,
+    timezone_value: ZoneInfo,
+) -> date:
+    """Anchor turn-scoped date semantics to message receipt, not worker delay."""
+
+    received_at = ctx.received_at_utc
+    if received_at is None:
+        return runtime_clock.local_date()
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    return received_at.astimezone(timezone_value).date()
 
 
 CalendarTargetScope = Literal[
@@ -316,12 +332,14 @@ class CareTools:
         calendar_mutation_plans: Any = None,
         course_series_resolver: Any = None,
         feature_capabilities: Any = None,
+        clock: RuntimeClock | None = None,
     ):
         self.profiles = profiles
         self.observations = observations
         self.calendar = calendar
         self.tokens = tokens
         self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self.forecast_coordinator = forecast_coordinator
         self.forecast_snapshots = forecast_snapshots
         self.presentations = presentations
@@ -2053,7 +2071,11 @@ class CareTools:
                 ctx.participant_id,
                 anchor_event=anchor,
                 scope=scope,
-                reference_local_date=datetime.now(self.timezone).date(),
+                reference_local_date=participant_reference_local_date(
+                    ctx,
+                    self.clock,
+                    self.timezone,
+                ),
             )
             normalized_args = dict(patch_args)
             if scope != "single_occurrence":

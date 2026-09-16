@@ -415,6 +415,7 @@ def build_business_services(
             "daily_review_enabled": settings.daily_review_enabled,
             "web_search_enabled": settings.web_search_enabled,
         },
+        clock=runtime_clock,
     )
     care_tools.register(registry)
     ReminderTools(

@@ -22,6 +22,7 @@ from app.services.card_action_service import CardActionService, _aware_calendar_
 from app.services.course_series_resolver import ResolvedCourseSeries
 from app.services.mutation_intent_verifier import MutationIntentDecision
 from app.services.presentation_service import PresentationOutbox
+from app.services.runtime_clock import RuntimeClock
 from app.tools.care import CareTools
 from helpers import memory_database, participant
 
@@ -93,7 +94,7 @@ def _context(participant_id, text):
     )
 
 
-def _stack(database, calendar, verifier):
+def _stack(database, calendar, verifier, *, clock=None):
     plans = CalendarMutationPlanRepository(database)
     outbox = PresentationOutbox()
     tools = CareTools(
@@ -105,12 +106,106 @@ def _stack(database, calendar, verifier):
         None,
         presentations=outbox,
         calendar_mutation_plans=plans,
+        clock=clock,
     )
     registry = ToolRegistry(mutation_verifier=verifier)
     tools.register(registry)
     runner = CalendarMutationPlanRunner(plans, tools.execute_calendar_mutation_plan_item)
     tools.calendar_mutation_plan_notifier = runner.wake
     return plans, outbox, tools, registry, runner
+
+
+class _ReferenceDateResolver:
+    def __init__(self, calendar):
+        self.calendar = calendar
+        self.reference_local_dates = []
+
+    async def resolve(
+        self,
+        _participant_id,
+        *,
+        anchor_event,
+        reference_local_date,
+        **_kwargs,
+    ):
+        self.reference_local_dates.append(reference_local_date)
+        return ResolvedCourseSeries(
+            anchor_event_id=str(anchor_event["id"]),
+            course_identity="course-import:import-1:item-1",
+            display_name=str(anchor_event["summary"]),
+            scope_start=datetime.fromisoformat(anchor_event["start_time"]),
+            scope_end=datetime.fromisoformat(anchor_event["end_time"]),
+            occurrence_events=(dict(anchor_event),),
+            resolution_source="course_import",
+        )
+
+
+def _stage_course_series_with_reference_times(*, received_at_utc, worker_now):
+    database = memory_database()
+    owner = participant(database, f"PLAN-REFERENCE-{uuid.uuid4().hex[:8]}")
+    calendar = _Calendar()
+    calendar.events["course-reference"] = {
+        "id": "course-reference",
+        "summary": "操作系统(0955)",
+        "start_time": "2026-09-22T12:55:00+08:00",
+        "end_time": "2026-09-22T14:30:00+08:00",
+    }
+    clock = RuntimeClock("Asia/Shanghai", now_fn=lambda: worker_now)
+    _plans, _outbox, tools, _registry, _runner = _stack(
+        database,
+        calendar,
+        _Verifier(),
+        clock=clock,
+    )
+    resolver = _ReferenceDateResolver(calendar)
+    tools.course_series_resolver = resolver
+    ctx = _context(owner.id, "以后这个课下课时间改为15:40")
+    ctx = AgentContext(
+        **{
+            **ctx.__dict__,
+            "received_at_utc": received_at_utc,
+        }
+    )
+
+    result = asyncio.run(
+        tools.update_calendar_event(
+            ctx,
+            {
+                "event_id": "course-reference",
+                "scope": "current_semester_remainder",
+                "end_clock": "15:40",
+            },
+        )
+    )
+    assert result["ok"] is True
+    return resolver.reference_local_dates
+
+
+def test_course_series_scope_uses_message_received_date():
+    reference_dates = _stage_course_series_with_reference_times(
+        received_at_utc=datetime(2026, 9, 15, 7, 30, tzinfo=timezone.utc),
+        worker_now=datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert reference_dates == [datetime(2026, 9, 15).date()]
+
+
+def test_course_series_scope_does_not_cross_midnight_with_worker_delay():
+    reference_dates = _stage_course_series_with_reference_times(
+        received_at_utc=datetime(2026, 9, 15, 15, 59, tzinfo=timezone.utc),
+        worker_now=datetime(2026, 9, 15, 16, 1, tzinfo=timezone.utc),
+    )
+
+    assert reference_dates == [datetime(2026, 9, 15, 23, 59).date()]
+
+
+def test_course_series_scope_falls_back_to_injected_clock():
+    reference_dates = _stage_course_series_with_reference_times(
+        received_at_utc=None,
+        worker_now=datetime(2026, 9, 15, 16, 1, tzinfo=timezone.utc),
+    )
+
+    assert reference_dates == [datetime(2026, 9, 16).date()]
 
 
 def _card_service(database, tools):
