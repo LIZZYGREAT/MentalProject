@@ -146,6 +146,62 @@ class ReminderRepository:
             ).scalar_one_or_none()
             return self._proposal_view(row) if row is not None else None
 
+    def update_pending_create_proposal(
+        self,
+        participant_id: uuid.UUID,
+        proposal_id: uuid.UUID | str,
+        *,
+        message: str,
+        remind_at: datetime,
+        recurrence_type: str,
+    ) -> dict[str, Any] | None:
+        """Update only a participant-owned create proposal before confirmation."""
+
+        normalized, instant, recurrence = self._normalized_create_values(
+            message,
+            remind_at,
+            recurrence_type,
+        )
+        now = utc_now()
+        with self.database.session() as session:
+            proposal = session.execute(
+                select(ReminderProposal)
+                .where(
+                    ReminderProposal.id == uuid.UUID(str(proposal_id)),
+                    ReminderProposal.participant_id == participant_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if proposal is None:
+                return None
+            if (
+                proposal.status == "awaiting_confirmation"
+                and _aware(proposal.expires_at) <= now
+            ):
+                proposal.status = "expired"
+                proposal.updated_at = now
+                proposal.resolved_at = now
+                value = self._proposal_view(proposal)
+                value["update_status"] = "expired"
+                return value
+            if (
+                proposal.status != "awaiting_confirmation"
+                or proposal.operation != "create"
+            ):
+                value = self._proposal_view(proposal)
+                value["update_status"] = "not_editable"
+                return value
+            proposal.payload_json = {
+                "message": normalized,
+                "remind_at": instant.isoformat(),
+                "recurrence_type": recurrence,
+            }
+            proposal.updated_at = now
+            session.flush()
+            value = self._proposal_view(proposal)
+            value["update_status"] = "updated"
+            return value
+
     def resolve_proposal(
         self,
         participant_id: uuid.UUID,

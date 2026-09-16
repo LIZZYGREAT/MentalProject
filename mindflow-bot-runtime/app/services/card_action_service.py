@@ -38,6 +38,8 @@ from app.integrations.feishu.cards import (
     memory_detail_card,
     memory_edit_card,
     preference_settings_card,
+    reminder_proposal_confirmation_card,
+    reminder_proposal_edit_card,
     today_calendar_card,
 )
 from app.presentation.consent_texts import external_llm_consent_declined_text
@@ -109,6 +111,31 @@ def _replace_local_clock(
 ) -> datetime:
     local_date = original.astimezone(display_timezone).date()
     naive = datetime.combine(local_date, time.fromisoformat(clock))
+    candidate = naive.replace(tzinfo=display_timezone, fold=0)
+    alternative = naive.replace(tzinfo=display_timezone, fold=1)
+    if candidate.utcoffset() != alternative.utcoffset():
+        raise ValueError("所选时间处于夏令时切换区间，请选择其他时间。")
+    round_trip = (
+        candidate.astimezone(timezone.utc)
+        .astimezone(display_timezone)
+        .replace(tzinfo=None)
+    )
+    if round_trip != naive:
+        raise ValueError("所选本地时间不存在，请选择其他时间。")
+    return candidate
+
+
+def _reminder_form_datetime(
+    values: dict[str, Any],
+    display_timezone: ZoneInfo,
+) -> datetime:
+    try:
+        local_date = date.fromisoformat(str(values.get("date") or "").strip())
+        hour = int(str(values.get("hour") or "").strip())
+        minute = int(str(values.get("minute") or "").strip())
+        naive = datetime.combine(local_date, time(hour, minute))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请填写有效的日期、小时和分钟。") from exc
     candidate = naive.replace(tzinfo=display_timezone, fold=0)
     alternative = naive.replace(tzinfo=display_timezone, fold=1)
     if candidate.utcoffset() != alternative.utcoffset():
@@ -367,6 +394,109 @@ class CardActionService:
                 )
             updated = self.interaction_preferences.get(participant_id)
             return {"ok": True, "reply_text": "表达与支持偏好已更新。", "card": preference_settings_card(updated)}
+        if action_name in {
+            "reminder_proposal_edit_open",
+            "reminder_proposal_edit_submit",
+            "reminder_proposal_view",
+        }:
+            if self.reminders is None:
+                raise RuntimeError("reminder proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_reminder_proposal_id"}
+            proposal = self.reminders.get_proposal_for_participant(
+                participant_id,
+                proposal_id,
+            )
+            if proposal is None:
+                return {"ok": False, "error": "reminder_proposal_not_found"}
+            if str(proposal.get("status") or "") != "awaiting_confirmation":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_already_resolved",
+                    "status": proposal.get("status"),
+                }
+            if _aware_calendar_datetime(proposal.get("expires_at")) <= datetime.now(
+                timezone.utc
+            ):
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_expired",
+                    "status": "expired",
+                }
+            if str(proposal.get("operation") or "") != "create":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_not_editable",
+                }
+            if action_name == "reminder_proposal_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请核对提醒内容。",
+                    "card": reminder_proposal_confirmation_card(
+                        proposal,
+                        timezone_name=self.timezone.key,
+                    ),
+                }
+            edit_card = reminder_proposal_edit_card(
+                proposal,
+                timezone_name=self.timezone.key,
+            )
+            if action_name == "reminder_proposal_edit_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请修改提醒内容、时间和重复方式。",
+                    "card": edit_card,
+                }
+            values = dict(form_value or {})
+            try:
+                message = " ".join(str(values.get("message") or "").split())
+                if not 1 <= len(message) <= 500:
+                    raise ValueError("提醒内容不能为空且不能超过 500 个字符。")
+                remind_at = _reminder_form_datetime(values, self.timezone)
+                recurrence = str(values.get("recurrence") or "").strip()
+                if recurrence not in {"none", "daily", "weekly"}:
+                    raise ValueError("请选择有效的重复方式。")
+                updated = self.reminders.update_pending_create_proposal(
+                    participant_id,
+                    proposal_id,
+                    message=message,
+                    remind_at=remind_at,
+                    recurrence_type=recurrence,
+                )
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_reminder_proposal_edit",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            if updated is None:
+                return {"ok": False, "error": "reminder_proposal_not_found"}
+            if updated.get("update_status") == "expired":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_expired",
+                    "status": "expired",
+                }
+            if updated.get("update_status") != "updated":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_not_editable",
+                    "status": updated.get("status"),
+                }
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "提醒内容已修改，请再次核对后确认。",
+                "card": reminder_proposal_confirmation_card(
+                    updated,
+                    timezone_name=self.timezone.key,
+                ),
+            }
         if action_name in {
             "reminder_proposal_confirm", "reminder_proposal_cancel"
         }:

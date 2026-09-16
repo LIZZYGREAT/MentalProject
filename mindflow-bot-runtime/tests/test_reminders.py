@@ -268,6 +268,140 @@ def test_reminder_confirmation_displays_resolved_local_time_then_persists():
     ]
 
 
+def test_reminder_proposal_can_be_edited_before_confirmation():
+    database = memory_database()
+    owner = participant(database, "REMINDER-EDIT")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    context = _reminder_context(owner.id, "明天下午三点提醒我交作业")
+    asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "交作业",
+                "remind_at": "2099-09-23T15:00:00+08:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+    card = outbox.take_cards(context.agent_run_id)[0]
+    assert "修改提醒" in json.dumps(card, ensure_ascii=False)
+
+    opened = card_actions.handle(
+        owner.id,
+        message_id="reminder-card",
+        action_value=_proposal_action(card, "reminder_proposal_edit_open"),
+        form_value={},
+    )
+    edit_card = opened["card"]
+    serialized = json.dumps(edit_card, ensure_ascii=False)
+    assert opened["navigation_only"] is True
+    assert all(f'"name": "{name}"' in serialized for name in (
+        "message", "date", "hour", "minute", "recurrence"
+    ))
+
+    proposal_id = _proposal_action(card, "reminder_proposal_edit_open")[
+        "proposal_id"
+    ]
+    saved = card_actions.handle(
+        owner.id,
+        message_id="reminder-edit-card",
+        callback_event_id="reminder-edit-submit",
+        action_value={
+            "mindflow_action": "reminder_proposal_edit_submit",
+            "version": "1",
+            "proposal_id": proposal_id,
+        },
+        form_value={
+            "message": "交修改后的作业",
+            "date": "2099-09-24",
+            "hour": "16",
+            "minute": "25",
+            "recurrence": "weekly",
+        },
+    )
+
+    assert saved["ok"] is True
+    assert repository.list_active(owner.id) == []
+    updated = repository.get_proposal_for_participant(owner.id, proposal_id)
+    assert updated["payload"]["message"] == "交修改后的作业"
+    assert updated["payload"]["recurrence_type"] == "weekly"
+    assert "2099-09-24 16:25" in json.dumps(saved["card"], ensure_ascii=False)
+
+    confirmed = card_actions.handle(
+        owner.id,
+        message_id="reminder-updated-card",
+        callback_event_id="reminder-updated-confirm",
+        action_value=_proposal_action(
+            saved["card"],
+            "reminder_proposal_confirm",
+        ),
+        form_value={},
+    )
+    active = repository.list_active(owner.id)
+
+    assert confirmed["ok"] is True
+    assert len(active) == 1
+    assert active[0]["message"] == "交修改后的作业"
+    assert active[0]["recurrence_type"] == "weekly"
+
+
+def test_invalid_reminder_proposal_edit_keeps_pending_payload_unchanged():
+    database = memory_database()
+    owner = participant(database, "REMINDER-EDIT-INVALID")
+    repository, outbox, registry, card_actions = _proposal_stack(
+        database, owner.id
+    )
+    context = _reminder_context(owner.id, "提醒我交作业")
+    asyncio.run(
+        registry.execute(
+            context,
+            "reminder_create",
+            {
+                "message": "交作业",
+                "remind_at": "2099-09-23T15:00:00+08:00",
+                "recurrence_type": "none",
+            },
+        )
+    )
+    card = outbox.take_cards(context.agent_run_id)[0]
+    proposal_id = _proposal_action(card, "reminder_proposal_edit_open")[
+        "proposal_id"
+    ]
+    before = repository.get_proposal_for_participant(owner.id, proposal_id)
+
+    result = card_actions.handle(
+        owner.id,
+        message_id="reminder-edit-card",
+        callback_event_id="reminder-edit-invalid",
+        action_value={
+            "mindflow_action": "reminder_proposal_edit_submit",
+            "version": "1",
+            "proposal_id": proposal_id,
+        },
+        form_value={
+            "message": "不应保存",
+            "date": "2000-01-01",
+            "hour": "08",
+            "minute": "00",
+            "recurrence": "daily",
+        },
+    )
+    after = repository.get_proposal_for_participant(owner.id, proposal_id)
+
+    assert result["error"] == "invalid_reminder_proposal_edit"
+    assert result["card"]["header"]["title"]["content"] == "修改提醒"
+    assert after["status"] == "awaiting_confirmation"
+    assert after["payload"] == before["payload"]
+    assert repository.list_active(owner.id) == []
+    assert card_action_spec("reminder_proposal_edit_open").replay_policy == "safe"
+    assert card_action_spec(
+        "reminder_proposal_edit_submit"
+    ).replay_policy == "receipt_required"
+
+
 def test_reminder_cancel_before_confirm_persists_nothing():
     database = memory_database()
     owner = participant(database, "REMINDER-PROPOSAL-CANCEL")

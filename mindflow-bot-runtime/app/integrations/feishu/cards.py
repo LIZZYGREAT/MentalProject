@@ -1420,6 +1420,61 @@ def reminder_proposal_confirmation_card(
     cancelling = operation == "cancel"
     title = "确认取消提醒" if cancelling else "确认创建提醒"
     confirm_label = "确认取消" if cancelling else "确认提醒"
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{message}**\n时间：{display_time}\n重复：{recurrence}\n\n"
+                + (
+                    "确认后这条提醒将停止。"
+                    if cancelling
+                    else "确认前不会保存或发送这条提醒。"
+                )
+            ),
+        }
+    ]
+    if not cancelling:
+        elements.append({
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "修改提醒"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "reminder_proposal_edit_open",
+                    "version": "1",
+                    "proposal_id": proposal_id,
+                },
+            }],
+        })
+    elements.extend([
+        {
+            "tag": "button",
+            "type": "danger" if cancelling else "primary",
+            "text": {"tag": "plain_text", "content": confirm_label},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "reminder_proposal_confirm",
+                    "version": "1",
+                    "proposal_id": proposal_id,
+                },
+            }],
+        },
+        {
+            "tag": "button",
+            "type": "default",
+            "text": {"tag": "plain_text", "content": "取消"},
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "mindflow_action": "reminder_proposal_cancel",
+                    "version": "1",
+                    "proposal_id": proposal_id,
+                },
+            }],
+        },
+    ])
     return {
         "schema": "2.0",
         "config": {
@@ -1434,39 +1489,148 @@ def reminder_proposal_confirmation_card(
         },
         "body": {
             "direction": "vertical",
+            "elements": elements,
+        },
+    }
+
+
+def reminder_proposal_edit_card(
+    proposal: dict[str, Any],
+    *,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Fixed form that edits a create proposal without persisting a reminder."""
+
+    proposal_id = str(proposal.get("id") or "").strip()
+    payload = dict(proposal.get("payload") or {})
+    if (
+        not proposal_id
+        or str(proposal.get("operation") or "") != "create"
+        or str(proposal.get("status") or "") != "awaiting_confirmation"
+    ):
+        raise ValueError("reminder proposal is not editable")
+    message = str(payload.get("message") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(
+            str(payload.get("remind_at") or "").replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
+        local = parsed.astimezone(ZoneInfo(timezone_name))
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("reminder proposal time is invalid") from exc
+    recurrence = str(payload.get("recurrence_type") or "")
+    recurrence_options = (
+        ("仅一次", "none"),
+        ("每天", "daily"),
+        ("每周", "weekly"),
+    )
+    if not message or recurrence not in {value for _label, value in recurrence_options}:
+        raise ValueError("reminder proposal payload is invalid")
+    minute = local.strftime("%M")
+    minutes = sorted({f"{value:02d}" for value in range(0, 60, 5)} | {minute})
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "enable_forward": False,
+            "summary": {"content": "修改待确认提醒"},
+        },
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "修改提醒"},
+        },
+        "body": {
+            "direction": "vertical",
             "elements": [
                 {
-                    "tag": "markdown",
-                    "content": (
-                        f"**{message}**\n时间：{display_time}\n重复：{recurrence}\n\n"
-                        + (
-                            "确认后这条提醒将停止。"
-                            if cancelling
-                            else "确认前不会保存或发送这条提醒。"
-                        )
-                    ),
-                },
-                {
-                    "tag": "button",
-                    "type": "danger" if cancelling else "primary",
-                    "text": {"tag": "plain_text", "content": confirm_label},
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "mindflow_action": "reminder_proposal_confirm",
-                            "version": "1",
-                            "proposal_id": proposal_id,
+                    "tag": "form",
+                    "name": "mindflow_reminder_proposal_edit",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "保存只会更新待确认内容，不会立即创建提醒。",
                         },
-                    }],
+                        {
+                            "tag": "input",
+                            "name": "message",
+                            "default_value": message,
+                            "required": True,
+                            "max_length": 500,
+                            "label": {"tag": "plain_text", "content": "提醒内容"},
+                        },
+                        {
+                            "tag": "input",
+                            "name": "date",
+                            "default_value": local.date().isoformat(),
+                            "required": True,
+                            "max_length": 10,
+                            "label": {
+                                "tag": "plain_text",
+                                "content": "日期（YYYY-MM-DD）",
+                            },
+                        },
+                        {"tag": "markdown", "content": "**提醒时间**"},
+                        _clock_select(
+                            "hour",
+                            "选择小时",
+                            local.strftime("%H"),
+                            [f"{value:02d}" for value in range(24)],
+                            "时",
+                        ),
+                        _clock_select(
+                            "minute",
+                            "选择分钟",
+                            minute,
+                            minutes,
+                            "分",
+                        ),
+                        {
+                            "tag": "select_static",
+                            "name": "recurrence",
+                            "required": True,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "选择重复方式",
+                            },
+                            "initial_option": recurrence,
+                            "options": [
+                                {
+                                    "text": {
+                                        "tag": "plain_text",
+                                        "content": label,
+                                    },
+                                    "value": value,
+                                }
+                                for label, value in recurrence_options
+                            ],
+                        },
+                        {
+                            "tag": "button",
+                            "name": "reminder_proposal_edit_submit",
+                            "type": "primary",
+                            "text": {"tag": "plain_text", "content": "保存修改"},
+                            "form_action_type": "submit",
+                            "behaviors": [{
+                                "type": "callback",
+                                "value": {
+                                    "mindflow_action": "reminder_proposal_edit_submit",
+                                    "version": "1",
+                                    "proposal_id": proposal_id,
+                                },
+                            }],
+                        },
+                    ],
                 },
                 {
                     "tag": "button",
                     "type": "default",
-                    "text": {"tag": "plain_text", "content": "取消"},
+                    "text": {"tag": "plain_text", "content": "返回确认"},
                     "behaviors": [{
                         "type": "callback",
                         "value": {
-                            "mindflow_action": "reminder_proposal_cancel",
+                            "mindflow_action": "reminder_proposal_view",
                             "version": "1",
                             "proposal_id": proposal_id,
                         },
