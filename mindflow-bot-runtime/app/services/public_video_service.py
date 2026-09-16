@@ -193,6 +193,8 @@ class PublicVideoService:
             raise VideoProviderError("subtitle_parse_failed")
         if transcript.total_chars > self.max_transcript_chars:
             raise VideoProviderError("transcript_too_large")
+        if transcript.total_chars != len(transcript.text):
+            raise VideoProviderError("subtitle_parse_failed")
 
     async def _metadata_only_result(
         self,

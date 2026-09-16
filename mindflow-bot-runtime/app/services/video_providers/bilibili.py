@@ -67,9 +67,13 @@ class BilibiliVideoAdapter:
         return "/video/" in f"{path}/" or bool(_AV_PATH_PATTERN.match(path))
 
     async def resolve_metadata(self, url: str) -> VideoMetadata:
-        if not self.can_handle(url):
+        try:
+            requested_url = validate_public_https_url(url)
+        except PublicWebReadError as exc:
+            raise VideoProviderError("video_url_not_safe") from exc
+        if not self.can_handle(requested_url):
             raise VideoProviderError("unsupported_video_provider")
-        final_url, page_body = await self._resolve_page(url)
+        final_url, page_body = await self._resolve_page(requested_url)
         reference = self._video_reference(final_url)
         if reference is None and page_body:
             reference = self._video_reference_from_markup(page_body)
@@ -209,6 +213,9 @@ class BilibiliVideoAdapter:
             end = BilibiliVideoAdapter._timestamp(
                 item.get("to", item.get("end_seconds", item.get("end")))
             )
+            if start is not None and end is not None and end < start:
+                start = None
+                end = None
             normalized.append((
                 position,
                 TranscriptSegment(start_seconds=start, end_seconds=end, text=text),
@@ -242,6 +249,17 @@ class BilibiliVideoAdapter:
         try:
             fetched = await self.public_transport.fetch_public_url(url)
         except PublicWebReadError as exc:
+            reason = getattr(exc, "reason_code", "")
+            if reason in {
+                "invalid_url",
+                "invalid_url_scheme",
+                "invalid_url_port",
+                "url_credentials_not_allowed",
+                "secret_query_not_allowed",
+                "url_private_address",
+                "dns_resolution_failed",
+            }:
+                raise VideoProviderError("video_url_not_safe") from exc
             raise VideoProviderError("video_page_not_public") from exc
         body = fetched.response.body.decode("utf-8", errors="replace")
         return fetched.canonical_url, body

@@ -175,3 +175,50 @@ def test_bilibili_without_public_subtitle_is_a_business_result():
     assert transcript.segments == ()
     assert transcript.extraction_mode == "no_public_subtitle"
     assert transcript.total_chars == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://www.bilibili.com/video/BV1xx411c7mD",
+        "https://user:pass@www.bilibili.com/video/BV1xx411c7mD",
+        "https://www.bilibili.com/video/BV1xx411c7mD?access_token=secret",
+        "https://127.0.0.1/video/BV1xx411c7mD",
+    ],
+)
+def test_bilibili_user_url_reuses_public_url_safety_gate(url):
+    adapter = make_adapter(FakeFetcher([]))
+
+    with pytest.raises(VideoProviderError) as exc_info:
+        asyncio.run(adapter.resolve_metadata(url))
+
+    assert exc_info.value.reason_code == "video_url_not_safe"
+
+
+def test_bilibili_redirect_to_private_target_is_rejected_before_api_call():
+    fetcher = FakeFetcher(
+        [
+            response(
+                "",
+                status=302,
+                content_type="text/html",
+                location="https://127.0.0.1/video/BV1xx411c7mD",
+            )
+        ]
+    )
+    adapter = make_adapter(fetcher)
+
+    with pytest.raises(VideoProviderError) as exc_info:
+        asyncio.run(adapter.resolve_metadata("https://b23.tv/private"))
+
+    assert exc_info.value.reason_code == "video_url_not_safe"
+    assert len(fetcher.calls) == 1
+
+
+def test_bilibili_invalid_timestamp_is_not_invented():
+    normalized = BilibiliVideoAdapter._normalize_segments(
+        [{"from": 10, "to": 2, "content": "out of order"}]
+    )
+
+    assert normalized[0].start_seconds is None
+    assert normalized[0].end_seconds is None
