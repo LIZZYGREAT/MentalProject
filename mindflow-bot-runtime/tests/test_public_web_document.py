@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import zlib
 
 import pytest
 
@@ -125,6 +126,36 @@ def test_public_https_html_is_extracted_wrapped_and_cached():
     assert first["cache_hit"] is False
     assert second["cache_hit"] is True
     assert len(fetcher.calls) == 1
+
+
+def test_gzip_html_reaches_article_extractor_and_metadata_fallback_works():
+    database = memory_database()
+    user = participant(database, "URL-GZIP")
+    markup = (
+        "<html><head><title>压缩页面</title>"
+        "<meta name='description' content='压缩页面简介'></head>"
+        "<body><article>压缩正文</article></body></html>"
+    ).encode("utf-8")
+    compressed = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+    encoded = compressed.compress(markup) + compressed.flush()
+    calls = []
+    reader = service(
+        database,
+        FakeFetcher([response(
+            encoded,
+            content_type="text/html; charset=utf-8",
+            **{"content-encoding": "gzip"},
+        )]),
+        extractor=lambda body: calls.append(body) or None,
+    )
+
+    result = asyncio.run(reader.read_url(user.id, url="https://example.com/gzip"))
+
+    assert result["ok"] is True
+    assert result["readability"] == "metadata_only"
+    assert result["title"] == "压缩页面"
+    assert "页面简介：压缩页面简介" in result["content"]
+    assert calls == [markup.decode("utf-8")]
 
 
 def test_configured_article_extractor_removes_navigation_and_keeps_main_text():

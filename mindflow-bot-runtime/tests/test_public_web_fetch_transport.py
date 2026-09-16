@@ -1,23 +1,31 @@
 import asyncio
 import socket
+import zlib
+
+import pytest
 
 from app.repositories_web_document import WebDocumentRepository
 from app.services.public_web_document_service import (
     PinnedHttpsWebFetcher,
     PublicWebDocumentService,
     RawWebResponse,
+    PublicWebReadError,
 )
 from helpers import memory_database, participant
 
 
 class _Reader:
-    def __init__(self, *, body=b"ok"):
+    def __init__(self, *, body=b"ok", content_encoding=None, content_type="text/plain"):
         self.lines = [
             b"HTTP/1.1 200 OK\r\n",
             f"Content-Length: {len(body)}\r\n".encode(),
-            b"Content-Type: text/plain\r\n",
-            b"\r\n",
+            f"Content-Type: {content_type}\r\n".encode(),
         ]
+        if content_encoding:
+            self.lines.insert(2, f"Content-Encoding: {content_encoding}\r\n".encode())
+        self.lines.extend([
+            b"\r\n",
+        ])
         self.body = body
 
     async def readline(self):
@@ -90,6 +98,92 @@ def test_fetcher_does_not_perform_second_dns_resolution(monkeypatch):
     ))
 
     assert result.status_code == 200
+
+
+def test_fetcher_decompresses_gzip_html(monkeypatch):
+    html = b"<html><title>gzip page</title><body>article</body></html>"
+    compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+    body = compressor.compress(html) + compressor.flush()
+
+    async def open_connection(**_kwargs):
+        return _Reader(body=body, content_encoding="gzip", content_type="text/html"), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    result = asyncio.run(PinnedHttpsWebFetcher().fetch(
+        "https://public.example/article",
+        resolved_addresses=("8.8.8.8",),
+        server_hostname="public.example",
+        timeout_seconds=1,
+        max_bytes=1024,
+    ))
+
+    assert result.body == html
+    assert "content-encoding" not in result.headers
+    assert result.headers["content-length"] == str(len(html))
+
+
+def test_fetcher_decompresses_deflate_html(monkeypatch):
+    html = b"<html><body>deflate article</body></html>"
+    body = zlib.compress(html)
+
+    async def open_connection(**_kwargs):
+        return _Reader(body=body, content_encoding="deflate", content_type="text/html"), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    result = asyncio.run(PinnedHttpsWebFetcher().fetch(
+        "https://public.example/article",
+        resolved_addresses=("8.8.8.8",),
+        server_hostname="public.example",
+        timeout_seconds=1,
+        max_bytes=1024,
+    ))
+
+    assert result.body == html
+
+
+def test_fetcher_rejects_decompressed_body_over_limit(monkeypatch):
+    body = zlib.compress(b"x" * 1024)
+
+    async def open_connection(**_kwargs):
+        return _Reader(body=body, content_encoding="deflate"), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    with pytest.raises(PublicWebReadError, match="response_too_large"):
+        asyncio.run(PinnedHttpsWebFetcher().fetch(
+            "https://public.example/article",
+            resolved_addresses=("8.8.8.8",),
+            server_hostname="public.example",
+            timeout_seconds=1,
+            max_bytes=128,
+        ))
+
+
+def test_fetcher_rejects_invalid_and_unknown_content_encoding(monkeypatch):
+    async def invalid_connection(**_kwargs):
+        return _Reader(body=b"invalid", content_encoding="gzip"), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", invalid_connection)
+    with pytest.raises(PublicWebReadError, match="invalid_content_encoding"):
+        asyncio.run(PinnedHttpsWebFetcher().fetch(
+            "https://public.example/article",
+            resolved_addresses=("8.8.8.8",),
+            server_hostname="public.example",
+            timeout_seconds=1,
+            max_bytes=128,
+        ))
+
+    async def unknown_connection(**_kwargs):
+        return _Reader(body=b"<html></html>", content_encoding="br"), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", unknown_connection)
+    with pytest.raises(PublicWebReadError, match="unsupported_content_encoding"):
+        asyncio.run(PinnedHttpsWebFetcher().fetch(
+            "https://public.example/article",
+            resolved_addresses=("8.8.8.8",),
+            server_hostname="public.example",
+            timeout_seconds=1,
+            max_bytes=128,
+        ))
 
 
 def test_dns_rebinding_cannot_switch_to_private_ip(monkeypatch):

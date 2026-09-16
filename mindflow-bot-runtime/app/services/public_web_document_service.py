@@ -17,6 +17,7 @@ import time
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+import zlib
 
 
 _SECRET_QUERY_KEYS = {
@@ -36,6 +37,8 @@ _PUBLIC_READ_REASON_TEXT = {
     "unsupported_content_type": "这个链接不是当前支持的公开 HTML/文本页面。",
     "empty_extracted_text": "页面可以访问，但没有提取到可阅读正文。",
     "response_too_large": "页面内容超过当前安全读取上限。",
+    "unsupported_content_encoding": "这个网页使用了当前不支持的内容压缩格式。",
+    "invalid_content_encoding": "这个网页的压缩内容格式无效，无法读取。",
     "fetch_timeout": "网页读取超时。",
     "url_private_address": "出于安全限制不能读取该链接。",
     "secret_query_not_allowed": "出于安全限制不能读取该链接。",
@@ -211,6 +214,15 @@ class PinnedHttpsWebFetcher:
                 status_code=status_code,
                 max_bytes=max_bytes,
             )
+            body = decode_content_encoding(
+                body,
+                headers.get("content-encoding"),
+                max_bytes=max_bytes,
+            )
+            if headers.get("content-encoding"):
+                headers = dict(headers)
+                headers.pop("content-encoding", None)
+                headers["content-length"] = str(len(body))
             return RawWebResponse(status_code=status_code, headers=headers, body=body)
         finally:
             if writer is not None:
@@ -314,6 +326,78 @@ class PinnedHttpsWebFetcher:
 
 # Retain the old import name for integrations that imported the implementation.
 HttpxLimitedWebFetcher = PinnedHttpsWebFetcher
+
+
+def decode_content_encoding(
+    body: bytes,
+    content_encoding: str | None,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Decode HTTP content codings without allowing decompression expansion.
+
+    ``RawWebResponse.body`` is an entity body, so the transport removes the
+    content-encoding header after calling this function.  The service also uses
+    it for custom fetchers that return an undecoded body.
+    """
+
+    encoded = bytes(body)
+    limit = int(max_bytes)
+    if limit < 0 or len(encoded) > limit:
+        raise PublicWebReadError("response_too_large")
+    codings = [
+        item.strip().casefold()
+        for item in str(content_encoding or "").split(",")
+        if item.strip()
+    ]
+    if not codings or codings == ["identity"]:
+        return encoded
+    if any(item not in {"identity", "gzip", "deflate"} for item in codings):
+        raise PublicWebReadError("unsupported_content_encoding")
+    if not encoded:
+        return b""
+    decoded = encoded
+    try:
+        for coding in reversed(codings):
+            if coding == "identity":
+                continue
+            decoded = _decompress_content(decoded, coding=coding, max_bytes=limit)
+    except PublicWebReadError:
+        raise
+    except (zlib.error, EOFError, ValueError) as exc:
+        raise PublicWebReadError("invalid_content_encoding") from exc
+    return decoded
+
+
+def _decompress_content(data: bytes, *, coding: str, max_bytes: int) -> bytes:
+    wbits = 16 + zlib.MAX_WBITS if coding == "gzip" else zlib.MAX_WBITS
+    decompressor = zlib.decompressobj(wbits)
+    output = bytearray()
+    input_view = memoryview(data)
+    for start in range(0, len(input_view), 65536):
+        pending = input_view[start : start + 65536]
+        while pending:
+            remaining = max_bytes + 1 - len(output)
+            if remaining <= 0:
+                raise PublicWebReadError("response_too_large")
+            chunk = decompressor.decompress(pending, remaining)
+            output.extend(chunk)
+            if len(output) > max_bytes:
+                raise PublicWebReadError("response_too_large")
+            pending = decompressor.unconsumed_tail
+            if pending:
+                raise PublicWebReadError("response_too_large")
+    if not decompressor.eof:
+        raise PublicWebReadError("invalid_content_encoding")
+    remaining = max_bytes + 1 - len(output)
+    if remaining <= 0:
+        raise PublicWebReadError("response_too_large")
+    output.extend(decompressor.flush(remaining))
+    if len(output) > max_bytes or decompressor.unused_data:
+        raise PublicWebReadError(
+            "response_too_large" if len(output) > max_bytes else "invalid_content_encoding"
+        )
+    return bytes(output)
 
 
 def validate_public_https_url(value: str) -> str:
@@ -630,8 +714,13 @@ class PublicWebDocumentService:
             content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
             if content_type not in _ALLOWED_CONTENT_TYPES:
                 raise PublicWebReadError("unsupported_content_type")
+            body = decode_content_encoding(
+                response.body,
+                response.headers.get("content-encoding"),
+                max_bytes=self.max_bytes,
+            )
             encoding = self._encoding(response.headers.get("content-type", ""))
-            body = response.body.decode(encoding, errors="replace")
+            body = body.decode(encoding, errors="replace")
             if content_type == "text/html":
                 metadata = self._extract_metadata(body, current)
                 title = metadata["title"] or self._html_title(body)
