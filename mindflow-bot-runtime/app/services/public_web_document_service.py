@@ -1017,6 +1017,9 @@ class PublicWebDocumentService:
         chunk_count = int(item.get("chunk_count", 1))
         next_chunk_index = chunk_index + len(chunks)
         has_more = next_chunk_index < chunk_count
+        video_page = PublicWebDocumentService._looks_like_video_page(
+            str(item.get("source_url") or "")
+        )
         return {
             "ok": True,
             "verified": True,
@@ -1024,6 +1027,8 @@ class PublicWebDocumentService:
             "title": item["title"],
             "source_url": item["source_url"],
             "content_type": item["content_type"],
+            "content_status": "video_page" if video_page else "document",
+            "video_capability_available": video_page,
             "readability": str(item.get("extraction_mode") or "article"),
             "chunk_index": chunk_index,
             "chunk_count": chunk_count,
@@ -1034,8 +1039,25 @@ class PublicWebDocumentService:
             "fetched_at": item["fetched_at"],
             "cache_hit": cache_hit,
             "reading_notice": (
-                "我读取到了页面标题/简介，但没有读取到视频正文或字幕。"
+                (
+                    "我读取到了视频页面标题/简介，但没有读取到视频正文或公开字幕。"
+                    if video_page
+                    else "我读取到了页面标题/简介，但没有读取到视频正文或字幕。"
+                )
                 if item.get("extraction_mode") == "metadata_only"
                 else None
             ),
         }
+
+    @staticmethod
+    def _looks_like_video_page(url: str) -> bool:
+        try:
+            parsed = urlsplit(str(url))
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        if host in {"b23.tv", "www.b23.tv"}:
+            return True
+        if host not in {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}:
+            return False
+        return "/video/" in f"{parsed.path.casefold()}/"

@@ -143,6 +143,13 @@ Use only these tools:
   not start cleanup. If the intended import is ambiguous, inspect recent
   imports and ask which one.
 
+- `video_inspect_url` when the participant explicitly supplies a supported public
+  video URL and asks what it is or what it covers. It reads public Metadata and
+  subtitle availability only.
+- `video_read_transcript` after `video_inspect_url` reports a transcript and
+  returns a known `video_id`; read bounded chunks in ascending offsets for a
+  transcript-grounded summary.
+
 For recurrence, use only the structured fields exposed by the tools. Never
 invent or pass raw RRULE text. `recurrence_weekdays` uses `MO` through `SU`.
 Never set both recurrence count and recurrence until. To remove an existing

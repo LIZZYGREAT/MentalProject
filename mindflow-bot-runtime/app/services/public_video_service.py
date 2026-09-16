@@ -86,8 +86,11 @@ class PublicVideoService:
             metadata = await adapter.resolve_metadata(raw_url)
             cached = None
             if self.repository is not None and hasattr(self.repository, "get"):
-                cached = self.repository.get(
-                    participant_id, video_id=metadata.video_id, provider=metadata.provider
+                cached = await asyncio.to_thread(
+                    self.repository.get,
+                    participant_id,
+                    video_id=metadata.video_id,
+                    provider=metadata.provider,
                 )
             if cached is not None and isinstance(cached, dict):
                 transcript = cached.get("transcript")
@@ -145,7 +148,7 @@ class PublicVideoService:
             return self._failure("invalid_arguments")
         if requested_limit > 10_000:
             requested_limit = 10_000
-        transcript = self._lookup_known(participant_id, str(video_id))
+        transcript = await self._lookup_known(participant_id, str(video_id))
         if transcript is None:
             return self._failure("video_not_inspected")
         if not transcript.segments:
@@ -174,12 +177,16 @@ class PublicVideoService:
             next_offset >= len(text),
         )
 
-    def _lookup_known(self, participant_id: Any, video_id: str) -> VideoTranscriptDocument | None:
+    async def _lookup_known(
+        self, participant_id: Any, video_id: str
+    ) -> VideoTranscriptDocument | None:
         for (owner, _provider, known_id), transcript in self._known.items():
             if owner == participant_id and known_id == video_id:
                 return transcript
         if self.repository is not None and hasattr(self.repository, "get"):
-            cached = self.repository.get(participant_id, video_id=video_id)
+            cached = await asyncio.to_thread(
+                self.repository.get, participant_id, video_id=video_id
+            )
             if cached is not None:
                 transcript = cached["transcript"] if isinstance(cached, dict) else cached
                 self._known[(participant_id, transcript.provider, transcript.video_id)] = transcript

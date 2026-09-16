@@ -74,6 +74,12 @@ class BilibiliVideoAdapter:
         if not self.can_handle(requested_url):
             raise VideoProviderError("unsupported_video_provider")
         final_url, page_body = await self._resolve_page(requested_url)
+        try:
+            final_host = (urlsplit(final_url).hostname or "").casefold().rstrip(".")
+        except ValueError:
+            final_host = ""
+        if final_host not in _BILIBILI_HOSTS:
+            raise VideoProviderError("video_page_not_public")
         reference = self._video_reference(final_url)
         if reference is None and page_body:
             reference = self._video_reference_from_markup(page_body)
