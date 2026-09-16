@@ -44,6 +44,19 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _allowlist(env: Mapping[str, str], name: str) -> tuple[str, ...]:
+    values = {
+        item.strip().casefold()
+        for item in env.get(name, "").split(",")
+        if item.strip()
+    }
+    if any(len(item) > 32 for item in values):
+        raise ValueError(f"{name} entries must be <= 32 characters")
+    if len(values) > 100:
+        raise ValueError(f"{name} must contain <= 100 entries")
+    return tuple(sorted(values))
+
+
 def _presentation_agent_mode(env: Mapping[str, str]) -> str:
     explicit = env.get("PRESENTATION_AGENT_MODE", "").strip().lower()
     if explicit:
@@ -144,6 +157,7 @@ class Settings:
     web_read_url_max_redirects: int = 3
     web_read_url_max_extracted_chars: int = 60000
     web_read_url_cache_ttl_minutes: int = 30
+    participant_diagnostics_allowlist: tuple[str, ...] = ()
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -453,6 +467,9 @@ class Settings:
             ),
             web_read_url_cache_ttl_minutes=_int(
                 values, "WEB_READ_URL_CACHE_TTL_MINUTES", 30, minimum=5
+            ),
+            participant_diagnostics_allowlist=_allowlist(
+                values, "PARTICIPANT_DIAGNOSTICS_ALLOWLIST"
             ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"

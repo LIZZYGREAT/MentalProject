@@ -429,6 +429,7 @@ class BotWorker:
         interaction_preferences: Any = None,
         psychological_context_builder: Any = None,
         backend_state_events: Any = None,
+        participant_diagnostics_allowlist: tuple[str, ...] = (),
     ):
         self.queue = queue
         self.identity = identity
@@ -451,6 +452,11 @@ class BotWorker:
         self.interaction_preferences = interaction_preferences
         self.psychological_context_builder = psychological_context_builder
         self.backend_state_events = backend_state_events
+        self.participant_diagnostics_allowlist = frozenset(
+            str(item).strip().casefold()
+            for item in participant_diagnostics_allowlist
+            if str(item).strip()
+        )
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
         self.presentations = presentations
@@ -1035,6 +1041,10 @@ class BotWorker:
                     source_kind="text",
                     access_tier=participant.access_tier,
                     scopes=participant.scopes,
+                    participant_diagnostics_enabled=(
+                        participant.participant_code.strip().casefold()
+                        in self.participant_diagnostics_allowlist
+                    ),
                 )
                 # Creating the task under the routing lock preserves arrival order;
                 # the lock is released before the long Agent turn so /stop can pass.
@@ -1719,6 +1729,10 @@ class BotWorker:
             source_kind=source_kind,
             access_tier=participant.access_tier,
             scopes=participant.scopes,
+            participant_diagnostics_enabled=(
+                participant.participant_code.strip().casefold()
+                in self.participant_diagnostics_allowlist
+            ),
         )
         self._active_agent_events.setdefault(participant.id, {})[
             event.event_id

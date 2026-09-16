@@ -126,6 +126,7 @@ capability（如 Daily Review）会直接隐藏对应功能。
 - `CLAUDE_DEFAULT_HAIKU_MODEL`、`CLAUDE_CODE_SUBAGENT_MODEL`：都填写云端已验证的 DeepSeek `v4-flash` 模型 ID；两者不一致时启动会拒绝配置。当前生产权限仍禁止 `Agent/Task`，不会因此开放子代理能力。
 - `POSTGRES_PASSWORD`、`DATABASE_URL`
 - `TOKEN_ENCRYPTION_KEY`
+- `PARTICIPANT_DIAGNOSTICS_ALLOWLIST`：由后端控制的诊断 participant code 逗号分隔 allowlist；留空时所有 Agent 只收到 participant-safe 结果。不要让 Agent 根据 participant code 自行开启诊断。
 - session pool、timeout 和 progress policy 参数
 
 不要保留旧的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BOT_HISTORY_LIMIT`、

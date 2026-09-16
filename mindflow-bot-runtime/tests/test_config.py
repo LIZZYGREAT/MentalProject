@@ -38,6 +38,17 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_participant_diagnostics_allowlist_is_explicit_and_normalized():
+    environment = valid_environment()
+    environment["PARTICIPANT_DIAGNOSTICS_ALLOWLIST"] = " P002, p001, P002 "
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.participant_diagnostics_allowlist == ("p001", "p002")
+
+
 def test_card_action_receipt_ttl_defaults_and_bounds():
     base = valid_environment()
     settings = Settings.from_env(

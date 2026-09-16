@@ -178,8 +178,9 @@ def test_care_incomplete_patch_is_structured_and_does_not_stage_other_fields():
         result = exc.as_tool_result()
     else:
         raise AssertionError("expected a focused quiet-hours clarification")
-    assert result["missing_fields"] == ["quiet_hours_end"]
-    assert result["resolved_changes"]["morning_brief_local_time"] == "08:30"
+    assert result["diagnostic_summary"]["missing_fields"] == ["quiet_hours_end"]
+    assert result["diagnostic_summary"]["resolved_changes"]["morning_brief_local_time"] == "08:30"
+    assert result["public_guidance"] == "晚上 23:00 开始免打扰，到几点恢复提醒？"
     assert result["staged"] is False
     assert care.get(owner.id)["morning_brief_local_time"] == "08:00"
 

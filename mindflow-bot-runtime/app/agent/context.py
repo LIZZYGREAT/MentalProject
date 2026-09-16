@@ -64,6 +64,7 @@ class AgentContext:
     authorization_semantic_context: tuple[AuthorizationSemanticTurn, ...] = ()
     access_tier: str = "participant"
     scopes: tuple[str, ...] = ()
+    participant_diagnostics_enabled: bool = False
 
     @property
     def calendar_mutation_allowed(self) -> bool:

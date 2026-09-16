@@ -85,12 +85,40 @@ class CarePreferenceClarificationRequired(ValueError):
         )
 
     def as_tool_result(self) -> dict[str, Any]:
+        start = self.resolved_changes.get("quiet_hours_start")
+        end = self.resolved_changes.get("quiet_hours_end")
+        known: dict[str, Any] = {}
+        if start not in (None, ""):
+            known["start"] = str(start)
+        if end not in (None, ""):
+            known["end"] = str(end)
+        morning_brief = self.resolved_changes.get("morning_brief_local_time")
+        if morning_brief not in (None, ""):
+            known["morning_brief"] = str(morning_brief)
+        if "quiet_hours_start" in self.missing_fields:
+            guidance = "从几点开始免打扰，到几点恢复提醒？"
+            need = "start_time"
+        else:
+            guidance = (
+                f"晚上 {known.get('start', '')} 开始免打扰，到几点恢复提醒？"
+            )
+            need = "end_time"
         return {
             "ok": False,
             "error": self.code,
             "reason_code": self.code,
-            "missing_fields": list(self.missing_fields),
-            "resolved_changes": dict(self.resolved_changes),
+            "kind": "clarification_required",
+            "clarification": {
+                "topic": "quiet_hours",
+                "known": known,
+                "need": need,
+            },
+            "public_guidance": guidance,
+            "diagnostic_summary": {
+                "reason_code": self.code,
+                "missing_fields": list(self.missing_fields),
+                "resolved_changes": dict(self.resolved_changes),
+            },
             "staged": False,
             "persisted": False,
             "do_not_retry": True,

@@ -334,7 +334,7 @@ def test_url_reader_does_not_guess_dynamic_page_instruction_is_runtime_bound():
         Path(__file__).resolve().parents[1] / "app" / "agent" / "sdk_adapter.py"
     ).read_text(encoding="utf-8")
 
-    assert "explain only the backend" in source
+    assert "use only public_reason" in source
     assert "Do not infer that a page is dynamic" in source
     assert "never claim to have" in source
     assert "watched the video" in source

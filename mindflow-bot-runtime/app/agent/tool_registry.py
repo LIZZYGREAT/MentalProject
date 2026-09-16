@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 from jsonschema import Draft202012Validator, FormatChecker
 
 from app.agent.context import AgentContext, CalendarMutationOperation, TurnEffectPolicy
+from app.agent.participant_safe_result import participant_safe_result
 from app.repositories import AgentRunRepository
 from app.services.mutation_intent_verifier import (
     MutationIntentVerifier,
@@ -263,6 +264,10 @@ class ToolRegistry:
         self._non_retryable_failures: dict[tuple[str, str, str], str] = {}
 
     @staticmethod
+    def _present(ctx: AgentContext, result: dict[str, Any], status: str) -> ToolExecution:
+        return ToolExecution(participant_safe_result(ctx, result), status)
+
+    @staticmethod
     def _tool_call_key(
         ctx: AgentContext, name: str, arguments: dict[str, Any]
     ) -> tuple[str, str, str]:
@@ -434,7 +439,7 @@ class ToolRegistry:
                 "not_evaluated",
                 "invalid_tool",
             )
-            return ToolExecution(result, "invalid_tool")
+            return self._present(ctx, result, "invalid_tool")
         if not self._scope_allowed(spec, ctx):
             result = {
                 "ok": False,
@@ -445,7 +450,7 @@ class ToolRegistry:
                 ctx, name, spec, None, result, "tool_not_authorized",
                 "deny", "required_scope_missing",
             )
-            return ToolExecution(result, "tool_not_authorized")
+            return self._present(ctx, result, "tool_not_authorized")
         if not isinstance(arguments, dict):
             result = {"ok": False, "error": "invalid_arguments"}
             await self._log(
@@ -458,7 +463,7 @@ class ToolRegistry:
                 "not_evaluated",
                 "arguments_not_object",
             )
-            return ToolExecution(result, "invalid_arguments")
+            return self._present(ctx, result, "invalid_arguments")
         repeated_reason = self._non_retryable_failures.get(
             self._tool_call_key(ctx, name, arguments)
         )
@@ -480,7 +485,7 @@ class ToolRegistry:
                 "not_evaluated",
                 repeated_reason,
             )
-            return ToolExecution(result, "repeated_non_retryable_tool_call")
+            return self._present(ctx, result, "repeated_non_retryable_tool_call")
         errors = sorted(
             Draft202012Validator(
                 spec.parameters, format_checker=FormatChecker()
@@ -506,7 +511,7 @@ class ToolRegistry:
                 "not_evaluated",
                 "schema_validation_failed",
             )
-            return ToolExecution(result, "invalid_arguments")
+            return self._present(ctx, result, "invalid_arguments")
 
         allowed_effects = _ALLOWED_EFFECTS_BY_TURN_POLICY.get(
             ctx.turn_effect_policy, frozenset()
@@ -532,7 +537,7 @@ class ToolRegistry:
                 "deny",
                 reason_code,
             )
-            return ToolExecution(result, "tool_effect_not_authorized")
+            return self._present(ctx, result, "tool_effect_not_authorized")
 
         authorization_decision = "not_required"
         reason_code = "authorization_not_required"
@@ -591,7 +596,7 @@ class ToolRegistry:
                         "unavailable",
                         reason_code,
                     )
-                    return ToolExecution(result, "authorization_unavailable")
+                    return self._present(ctx, result, "authorization_unavailable")
             if deterministic_authorization:
                 authorization_decision = "allow"
                 reason_code = "server_bound_no_provider_effect"
@@ -611,7 +616,7 @@ class ToolRegistry:
                     "unavailable",
                     "verifier_unavailable",
                 )
-                return ToolExecution(result, "authorization_unavailable")
+                return self._present(ctx, result, "authorization_unavailable")
             if not deterministic_authorization:
                 try:
                     decision = await self.mutation_verifier.verify(
@@ -641,7 +646,7 @@ class ToolRegistry:
                         "unavailable",
                         "verifier_failure",
                     )
-                    return ToolExecution(result, "authorization_unavailable")
+                    return self._present(ctx, result, "authorization_unavailable")
                 authorization_decision = decision.decision
                 reason_code = decision.reason_code
                 if decision.decision == "deny":
@@ -660,7 +665,7 @@ class ToolRegistry:
                         authorization_decision,
                         reason_code,
                     )
-                    return ToolExecution(result, "tool_effect_not_authorized")
+                    return self._present(ctx, result, "tool_effect_not_authorized")
                 if decision.decision == "needs_clarification":
                     result = {
                         "ok": False,
@@ -677,7 +682,7 @@ class ToolRegistry:
                         authorization_decision,
                         reason_code,
                     )
-                    return ToolExecution(result, "mutation_needs_clarification")
+                    return self._present(ctx, result, "mutation_needs_clarification")
 
         calendar_operation = CALENDAR_MUTATION_TOOLS.get(name)
         if (
@@ -699,7 +704,7 @@ class ToolRegistry:
                 "deny",
                 "calendar_operation_not_allowed",
             )
-            return ToolExecution(result, "calendar_mutation_not_authorized")
+            return self._present(ctx, result, "calendar_mutation_not_authorized")
         try:
             if spec.execution_mode == "async":
                 value = spec.handler(ctx, arguments)
@@ -721,7 +726,7 @@ class ToolRegistry:
                 authorization_decision,
                 reason_code,
             )
-            return ToolExecution(safe, "succeeded")
+            return self._present(ctx, safe, "succeeded")
         except Exception as exc:
             structured_result_factory = getattr(exc, "as_tool_result", None)
             if callable(structured_result_factory):
@@ -743,7 +748,7 @@ class ToolRegistry:
                         authorization_decision,
                         str(structured_result.get("reason_code") or "needs_clarification"),
                     )
-                    return ToolExecution(structured_result, "needs_clarification")
+                    return self._present(ctx, structured_result, "needs_clarification")
             error_id = uuid.uuid4().hex
             result = {
                 "ok": False,
@@ -776,7 +781,7 @@ class ToolRegistry:
                 error_id=error_id,
                 error_class=type(exc).__name__,
             )
-            return ToolExecution(result, "tool_exception")
+            return self._present(ctx, result, "tool_exception")
 
     async def _record_tool_incident(
         self,

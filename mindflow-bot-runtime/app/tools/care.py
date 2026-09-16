@@ -1013,13 +1013,7 @@ class CareTools:
                 ctx.participant_id, changes
             )
         except CarePreferenceClarificationRequired as exc:
-            return {
-                **exc.as_tool_result(),
-                "message": (
-                    "免打扰时间需要同时提供开始和结束时间；"
-                    f"还缺少 {', '.join(exc.missing_fields)}。刚才的设置没有提交。"
-                ),
-            }
+            return exc.as_tool_result()
         self.presentations.stage_card(
             ctx.agent_run_id,
             personalization_proposal_confirmation_card(proposal),

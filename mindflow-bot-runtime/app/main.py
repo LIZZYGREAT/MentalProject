@@ -1006,6 +1006,9 @@ async def run() -> None:
         interaction_preferences=business.interaction_preferences,
         psychological_context_builder=business.psychological_context,
         backend_state_events=backend_state_events,
+        participant_diagnostics_allowlist=(
+            settings.participant_diagnostics_allowlist
+        ),
     )
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image
