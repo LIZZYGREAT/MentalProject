@@ -2391,6 +2391,36 @@ def personalization_proposal_confirmation_card(
             for key, value in changes.items()
         ]
         lines.append("这些设置不能改变安全、授权或权限规则。")
+    elif domain == "care_preferences" and operation == "update":
+        title = "确认修改提醒与关怀设置"
+        labels = {
+            "care_enabled": "关怀功能",
+            "warning_enabled": "压力预警",
+            "daily_review_enabled": "每日回顾",
+            "morning_brief_enabled": "Morning Brief",
+            "morning_brief_local_time": "Morning Brief 时间",
+            "quiet_hours_start": "免打扰开始",
+            "quiet_hours_end": "免打扰结束",
+            "max_proactive_care_per_day": "每日主动关怀上限",
+            "allow_schedule_suggestions": "日程建议",
+            "allow_follow_up": "支持性跟进",
+            "preferred_support_types": "偏好支持类型",
+            "reenable_intervention_types": "重新启用支持类型",
+        }
+
+        def display(value: Any) -> str:
+            if isinstance(value, bool):
+                return "开启" if value else "关闭"
+            if isinstance(value, list):
+                return "、".join(str(item) for item in value) or "无"
+            return "无" if value is None else str(value)
+
+        changes = dict(payload.get("changes") or {})
+        lines = [
+            f"- **{labels.get(key, key)}：** {display(value)}"
+            for key, value in changes.items()
+        ]
+        lines.append("确认前不会修改提醒、关怀或免打扰设置。")
     else:
         raise ValueError("personalization proposal is invalid")
     return {

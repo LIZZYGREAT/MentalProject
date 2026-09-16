@@ -2134,7 +2134,8 @@ class PersonalizationProposal(Base):
         ),
         Index("ix_personalization_proposal_expiry", "status", "expires_at"),
         CheckConstraint(
-            "domain IN ('memory', 'interaction_preferences', 'support_preferences')",
+            "domain IN ('memory', 'interaction_preferences', "
+            "'support_preferences', 'care_preferences')",
             name="ck_personalization_proposal_domain",
         ),
         CheckConstraint(

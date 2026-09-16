@@ -551,7 +551,7 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
         "care_get_recent_state": ("read", "none"),
         "care_run_today_assessment": ("compute", "none"),
         "care_get_support": ("compute", "none"),
-        "care_update_preferences": ("internal_write", "direct_request"),
+        "care_update_preferences": ("proposal_stage", "none"),
         "care_respond_to_latest_intervention": (
             "internal_write",
             "direct_request",

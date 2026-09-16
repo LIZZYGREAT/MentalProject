@@ -20,6 +20,7 @@ from app.integrations.feishu.cards import (
     calendar_mutation_plan_confirmation_card,
     daily_checkin_card,
     morning_brief_settings_card,
+    personalization_proposal_confirmation_card,
     pressure_curve_card,
 )
 from app.presentation.feature_cards import (
@@ -309,6 +310,7 @@ class CareTools:
         observation_refresh: ObservationForecastRefreshService | None = None,
         mutation_refresh: ForecastMutationRefreshQueue | None = None,
         care_preferences: Any = None,
+        personalization_proposals: Any = None,
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         calendar_mutation_plans: Any = None,
@@ -339,6 +341,7 @@ class CareTools:
             or CareMessageService(timezone_name)
         )
         self.care_preferences = care_preferences
+        self.personalization_proposals = personalization_proposals
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
         self.calendar_mutation_plans = calendar_mutation_plans
@@ -420,7 +423,7 @@ class CareTools:
         )
         registry.register(
             "care_update_preferences",
-            "Update this participant's durable care, warning, review, quiet-hour, and follow-up preferences without exceeding backend safety limits.",
+            "Stage a fixed review card for structured care, warning, review, quiet-hour, and follow-up preference changes. The tool validates backend safety limits but does not persist settings.",
             {
                 "type": "object",
                 "properties": {
@@ -493,8 +496,8 @@ class CareTools:
                 "additionalProperties": False,
             },
             self.update_care_preferences,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "morning_brief_show_settings",
@@ -979,16 +982,26 @@ class CareTools:
     def update_care_preferences(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
-        if self.care_preferences is None:
-            raise RuntimeError("care preference service is unavailable")
+        if self.personalization_proposals is None or self.presentations is None:
+            raise RuntimeError("care preference proposal service is unavailable")
         changes = dict(args)
         if changes.pop("clear_quiet_hours", False):
             changes["quiet_hours_start"] = None
             changes["quiet_hours_end"] = None
-        preferences = self.care_preferences.update(ctx.participant_id, changes)
+        proposal = self.personalization_proposals.stage_care_preferences(
+            ctx.participant_id, changes
+        )
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            personalization_proposal_confirmation_card(proposal),
+        )
         return {
             "ok": True,
-            "care_preferences": _public_care_preferences(preferences),
+            "proposal_id": proposal["id"],
+            "personalization_proposal": "pending_confirmation",
+            "persisted": False,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
         }
 
     def show_morning_brief_settings(

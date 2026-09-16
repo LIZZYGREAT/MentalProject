@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0077_personalization_proposals -->
+<!-- ALEMBIC_HEAD: 0078_care_preference_proposals -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -75,6 +75,12 @@ external write 只能由原参与者点击确认卡后，通过 receipt/idempote
 表达的字段填入固定状态表单，未明确字段保持空白，不写 Observation，也不经过 mutation
 语义复核。只有原参与者补齐并提交固定卡片后，CardAction executor 才校验完整字段、幂等写入
 Observation，并触发 Forecast refresh；Agent 不得把“卡片已生成”表述为“状态已记录”。
+
+Care 与通知偏好也采用 typed proposal。`care_update_preferences` 只接受封闭 schema 中的
+structured changes，经 Backend 当前状态与安全上限校验后保存短期 participant-bound proposal，
+并生成固定设置差异卡；Agent 不直接持久化。只有绑定参与者的 receipt-protected CardAction
+确认后才更新设置，取消、过期、跨参与者确认与重复确认都不会产生写入。Morning Brief 时间
+继续使用当前研究配置允许的离散时段；是否开放任意 `HH:MM` 属于独立产品能力决策。
 
 Reminder 的创建与取消同样采用 `proposal_stage`。Agent 只提交结构化 message、RFC3339
 时间与 recurrence，Backend 验证格式并保存短期 participant-bound proposal；固定卡展示

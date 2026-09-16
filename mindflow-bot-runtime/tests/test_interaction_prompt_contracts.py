@@ -221,7 +221,8 @@ def test_reminder_complaint_is_not_treated_as_a_direct_preference_request():
     explicit = _skill_example("帮我减少提醒")
     assert "care_update_preferences" in explicit
     assert "direct request" in explicit
-    assert "ok: true" in explicit
+    assert "fixed review card" in explicit
+    assert "only after the participant confirms" in explicit
 
 
 def test_course_series_scope_and_clock_semantics_match_system_and_skill():

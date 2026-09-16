@@ -16,6 +16,7 @@ _OPERATIONS = {
     "memory": {"remember", "replace", "delete", "clear"},
     "interaction_preferences": {"update"},
     "support_preferences": {"update"},
+    "care_preferences": {"update"},
 }
 
 

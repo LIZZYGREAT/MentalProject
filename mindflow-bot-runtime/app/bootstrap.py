@@ -266,6 +266,7 @@ def build_business_services(
         PersonalizationProposalRepository(database),
         memory,
         interaction_preferences,
+        care_preferences,
     )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
@@ -401,6 +402,7 @@ def build_business_services(
         observation_refresh=observation_refresh,
         mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
+        personalization_proposals=personalization_proposals,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
         calendar_mutation_plans=calendar_mutation_plans,

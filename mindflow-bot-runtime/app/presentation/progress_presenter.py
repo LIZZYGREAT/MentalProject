@@ -77,7 +77,7 @@ class ProgressPresenter:
             if stage == "support":
                 return "我在结合当前状态整理更合适的支持建议。"
             if stage == "preferences":
-                return "我正在更新你的提醒与关怀设置。"
+                return "我在整理设置变更并准备确认卡。"
             if stage == "intervention_feedback":
                 return "我正在记录这次反馈。"
             if tool_name == "calendar_create_event":

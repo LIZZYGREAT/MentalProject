@@ -7,10 +7,17 @@ import uuid
 
 
 class PersonalizationProposalService:
-    def __init__(self, proposals: Any, memory: Any, preferences: Any) -> None:
+    def __init__(
+        self,
+        proposals: Any,
+        memory: Any,
+        preferences: Any,
+        care_preferences: Any = None,
+    ) -> None:
         self.proposals = proposals
         self.memory = memory
         self.preferences = preferences
+        self.care_preferences = care_preferences
 
     def stage_memory_remember(
         self,
@@ -108,6 +115,23 @@ class PersonalizationProposalService:
             payload=payload,
         )
 
+    def stage_care_preferences(
+        self,
+        participant_id: uuid.UUID,
+        changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.care_preferences is None:
+            raise RuntimeError("care preference proposals are unavailable")
+        validated = self.care_preferences.validate_changes(
+            participant_id, changes
+        )
+        return self.proposals.stage(
+            participant_id,
+            domain="care_preferences",
+            operation="update",
+            payload={"changes": validated},
+        )
+
     def resolve(
         self,
         participant_id: uuid.UUID,
@@ -137,6 +161,18 @@ class PersonalizationProposalService:
                     identity_changes=payload.get("identity_changes"),
                 )
                 result = {"operation": "update", "preferences": preferences}
+            elif (
+                proposal["domain"] == "care_preferences"
+                and proposal["operation"] == "update"
+                and self.care_preferences is not None
+            ):
+                preferences = self.care_preferences.update(
+                    participant_id, dict(payload.get("changes") or {})
+                )
+                result = {
+                    "operation": "care_update",
+                    "care_preferences": preferences,
+                }
             else:
                 raise ValueError("unsupported personalization proposal")
         except (LookupError, ValueError) as exc:

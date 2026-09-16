@@ -43,6 +43,26 @@ CARE_ACTIONS = {
 CARE_CARD_ACTIONS = ["helpful", "not_relevant", "snooze_30", "disable_type"]
 OPERATIONAL_CARE_ACTIONS = {"ack", "snooze_30", "mute_today"}
 PREFERRED_SUPPORT_TYPES = set(INTERVENTION_OPTIONS)
+CARE_PREFERENCE_CHANGE_FIELDS = {
+    "care_enabled",
+    "warning_enabled",
+    "daily_review_enabled",
+    "morning_brief_enabled",
+    "weekly_summary_enabled",
+    "morning_brief_local_time",
+    "morning_brief_paused_until",
+    "weekly_summary_local_time",
+    "weekly_summary_weekday",
+    "quiet_hours_start",
+    "quiet_hours_end",
+    "max_proactive_care_per_day",
+    "max_system_proactive_per_day",
+    "allow_schedule_suggestions",
+    "allow_follow_up",
+    "global_proactive_muted_until",
+    "preferred_support_types",
+    "reenable_intervention_types",
+}
 
 
 def _aware(value: datetime) -> datetime:
@@ -130,29 +150,7 @@ class ParticipantCarePreferenceRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         changed_at = _aware(now or utc_now())
-        allowed = {
-            "care_enabled",
-            "warning_enabled",
-            "daily_review_enabled",
-            "morning_brief_enabled",
-            "weekly_summary_enabled",
-            "morning_brief_local_time",
-            "morning_brief_paused_until",
-            "weekly_summary_local_time",
-            "weekly_summary_weekday",
-            "quiet_hours_start",
-            "quiet_hours_end",
-            "max_proactive_care_per_day",
-            "max_system_proactive_per_day",
-            "allow_schedule_suggestions",
-            "allow_follow_up",
-            "global_proactive_muted_until",
-            "preferred_support_types",
-            "reenable_intervention_types",
-        }
-        unknown = set(changes) - allowed
-        if unknown:
-            raise ValueError(f"unsupported care preference fields: {sorted(unknown)}")
+        self._validate_change_fields(changes)
         with self.database.session() as session:
             participant = session.get(
                 Participant, participant_id, with_for_update=True
@@ -174,7 +172,7 @@ class ParticipantCarePreferenceRepository:
             self._apply_changes(row, changes)
             after_values = self._view(row)
             material_keys = (
-                allowed - {"reenable_intervention_types"}
+                CARE_PREFERENCE_CHANGE_FIELDS - {"reenable_intervention_types"}
             ) | {"disabled_intervention_types"}
             if (
                 (created_preference and bool(changes))
@@ -190,6 +188,56 @@ class ParticipantCarePreferenceRepository:
             )
             session.flush()
             return self._view(row)
+
+    def validate_changes(
+        self,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate a proposal against current state without persisting it."""
+
+        normalized = dict(changes)
+        if not normalized:
+            raise ValueError("care preference proposal has no changes")
+        self._validate_change_fields(normalized)
+        with self.database.session() as session:
+            participant = session.get(Participant, participant_id)
+            if participant is None:
+                raise ValueError("participant does not exist")
+            row = session.get(ParticipantCarePreference, participant_id)
+            if row is None:
+                row = ParticipantCarePreference(
+                    participant_id=participant_id,
+                    version=0,
+                )
+            self._apply_changes(row, normalized)
+            session.rollback()
+        for key in (
+            "morning_brief_local_time",
+            "weekly_summary_local_time",
+            "quiet_hours_start",
+            "quiet_hours_end",
+        ):
+            if key in normalized:
+                parsed = _parse_clock(normalized[key])
+                normalized[key] = parsed.strftime("%H:%M") if parsed else None
+        if "preferred_support_types" in normalized:
+            normalized["preferred_support_types"] = normalized_intervention_types(
+                normalized["preferred_support_types"]
+            )
+        if "reenable_intervention_types" in normalized:
+            normalized["reenable_intervention_types"] = normalized_intervention_types(
+                normalized["reenable_intervention_types"]
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_change_fields(changes: Mapping[str, Any]) -> None:
+        unknown = set(changes) - CARE_PREFERENCE_CHANGE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unsupported care preference fields: {sorted(unknown)}"
+            )
 
     def mute_today(
         self,
