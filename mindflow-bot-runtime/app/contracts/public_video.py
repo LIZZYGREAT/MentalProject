@@ -23,6 +23,7 @@ VIDEO_REASON_CODES = frozenset(
         "subtitle_parse_failed",
         "transcript_too_large",
         "video_url_not_safe",
+        "unsupported_video_variant",
         "video_disabled",
         "video_not_inspected",
     }
