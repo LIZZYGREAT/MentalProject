@@ -28,6 +28,7 @@ _PUBLIC_REASON_TEXT = {
     "subtitle_parse_failed": "视频页面可以读取，但公开字幕格式暂时无法解析。",
     "transcript_too_large": "视频字幕超过当前安全读取上限。",
     "video_url_not_safe": "出于安全限制不能读取这个视频链接。",
+    "unsupported_video_variant": "当前不能读取这个视频的指定分 P。",
     "video_disabled": "公开视频读取功能当前未启用。",
     "video_not_inspected": "请先检查一个公开视频链接，再读取它的字幕。",
 }

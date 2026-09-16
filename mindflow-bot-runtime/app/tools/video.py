@@ -11,6 +11,7 @@ from app.agent.tool_registry import ToolRegistry
 class VideoTools:
     def __init__(self, service: Any) -> None:
         self.service = service
+        self._read_counts: dict[tuple[str, str], int] = {}
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -62,9 +63,22 @@ class VideoTools:
     async def read_transcript(
         self, ctx: AgentContext, args: dict[str, Any]
     ) -> dict[str, Any]:
+        video_id = str(args["video_id"])
+        key = (str(ctx.agent_run_id), video_id)
+        max_reads = max(1, int(getattr(self.service, "max_tool_reads", 6)))
+        used_reads = self._read_counts.get(key, 0)
+        if used_reads >= max_reads:
+            return {
+                "ok": False,
+                "verified": False,
+                "error": "video_read_limit_reached",
+                "public_reason": "本轮已经读取了足够的视频字幕内容，无法继续读取更多片段。",
+                "do_not_retry": True,
+            }
+        self._read_counts[key] = used_reads + 1
         return await self.service.read_transcript(
             ctx.participant_id,
-            video_id=args["video_id"],
+            video_id=video_id,
             offset=args.get("offset", 0),
             limit_chars=args.get("limit_chars", 8_000),
         )
