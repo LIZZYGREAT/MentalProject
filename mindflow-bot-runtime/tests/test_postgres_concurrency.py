@@ -43,6 +43,12 @@ from app.repositories_care import (
     ParticipantCarePreferenceRepository,
 )
 from app.repositories_consent import ParticipantConsentRepository
+from app.repositories_memory import ParticipantMemoryRepository
+from app.repositories_personalization_proposal import (
+    PersonalizationProposalRepository,
+)
+from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_support_preferences import SupportPreferenceRepository
 from app.services.consent_service import ConsentService
 from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
@@ -50,6 +56,11 @@ from app.services.forecast_coordinator import _sha
 from app.services.hierarchical_personalization import (
     MODEL_FAMILY,
     ParameterLearningService,
+)
+from app.services.interaction_preference_service import InteractionPreferenceService
+from app.services.memory_service import MemoryService
+from app.services.personalization_proposal_service import (
+    PersonalizationProposalService,
 )
 from app.services.token_service import (
     OAuthTokenSet,
@@ -104,6 +115,105 @@ def _runtime_repositories(database: Database):
         timezone_name="Asia/Shanghai",
     )
     return warnings, preferences
+
+
+def _personalization_stack(database: Database, *, failpoint=None):
+    memory = MemoryService(ParticipantMemoryRepository(database))
+    preferences = InteractionPreferenceService(
+        InteractionPreferenceRepository(database),
+        SupportPreferenceRepository(database),
+    )
+    proposals = PersonalizationProposalService(
+        PersonalizationProposalRepository(database),
+        memory,
+        preferences,
+        confirmed_effect_failpoint=failpoint,
+    )
+    return memory, proposals
+
+
+def test_postgres_concurrent_personalization_confirm_executes_once(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-CONCURRENT"
+    )
+    memory, proposals = _personalization_stack(postgres_database)
+    proposal = proposals.stage_memory_remember(
+        owner.id,
+        memory_type="context",
+        memory_subtype=None,
+        content="PostgreSQL 并发确认",
+    )
+    barrier = threading.Barrier(2)
+
+    def confirm():
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: confirm(), range(2)))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    assert len(memory.list(owner.id)) == 1
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "confirmed"
+
+
+def test_postgres_personalization_failpoint_rolls_back_effect(
+    postgres_database,
+):
+    def fail_before_terminal():
+        raise RuntimeError("injected PostgreSQL terminal failure")
+
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-ROLLBACK"
+    )
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=fail_before_terminal
+    )
+    proposal = proposals.stage_memory_remember(
+        owner.id,
+        memory_type="context",
+        memory_subtype=None,
+        content="PostgreSQL 回滚确认",
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    assert memory.list(owner.id) == []
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "awaiting_confirmation"
+
+
+def test_postgres_memory_clear_is_all_or_nothing(postgres_database):
+    def fail_before_terminal():
+        raise RuntimeError("injected PostgreSQL clear failure")
+
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-MEMORY-CLEAR-ROLLBACK"
+    )
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=fail_before_terminal
+    )
+    for index in range(10):
+        memory.remember_explicit(
+            owner.id,
+            memory_type="context",
+            content=f"PostgreSQL 待清理 {index}",
+        )
+    proposal = proposals.stage_memory_clear(owner.id)
+
+    with pytest.raises(RuntimeError, match="clear failure"):
+        proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    assert len(memory.list(owner.id)) == 10
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "awaiting_confirmation"
 
 
 def _forecast(database: Database, participant_id: uuid.UUID, local_date):

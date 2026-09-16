@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 
@@ -13,11 +13,13 @@ class PersonalizationProposalService:
         memory: Any,
         preferences: Any,
         care_preferences: Any = None,
+        confirmed_effect_failpoint: Callable[[], None] | None = None,
     ) -> None:
         self.proposals = proposals
         self.memory = memory
         self.preferences = preferences
         self.care_preferences = care_preferences
+        self.confirmed_effect_failpoint = confirmed_effect_failpoint
 
     def stage_memory_remember(
         self,
@@ -139,44 +141,19 @@ class PersonalizationProposalService:
         *,
         confirmed: bool,
     ) -> dict[str, Any]:
-        claim = self.proposals.claim(
-            participant_id, proposal_id, confirmed=confirmed
-        )
-        if not claim.get("ok") or not confirmed:
-            return claim
-        proposal = dict(claim["proposal"])
-        payload = dict(proposal.get("payload") or {})
+        if not confirmed:
+            return self.proposals.cancel(participant_id, proposal_id)
         try:
-            if proposal["domain"] == "memory":
-                result = self._execute_memory(
-                    participant_id, proposal["operation"], payload
-                )
-            elif proposal["domain"] in {
-                "interaction_preferences", "support_preferences"
-            } and proposal["operation"] == "update":
-                preferences = self.preferences.update_preferences(
-                    participant_id,
-                    style_changes=payload.get("style_changes"),
-                    support_changes=payload.get("support_changes"),
-                    identity_changes=payload.get("identity_changes"),
-                )
-                result = {"operation": "update", "preferences": preferences}
-            elif (
-                proposal["domain"] == "care_preferences"
-                and proposal["operation"] == "update"
-                and self.care_preferences is not None
-            ):
-                preferences = self.care_preferences.update(
-                    participant_id, dict(payload.get("changes") or {})
-                )
-                result = {
-                    "operation": "care_update",
-                    "care_preferences": preferences,
-                }
-            else:
-                raise ValueError("unsupported personalization proposal")
+            return self.proposals.resolve_confirmed_atomically(
+                participant_id,
+                proposal_id,
+                execute=lambda session, proposal: self._execute_in_session(
+                    session, participant_id, proposal
+                ),
+                before_terminal_status=self.confirmed_effect_failpoint,
+            )
         except (LookupError, ValueError) as exc:
-            self.proposals.fail(
+            self.proposals.fail_pending(
                 participant_id, proposal_id, "personalization_effect_rejected"
             )
             return {
@@ -184,15 +161,57 @@ class PersonalizationProposalService:
                 "error": "personalization_effect_rejected",
                 "detail": str(exc)[:200],
             }
-        self.proposals.complete(participant_id, proposal_id, result)
-        return {"ok": True, "status": "confirmed", **result}
 
-    def _execute_memory(
-        self, participant_id: uuid.UUID, operation: str, payload: dict[str, Any]
+    def _execute_in_session(
+        self,
+        session: Any,
+        participant_id: uuid.UUID,
+        proposal: dict[str, Any],
     ) -> dict[str, Any]:
-        if operation == "remember":
-            memory = self.memory.remember_explicit(
+        domain = str(proposal.get("domain") or "")
+        operation = str(proposal.get("operation") or "")
+        payload = dict(proposal.get("payload") or {})
+        if domain == "memory":
+            return self._execute_memory_in_session(
+                session, participant_id, operation, payload
+            )
+        if domain in {
+            "interaction_preferences", "support_preferences"
+        } and operation == "update":
+            validated = self.preferences.validate_changes(
+                style_changes=payload.get("style_changes"),
+                support_changes=payload.get("support_changes"),
+                identity_changes=payload.get("identity_changes"),
+            )
+            self.preferences.repository.update_atomic_in_session(
+                session,
                 participant_id,
+                style_changes=validated["style_changes"],
+                support_changes=validated["support_changes"],
+                identity_changes=validated["identity_changes"],
+            )
+            return {"operation": "update"}
+        if (
+            domain == "care_preferences"
+            and operation == "update"
+            and self.care_preferences is not None
+        ):
+            self.care_preferences.update_in_session(
+                session, participant_id, dict(payload.get("changes") or {})
+            )
+            return {"operation": "care_update"}
+        raise ValueError("unsupported personalization proposal")
+
+    def _execute_memory_in_session(
+        self,
+        session: Any,
+        participant_id: uuid.UUID,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        repository = self.memory.repository
+        if operation == "remember":
+            validated = self.memory.validate_explicit(
                 memory_type=str(payload.get("memory_type") or ""),
                 memory_subtype=(
                     str(payload["memory_subtype"])
@@ -201,30 +220,57 @@ class PersonalizationProposalService:
                 ),
                 content=str(payload.get("content") or ""),
             )
+            memory = repository.remember_in_session(
+                session,
+                participant_id,
+                memory_type=str(validated["memory_type"]),
+                content=str(validated["content"]),
+                normalized_content=str(validated["normalized_content"]),
+                conflict_key=validated.get("memory_subtype"),
+                source="user_explicit",
+                consent_basis="user_requested_memory",
+                confidence=1.0,
+            )
             return {"operation": "remember", "memory_id": memory["id"]}
         if operation == "replace":
-            memory = self.memory.replace(
-                participant_id,
-                uuid.UUID(str(payload.get("memory_id") or "")),
+            memory_id = uuid.UUID(str(payload.get("memory_id") or ""))
+            active = repository.get_active_in_session(
+                session, participant_id, memory_id
+            )
+            if active is None:
+                raise LookupError("memory not found")
+            validated = self.memory.validate_explicit(
+                memory_type=str(active["memory_type"]),
+                memory_subtype=active.get("conflict_key"),
                 content=str(payload.get("content") or ""),
+            )
+            memory = repository.replace_in_session(
+                session,
+                participant_id,
+                memory_id,
+                content=str(validated["content"]),
+                normalized_content=str(validated["normalized_content"]),
+                conflict_key=validated.get("memory_subtype"),
             )
             if memory is None:
                 raise LookupError("memory not found")
             return {"operation": "replace", "memory_id": memory["id"]}
         if operation == "delete":
-            deleted = self.memory.delete(
-                participant_id, uuid.UUID(str(payload.get("memory_id") or ""))
+            deleted = repository.delete_in_session(
+                session,
+                participant_id,
+                uuid.UUID(str(payload.get("memory_id") or "")),
             )
             if not deleted:
                 raise LookupError("memory not found")
             return {"operation": "delete", "deleted_count": 1}
         if operation == "clear":
-            deleted = 0
-            for item in list(payload.get("items") or []):
-                if self.memory.delete(
-                    participant_id,
-                    uuid.UUID(str(dict(item).get("memory_id") or "")),
-                ):
-                    deleted += 1
+            memory_ids = [
+                uuid.UUID(str(dict(item).get("memory_id") or ""))
+                for item in list(payload.get("items") or [])
+            ]
+            deleted = repository.clear_exact_in_session(
+                session, participant_id, memory_ids
+            )
             return {"operation": "clear", "deleted_count": deleted}
         raise ValueError("unsupported memory proposal")

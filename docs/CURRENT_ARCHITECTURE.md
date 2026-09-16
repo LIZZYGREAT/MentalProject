@@ -95,6 +95,11 @@ Agent-facing Memory remember/replace/delete/clear 和 interaction/support prefer
 统一写入有 TTL 的 `PersonalizationProposal` 并生成固定审核卡。卡片只携带 proposal id，
 原参与者确认后才由 deterministic executor 调用相应 service；取消审核不改变耐久状态。
 Memory Center 与 Settings 表单本身是用户提交入口，因此继续作为直接 CardAction executor。
+Personalization 确认使用单一数据库事务：先锁定 participant-bound proposal，在同一 session
+内完整应用 Memory、interaction/support 或 Care Preference effect，再把 proposal 写为
+`confirmed` 后一次提交。Memory clear 锁定并处理审核时保存的 exact IDs；任一目标失效或
+terminal status 前发生异常时整笔回滚，proposal 保持可重试，不能出现部分删除或 effect 已
+提交但 proposal 卡在 `executing` 的状态。并发确认通过 proposal 行锁保证只有一个执行者。
 
 Course Schedule 的 Draft correction 与 pending-draft cancel 属于 `draft_write`，不经过
 MutationIntent verifier，且不会写 Calendar。已完成/部分完成导入的 provider revert 使用

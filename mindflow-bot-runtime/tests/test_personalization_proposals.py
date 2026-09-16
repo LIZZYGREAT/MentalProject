@@ -1,7 +1,11 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from types import SimpleNamespace
+import threading
 import uuid
+
+import pytest
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
@@ -48,14 +52,17 @@ def _context(participant_id, text):
     )
 
 
-def _stack(database, *, verifier=None):
+def _stack(database, *, verifier=None, failpoint=None):
     memory = MemoryService(ParticipantMemoryRepository(database))
     preferences = InteractionPreferenceService(
         InteractionPreferenceRepository(database),
         SupportPreferenceRepository(database),
     )
     proposals = PersonalizationProposalService(
-        PersonalizationProposalRepository(database), memory, preferences
+        PersonalizationProposalRepository(database),
+        memory,
+        preferences,
+        confirmed_effect_failpoint=failpoint,
     )
     outbox = PresentationOutbox()
     registry = ToolRegistry(mutation_verifier=verifier)
@@ -71,7 +78,7 @@ def _stack(database, *, verifier=None):
     return memory, preferences, proposals, outbox, registry, actions
 
 
-def _care_stack(database, *, verifier=None):
+def _care_stack(database, *, verifier=None, failpoint=None):
     memory = MemoryService(ParticipantMemoryRepository(database))
     preferences = InteractionPreferenceService(
         InteractionPreferenceRepository(database),
@@ -87,6 +94,7 @@ def _care_stack(database, *, verifier=None):
         memory,
         preferences,
         care_preferences,
+        confirmed_effect_failpoint=failpoint,
     )
     outbox = PresentationOutbox()
     registry = ToolRegistry(mutation_verifier=verifier)
@@ -107,7 +115,7 @@ def _care_stack(database, *, verifier=None):
         care_preferences=care_preferences,
         personalization_proposals=proposals,
     )
-    return care_preferences, outbox, registry, actions
+    return care_preferences, proposals, outbox, registry, actions
 
 
 def _action(card, name):
@@ -225,7 +233,7 @@ def test_care_preference_change_uses_compact_review_card_before_update():
     database = memory_database()
     owner = participant(database, "CARE-PREFERENCE-PROPOSAL")
     verifier = _FailIfCalledVerifier()
-    care_preferences, outbox, registry, actions = _care_stack(
+    care_preferences, _proposals, outbox, registry, actions = _care_stack(
         database, verifier=verifier
     )
     ctx = _context(owner.id, "早报改到八点半，晚上十一点后不要打扰")
@@ -274,7 +282,7 @@ def test_care_preference_change_uses_compact_review_card_before_update():
 def test_care_preference_review_cancel_persists_nothing():
     database = memory_database()
     owner = participant(database, "CARE-PREFERENCE-CANCEL")
-    care_preferences, outbox, registry, actions = _care_stack(database)
+    care_preferences, _proposals, outbox, registry, actions = _care_stack(database)
     ctx = _context(owner.id, "关闭支持性跟进")
 
     asyncio.run(registry.execute(
@@ -335,3 +343,200 @@ def test_agent_personalization_writes_are_proposal_stage_only():
     ):
         assert specs[name].effect == "proposal_stage"
         assert specs[name].authorization_requirement == "none"
+
+
+def test_personalization_confirm_is_atomic():
+    database = memory_database()
+    owner = participant(database, "PERSONALIZATION-ATOMIC")
+    memory, _preferences, proposals, outbox, registry, _actions = _stack(database)
+    ctx = _context(owner.id, "记住我要原子地完成项目")
+    asyncio.run(registry.execute(
+        ctx,
+        "memory_remember_explicit",
+        {"memory_type": "goal", "content": "原子地完成项目"},
+    ))
+    card = outbox.take_cards(ctx.agent_run_id)[0]
+    proposal_id = _action(card, "personalization_proposal_confirm")["proposal_id"]
+
+    result = proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert result["ok"] is True
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal_id
+    )["status"] == "confirmed"
+    assert [item["content"] for item in memory.list(owner.id)] == [
+        "原子地完成项目"
+    ]
+
+
+def test_personalization_effect_rolls_back_if_terminal_status_cannot_commit():
+    def fail_before_terminal():
+        raise RuntimeError("injected terminal-status failure")
+
+    database = memory_database()
+    owner = participant(database, "PERSONALIZATION-ROLLBACK")
+    memory, _preferences, proposals, outbox, registry, _actions = _stack(
+        database, failpoint=fail_before_terminal
+    )
+    ctx = _context(owner.id, "记住这个事务测试")
+    asyncio.run(registry.execute(
+        ctx,
+        "memory_remember_explicit",
+        {"memory_type": "context", "content": "这个事务测试"},
+    ))
+    card = outbox.take_cards(ctx.agent_run_id)[0]
+    proposal_id = _action(card, "personalization_proposal_confirm")["proposal_id"]
+
+    with pytest.raises(RuntimeError, match="terminal-status failure"):
+        proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert memory.list(owner.id) == []
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal_id
+    )["status"] == "awaiting_confirmation"
+    proposals.confirmed_effect_failpoint = None
+    assert proposals.resolve(owner.id, proposal_id, confirmed=True)["ok"] is True
+    assert [item["content"] for item in memory.list(owner.id)] == [
+        "这个事务测试"
+    ]
+
+
+def test_memory_clear_is_all_or_nothing():
+    def fail_before_terminal():
+        raise RuntimeError("injected clear failure")
+
+    database = memory_database()
+    owner = participant(database, "MEMORY-CLEAR-ATOMIC")
+    memory, _preferences, proposals, outbox, registry, _actions = _stack(
+        database, failpoint=fail_before_terminal
+    )
+    for index in range(10):
+        memory.remember_explicit(
+            owner.id,
+            memory_type="context",
+            content=f"待清理记忆 {index}",
+        )
+    ctx = _context(owner.id, "清空全部长期记忆")
+    asyncio.run(registry.execute(ctx, "memory_clear_all", {}))
+    card = outbox.take_cards(ctx.agent_run_id)[0]
+    proposal_id = _action(card, "personalization_proposal_confirm")["proposal_id"]
+
+    with pytest.raises(RuntimeError, match="clear failure"):
+        proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert len(memory.list(owner.id)) == 10
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal_id
+    )["status"] == "awaiting_confirmation"
+    proposals.confirmed_effect_failpoint = None
+    result = proposals.resolve(owner.id, proposal_id, confirmed=True)
+    assert result["deleted_count"] == 10
+    assert memory.list(owner.id) == []
+
+
+def test_interaction_preference_rolls_back_with_proposal_terminal_failure():
+    def fail_before_terminal():
+        raise RuntimeError("injected preference failure")
+
+    database = memory_database()
+    owner = participant(database, "PREFERENCE-ATOMIC-ROLLBACK")
+    _memory, preferences, proposals, outbox, registry, _actions = _stack(
+        database, failpoint=fail_before_terminal
+    )
+    ctx = _context(owner.id, "以后回答简短一点")
+    asyncio.run(registry.execute(
+        ctx, "interaction_preferences_update", {"verbosity": "concise"}
+    ))
+    proposal_id = _action(
+        outbox.take_cards(ctx.agent_run_id)[0],
+        "personalization_proposal_confirm",
+    )["proposal_id"]
+
+    with pytest.raises(RuntimeError, match="preference failure"):
+        proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert preferences.get(owner.id)["verbosity"] == "balanced"
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal_id
+    )["status"] == "awaiting_confirmation"
+
+
+def test_care_preference_rolls_back_with_proposal_terminal_failure():
+    def fail_before_terminal():
+        raise RuntimeError("injected care preference failure")
+
+    database = memory_database()
+    owner = participant(database, "CARE-PREFERENCE-ATOMIC-ROLLBACK")
+    care_preferences, proposals, outbox, registry, _actions = _care_stack(
+        database, failpoint=fail_before_terminal
+    )
+    ctx = _context(owner.id, "关闭支持性跟进")
+    asyncio.run(registry.execute(
+        ctx, "care_update_preferences", {"allow_follow_up": False}
+    ))
+    proposal_id = _action(
+        outbox.take_cards(ctx.agent_run_id)[0],
+        "personalization_proposal_confirm",
+    )["proposal_id"]
+
+    with pytest.raises(RuntimeError, match="care preference failure"):
+        proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert care_preferences.get(owner.id)["allow_follow_up"] is True
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal_id
+    )["status"] == "awaiting_confirmation"
+
+
+def test_duplicate_personalization_confirm_executes_once():
+    database = memory_database()
+    owner = participant(database, "PERSONALIZATION-DUPLICATE")
+    memory, _preferences, proposals, outbox, registry, _actions = _stack(database)
+    ctx = _context(owner.id, "记住只执行一次")
+    asyncio.run(registry.execute(
+        ctx,
+        "memory_remember_explicit",
+        {"memory_type": "context", "content": "只执行一次"},
+    ))
+    proposal_id = _action(
+        outbox.take_cards(ctx.agent_run_id)[0],
+        "personalization_proposal_confirm",
+    )["proposal_id"]
+
+    first = proposals.resolve(owner.id, proposal_id, confirmed=True)
+    second = proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    assert first["ok"] is True
+    assert second["error"] == "personalization_proposal_already_resolved"
+    assert len(memory.list(owner.id)) == 1
+
+
+def test_concurrent_personalization_confirm_executes_once():
+    database = memory_database()
+    owner = participant(database, "PERSONALIZATION-CONCURRENT")
+    memory, _preferences, proposals, outbox, registry, _actions = _stack(database)
+    ctx = _context(owner.id, "记住并发只执行一次")
+    asyncio.run(registry.execute(
+        ctx,
+        "memory_remember_explicit",
+        {"memory_type": "context", "content": "并发只执行一次"},
+    ))
+    proposal_id = _action(
+        outbox.take_cards(ctx.agent_run_id)[0],
+        "personalization_proposal_confirm",
+    )["proposal_id"]
+    barrier = threading.Barrier(2)
+
+    def confirm():
+        barrier.wait(timeout=5)
+        return proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: confirm(), range(2)))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    assert sum(
+        result.get("error") == "personalization_proposal_already_resolved"
+        for result in results
+    ) == 1
+    assert len(memory.list(owner.id)) == 1

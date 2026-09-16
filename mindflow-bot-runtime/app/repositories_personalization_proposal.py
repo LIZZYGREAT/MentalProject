@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.db import Database
 from app.models import Participant, PersonalizationProposal, utc_now
@@ -74,19 +75,26 @@ class PersonalizationProposalRepository:
             ).scalar_one_or_none()
             return self._view(row) if row is not None else None
 
-    def claim(
+    def resolve_confirmed_atomically(
         self,
         participant_id: uuid.UUID,
         proposal_id: uuid.UUID | str,
         *,
-        confirmed: bool,
+        execute: Callable[[Session, dict[str, Any]], dict[str, Any]],
+        before_terminal_status: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        """Apply one local effect and terminalize its proposal in one commit."""
+
+        try:
+            parsed_id = uuid.UUID(str(proposal_id))
+        except ValueError:
+            return {"ok": False, "error": "personalization_proposal_not_found"}
         now = utc_now()
         with self.database.session() as session:
             row = session.execute(
                 select(PersonalizationProposal)
                 .where(
-                    PersonalizationProposal.id == uuid.UUID(str(proposal_id)),
+                    PersonalizationProposal.id == parsed_id,
                     PersonalizationProposal.participant_id == participant_id,
                 )
                 .with_for_update()
@@ -108,45 +116,64 @@ class PersonalizationProposalRepository:
                     "error": "personalization_proposal_expired",
                     "status": "expired",
                 }
-            if not confirmed:
-                row.status = "cancelled"
-                row.result_json = {"persisted": False}
-                row.updated_at = now
-                row.resolved_at = now
-                return {
-                    "ok": True,
-                    "status": "cancelled",
-                    "persisted": False,
-                }
-            row.status = "executing"
+            result = dict(execute(session, self._view(row)))
+            if before_terminal_status is not None:
+                before_terminal_status()
+            row.status = "confirmed"
+            row.result_json = result
+            row.error_code = None
             row.updated_at = now
-            return {"ok": True, "status": "executing", "proposal": self._view(row)}
+            row.resolved_at = now
+            session.flush()
+            return {"ok": True, "status": "confirmed", **result}
 
-    def complete(
+    def cancel(
         self,
         participant_id: uuid.UUID,
         proposal_id: uuid.UUID | str,
-        result: dict[str, Any],
     ) -> dict[str, Any]:
+        try:
+            parsed_id = uuid.UUID(str(proposal_id))
+        except ValueError:
+            return {"ok": False, "error": "personalization_proposal_not_found"}
         now = utc_now()
         with self.database.session() as session:
             row = session.execute(
                 select(PersonalizationProposal)
                 .where(
-                    PersonalizationProposal.id == uuid.UUID(str(proposal_id)),
+                    PersonalizationProposal.id == parsed_id,
                     PersonalizationProposal.participant_id == participant_id,
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is None or row.status != "executing":
-                raise RuntimeError("personalization proposal execution state changed")
-            row.status = "confirmed"
-            row.result_json = dict(result)
+            if row is None:
+                return {"ok": False, "error": "personalization_proposal_not_found"}
+            if row.status != "awaiting_confirmation":
+                return {
+                    "ok": False,
+                    "error": "personalization_proposal_already_resolved",
+                    "status": row.status,
+                }
+            if _aware(row.expires_at) <= now:
+                row.status = "expired"
+                row.updated_at = now
+                row.resolved_at = now
+                return {
+                    "ok": False,
+                    "error": "personalization_proposal_expired",
+                    "status": "expired",
+                }
+            row.status = "cancelled"
+            row.result_json = {"persisted": False}
             row.updated_at = now
             row.resolved_at = now
-            return self._view(row)
+            return {
+                "ok": True,
+                "status": "cancelled",
+                "persisted": False,
+            }
 
-    def fail(
+    def fail_pending(
         self,
         participant_id: uuid.UUID,
         proposal_id: uuid.UUID | str,
@@ -162,7 +189,7 @@ class PersonalizationProposalRepository:
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is not None and row.status == "executing":
+            if row is not None and row.status == "awaiting_confirmation":
                 row.status = "failed"
                 row.error_code = str(error_code)[:128]
                 row.updated_at = now

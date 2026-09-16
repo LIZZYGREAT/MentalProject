@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.db import Database
 from app.models import (
@@ -152,42 +153,59 @@ class ParticipantCarePreferenceRepository:
         changed_at = _aware(now or utc_now())
         self._validate_change_fields(changes)
         with self.database.session() as session:
-            participant = session.get(
-                Participant, participant_id, with_for_update=True
+            return self.update_in_session(
+                session,
+                participant_id,
+                changes,
+                now=changed_at,
             )
-            if participant is None:
-                raise ValueError("participant does not exist")
-            row = session.get(
-                ParticipantCarePreference, participant_id, with_for_update=True
+
+    def update_in_session(
+        self,
+        session: Session,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        changed_at = _aware(now or utc_now())
+        self._validate_change_fields(changes)
+        participant = session.get(
+            Participant, participant_id, with_for_update=True
+        )
+        if participant is None:
+            raise ValueError("participant does not exist")
+        row = session.get(
+            ParticipantCarePreference, participant_id, with_for_update=True
+        )
+        created_preference = row is None
+        if row is None:
+            row = ParticipantCarePreference(
+                participant_id=participant_id,
+                version=0,
             )
-            created_preference = row is None
-            if row is None:
-                row = ParticipantCarePreference(
-                    participant_id=participant_id,
-                    version=0,
-                )
-                session.add(row)
-                session.flush()
-            before = self._view(row)
-            self._apply_changes(row, changes)
-            after_values = self._view(row)
-            material_keys = (
-                CARE_PREFERENCE_CHANGE_FIELDS - {"reenable_intervention_types"}
-            ) | {"disabled_intervention_types"}
-            if (
-                (created_preference and bool(changes))
-                or any(
-                    before.get(key) != after_values.get(key)
-                    for key in material_keys
-                )
-            ):
-                row.version = int(row.version or 0) + 1
-                row.updated_at = changed_at
-            self._cancel_disallowed_in_session(
-                session, participant_id, row, now=changed_at
-            )
+            session.add(row)
             session.flush()
-            return self._view(row)
+        before = self._view(row)
+        self._apply_changes(row, changes)
+        after_values = self._view(row)
+        material_keys = (
+            CARE_PREFERENCE_CHANGE_FIELDS - {"reenable_intervention_types"}
+        ) | {"disabled_intervention_types"}
+        if (
+            (created_preference and bool(changes))
+            or any(
+                before.get(key) != after_values.get(key)
+                for key in material_keys
+            )
+        ):
+            row.version = int(row.version or 0) + 1
+            row.updated_at = changed_at
+        self._cancel_disallowed_in_session(
+            session, participant_id, row, now=changed_at
+        )
+        session.flush()
+        return self._view(row)
 
     def validate_changes(
         self,

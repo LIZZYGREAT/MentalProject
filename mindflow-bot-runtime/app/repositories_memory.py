@@ -7,6 +7,7 @@ import re
 import uuid
 
 from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
 
 from app.db import Database
 from app.models import ParticipantMemoryItem, utc_now
@@ -52,29 +53,54 @@ class ParticipantMemoryRepository:
         self.database = database
 
     def remember(self, participant_id: uuid.UUID, *, memory_type: str, content: str, normalized_content: str, conflict_key: str | None, source: str, consent_basis: str, confidence: float = 1.0) -> dict:
-        now = utc_now()
         with self.database.session() as session:
-            row = ParticipantMemoryItem(
-                participant_id=participant_id, memory_type=memory_type,
-                content=content, normalized_content=normalized_content,
-                conflict_key=conflict_key, source=source,
-                consent_basis=consent_basis, confidence=confidence,
-                status="active", created_at=now, updated_at=now,
+            return self.remember_in_session(
+                session,
+                participant_id,
+                memory_type=memory_type,
+                content=content,
+                normalized_content=normalized_content,
+                conflict_key=conflict_key,
+                source=source,
+                consent_basis=consent_basis,
+                confidence=confidence,
             )
-            session.add(row)
-            session.flush()
-            if conflict_key:
-                old_rows = session.execute(select(ParticipantMemoryItem).where(
-                    ParticipantMemoryItem.participant_id == participant_id,
-                    ParticipantMemoryItem.status == "active",
-                    ParticipantMemoryItem.conflict_key == conflict_key,
-                    ParticipantMemoryItem.id != row.id,
-                ).with_for_update()).scalars().all()
-                for old in old_rows:
-                    old.status = "superseded"
-                    old.superseded_by = row.id
-                    old.updated_at = now
-            return self._view(row)
+
+    def remember_in_session(
+        self,
+        session: Session,
+        participant_id: uuid.UUID,
+        *,
+        memory_type: str,
+        content: str,
+        normalized_content: str,
+        conflict_key: str | None,
+        source: str,
+        consent_basis: str,
+        confidence: float = 1.0,
+    ) -> dict:
+        now = utc_now()
+        row = ParticipantMemoryItem(
+            participant_id=participant_id, memory_type=memory_type,
+            content=content, normalized_content=normalized_content,
+            conflict_key=conflict_key, source=source,
+            consent_basis=consent_basis, confidence=confidence,
+            status="active", created_at=now, updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        if conflict_key:
+            old_rows = session.execute(select(ParticipantMemoryItem).where(
+                ParticipantMemoryItem.participant_id == participant_id,
+                ParticipantMemoryItem.status == "active",
+                ParticipantMemoryItem.conflict_key == conflict_key,
+                ParticipantMemoryItem.id != row.id,
+            ).with_for_update()).scalars().all()
+            for old in old_rows:
+                old.status = "superseded"
+                old.superseded_by = row.id
+                old.updated_at = now
+        return self._view(row)
 
     def list_active(self, participant_id: uuid.UUID, *, limit: int = 50) -> list[dict]:
         with self.database.session() as session:
@@ -84,63 +110,115 @@ class ParticipantMemoryRepository:
             ).order_by(desc(ParticipantMemoryItem.updated_at)).limit(max(1, min(limit, 100)))).scalars().all()
             return [self._view(row) for row in rows]
 
+    def get_active_in_session(
+        self, session: Session, participant_id: uuid.UUID, memory_id: uuid.UUID
+    ) -> dict | None:
+        row = session.execute(select(ParticipantMemoryItem).where(
+            ParticipantMemoryItem.id == memory_id,
+            ParticipantMemoryItem.participant_id == participant_id,
+            ParticipantMemoryItem.status == "active",
+        ).with_for_update()).scalar_one_or_none()
+        return self._view(row) if row is not None else None
+
     def delete(self, participant_id: uuid.UUID, memory_id: uuid.UUID) -> bool:
         with self.database.session() as session:
-            row = session.execute(select(ParticipantMemoryItem).where(
-                ParticipantMemoryItem.id == memory_id,
-                ParticipantMemoryItem.participant_id == participant_id,
-                ParticipantMemoryItem.status == "active",
-            ).with_for_update()).scalar_one_or_none()
-            if row is None:
-                return False
-            row.status = "deleted"
-            row.updated_at = utc_now()
-            return True
+            return self.delete_in_session(session, participant_id, memory_id)
+
+    def delete_in_session(
+        self, session: Session, participant_id: uuid.UUID, memory_id: uuid.UUID
+    ) -> bool:
+        row = session.execute(select(ParticipantMemoryItem).where(
+            ParticipantMemoryItem.id == memory_id,
+            ParticipantMemoryItem.participant_id == participant_id,
+            ParticipantMemoryItem.status == "active",
+        ).with_for_update()).scalar_one_or_none()
+        if row is None:
+            return False
+        row.status = "deleted"
+        row.updated_at = utc_now()
+        return True
 
     def replace(self, participant_id: uuid.UUID, memory_id: uuid.UUID, *, content: str, normalized_content: str, conflict_key: str | None) -> dict | None:
-        now = utc_now()
         with self.database.session() as session:
-            old = session.execute(select(ParticipantMemoryItem).where(
-                ParticipantMemoryItem.id == memory_id,
+            return self.replace_in_session(
+                session,
+                participant_id,
+                memory_id,
+                content=content,
+                normalized_content=normalized_content,
+                conflict_key=conflict_key,
+            )
+
+    def replace_in_session(
+        self,
+        session: Session,
+        participant_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        *,
+        content: str,
+        normalized_content: str,
+        conflict_key: str | None,
+    ) -> dict | None:
+        now = utc_now()
+        old = session.execute(select(ParticipantMemoryItem).where(
+            ParticipantMemoryItem.id == memory_id,
+            ParticipantMemoryItem.participant_id == participant_id,
+            ParticipantMemoryItem.status == "active",
+        ).with_for_update()).scalar_one_or_none()
+        if old is None:
+            return None
+        row = ParticipantMemoryItem(
+            participant_id=participant_id, memory_type=old.memory_type,
+            content=content, normalized_content=normalized_content,
+            conflict_key=conflict_key, source="user_explicit",
+            consent_basis="user_requested_memory", confidence=1.0,
+            status="active", created_at=now, updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        superseded = [old]
+        if conflict_key:
+            superseded.extend(session.execute(select(ParticipantMemoryItem).where(
                 ParticipantMemoryItem.participant_id == participant_id,
                 ParticipantMemoryItem.status == "active",
-            ).with_for_update()).scalar_one_or_none()
-            if old is None:
-                return None
-            row = ParticipantMemoryItem(
-                participant_id=participant_id, memory_type=old.memory_type,
-                content=content, normalized_content=normalized_content,
-                conflict_key=conflict_key, source="user_explicit",
-                consent_basis="user_requested_memory", confidence=1.0,
-                status="active", created_at=now, updated_at=now,
-            )
-            session.add(row)
-            session.flush()
-            superseded = [old]
-            if conflict_key:
-                superseded.extend(session.execute(select(ParticipantMemoryItem).where(
-                    ParticipantMemoryItem.participant_id == participant_id,
-                    ParticipantMemoryItem.status == "active",
-                    ParticipantMemoryItem.conflict_key == conflict_key,
-                    ParticipantMemoryItem.id.not_in((old.id, row.id)),
-                ).with_for_update()).scalars().all())
-            for previous in superseded:
-                previous.status = "superseded"
-                previous.superseded_by = row.id
-                previous.updated_at = now
-            return self._view(row)
+                ParticipantMemoryItem.conflict_key == conflict_key,
+                ParticipantMemoryItem.id.not_in((old.id, row.id)),
+            ).with_for_update()).scalars().all())
+        for previous in superseded:
+            previous.status = "superseded"
+            previous.superseded_by = row.id
+            previous.updated_at = now
+        return self._view(row)
 
     def clear_all(self, participant_id: uuid.UUID) -> int:
         with self.database.session() as session:
-            rows = session.execute(select(ParticipantMemoryItem).where(
+            rows = session.execute(select(ParticipantMemoryItem.id).where(
                 ParticipantMemoryItem.participant_id == participant_id,
                 ParticipantMemoryItem.status == "active",
-            ).with_for_update()).scalars().all()
-            now = utc_now()
-            for row in rows:
-                row.status = "deleted"
-                row.updated_at = now
-            return len(rows)
+            )).scalars().all()
+            return self.clear_exact_in_session(session, participant_id, rows)
+
+    def clear_exact_in_session(
+        self,
+        session: Session,
+        participant_id: uuid.UUID,
+        memory_ids: list[uuid.UUID],
+    ) -> int:
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return 0
+        rows = session.execute(select(ParticipantMemoryItem).where(
+            ParticipantMemoryItem.participant_id == participant_id,
+            ParticipantMemoryItem.id.in_(unique_ids),
+            ParticipantMemoryItem.status == "active",
+        ).with_for_update()).scalars().all()
+        if len(rows) != len(unique_ids):
+            raise LookupError("one or more reviewed memories are no longer active")
+        now = utc_now()
+        for row in rows:
+            row.status = "deleted"
+            row.updated_at = now
+        return len(rows)
 
     def retrieve(self, participant_id: uuid.UUID, *, query: str, limit: int = 5, max_chars: int = 1200) -> list[dict]:
         query = str(query).strip()
