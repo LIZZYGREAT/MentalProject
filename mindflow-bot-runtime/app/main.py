@@ -154,6 +154,7 @@ def _build_card_action_handler(
     sender: Any = None,
     incidents: Any = None,
     receipts: Any = None,
+    backend_state_events: Any = None,
 ) -> Any:
     """Compatibility constructor composed from executor and WS delivery."""
 
@@ -161,7 +162,7 @@ def _build_card_action_handler(
         from app.card_actions.delivery import build_card_action_delivery
 
         executor = _build_card_action_handler(
-            identity, card_actions, None, incidents, receipts
+            identity, card_actions, None, incidents, receipts, backend_state_events
         )
         return build_card_action_delivery(executor, sender, incidents)
 
@@ -495,6 +496,45 @@ def _build_card_action_handler(
             business_latency_ms=(time.monotonic() - business_started) * 1000,
         )
 
+        backend_state_update = result.get("backend_state_update")
+        if (
+            backend_state_events is not None
+            and not navigation_only
+            and isinstance(backend_state_update, dict)
+        ):
+            try:
+                backend_state_events.append(
+                    participant.id,
+                    backend_state_update,
+                )
+            except Exception as exc:
+                # The business effect is already committed. Preserve that
+                # truth and make the missing continuity fact observable rather
+                # than rolling back or hiding the completed action.
+                logging.getLogger(__name__).exception(
+                    "backend_state_event_append_failed event_id=%s participant_id=%s",
+                    event.event_id,
+                    participant.id,
+                )
+                if incidents is not None:
+                    try:
+                        incidents.record(
+                            severity="error",
+                            subsystem="agent_state_continuity",
+                            event_name="backend_state_event_append_failed",
+                            summary="Committed CardAction state could not be added to the Agent continuity ledger.",
+                            participant_id=participant.id,
+                            bot_event_id=event.event_id,
+                            error_code="backend_state_event_append_failed",
+                            error_class=type(exc).__name__,
+                            details={"action_name": safe_action_name(event)},
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "backend_state_event_incident_record_failed event_id=%s",
+                            event.event_id,
+                        )
+
         card = result.get("card")
         if not isinstance(card, dict) or not card:
             card = card_action_result_card(
@@ -673,11 +713,12 @@ def _build_card_action_executor(
     card_actions: Any,
     incidents: Any = None,
     receipts: Any = None,
+    backend_state_events: Any = None,
 ) -> Any:
     """Build the transport-agnostic identity/business/idempotency executor."""
 
     return _build_card_action_handler(
-        identity, card_actions, None, incidents, receipts
+        identity, card_actions, None, incidents, receipts, backend_state_events
     )
 
 
@@ -747,6 +788,7 @@ async def run() -> None:
         AgentRunRepository, BindingRepository, BotEventRepository,
         ClaudeSessionRepository, ParticipantRepository, RuntimeIncidentRepository,
     )
+    from app.repositories_agent_state import ParticipantAgentStateEventRepository
     from app.services.forecast_scheduler import ForecastScheduler
     from app.services.daily_review_scheduler import DailyReviewScheduler
     from app.services.morning_brief_scheduler import MorningBriefScheduler
@@ -890,8 +932,13 @@ async def run() -> None:
     card_action_receipts = CardActionReceiptRepository(
         database, ttl_hours=settings.card_action_receipt_ttl_hours
     )
+    backend_state_events = ParticipantAgentStateEventRepository(database)
     execute_card_action = _build_card_action_executor(
-        identity, business.card_actions, incidents, card_action_receipts
+        identity,
+        business.card_actions,
+        incidents,
+        card_action_receipts,
+        backend_state_events,
     )
     from app.card_actions.delivery import build_card_action_delivery
 
@@ -958,6 +1005,7 @@ async def run() -> None:
         memory_service=business.memory,
         interaction_preferences=business.interaction_preferences,
         psychological_context_builder=business.psychological_context,
+        backend_state_events=backend_state_events,
     )
     business.course_schedule_tools.recent_image_importer = (
         worker.import_recent_schedule_image

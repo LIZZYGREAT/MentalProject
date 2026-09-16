@@ -428,6 +428,7 @@ class BotWorker:
         memory_service: Any = None,
         interaction_preferences: Any = None,
         psychological_context_builder: Any = None,
+        backend_state_events: Any = None,
     ):
         self.queue = queue
         self.identity = identity
@@ -449,6 +450,7 @@ class BotWorker:
         self.memory_service = memory_service
         self.interaction_preferences = interaction_preferences
         self.psychological_context_builder = psychological_context_builder
+        self.backend_state_events = backend_state_events
         self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
         self.presentations = presentations
@@ -2323,6 +2325,33 @@ class BotWorker:
         )
         if not (psychological or {}).get("features"):
             psychological = None
+        backend_state_updates: tuple[Mapping[str, str], ...] = ()
+        backend_state_cursor: str | None = None
+        if self.backend_state_events is not None:
+            try:
+                rows, backend_state_cursor = await asyncio.to_thread(
+                    self.backend_state_events.pending_for_turn,
+                    ctx.participant_id,
+                )
+                backend_state_updates = tuple(
+                    {
+                        key: str(row.get(key) or "")
+                        for key in (
+                            "event_type",
+                            "resource_kind",
+                            "state",
+                            "summary",
+                        )
+                        if row.get(key) is not None
+                    }
+                    for row in rows
+                )
+            except Exception:
+                logger.warning(
+                    "backend_state_event_lookup_failed participant_id=%s",
+                    ctx.participant_id,
+                    exc_info=True,
+                )
         safe_memories = tuple(
             {"memory_type": row.get("memory_type"), "content": row.get("content")}
             for row in (memories or [])
@@ -2333,6 +2362,8 @@ class BotWorker:
             participant_memory=safe_memories,
             interaction_preferences=preferences,
             psychological_context=psychological,
+            backend_state_updates=backend_state_updates,
+            backend_state_event_cursor=backend_state_cursor,
         )
 
     async def _run_agent(

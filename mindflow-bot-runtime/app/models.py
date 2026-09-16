@@ -429,10 +429,40 @@ class ClaudeSession(Base):
     session_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     last_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_backend_state_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ParticipantAgentStateEvent(Base):
+    """Durable, participant-scoped facts committed by backend actions."""
+
+    __tablename__ = "participant_agent_state_events"
+    __table_args__ = (
+        Index("ix_agent_state_event_participant_created", "participant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
 
@@ -2388,6 +2418,43 @@ class ParticipantInteractionRule(Base):
     normalized_category: Mapped[str] = mapped_column(String(32), nullable=False)
     normalized_value: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantInteractionSemanticRule(Base):
+    """Participant-reviewed semantic communication rules.
+
+    These are deliberately separate from the legacy identity rule table so a
+    concrete communication preference cannot be collapsed into a style enum
+    or accidentally treated as durable memory.
+    """
+
+    __tablename__ = "participant_interaction_semantic_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('all_responses', 'explanations', 'technical_explanations', 'code_and_engineering')",
+            name="ck_semantic_rule_scope",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted')",
+            name="ck_semantic_rule_status",
+        ),
+        Index("ix_semantic_rule_active", "participant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    source_proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("personalization_proposals.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 

@@ -63,6 +63,7 @@ _INTERNAL_WRITE = {
     "morning_brief_time_update",
     "morning_brief_toggle",
     "preference_settings_save",
+    "interaction_preference_rule_delete",
     "personalization_proposal_cancel",
     "personalization_proposal_confirm",
     "reminder_proposal_cancel",

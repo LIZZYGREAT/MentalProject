@@ -227,6 +227,7 @@ class ClaudeSessionView:
     session_id: str
     status: str
     last_message_id: str | None
+    last_backend_state_event_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 
@@ -4098,6 +4099,7 @@ class ClaudeSessionRepository:
             session_id=row.session_id,
             status=row.status,
             last_message_id=row.last_message_id,
+            last_backend_state_event_id=row.last_backend_state_event_id,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -4113,6 +4115,7 @@ class ClaudeSessionRepository:
         session_id: str,
         *,
         last_message_id: Optional[str],
+        last_backend_state_event_id: uuid.UUID | str | None = None,
     ) -> ClaudeSessionView:
         value = str(session_id).strip()
         if not value:
@@ -4125,12 +4128,20 @@ class ClaudeSessionRepository:
                     session_id=value,
                     status="active",
                     last_message_id=last_message_id,
+                    last_backend_state_event_id=(
+                        uuid.UUID(str(last_backend_state_event_id))
+                        if last_backend_state_event_id else None
+                    ),
                 )
                 session.add(row)
             else:
                 row.session_id = value
                 row.status = "active"
                 row.last_message_id = last_message_id
+                if last_backend_state_event_id:
+                    row.last_backend_state_event_id = uuid.UUID(
+                        str(last_backend_state_event_id)
+                    )
                 row.updated_at = utc_now()
             session.flush()
             return self._view(row)

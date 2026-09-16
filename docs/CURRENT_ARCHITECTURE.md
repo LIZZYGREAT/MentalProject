@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0078_care_preference_proposals -->
+<!-- ALEMBIC_HEAD: 0080_agent_state_continuity -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -100,6 +100,18 @@ Personalization 确认使用单一数据库事务：先锁定 participant-bound 
 `confirmed` 后一次提交。Memory clear 锁定并处理审核时保存的 exact IDs；任一目标失效或
 terminal status 前发生异常时整笔回滚，proposal 保持可重试，不能出现部分删除或 effect 已
 提交但 proposal 卡在 `executing` 的状态。并发确认通过 proposal 行锁保证只有一个执行者。
+
+表达偏好中的基础 style 与语义沟通规则分开存储。`custom_rules` 只接受 Agent 已经理解的
+结构化 `{scope, instruction}`，最多三条 active rule；不再由 Backend 解析原始中文。规则与
+基础 style 一起进入同一个 Personalization 确认事务，Settings 卡展示具体规则并通过同样的
+proposal 流程删除/替换。确认后的规则只影响表达方式，不能改变安全、授权、工具、身份或
+隐私边界。
+
+CardAction 的确定性业务提交还会写入 participant-scoped 的
+`participant_agent_state_events` 账本。下一轮 Agent 从 Claude session 游标之后读取这些
+后端事实并通过独立的 `backend_state_updates` 通道注入；Agent turn 成功后才推进游标，失败、
+超时或取消则保留游标。账本不保存 callback token、原始卡片 JSON 或私密 payload，导航动作
+不产生事件；卡片 update 失败也不会遮蔽已经提交的业务事实。
 
 Course Schedule 的 Draft correction 与 pending-draft cancel 属于 `draft_write`，不经过
 MutationIntent verifier，且不会写 Calendar。已完成/部分完成导入的 provider revert 使用

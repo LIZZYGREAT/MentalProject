@@ -32,6 +32,10 @@ class AgentTurnInput:
     participant_memory: tuple[Mapping[str, Any], ...] = ()
     interaction_preferences: Mapping[str, Any] | None = None
     psychological_context: Mapping[str, Any] | None = None
+    # Durable backend facts committed by CardAction and not yet acknowledged
+    # by this participant's successful Agent session.
+    backend_state_updates: tuple[Mapping[str, str], ...] = ()
+    backend_state_event_cursor: str | None = None
     # Bounded, backend-owned short-term context injected only when a model
     # session cannot be resumed. It is neither durable Memory nor authority.
     recent_conversation_context: tuple[Mapping[str, str], ...] = ()

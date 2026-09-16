@@ -37,6 +37,7 @@ from app.integrations.feishu.cards import (
     memory_delete_confirmation_card,
     memory_detail_card,
     memory_edit_card,
+    personalization_proposal_confirmation_card,
     preference_settings_card,
     reminder_proposal_confirmation_card,
     reminder_proposal_edit_card,
@@ -343,6 +344,143 @@ class CardActionService:
         action_value: dict[str, Any] | None,
         form_value: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        """Handle a callback and expose a safe backend-state event directive."""
+
+        result = self._handle(
+            participant_id,
+            message_id=message_id,
+            chat_id=chat_id,
+            callback_event_id=callback_event_id,
+            action_value=action_value,
+            form_value=form_value,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        action_name = str((action_value or {}).get("mindflow_action") or "")
+        if result.get("navigation_only"):
+            return result
+        directive = self._backend_state_directive(
+            action_name, action_value or {}, result
+        )
+        return {**result, **({"backend_state_update": directive} if directive else {})}
+
+    @staticmethod
+    def _backend_state_directive(
+        action_name: str, action_value: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, str] | None:
+        """Return only opaque, participant-safe facts for the Agent ledger."""
+
+        direct_actions = {
+            "preference_settings_save": (
+                "interaction_preferences_updated", "interaction_preferences"
+            ),
+            "support_acknowledge_first": (
+                "support_preferences_updated", "support_preferences"
+            ),
+            "support_followup_disable": (
+                "support_preferences_updated", "support_preferences"
+            ),
+            "memory_clear_confirm": ("memory_cleared", "memory"),
+            "memory_delete_confirm": ("memory_deleted", "memory"),
+            "memory_edit_save": ("memory_updated", "memory"),
+            "submit_checkin": ("checkin_recorded", "checkin"),
+            "daily_review_submit": ("daily_review_recorded", "daily_review"),
+            "external_llm_consent_accept": (
+                "external_llm_consent_updated", "consent"
+            ),
+            "external_llm_consent_revoke": (
+                "external_llm_consent_updated", "consent"
+            ),
+        }
+        if action_name in {"personalization_proposal_confirm", "personalization_proposal_cancel"}:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "personalization_proposal_cancelled"
+                if state == "cancelled"
+                else "personalization_proposal_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "personalization_proposal",
+                "resource_id": str(action_value.get("proposal_id") or action_name)[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "设置审核结果已更新")[:240],
+            }
+        if action_name in {"reminder_proposal_confirm", "reminder_proposal_cancel"}:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "reminder_proposal_cancelled"
+                if state == "cancelled"
+                else "reminder_proposal_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "reminder_proposal",
+                "resource_id": str(action_value.get("proposal_id") or action_name)[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "提醒审核结果已更新")[:240],
+            }
+        if action_name in {
+            "calendar_mutation_plan_confirm",
+            "calendar_mutation_plan_cancel",
+            "calendar_delete_confirm",
+            "course_schedule_import_confirm",
+            "course_schedule_import_cancel",
+            "course_schedule_revert_confirm",
+        }:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "calendar_plan_cancelled"
+                if action_name == "calendar_mutation_plan_cancel" and state == "cancelled"
+                else "calendar_plan_queued"
+                if action_name == "calendar_mutation_plan_confirm"
+                else "course_import_revert_confirmed"
+                if action_name == "course_schedule_revert_confirm"
+                else "calendar_action_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "calendar_plan",
+                "resource_id": str(
+                    action_value.get("plan_id")
+                    or action_value.get("proposal_id")
+                    or action_value.get("import_id")
+                    or action_value.get("event_id")
+                    or action_value.get("item_id")
+                    or action_name
+                    or ""
+                )[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "日历操作状态已更新")[:240],
+            }
+        direct = direct_actions.get(action_name)
+        if direct is None:
+            return None
+        event_type, resource_kind = direct
+        return {
+            "event_type": event_type,
+            "resource_kind": resource_kind,
+            "resource_id": str(
+                result.get(f"{resource_kind}_id")
+                or action_value.get("memory_id")
+                or action_value.get("intervention_id")
+                or action_name
+                or ""
+            )[:64],
+            "state": "committed",
+            "summary": str(result.get("reply_text") or "后端状态已更新")[:240],
+        }
+
+    def _handle(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        message_id: str,
+        chat_id: str | None = None,
+        callback_event_id: str | None = None,
+        action_value: dict[str, Any] | None,
+        form_value: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
         from app.card_actions.registry import card_action_spec
@@ -529,6 +667,29 @@ class CardActionService:
                 **result,
                 "reply_text": reply_text,
                 "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {
+            "interaction_preference_rule_delete",
+        }:
+            if self.personalization_proposals is None:
+                raise RuntimeError("personalization proposals are unavailable")
+            try:
+                rule_id = uuid.UUID(str(action.get("rule_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_semantic_rule_id"}
+            try:
+                proposal = self.personalization_proposals.stage_preference_rule_delete(
+                    participant_id, rule_id=rule_id
+                )
+            except LookupError:
+                return {"ok": False, "error": "semantic_rule_not_found"}
+            return {
+                "ok": True,
+                "reply_text": "请确认是否删除这条沟通规则。",
+                "personalization_proposal": "pending_confirmation",
+                "confirmation_required": True,
+                "persisted": False,
+                "card": personalization_proposal_confirmation_card(proposal),
             }
         if action_name in {
             "personalization_proposal_confirm",

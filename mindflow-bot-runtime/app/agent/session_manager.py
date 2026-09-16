@@ -257,12 +257,40 @@ class ParticipantSessionManager:
                         client.run_turn(request.turn_input),
                         timeout=self.turn_timeout_seconds,
                     )
-                    await asyncio.to_thread(
-                        self.repository.save,
-                        session.participant_id,
-                        result.session_id,
-                        last_message_id=request.ctx.message_id,
-                    )
+                    save_kwargs = {
+                        "last_message_id": request.ctx.message_id,
+                        "last_backend_state_event_id": request.turn_input.backend_state_event_cursor
+                        or next(
+                            (
+                                item.get("event_id") or item.get("id")
+                                for item in reversed(
+                                    request.turn_input.backend_state_updates
+                                )
+                                if isinstance(item, dict)
+                                and (item.get("event_id") or item.get("id"))
+                            ),
+                            None,
+                        ),
+                    }
+                    try:
+                        await asyncio.to_thread(
+                            self.repository.save,
+                            session.participant_id,
+                            result.session_id,
+                            **save_kwargs,
+                        )
+                    except TypeError as exc:
+                        # Keep lightweight test doubles and older adapters
+                        # source-compatible while the durable repository rolls
+                        # out the state cursor.
+                        if "last_backend_state_event_id" not in str(exc):
+                            raise
+                        await asyncio.to_thread(
+                            self.repository.save,
+                            session.participant_id,
+                            result.session_id,
+                            last_message_id=request.ctx.message_id,
+                        )
                     self._recovery_needed.discard(session.participant_id)
                     if not request.future.done():
                         request.future.set_result(result)
