@@ -157,6 +157,11 @@ class Settings:
     web_read_url_max_redirects: int = 3
     web_read_url_max_extracted_chars: int = 60000
     web_read_url_cache_ttl_minutes: int = 30
+    public_video_enabled: bool = True
+    public_video_transcript_max_chars: int = 120000
+    public_video_transcript_cache_ttl_minutes: int = 60
+    public_video_timeout_seconds: float = 10.0
+    public_video_max_tool_reads: int = 6
     participant_diagnostics_allowlist: tuple[str, ...] = ()
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
@@ -468,6 +473,19 @@ class Settings:
             web_read_url_cache_ttl_minutes=_int(
                 values, "WEB_READ_URL_CACHE_TTL_MINUTES", 30, minimum=5
             ),
+            public_video_enabled=_bool(values, "PUBLIC_VIDEO_ENABLED", True),
+            public_video_transcript_max_chars=_int(
+                values, "PUBLIC_VIDEO_TRANSCRIPT_MAX_CHARS", 120000, minimum=1000
+            ),
+            public_video_transcript_cache_ttl_minutes=_int(
+                values, "PUBLIC_VIDEO_TRANSCRIPT_CACHE_TTL_MINUTES", 60, minimum=5
+            ),
+            public_video_timeout_seconds=_float(
+                values, "PUBLIC_VIDEO_TIMEOUT_SECONDS", 10.0, minimum=0.1
+            ),
+            public_video_max_tool_reads=_int(
+                values, "PUBLIC_VIDEO_MAX_TOOL_READS", 6, minimum=1
+            ),
             participant_diagnostics_allowlist=_allowlist(
                 values, "PARTICIPANT_DIAGNOSTICS_ALLOWLIST"
             ),
@@ -651,6 +669,14 @@ class Settings:
             raise ValueError("WEB_READ_URL_MAX_REDIRECTS must be <= 10")
         if self.web_read_url_cache_ttl_minutes > 120:
             raise ValueError("WEB_READ_URL_CACHE_TTL_MINUTES must be <= 120")
+        if self.public_video_transcript_max_chars > 500_000:
+            raise ValueError("PUBLIC_VIDEO_TRANSCRIPT_MAX_CHARS must be <= 500000")
+        if self.public_video_transcript_cache_ttl_minutes > 360:
+            raise ValueError(
+                "PUBLIC_VIDEO_TRANSCRIPT_CACHE_TTL_MINUTES must be <= 360"
+            )
+        if self.public_video_max_tool_reads > 20:
+            raise ValueError("PUBLIC_VIDEO_MAX_TOOL_READS must be <= 20")
         if self.web_search_enabled and not self.deepseek_api_key:
             raise ValueError(
                 "DEEPSEEK_API_KEY is required when web search is enabled"

@@ -314,8 +314,9 @@ class ToolRegistry:
         if name in self._tools:
             raise ValueError(f"duplicate tool: {name}")
         forbidden = _schema_fields(parameters) & FORBIDDEN_FIELDS
-        if name == "web_read_url":
-            # This single reviewed read-only tool necessarily accepts a URL.
+        if name in {"web_read_url", "video_inspect_url"}:
+            # These reviewed read-only tools necessarily accept a URL.  Their
+            # handlers apply the HTTPS/credential/secret-query/SSRF gate.
             # The handler applies the HTTPS/credential/secret-query/SSRF gate;
             # URL remains forbidden for every other tool schema.
             forbidden.discard("url")

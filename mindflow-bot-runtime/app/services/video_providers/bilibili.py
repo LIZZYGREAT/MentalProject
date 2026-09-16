@@ -44,11 +44,13 @@ class BilibiliVideoAdapter:
         api_base_url: str = "https://api.bilibili.com",
         api_max_bytes: int = 512 * 1024,
         transcript_max_chars: int = 120_000,
+        timeout_seconds: float = 10.0,
     ) -> None:
         self.public_transport = public_transport
         self.api_base_url = validate_public_https_url(api_base_url).rstrip("/")
         self.api_max_bytes = max(16 * 1024, int(api_max_bytes))
         self.transcript_max_chars = max(1_000, int(transcript_max_chars))
+        self.timeout_seconds = max(0.1, float(timeout_seconds))
         self._metadata_payloads: dict[str, dict[str, Any]] = {}
 
     def can_handle(self, url: str) -> bool:
@@ -126,7 +128,9 @@ class BilibiliVideoAdapter:
             raw_url = "https:" + raw_url
         try:
             fetched = await self.public_transport.fetch_public_url(
-                raw_url, max_bytes=self.api_max_bytes
+                raw_url,
+                max_bytes=self.api_max_bytes,
+                timeout_seconds=self.timeout_seconds,
             )
         except PublicWebReadError as exc:
             raise VideoProviderError("subtitle_fetch_failed") from exc
@@ -245,7 +249,9 @@ class BilibiliVideoAdapter:
     async def _read_json(self, url: str) -> dict[str, Any]:
         try:
             fetched = await self.public_transport.fetch_public_url(
-                url, max_bytes=self.api_max_bytes
+                url,
+                max_bytes=self.api_max_bytes,
+                timeout_seconds=self.timeout_seconds,
             )
         except PublicWebReadError as exc:
             raise VideoProviderError("video_metadata_unavailable") from exc

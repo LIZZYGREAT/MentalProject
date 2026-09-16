@@ -37,6 +37,7 @@ from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
 from app.repositories_web_document import WebDocumentRepository
+from app.repositories_public_video import PublicVideoRepository
 from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_preferences import InteractionPreferenceRepository
 from app.repositories_personalization_proposal import (
@@ -89,6 +90,7 @@ from app.tools.care import CareTools
 from app.tools.course_schedule import CourseScheduleTools
 from app.tools.reminder import ReminderTools
 from app.tools.web import WebTools
+from app.tools.video import VideoTools
 from app.tools.memory import MemoryTools
 from app.tools.preferences import InteractionPreferenceTools
 from app.tools.research import ResearchTools
@@ -105,6 +107,8 @@ from app.services.web_search_service import (
     WebSearchService,
 )
 from app.services.public_web_document_service import PublicWebDocumentService
+from app.services.public_video_service import PublicVideoService
+from app.services.video_providers.bilibili import BilibiliVideoAdapter
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -152,6 +156,7 @@ class BusinessServices:
     followup_candidates: CareFollowupCandidateRepository
     web_search: WebSearchService
     public_web_documents: PublicWebDocumentService
+    public_videos: PublicVideoService
     memory: MemoryService
     interaction_preferences: InteractionPreferenceService
     personalization_proposals: PersonalizationProposalService
@@ -256,6 +261,22 @@ def build_business_services(
         max_redirects=settings.web_read_url_max_redirects,
         max_extracted_chars=settings.web_read_url_max_extracted_chars,
         cache_ttl_minutes=settings.web_read_url_cache_ttl_minutes,
+    )
+    public_videos = PublicVideoService(
+        PublicVideoRepository(
+            database,
+            ttl_minutes=settings.public_video_transcript_cache_ttl_minutes,
+        ),
+        enabled=settings.public_video_enabled,
+        max_transcript_chars=settings.public_video_transcript_max_chars,
+        max_tool_reads=settings.public_video_max_tool_reads,
+    )
+    public_videos.register_adapter(
+        BilibiliVideoAdapter(
+            public_web_documents,
+            transcript_max_chars=settings.public_video_transcript_max_chars,
+            timeout_seconds=settings.public_video_timeout_seconds,
+        )
     )
     memory = MemoryService(ParticipantMemoryRepository(database))
     interaction_preferences = InteractionPreferenceService(
@@ -425,6 +446,7 @@ def build_business_services(
         timezone_name=settings.timezone_name,
     ).register(registry)
     WebTools(web_search, public_web_documents).register(registry)
+    VideoTools(public_videos).register(registry)
     MemoryTools(memory, presentations, personalization_proposals).register(registry)
     InteractionPreferenceTools(
         interaction_preferences, presentations, personalization_proposals
@@ -509,6 +531,7 @@ def build_business_services(
         followup_candidates=followup_candidates,
         web_search=web_search,
         public_web_documents=public_web_documents,
+        public_videos=public_videos,
         memory=memory,
         interaction_preferences=interaction_preferences,
         personalization_proposals=personalization_proposals,

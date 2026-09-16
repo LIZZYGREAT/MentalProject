@@ -662,6 +662,7 @@ class PublicWebDocumentService:
         *,
         max_bytes: int | None = None,
         max_redirects: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> FetchedPublicResponse:
         """Fetch a bounded public response using the existing SSRF boundary.
 
@@ -678,6 +679,11 @@ class PublicWebDocumentService:
             self.max_redirects
             if max_redirects is None
             else max(0, min(int(max_redirects), 10))
+        )
+        request_timeout = (
+            self.timeout_seconds
+            if timeout_seconds is None
+            else max(0.1, float(timeout_seconds))
         )
         for redirect_count in range(redirect_limit + 1):
             current = validate_public_https_url(current)
@@ -696,7 +702,7 @@ class PublicWebDocumentService:
                 current,
                 resolved_addresses=addresses,
                 server_hostname=str(parsed.hostname),
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=request_timeout,
                 max_bytes=byte_limit,
             )
             declared = response.headers.get("content-length")
