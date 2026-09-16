@@ -91,6 +91,8 @@ class PersonalizationProposalRepository:
             return {"ok": False, "error": "personalization_proposal_not_found"}
         now = utc_now()
         with self.database.session() as session:
+            if session.get(Participant, participant_id, with_for_update=True) is None:
+                return {"ok": False, "error": "personalization_proposal_not_found"}
             row = session.execute(
                 select(PersonalizationProposal)
                 .where(
@@ -138,6 +140,8 @@ class PersonalizationProposalRepository:
             return {"ok": False, "error": "personalization_proposal_not_found"}
         now = utc_now()
         with self.database.session() as session:
+            if session.get(Participant, participant_id, with_for_update=True) is None:
+                return {"ok": False, "error": "personalization_proposal_not_found"}
             row = session.execute(
                 select(PersonalizationProposal)
                 .where(

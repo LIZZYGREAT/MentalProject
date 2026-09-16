@@ -24,6 +24,7 @@ from app.models import (
     DatasetSnapshot,
     ForecastCurrentnessEvent,
     ParameterLearningRun,
+    ParticipantInteractionSemanticRule,
     WarningSchedule,
 )
 from app.repositories import (
@@ -159,6 +160,164 @@ def test_postgres_concurrent_personalization_confirm_executes_once(
     assert proposals.proposals.get_for_participant(
         owner.id, proposal["id"]
     )["status"] == "confirmed"
+
+
+def test_postgres_concurrent_semantic_rule_confirm_respects_limit(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-SEMANTIC-RULE-LIMIT-RACE"
+    )
+    _memory, proposals = _personalization_stack(postgres_database)
+    proposal_a = proposals.stage_preferences(
+        owner.id,
+        domain="interaction_preferences",
+        custom_rules=[
+            {"scope": "all_responses", "instruction": "先说结论"},
+            {"scope": "explanations", "instruction": "给出一个例子"},
+        ],
+    )
+    proposal_b = proposals.stage_preferences(
+        owner.id,
+        domain="interaction_preferences",
+        custom_rules=[
+            {"scope": "technical_explanations", "instruction": "解释术语"},
+            {"scope": "code_and_engineering", "instruction": "说明边界"},
+        ],
+    )
+    barrier = threading.Barrier(2)
+
+    def confirm(proposal):
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(confirm, (proposal_a, proposal_b)))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    with postgres_database.session() as session:
+        active = session.query(ParticipantInteractionSemanticRule).filter(
+            ParticipantInteractionSemanticRule.participant_id == owner.id,
+            ParticipantInteractionSemanticRule.status == "active",
+        ).count()
+    assert active <= 3
+
+
+def test_postgres_concurrent_personalization_confirm_serializes_per_participant(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-SERIALIZED"
+    )
+    entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    callback_lock = threading.Lock()
+    callback_count = 0
+
+    def failpoint():
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            call_number = callback_count
+        if call_number == 1:
+            entered.set()
+            release.wait(timeout=10)
+        else:
+            second_entered.set()
+
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=failpoint
+    )
+    proposal_ids = [
+        proposals.stage_memory_remember(
+            owner.id,
+            memory_type="context",
+            memory_subtype=None,
+            content=f"串行确认 {index}",
+        )["id"]
+        for index in (1, 2)
+    ]
+    barrier = threading.Barrier(2)
+
+    def confirm(proposal_id):
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(confirm, proposal_id) for proposal_id in proposal_ids]
+            assert entered.wait(timeout=10)
+            assert not second_entered.wait(timeout=1)
+            release.set()
+            results = [future.result(timeout=10) for future in futures]
+    finally:
+        release.set()
+
+    assert all(result.get("ok") is True for result in results)
+    assert len(memory.list(owner.id)) == 2
+
+
+def test_postgres_personalization_confirm_does_not_cross_lock_participants(
+    postgres_database,
+):
+    owners = [
+        ParticipantRepository(postgres_database).create(
+            f"PG-PERSONALIZATION-PARALLEL-{index}"
+        )
+        for index in (1, 2)
+    ]
+    entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    callback_lock = threading.Lock()
+    callback_count = 0
+
+    def failpoint():
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            call_number = callback_count
+        if call_number == 1:
+            entered.set()
+            release.wait(timeout=10)
+        else:
+            second_entered.set()
+
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=failpoint
+    )
+    proposal_ids = [
+        proposals.stage_memory_remember(
+            owner.id,
+            memory_type="context",
+            memory_subtype=None,
+            content=f"并行确认 {index}",
+        )["id"]
+        for index, owner in enumerate(owners, start=1)
+    ]
+    barrier = threading.Barrier(2)
+
+    def confirm(item):
+        barrier.wait(timeout=10)
+        owner, proposal_id = item
+        return proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(confirm, item)
+                for item in zip(owners, proposal_ids)
+            ]
+            assert entered.wait(timeout=10)
+            assert second_entered.wait(timeout=2)
+            release.set()
+            results = [future.result(timeout=10) for future in futures]
+    finally:
+        release.set()
+
+    assert all(result.get("ok") is True for result in results)
+    assert all(len(memory.list(owner.id)) == 1 for owner in owners)
 
 
 def test_postgres_personalization_failpoint_rolls_back_effect(
