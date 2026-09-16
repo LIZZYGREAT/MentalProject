@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Iterable
 
@@ -79,13 +80,24 @@ class PublicVideoService:
         adapter = self._adapter_for(raw_url)
         if adapter is None:
             return self._failure("unsupported_video_provider")
+        metadata: VideoMetadata | None = None
+        cache_hit = False
         try:
             metadata = await adapter.resolve_metadata(raw_url)
-            transcript = await adapter.resolve_transcript(metadata)
+            cached = None
+            if self.repository is not None and hasattr(self.repository, "get"):
+                cached = self.repository.get(
+                    participant_id, video_id=metadata.video_id, provider=metadata.provider
+                )
+            if cached is not None and isinstance(cached, dict):
+                transcript = cached.get("transcript")
+                cache_hit = isinstance(transcript, VideoTranscriptDocument)
+            if not cache_hit:
+                transcript = await adapter.resolve_transcript(metadata)
             self._validate_transcript(transcript, metadata)
         except VideoProviderError as exc:
             if exc.reason_code in {"no_public_subtitle", "subtitle_fetch_failed", "subtitle_parse_failed"}:
-                return self._metadata_only_result(
+                return await self._metadata_only_result(
                     metadata if "metadata" in locals() else None,
                     reason_code=exc.reason_code,
                     participant_id=participant_id,
@@ -97,16 +109,8 @@ class PublicVideoService:
 
         key = (participant_id, metadata.provider, metadata.video_id)
         self._known[key] = transcript
-        if self.repository is not None and hasattr(self.repository, "store"):
-            try:
-                self.repository.store_inspection(
-                    participant_id,
-                    metadata=metadata,
-                    transcript=transcript,
-                    max_chars=self.max_transcript_chars,
-                )
-            except Exception:
-                logger.exception("public_video_cache_store_failed")
+        if not cache_hit:
+            await self._store_inspection(participant_id, metadata, transcript)
         result = {
             "ok": True,
             "verified": True,
@@ -115,6 +119,7 @@ class PublicVideoService:
             "language": transcript.language,
             "extraction_mode": transcript.extraction_mode,
             "total_chars": transcript.total_chars,
+            "cache_hit": cache_hit,
         }
         if not transcript.segments:
             result.update(
@@ -189,7 +194,7 @@ class PublicVideoService:
         if transcript.total_chars > self.max_transcript_chars:
             raise VideoProviderError("transcript_too_large")
 
-    def _metadata_only_result(
+    async def _metadata_only_result(
         self,
         metadata: VideoMetadata | None,
         *,
@@ -215,7 +220,7 @@ class PublicVideoService:
                 reason_code, _PUBLIC_REASON_TEXT["no_public_subtitle"]
             ),
         }
-        self._known[(participant_id, metadata.provider, metadata.video_id)] = VideoTranscriptDocument(
+        transcript = VideoTranscriptDocument(
             video_id=metadata.video_id,
             provider=metadata.provider,
             title=metadata.title,
@@ -228,7 +233,28 @@ class PublicVideoService:
                 else "metadata_only"
             ),
         )
+        self._known[(participant_id, metadata.provider, metadata.video_id)] = transcript
+        await self._store_inspection(participant_id, metadata, transcript)
         return result
+
+    async def _store_inspection(
+        self,
+        participant_id: Any,
+        metadata: VideoMetadata,
+        transcript: VideoTranscriptDocument,
+    ) -> None:
+        if self.repository is None or not hasattr(self.repository, "store_inspection"):
+            return
+        try:
+            await asyncio.to_thread(
+                self.repository.store_inspection,
+                participant_id,
+                metadata=metadata,
+                transcript=transcript,
+                max_chars=self.max_transcript_chars,
+            )
+        except Exception:
+            logger.exception("public_video_cache_store_failed")
 
     @staticmethod
     def _chunk_result(
