@@ -87,7 +87,7 @@ def service(database, fetcher, **overrides):
         ("https://169.254.169.254/latest/meta-data", "url_private_address"),
         ("https://user:pass@example.com/a", "url_credentials_not_allowed"),
         ("https://example.com/a?access_token=secret", "secret_query_not_allowed"),
-        ("https://example.com/a?signature=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?token=secret", "secret_query_not_allowed"),
     ],
 )
 def test_url_gate_rejects_unsafe_targets(url, reason):
@@ -103,6 +103,49 @@ def test_url_gate_rejects_unsafe_targets(url, reason):
         return
     with pytest.raises(PublicWebReadError, match=reason):
         validate_public_https_url(url)
+
+
+def test_public_wechat_style_share_query_is_not_rejected_as_secret():
+    url = (
+        "https://share.example.test/article?__biz=MzA4&mid=123&idx=1"
+        "&sn=public-signature&chksm=route-state&scene=1&share_token=public"
+    )
+
+    assert validate_public_https_url(url) == url
+
+
+def test_session_like_public_routing_param_is_not_credential():
+    url = "https://share.example.test/article?session=route-state&session_id=public"
+
+    assert validate_public_https_url(url) == url
+
+
+def test_signature_like_public_param_is_not_credential():
+    url = "https://share.example.test/article?signature=public&sig=public&sig_source=share"
+
+    assert validate_public_https_url(url) == url
+
+
+def _assert_strong_credential_query_is_rejected(key):
+    with pytest.raises(PublicWebReadError, match="secret_query_not_allowed"):
+        validate_public_https_url(f"https://share.example.test/article?{key}=secret")
+
+
+def test_access_token_query_is_rejected():
+    _assert_strong_credential_query_is_rejected("access_token")
+
+
+def test_api_key_query_is_rejected():
+    _assert_strong_credential_query_is_rejected("api_key")
+
+
+def test_password_query_is_rejected():
+    _assert_strong_credential_query_is_rejected("password")
+
+
+def test_url_userinfo_credentials_are_rejected():
+    with pytest.raises(PublicWebReadError, match="url_credentials_not_allowed"):
+        validate_public_https_url("https://user:password@share.example.test/article")
 
 
 def test_public_https_html_is_extracted_wrapped_and_cached():

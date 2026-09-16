@@ -20,15 +20,22 @@ from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 import zlib
 
 
-_SECRET_QUERY_KEYS = {
+_STRONG_CREDENTIAL_QUERY_KEYS = frozenset({
     "token",
     "access_token",
-    "signature",
-    "sig",
-    "key",
-    "auth",
-    "session",
-}
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer_token",
+    "password",
+    "passwd",
+    "session_token",
+    "refresh_token",
+    "private_key",
+    "client_secret",
+    "app_secret",
+    "id_token",
+})
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _ALLOWED_CONTENT_TYPES = {"text/html", "text/plain"}
 _PUBLIC_READ_REASON_TEXT = {
@@ -425,12 +432,7 @@ def validate_public_https_url(value: str) -> str:
         raise PublicWebReadError("url_private_address")
     for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
         normalized_key = key.casefold().replace("-", "_")
-        if any(
-            normalized_key == secret
-            or normalized_key.startswith(f"{secret}_")
-            or normalized_key.endswith(f"_{secret}")
-            for secret in _SECRET_QUERY_KEYS
-        ):
+        if normalized_key in _STRONG_CREDENTIAL_QUERY_KEYS:
             raise PublicWebReadError("secret_query_not_allowed")
     host_for_url = normalized_host
     try:
