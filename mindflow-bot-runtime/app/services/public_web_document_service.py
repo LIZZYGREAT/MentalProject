@@ -83,6 +83,20 @@ class FetchedWebDocument:
     redirect_count: int = 0
 
 
+@dataclass(frozen=True)
+class FetchedPublicResponse:
+    """One safe public HTTPS response after redirect resolution.
+
+    This transport result is intentionally content-type agnostic.  The web
+    document service still accepts only HTML/plain text, while dedicated
+    public providers may consume bounded JSON APIs through the same SSRF gate.
+    """
+
+    canonical_url: str
+    response: RawWebResponse
+    redirect_count: int
+
+
 class _MetadataParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -642,6 +656,77 @@ class PublicWebDocumentService:
             return self._failure("web_document_chunk_not_found")
         return self._success_chunks(item, cache_hit=True)
 
+    async def fetch_public_url(
+        self,
+        url: str,
+        *,
+        max_bytes: int | None = None,
+        max_redirects: int | None = None,
+    ) -> FetchedPublicResponse:
+        """Fetch a bounded public response using the existing SSRF boundary.
+
+        Callers such as public-video providers receive no cookie or caller
+        authorization channel.  Every redirect is normalized, DNS-resolved,
+        and checked again before the next request.
+        """
+
+        if not self.enabled:
+            raise PublicWebReadError("web_read_url_disabled")
+        current = str(url or "").strip()
+        byte_limit = self.max_bytes if max_bytes is None else max(1024, int(max_bytes))
+        redirect_limit = (
+            self.max_redirects
+            if max_redirects is None
+            else max(0, min(int(max_redirects), 10))
+        )
+        for redirect_count in range(redirect_limit + 1):
+            current = validate_public_https_url(current)
+            parsed = urlsplit(current)
+            resolution = self.resolver(str(parsed.hostname), 443)
+            if inspect.isawaitable(resolution):
+                resolution = await resolution
+            if resolution is None:
+                raise PublicWebReadError("dns_resolution_failed")
+            addresses = tuple(str(item) for item in resolution)
+            if not addresses:
+                raise PublicWebReadError("dns_resolution_failed")
+            for address in addresses:
+                _assert_public_ip(address)
+            response = await self.fetcher.fetch(
+                current,
+                resolved_addresses=addresses,
+                server_hostname=str(parsed.hostname),
+                timeout_seconds=self.timeout_seconds,
+                max_bytes=byte_limit,
+            )
+            declared = response.headers.get("content-length")
+            if declared:
+                try:
+                    if int(declared) > byte_limit:
+                        raise PublicWebReadError("response_too_large")
+                except ValueError:
+                    pass
+            if len(response.body) > byte_limit:
+                raise PublicWebReadError("response_too_large")
+            if response.status_code in _REDIRECT_STATUSES:
+                location = response.headers.get("location")
+                if not location:
+                    raise PublicWebReadError("fetch_failed")
+                if redirect_count >= redirect_limit:
+                    raise PublicWebReadError("too_many_redirects")
+                current = urljoin(current, location)
+                continue
+            if response.status_code in {401, 403, 407}:
+                raise PublicWebReadError("authentication_required")
+            if response.status_code < 200 or response.status_code >= 300:
+                raise PublicWebReadError("fetch_failed")
+            return FetchedPublicResponse(
+                canonical_url=current,
+                response=response,
+                redirect_count=redirect_count,
+            )
+        raise PublicWebReadError("too_many_redirects")
+
     async def _fetch_document(
         self,
         url: str,
@@ -649,115 +734,56 @@ class PublicWebDocumentService:
         participant_id: Any = None,
         url_hash: str = "",
     ) -> FetchedWebDocument:
-        current = url
-        for redirect_count in range(self.max_redirects + 1):
-            current = validate_public_https_url(current)
-            parsed = urlsplit(current)
-            resolution = self.resolver(str(parsed.hostname), 443)
-            if inspect.isawaitable(resolution):
-                resolution = await resolution
-            if resolution is not None:
-                addresses = tuple(str(item) for item in resolution)
-                if not addresses:
-                    raise PublicWebReadError("dns_resolution_failed")
-                for address in addresses:
-                    _assert_public_ip(address)
-            else:
-                raise PublicWebReadError("dns_resolution_failed")
-            response = await self.fetcher.fetch(
-                current,
-                resolved_addresses=addresses,
-                server_hostname=str(parsed.hostname),
-                timeout_seconds=self.timeout_seconds,
-                max_bytes=self.max_bytes,
-            )
-            declared = response.headers.get("content-length")
-            if declared:
-                try:
-                    if int(declared) > self.max_bytes:
-                        raise PublicWebReadError("response_too_large")
-                except ValueError:
-                    pass
-            if len(response.body) > self.max_bytes:
-                raise PublicWebReadError("response_too_large")
-            if response.status_code in _REDIRECT_STATUSES:
-                location = response.headers.get("location")
-                if not location:
-                    raise PublicWebReadError(
-                        "fetch_failed",
-                        status_code_class=f"{response.status_code // 100}xx",
-                        redirect_count=redirect_count,
-                    )
-                if redirect_count >= self.max_redirects:
-                    raise PublicWebReadError("too_many_redirects")
-                current = urljoin(current, location)
-                logger.info(
-                    "web_read_url_redirected participant_id=%s url_hash=%s "
-                    "hostname=%s status_code_class=%s redirect_count=%s",
-                    participant_id,
-                    url_hash,
-                    str(urlsplit(current).hostname or "")[:253],
-                    f"{response.status_code // 100}xx",
-                    redirect_count + 1,
-                )
-                continue
-            if response.status_code in {401, 403, 407}:
+        fetched = await self.fetch_public_url(url)
+        current = fetched.canonical_url
+        response = fetched.response
+        redirect_count = fetched.redirect_count
+        parsed = urlsplit(current)
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
+        if content_type not in _ALLOWED_CONTENT_TYPES:
+            raise PublicWebReadError("unsupported_content_type")
+        body = decode_content_encoding(
+            response.body,
+            response.headers.get("content-encoding"),
+            max_bytes=self.max_bytes,
+        )
+        encoding = self._encoding(response.headers.get("content-type", ""))
+        body = body.decode(encoding, errors="replace")
+        if content_type == "text/html":
+            metadata = self._extract_metadata(body, current)
+            title = metadata["title"] or self._html_title(body)
+            extracted = self.extractor(body)
+            extraction_mode = "article"
+            canonical_url = metadata["canonical_url"] or current
+        else:
+            metadata = {"title": None, "description": None, "canonical_url": None}
+            title = str(parsed.hostname or "Public document")
+            extracted = body
+            extraction_mode = "plain_text"
+            canonical_url = current
+        text = self._normalize_text(extracted or "")
+        if not text:
+            metadata_text = self._metadata_text(metadata) if content_type == "text/html" else ""
+            if not metadata_text:
                 raise PublicWebReadError(
-                    "authentication_required",
+                    "empty_extracted_text",
                     status_code_class=f"{response.status_code // 100}xx",
+                    content_type=content_type,
                     redirect_count=redirect_count,
                 )
-            if response.status_code < 200 or response.status_code >= 300:
-                raise PublicWebReadError(
-                    "fetch_failed",
-                    status_code_class=f"{response.status_code // 100}xx",
-                    redirect_count=redirect_count,
-                )
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
-            if content_type not in _ALLOWED_CONTENT_TYPES:
-                raise PublicWebReadError("unsupported_content_type")
-            body = decode_content_encoding(
-                response.body,
-                response.headers.get("content-encoding"),
-                max_bytes=self.max_bytes,
-            )
-            encoding = self._encoding(response.headers.get("content-type", ""))
-            body = body.decode(encoding, errors="replace")
-            if content_type == "text/html":
-                metadata = self._extract_metadata(body, current)
-                title = metadata["title"] or self._html_title(body)
-                extracted = self.extractor(body)
-                extraction_mode = "article"
-                canonical_url = metadata["canonical_url"] or current
-            else:
-                title = str(parsed.hostname or "Public document")
-                extracted = body
-                extraction_mode = "plain_text"
-                canonical_url = current
-            text = self._normalize_text(extracted or "")
-            if not text:
-                metadata_text = self._metadata_text(metadata) if content_type == "text/html" else ""
-                if not metadata_text:
-                    raise PublicWebReadError(
-                        "empty_extracted_text",
-                        status_code_class=f"{response.status_code // 100}xx",
-                        content_type=content_type,
-                        redirect_count=redirect_count,
-                    )
-                text = metadata_text
-                extraction_mode = "metadata_only"
-            text = self._limit_extracted_text(text)
-            return FetchedWebDocument(
-                title=title,
-                canonical_url=canonical_url,
-                text=text,
-                fetched_at=datetime.now(timezone.utc),
-                content_type=content_type,
-                extraction_mode=extraction_mode,
-                status_code_class=f"{response.status_code // 100}xx",
-                redirect_count=redirect_count,
-            )
-        raise PublicWebReadError("too_many_redirects")
+            text = metadata_text
+            extraction_mode = "metadata_only"
+        text = self._limit_extracted_text(text)
+        return FetchedWebDocument(
+            title=title,
+            canonical_url=canonical_url,
+            text=text,
+            fetched_at=datetime.now(timezone.utc),
+            content_type=content_type,
+            extraction_mode=extraction_mode,
+            status_code_class=f"{response.status_code // 100}xx",
+            redirect_count=redirect_count,
+        )
 
     @staticmethod
     def _extract_article(markup: str) -> str | None:
