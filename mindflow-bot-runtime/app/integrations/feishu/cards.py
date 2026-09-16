@@ -1260,9 +1260,17 @@ def calendar_mutation_plan_confirmation_card(
     plan_id = str(plan.get("id") or "").strip()
     operation = str(plan.get("operation") or "").strip()
     items = [dict(item) for item in list(plan.get("items") or [])]
+    context = dict(plan.get("presentation_context") or {})
+    is_course_series = (
+        operation == "update" and context.get("kind") == "course_series_update"
+    )
+    max_items = 64 if is_course_series else 20
     if not plan_id or len(plan_id) > 64:
         raise ValueError("calendar mutation plan id is invalid")
-    if operation not in {"create", "update", "delete"} or not 1 <= len(items) <= 20:
+    if (
+        operation not in {"create", "update", "delete"}
+        or not 1 <= len(items) <= max_items
+    ):
         raise ValueError("calendar mutation plan is invalid")
     verb = {"create": "添加", "update": "修改", "delete": "删除"}[operation]
     ledger_by_index: dict[int, dict[str, Any]] = {}
@@ -1287,8 +1295,7 @@ def calendar_mutation_plan_confirmation_card(
         if len(ledger_by_index) != len(items):
             raise ValueError("calendar plan aggregate and ledger are inconsistent")
 
-    context = dict(plan.get("presentation_context") or {})
-    if operation == "update" and context.get("kind") == "course_series_update":
+    if is_course_series:
         return _course_series_update_confirmation_card(
             plan,
             items,

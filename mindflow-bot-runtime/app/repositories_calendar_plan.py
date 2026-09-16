@@ -20,6 +20,8 @@ def _aware(value: datetime) -> datetime:
 
 
 class CalendarMutationPlanRepository:
+    GENERIC_MAX_ITEMS = 20
+    COURSE_SERIES_MAX_ITEMS = 64
     _RETRY_BACKOFF_SECONDS = (5, 15, 60, 300, 900)
     _MAX_OUTCOME_UNKNOWN_ATTEMPTS = len(_RETRY_BACKOFF_SECONDS)
     _MAX_COMPLETION_PRESENTATION_ATTEMPTS = len(_RETRY_BACKOFF_SECONDS)
@@ -146,11 +148,58 @@ class CalendarMutationPlanRepository:
         ttl_minutes: int = 15,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        return self._create(
+            participant_id,
+            operation=operation,
+            items=items,
+            presentation_context=presentation_context,
+            ttl_minutes=ttl_minutes,
+            now=now,
+            max_items=self.GENERIC_MAX_ITEMS,
+            limit_label="calendar mutation plan requires 1 to 20 items",
+        )
+
+    def create_course_series(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        operation: str,
+        items: list[dict[str, Any]],
+        presentation_context: dict[str, Any],
+        ttl_minutes: int = 15,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        context = dict(presentation_context or {})
+        if operation != "update" or context.get("kind") != "course_series_update":
+            raise ValueError("course-series plan authority is required")
+        return self._create(
+            participant_id,
+            operation=operation,
+            items=items,
+            presentation_context=context,
+            ttl_minutes=ttl_minutes,
+            now=now,
+            max_items=self.COURSE_SERIES_MAX_ITEMS,
+            limit_label="course-series mutation plan requires 1 to 64 items",
+        )
+
+    def _create(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        operation: str,
+        items: list[dict[str, Any]],
+        presentation_context: dict[str, Any] | None,
+        ttl_minutes: int,
+        now: datetime | None,
+        max_items: int,
+        limit_label: str,
+    ) -> dict[str, Any]:
         normalized_operation = str(operation).strip().lower()
         if normalized_operation not in {"create", "update", "delete"}:
             raise ValueError("unsupported calendar mutation plan operation")
-        if not 1 <= len(items) <= 20:
-            raise ValueError("calendar mutation plan requires 1 to 20 items")
+        if not 1 <= len(items) <= max_items:
+            raise ValueError(limit_label)
         created_at = _aware(now or datetime.now(timezone.utc))
         row = CalendarMutationPlan(
             participant_id=participant_id,

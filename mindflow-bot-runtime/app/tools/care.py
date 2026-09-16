@@ -1695,13 +1695,19 @@ class CareTools:
         operation: str,
         items: list[dict[str, Any]],
         presentation_context: dict[str, Any] | None = None,
+        backend_resolved_course_series: bool = False,
     ) -> dict[str, Any]:
         if self.presentations is None:
             return {"ok": False, "error": "rich_reply_delivery_unavailable"}
         if self.calendar_mutation_plans is None:
             return {"ok": False, "error": "calendar_mutation_plan_unavailable"}
+        create_plan = (
+            self.calendar_mutation_plans.create_course_series
+            if backend_resolved_course_series
+            else self.calendar_mutation_plans.create
+        )
         plan = await asyncio.to_thread(
-            self.calendar_mutation_plans.create,
+            create_plan,
             ctx.participant_id,
             operation=operation,
             items=items,
@@ -2135,6 +2141,7 @@ class CareTools:
                     if key != "event_id"
                 },
             },
+            backend_resolved_course_series=scope != "single_occurrence",
         )
         return {
             **staged,

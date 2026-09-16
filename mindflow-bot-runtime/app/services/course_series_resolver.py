@@ -26,7 +26,7 @@ CourseSeriesResolutionSource = Literal[
 ]
 
 _WINDOW_DAYS = 31
-_MAX_OCCURRENCES = 20
+COURSE_SERIES_MAX_OCCURRENCES = 64
 _WEEKDAY_CODES = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 
 
@@ -417,7 +417,7 @@ class CourseSeriesResolver:
     ) -> ResolvedCourseSeries:
         if not events:
             raise CourseSeriesResolutionError("course_series_occurrences_not_found")
-        if len(events) > _MAX_OCCURRENCES:
+        if len(events) > COURSE_SERIES_MAX_OCCURRENCES:
             raise CourseSeriesResolutionError("course_series_occurrence_limit_exceeded")
         return ResolvedCourseSeries(
             anchor_event_id=str(anchor.get("id") or ""),

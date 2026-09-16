@@ -287,6 +287,97 @@ def test_plan_accepts_one_to_twenty_items_and_update_operation():
         )
 
 
+def test_course_series_internal_cap_is_not_generic_agent_batch_cap():
+    database = memory_database()
+    owner = participant(database, "PLAN-COURSE-INTERNAL-CAP")
+    repository = CalendarMutationPlanRepository(database)
+    items = [{"event_id": str(index)} for index in range(21)]
+
+    with pytest.raises(ValueError, match="1 to 20"):
+        repository.create(owner.id, operation="update", items=items)
+
+    plan = repository.create_course_series(
+        owner.id,
+        operation="update",
+        items=items,
+        presentation_context={"kind": "course_series_update"},
+    )
+
+    assert len(plan["ledger_items"]) == 21
+
+
+def _stage_long_course_series(count):
+    database = memory_database()
+    owner = participant(database, f"PLAN-LONG-COURSE-{uuid.uuid4().hex[:8]}")
+    calendar = _Calendar()
+    events = []
+    first = datetime(2030, 1, 1, 12, 55, tzinfo=timezone(timedelta(hours=8)))
+    for index in range(count):
+        start = first + timedelta(weeks=index)
+        event = {
+            "id": f"long-course-{index + 1}",
+            "summary": "长期课程",
+            "start_time": start.isoformat(),
+            "end_time": (start + timedelta(minutes=95)).isoformat(),
+        }
+        events.append(event)
+        calendar.events[event["id"]] = event
+    plans, outbox, tools, _registry, _runner = _stack(
+        database, calendar, _Verifier()
+    )
+
+    class _Resolver:
+        async def resolve(self, *_args, **_kwargs):
+            return ResolvedCourseSeries(
+                anchor_event_id=events[0]["id"],
+                course_identity="course-import:long:item-1",
+                display_name="长期课程",
+                scope_start=datetime.fromisoformat(events[0]["start_time"]),
+                scope_end=datetime.fromisoformat(events[-1]["end_time"]),
+                occurrence_events=tuple(dict(event) for event in events),
+                resolution_source="course_import",
+            )
+
+    tools.course_series_resolver = _Resolver()
+    ctx = _context(owner.id, "以后这个课下课时间改为15:40")
+    result = asyncio.run(
+        tools.update_calendar_event(
+            ctx,
+            {
+                "event_id": events[0]["id"],
+                "scope": "current_semester_remainder",
+                "end_clock": "15:40",
+            },
+        )
+    )
+    return database, plans, outbox, ctx, result
+
+
+def test_course_series_more_than_twenty_occurrences_stages_one_review():
+    database, plans, outbox, ctx, result = _stage_long_course_series(24)
+
+    cards = outbox.take_cards(ctx.agent_run_id)
+    with database.session() as session:
+        plan_id = str(session.scalar(select(CalendarMutationPlan.id)))
+    plan = plans.get_for_participant(ctx.participant_id, plan_id)
+
+    assert result["ok"] is True
+    assert result["item_count"] == 24
+    assert len(plan["ledger_items"]) == 24
+    assert len(cards) == 1
+
+
+def test_course_series_compact_card_shows_full_occurrence_count():
+    _database, _plans, outbox, ctx, result = _stage_long_course_series(24)
+
+    cards = outbox.take_cards(ctx.agent_run_id)
+    serialized = json.dumps(cards[0], ensure_ascii=False)
+
+    assert result["course_series"]["occurrence_count"] == 24
+    assert "**场次：** 24 节" in serialized
+    assert serialized.count("calendar_mutation_plan_confirm") == 1
+
+
 def test_course_series_end_clock_stages_all_occurrences_without_moving_starts():
     database = memory_database()
     owner = participant(database, "PLAN-COURSE-SERIES")

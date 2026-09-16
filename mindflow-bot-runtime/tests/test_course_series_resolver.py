@@ -156,6 +156,39 @@ def test_provider_series_uses_count_boundary_and_not_title_matching():
     assert resolved.resolution_source == "provider_series"
 
 
+def test_course_series_resolver_accepts_more_than_twenty_occurrences():
+    first = datetime(2026, 9, 1, 12, 55, tzinfo=TZ)
+    master = _event(
+        "master-long-course",
+        first.date(),
+        recurrence="FREQ=WEEKLY;INTERVAL=1;COUNT=24;BYDAY=TU",
+    )
+    instances = [
+        _event(
+            f"long-occ-{index}",
+            (first + timedelta(weeks=index - 1)).date(),
+            parent="master-long-course",
+        )
+        for index in range(1, 25)
+    ]
+    resolver = CourseSeriesResolver(
+        _Calendar(instances, {"master-long-course": master}),
+        timezone_name="Asia/Shanghai",
+    )
+
+    resolved = asyncio.run(
+        resolver.resolve(
+            OWNER,
+            anchor_event=instances[0],
+            scope="entire_series",
+            reference_local_date=first.date(),
+        )
+    )
+
+    assert len(resolved.occurrence_events) == 24
+    assert resolved.occurrence_event_ids[-1] == "long-occ-24"
+
+
 def test_series_without_backend_identity_or_recurrence_is_ambiguous():
     anchor = _event("one-off", date(2026, 9, 22), parent="")
     resolver = CourseSeriesResolver(_Calendar([anchor]), timezone_name="Asia/Shanghai")
