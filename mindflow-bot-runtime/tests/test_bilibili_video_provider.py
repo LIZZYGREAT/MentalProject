@@ -61,6 +61,8 @@ def make_adapter(fetcher):
 def metadata_payload(**overrides):
     data = {
         "bvid": "BV1xx411c7mD",
+        "aid": 123456,
+        "cid": 111111,
         "title": "公开测试视频",
         "desc": "视频简介",
         "duration": 523,
@@ -72,8 +74,17 @@ def metadata_payload(**overrides):
     return json.dumps({"code": 0, "data": data}, ensure_ascii=False)
 
 
-def metadata_with_subtitle_payload(subtitle_entries):
-    return metadata_payload(subtitle={"list": subtitle_entries})
+def player_payload(subtitles=None, *, need_login_subtitle=False):
+    return json.dumps(
+        {
+            "code": 0,
+            "data": {
+                "need_login_subtitle": need_login_subtitle,
+                "subtitle": {"subtitles": list(subtitles or [])},
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 def test_bilibili_short_url_resolves_to_video_and_normalizes_metadata():
@@ -121,7 +132,26 @@ def test_bilibili_non_public_api_result_is_classified_without_leaking_details():
     assert exc_info.value.reason_code == "video_page_not_public"
 
 
-def test_bilibili_public_subtitle_is_normalized_and_keeps_timestamps():
+def test_view_metadata_supplies_cid_not_subtitle():
+    fetcher = FakeFetcher(
+        [
+            response(metadata_payload()),
+            response(player_payload([])),
+        ]
+    )
+    adapter = make_adapter(fetcher)
+    metadata = asyncio.run(
+        adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD")
+    )
+
+    asyncio.run(adapter.resolve_transcript(metadata))
+
+    assert fetcher.calls[1]["url"] == (
+        "https://api.bilibili.com/x/player/wbi/v2?bvid=BV1xx411c7mD&cid=111111"
+    )
+
+
+def test_player_v2_subtitles_are_discovered_from_subtitles_field():
     subtitle_url = "https://aisubtitle.example.test/subtitle.json"
     subtitle = json.dumps(
         {
@@ -137,10 +167,9 @@ def test_bilibili_public_subtitle_is_normalized_and_keeps_timestamps():
     fetcher = FakeFetcher(
         [
             response(
-                metadata_with_subtitle_payload(
-                    [{"lan": "ai-zh", "subtitle_url": subtitle_url}]
-                )
+                metadata_payload()
             ),
+            response(player_payload([{"lan": "ai-zh", "subtitle_url": subtitle_url}])),
             response(subtitle, content_type="application/json"),
         ]
     )
@@ -163,8 +192,10 @@ def test_bilibili_public_subtitle_is_normalized_and_keeps_timestamps():
     assert transcript.total_chars == len("第一句\n第二句\n没有时间戳")
 
 
-def test_bilibili_without_public_subtitle_is_a_business_result():
-    fetcher = FakeFetcher([response(metadata_with_subtitle_payload([]))])
+def test_need_login_subtitle_without_tracks_returns_no_public_subtitle():
+    fetcher = FakeFetcher(
+        [response(metadata_payload()), response(player_payload([], need_login_subtitle=True))]
+    )
     adapter = make_adapter(fetcher)
     metadata = asyncio.run(
         adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD")
@@ -175,6 +206,76 @@ def test_bilibili_without_public_subtitle_is_a_business_result():
     assert transcript.segments == ()
     assert transcript.extraction_mode == "no_public_subtitle"
     assert transcript.total_chars == 0
+
+
+def test_public_subtitle_track_is_downloaded():
+    subtitle_url = "https://aisubtitle.example.test/subtitle.json"
+    fetcher = FakeFetcher(
+        [
+            response(metadata_payload()),
+            response(player_payload([{"lan": "en", "subtitle_url": subtitle_url}])),
+            response(json.dumps({"body": [{"from": 0, "to": 1, "content": "hello"}]})),
+        ]
+    )
+    adapter = make_adapter(fetcher)
+    metadata = asyncio.run(
+        adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD")
+    )
+
+    transcript = asyncio.run(adapter.resolve_transcript(metadata))
+
+    assert transcript.segments[0].text == "hello"
+    assert [call["url"] for call in fetcher.calls] == [
+        "https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
+        "https://api.bilibili.com/x/player/wbi/v2?bvid=BV1xx411c7mD&cid=111111",
+        subtitle_url,
+    ]
+
+
+def test_part_2_uses_page_2_cid_and_preserves_canonical_url():
+    pages = [
+        {"page": 1, "cid": 111111, "part": "第一 P", "duration": 10},
+        {"page": 2, "cid": 222222, "part": "第二 P", "duration": 20},
+    ]
+    fetcher = FakeFetcher(
+        [response(metadata_payload(pages=pages)), response(player_payload([]))]
+    )
+    adapter = make_adapter(fetcher)
+    metadata = asyncio.run(
+        adapter.resolve_metadata(
+            "https://www.bilibili.com/video/BV1xx411c7mD?p=2"
+        )
+    )
+
+    asyncio.run(adapter.resolve_transcript(metadata))
+
+    assert metadata.canonical_url == "https://www.bilibili.com/video/BV1xx411c7mD?p=2"
+    assert metadata.title == "第二 P"
+    assert metadata.duration_seconds == 20
+    assert fetcher.calls[1]["url"].endswith("bvid=BV1xx411c7mD&cid=222222")
+
+
+def test_part_2_does_not_fall_back_to_part_1():
+    fetcher = FakeFetcher(
+        [
+            response(
+                metadata_payload(
+                    pages=[{"page": 1, "cid": 111111, "part": "第一 P"}]
+                )
+            )
+        ]
+    )
+    adapter = make_adapter(fetcher)
+
+    with pytest.raises(VideoProviderError) as exc_info:
+        asyncio.run(
+            adapter.resolve_metadata(
+                "https://www.bilibili.com/video/BV1xx411c7mD?p=2"
+            )
+        )
+
+    assert exc_info.value.reason_code == "unsupported_video_variant"
+    assert len(fetcher.calls) == 1
 
 
 @pytest.mark.parametrize(

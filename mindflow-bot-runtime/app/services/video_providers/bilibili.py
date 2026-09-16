@@ -99,14 +99,28 @@ class BilibiliVideoAdapter:
             bvid = query_value if query_key == "bvid" else ""
         if not bvid:
             raise VideoProviderError("video_metadata_unavailable")
+        part_number = self._part_number(requested_url, final_url)
+        selected_page = self._select_page(data, part_number)
+        if part_number is not None and selected_page is None:
+            raise VideoProviderError("unsupported_video_variant")
+        if part_number is not None and not self._page_cid(selected_page):
+            raise VideoProviderError("video_metadata_unavailable")
         self._metadata_payloads[bvid] = data
+        title = data.get("title")
+        duration = data.get("duration")
+        if selected_page is not None:
+            title = selected_page.get("part") or title
+            duration = selected_page.get("duration")
+        canonical_url = f"https://www.bilibili.com/video/{bvid}"
+        if part_number is not None:
+            canonical_url = f"{canonical_url}?{urlencode({'p': part_number})}"
         return VideoMetadata(
             provider=self.provider,
-            canonical_url=f"https://www.bilibili.com/video/{bvid}",
-            title=self._clean_text(data.get("title"), fallback="Bilibili video", limit=300),
+            canonical_url=canonical_url,
+            title=self._clean_text(title, fallback="Bilibili video", limit=300),
             description=self._optional_text(data.get("desc"), limit=2_000),
             author=self._owner_name(data.get("owner")),
-            duration_seconds=self._duration(data.get("duration")),
+            duration_seconds=self._duration(duration),
             published_at=self._published_at(data.get("pubdate")),
             cover_url=self._https_url(data.get("pic")),
             video_id=bvid,
@@ -122,10 +136,29 @@ class BilibiliVideoAdapter:
                 f"{urlencode({'bvid': metadata.video_id})}"
             )
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        subtitle = data.get("subtitle") if isinstance(data, dict) else None
-        entries = subtitle.get("list") if isinstance(subtitle, dict) else None
+            if data:
+                self._metadata_payloads[metadata.video_id] = data
+        if not isinstance(data, dict):
+            raise VideoProviderError("video_metadata_unavailable")
+        page_number = self._part_number(metadata.canonical_url)
+        selected_page = self._select_page(data, page_number)
+        if page_number is not None and selected_page is None:
+            raise VideoProviderError("unsupported_video_variant")
+        cid = self._page_cid(selected_page) if selected_page is not None else data.get("cid")
+        if not cid:
+            raise VideoProviderError("video_metadata_unavailable")
+        player_url = (
+            f"{self.api_base_url}/x/player/wbi/v2?"
+            f"{urlencode({'bvid': metadata.video_id, 'cid': cid})}"
+        )
+        player_payload = await self._read_json(player_url)
+        player_data = player_payload.get("data")
+        if not isinstance(player_data, dict):
+            return self._empty_transcript(metadata)
+        subtitle = player_data.get("subtitle")
+        entries = subtitle.get("subtitles") if isinstance(subtitle, dict) else None
         if not isinstance(entries, list):
-            raise VideoProviderError("no_public_subtitle")
+            return self._empty_transcript(metadata)
         candidates = [
             item for item in entries
             if isinstance(item, dict) and str(item.get("subtitle_url") or "").strip()
@@ -313,6 +346,53 @@ class BilibiliVideoAdapter:
     def _video_reference_from_markup(markup: str) -> tuple[str, str] | None:
         match = _BVID_PATTERN.search(markup)
         return ("bvid", match.group(1)) if match else None
+
+    @staticmethod
+    def _part_number(*urls: str) -> int | None:
+        for raw_url in urls:
+            if not raw_url:
+                continue
+            try:
+                query = parse_qs(urlsplit(raw_url).query, keep_blank_values=True)
+            except ValueError as exc:
+                raise VideoProviderError("unsupported_video_variant") from exc
+            values = query.get("p")
+            if not values:
+                continue
+            if len(values) != 1 or not values[0].isdigit() or int(values[0]) < 1:
+                raise VideoProviderError("unsupported_video_variant")
+            return int(values[0])
+        return None
+
+    @staticmethod
+    def _select_page(
+        data: dict[str, Any], part_number: int | None
+    ) -> dict[str, Any] | None:
+        if part_number is None:
+            return None
+        pages = data.get("pages")
+        if not isinstance(pages, list):
+            return None
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            try:
+                page_number = int(page.get("page"))
+            except (TypeError, ValueError):
+                continue
+            if page_number == part_number:
+                return page
+        return None
+
+    @staticmethod
+    def _page_cid(page: dict[str, Any] | None) -> str | None:
+        if not isinstance(page, dict):
+            return None
+        value = page.get("cid")
+        if value is None:
+            return None
+        cid = str(value).strip()
+        return cid or None
 
     @staticmethod
     def _clean_text(value: Any, *, fallback: str, limit: int) -> str:
