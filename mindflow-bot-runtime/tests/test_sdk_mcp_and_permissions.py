@@ -547,7 +547,7 @@ def test_all_production_tool_schemas_are_closed_and_identity_free():
     }
     assert classifications == {
         "care_get_today_context": ("read", "none"),
-        "care_record_checkin": ("internal_write", "direct_request"),
+        "care_record_checkin": ("proposal_stage", "none"),
         "care_get_recent_state": ("read", "none"),
         "care_run_today_assessment": ("compute", "none"),
         "care_get_support": ("compute", "none"),

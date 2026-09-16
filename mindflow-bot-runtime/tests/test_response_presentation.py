@@ -143,7 +143,7 @@ def test_progress_presenter_keeps_generic_copy_available_after_tool_activity():
 @pytest.mark.parametrize(
     ("tool_name", "expected"),
     [
-        ("care_record_checkin", "我在记录这次状态。"),
+        ("care_record_checkin", "我在准备这次状态记录。"),
         ("care_get_support", "我在结合当前状态整理更合适的支持建议。"),
         ("care_simulate_schedule_change", "我正在比较这次时间调整前后的压力变化。"),
         ("care_update_preferences", "我正在更新你的提醒与关怀设置。"),

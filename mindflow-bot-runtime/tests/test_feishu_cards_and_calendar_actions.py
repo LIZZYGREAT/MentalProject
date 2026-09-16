@@ -463,6 +463,28 @@ def test_daily_checkin_card_uses_json_2_form_submit_contract():
     }]
 
 
+def test_daily_checkin_card_prefills_only_agent_supplied_fields():
+    card = daily_checkin_card(prefill={
+        "stress": 8,
+        "activity": "在写报告",
+        "event_ongoing": True,
+    })
+    form = next(
+        item for item in card["body"]["elements"] if item["tag"] == "form"
+    )
+    fields = {
+        item.get("name"): item
+        for item in form["elements"]
+        if item.get("name")
+    }
+
+    assert fields["stress"]["initial_option"] == "8"
+    assert fields["activity"]["default_value"] == "在写报告"
+    assert fields["event_ongoing"]["initial_option"] == "true"
+    assert "initial_option" not in fields["energy"]
+    assert "initial_option" not in fields["stress_event_since_last"]
+
+
 def test_card_callback_server_exposes_only_configured_callback_and_health_routes():
     handled = []
     server = FeishuCardCallbackServer(

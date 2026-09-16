@@ -722,9 +722,12 @@ def select_card_key_nodes(analysis: CurveAnalysis, limit: int = 8) -> list[Any]:
     return sorted(ranked, key=lambda node: node.time)
 
 
-def daily_checkin_card() -> dict[str, Any]:
+def daily_checkin_card(
+    prefill: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build the fixed non-clinical check-in form accepted by the callback service."""
 
+    prefill = dict(prefill or {})
     scale_options = [
         {"text": {"tag": "plain_text", "content": str(value)}, "value": str(value)}
         for value in range(11)
@@ -733,7 +736,7 @@ def daily_checkin_card() -> dict[str, Any]:
         {"text": {"tag": "plain_text", "content": "是"}, "value": "true"},
         {"text": {"tag": "plain_text", "content": "否"}, "value": "false"},
     ]
-    return {
+    card = {
         "schema": "2.0",
         "config": {
             "update_multi": True,
@@ -858,6 +861,29 @@ def daily_checkin_card() -> dict[str, Any]:
             ],
         },
     }
+    form = next(
+        item for item in card["body"]["elements"] if item.get("tag") == "form"
+    )
+    fields = {
+        item.get("name"): item
+        for item in form["elements"]
+        if item.get("name")
+    }
+    for name in ("stress", "energy"):
+        value = prefill.get(name)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 10
+        ):
+            fields[name]["initial_option"] = str(value)
+    activity = str(prefill.get("activity") or "").strip()
+    if activity:
+        fields["activity"]["default_value"] = activity[:120]
+    for name in ("stress_event_since_last", "event_ongoing"):
+        if isinstance(prefill.get(name), bool):
+            fields[name]["initial_option"] = str(prefill[name]).lower()
+    return card
 
 
 def daily_review_card(

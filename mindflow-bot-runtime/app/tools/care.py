@@ -366,34 +366,21 @@ class CareTools:
         )
         registry.register(
             "care_record_checkin",
-            "Record a momentary non-clinical pressure/vitality check-in.",
+            "Generate a fixed participant-submitted check-in card. Prefill only fields explicitly stated by the participant; omit every uncertain field. This tool never records an Observation.",
             {
                 "type": "object",
                 "properties": {
-                    "stress": {"type": "number", "minimum": 0, "maximum": 10},
-                    "energy": {"type": "number", "minimum": 0, "maximum": 10},
+                    "stress": {"type": "integer", "minimum": 0, "maximum": 10},
+                    "energy": {"type": "integer", "minimum": 0, "maximum": 10},
                     "activity": {"type": "string", "minLength": 1, "maxLength": 120},
                     "stress_event_since_last": {"type": "boolean"},
                     "event_ongoing": {"type": "boolean"},
-                    "current_workload": {
-                        "type": "number", "minimum": 0, "maximum": 10
-                    },
-                    "perceived_control": {
-                        "type": "number", "minimum": 0, "maximum": 10
-                    },
                 },
-                "required": [
-                    "stress",
-                    "energy",
-                    "activity",
-                    "stress_event_since_last",
-                    "event_ongoing",
-                ],
                 "additionalProperties": False,
             },
-            self.record_checkin,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            self.stage_checkin,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "care_get_recent_state",
@@ -873,6 +860,34 @@ class CareTools:
                 "stress": persisted.get("stress_0_10"),
                 "energy": persisted.get("energy_0_10"),
             },
+        }
+
+    def stage_checkin(
+        self, ctx: AgentContext, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.presentations is None:
+            raise RuntimeError("rich reply delivery is unavailable")
+        prefill = {
+            key: args[key]
+            for key in (
+                "stress",
+                "energy",
+                "activity",
+                "stress_event_since_last",
+                "event_ongoing",
+            )
+            if key in args
+        }
+        self.presentations.stage_card(
+            ctx.agent_run_id, daily_checkin_card(prefill=prefill)
+        )
+        return {
+            "ok": True,
+            "card_queued": True,
+            "delivery_state": "queued_not_delivered",
+            "questionnaire": "daily_non_clinical_checkin_v1",
+            "prefilled_fields": sorted(prefill),
+            "observation_persisted": False,
         }
 
     def get_recent_state(

@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.agent.context import AgentContext
+from app.agent.tool_registry import ToolRegistry
 from app.db import Database, build_engine
 from app.integrations.feishu.cards import pressure_curve_card
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
@@ -600,6 +601,44 @@ def test_care_record_checkin_uses_observation_refresh_service():
     assert len(refresh.created_calls) == 1
     with database.session() as session:
         assert session.query(StateObservation).count() == 1
+
+
+def test_agent_checkin_stages_prefilled_card_without_persisting_observation():
+    database = memory_database()
+    person = participant(database, "CARE-CARD-PREFILL")
+
+    class Cards:
+        def __init__(self):
+            self.items = []
+
+        def stage_card(self, run_id, card):
+            self.items.append((run_id, card))
+
+    cards = Cards()
+    tools = CareTools(
+        None,
+        ObservationRepository(database),
+        None,
+        None,
+        "Asia/Shanghai",
+        object(),
+        presentations=cards,
+    )
+    registry = ToolRegistry()
+    tools.register(registry)
+    ctx = AgentContext(person.id, "P", "ou", "oc", "care-card", uuid.uuid4())
+
+    result = asyncio.run(registry.execute(ctx, "care_record_checkin", {
+        "stress": 8,
+        "activity": "在写报告",
+    }))
+
+    assert result.status == "succeeded"
+    assert result.result["observation_persisted"] is False
+    assert result.result["prefilled_fields"] == ["activity", "stress"]
+    assert len(cards.items) == 1
+    with database.session() as session:
+        assert session.query(StateObservation).count() == 0
 
 
 def _prediction_with_optional_afternoon_checkin(include: bool):

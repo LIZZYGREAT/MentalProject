@@ -18,7 +18,7 @@ TOOL_STAGE = {
     "care_get_pressure_curve": "forecast",
     "care_simulate_schedule_change": "what_if",
     "care_get_checkin_card": "card",
-    "care_record_checkin": "record_checkin",
+    "care_record_checkin": "card",
     "care_get_support": "support",
     "care_update_preferences": "preferences",
     "care_respond_to_latest_intervention": "intervention_feedback",
@@ -74,8 +74,6 @@ class ProgressPresenter:
                 if previous_stage == "forecast":
                     return "压力趋势已经算好了，我在整理成更直观的结果。"
                 return "我在准备这次状态记录。"
-            if stage == "record_checkin":
-                return "我在记录这次状态。"
             if stage == "support":
                 return "我在结合当前状态整理更合适的支持建议。"
             if stage == "preferences":

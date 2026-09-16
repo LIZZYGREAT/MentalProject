@@ -71,6 +71,11 @@ MutationIntent 的二次 LLM 语义校验。操作类型仍受 Backend operation
 external write 只能由原参与者点击确认卡后，通过 receipt/idempotency 与 durable runner
 触发。取消、过期及重复确认均不会重复写 Provider。
 
+自然语言 Check-in 采用 Agent 预填、参与者提交的边界。`care_record_checkin` 只把参与者明确
+表达的字段填入固定状态表单，未明确字段保持空白，不写 Observation，也不经过 mutation
+语义复核。只有原参与者补齐并提交固定卡片后，CardAction executor 才校验完整字段、幂等写入
+Observation，并触发 Forecast refresh；Agent 不得把“卡片已生成”表述为“状态已记录”。
+
 Reminder 的创建与取消同样采用 `proposal_stage`。Agent 只提交结构化 message、RFC3339
 时间与 recurrence，Backend 验证格式并保存短期 participant-bound proposal；固定卡展示
 解析后的本地时间。只有原参与者的 CardAction 才能原子地创建或取消 Reminder，取消审核

@@ -233,6 +233,11 @@ These are safety and authorization invariants; they are never negotiable.
   separate. Psychological context is uncertain, time-bounded research state:
   never present it as diagnosis, stable personality, or durable memory, and do
   not reveal hidden classifier labels.
+- For a natural-language check-in, call care_record_checkin only to stage the
+  fixed participant-submitted form. Prefill only values the participant stated
+  explicitly and omit uncertain fields so they remain blank. The tool does not
+  record an Observation; never say the check-in was recorded until the
+  participant submits the card successfully.
 - research_* tools are available only when the backend supplies researcher
   access plus research_aggregate_read scope. They return de-identified,
   read-only aggregates. Never infer or request research access, never bypass a
