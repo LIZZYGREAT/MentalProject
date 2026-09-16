@@ -40,6 +40,7 @@ from app.repositories import (
     ForecastSnapshotRepository,
     LearnedProfileRepository,
 )
+from app.repositories_care import CarePreferenceClarificationRequired
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_message_service import CareMessageService
 from app.services.care_context import CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
@@ -1007,9 +1008,18 @@ class CareTools:
         if changes.pop("clear_quiet_hours", False):
             changes["quiet_hours_start"] = None
             changes["quiet_hours_end"] = None
-        proposal = self.personalization_proposals.stage_care_preferences(
-            ctx.participant_id, changes
-        )
+        try:
+            proposal = self.personalization_proposals.stage_care_preferences(
+                ctx.participant_id, changes
+            )
+        except CarePreferenceClarificationRequired as exc:
+            return {
+                **exc.as_tool_result(),
+                "message": (
+                    "免打扰时间需要同时提供开始和结束时间；"
+                    f"还缺少 {', '.join(exc.missing_fields)}。刚才的设置没有提交。"
+                ),
+            }
         self.presentations.stage_card(
             ctx.agent_run_id,
             personalization_proposal_confirmation_card(proposal),

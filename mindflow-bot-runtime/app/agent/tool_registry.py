@@ -723,6 +723,27 @@ class ToolRegistry:
             )
             return ToolExecution(safe, "succeeded")
         except Exception as exc:
+            structured_result_factory = getattr(exc, "as_tool_result", None)
+            if callable(structured_result_factory):
+                structured_result = structured_result_factory()
+                if isinstance(structured_result, dict):
+                    structured_result = dict(structured_result)
+                    structured_result.setdefault("ok", False)
+                    structured_result.setdefault("do_not_retry", True)
+                    self._remember_non_retryable(
+                        ctx, name, arguments, structured_result
+                    )
+                    await self._log(
+                        ctx,
+                        name,
+                        spec,
+                        arguments,
+                        _safe_summary(structured_result),
+                        "needs_clarification",
+                        authorization_decision,
+                        str(structured_result.get("reason_code") or "needs_clarification"),
+                    )
+                    return ToolExecution(structured_result, "needs_clarification")
             error_id = uuid.uuid4().hex
             result = {
                 "ok": False,

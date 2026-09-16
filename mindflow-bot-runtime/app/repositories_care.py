@@ -66,6 +66,37 @@ CARE_PREFERENCE_CHANGE_FIELDS = {
 }
 
 
+class CarePreferenceClarificationRequired(ValueError):
+    """The proposed quiet-hours patch would leave one bound unresolved."""
+
+    code = "care_preference_incomplete"
+
+    def __init__(
+        self,
+        *,
+        missing_fields: tuple[str, ...],
+        resolved_changes: Mapping[str, Any],
+    ) -> None:
+        self.missing_fields = tuple(missing_fields)
+        self.resolved_changes = dict(resolved_changes)
+        super().__init__(
+            "quiet hours require both quiet_hours_start and quiet_hours_end; "
+            f"missing {', '.join(self.missing_fields)}"
+        )
+
+    def as_tool_result(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": self.code,
+            "reason_code": self.code,
+            "missing_fields": list(self.missing_fields),
+            "resolved_changes": dict(self.resolved_changes),
+            "staged": False,
+            "persisted": False,
+            "do_not_retry": True,
+        }
+
+
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
@@ -224,9 +255,34 @@ class ParticipantCarePreferenceRepository:
                 raise ValueError("participant does not exist")
             row = session.get(ParticipantCarePreference, participant_id)
             if row is None:
-                row = ParticipantCarePreference(
-                    participant_id=participant_id,
-                    version=0,
+                current = self.defaults()
+                # A transient row is only used for field validation. Keep it
+                # out of the session so incomplete requests cannot create a
+                # preference record as a side effect.
+                row = ParticipantCarePreference(participant_id=participant_id)
+            else:
+                current = self._view(row)
+            proposed_start = (
+                _parse_clock(normalized["quiet_hours_start"])
+                if "quiet_hours_start" in normalized
+                else _parse_clock(current.get("quiet_hours_start"))
+            )
+            proposed_end = (
+                _parse_clock(normalized["quiet_hours_end"])
+                if "quiet_hours_end" in normalized
+                else _parse_clock(current.get("quiet_hours_end"))
+            )
+            missing: list[str] = []
+            if proposed_start is None and proposed_end is not None and "quiet_hours_start" not in normalized:
+                missing.append("quiet_hours_start")
+            if proposed_end is None and proposed_start is not None and "quiet_hours_end" not in normalized:
+                missing.append("quiet_hours_end")
+            if missing:
+                raise CarePreferenceClarificationRequired(
+                    missing_fields=tuple(missing),
+                    resolved_changes={
+                        key: value for key, value in normalized.items()
+                    },
                 )
             self._apply_changes(row, normalized)
             session.rollback()
@@ -248,6 +304,15 @@ class ParticipantCarePreferenceRepository:
                 normalized["reenable_intervention_types"]
             )
         return normalized
+
+    def validate_effective_changes(
+        self,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Preflight current state plus a proposed patch by its effective values."""
+
+        return self.validate_changes(participant_id, changes)
 
     @staticmethod
     def _validate_change_fields(changes: Mapping[str, Any]) -> None:
