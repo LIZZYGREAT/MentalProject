@@ -33,7 +33,7 @@ class InteractionPreferenceTools:
         )
         registry.register(
             "interaction_preferences_update",
-            "Stage a fixed review card for structured response style and assistant identity after an explicit lasting preference request. Natural-language interpretation is complete before this call; the tool itself does not persist preferences.",
+            "Stage a fixed review card for structured response style, reviewed semantic communication rules, and assistant identity after an explicit lasting preference request. Natural-language interpretation is complete before this call; do not pass the original sentence or ask the backend to parse it. Summarize the lasting communication preference faithfully. The tool itself does not persist preferences.",
             {
                 "type": "object",
                 "properties": {
@@ -42,10 +42,51 @@ class InteractionPreferenceTools:
                     "suggestion_style": {"type": "string", "enum": ["ask_first", "light_suggestions", "proactive_suggestions"]},
                     "assistant_display_name": {"type": "string", "minLength": 1, "maxLength": 20},
                     "assistant_self_reference": {"type": "string", "minLength": 1, "maxLength": 20},
+                    "custom_rules": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "scope": {
+                                    "type": "string",
+                                    "enum": [
+                                        "all_responses",
+                                        "explanations",
+                                        "technical_explanations",
+                                        "code_and_engineering",
+                                    ],
+                                },
+                                "instruction": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 500,
+                                },
+                            },
+                            "required": ["scope", "instruction"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "minProperties": 1, "additionalProperties": False,
             },
             self.update,
+            effect="proposal_stage",
+            authorization_requirement="none",
+        )
+        registry.register(
+            "interaction_preference_rule_delete",
+            "Stage a fixed review card to delete one currently active reviewed semantic communication rule. The rule id comes only from the participant's settings card.",
+            {
+                "type": "object",
+                "properties": {
+                    "rule_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                },
+                "required": ["rule_id"],
+                "additionalProperties": False,
+            },
+            self.delete_rule,
             effect="proposal_stage",
             authorization_requirement="none",
         )
@@ -87,14 +128,16 @@ class InteractionPreferenceTools:
             for key in ("assistant_display_name", "assistant_self_reference")
             if key in args
         }
+        custom_rules = list(args.get("custom_rules") or [])
         try:
             proposal = self._proposals().stage_preferences(
                 ctx.participant_id,
                 domain="interaction_preferences",
                 style_changes=style,
                 identity_changes=identity,
+                custom_rules=custom_rules,
             )
-        except ValueError as exc:
+        except (LookupError, ValueError) as exc:
             return {
                 "ok": False,
                 "error": getattr(exc, "code", "invalid_interaction_preferences"),
@@ -102,6 +145,21 @@ class InteractionPreferenceTools:
                     exc, "code", "invalid_interaction_preferences"
                 ),
                 "message": str(exc),
+            }
+        return self._stage(ctx, proposal)
+
+    def delete_rule(self, ctx: AgentContext, args: dict[str, Any]):
+        try:
+            proposal = self._proposals().stage_preference_rule_delete(
+                ctx.participant_id, rule_id=str(args.get("rule_id") or "")
+            )
+        except (LookupError, ValueError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "semantic_rule_not_found"),
+                "reason_code": getattr(exc, "code", "semantic_rule_not_found"),
+                "message": str(exc),
+                "do_not_retry": True,
             }
         return self._stage(ctx, proposal)
 

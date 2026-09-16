@@ -15,7 +15,7 @@ from app.models import Participant, PersonalizationProposal, utc_now
 
 _OPERATIONS = {
     "memory": {"remember", "replace", "delete", "clear"},
-    "interaction_preferences": {"update"},
+    "interaction_preferences": {"update", "delete_rule"},
     "support_preferences": {"update"},
     "care_preferences": {"update"},
 }

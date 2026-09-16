@@ -2561,7 +2561,24 @@ def personalization_proposal_confirmation_card(
             f"- **{labels.get(key, key)}：** {value}"
             for key, value in changes.items()
         ]
+        semantic_rules = [
+            dict(item) for item in list(payload.get("custom_rules") or [])
+        ]
+        if semantic_rules:
+            lines.append("- **语义沟通规则：**")
+            lines.extend(
+                f"  - {str(item.get('scope') or '')}：{str(item.get('instruction') or '')[:500]}"
+                for item in semantic_rules
+            )
         lines.append("这些设置不能改变安全、授权或权限规则。")
+    elif domain == "interaction_preferences" and operation == "delete_rule":
+        title = "确认删除沟通规则"
+        destructive = True
+        lines = [
+            f"**适用范围：** {str(payload.get('scope') or '')[:40]}",
+            f"**规则内容：** {str(payload.get('instruction') or '')[:500]}",
+            "确认后这条已审核的沟通规则将被删除。",
+        ]
     elif domain == "care_preferences" and operation == "update":
         title = "确认修改提醒与关怀设置"
         labels = {
@@ -2643,10 +2660,42 @@ def personalization_proposal_confirmation_card(
 
 def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
     support = dict(preferences.get("support") or {})
+    semantic_rules = [
+        dict(item) for item in list(preferences.get("semantic_rules") or [])
+    ]
 
     def options(values: tuple[str, ...]) -> list[dict[str, Any]]:
         return [{"text": {"tag": "plain_text", "content": value}, "value": value} for value in values]
 
+    semantic_elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": "**已审核的语义沟通规则**"},
+    ]
+    if semantic_rules:
+        for rule in semantic_rules[:3]:
+            semantic_elements.extend([
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"`{str(rule.get('scope') or '')[:40]}`："
+                        f"{str(rule.get('instruction') or '')[:500]}"
+                    ),
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "删除这条规则"},
+                    "type": "danger",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "mindflow_action": "interaction_preference_rule_delete",
+                            "version": "1",
+                            "rule_id": str(rule.get("id") or ""),
+                        },
+                    }],
+                },
+            ])
+    else:
+        semantic_elements.append({"tag": "markdown", "content": "暂无单独的语义沟通规则。"})
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": "blue", "title": {"tag": "plain_text", "content": "表达与支持偏好"}},
@@ -2663,5 +2712,6 @@ def preference_settings_card(preferences: dict[str, Any]) -> dict[str, Any]:
                 {"tag": "button", "text": {"tag": "plain_text", "content": "先听我说，再建议"}, "value": {"mindflow_action": "support_acknowledge_first", "version": "1"}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "关闭支持性跟进"}, "value": {"mindflow_action": "support_followup_disable", "version": "1"}},
             ]},
+            *semantic_elements,
         ],
     }

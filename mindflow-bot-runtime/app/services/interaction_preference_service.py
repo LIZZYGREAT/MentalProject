@@ -6,6 +6,7 @@ from typing import Any
 
 from app.repositories_support_preferences import validate_support_changes
 from app.services.preference_validator import (
+    validate_custom_rules,
     validate_identity_changes,
     validate_style_changes,
 )
@@ -33,6 +34,7 @@ class InteractionPreferenceService:
         style_changes: dict | None = None,
         support_changes: dict | None = None,
         identity_changes: dict | None = None,
+        custom_rules: list | None = None,
     ) -> dict[str, dict]:
         return {
             "style_changes": (
@@ -42,6 +44,7 @@ class InteractionPreferenceService:
                 validate_support_changes(support_changes) if support_changes else {}
             ),
             "identity_changes": validate_identity_changes(identity_changes or {}),
+            "custom_rules": validate_custom_rules(custom_rules),
         }
 
     def update_preferences(
@@ -51,17 +54,20 @@ class InteractionPreferenceService:
         style_changes: dict | None = None,
         support_changes: dict | None = None,
         identity_changes: dict | None = None,
+        custom_rules: list | None = None,
     ):
         validated = self.validate_changes(
             style_changes=style_changes,
             support_changes=support_changes,
             identity_changes=identity_changes,
+            custom_rules=custom_rules,
         )
         self.repository.update_atomic(
             participant_id,
             style_changes=validated["style_changes"],
             support_changes=validated["support_changes"],
             identity_changes=validated["identity_changes"],
+            custom_rules=validated["custom_rules"],
         )
         return self.get(participant_id)
 

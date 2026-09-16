@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db import Database
 from app.models import (
+    ParticipantInteractionSemanticRule,
     ParticipantInteractionRule,
     ParticipantInteractionStyle,
     ParticipantSupportPreference,
@@ -42,6 +43,16 @@ class InteractionPreferenceRepository:
                 ParticipantInteractionRule.participant_id == participant_id,
                 ParticipantInteractionRule.status == "active",
             ).order_by(ParticipantInteractionRule.created_at)).scalars().all()
+            semantic_rules = session.execute(
+                select(ParticipantInteractionSemanticRule).where(
+                    ParticipantInteractionSemanticRule.participant_id == participant_id,
+                    ParticipantInteractionSemanticRule.status == "active",
+                ).order_by(ParticipantInteractionSemanticRule.created_at)
+            ).scalars().all()
+            identity = {
+                row.normalized_category: row.normalized_value
+                for row in rules
+            }
             return {
                 **(DEFAULT_STYLE if style is None else {
                     "verbosity": style.verbosity, "tone": style.tone,
@@ -51,6 +62,12 @@ class InteractionPreferenceRepository:
                     "id": str(row.id), "category": row.normalized_category,
                     "value": row.normalized_value,
                 } for row in rules],
+                "identity": identity,
+                "semantic_rules": [{
+                    "id": str(row.id),
+                    "scope": row.scope,
+                    "instruction": row.instruction,
+                } for row in semantic_rules],
             }
 
     def update_style(self, participant_id: uuid.UUID, changes: dict) -> dict:
@@ -71,13 +88,15 @@ class InteractionPreferenceRepository:
         style_changes: dict | None = None,
         support_changes: dict | None = None,
         identity_changes: dict[str, str] | None = None,
+        custom_rules: list[dict[str, str]] | None = None,
     ) -> None:
         """Commit all validated interaction preference changes together."""
 
         style_changes = dict(style_changes or {})
         support_changes = dict(support_changes or {})
         identity_changes = dict(identity_changes or {})
-        if not (style_changes or support_changes or identity_changes):
+        custom_rules = list(custom_rules or [])
+        if not (style_changes or support_changes or identity_changes or custom_rules):
             raise ValueError("at least one interaction preference is required")
 
         with self.database.session() as session:
@@ -87,6 +106,7 @@ class InteractionPreferenceRepository:
                 style_changes=style_changes,
                 support_changes=support_changes,
                 identity_changes=identity_changes,
+                custom_rules=custom_rules,
             )
 
     def update_atomic_in_session(
@@ -97,13 +117,32 @@ class InteractionPreferenceRepository:
         style_changes: dict | None = None,
         support_changes: dict | None = None,
         identity_changes: dict[str, str] | None = None,
+        custom_rules: list[dict[str, str]] | None = None,
     ) -> None:
         style_changes = dict(style_changes or {})
         support_changes = dict(support_changes or {})
         identity_changes = dict(identity_changes or {})
-        if not (style_changes or support_changes or identity_changes):
+        custom_rules = [dict(item) for item in (custom_rules or [])]
+        if not (style_changes or support_changes or identity_changes or custom_rules):
             raise ValueError("at least one interaction preference is required")
         now = utc_now()
+        semantic_active = []
+        if custom_rules:
+            semantic_active = session.execute(
+                select(ParticipantInteractionSemanticRule)
+                .where(
+                    ParticipantInteractionSemanticRule.participant_id == participant_id,
+                    ParticipantInteractionSemanticRule.status == "active",
+                )
+                .order_by(ParticipantInteractionSemanticRule.created_at)
+                .with_for_update()
+            ).scalars().all()
+            new_scopes = {str(item["scope"]) for item in custom_rules}
+            retained_semantic = [
+                row for row in semantic_active if row.scope not in new_scopes
+            ]
+            if len(retained_semantic) + len(custom_rules) > self.max_rules:
+                raise PreferenceRuleLimitReached()
         active_rules = []
         if identity_changes:
             active_rules = session.execute(
@@ -175,7 +214,46 @@ class InteractionPreferenceRepository:
                     updated_at=now,
                 )
             )
+        for old in semantic_active:
+            if old.scope in {str(item["scope"]) for item in custom_rules}:
+                old.status = "superseded"
+                old.updated_at = now
+        for item in custom_rules:
+            session.add(
+                ParticipantInteractionSemanticRule(
+                    participant_id=participant_id,
+                    scope=str(item["scope"]),
+                    instruction=str(item["instruction"]),
+                    status="active",
+                    source_proposal_id=item.get("source_proposal_id"),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
         session.flush()
+
+    def delete_semantic_rule_in_session(
+        self, session: Session, participant_id: uuid.UUID, rule_id: uuid.UUID | str
+    ) -> dict[str, str]:
+        try:
+            parsed_id = uuid.UUID(str(rule_id))
+        except ValueError as exc:
+            raise LookupError("semantic rule not found") from exc
+        row = session.execute(
+            select(ParticipantInteractionSemanticRule)
+            .where(
+                ParticipantInteractionSemanticRule.id == parsed_id,
+                ParticipantInteractionSemanticRule.participant_id == participant_id,
+                ParticipantInteractionSemanticRule.status == "active",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if row is None:
+            raise LookupError("semantic rule not found")
+        row.status = "deleted"
+        row.updated_at = utc_now()
+        session.flush()
+        return {"operation": "delete_rule", "semantic_rule_id": str(row.id)}
 
     def add_rule(self, participant_id: uuid.UUID, *, safe_text: str, category: str, value: str) -> dict:
         stored_value = str(value).lower() if isinstance(value, bool) else str(value)

@@ -101,11 +101,13 @@ class PersonalizationProposalService:
         style_changes: dict | None = None,
         support_changes: dict | None = None,
         identity_changes: dict | None = None,
+        custom_rules: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         validated = self.preferences.validate_changes(
             style_changes=style_changes,
             support_changes=support_changes,
             identity_changes=identity_changes,
+            custom_rules=custom_rules,
         )
         payload = {key: value for key, value in validated.items() if value}
         if not payload:
@@ -117,6 +119,36 @@ class PersonalizationProposalService:
             payload=payload,
         )
 
+    def stage_preference_rule_delete(
+        self, participant_id: uuid.UUID, *, rule_id: uuid.UUID | str
+    ) -> dict[str, Any]:
+        try:
+            parsed_rule_id = uuid.UUID(str(rule_id))
+        except ValueError as exc:
+            raise ValueError("semantic rule id is invalid") from exc
+        active = next(
+            (
+                item
+                for item in list(
+                    self.preferences.get(participant_id).get("semantic_rules") or []
+                )
+                if str(item.get("id")) == str(parsed_rule_id)
+            ),
+            None,
+        )
+        if active is None:
+            raise LookupError("semantic rule not found")
+        return self.proposals.stage(
+            participant_id,
+            domain="interaction_preferences",
+            operation="delete_rule",
+            payload={
+                "rule_id": str(parsed_rule_id),
+                "scope": str(active.get("scope") or ""),
+                "instruction": str(active.get("instruction") or "")[:500],
+            },
+        )
+
     def stage_care_preferences(
         self,
         participant_id: uuid.UUID,
@@ -124,9 +156,10 @@ class PersonalizationProposalService:
     ) -> dict[str, Any]:
         if self.care_preferences is None:
             raise RuntimeError("care preference proposals are unavailable")
-        validated = self.care_preferences.validate_changes(
-            participant_id, changes
-        )
+        validator = getattr(
+            self.care_preferences, "validate_effective_changes", None
+        ) or self.care_preferences.validate_changes
+        validated = validator(participant_id, changes)
         return self.proposals.stage(
             participant_id,
             domain="care_preferences",
@@ -182,15 +215,32 @@ class PersonalizationProposalService:
                 style_changes=payload.get("style_changes"),
                 support_changes=payload.get("support_changes"),
                 identity_changes=payload.get("identity_changes"),
+                custom_rules=payload.get("custom_rules"),
             )
+            if validated["custom_rules"]:
+                validated["custom_rules"] = [
+                    {
+                        **item,
+                        "source_proposal_id": uuid.UUID(str(proposal["id"])),
+                    }
+                    for item in validated["custom_rules"]
+                ]
             self.preferences.repository.update_atomic_in_session(
                 session,
                 participant_id,
                 style_changes=validated["style_changes"],
                 support_changes=validated["support_changes"],
                 identity_changes=validated["identity_changes"],
+                custom_rules=validated["custom_rules"],
             )
             return {"operation": "update"}
+        if (
+            domain == "interaction_preferences"
+            and operation == "delete_rule"
+        ):
+            return self.preferences.repository.delete_semantic_rule_in_session(
+                session, participant_id, str(payload.get("rule_id") or "")
+            )
         if (
             domain == "care_preferences"
             and operation == "update"
