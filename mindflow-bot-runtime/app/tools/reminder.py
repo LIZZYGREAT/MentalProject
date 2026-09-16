@@ -10,6 +10,7 @@ import uuid
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.cards import reminder_proposal_confirmation_card
+from app.services.presentation_service import ReviewCardPolicy
 
 
 class ReminderTools:
@@ -104,6 +105,11 @@ class ReminderTools:
             reminder_proposal_confirmation_card(
                 proposal, timezone_name=self.timezone.key
             ),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "提醒确认卡暂时未能发送，本次提醒尚未保存，请稍后重试。"
+                )
+            ),
         )
         return {
             "ok": True,
@@ -140,6 +146,11 @@ class ReminderTools:
             ctx.agent_run_id,
             reminder_proposal_confirmation_card(
                 proposal, timezone_name=self.timezone.key
+            ),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "提醒取消确认卡暂时未能发送，原提醒仍然有效，请稍后重试。"
+                )
             ),
         )
         return {

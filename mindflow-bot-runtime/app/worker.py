@@ -142,15 +142,21 @@ _STREAMING_WEB_TOOLS = {
 }
 
 
-def _with_card_delivery_failure(response: RuntimeResponse | str) -> RuntimeResponse:
+def _with_card_delivery_failure(
+    response: RuntimeResponse | str,
+    *,
+    deterministic_fallback: str | None = None,
+) -> RuntimeResponse:
     authoritative = (
         response
         if isinstance(response, RuntimeResponse)
         else RuntimeResponse(text=str(response))
     )
-    text = _CARD_DELIVERED_CLAIM.sub(
-        "卡片已生成，但尚未成功发送", authoritative.text
-    ).rstrip()
+    text = str(deterministic_fallback or "").strip()
+    if not text:
+        text = _CARD_DELIVERED_CLAIM.sub(
+            "卡片已生成，但尚未成功发送", authoritative.text
+        ).rstrip()
     notice = "卡片暂时未能发送，请稍后再试。"
     if notice not in text:
         text = f"{text}\n\n{notice}" if text else notice
@@ -2627,10 +2633,10 @@ class BotWorker:
             await close_progress_before_final()
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
-            cards = (
-                self.presentations.take_cards(run_id)
+            cards, review_policy = (
+                self.presentations.take_delivery(run_id)
                 if self.presentations is not None
-                else []
+                else ([], None)
             )
             card_delivery_failed = False
             delivered_cards: list[object] = []
@@ -2676,7 +2682,14 @@ class BotWorker:
                 (time.monotonic() - card_started) * 1000, 1
             )
             if card_delivery_failed:
-                response = _with_card_delivery_failure(response)
+                response = _with_card_delivery_failure(
+                    response,
+                    deterministic_fallback=(
+                        review_policy.fallback_text
+                        if review_policy is not None
+                        else None
+                    ),
+                )
             presentation_started = time.monotonic()
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
@@ -2685,6 +2698,13 @@ class BotWorker:
                 cards=delivered_cards,
                 used_tools=progress.used_tools,
                 evidence=PresentationEvidence(tuple(progress.evidence_sources)),
+                suppress_card_companion=bool(
+                    review_policy is not None
+                    and review_policy.self_contained
+                    and review_policy.suppress_companion
+                    and delivered_cards
+                    and not card_delivery_failed
+                ),
             )
             metrics["presentation_ms"] = round(
                 (time.monotonic() - presentation_started) * 1000, 1

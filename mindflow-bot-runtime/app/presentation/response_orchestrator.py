@@ -80,6 +80,7 @@ class ResponseOrchestrator:
         cards: list[object],
         used_tools: set[str],
         evidence: PresentationEvidence | None = None,
+        suppress_card_companion: bool = False,
     ) -> ResponsePlan:
         authoritative = self._coerce(response)
         tools = {str(name) for name in used_tools}
@@ -90,6 +91,15 @@ class ResponseOrchestrator:
             cards=cards,
             used_tools=tools,
         )
+
+        if suppress_card_companion and cards:
+            return self._plan(
+                kind,
+                (),
+                True,
+                False,
+                presentation_mode=mode,
+            )
 
         if kind in {"fixed", "error"} or authoritative.safety_locked:
             return ResponsePlan(

@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import time
+import uuid
 
 import pytest
 
@@ -23,8 +24,9 @@ from app.presentation.presentation_agent import ProductionPresentationAgent
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.presentation.semantic_segmenter import SemanticSegmenter
 from app.repositories import BotEventRepository
+from app.services.presentation_service import PresentationOutbox, ReviewCardPolicy
 from app.models import BotEvent as BotEventRow
-from app.worker import BotWorker, ProgressState
+from app.worker import BotWorker, ProgressState, _with_card_delivery_failure
 from helpers import memory_database
 
 
@@ -252,6 +254,75 @@ def test_calendar_confirmation_card_failure_keeps_text_fallback():
     assert [segment.text for segment in plan.segments] == [
         "已生成待确认方案，请确认。"
     ]
+
+
+def _self_contained_review_plan(tool_name):
+    return asyncio.run(
+        ResponseOrchestrator().build_plan(
+            RuntimeResponse("这段模型说明不应与审核卡重复发送。"),
+            cards=[{"schema": "2.0"}],
+            used_tools={tool_name},
+            suppress_card_companion=True,
+        )
+    )
+
+
+def test_reminder_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("reminder_create")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_memory_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("memory_replace")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_preference_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("interaction_preferences_update")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_care_preference_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("care_update_preferences")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_review_card_delivery_failure_keeps_text_fallback():
+    run_id = uuid.uuid4()
+    outbox = PresentationOutbox()
+    fallback = "提醒确认卡暂时未能发送，本次提醒尚未保存，请稍后重试。"
+    outbox.stage_card(
+        run_id,
+        {"schema": "2.0"},
+        review_policy=ReviewCardPolicy(fallback_text=fallback),
+    )
+    cards, policy = outbox.take_delivery(run_id)
+
+    assert cards == [{"schema": "2.0"}]
+    assert policy is not None
+    failed = _with_card_delivery_failure(
+        RuntimeResponse("卡片已经准备好了，请查看。"),
+        deterministic_fallback=policy.fallback_text,
+    )
+    plan = asyncio.run(
+        ResponseOrchestrator().build_plan(
+            failed,
+            cards=[],
+            used_tools={"reminder_create"},
+        )
+    )
+
+    assert "本次提醒尚未保存" in plan.full_text
+    assert "卡片已经准备好了" not in plan.full_text
+    assert plan.segments
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from app.integrations.feishu.cards import (
     memory_center_card,
     personalization_proposal_confirmation_card,
 )
+from app.services.presentation_service import ReviewCardPolicy
 
 
 class MemoryTools:
@@ -141,6 +142,11 @@ class MemoryTools:
         self.presentations.stage_card(
             ctx.agent_run_id,
             personalization_proposal_confirmation_card(proposal),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "记忆变更确认卡暂时未能发送，本次变更尚未生效，请稍后重试。"
+                )
+            ),
         )
         return {
             "ok": True,

@@ -19,6 +19,7 @@ from app.repositories_course_schedule import (
     CourseScheduleImportAmbiguityError,
 )
 from app.services.participant_time import to_participant_local_datetime
+from app.services.presentation_service import ReviewCardPolicy
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -145,11 +146,25 @@ class CourseScheduleTools:
         if self.presentations is None:
             return
         card = course_schedule_preview_card(draft)
+        review_policy = ReviewCardPolicy(
+            fallback_text=(
+                "课程表确认卡暂时未能发送，本次课程表尚未导入，请稍后重试。"
+            )
+        )
         message_id = str(draft.get("status_card_message_id") or "").strip()
         if message_id:
-            self.presentations.stage_card_update(run_id, message_id, card)
+            self.presentations.stage_card_update(
+                run_id,
+                message_id,
+                card,
+                review_policy=review_policy,
+            )
         else:
-            self.presentations.stage_card(run_id, card)
+            self.presentations.stage_card(
+                run_id,
+                card,
+                review_policy=review_policy,
+            )
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -480,6 +495,11 @@ class CourseScheduleTools:
         self.presentations.stage_card(
             ctx.agent_run_id,
             course_schedule_revert_confirmation_card(candidate),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "课程表撤销确认卡暂时未能发送，现有日程尚未撤销，请稍后重试。"
+                )
+            ),
         )
         return {
             "ok": True,

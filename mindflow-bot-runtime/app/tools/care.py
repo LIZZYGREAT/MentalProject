@@ -60,6 +60,7 @@ from app.services.runtime_clock import RuntimeClock
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PresentationOutbox,
+    ReviewCardPolicy,
 )
 from app.services.token_service import TokenRepository
 
@@ -1012,6 +1013,11 @@ class CareTools:
         self.presentations.stage_card(
             ctx.agent_run_id,
             personalization_proposal_confirmation_card(proposal),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "关怀偏好确认卡暂时未能发送，本次变更尚未生效，请稍后重试。"
+                )
+            ),
         )
         return {
             "ok": True,
@@ -1717,6 +1723,11 @@ class CareTools:
             ctx.agent_run_id,
             calendar_mutation_plan_confirmation_card(
                 plan, timezone_name=self.timezone.key
+            ),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "日程确认卡暂时未能发送，本次日程变更尚未执行，请稍后重试。"
+                )
             ),
         )
         return {

@@ -10,6 +10,7 @@ from app.integrations.feishu.cards import (
     personalization_proposal_confirmation_card,
     preference_settings_card,
 )
+from app.services.presentation_service import ReviewCardPolicy
 
 
 class InteractionPreferenceTools:
@@ -131,6 +132,11 @@ class InteractionPreferenceTools:
         self.presentations.stage_card(
             ctx.agent_run_id,
             personalization_proposal_confirmation_card(proposal),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "偏好变更确认卡暂时未能发送，本次变更尚未生效，请稍后重试。"
+                )
+            ),
         )
         return {
             "ok": True,
