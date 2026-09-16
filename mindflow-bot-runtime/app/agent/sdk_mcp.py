@@ -26,11 +26,17 @@ def _presentation_evidence(tool_name: str, value: Any) -> PresentationEvidence |
         "web_read_result",
         "web_read_url",
         "web_read_url_chunk",
+        "video_inspect_url",
+        "video_read_transcript",
     }:
         return None
     if not isinstance(value, dict) or value.get("ok") is not True:
         return None
-    kind = "url_read" if tool_name.startswith("web_read_url") else "search"
+    kind = (
+        "url_read"
+        if tool_name.startswith("web_read_url") or tool_name.startswith("video_")
+        else "search"
+    )
     raw_sources: list[Any] = []
     if isinstance(value.get("sources"), list):
         raw_sources.extend(value["sources"])

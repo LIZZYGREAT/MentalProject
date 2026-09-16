@@ -139,6 +139,8 @@ _STREAMING_WEB_TOOLS = {
     "web_read_result",
     "web_read_url",
     "web_read_url_chunk",
+    "video_inspect_url",
+    "video_read_transcript",
 }
 
 

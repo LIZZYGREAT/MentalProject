@@ -34,7 +34,14 @@ _ANALYSIS_TOOLS = {
     "care_get_pressure_curve",
 }
 _CHECKIN_TOOLS = {"care_get_checkin_card"}
-_WEB_TOOLS = {"web_search", "web_read_result", "web_read_url", "web_read_url_chunk"}
+_WEB_TOOLS = {
+    "web_search",
+    "web_read_result",
+    "web_read_url",
+    "web_read_url_chunk",
+    "video_inspect_url",
+    "video_read_transcript",
+}
 
 
 class ResponseOrchestrator:
