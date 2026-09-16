@@ -114,6 +114,8 @@ def validate_semantic_rule_instruction(instruction: str) -> str:
     """Reject only explicit attempts to control authorization or tool use."""
 
     value = str(instruction or "").strip()
+    if "<" in value or ">" in value:
+        raise UnsafeSemanticPreferenceRule()
     if any(pattern.search(value) for pattern in _SEMANTIC_RULE_UNSAFE_PATTERNS):
         raise UnsafeSemanticPreferenceRule()
     return value
