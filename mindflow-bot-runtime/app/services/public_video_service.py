@@ -88,6 +88,7 @@ class PublicVideoService:
                 return self._metadata_only_result(
                     metadata if "metadata" in locals() else None,
                     reason_code=exc.reason_code,
+                    participant_id=participant_id,
                 )
             return self._failure(exc.reason_code)
         except Exception:
@@ -193,6 +194,7 @@ class PublicVideoService:
         metadata: VideoMetadata | None,
         *,
         reason_code: str,
+        participant_id: Any,
     ) -> dict[str, Any]:
         if metadata is None:
             return self._failure("video_metadata_unavailable")
@@ -202,21 +204,29 @@ class PublicVideoService:
             **metadata_as_dict(metadata),
             "transcript_available": False,
             "language": None,
-            "extraction_mode": "no_public_subtitle",
+            "extraction_mode": (
+                "no_public_subtitle"
+                if reason_code == "no_public_subtitle"
+                else "metadata_only"
+            ),
             "total_chars": 0,
             "reason_code": reason_code,
             "public_reason": _PUBLIC_REASON_TEXT.get(
                 reason_code, _PUBLIC_REASON_TEXT["no_public_subtitle"]
             ),
         }
-        self._known[(None, metadata.provider, metadata.video_id)] = VideoTranscriptDocument(
+        self._known[(participant_id, metadata.provider, metadata.video_id)] = VideoTranscriptDocument(
             video_id=metadata.video_id,
             provider=metadata.provider,
             title=metadata.title,
             language=None,
             segments=(),
             total_chars=0,
-            extraction_mode="no_public_subtitle",
+            extraction_mode=(
+                "no_public_subtitle"
+                if reason_code == "no_public_subtitle"
+                else "metadata_only"
+            ),
         )
         return result
 

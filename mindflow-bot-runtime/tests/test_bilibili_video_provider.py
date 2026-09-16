@@ -72,6 +72,10 @@ def metadata_payload(**overrides):
     return json.dumps({"code": 0, "data": data}, ensure_ascii=False)
 
 
+def metadata_with_subtitle_payload(subtitle_entries):
+    return metadata_payload(subtitle={"list": subtitle_entries})
+
+
 def test_bilibili_short_url_resolves_to_video_and_normalizes_metadata():
     fetcher = FakeFetcher(
         [
@@ -115,3 +119,59 @@ def test_bilibili_non_public_api_result_is_classified_without_leaking_details():
         asyncio.run(adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD"))
 
     assert exc_info.value.reason_code == "video_page_not_public"
+
+
+def test_bilibili_public_subtitle_is_normalized_and_keeps_timestamps():
+    subtitle_url = "https://aisubtitle.example.test/subtitle.json"
+    subtitle = json.dumps(
+        {
+            "body": [
+                {"from": 20.5, "to": 22.0, "content": "第二句"},
+                {"from": 0, "to": 2.5, "content": "第一句"},
+                {"from": 2.5, "to": 4.0, "content": "   "},
+                {"content": "没有时间戳"},
+            ]
+        },
+        ensure_ascii=False,
+    )
+    fetcher = FakeFetcher(
+        [
+            response(
+                metadata_with_subtitle_payload(
+                    [{"lan": "ai-zh", "subtitle_url": subtitle_url}]
+                )
+            ),
+            response(subtitle, content_type="application/json"),
+        ]
+    )
+    adapter = make_adapter(fetcher)
+    metadata = asyncio.run(
+        adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD")
+    )
+
+    transcript = asyncio.run(adapter.resolve_transcript(metadata))
+
+    assert transcript.language == "zh-CN"
+    assert [segment.text for segment in transcript.segments] == [
+        "第一句",
+        "第二句",
+        "没有时间戳",
+    ]
+    assert transcript.segments[0].start_seconds == 0.0
+    assert transcript.segments[1].end_seconds == 22.0
+    assert transcript.segments[2].start_seconds is None
+    assert transcript.total_chars == len("第一句\n第二句\n没有时间戳")
+
+
+def test_bilibili_without_public_subtitle_is_a_business_result():
+    fetcher = FakeFetcher([response(metadata_with_subtitle_payload([]))])
+    adapter = make_adapter(fetcher)
+    metadata = asyncio.run(
+        adapter.resolve_metadata("https://www.bilibili.com/video/BV1xx411c7mD")
+    )
+
+    transcript = asyncio.run(adapter.resolve_transcript(metadata))
+
+    assert transcript.segments == ()
+    assert transcript.extraction_mode == "no_public_subtitle"
+    assert transcript.total_chars == 0

@@ -43,10 +43,13 @@ class BilibiliVideoAdapter:
         *,
         api_base_url: str = "https://api.bilibili.com",
         api_max_bytes: int = 512 * 1024,
+        transcript_max_chars: int = 120_000,
     ) -> None:
         self.public_transport = public_transport
         self.api_base_url = validate_public_https_url(api_base_url).rstrip("/")
         self.api_max_bytes = max(16 * 1024, int(api_max_bytes))
+        self.transcript_max_chars = max(1_000, int(transcript_max_chars))
+        self._metadata_payloads: dict[str, dict[str, Any]] = {}
 
     def can_handle(self, url: str) -> bool:
         try:
@@ -84,6 +87,7 @@ class BilibiliVideoAdapter:
             bvid = query_value if query_key == "bvid" else ""
         if not bvid:
             raise VideoProviderError("video_metadata_unavailable")
+        self._metadata_payloads[bvid] = data
         return VideoMetadata(
             provider=self.provider,
             canonical_url=f"https://www.bilibili.com/video/{bvid}",
@@ -99,17 +103,132 @@ class BilibiliVideoAdapter:
     async def resolve_transcript(
         self, metadata: VideoMetadata
     ) -> VideoTranscriptDocument:
-        """Part 2 placeholder; public subtitle discovery is added in Part 3."""
-
+        data = self._metadata_payloads.get(metadata.video_id)
+        if data is None:
+            payload = await self._read_json(
+                f"{self.api_base_url}/x/web-interface/view?"
+                f"{urlencode({'bvid': metadata.video_id})}"
+            )
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        subtitle = data.get("subtitle") if isinstance(data, dict) else None
+        entries = subtitle.get("list") if isinstance(subtitle, dict) else None
+        if not isinstance(entries, list):
+            raise VideoProviderError("no_public_subtitle")
+        candidates = [
+            item for item in entries
+            if isinstance(item, dict) and str(item.get("subtitle_url") or "").strip()
+        ]
+        if not candidates:
+            return self._empty_transcript(metadata)
+        selected = min(candidates, key=self._subtitle_priority)
+        raw_url = str(selected.get("subtitle_url") or "").strip()
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        try:
+            fetched = await self.public_transport.fetch_public_url(
+                raw_url, max_bytes=self.api_max_bytes
+            )
+        except PublicWebReadError as exc:
+            raise VideoProviderError("subtitle_fetch_failed") from exc
+        try:
+            payload = json.loads(
+                fetched.response.body.decode("utf-8", errors="strict")
+            )
+            segments = self._normalize_segments(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise VideoProviderError("subtitle_parse_failed") from exc
+        if not segments:
+            return self._empty_transcript(metadata)
+        total_chars = len("\n".join(segment.text for segment in segments))
+        if total_chars > self.transcript_max_chars:
+            raise VideoProviderError("transcript_too_large")
         return VideoTranscriptDocument(
             video_id=metadata.video_id,
             provider=self.provider,
+            title=metadata.title,
+            language=self._language(selected),
+            segments=tuple(segments),
+            total_chars=total_chars,
+            extraction_mode="public_subtitle",
+        )
+
+    @staticmethod
+    def _empty_transcript(metadata: VideoMetadata) -> VideoTranscriptDocument:
+        return VideoTranscriptDocument(
+            video_id=metadata.video_id,
+            provider="bilibili",
             title=metadata.title,
             language=None,
             segments=(),
             total_chars=0,
             extraction_mode="no_public_subtitle",
         )
+
+    @staticmethod
+    def _subtitle_priority(item: dict[str, Any]) -> tuple[int, str]:
+        language = BilibiliVideoAdapter._language(item)
+        priority = {"zh-CN": 0, "zh": 1, "en": 2}.get(language, 3)
+        return priority, language
+
+    @staticmethod
+    def _language(item: dict[str, Any]) -> str:
+        raw = str(item.get("lan") or item.get("lang") or "").strip()
+        folded = raw.casefold().replace("_", "-")
+        if folded in {"zh", "zh-cn", "ai-zh", "zh-hans", "zh-hans-cn"}:
+            return "zh-CN"
+        if folded in {"en", "en-us", "en-gb"}:
+            return "en"
+        return raw or "unknown"
+
+    @staticmethod
+    def _normalize_segments(payload: Any) -> list[TranscriptSegment]:
+        if isinstance(payload, dict):
+            raw_segments = payload.get("body") or payload.get("segments")
+        else:
+            raw_segments = payload
+        if not isinstance(raw_segments, list):
+            raise ValueError("subtitle body must be a list")
+        normalized: list[tuple[int, TranscriptSegment]] = []
+        for position, item in enumerate(raw_segments):
+            if not isinstance(item, dict):
+                continue
+            text = str(
+                item.get("content")
+                if item.get("content") is not None
+                else item.get("text") or ""
+            ).strip()
+            if not text:
+                continue
+            start = BilibiliVideoAdapter._timestamp(
+                item.get("from", item.get("start_seconds", item.get("start")))
+            )
+            end = BilibiliVideoAdapter._timestamp(
+                item.get("to", item.get("end_seconds", item.get("end")))
+            )
+            normalized.append((
+                position,
+                TranscriptSegment(start_seconds=start, end_seconds=end, text=text),
+            ))
+        normalized.sort(
+            key=lambda pair: (
+                pair[1].start_seconds is None,
+                pair[1].start_seconds if pair[1].start_seconds is not None else 0.0,
+                pair[0],
+            )
+        )
+        return [segment for _position, segment in normalized]
+
+    @staticmethod
+    def _timestamp(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(result) or result < 0:
+            return None
+        return result
 
     async def _resolve_page(self, url: str) -> tuple[str, str]:
         parsed = urlsplit(validate_public_https_url(url))
