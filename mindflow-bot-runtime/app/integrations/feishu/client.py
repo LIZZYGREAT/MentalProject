@@ -111,10 +111,8 @@ class FeishuClient:
             {"type": "card_json", "data": json.dumps(card, ensure_ascii=False)},
             operation="create_card_instance",
         )
-        data = getattr(response, "data", None)
-        card_id = (
-            data.get("card_id") if isinstance(data, dict) else getattr(data, "card_id", None)
-        )
+        data = self._cardkit_response_data(response, operation="create_card_instance")
+        card_id = data.get("card_id") if isinstance(data, dict) else None
         if not card_id:
             raise FeishuSendError(
                 "Feishu CardKit response has no card_id",
@@ -283,6 +281,59 @@ class FeishuClient:
                 provider_request_id=self._response_request_id(response),
             )
         return response
+
+    @staticmethod
+    def _cardkit_response_data(response: Any, *, operation: str) -> dict[str, Any] | None:
+        """Return CardKit response data across typed and generic SDK responses.
+
+        Some lark-oapi versions leave ``BaseResponse.data`` empty even though the
+        raw HTTP response contains the successful CardKit payload.  Prefer the
+        raw payload when it is present so that the generic ``BaseRequest`` path
+        does not turn a successful card creation into a false failure.
+        """
+
+        raw = getattr(response, "raw", None)
+        raw_content = getattr(raw, "content", None) if raw is not None else None
+        if raw_content is not None:
+            try:
+                if isinstance(raw_content, (bytes, bytearray)):
+                    raw_content = bytes(raw_content).decode("utf-8")
+                payload = json.loads(str(raw_content))
+            except (UnicodeDecodeError, TypeError, ValueError) as exc:
+                raise FeishuSendError(
+                    "Feishu CardKit response has invalid JSON",
+                    retryable=False,
+                    operation=operation,
+                ) from exc
+            if not isinstance(payload, dict):
+                raise FeishuSendError(
+                    "Feishu CardKit response payload is not an object",
+                    retryable=False,
+                    operation=operation,
+                )
+            if payload.get("code") != 0:
+                raise FeishuSendError(
+                    "Feishu CardKit response has a non-zero code",
+                    code=payload.get("code") if isinstance(payload.get("code"), int) else None,
+                    retryable=False,
+                    operation=operation,
+                )
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise FeishuSendError(
+                    "Feishu CardKit response data is not an object",
+                    retryable=False,
+                    operation=operation,
+                )
+            return data
+
+        data = getattr(response, "data", None)
+        if isinstance(data, dict):
+            return data
+        if data is None:
+            return None
+        card_id = getattr(data, "card_id", None)
+        return {"card_id": card_id} if card_id is not None else None
 
     @staticmethod
     def _response_request_id(response: Any) -> str | None:

@@ -212,6 +212,75 @@ def test_feishu_client_uses_cardkit_preallocation_element_and_settings_endpoints
     )
 
 
+def test_create_card_instance_parses_card_id_from_generic_raw_response():
+    class Response:
+        code = 0
+        msg = "success"
+        data = None
+        raw = SimpleNamespace(
+            content=b'{"code":0,"data":{"card_id":"7685996010229878000"},"msg":"success"}'
+        )
+
+        @staticmethod
+        def success():
+            return True
+
+    class SDK:
+        @staticmethod
+        def request(_request):
+            return Response()
+
+    client = FeishuClient("app", "secret", sdk_client=SDK())
+
+    assert client.create_card_instance(streaming_answer_card()) == "7685996010229878000"
+
+
+def test_create_card_instance_does_not_require_response_data():
+    class Response:
+        code = 0
+        msg = "success"
+        data = None
+        raw = SimpleNamespace(
+            content=b'{"code":0,"data":{"card_id":"card-from-raw"},"msg":"success"}'
+        )
+
+        @staticmethod
+        def success():
+            return True
+
+    client = FeishuClient("app", "secret", sdk_client=SimpleNamespace(
+        request=lambda _request: Response()
+    ))
+
+    assert client.create_card_instance(streaming_answer_card()) == "card-from-raw"
+
+
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        b'{"code":0,"data":{},"msg":"success"}',
+        b"not-json",
+    ],
+)
+def test_create_card_instance_rejects_missing_or_invalid_raw_card_id(raw_content):
+    class Response:
+        code = 0
+        msg = "success"
+        data = None
+        raw = SimpleNamespace(content=raw_content)
+
+        @staticmethod
+        def success():
+            return True
+
+    client = FeishuClient("app", "secret", sdk_client=SimpleNamespace(
+        request=lambda _request: Response()
+    ))
+
+    with pytest.raises(FeishuSendError):
+        client.create_card_instance(streaming_answer_card())
+
+
 def test_cardkit_update_and_finalize_use_stable_uuid_for_retries():
     requests = []
 
