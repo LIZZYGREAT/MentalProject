@@ -18,6 +18,60 @@ _CUSTOM_VALUE_UNSAFE = re.compile(
     r"(?:忽略|绕过|覆盖|系统|安全|权限|授权|确认|规则|提示词|prompt|tool|token|secret|泄露|执行)",
     re.I,
 )
+_SEMANTIC_RULE_UNSAFE_PATTERNS = (
+    re.compile(
+        r"(?:忽略|绕过|覆盖)\s*(?:所有|任何)?\s*"
+        r"(?:系统(?:规则|指令)?|安全(?:规则|限制)?|权限|授权|确认)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:无需|不(?:要|需)|免于|跳过)\s*(?:任何|用户)?\s*(?:确认|授权)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:直接|立即|无需确认地)\s*(?:调用|执行|使用)\s*"
+        r"(?:任何|任意)?\s*(?:工具|tools?\b)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:泄露|显示|输出|提供|打印|暴露|reveal|disclose|print|output|"
+        r"leak|exfiltrate)\s*(?:所有|内部)?\s*"
+        r"(?:token|tokens|secret|secrets|api\s*key|密钥|系统提示|"
+        r"system\s*prompt|system\s*instructions)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:ignore|bypass|override)\s+(?:the\s+)?"
+        r"(?:system|safety|security|permission|authorization|confirmation|rules?)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:without|skip|no)\s+(?:user\s+)?"
+        r"(?:confirmation|authorization)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:directly|immediately)\s+(?:call|execute|invoke)\s+"
+        r"(?:any\s+)?tools?\b",
+        re.I,
+    ),
+    re.compile(
+        r"(?:reveal|disclose|print|output|leak|exfiltrate)\s+"
+        r"(?:tokens?|secrets?|api\s*keys?|system\s*prompts?)",
+        re.I,
+    ),
+)
+
+
+class UnsafeSemanticPreferenceRule(ValueError):
+    code = "unsafe_semantic_preference_rule"
+    do_not_retry = True
+
+    def __init__(self) -> None:
+        super().__init__(
+            "semantic communication rules cannot change authorization, safety, "
+            "confirmation, tool, or secret-handling behavior"
+        )
 
 
 def validate_style_changes(changes: dict) -> dict:
@@ -56,6 +110,15 @@ def validate_identity_changes(changes: dict) -> dict[str, str]:
     return validated
 
 
+def validate_semantic_rule_instruction(instruction: str) -> str:
+    """Reject only explicit attempts to control authorization or tool use."""
+
+    value = str(instruction or "").strip()
+    if any(pattern.search(value) for pattern in _SEMANTIC_RULE_UNSAFE_PATTERNS):
+        raise UnsafeSemanticPreferenceRule()
+    return value
+
+
 def validate_custom_rules(changes: list | tuple | None) -> list[dict[str, str]]:
     """Validate already-interpreted communication rules.
 
@@ -82,6 +145,7 @@ def validate_custom_rules(changes: list | tuple | None) -> list[dict[str, str]]:
             raise ValueError("custom rule instruction must be 1-500 characters")
         if "\n" in instruction or "\r" in instruction:
             raise ValueError("custom rule instruction cannot contain line breaks")
+        instruction = validate_semantic_rule_instruction(instruction)
         if scope in scopes:
             raise ValueError("custom_rules cannot contain duplicate scopes")
         scopes.add(scope)

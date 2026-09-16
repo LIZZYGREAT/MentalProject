@@ -138,7 +138,7 @@ class InteractionPreferenceTools:
                 custom_rules=custom_rules,
             )
         except (LookupError, ValueError) as exc:
-            return {
+            result = {
                 "ok": False,
                 "error": getattr(exc, "code", "invalid_interaction_preferences"),
                 "reason_code": getattr(
@@ -146,6 +146,9 @@ class InteractionPreferenceTools:
                 ),
                 "message": str(exc),
             }
+            if getattr(exc, "do_not_retry", False):
+                result["do_not_retry"] = True
+            return result
         return self._stage(ctx, proposal)
 
     def delete_rule(self, ctx: AgentContext, args: dict[str, Any]):

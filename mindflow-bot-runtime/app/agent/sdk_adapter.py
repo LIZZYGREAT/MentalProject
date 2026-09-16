@@ -21,6 +21,7 @@ from app.agent.context import AgentContext
 from app.agent.sdk_mcp import TurnContextBinding, build_sdk_mcp_server
 from app.agent.tool_registry import ToolRegistry
 from app.contracts.agent_input import AgentTurnInput, ensure_agent_turn_input
+from app.services.preference_validator import validate_semantic_rule_instruction
 
 
 logger = logging.getLogger(__name__)
@@ -550,6 +551,10 @@ def _text_transport_prompt(
                 "technical_explanations",
                 "code_and_engineering",
             } and 1 <= len(instruction) <= 500:
+                try:
+                    instruction = validate_semantic_rule_instruction(instruction)
+                except ValueError:
+                    continue
                 semantic_rules.append({
                     "scope": scope,
                     "instruction": instruction,
