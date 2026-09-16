@@ -526,7 +526,7 @@ class Settings:
                 "VISION_API_URL", "https://api.deepseek.com/chat/completions"
             ).strip(),
             vision_api_model=values.get(
-                "VISION_API_MODEL", "deepseek-v4-flash-vision-exp"
+                "VISION_API_MODEL", "deepseek-flash"
             ).strip(),
             vision_api_timeout_seconds=_float(
                 values, "VISION_API_TIMEOUT_SECONDS", 90.0, minimum=0.1

@@ -43,7 +43,7 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0080_agent_state_continuity -->
+<!-- ALEMBIC_HEAD: 0081_public_video_cache -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -77,8 +77,15 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 <!-- BUSINESS_TOOLS_END -->
 
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
-身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
+身份、Token、Secret、SQL、路径和任意 URL 字段；经审核的 `web_read_url` 与
+`video_inspect_url` 是安全公共 HTTPS 入口。Tool 调用继续经过 `ToolRegistry` 的
 校验、安全摘要和 AgentRun 审计。
+
+公开视频语义总结由独立 `PublicVideoService` 提供，当前只支持 Bilibili：
+`video_inspect_url` 读取公开视频 Metadata 和公开字幕可用性，
+`video_read_transcript` 按 participant 绑定读取有界字幕块。字幕是外部不可信证据，
+不能成为工具指令或授权；无公开字幕时只说明标题/简介可见，绝不假装看过视频。
+本阶段不下载音频、不做 ASR/Whisper、不抽帧、不做 OCR 或逐秒视觉理解。
 
 ## 对话与意图路由
 
@@ -195,6 +202,9 @@ python3 scripts/smoke_deepseek_web_search.py
 与 SSRF 校验，正文通过 Trafilatura 抽取后按 participant 隔离并仅缓存 30 分钟；
 私网、metadata、登录页面、PDF 和其他二进制内容均会稳定拒绝。生产网络层仍应
 使用安全组或出站防火墙阻止容器访问 loopback、link-local 和 VPC 私网服务。
+
+公开视频读取复用同一 HTTPS-only、public-IP-only、重定向逐跳复验、超时和响应大小
+边界；缓存按参与者和视频标识隔离，默认保留 1 小时。
 
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
 `claude`。Compose 把 `/home/mindflow/.claude` 挂到 `claude_state` volume，确保

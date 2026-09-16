@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0080_agent_state_continuity -->
+<!-- ALEMBIC_HEAD: 0081_public_video_cache -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -32,9 +32,10 @@ Vision 请求、严格解析与 Draft 创建共享同一并发上限；同步图
 
 ## Agent 与业务工具
 
-每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 21 个封闭 schema
-的 participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线和 Calendar。工具
-Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
+每位参与者使用独立顺序队列与可恢复 session。Backend 向 Agent 暴露封闭 schema 的
+participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线、Calendar 以及独立的
+公共 Web/Video 只读能力。工具 Registry 禁止身份、Token、Secret、SQL、路径与任意 URL
+字段；经审核的公共 URL 入口由 handler 执行 HTTPS、凭据、敏感 query 与 SSRF 校验。
 
 <!-- BUSINESS_TOOLS_BEGIN -->
 - `care_get_today_context`
@@ -59,6 +60,21 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `calendar_delete_event`
 - `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
+
+公共 Web/Video 工具不属于上面的 Care/Calendar 清单：
+
+- `web_search`
+- `web_read_result`
+- `web_read_url`
+- `web_read_url_chunk`
+- `video_inspect_url`
+- `video_read_transcript`
+
+`PublicVideoService` 当前只接入 Bilibili。公开视频 URL 先经过复用的 public HTTPS
+redirect/DNS/SSRF 链路，再读取公开 Metadata 与匿名可访问字幕；Transcript 按
+participant、provider、video_id 短期缓存并按 offset 分块。字幕是 untrusted evidence，
+不能改变系统规则、工具授权或 Calendar 状态。无公开字幕时只返回标题/简介可见和明确
+降级说明。本阶段不做 ASR、音频下载、Whisper、逐帧视觉理解、OCR、时间轴对齐或秒级问答。
 
 `calendar_update_event` 与批量更新采用 PATCH 合同：Agent 提供 `event_ref`、结构化 `scope`
 以及只包含目标字段的 `changes`。Backend 先绑定 participant-owned 当前对象，再把 partial
