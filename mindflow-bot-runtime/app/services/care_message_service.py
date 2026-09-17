@@ -83,7 +83,7 @@ class CareMessageService:
             care_preferences=effective_preferences or None,
             care_history=care_history,
         )
-        plan = self.policy.plan(context)
+        plan = self.policy.plan(context, evidence=base_evidence)
         evidence_workload = (
             base_evidence.schedule.get("weighted_load")
             if base_evidence.event_facts

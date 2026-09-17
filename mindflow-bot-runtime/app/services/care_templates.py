@@ -134,7 +134,7 @@ class CareTemplateLibrary:
         reasons = [str(item.get("code") or "") for item in evidence.reason_candidates]
         risk = self._clock(evidence.risk.get("risk_time") or context.risk_time)
         course_names = [
-            str(item.get("display_name") or "一段课程")[:24]
+            item
             for item in evidence.event_facts
             if item.get("event_type") == "course"
             and item.get("workload_level") == "high"
@@ -142,9 +142,23 @@ class CareTemplateLibrary:
         schedule = evidence.schedule
         pieces: list[str] = []
         if "dense_high_load_course_block" in reasons and course_names:
-            joined = "、".join(course_names)
+            block_reason = next(
+                item for item in evidence.reason_candidates
+                if item.get("code") == "dense_high_load_course_block"
+            )
+            fact_ids = set(block_reason.get("fact_ids") or [])
+            block_courses = [
+                item for item in evidence.event_facts
+                if item.get("event_type") == "course"
+                and (not fact_ids or item.get("fact_id") in fact_ids)
+            ][:3]
+            described = [
+                f"{str(item.get('display_name') or '一段课程')[:24]}{self._semantic_load_phrase(item)}"
+                for item in block_courses
+            ]
+            joined = "、".join(described) or "这些课程综合任务负荷偏高"
             pieces.append(
-                f"{risk} 前后模型预计压力可能上升，{joined}等课程在本次语义模型里认知负荷偏高，"
+                f"{risk} 前后模型预计压力可能上升，{joined}，"
                 f"连续 {int(schedule.get('consecutive_course_count') or 0)} 节、课程间最长间隔约 "
                 f"{int(schedule.get('largest_break_minutes') or 0)} 分钟"
             )
@@ -175,6 +189,24 @@ class CareTemplateLibrary:
         if pieces:
             return pieces[0] + "。"
         return ""
+
+    @staticmethod
+    def _semantic_load_phrase(event: dict[str, Any]) -> str:
+        semantic = dict(event.get("semantic") or {})
+        labels = []
+        if float(semantic.get("cognitive_demand") or 0.0) >= 0.70:
+            labels.append("认知负荷")
+        if float(semantic.get("time_pressure") or 0.0) >= 0.70:
+            labels.append("时间压力")
+        if float(semantic.get("expected_effort") or 0.0) >= 0.70:
+            labels.append("预计投入")
+        if float(semantic.get("uncertainty") or 0.0) >= 0.70:
+            labels.append("不确定性")
+        if float(semantic.get("difficulty") or 0.0) >= 0.70:
+            labels.append("难度")
+        if not labels:
+            return "综合任务负荷偏高"
+        return "".join(["在当前语义评估里", "、".join(labels), "偏高"])
 
     def _action_line(self, context: CareContext, plan: CareMessagePlan) -> str:
         if plan.intervention_type == "pause_and_seek_support":
