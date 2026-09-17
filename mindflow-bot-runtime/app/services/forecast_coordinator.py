@@ -8,7 +8,7 @@ import hashlib
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.calendar import CalendarService
@@ -47,6 +47,8 @@ from app.services.forecast_dependency_refresh import (
     ForecastDependencyRefreshService,
     dependent_date_for,
 )
+from app.contracts.care_evidence import CARE_EVIDENCE_SCHEMA_VERSION
+from app.services.care_reason_policy import CARE_REASON_POLICY_VERSION
 from app.services.runtime_clock import RuntimeClock
 from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
@@ -261,6 +263,7 @@ def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, A
         classification = dict(metadata.get("classification") or {})
         catalog_context = dict(classification.get("course_catalog_context") or {})
         semantic = dict(metadata.get("semantic") or {})
+        semantic_values = dict(semantic.get("values") or {})
         classified.append(
             {
                 "id": str(event.get("id") or event.get("event_id") or ""),
@@ -284,12 +287,71 @@ def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, A
                 "classification_source": classification.get("source"),
                 "classification_confidence": classification.get("confidence"),
                 "semantic_source": semantic.get("source"),
+                "semantic_confidence": semantic.get("confidence"),
+                "semantic_values": {
+                    key: semantic_values.get(key)
+                    for key in (
+                        "difficulty", "cognitive_demand", "expected_effort",
+                        "time_pressure", "uncertainty",
+                    )
+                    if semantic_values.get(key) is not None
+                },
+                "semantic_evidence_tags": list(
+                    (semantic.get("external") or {}).get("evidence_tags") or []
+                )[:6],
                 "workload_feature_vector": semantic.get("workload_feature_vector"),
                 "workload_prior": semantic.get("workload_prior"),
                 "workload_model_version": semantic.get("workload_model_version"),
+                "course_catalog": _matched_course_catalog(
+                    event, classification, catalog_context
+                ),
             }
         )
     return classified
+
+
+def _matched_course_catalog(
+    event: Mapping[str, Any],
+    classification: Mapping[str, Any],
+    catalog_context: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    course_match = dict(classification.get("course_match") or {})
+    name = str(
+        event.get("course_name")
+        or event.get("related_course_name")
+        or course_match.get("canonical_name")
+        or ""
+    ).strip()
+    code = str(
+        event.get("course_code")
+        or event.get("related_course_code")
+        or course_match.get("code")
+        or ""
+    ).strip()
+    confidence = event.get("course_match_confidence", course_match.get("confidence"))
+    try:
+        if float(confidence) < 0.55:
+            return None
+    except (TypeError, ValueError):
+        return None
+    candidates = [
+        item for item in list(catalog_context.get("candidates") or [])
+        if isinstance(item, dict)
+        and (
+            (code and str(item.get("code") or "").strip() == code)
+            or (name and str(item.get("canonical_name") or "").strip() == name)
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    return {
+        "canonical_name": str(candidate.get("canonical_name") or "")[:200],
+        "code": str(candidate.get("code") or "")[:64],
+        "credits": candidate.get("credits"),
+        "hours": candidate.get("hours"),
+        "hours_per_week": candidate.get("hours_per_week"),
+    }
 
 
 class ForecastCoordinator:
@@ -383,6 +445,8 @@ class ForecastCoordinator:
                 CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
             ),
             "care_message_schema_version": CARE_MESSAGE_SCHEMA_VERSION,
+            "care_evidence_schema_version": CARE_EVIDENCE_SCHEMA_VERSION,
+            "care_reason_policy_version": CARE_REASON_POLICY_VERSION,
             "care_intervention_policy_version": CARE_INTERVENTION_POLICY_VERSION,
             "care_template_library_version": CARE_TEMPLATE_LIBRARY_VERSION,
             "care_jitai_version": CARE_JITAI_VERSION,
@@ -421,6 +485,7 @@ class ForecastCoordinator:
                 profile_version=facts.get("profile_version"),
                 care_preferences=preferences or None,
                 care_history=facts.get("care_history"),
+                forecast_output=output,
             )
             for alert in raw_candidates
         ]
