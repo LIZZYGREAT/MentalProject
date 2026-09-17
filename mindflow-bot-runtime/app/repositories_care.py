@@ -750,6 +750,8 @@ class CareInterventionRepository:
                 "care_context": context,
                 "care_plan": plan,
                 "care_provenance": provenance,
+                "care_evidence": dict(payload.get("care_evidence") or {}),
+                "care_composition": dict(payload.get("care_composition") or {}),
             },
             "actions_json": list(plan.get("actions") or CARE_CARD_ACTIONS),
             "updated_at": warning.updated_at,
@@ -859,11 +861,43 @@ class CareInterventionRepository:
                     ),
                 ).order_by(desc(CareInterventionFeedback.submitted_at)).limit(1)
             ).scalar_one_or_none()
+            feedback_rows = session.execute(
+                select(CareInterventionFeedback, CareInterventionEvent)
+                .join(
+                    CareInterventionEvent,
+                    CareInterventionEvent.id == CareInterventionFeedback.intervention_id,
+                )
+                .where(
+                    CareInterventionFeedback.participant_id == participant_id,
+                    CareInterventionFeedback.submitted_at <= decision_time,
+                    CareInterventionFeedback.action_selected.in_(
+                        ("helpful", "not_relevant", "disable_type")
+                    ),
+                )
+                .order_by(desc(CareInterventionFeedback.submitted_at))
+                .limit(100)
+            ).all()
+            helpful_summary: dict[str, dict[str, int]] = {}
+            disabled_types: set[str] = set()
+            for feedback, intervention in feedback_rows:
+                intervention_type = str(intervention.intervention_type or "brief_check_in")
+                summary = helpful_summary.setdefault(
+                    intervention_type, {"helpful_count": 0, "rated_count": 0}
+                )
+                if feedback.action_selected in {"helpful", "not_relevant"}:
+                    summary["rated_count"] += 1
+                if feedback.action_selected == "helpful":
+                    summary["helpful_count"] += 1
+                if feedback.action_selected == "disable_type":
+                    disabled_types.add(intervention_type)
             return {
                 "last_intervention_at": _aware(latest.sent_at).isoformat()
                 if latest and latest.sent_at else None,
                 "last_dismissal_at": _aware(dismissal.submitted_at).isoformat()
                 if dismissal is not None else None,
+                "explicit_helpful_summary": helpful_summary,
+                "disabled_intervention_types": sorted(disabled_types),
+                "feedback_source": "explicit_user_feedback",
             }
 
     def latest_sent(self, participant_id: uuid.UUID) -> dict[str, Any] | None:

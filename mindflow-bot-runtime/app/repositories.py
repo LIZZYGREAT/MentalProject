@@ -3805,6 +3805,38 @@ class WarningScheduleRepository:
             row.updated_at = now
             return True
 
+    def persist_claimed_composition(
+        self,
+        warning_id: uuid.UUID,
+        *,
+        claim_token: uuid.UUID | str,
+        expected_forecast_version: str,
+        message: str,
+        composition: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        """Persist one validated composition while the delivery claim is held."""
+
+        token = uuid.UUID(str(claim_token))
+        changed_at = self._aware(now)
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
+            row.payload_json = {
+                **dict(row.payload_json or {}),
+                "message": str(message)[:4000],
+                "care_composition": dict(composition),
+            }
+            row.updated_at = changed_at
+            self._mirror_care(session, row)
+            return True
+
     def finish_claim(
         self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
         expected_forecast_version: str, sent: bool, now: datetime,

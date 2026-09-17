@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.agent.tool_registry import ToolRegistry
+from app.agent.care_composer import OpenAICompatibleCareComposerClient
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.config import Settings
 from app.db import Database
@@ -162,6 +163,7 @@ class BusinessServices:
     personalization_proposals: PersonalizationProposalService
     psychological_context: PsychologicalContextBuilder
     research_aggregates: ResearchAggregateService
+    care_composer: object | None = None
 
 
 def build_business_services(
@@ -201,11 +203,18 @@ def build_business_services(
     )
     prediction_service = PredictionService(AssessmentModel(settings.timezone_name))
     semantic_client = None
+    care_composer = None
     if settings.semantic_api_enabled and settings.deepseek_api_key:
         semantic_client = OpenAICompatibleSemanticClient(
             settings.semantic_api_url, settings.deepseek_api_key,
             settings.semantic_api_model, timeout=settings.semantic_api_timeout_seconds,
             provider="deepseek",
+        )
+        care_composer = OpenAICompatibleCareComposerClient(
+            settings.semantic_api_url,
+            settings.deepseek_api_key,
+            settings.semantic_api_model,
+            timeout_seconds=settings.semantic_api_timeout_seconds,
         )
     semantic_preprocessor = EventSemanticPreprocessor(
         EventSemanticCacheRepository(database), client=semantic_client,
@@ -537,4 +546,5 @@ def build_business_services(
         personalization_proposals=personalization_proposals,
         psychological_context=psychological_context,
         research_aggregates=research_aggregates,
+        care_composer=care_composer,
     )

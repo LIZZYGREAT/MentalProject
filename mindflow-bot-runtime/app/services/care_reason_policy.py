@@ -65,7 +65,10 @@ class CareReasonSelector:
             candidates.append({"code": "high_personal_workload_sensitivity", "fact_ids": [], "salience": 0.58})
         if personalization.get("recovery_rate") == "slower_than_population_prior":
             candidates.append({"code": "slow_personal_recovery", "fact_ids": [], "salience": 0.57})
-        if len(high_events) == 1 and not course_events:
+        if len(high_events) == 1 and not (
+            len(course_events) >= 2
+            and int(schedule.get("consecutive_course_count") or 0) >= 2
+        ):
             candidates.append({
                 "code": "single_high_load_event",
                 "fact_ids": [str(high_events[0]["fact_id"])],

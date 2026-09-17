@@ -1040,6 +1040,7 @@ async def run() -> None:
         care_card_enabled=card_action_transport_available,
         care_outcome_refresh=business.care_outcome_refresh,
         proactive_policy=business.proactive_notifications,
+        care_composer=business.care_composer,
     )
     daily_review_scheduler = DailyReviewScheduler(
         schedules=business.daily_review_schedules,

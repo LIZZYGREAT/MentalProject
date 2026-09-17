@@ -84,12 +84,20 @@ class CareMessageService:
             care_history=care_history,
         )
         plan = self.policy.plan(context)
+        evidence_workload = (
+            base_evidence.schedule.get("weighted_load")
+            if base_evidence.event_facts
+            else alert.get("workload", 0.0)
+        )
+        evidence_continuous = (
+            base_evidence.trajectory.get("continuous_load_factor")
+            if base_evidence.event_facts or (forecast_output or {}).get("trajectory")
+            else alert.get("continuous_load_factor", 0.5)
+        )
         jitai_alert = {
             **dict(alert),
-            "workload": base_evidence.schedule.get("weighted_load", alert.get("workload", 0.0)),
-            "continuous_load_factor": base_evidence.trajectory.get(
-                "continuous_load_factor", alert.get("continuous_load_factor", 0.0)
-            ),
+            "workload": evidence_workload,
+            "continuous_load_factor": evidence_continuous,
         }
         decision = self.jitai.decide(
             context=context,

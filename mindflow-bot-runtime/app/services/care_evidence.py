@@ -192,8 +192,9 @@ class CareEvidenceBuilder:
 
     @staticmethod
     def _course_catalog(event: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any] | None:
+        course_match = dict(classification.get("course_match") or {})
         direct_confidence = _number(
-            event.get("course_match_confidence"), 0.0
+            event.get("course_match_confidence", course_match.get("confidence")), 0.0
         ) or 0.0
         if (
             isinstance(event.get("course_catalog"), Mapping)
@@ -208,7 +209,6 @@ class CareEvidenceBuilder:
                 "hours_per_week": _number(value.get("hours_per_week")),
             }
         context = dict(classification.get("course_catalog_context") or {})
-        course_match = dict(classification.get("course_match") or {})
         candidates = [dict(item) for item in list(context.get("candidates") or []) if isinstance(item, Mapping)]
         name = _text(event.get("course_name") or event.get("related_course_name") or course_match.get("canonical_name"), 200)
         code = _text(event.get("course_code") or event.get("related_course_code") or course_match.get("code"), 64)
@@ -362,9 +362,23 @@ class CareEvidenceBuilder:
     @staticmethod
     def _history(history: Mapping[str, Any] | None, preferences: Mapping[str, Any] | None) -> dict[str, Any]:
         value = dict(history or {})
+        explicit_summary = dict(value.get("explicit_helpful_summary") or {})
+        preferred_from_feedback = [
+            intervention_type
+            for intervention_type, summary in explicit_summary.items()
+            if isinstance(summary, Mapping)
+            and int(summary.get("rated_count") or 0) >= 3
+            and int(summary.get("helpful_count") or 0) >= 2
+        ]
         return {
-            "preferred_intervention_types": list(value.get("preferred_intervention_types") or (preferences or {}).get("preferred_support_types") or [])[:8],
+            "preferred_intervention_types": list(
+                dict.fromkeys(
+                    list(value.get("preferred_intervention_types") or [])
+                    + preferred_from_feedback
+                    + list((preferences or {}).get("preferred_support_types") or [])
+                )
+            )[:8],
             "disabled_intervention_types": list(value.get("disabled_intervention_types") or (preferences or {}).get("disabled_intervention_types") or [])[:8],
-            "explicit_helpful_summary": dict(value.get("explicit_helpful_summary") or {}),
+            "explicit_helpful_summary": explicit_summary,
             "causal_claim_allowed": False,
         }
