@@ -1770,9 +1770,11 @@ def test_legacy_forecast_without_warning_revision_is_recomputed():
         "episode_drift_minutes": 15,
         "care_context_schema_version": "care_context.v2",
         "care_recent_observation_max_age_minutes": 360,
-        "care_message_schema_version": "care_message.v3",
+        "care_message_schema_version": "care_message.v4",
         "care_intervention_policy_version": "care_intervention_policy.v3",
-        "care_template_library_version": "care_template_library.v3",
+        "care_template_library_version": "care_template_library.v4",
+        "care_evidence_schema_version": "care_evidence.v1",
+        "care_reason_policy_version": "care_reason_policy.v1",
         "care_jitai_version": "care-jitai.v1",
         "receptivity_model_version": "receptivity-logistic-v1",
     }
