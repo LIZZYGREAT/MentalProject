@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import html
 import json
+import logging
 import math
 import re
 from typing import Any
@@ -32,6 +33,7 @@ _BILIBILI_HOSTS = frozenset(
 )
 _BVID_PATTERN = re.compile(r"(?i)(BV[0-9A-Za-z]{6,})")
 _AV_PATH_PATTERN = re.compile(r"(?i)^/av(\d+)(?:/|$)")
+logger = logging.getLogger(__name__)
 
 
 class BilibiliVideoAdapter:
@@ -124,6 +126,7 @@ class BilibiliVideoAdapter:
             published_at=self._published_at(data.get("pubdate")),
             cover_url=self._https_url(data.get("pic")),
             video_id=bvid,
+            resource_key=self._resource_key(bvid, part_number),
         )
 
     async def resolve_transcript(
@@ -152,11 +155,27 @@ class BilibiliVideoAdapter:
             f"{urlencode({'bvid': metadata.video_id, 'cid': cid})}"
         )
         player_payload = await self._read_json(player_url)
+        provider_code = player_payload.get("code")
         player_data = player_payload.get("data")
+        subtitle = player_data.get("subtitle") if isinstance(player_data, dict) else None
+        entries = subtitle.get("subtitles") if isinstance(subtitle, dict) else None
+        track_count = len(entries) if isinstance(entries, list) else 0
+        need_login_subtitle = (
+            bool(player_data.get("need_login_subtitle"))
+            if isinstance(player_data, dict)
+            else None
+        )
+        logger.info(
+            "bilibili_subtitle_probe provider=bilibili endpoint=player_v2 "
+            "provider_code=%s need_login_subtitle=%s subtitle_track_count=%s",
+            provider_code,
+            need_login_subtitle,
+            track_count,
+        )
+        if provider_code != 0:
+            raise VideoProviderError("subtitle_provider_failed")
         if not isinstance(player_data, dict):
             return self._empty_transcript(metadata)
-        subtitle = player_data.get("subtitle")
-        entries = subtitle.get("subtitles") if isinstance(subtitle, dict) else None
         if not isinstance(entries, list):
             return self._empty_transcript(metadata)
         candidates = [
@@ -210,6 +229,11 @@ class BilibiliVideoAdapter:
             total_chars=0,
             extraction_mode="no_public_subtitle",
         )
+
+    @staticmethod
+    def _resource_key(video_id: str, part_number: int | None) -> str:
+        suffix = f":p{part_number}" if part_number is not None else ""
+        return f"bilibili:{video_id}{suffix}"
 
     @staticmethod
     def _subtitle_priority(item: dict[str, Any]) -> tuple[int, str]:

@@ -2355,6 +2355,7 @@ class PublicVideoCache(Base):
     )
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     video_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    resource_key: Mapped[str] = mapped_column(String(192), nullable=False, default="")
     canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)

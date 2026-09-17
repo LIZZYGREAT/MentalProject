@@ -20,6 +20,7 @@ VIDEO_REASON_CODES = frozenset(
         "video_page_not_public",
         "no_public_subtitle",
         "subtitle_fetch_failed",
+        "subtitle_provider_failed",
         "subtitle_parse_failed",
         "transcript_too_large",
         "video_url_not_safe",
@@ -43,6 +44,7 @@ class VideoMetadata:
     published_at: str | None
     cover_url: str | None
     video_id: str = ""
+    resource_key: str = ""
 
 
 @dataclass(frozen=True)

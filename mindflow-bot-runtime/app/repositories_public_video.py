@@ -29,6 +29,7 @@ class PublicVideoRepository:
         metadata: VideoMetadata,
         transcript: VideoTranscriptDocument,
         max_chars: int,
+        resource_key: str | None = None,
     ) -> dict:
         if transcript.total_chars > int(max_chars):
             raise ValueError("transcript_too_large")
@@ -36,6 +37,11 @@ class PublicVideoRepository:
         payload = json.dumps(
             transcript_as_dict(transcript), ensure_ascii=False, sort_keys=True
         )
+        identity = str(
+            resource_key
+            or metadata.resource_key
+            or f"{metadata.provider}:{metadata.video_id}"
+        )[:192]
         with self.database.session() as session:
             existing = session.execute(
                 select(PublicVideoCache)
@@ -43,6 +49,7 @@ class PublicVideoRepository:
                     PublicVideoCache.participant_id == participant_id,
                     PublicVideoCache.provider == metadata.provider,
                     PublicVideoCache.video_id == metadata.video_id,
+                    PublicVideoCache.resource_key == identity,
                 )
                 .order_by(PublicVideoCache.fetched_at.desc())
             ).scalars().first()
@@ -50,7 +57,9 @@ class PublicVideoRepository:
                 participant_id=participant_id,
                 provider=metadata.provider,
                 video_id=metadata.video_id,
+                resource_key=identity,
             )
+            row.resource_key = identity
             row.canonical_url = metadata.canonical_url
             row.title = metadata.title[:300]
             row.description = metadata.description
@@ -76,6 +85,7 @@ class PublicVideoRepository:
         *,
         video_id: str,
         provider: str | None = None,
+        resource_key: str | None = None,
     ) -> dict | None:
         with self.database.session() as session:
             query = select(PublicVideoCache).where(
@@ -85,6 +95,8 @@ class PublicVideoRepository:
             )
             if provider:
                 query = query.where(PublicVideoCache.provider == str(provider))
+            if resource_key:
+                query = query.where(PublicVideoCache.resource_key == str(resource_key))
             row = session.execute(
                 query.order_by(PublicVideoCache.fetched_at.desc())
             ).scalars().first()
@@ -104,6 +116,7 @@ class PublicVideoRepository:
                 published_at=row.published_at,
                 cover_url=row.cover_url,
                 video_id=row.video_id,
+                resource_key=row.resource_key,
             )
             return self._view(row, metadata, transcript)
 

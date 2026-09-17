@@ -12,6 +12,7 @@ class VideoTools:
     def __init__(self, service: Any) -> None:
         self.service = service
         self._read_counts: dict[tuple[str, str], int] = {}
+        self._max_read_count_keys = 4096
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -39,6 +40,11 @@ class VideoTools:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 128,
+                    },
+                    "resource_key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 192,
                     },
                     "offset": {"type": "integer", "minimum": 0, "maximum": 120000},
                     "limit_chars": {
@@ -76,9 +82,13 @@ class VideoTools:
                 "do_not_retry": True,
             }
         self._read_counts[key] = used_reads + 1
-        return await self.service.read_transcript(
-            ctx.participant_id,
-            video_id=video_id,
-            offset=args.get("offset", 0),
-            limit_chars=args.get("limit_chars", 8_000),
-        )
+        while len(self._read_counts) > self._max_read_count_keys:
+            self._read_counts.pop(next(iter(self._read_counts)))
+        kwargs = {
+            "video_id": video_id,
+            "offset": args.get("offset", 0),
+            "limit_chars": args.get("limit_chars", 8_000),
+        }
+        if args.get("resource_key"):
+            kwargs["resource_key"] = str(args["resource_key"])
+        return await self.service.read_transcript(ctx.participant_id, **kwargs)

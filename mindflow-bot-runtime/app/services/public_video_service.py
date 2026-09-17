@@ -24,6 +24,7 @@ _PUBLIC_REASON_TEXT = {
     "video_metadata_unavailable": "这个视频页面暂时无法读取公开信息。",
     "video_page_not_public": "这个视频页面不是可读取的公开页面。",
     "no_public_subtitle": "这个视频目前没有可读取的公开字幕。",
+    "subtitle_provider_failed": "视频页面可以读取，但字幕服务暂时返回了错误。",
     "subtitle_fetch_failed": "视频页面可以读取，但公开字幕暂时无法读取。",
     "subtitle_parse_failed": "视频页面可以读取，但公开字幕格式暂时无法解析。",
     "transcript_too_large": "视频字幕超过当前安全读取上限。",
@@ -56,7 +57,7 @@ class PublicVideoService:
         self.max_transcript_chars = max(1_000, int(max_transcript_chars))
         self.max_tool_reads = max(1, int(max_tool_reads))
         self._adapters = tuple(adapters)
-        self._known: dict[tuple[Any, str, str], VideoTranscriptDocument] = {}
+        self._known: dict[tuple[Any, str, str, str], VideoTranscriptDocument] = {}
 
     @property
     def adapters(self) -> tuple[VideoProviderAdapter, ...]:
@@ -85,6 +86,7 @@ class PublicVideoService:
         cache_hit = False
         try:
             metadata = await adapter.resolve_metadata(raw_url)
+            resource_key = self._resource_key(metadata)
             cached = None
             if self.repository is not None and hasattr(self.repository, "get"):
                 cached = await asyncio.to_thread(
@@ -92,6 +94,7 @@ class PublicVideoService:
                     participant_id,
                     video_id=metadata.video_id,
                     provider=metadata.provider,
+                    resource_key=resource_key,
                 )
             if cached is not None and isinstance(cached, dict):
                 transcript = cached.get("transcript")
@@ -100,7 +103,12 @@ class PublicVideoService:
                 transcript = await adapter.resolve_transcript(metadata)
             self._validate_transcript(transcript, metadata)
         except VideoProviderError as exc:
-            if exc.reason_code in {"no_public_subtitle", "subtitle_fetch_failed", "subtitle_parse_failed"}:
+            if exc.reason_code in {
+                "no_public_subtitle",
+                "subtitle_fetch_failed",
+                "subtitle_provider_failed",
+                "subtitle_parse_failed",
+            }:
                 return await self._metadata_only_result(
                     metadata if "metadata" in locals() else None,
                     reason_code=exc.reason_code,
@@ -111,7 +119,7 @@ class PublicVideoService:
             logger.exception("public_video_inspection_failed")
             return self._failure("video_metadata_unavailable")
 
-        key = (participant_id, metadata.provider, metadata.video_id)
+        key = (participant_id, metadata.provider, metadata.video_id, resource_key)
         self._known[key] = transcript
         if not cache_hit:
             await self._store_inspection(participant_id, metadata, transcript)
@@ -124,6 +132,7 @@ class PublicVideoService:
             "extraction_mode": transcript.extraction_mode,
             "total_chars": transcript.total_chars,
             "cache_hit": cache_hit,
+            "resource_key": resource_key,
         }
         if not transcript.segments:
             result.update(
@@ -137,6 +146,7 @@ class PublicVideoService:
         participant_id: Any,
         *,
         video_id: str,
+        resource_key: str | None = None,
         offset: int = 0,
         limit_chars: int = 8_000,
     ) -> dict[str, Any]:
@@ -149,7 +159,9 @@ class PublicVideoService:
             return self._failure("invalid_arguments")
         if requested_limit > 10_000:
             requested_limit = 10_000
-        transcript = await self._lookup_known(participant_id, str(video_id))
+        transcript = await self._lookup_known(
+            participant_id, str(video_id), resource_key=resource_key
+        )
         if transcript is None:
             return self._failure("video_not_inspected")
         if not transcript.segments:
@@ -158,6 +170,7 @@ class PublicVideoService:
                 "verified": True,
                 "video_id": transcript.video_id,
                 "provider": transcript.provider,
+                "resource_key": resource_key or f"{transcript.provider}:{transcript.video_id}",
                 "title": transcript.title,
                 "transcript_available": False,
                 "reason_code": "no_public_subtitle",
@@ -167,7 +180,14 @@ class PublicVideoService:
             }
         text = transcript.text
         if requested_offset >= len(text):
-            return self._chunk_result(transcript, "", requested_offset, requested_offset, True)
+            return self._chunk_result(
+                transcript,
+                "",
+                requested_offset,
+                requested_offset,
+                True,
+                resource_key=resource_key,
+            )
         chunk = text[requested_offset : requested_offset + requested_limit]
         next_offset = requested_offset + len(chunk)
         return self._chunk_result(
@@ -176,21 +196,44 @@ class PublicVideoService:
             requested_offset,
             next_offset,
             next_offset >= len(text),
+            resource_key=resource_key,
         )
 
     async def _lookup_known(
-        self, participant_id: Any, video_id: str
+        self,
+        participant_id: Any,
+        video_id: str,
+        *,
+        resource_key: str | None = None,
     ) -> VideoTranscriptDocument | None:
-        for (owner, _provider, known_id), transcript in self._known.items():
-            if owner == participant_id and known_id == video_id:
-                return transcript
+        matches = []
+        for (owner, _provider, known_id, known_resource_key), transcript in self._known.items():
+            if owner != participant_id or known_id != video_id:
+                continue
+            if resource_key and known_resource_key != resource_key:
+                continue
+            matches.append(transcript)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and resource_key:
+            return matches[0]
         if self.repository is not None and hasattr(self.repository, "get"):
             cached = await asyncio.to_thread(
-                self.repository.get, participant_id, video_id=video_id
+                self.repository.get,
+                participant_id,
+                video_id=video_id,
+                resource_key=resource_key,
             )
             if cached is not None:
                 transcript = cached["transcript"] if isinstance(cached, dict) else cached
-                self._known[(participant_id, transcript.provider, transcript.video_id)] = transcript
+                self._known[
+                    (
+                        participant_id,
+                        transcript.provider,
+                        transcript.video_id,
+                        self._cached_resource_key(cached, transcript),
+                    )
+                ] = transcript
                 return transcript
         return None
 
@@ -243,7 +286,14 @@ class PublicVideoService:
                 else "metadata_only"
             ),
         )
-        self._known[(participant_id, metadata.provider, metadata.video_id)] = transcript
+        self._known[
+            (
+                participant_id,
+                metadata.provider,
+                metadata.video_id,
+                self._resource_key(metadata),
+            )
+        ] = transcript
         await self._store_inspection(participant_id, metadata, transcript)
         return result
 
@@ -262,9 +312,29 @@ class PublicVideoService:
                 metadata=metadata,
                 transcript=transcript,
                 max_chars=self.max_transcript_chars,
+                resource_key=self._resource_key(metadata),
             )
         except Exception:
             logger.exception("public_video_cache_store_failed")
+
+    @staticmethod
+    def _resource_key(metadata: VideoMetadata) -> str:
+        value = str(getattr(metadata, "resource_key", "") or "").strip()
+        return value or f"{metadata.provider}:{metadata.video_id}"
+
+    @staticmethod
+    def _cached_resource_key(
+        cached: Any, transcript: VideoTranscriptDocument
+    ) -> str:
+        if isinstance(cached, dict):
+            value = str(cached.get("resource_key") or "").strip()
+            if value:
+                return value
+            metadata = cached.get("metadata")
+            value = str(getattr(metadata, "resource_key", "") or "").strip()
+            if value:
+                return value
+        return f"{transcript.provider}:{transcript.video_id}"
 
     @staticmethod
     def _chunk_result(
@@ -273,6 +343,7 @@ class PublicVideoService:
         offset: int,
         next_offset: int,
         done: bool,
+        resource_key: str | None = None,
     ) -> dict[str, Any]:
         evidence = (
             "<external_video_transcript>\n"
@@ -286,6 +357,7 @@ class PublicVideoService:
             "verified": True,
             "video_id": transcript.video_id,
             "provider": transcript.provider,
+            "resource_key": resource_key or f"{transcript.provider}:{transcript.video_id}",
             "title": transcript.title,
             "language": transcript.language,
             "transcript_available": True,

@@ -19,6 +19,8 @@ from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 import zlib
 
+from app.services.wechat_article_extractor import WeChatArticleExtractor
+
 
 _STRONG_CREDENTIAL_QUERY_KEYS = frozenset({
     "token",
@@ -43,6 +45,8 @@ _PUBLIC_READ_REASON_TEXT = {
     "fetch_failed": "网页服务器没有返回可读取的公开内容。",
     "unsupported_content_type": "这个链接不是当前支持的公开 HTML/文本页面。",
     "empty_extracted_text": "页面可以访问，但没有提取到可阅读正文。",
+    "challenge_page": "页面返回了验证/反爬页面，无法读取公开正文。",
+    "javascript_shell": "页面返回了需要浏览器渲染的空壳，无法读取公开正文。",
     "response_too_large": "页面内容超过当前安全读取上限。",
     "unsupported_content_encoding": "这个网页使用了当前不支持的内容压缩格式。",
     "invalid_content_encoding": "这个网页的压缩内容格式无效，无法读取。",
@@ -518,6 +522,37 @@ class PublicWebDocumentService:
         self.resolver = resolver or resolve_public_addresses
         self.extractor = extractor or self._extract_article
 
+    async def diagnose_url(self, *, url: str) -> dict[str, Any]:
+        """Return bounded diagnostics for manual public-page investigation."""
+
+        fetched = await self.fetch_public_url(url)
+        response = fetched.response
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
+        body = decode_content_encoding(
+            response.body,
+            response.headers.get("content-encoding"),
+            max_bytes=self.max_bytes,
+        )
+        encoding = self._encoding(response.headers.get("content-type", ""))
+        markup = body.decode(encoding, errors="replace")
+        metadata = self._extract_metadata(markup, fetched.canonical_url) if content_type == "text/html" else {}
+        lowered = markup.casefold()
+        return {
+            "final_url": fetched.canonical_url,
+            "status": response.status_code,
+            "content_type": content_type,
+            "body_bytes": len(response.body),
+            "title": metadata.get("title") or self._html_title(markup),
+            "contains_js_content": bool(re.search(r"(?is)id\s*=\s*[\"']js_content[\"']", lowered)),
+            "contains_rich_media_content": "rich_media_content" in lowered,
+            "contains_verify_captcha_challenge": any(
+                marker.casefold() in lowered
+                for marker in WeChatArticleExtractor.CHALLENGE_MARKERS
+            ),
+            "page_kind": WeChatArticleExtractor.classify(markup) if content_type == "text/html" else "unknown",
+            "body_prefix": markup[:1000],
+        }
+
     async def read_url(self, participant_id, *, url: str) -> dict[str, Any]:
         started = time.monotonic()
         raw_url = str(url or "").strip()
@@ -758,7 +793,31 @@ class PublicWebDocumentService:
         if content_type == "text/html":
             metadata = self._extract_metadata(body, current)
             title = metadata["title"] or self._html_title(body)
-            extracted = self.extractor(body)
+            page_kind = WeChatArticleExtractor.classify(body)
+            if page_kind == "challenge":
+                raise PublicWebReadError(
+                    "challenge_page",
+                    status_code_class=f"{response.status_code // 100}xx",
+                    content_type=content_type,
+                    redirect_count=redirect_count,
+                )
+            if page_kind == "javascript_shell":
+                raise PublicWebReadError(
+                    "javascript_shell",
+                    status_code_class=f"{response.status_code // 100}xx",
+                    content_type=content_type,
+                    redirect_count=redirect_count,
+                )
+            try:
+                extracted = self.extractor(body)
+            except PublicWebReadError as exc:
+                if exc.reason_code != "extractor_unavailable":
+                    raise
+                extracted = None
+            if not extracted and page_kind == "article":
+                extracted = WeChatArticleExtractor.extract(
+                    body, max_chars=self.max_extracted_chars
+                )
             extraction_mode = "article"
             canonical_url = metadata["canonical_url"] or current
         else:
