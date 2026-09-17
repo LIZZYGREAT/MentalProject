@@ -63,8 +63,12 @@ def _level(prior: Any) -> str:
 
 class CareEvidenceBuilder:
     CONTINUOUS_GAP_MINUTES = 20
+    HIGH_LOAD_THRESHOLD = 0.66
+    DENSE_COURSE_BLOCK_WEIGHT_THRESHOLD = 0.60
     WINDOW_BEFORE_HOURS = 4
     WINDOW_AFTER_MINUTES = 90
+    TRAJECTORY_WINDOW_BEFORE_MINUTES = 90
+    TRAJECTORY_WINDOW_AFTER_MINUTES = 45
 
     def __init__(self, timezone_name: str):
         self.timezone = ZoneInfo(timezone_name)
@@ -95,9 +99,9 @@ class CareEvidenceBuilder:
         recent_state = self._recent_state(recent_observation, risk_time)
         personalization = self._personalization(profile, care_preferences)
         history = self._history(care_history, care_preferences)
-        public_event_facts = [
+        all_public_event_facts = [
             {key: value for key, value in fact.items() if not key.startswith("_")}
-            for fact in event_facts[:8]
+            for fact in event_facts
         ]
         packet = CareEvidencePacket(
             schema_version=CARE_EVIDENCE_SCHEMA_VERSION,
@@ -114,7 +118,7 @@ class CareEvidenceBuilder:
             },
             trajectory=trajectory,
             schedule=schedule,
-            event_facts=tuple(public_event_facts),
+            event_facts=tuple(all_public_event_facts),
             recent_state=recent_state,
             personalization=personalization,
             care_history=history,
@@ -125,10 +129,21 @@ class CareEvidenceBuilder:
             },
             reason_candidates=(),
         )
+        reason_candidates = self.reasons.select(packet)
+        selected_facts = self._select_packet_event_facts(
+            event_facts,
+            risk_time=risk_time,
+            schedule=schedule,
+            reason_candidates=reason_candidates,
+        )
         return CareEvidencePacket(
             **{
                 **packet.__dict__,
-                "reason_candidates": self.reasons.select(packet),
+                "event_facts": tuple(
+                    {key: value for key, value in fact.items() if not key.startswith("_")}
+                    for fact in selected_facts
+                ),
+                "reason_candidates": reason_candidates,
             }
         )
 
@@ -186,6 +201,58 @@ class CareEvidenceBuilder:
             })
         return facts
 
+    def _select_packet_event_facts(
+        self,
+        facts: list[dict[str, Any]],
+        *,
+        risk_time: datetime,
+        schedule: Mapping[str, Any],
+        reason_candidates: tuple[dict[str, Any], ...],
+    ) -> list[dict[str, Any]]:
+        """Keep a bounded packet while preserving the facts explanations use."""
+
+        linked = {
+            str(fact_id)
+            for reason in reason_candidates
+            for fact_id in list(reason.get("fact_ids") or [])
+        }
+        dominant = {
+            str(fact_id)
+            for fact_id in list(schedule.get("dominant_event_fact_ids") or [])
+        }
+        window_start = risk_time - timedelta(hours=self.WINDOW_BEFORE_HOURS)
+        window_end = risk_time + timedelta(minutes=self.WINDOW_AFTER_MINUTES)
+
+        def rank(fact: Mapping[str, Any]) -> tuple[int, int, int, int, float, str]:
+            fact_id = str(fact.get("fact_id") or "")
+            start = fact.get("_start")
+            in_window = bool(
+                isinstance(start, datetime)
+                and window_start <= start <= window_end
+            )
+            distance = (
+                abs((start - risk_time).total_seconds())
+                if isinstance(start, datetime)
+                else float("inf")
+            )
+            return (
+                1 if fact_id in linked else 0,
+                1 if in_window else 0,
+                1 if fact_id in dominant else 0,
+                1 if str(fact.get("workload_level") or "") == "high" else 0,
+                -distance,
+                fact_id,
+            )
+
+        selected = sorted(facts, key=rank, reverse=True)[:8]
+        return sorted(
+            selected,
+            key=lambda fact: (
+                fact.get("_start") if isinstance(fact.get("_start"), datetime) else datetime.max,
+                str(fact.get("fact_id") or ""),
+            ),
+        )
+
     @staticmethod
     def _tags(semantic: Mapping[str, Any]) -> list[str]:
         external = dict(semantic.get("external") or {})
@@ -239,21 +306,53 @@ class CareEvidenceBuilder:
         courses = [fact for fact in visible if fact["event_type"] == "course"]
         longest_count = longest_minutes = largest_break = 0
         current_count = current_minutes = 0.0
+        current_block: list[dict[str, Any]] = []
+        blocks: list[dict[str, Any]] = []
         previous = None
+
+        def append_block(block: list[dict[str, Any]]) -> None:
+            if not block:
+                return
+            total_minutes = sum(float(item["duration_minutes"]) for item in block)
+            weighted_load = sum(
+                float(item["duration_minutes"]) * float(item["workload_prior"])
+                for item in block
+            )
+            breaks = [
+                max(0.0, (right["_start"] - left["_end"]).total_seconds() / 60.0)
+                for left, right in zip(block, block[1:])
+            ]
+            blocks.append({
+                "fact_ids": [item["fact_id"] for item in block],
+                "course_count": len(block),
+                "high_load_course_count": sum(
+                    float(item["workload_prior"]) >= self.HIGH_LOAD_THRESHOLD
+                    for item in block
+                ),
+                "weighted_load": round(weighted_load / total_minutes, 3)
+                if total_minutes else 0.0,
+                "course_minutes": round(total_minutes, 2),
+                "largest_internal_break_minutes": int(max(breaks, default=0.0)),
+            })
+
         for fact in courses:
             gap = None if previous is None else max(0.0, (fact["_start"] - previous).total_seconds() / 60.0)
             if previous is None or (gap is not None and gap <= self.CONTINUOUS_GAP_MINUTES):
                 current_count += 1
                 current_minutes += fact["duration_minutes"]
+                current_block.append(fact)
             else:
                 longest_count = max(longest_count, int(current_count))
                 longest_minutes = max(longest_minutes, int(current_minutes))
+                append_block(current_block)
                 current_count, current_minutes = 1, fact["duration_minutes"]
+                current_block = [fact]
             if gap is not None:
                 largest_break = max(largest_break, int(gap))
             previous = fact["_end"]
         longest_count = max(longest_count, int(current_count))
         longest_minutes = max(longest_minutes, int(current_minutes))
+        append_block(current_block)
         total_minutes = sum(float(item["duration_minutes"]) for item in visible)
         weighted = sum(float(item["duration_minutes"]) * float(item["workload_prior"]) for item in visible)
         return {
@@ -262,6 +361,7 @@ class CareEvidenceBuilder:
             "continuous_course_count": longest_count,
             "consecutive_course_count": longest_count,
             "consecutive_course_minutes": longest_minutes,
+            "continuous_course_blocks": blocks,
             "largest_break_minutes": largest_break,
             "high_load_event_count": sum(item["workload_level"] == "high" for item in visible),
             "low_load_event_count": sum(item["workload_level"] == "low" for item in visible),
@@ -276,7 +376,46 @@ class CareEvidenceBuilder:
         points = [dict(item) for item in list(output.get("trajectory") or []) if isinstance(item, Mapping)]
         def stress(item: Mapping[str, Any]) -> float:
             return _number(item.get("stress_0_10", item.get("predicted_stress")), 0.0) or 0.0
-        peak = max(points, key=stress, default={})
+
+        timed_points: list[dict[str, Any]] = []
+        untimed_points: list[dict[str, Any]] = []
+        for point in points:
+            parsed = self._trajectory_time(point, risk_time.date())
+            if parsed is None:
+                untimed_points.append(point)
+            else:
+                timed_points.append({**point, "_time": parsed})
+        timed_points.sort(key=lambda item: item["_time"])
+        day_points = timed_points or untimed_points
+        day_peak = max(day_points, key=stress, default={})
+        local_start = risk_time - timedelta(minutes=self.TRAJECTORY_WINDOW_BEFORE_MINUTES)
+        local_end = risk_time + timedelta(minutes=self.TRAJECTORY_WINDOW_AFTER_MINUTES)
+        local_points = [
+            item for item in timed_points
+            if local_start <= item["_time"] <= local_end
+        ]
+        local_scope = "risk_window" if local_points else None
+        if not local_points and untimed_points:
+            # Legacy model outputs without timestamps can still be used, but
+            # are explicitly marked as unknown scope rather than pretending
+            # they are risk-local.
+            local_points = untimed_points
+            local_scope = "untimed_legacy"
+
+        local_peak = max(local_points, key=stress, default={})
+        day_factor = self._max_metric(day_points, "continuous_load_factor", "continuous_load")
+        local_factor = self._max_metric(local_points, "continuous_load_factor", "continuous_load")
+        day_penalty = self._max_metric(day_points, "continuous_load_penalty")
+        local_penalty = self._max_metric(local_points, "continuous_load_penalty")
+        local_slope = self._risk_slope(local_points, stress)
+        if local_slope is None:
+            trajectory_label = "unknown"
+        elif local_slope > 0.3:
+            trajectory_label = "rising"
+        elif local_slope < -0.3:
+            trajectory_label = "recovering"
+        else:
+            trajectory_label = "plateau"
         initial = dict(output.get("initial_state") or {})
         initial_stress = _number(initial.get("stress_0_10"))
         baseline = self._baseline(profile)
@@ -287,16 +426,86 @@ class CareEvidenceBuilder:
             "initial_vitality_0_10": _number(initial.get("vitality_0_10")),
             "stress_above_baseline": round(max(0.0, (initial_stress or baseline) - baseline), 3),
         }
-        factor = max((_bounded(item.get("continuous_load_factor", item.get("continuous_load")), 0.0, 1.0, 0.0) or 0.0) for item in points) if points else _bounded(alert.get("continuous_load_factor"), 0.0, 1.0, 0.0) or 0.0
+        if not day_points:
+            day_factor = _bounded(alert.get("continuous_load_factor"), 0.0, 1.0, 0.0) or 0.0
+        if not local_points:
+            local_factor = _bounded(alert.get("continuous_load_factor"), 0.0, 1.0, 0.0) or 0.0
+        day_peak_time = self._trajectory_label(day_peak)
+        local_peak_time = self._trajectory_label(local_peak)
+        local_stress = stress(local_peak) if local_peak else (
+            _number(alert.get("S"), 0.0) or 0.0
+        )
         return {
-            "peak_stress_0_10": round(stress(peak) if peak else (_number(alert.get("S"), 0.0) or 0.0), 3),
-            "peak_time": _text(peak.get("time"), 16) or None,
-            "continuous_load_factor": round(factor, 3),
-            "continuous_load_penalty": round(max((_number(item.get("continuous_load_penalty"), 0.0) or 0.0) for item in points), 3) if points else 0.0,
-            "recovery_window_before_risk": "insufficient" if factor >= 0.6 else "available",
+            "peak_stress_0_10": round(local_stress, 3),
+            "peak_time": local_peak_time,
+            "day_peak_stress_0_10": round(stress(day_peak) if day_peak else local_stress, 3),
+            "day_peak_time": day_peak_time,
+            "local_peak_stress_0_10": round(local_stress, 3),
+            "local_peak_time": local_peak_time,
+            "continuous_load_factor": round(local_factor, 3),
+            "local_continuous_load_factor": round(local_factor, 3),
+            "day_continuous_load_factor": round(day_factor, 3),
+            "continuous_load_penalty": round(local_penalty, 3),
+            "local_continuous_load_penalty": round(local_penalty, 3),
+            "day_continuous_load_penalty": round(day_penalty, 3),
+            "local_event_stress_input": self._max_metric(local_points, "event_stress_input", "event_stress"),
+            "local_anticipatory_input": self._max_metric(local_points, "anticipatory_input"),
+            "local_post_event_input": self._max_metric(local_points, "post_event_input"),
+            "risk_slope": round(local_slope, 4) if local_slope is not None else None,
+            "trajectory_scope": local_scope,
+            "local_window_start": local_start.isoformat(),
+            "local_window_end": local_end.isoformat(),
+            "recovery_window_before_risk": (
+                "unknown" if not local_points
+                else "insufficient" if local_factor >= 0.6
+                else "available"
+            ),
             "previous_day_carryover": carryover,
-            "trajectory": "rising" if len(points) >= 2 and stress(points[-1]) > stress(points[0]) + 0.3 else "plateau" if points else None,
+            "trajectory": trajectory_label,
         }
+
+    def _trajectory_time(self, point: Mapping[str, Any], local_date: date) -> datetime | None:
+        for key in ("time", "timestamp", "observed_at"):
+            parsed = _parse(point.get(key), self.timezone, local_date)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _trajectory_label(point: Mapping[str, Any]) -> str | None:
+        if not point:
+            return None
+        raw = _text(point.get("time") or point.get("timestamp"), 32)
+        if raw:
+            return raw
+        parsed = point.get("_time")
+        if isinstance(parsed, datetime):
+            return parsed.isoformat()
+        return None
+
+    @staticmethod
+    def _max_metric(points: list[Mapping[str, Any]], *keys: str) -> float:
+        values = []
+        for point in points:
+            for key in keys:
+                value = _bounded(point.get(key), 0.0, 1.0)
+                if value is not None:
+                    values.append(value)
+                    break
+        return round(max(values), 3) if values else 0.0
+
+    @staticmethod
+    def _risk_slope(points: list[Mapping[str, Any]], stress) -> float | None:
+        if len(points) < 2:
+            return None
+        first = points[0]
+        last = points[-1]
+        first_time = first.get("_time")
+        last_time = last.get("_time")
+        if isinstance(first_time, datetime) and isinstance(last_time, datetime):
+            hours = max(1.0 / 60.0, (last_time - first_time).total_seconds() / 3600.0)
+            return (stress(last) - stress(first)) / hours
+        return stress(last) - stress(first)
 
     @staticmethod
     def _baseline(profile: Mapping[str, Any] | None) -> float:

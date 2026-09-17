@@ -25,11 +25,31 @@ class CareReasonSelector:
             item for item in events
             if str(item.get("event_type") or "") == "course"
         ]
-        if len(course_events) >= 2 and int(schedule.get("consecutive_course_count") or 0) >= 2:
+        dense_blocks = [
+            dict(block)
+            for block in list(schedule.get("continuous_course_blocks") or [])
+            if int(block.get("course_count") or 0) >= 2
+            and (
+                int(block.get("high_load_course_count") or 0) >= 2
+                or float(block.get("weighted_load") or 0.0) >= 0.60
+            )
+        ]
+        if dense_blocks:
+            block = max(
+                dense_blocks,
+                key=lambda item: (
+                    float(item.get("weighted_load") or 0.0),
+                    int(item.get("high_load_course_count") or 0),
+                    int(item.get("course_count") or 0),
+                ),
+            )
             candidates.append({
                 "code": "dense_high_load_course_block",
-                "fact_ids": [str(item["fact_id"]) for item in high_events[:4]],
-                "salience": min(1.0, 0.72 + 0.05 * len(high_events)),
+                "fact_ids": [str(item) for item in list(block.get("fact_ids") or [])[:4]],
+                "salience": min(
+                    1.0,
+                    0.72 + 0.05 * int(block.get("high_load_course_count") or 0),
+                ),
             })
         continuous = max(
             float(schedule.get("weighted_load") or 0.0),

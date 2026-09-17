@@ -64,6 +64,68 @@ def test_many_simple_tasks_do_not_become_a_high_load_reason():
     )
 
 
+def test_two_low_load_courses_do_not_create_dense_high_load_reason():
+    packet = _packet([
+        _event("course-a", "通识选修 A", "08:00", "08:45", 0.30),
+        _event("course-b", "轻量选修 B", "08:55", "09:40", 0.32),
+    ])
+
+    assert packet.schedule["continuous_course_blocks"][0]["high_load_course_count"] == 0
+    assert "dense_high_load_course_block" not in {
+        item["code"] for item in packet.reason_candidates
+    }
+
+
+def test_high_task_plus_two_low_courses_does_not_mislabel_task_as_course_reason():
+    packet = _packet([
+        _event("course-a", "通识选修 A", "08:00", "08:45", 0.30),
+        _event("course-b", "轻量选修 B", "08:55", "09:40", 0.32),
+        _event("ddl-task", "项目 DDL", "10:00", "10:30", 0.90, event_type="task"),
+    ])
+
+    dense = [item for item in packet.reason_candidates if item["code"] == "dense_high_load_course_block"]
+    assert dense == []
+    assert all("ddl-task" not in item.get("fact_ids", []) for item in packet.reason_candidates)
+
+
+def test_mixed_course_block_uses_only_block_course_fact_ids():
+    packet = _packet([
+        _event("course-a", "高等数学", "08:00", "08:45", 0.82),
+        _event("course-b", "数据结构", "08:55", "09:40", 0.78),
+        _event("course-c", "轻量选修", "10:00", "10:45", 0.31),
+        _event("task", "高负荷任务", "10:55", "11:25", 0.95, event_type="task"),
+    ])
+
+    dense = next(item for item in packet.reason_candidates if item["code"] == "dense_high_load_course_block")
+    assert set(dense["fact_ids"]) == {"event:course-a", "event:course-b", "event:course-c"}
+    assert "event:task" not in dense["fact_ids"]
+
+
+def test_bounded_packet_keeps_afternoon_risk_events_after_many_earlier_events():
+    events = [
+        _event(f"early-{index}", f"早间安排 {index}", f"{index:02d}:00", f"{index:02d}:20", 0.20, event_type="task")
+        for index in range(8)
+    ]
+    events.extend([
+        _event("risk-1", "下午课程", "14:00", "14:45", 0.72),
+        _event("risk-2", "下午任务", "15:00", "15:30", 0.75, event_type="task"),
+    ])
+    packet = CareEvidenceBuilder("Asia/Shanghai").build(
+        source="forecast_warning",
+        local_date=TARGET,
+        alert={"time": "15:00", "S": 8.1, "V": 4.6, "F": 0.63},
+        calendar_events=events,
+    )
+
+    fact_ids = packet.fact_ids
+    assert {"event:risk-1", "event:risk-2"} <= fact_ids
+    assert len(packet.event_facts) <= 8
+    assert all(
+        set(reason.get("fact_ids") or []) <= fact_ids
+        for reason in packet.reason_candidates
+    )
+
+
 def test_course_catalog_is_kept_only_for_a_unique_confirmed_match():
     unique = _packet([
         _event(
@@ -151,3 +213,57 @@ def test_promoted_profile_reads_hierarchical_parameters_and_stored_population_pr
     assert "high_personal_workload_sensitivity" in {
         item["code"] for item in packet.reason_candidates
     }
+
+
+def test_late_day_load_does_not_explain_morning_warning():
+    packet = _packet(
+        [],
+        output={
+            "trajectory": [
+                {"time": "10:00", "stress_0_10": 5.0, "continuous_load_factor": 0.10},
+                {"time": "10:30", "stress_0_10": 5.2, "continuous_load_factor": 0.15},
+                {"time": "18:00", "stress_0_10": 8.0, "continuous_load_factor": 0.95},
+            ]
+        },
+    )
+
+    assert packet.trajectory["local_continuous_load_factor"] == 0.15
+    assert packet.trajectory["day_continuous_load_factor"] == 0.95
+    assert "sustained_continuous_load" not in {
+        item["code"] for item in packet.reason_candidates
+    }
+
+
+def test_morning_local_load_explains_morning_warning():
+    packet = _packet(
+        [],
+        output={
+            "trajectory": [
+                {"time": "09:30", "stress_0_10": 5.0, "continuous_load_factor": 0.70},
+                {"time": "10:30", "stress_0_10": 6.2, "continuous_load_factor": 0.80},
+                {"time": "18:00", "stress_0_10": 8.0, "continuous_load_factor": 0.10},
+            ]
+        },
+    )
+
+    assert packet.trajectory["local_continuous_load_factor"] == 0.8
+    assert "sustained_continuous_load" in {
+        item["code"] for item in packet.reason_candidates
+    }
+
+
+def test_risk_trajectory_uses_local_slope_and_keeps_day_peak_as_background():
+    packet = _packet(
+        [],
+        output={
+            "trajectory": [
+                {"time": "09:20", "stress_0_10": 4.0},
+                {"time": "10:30", "stress_0_10": 6.0},
+                {"time": "18:00", "stress_0_10": 9.0},
+            ]
+        },
+    )
+
+    assert packet.trajectory["trajectory"] == "rising"
+    assert packet.trajectory["local_peak_time"] == "10:30"
+    assert packet.trajectory["day_peak_time"] == "18:00"
