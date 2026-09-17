@@ -1773,7 +1773,7 @@ def test_legacy_forecast_without_warning_revision_is_recomputed():
         "care_message_schema_version": "care_message.v4",
         "care_intervention_policy_version": "care_intervention_policy.v4",
         "care_template_library_version": "care_template_library.v4",
-        "care_evidence_schema_version": "care_evidence.v1",
+        "care_evidence_schema_version": "care_evidence.v2",
         "care_reason_policy_version": "care_reason_policy.v1",
         "care_jitai_version": "care-jitai.v1",
         "receptivity_model_version": "receptivity-logistic-v1",

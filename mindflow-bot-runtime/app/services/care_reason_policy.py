@@ -15,6 +15,7 @@ class CareReasonSelector:
         schedule = packet.schedule
         trajectory = packet.trajectory
         state = packet.recent_state
+        longitudinal = packet.longitudinal_state
         personalization = packet.personalization
         events = list(packet.event_facts)
         high_events = [
@@ -81,6 +82,14 @@ class CareReasonSelector:
             candidates.append({"code": "low_recent_energy", "fact_ids": [], "salience": 0.61})
         if state.get("stress_tendency") == "high":
             candidates.append({"code": "high_recent_stress", "fact_ids": [], "salience": 0.60})
+        if longitudinal.get("recovery_trend") == "declining":
+            candidates.append({"code": "declining_recovery_trend", "fact_ids": [], "salience": 0.64})
+        if longitudinal.get("recent_stress_7d") in {"elevated", "high"}:
+            candidates.append({"code": "elevated_recent_stress_7d", "fact_ids": [], "salience": 0.55})
+        if longitudinal.get("recent_workload_7d") == "high":
+            candidates.append({"code": "elevated_recent_workload_7d", "fact_ids": [], "salience": 0.54})
+        if longitudinal.get("recent_frustration") == "high":
+            candidates.append({"code": "high_recent_frustration", "fact_ids": [], "salience": 0.56})
         if personalization.get("workload_sensitivity") == "above_population_prior":
             candidates.append({"code": "high_personal_workload_sensitivity", "fact_ids": [], "salience": 0.58})
         if personalization.get("recovery_rate") == "slower_than_population_prior":

@@ -48,6 +48,7 @@ class CareMessageService:
         care_preferences: Mapping[str, Any] | None = None,
         care_history: Mapping[str, Any] | None = None,
         forecast_output: Mapping[str, Any] | None = None,
+        longitudinal_state: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         effective_preferences = dict(care_preferences or {})
         explicit_types = normalized_intervention_types(
@@ -79,6 +80,7 @@ class CareMessageService:
             forecast_output=forecast_output,
             calendar_events=calendar_events,
             recent_observation=recent_observation,
+            longitudinal_state=longitudinal_state,
             profile=profile,
             care_preferences=effective_preferences or None,
             care_history=care_history,
@@ -123,6 +125,7 @@ class CareMessageService:
             forecast_output=forecast_output,
             calendar_events=calendar_events,
             recent_observation=recent_observation,
+            longitudinal_state=longitudinal_state,
             profile=profile,
             care_preferences=effective_preferences or None,
             care_history=care_history,

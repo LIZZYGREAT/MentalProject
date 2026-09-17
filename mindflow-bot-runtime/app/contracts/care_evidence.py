@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-CARE_EVIDENCE_SCHEMA_VERSION = "care_evidence.v1"
+CARE_EVIDENCE_SCHEMA_VERSION = "care_evidence.v2"
 CARE_REASON_POLICY_VERSION = "care_reason_policy.v1"
 
 
@@ -24,6 +24,7 @@ class CareEvidencePacket:
     schedule: dict[str, Any]
     event_facts: tuple[dict[str, Any], ...]
     recent_state: dict[str, Any]
+    longitudinal_state: dict[str, Any]
     personalization: dict[str, Any]
     care_history: dict[str, Any]
     intervention: dict[str, Any]
@@ -44,6 +45,7 @@ class CareEvidencePacket:
                 if isinstance(item, Mapping)
             ),
             recent_state=_copy_mapping(payload.get("recent_state")),
+            longitudinal_state=_copy_mapping(payload.get("longitudinal_state")),
             personalization=_copy_mapping(payload.get("personalization")),
             care_history=_copy_mapping(payload.get("care_history")),
             intervention=_copy_mapping(payload.get("intervention")),
@@ -79,6 +81,7 @@ class CareEvidencePacket:
             "schedule": dict(self.schedule),
             "event_facts": [dict(item) for item in self.event_facts],
             "recent_state": dict(self.recent_state),
+            "longitudinal_state": dict(self.longitudinal_state),
             "personalization": dict(self.personalization),
             "care_history": dict(self.care_history),
             "intervention": dict(self.intervention),

@@ -332,6 +332,7 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
+        psychological_context=psychological_context,
         consent_service=consent_service,
         clock=runtime_clock,
     )

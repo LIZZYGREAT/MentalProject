@@ -368,6 +368,7 @@ class ForecastCoordinator:
         retrospective_curves: RetrospectiveCurveRepository | None = None,
         care_preferences: ParticipantCarePreferenceRepository | None = None,
         care_interventions: Any | None = None,
+        psychological_context: Any | None = None,
         consent_service: Any | None = None,
         clock: RuntimeClock | None = None,
     ):
@@ -393,6 +394,7 @@ class ForecastCoordinator:
         self.care_messages = CareMessageService(timezone_name)
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.psychological_context = psychological_context
         if consent_service is False:
             # Explicitly disabled: the gate fails closed.
             self.consent_service = None
@@ -481,6 +483,7 @@ class ForecastCoordinator:
                     facts.get("calendar_degraded", output.get("calendar_degraded"))
                 ),
                 recent_observation=facts.get("recent_observation"),
+                longitudinal_state=facts.get("longitudinal_state"),
                 profile=facts.get("profile"),
                 profile_version=facts.get("profile_version"),
                 care_preferences=preferences or None,
@@ -838,6 +841,7 @@ class ForecastCoordinator:
             "calendar_events": presentation_events,
             "calendar_degraded": bool(calendar_snapshot["degraded"]),
             "recent_observation": recent_care_observation,
+            "longitudinal_state": {},
             "profile": effective_profile,
             "profile_version": profile_row.get("version") if profile_row else None,
             "care_preferences": (
@@ -857,6 +861,19 @@ class ForecastCoordinator:
                 else None
             ),
         }
+        if self.psychological_context is not None:
+            try:
+                care_inputs["longitudinal_state"] = await asyncio.to_thread(
+                    self.psychological_context.build,
+                    participant_id,
+                    now=local_now,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "care_longitudinal_state_unavailable participant_id=%s error_class=%s",
+                    participant_id,
+                    type(exc).__name__,
+                )
         observation_revision = _sha(observations)
         profile_revision = _sha({
             "explicit": profile_row,

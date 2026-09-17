@@ -66,6 +66,7 @@ class CareInterventionPolicy:
         evidence_schedule = dict(getattr(evidence, "schedule", {}) or {})
         evidence_trajectory = dict(getattr(evidence, "trajectory", {}) or {})
         evidence_personalization = dict(getattr(evidence, "personalization", {}) or {})
+        longitudinal = dict(getattr(evidence, "longitudinal_state", {}) or {})
         has_evidence = evidence is not None
         evidence_has_qualified_events = any(
             float(fact.get("workload_prior") or 0.0) > 0.0
@@ -92,6 +93,7 @@ class CareInterventionPolicy:
         ) if has_evidence else False
         carryover = "previous_day_carryover" in reason_codes
         slow_recovery = evidence_personalization.get("recovery_rate") == "slower_than_population_prior"
+        declining_recovery = longitudinal.get("recovery_trend") == "declining"
         low_energy = "low_recent_energy" in reason_codes
         high_task = self._has_high_workload_task(evidence) if has_evidence else False
         has_workload = bool(
@@ -110,17 +112,19 @@ class CareInterventionPolicy:
                 "score": 0.40,
             }
         ]
-        if context.profile_summary.recent_energy_tendency == "low" or low_energy or carryover or slow_recovery:
+        if context.profile_summary.recent_energy_tendency == "low" or low_energy or carryover or slow_recovery or declining_recovery:
             candidates.append({
                 "intervention_type": "recovery",
                 "template_id": "recovery-v1",
                 "reason_code": (
                     "low_recent_energy_before_risk"
                     if low_energy or context.profile_summary.recent_energy_tendency == "low"
+                    else "declining_recovery_trend"
+                    if declining_recovery
                     else "personal_recovery_evidence"
                 ),
                 "action_minutes": 10,
-                "score": 0.94 if carryover or slow_recovery else 0.90,
+                "score": 0.94 if carryover or slow_recovery or declining_recovery else 0.90,
             })
         if dense_signal or has_workload:
             candidates.append({

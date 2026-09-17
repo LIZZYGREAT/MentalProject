@@ -23,13 +23,14 @@ def _event(event_id, name, start, end, prior, *, event_type="course", **extra):
     }
 
 
-def _packet(events, *, output=None, profile=None, preferences=None):
+def _packet(events, *, output=None, profile=None, preferences=None, longitudinal_state=None):
     return CareEvidenceBuilder("Asia/Shanghai").build(
         source="forecast_warning",
         local_date=TARGET,
         alert={"time": "10:40", "S": 8.1, "V": 4.6, "F": 0.63},
         forecast_output=output,
         calendar_events=events,
+        longitudinal_state=longitudinal_state,
         profile=profile,
         care_preferences=preferences,
     )
@@ -124,6 +125,39 @@ def test_bounded_packet_keeps_afternoon_risk_events_after_many_earlier_events():
         set(reason.get("fact_ids") or []) <= fact_ids
         for reason in packet.reason_candidates
     )
+
+
+def test_time_bounded_longitudinal_state_adds_recovery_trend_evidence():
+    packet = _packet(
+        [],
+        longitudinal_state={
+            "features": [
+                {
+                    "feature": "recovery_trend",
+                    "value": "declining",
+                    "time_window": "7d",
+                    "source_at": f"{TARGET.isoformat()}T08:00:00+08:00",
+                    "valid_until": f"{TARGET.isoformat()}T18:00:00+08:00",
+                    "source": "participant_slow_state",
+                    "evidence_type": "derived_trend",
+                    "model_version": "research-state-v1",
+                },
+                {
+                    "feature": "recent_workload",
+                    "value": "high",
+                    "time_window": "7d",
+                    "source_at": f"{TARGET.isoformat()}T08:00:00+08:00",
+                    "valid_until": f"{TARGET.isoformat()}T09:00:00+08:00",
+                },
+            ]
+        },
+    )
+
+    assert packet.longitudinal_state["recovery_trend"] == "declining"
+    assert packet.longitudinal_state["recent_workload_7d"] is None
+    assert "declining_recovery_trend" in {
+        item["code"] for item in packet.reason_candidates
+    }
 
 
 def test_course_catalog_is_kept_only_for_a_unique_confirmed_match():

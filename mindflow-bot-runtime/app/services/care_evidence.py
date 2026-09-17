@@ -83,6 +83,7 @@ class CareEvidenceBuilder:
         forecast_output: Mapping[str, Any] | None = None,
         calendar_events: list[Mapping[str, Any]] | None = None,
         recent_observation: Mapping[str, Any] | None = None,
+        longitudinal_state: Mapping[str, Any] | None = None,
         profile: Mapping[str, Any] | None = None,
         care_preferences: Mapping[str, Any] | None = None,
         care_history: Mapping[str, Any] | None = None,
@@ -97,6 +98,7 @@ class CareEvidenceBuilder:
         schedule = self._schedule(event_facts, risk_time)
         trajectory = self._trajectory(output, alert, risk_time, profile)
         recent_state = self._recent_state(recent_observation, risk_time)
+        longitudinal = self._longitudinal_state(longitudinal_state, risk_time)
         personalization = self._personalization(profile, care_preferences)
         history = self._history(care_history, care_preferences)
         all_public_event_facts = [
@@ -120,6 +122,7 @@ class CareEvidenceBuilder:
             schedule=schedule,
             event_facts=tuple(all_public_event_facts),
             recent_state=recent_state,
+            longitudinal_state=longitudinal,
             personalization=personalization,
             care_history=history,
             intervention={
@@ -526,6 +529,50 @@ class CareEvidenceBuilder:
             "energy_tendency": "low" if valid and energy is not None and energy <= 3.5 else "normal" if valid and energy is not None else None,
             "source_age_minutes": round(max(0.0, age), 1) if valid and age is not None else None,
             "source_at": observed_at.isoformat() if valid and observed_at else None,
+        }
+
+    def _longitudinal_state(
+        self,
+        state: Mapping[str, Any] | None,
+        risk_time: datetime,
+    ) -> dict[str, Any]:
+        value = dict(state or {})
+        features = []
+        for item in list(value.get("features") or [])[:5]:
+            if not isinstance(item, Mapping):
+                continue
+            source_at = _parse(item.get("source_at"), self.timezone, risk_time.date())
+            valid_until = _parse(item.get("valid_until"), self.timezone, risk_time.date())
+            if valid_until is not None and valid_until < risk_time:
+                continue
+            if source_at is not None and source_at > risk_time:
+                continue
+            feature = _text(item.get("feature"), 48)
+            if feature not in {
+                "recent_stress",
+                "recent_workload",
+                "recovery_trend",
+                "recent_frustration",
+            }:
+                continue
+            features.append({
+                "feature": feature,
+                "value": _text(item.get("value"), 32),
+                "time_window": _text(item.get("time_window"), 16),
+                "source_at": source_at.isoformat() if source_at else None,
+                "valid_until": valid_until.isoformat() if valid_until else None,
+                "source": _text(item.get("source"), 64),
+                "evidence_type": _text(item.get("evidence_type"), 32),
+                "model_version": _text(item.get("model_version"), 64),
+            })
+        by_feature = {item["feature"]: item["value"] for item in features}
+        return {
+            "available": bool(features),
+            "recent_stress_7d": by_feature.get("recent_stress"),
+            "recent_workload_7d": by_feature.get("recent_workload"),
+            "recovery_trend": by_feature.get("recovery_trend"),
+            "recent_frustration": by_feature.get("recent_frustration"),
+            "features": features,
         }
 
     @staticmethod
