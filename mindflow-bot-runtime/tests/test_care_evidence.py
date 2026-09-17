@@ -122,3 +122,32 @@ def test_unpromoted_profile_does_not_emit_personal_sensitivity():
     assert "high_personal_workload_sensitivity" not in {
         item["code"] for item in packet.reason_candidates
     }
+
+
+def test_promoted_profile_reads_hierarchical_parameters_and_stored_population_prior():
+    packet = _packet(
+        [_event("1", "数据结构", "10:00", "10:45", 0.82)],
+        profile={
+            "model_params": {
+                "hierarchical_parameters": {
+                    "workload_sensitivity_i": 4.2,
+                    "stress_recovery_rate_i": 0.36,
+                    "stress_reactivity_i": 0.92,
+                },
+                "hierarchical_population_prior": {
+                    "workload_sensitivity_i": {"mean": 2.9},
+                    "stress_recovery_rate_i": {"mean": 0.51},
+                    "stress_reactivity_i": {"mean": 0.7},
+                },
+            },
+            "runtime_model_provenance": {"provenance_type": "stage5_promotion"},
+        },
+    )
+
+    assert packet.personalization["workload_sensitivity"] == "above_population_prior"
+    assert packet.personalization["recovery_rate"] == "slower_than_population_prior"
+    assert packet.personalization["stress_reactivity"] == "faster_than_population_prior"
+    assert packet.personalization["population_prior"]["workload_sensitivity_i"]["mean"] == 2.9
+    assert "high_personal_workload_sensitivity" in {
+        item["code"] for item in packet.reason_candidates
+    }

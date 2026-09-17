@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from app.contracts.care_evidence import CareEvidencePacket, CARE_EVIDENCE_SCHEMA_VERSION
 from app.services.care_reason_policy import CareReasonSelector
+from app.services.hierarchical_personalization import care_personalization_projection
 
 
 _SEMANTIC_DIMENSIONS = ("difficulty", "cognitive_demand", "expected_effort", "time_pressure", "uncertainty")
@@ -332,18 +333,23 @@ class CareEvidenceBuilder:
                 "recovery_preference": CareEvidenceBuilder._preference(preferences),
                 "support_preference": None,
             }
-        population = dict(value.get("hierarchical_population_prior") or value.get("population_prior") or {})
+        projection = care_personalization_projection(params)
+        projected_params = dict(projection.get("parameters") or {})
+        population = dict(projection.get("population_prior") or {})
         def prior(name: str, fallback: float) -> float:
             raw = population.get(name, fallback)
             return _number(raw.get("mean") if isinstance(raw, Mapping) else raw, fallback) or fallback
-        workload = _number(params.get("workload_sensitivity_i"))
-        recovery_rate = _number(params.get("stress_recovery_rate_i"))
+        workload = _number(projected_params.get("workload_sensitivity_i"))
+        recovery_rate = _number(projected_params.get("stress_recovery_rate_i"))
+        reactivity = _number(projected_params.get("stress_reactivity_i"))
         return {
             "available": True,
             "source": "stage5_promoted",
             "workload_sensitivity": "above_population_prior" if workload is not None and workload > prior("workload_sensitivity_i", 2.8) else "near_population_prior",
             "recovery_rate": "slower_than_population_prior" if recovery_rate is not None and recovery_rate < prior("stress_recovery_rate_i", 0.5) else "near_population_prior",
-            "stress_reactivity": "faster_than_population_prior" if _number(params.get("stress_reactivity_i")) is not None and (_number(params.get("stress_reactivity_i")) or 0) > prior("stress_reactivity_i", 0.7) else "near_population_prior",
+            "stress_reactivity": "faster_than_population_prior" if reactivity is not None and reactivity > prior("stress_reactivity_i", 0.7) else "near_population_prior",
+            "parameters": projected_params,
+            "population_prior": population,
             "recovery_preference": CareEvidenceBuilder._preference(preferences),
             "support_preference": None,
         }
