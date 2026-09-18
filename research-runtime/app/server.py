@@ -85,7 +85,7 @@ class ResearchRuntime:
         if document.extraction_mode == "javascript_shell":
             return {"ok": False, "job_id": session.job_id, "reason_code": "javascript_shell", "candidate_url": url, "verified": False}
         item = ResearchEvidenceItem.build(
-            source_kind="web",
+            source_kind=job.source_kinds[0] if job.source_kinds[0] in {"web", "paper"} else "web",
             title=document.title or url,
             canonical_url=document.canonical_url or response.url,
             content=document.text,

@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 import sys
 
 import pytest
@@ -39,3 +40,12 @@ def test_job_budget_is_cumulative_across_runtime_calls(tmp_path):
     assert runtime.search(payload)["job_id"] == "job-1"
     with pytest.raises(ValueError, match="research_budget_exhausted"):
         runtime.search(payload)
+
+
+def test_exec_is_disabled_by_default_and_runtime_can_require_token(tmp_path, monkeypatch):
+    runtime = ResearchRuntime(workspace=tmp_path)
+    with pytest.raises(ValueError, match="research_exec_disabled"):
+        asyncio.run(runtime.exec_public({"topic": "local", "argv": ["python3", "-c", "print(1)"]}))
+    monkeypatch.setenv("RESEARCH_RUNTIME_REQUIRE_TOKEN", "true")
+    with pytest.raises(RuntimeError, match="TOKEN"):
+        ResearchRuntime(workspace=tmp_path)

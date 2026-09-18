@@ -197,7 +197,14 @@ class PublicResearchService:
                         else:
                             return []
                     elif self.gateway is not None:
-                        result = await self.gateway.open_url(job, candidate.url)
+                        candidate_job = ResearchJobSpec(
+                            topic=job.topic, job_id=job.job_id, query_hints=job.query_hints,
+                            freshness_hours=job.freshness_hours, language=job.language,
+                            source_kinds=(candidate.source_kind,), max_searches=job.max_searches,
+                            max_pages=job.max_pages, max_browser_pages=job.max_browser_pages,
+                            max_exec_calls=job.max_exec_calls, deadline_seconds=job.deadline_seconds,
+                        )
+                        result = await self.gateway.open_url(candidate_job, candidate.url)
                         if not result.get("ok") and result.get("reason_code") in {"javascript_shell", "browser_unavailable"}:
                             result = await self.gateway.browser_open(job, candidate.url)
                     else:
@@ -220,8 +227,8 @@ class PublicResearchService:
         raw_items = result.get("results") or result.get("sources") or []
         if isinstance(raw_items, Mapping):
             raw_items = [raw_items]
-        if not isinstance(raw_items, list) and result.get("evidence"):
-            raw_items = [result["evidence"]]
+        if not raw_items and result.get("evidence"):
+            raw_items = result["evidence"] if isinstance(result["evidence"], list) else [result["evidence"]]
         items: list[ResearchEvidenceItem] = []
         for raw in raw_items if isinstance(raw_items, list) else []:
             if not isinstance(raw, Mapping):
