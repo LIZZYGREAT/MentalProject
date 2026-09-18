@@ -11,6 +11,15 @@ FORBIDDEN_BRIEF_TERMS = frozenset({"压力预测", "压力等级", "高压峰值
 
 
 class MorningBriefComposer:
+    @staticmethod
+    def _summary(item: ResearchEvidenceItem, topic: str) -> tuple[str, str]:
+        text = " ".join(item.content.split())
+        if not text:
+            return "正文暂未提供可提取摘要。", f"与“{topic}”主题相关，建议打开来源核实。"
+        sentence = text.split("。", 1)[0].split(".", 1)[0].strip()
+        summary = (sentence or text)[:220]
+        return summary, f"与“{topic}”主题相关，摘要来自已读取的公开正文。"
+
     def compose(
         self,
         local_date: str,
@@ -49,7 +58,10 @@ class MorningBriefComposer:
                         provenance = f"来源：{source}；证据 {item.evidence_id}"
                         if item.published_at:
                             provenance += f"；发布：{item.published_at}"
+                        summary, why_relevant = self._summary(item, topic)
                         lines.append(f"- {item.title[:160]}（{provenance}）")
+                        lines.append(f"  摘要：{summary}")
+                        lines.append(f"  关注点：{why_relevant}")
                         emitted += 1
                 if not emitted:
                     lines.append("- 暂无符合条件的公开信息。")

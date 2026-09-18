@@ -72,6 +72,9 @@ services:
       dockerfile: research-runtime/Dockerfile
     environment:
       RESEARCH_RUNTIME_TOKEN: ${RESEARCH_RUNTIME_TOKEN:-}
+      RESEARCH_RUNTIME_REQUIRE_TOKEN: ${RESEARCH_RUNTIME_ENABLED:-false}
+      RESEARCH_BROWSER_ENABLED: ${RESEARCH_BROWSER_ENABLED:-true}
+      RESEARCH_EXEC_ENABLED: ${RESEARCH_EXEC_ENABLED:-false}
       RESEARCH_BIND_HOST: 0.0.0.0
       RESEARCH_PORT: 8080
     volumes:

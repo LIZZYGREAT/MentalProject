@@ -1,11 +1,13 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 
 from app.contracts.research import ResearchEvidenceItem
 from app.repositories_morning_brief_preferences import MorningBriefTopicRepository
 from app.services.morning_brief_composer import MorningBriefComposer
 from app.services.morning_brief_research_planner import MorningBriefResearchPlanner
 from app.services.research_ranker import MorningBriefResearchRanker
+from app.services.public_research_service import PublicResearchService
 from tests.helpers import memory_database, participant
 
 
@@ -73,3 +75,48 @@ def test_composer_contains_provenance_and_degrades_without_research():
     )
     assert "公开信息部分今天暂时没有完成更新" in fallback
 
+
+def test_search_candidate_is_opened_before_becoming_evidence():
+    calls = []
+
+    class Gateway:
+        async def search(self, job):
+            return {"ok": True, "candidate_only": True, "results": [{
+                "candidate_id": "c1", "source_kind": "web", "title": "Article",
+                "url": "https://example.com/article",
+            }]}
+
+        async def open_url(self, job, url):
+            calls.append(url)
+            item = ResearchEvidenceItem.build(
+                source_kind="web", title="Article", canonical_url=url,
+                content="The article explains a meaningful change.", extraction_mode="http", freshness_hours=24,
+            )
+            return {"ok": True, "evidence": item.as_dict()}
+
+        async def browser_open(self, *_args):
+            raise AssertionError("browser fallback should not be needed")
+
+        async def exec_public(self, *_args):
+            raise AssertionError
+
+        async def github(self, *_args):
+            raise AssertionError
+
+    result = asyncio.run(PublicResearchService(
+        gateway=Gateway(), web_search=None, web_documents=None,
+    ).search(None, topic="Agent"))
+    assert calls == ["https://example.com/article"]
+    assert result["verified"] is True
+    assert result["results"][0]["content"]
+
+
+def test_ranker_uses_published_time_not_retrieved_time_for_freshness():
+    item = ResearchEvidenceItem.build(
+        source_kind="web", title="Old article", canonical_url="https://example.com/old",
+        content="old", extraction_mode="http", freshness_hours=24,
+    )
+    old = replace(item, published_at="2020-01-01T00:00:00+00:00")
+    assert MorningBriefResearchRanker().rank(
+        [old], topic_label="article", now=datetime(2026, 9, 18, tzinfo=timezone.utc)
+    ) == []

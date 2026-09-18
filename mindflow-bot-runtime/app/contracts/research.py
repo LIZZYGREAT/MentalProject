@@ -124,6 +124,7 @@ def _bounded_int(value: Any, *, name: str, minimum: int, maximum: int) -> int:
 @dataclass(frozen=True)
 class ResearchJobSpec:
     topic: str
+    job_id: str | None = None
     query_hints: tuple[str, ...] = ()
     freshness_hours: int = 24
     language: str = "zh-CN"
@@ -156,6 +157,18 @@ class ResearchJobSpec:
 
 
 @dataclass(frozen=True)
+class ResearchCandidate:
+    candidate_id: str
+    source_kind: str
+    title: str
+    url: str
+    snippet: str = ""
+    discovered_at: str | None = None
+    published_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
 class ResearchEvidenceItem:
     evidence_id: str
     source_kind: str
@@ -169,6 +182,7 @@ class ResearchEvidenceItem:
     extraction_mode: str
     freshness_hours: int
     verified_public_source: bool = True
+    updated_at: str | None = None
     topic_label: str | None = None
     rank_score: float | None = None
 
@@ -184,6 +198,8 @@ class ResearchEvidenceItem:
         freshness_hours: int,
         publisher: str | None = None,
         published_at: str | None = None,
+        updated_at: str | None = None,
+        verified_public_source: bool = True,
         topic_label: str | None = None,
     ) -> "ResearchEvidenceItem":
         normalized_content = str(content)[:60000]
@@ -203,7 +219,8 @@ class ResearchEvidenceItem:
             content_hash=content_hash,
             extraction_mode=extraction_mode,
             freshness_hours=int(freshness_hours),
-            verified_public_source=True,
+            verified_public_source=verified_public_source,
+            updated_at=updated_at,
             topic_label=topic_label,
         )
 
@@ -231,6 +248,7 @@ class ResearchEvidenceItem:
             extraction_mode=str(value.get("extraction_mode") or "http"),
             freshness_hours=int(value.get("freshness_hours") or 24),
             verified_public_source=bool(value.get("verified_public_source", True)),
+            updated_at=(str(value["updated_at"]) if value.get("updated_at") else None),
             topic_label=topic_label or (str(value["topic_label"]) if value.get("topic_label") else None),
             rank_score=float(value["rank_score"]) if value.get("rank_score") is not None else None,
         )

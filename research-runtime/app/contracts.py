@@ -44,6 +44,7 @@ def _bounded_int(value: Any, *, name: str, minimum: int, maximum: int) -> int:
 @dataclass(frozen=True)
 class ResearchJobSpec:
     topic: str
+    job_id: str | None = None
     query_hints: tuple[str, ...] = ()
     freshness_hours: int = 24
     language: str = "zh-CN"
@@ -72,6 +73,7 @@ class ResearchJobSpec:
         if not set(source_kinds).issubset(ALLOWED_SOURCE_KINDS):
             raise ValueError("unsupported source kind")
         return cls(
+            job_id=_optional_job_id(raw.get("job_id")),
             topic=topic,
             query_hints=hints,
             freshness_hours=_bounded_int(raw.get("freshness_hours", 24), name="freshness_hours", minimum=1, maximum=24 * 30),
@@ -91,6 +93,28 @@ class ResearchJobSpec:
         }
 
 
+def _optional_job_id(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    result = _text(value, name="job_id", limit=80)
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", result):
+        raise ValueError("job_id contains unsupported characters")
+    return result
+
+
+@dataclass(frozen=True)
+class ResearchCandidate:
+    candidate_id: str
+    source_kind: str
+    title: str
+    url: str
+    snippet: str = ""
+    discovered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass(frozen=True)
 class ResearchEvidenceItem:
     evidence_id: str
@@ -105,6 +129,7 @@ class ResearchEvidenceItem:
     extraction_mode: str
     freshness_hours: int
     verified_public_source: bool = True
+    updated_at: str | None = None
 
     @classmethod
     def build(
@@ -118,6 +143,8 @@ class ResearchEvidenceItem:
         freshness_hours: int,
         publisher: str | None = None,
         published_at: str | None = None,
+        updated_at: str | None = None,
+        verified_public_source: bool = True,
     ) -> "ResearchEvidenceItem":
         normalized_url = canonicalize_url(canonical_url)
         digest = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
@@ -136,6 +163,8 @@ class ResearchEvidenceItem:
             content_hash=digest,
             extraction_mode=extraction_mode,
             freshness_hours=freshness_hours,
+            updated_at=updated_at,
+            verified_public_source=verified_public_source,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -163,4 +192,3 @@ def evidence_envelope(items: list[ResearchEvidenceItem]) -> str:
         {"untrusted_public_evidence_only": True, "items": payload},
         ensure_ascii=False,
     ) + "\n</external_research_evidence>"
-

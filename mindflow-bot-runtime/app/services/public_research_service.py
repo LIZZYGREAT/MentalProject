@@ -6,10 +6,12 @@ import asyncio
 from dataclasses import dataclass
 import logging
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlsplit
+import uuid
 
 import httpx
 
-from app.contracts.research import ResearchEvidenceItem, ResearchJobSpec, evidence_envelope
+from app.contracts.research import ResearchCandidate, ResearchEvidenceItem, ResearchJobSpec, evidence_envelope
 from app.services.web_search_service import SearchQueryRequiresPublicTopic
 
 
@@ -71,7 +73,7 @@ class PublicResearchService:
         self.audit = audit
 
     async def search(self, participant_id: Any, *, topic: str, query_hints: list[str] | tuple[str, ...] = (), freshness_hours: int = 24, source_kinds: list[str] | tuple[str, ...] = ("web",), max_results: int = 5) -> dict[str, Any]:
-        job = ResearchJobSpec(topic=topic, query_hints=tuple(query_hints), freshness_hours=int(freshness_hours), source_kinds=tuple(source_kinds), max_pages=max(1, min(int(max_results) + 2, 12)))
+        job = ResearchJobSpec(topic=topic, job_id=uuid.uuid4().hex, query_hints=tuple(query_hints), freshness_hours=int(freshness_hours), source_kinds=tuple(source_kinds), max_pages=max(1, min(int(max_results) + 2, 12)))
         query = " ".join((job.topic, *job.query_hints))[:500]
         audit_id = self.audit.start_job(participant_id, topic=job.topic, query=query, source_kind=job.source_kinds[0]) if self.audit is not None else None
         try:
@@ -80,11 +82,12 @@ class PublicResearchService:
             else:
                 freshness = "day" if job.freshness_hours <= 24 else "week" if job.freshness_hours <= 168 else "month"
                 result = await self.web_search.search(participant_id, query=query, freshness=freshness, max_results=max_results)
-            items = self._items_from_result(result, topic_label=job.topic, freshness_hours=job.freshness_hours)
+            candidates = self._candidates_from_result(result, topic_label=job.topic)
+            items = await self._acquire_candidates(participant_id, job, candidates[:max(1, min(int(max_results), 10))])
             items = self._persist(participant_id, items, topic_label=job.topic)
             if self.audit is not None:
                 self.audit.finish_job(audit_id, status="succeeded", request_count=1, page_count=len(items))
-            return {"ok": True, "verified": True, "topic": job.topic, "results": [item.as_dict() for item in items], "evidence": evidence_envelope(items)}
+            return {"ok": True, "verified": bool(items), "candidate_count": len(candidates), "topic": job.topic, "results": [item.as_dict() for item in items], "evidence": evidence_envelope(items)}
         except (ResearchRuntimeUnavailable, SearchQueryRequiresPublicTopic, ValueError) as exc:
             if self.audit is not None and audit_id:
                 self.audit.finish_job(audit_id, status="failed", failure_reason=type(exc).__name__)
@@ -111,7 +114,11 @@ class PublicResearchService:
         if self.gateway is None:
             return {"ok": False, "error": "research_runtime_unavailable", "verified": False}
         try:
-            return await self.gateway.browser_open(ResearchJobSpec(topic=topic, source_kinds=("web",)), url)
+            job = ResearchJobSpec(topic=topic, job_id=uuid.uuid4().hex, source_kinds=("web",))
+            result = await self.gateway.browser_open(job, url)
+            items = self._items_from_result(result, topic_label=topic, freshness_hours=job.freshness_hours)
+            items = self._persist(participant_id, items, topic_label=topic)
+            return {"ok": bool(items), "verified": bool(items), "evidence": items[0].as_dict() if items else None, "content": evidence_envelope(items)}
         except Exception as exc:
             return {"ok": False, "error": "research_runtime_unavailable", "reason_code": str(exc)[:64], "verified": False}
 
@@ -119,8 +126,11 @@ class PublicResearchService:
         if self.gateway is None:
             return {"ok": False, "error": "research_runtime_unavailable", "verified": False}
         try:
-            job = ResearchJobSpec(topic=topic, source_kinds=("api",), max_exec_calls=1)
-            return await self.gateway.exec_public(job, argv, timeout_seconds)
+            job = ResearchJobSpec(topic=topic, job_id=uuid.uuid4().hex, source_kinds=("api",), max_exec_calls=1)
+            result = await self.gateway.exec_public(job, argv, timeout_seconds)
+            items = self._items_from_result(result, topic_label=topic, freshness_hours=job.freshness_hours)
+            items = self._persist(participant_id, items, topic_label=topic)
+            return {"ok": bool(items), "verified": bool(items), "evidence": items[0].as_dict() if items else None, "content": evidence_envelope(items)}
         except Exception as exc:
             return {"ok": False, "error": "research_runtime_unavailable", "reason_code": str(exc)[:64], "verified": False}
 
@@ -128,7 +138,11 @@ class PublicResearchService:
         if self.gateway is None:
             return {"ok": False, "error": "research_runtime_unavailable", "verified": False}
         try:
-            return await self.gateway.github(ResearchJobSpec(topic=topic, source_kinds=("github",)), payload)
+            job = ResearchJobSpec(topic=topic, job_id=uuid.uuid4().hex, source_kinds=("github",))
+            result = await self.gateway.github(job, payload)
+            items = self._items_from_result(result, topic_label=topic, freshness_hours=job.freshness_hours)
+            items = self._persist(participant_id, items, topic_label=topic)
+            return {"ok": bool(items), "verified": bool(items), "evidence": [item.as_dict() for item in items], "content": evidence_envelope(items)}
         except Exception as exc:
             return {"ok": False, "error": "research_runtime_unavailable", "reason_code": str(exc)[:64], "verified": False}
 
@@ -140,6 +154,64 @@ class PublicResearchService:
             self.evidence.save_evidence(participant_id, item, topic_label=topic_label)
             persisted.append(item)
         return persisted
+
+    @staticmethod
+    def _candidates_from_result(result: Mapping[str, Any], *, topic_label: str) -> list[ResearchCandidate]:
+        if not result.get("ok"):
+            raise ResearchRuntimeUnavailable(str(result.get("reason_code") or result.get("error") or "provider_unavailable"))
+        raw_items = result.get("results") or result.get("candidates") or []
+        if isinstance(raw_items, Mapping):
+            raw_items = [raw_items]
+        candidates: list[ResearchCandidate] = []
+        for raw in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            url = str(raw.get("url") or raw.get("canonical_url") or raw.get("source_url") or "")
+            if not url.startswith("https://"):
+                continue
+            try:
+                candidates.append(ResearchCandidate(
+                    candidate_id=str(raw.get("candidate_id") or uuid.uuid4().hex),
+                    source_kind=str(raw.get("source_kind") or "web"),
+                    title=" ".join(str(raw.get("title") or url).split())[:300],
+                    url=url,
+                    snippet=" ".join(str(raw.get("snippet") or "").split())[:500],
+                    discovered_at=str(raw.get("discovered_at") or "") or None,
+                    published_at=str(raw.get("published_at")) if raw.get("published_at") else None,
+                    updated_at=str(raw.get("updated_at")) if raw.get("updated_at") else None,
+                ))
+            except (TypeError, ValueError):
+                continue
+        return candidates
+
+    async def _acquire_candidates(self, participant_id: Any, job: ResearchJobSpec, candidates: list[ResearchCandidate]) -> list[ResearchEvidenceItem]:
+        semaphore = asyncio.Semaphore(4)
+
+        async def acquire(candidate: ResearchCandidate) -> list[ResearchEvidenceItem]:
+            async with semaphore:
+                try:
+                    if candidate.source_kind == "github" and self.gateway is not None:
+                        parts = [item for item in urlsplit(candidate.url).path.split("/") if item]
+                        if len(parts) >= 2:
+                            result = await self.gateway.github(job, {"action": "readme", "owner": parts[0], "repo": parts[1]})
+                        else:
+                            return []
+                    elif self.gateway is not None:
+                        result = await self.gateway.open_url(job, candidate.url)
+                        if not result.get("ok") and result.get("reason_code") in {"javascript_shell", "browser_unavailable"}:
+                            result = await self.gateway.browser_open(job, candidate.url)
+                    else:
+                        result = await self.web_documents.read_url(participant_id, url=candidate.url)
+                    items = self._items_from_result(result, topic_label=job.topic, freshness_hours=job.freshness_hours)
+                    if items:
+                        return items
+                    return []
+                except Exception:
+                    logger.info("public_research_candidate_unavailable", extra={"source_kind": candidate.source_kind})
+                    return []
+
+        groups = await asyncio.gather(*(acquire(candidate) for candidate in candidates))
+        return [item for group in groups for item in group]
 
     @staticmethod
     def _items_from_result(result: Mapping[str, Any], *, topic_label: str, freshness_hours: int) -> list[ResearchEvidenceItem]:

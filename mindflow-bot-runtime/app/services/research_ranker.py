@@ -64,14 +64,18 @@ class MorningBriefResearchRanker:
             terms = _tokens(topic_label)
             evidence_terms = _tokens(f"{item.title} {item.content[:2000]}")
             relevance = 0.5 + (len(terms & evidence_terms) / max(1, len(terms)))
+        date_value = item.published_at or item.updated_at
+        confidence = 1.0 if date_value else 0.25
         try:
-            retrieved = datetime.fromisoformat(item.retrieved_at.replace("Z", "+00:00"))
-            if retrieved.tzinfo is None:
-                retrieved = retrieved.replace(tzinfo=timezone.utc)
-            age_hours = max(0.0, (now - retrieved.astimezone(timezone.utc)).total_seconds() / 3600)
+            event_time = datetime.fromisoformat((date_value or item.retrieved_at).replace("Z", "+00:00"))
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=timezone.utc)
+            age_hours = max(0.0, (now - event_time.astimezone(timezone.utc)).total_seconds() / 3600)
         except ValueError:
             age_hours = float(item.freshness_hours) + 1
-        freshness = max(0.0, 1.0 - age_hours / max(1, item.freshness_hours))
+            confidence = 0.0
+        freshness = confidence * max(0.0, 1.0 - age_hours / max(1, item.freshness_hours))
+        if freshness <= 0:
+            return 0.0
         quality = _QUALITY.get(item.source_kind, 0.5)
         return round(relevance * 0.45 + freshness * 0.30 + quality * 0.20 + max(0, min(topic_priority, 10)) * 0.005, 6)
-

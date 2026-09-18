@@ -17,5 +17,6 @@ class _Http:
 
 def test_public_search_extracts_only_https_results():
     items = PublicSearchClient(_Http()).search("public topic")
-    assert items == [{"title": "A result", "url": "https://example.com/a", "snippet": ""}]
-
+    assert items[0]["title"] == "A result"
+    assert items[0]["url"] == "https://example.com/a"
+    assert items[0]["source_kind"] == "web"

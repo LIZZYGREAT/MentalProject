@@ -13,6 +13,8 @@ class ExtractedDocument:
     text: str
     canonical_url: str | None = None
     extraction_mode: str = "http"
+    published_at: str | None = None
+    updated_at: str | None = None
 
 
 class _Parser(HTMLParser):
@@ -21,6 +23,8 @@ class _Parser(HTMLParser):
         self.title: list[str] = []
         self.body: list[str] = []
         self.canonical_url: str | None = None
+        self.published_at: str | None = None
+        self.updated_at: str | None = None
         self._title = False
         self._skip = 0
 
@@ -33,6 +37,13 @@ class _Parser(HTMLParser):
             self._skip += 1
         if name == "link" and "canonical" in values.get("rel", "").casefold().split():
             self.canonical_url = values.get("href") or None
+        if name == "meta":
+            key = (values.get("property") or values.get("name") or "").casefold()
+            content = values.get("content") or None
+            if key in {"article:published_time", "datepublished", "datepublished"}:
+                self.published_at = content
+            elif key in {"article:modified_time", "datemodified", "last-modified"}:
+                self.updated_at = content
 
     def handle_endtag(self, tag: str) -> None:
         name = tag.casefold()
@@ -62,6 +73,5 @@ def extract(content: bytes, *, content_type: str, max_chars: int = 60_000) -> Ex
     title = " ".join("".join(parser.title).split())[:300]
     body = " ".join(" ".join(parser.body).split())
     if len(body) < 80 and ("id=\"app\"" in text or "id='app'" in text or "__next" in text):
-        return ExtractedDocument(title, body[:max_chars], parser.canonical_url, "javascript_shell")
-    return ExtractedDocument(title, body[:max_chars], parser.canonical_url, "http")
-
+        return ExtractedDocument(title, body[:max_chars], parser.canonical_url, "javascript_shell", parser.published_at, parser.updated_at)
+    return ExtractedDocument(title, body[:max_chars], parser.canonical_url, "http", parser.published_at, parser.updated_at)

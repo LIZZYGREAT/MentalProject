@@ -152,27 +152,34 @@ class MorningBriefScheduler:
                     language=brief_preferences.get("language", "zh-CN"),
                     max_research_items=brief_preferences.get("max_research_items", 10),
                 )
-                for job in jobs:
-                    try:
-                        result = await self.research_service.search(
-                            participant_id,
-                            topic=job.topic,
-                            query_hints=job.query_hints,
-                            freshness_hours=job.freshness_hours,
-                            source_kinds=job.source_kinds,
-                            max_results=brief_preferences.get("max_research_items", 10),
-                        )
-                        if not result.get("ok"):
-                            research_unavailable = True
-                            continue
-                        topic_items = self.research_ranker.rank(
-                            result.get("results", []), topic_label=job.topic,
-                            max_items=min(3, brief_preferences.get("max_research_items", 10)),
-                        )
-                        research_by_topic[job.topic] = topic_items
-                    except Exception:
-                        logger.info("morning_brief_topic_research_unavailable", extra={"topic_hash": hash(job.topic)})
-                        research_unavailable = True
+                semaphore = asyncio.Semaphore(3)
+
+                async def research_one(job):
+                    async with semaphore:
+                        try:
+                            result = await self.research_service.search(
+                                participant_id,
+                                topic=job.topic,
+                                query_hints=job.query_hints,
+                                freshness_hours=job.freshness_hours,
+                                source_kinds=job.source_kinds,
+                                max_results=brief_preferences.get("max_research_items", 10),
+                            )
+                            if not result.get("ok"):
+                                return job.topic, [], True
+                            topic_items = self.research_ranker.rank(
+                                result.get("results", []), topic_label=job.topic,
+                                max_items=min(3, brief_preferences.get("max_research_items", 10)),
+                            )
+                            return job.topic, topic_items, False
+                        except Exception:
+                            logger.info("morning_brief_topic_research_unavailable", extra={"topic_hash": hash(job.topic)})
+                            return job.topic, [], True
+
+                for topic, topic_items, failed in await asyncio.gather(*(research_one(job) for job in jobs)):
+                    if topic_items:
+                        research_by_topic[topic] = topic_items
+                    research_unavailable = research_unavailable or failed
                 message = self.brief_composer.compose(
                     item["local_date"], events, reminders, research_by_topic,
                     include_calendar=brief_preferences.get("include_calendar", True),

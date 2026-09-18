@@ -5,8 +5,11 @@ from __future__ import annotations
 from html import unescape
 import re
 from urllib.parse import parse_qs, quote_plus, urlsplit
+import hashlib
+from datetime import datetime, timezone
 
 from .http_client import PublicHttpClient
+from .contracts import ResearchCandidate
 
 
 _RESULT = re.compile(
@@ -39,8 +42,14 @@ class PublicSearchClient:
                 continue
             seen.add(canonical)
             title = _TAG.sub("", unescape(raw_title))
-            results.append({"title": " ".join(title.split())[:300], "url": canonical, "snippet": ""})
+            results.append(ResearchCandidate(
+                candidate_id=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32],
+                source_kind="web",
+                title=" ".join(title.split())[:300],
+                url=canonical,
+                snippet="",
+                discovered_at=datetime.now(timezone.utc).isoformat(),
+            ).as_dict())
             if len(results) >= max(1, min(int(max_results), 10)):
                 break
         return results
-
