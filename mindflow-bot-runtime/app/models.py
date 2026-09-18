@@ -2157,6 +2157,7 @@ class ResearchEvidence(Base):
     canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
     publisher: Mapped[str | None] = mapped_column(String(160), nullable=True)
     published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)

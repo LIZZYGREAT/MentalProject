@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from app.contracts.research import ResearchEvidenceItem
 from app.repositories_morning_brief_preferences import MorningBriefTopicRepository
+from app.repositories_research import ResearchRepository
 from app.services.morning_brief_composer import MorningBriefComposer
 from app.services.morning_brief_research_planner import MorningBriefResearchPlanner
 from app.services.research_ranker import MorningBriefResearchRanker
@@ -120,3 +121,16 @@ def test_ranker_uses_published_time_not_retrieved_time_for_freshness():
     assert MorningBriefResearchRanker().rank(
         [old], topic_label="article", now=datetime(2026, 9, 18, tzinfo=timezone.utc)
     ) == []
+
+
+def test_evidence_repository_preserves_source_updated_time():
+    database = memory_database()
+    user = participant(database, "EVIDENCE-DATE")
+    item = ResearchEvidenceItem.build(
+        source_kind="github", title="Release", canonical_url="https://github.com/a/b/releases/1",
+        content="release", extraction_mode="api", freshness_hours=24,
+        published_at="2026-09-17T00:00:00Z", updated_at="2026-09-18T00:00:00Z",
+    )
+    saved = ResearchRepository(database).save_evidence(user.id, item, topic_label="Agent")
+    assert saved["published_at"] == "2026-09-17T00:00:00Z"
+    assert saved["updated_at"] == "2026-09-18T00:00:00Z"

@@ -64,6 +64,7 @@ class ResearchRepository:
                     canonical_url=item.canonical_url,
                     publisher=item.publisher,
                     published_at=item.published_at,
+                    updated_at=item.updated_at,
                     retrieved_at=_aware(datetime.fromisoformat(item.retrieved_at.replace("Z", "+00:00"))),
                     content=item.content,
                     content_hash=item.content_hash,
@@ -100,9 +101,8 @@ class ResearchRepository:
         return {
             "evidence_id": row.evidence_id, "participant_id": str(row.participant_id), "topic_label": row.topic_label,
             "source_kind": row.source_kind, "title": row.title, "canonical_url": row.canonical_url,
-            "publisher": row.publisher, "published_at": row.published_at, "retrieved_at": _aware(row.retrieved_at).isoformat(),
+            "publisher": row.publisher, "published_at": row.published_at, "updated_at": row.updated_at, "retrieved_at": _aware(row.retrieved_at).isoformat(),
             "content": row.content, "content_hash": row.content_hash, "extraction_mode": row.extraction_mode,
             "freshness_hours": row.freshness_hours, "verified_public_source": row.verified_public_source,
             "expires_at": _aware(row.expires_at).isoformat(),
         }
-
