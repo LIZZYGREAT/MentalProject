@@ -13,6 +13,8 @@ services:
         condition: service_healthy
     command: ["alembic", "upgrade", "head"]
     restart: "no"
+    networks:
+      - mindflow-core
 
   claude-state-init:
     image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/python
@@ -41,12 +43,16 @@ services:
         condition: service_completed_successfully
       claude-state-init:
         condition: service_completed_successfully
+      research-runtime:
+        condition: service_healthy
     command: ["python", "-m", "app.main"]
     environment:
       CLAUDE_WORKDIR: /srv/claude-workspace
       CLAUDE_SETTINGS_PATH: /srv/claude-workspace/.claude/settings.json
       HOME: /home/mindflow
       VISION_MAX_CONCURRENCY: ${VISION_MAX_CONCURRENCY:-1}
+      RESEARCH_RUNTIME_URL: ${RESEARCH_RUNTIME_URL:-http://research-runtime:8080}
+      RESEARCH_RUNTIME_TOKEN: ${RESEARCH_RUNTIME_TOKEN:-}
     volumes:
       - claude_state:/home/mindflow/.claude
     ports:
@@ -56,6 +62,42 @@ services:
     mem_limit: ${BOT_MEMORY_LIMIT:-768m}
     memswap_limit: ${BOT_MEMORY_SWAP_LIMIT:-1280m}
     pids_limit: ${BOT_PID_LIMIT:-128}
+    networks:
+      - mindflow-core
+      - research-rpc
+
+  research-runtime:
+    build:
+      context: ..
+      dockerfile: research-runtime/Dockerfile
+    environment:
+      RESEARCH_RUNTIME_TOKEN: ${RESEARCH_RUNTIME_TOKEN:-}
+      RESEARCH_BIND_HOST: 0.0.0.0
+      RESEARCH_PORT: 8080
+    volumes:
+      - research_workspace:/workspace
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    cpus: ${RESEARCH_CPU_LIMIT:-0.50}
+    mem_limit: ${RESEARCH_MEMORY_LIMIT:-512m}
+    memswap_limit: ${RESEARCH_MEMORY_SWAP_LIMIT:-768m}
+    pids_limit: ${RESEARCH_PID_LIMIT:-64}
+    networks:
+      - research-rpc
+      - research-public
 
   acceptance:
     profiles: ["acceptance"]
@@ -97,6 +139,8 @@ services:
     mem_limit: ${ACCEPTANCE_MEMORY_LIMIT:-1024m}
     memswap_limit: ${ACCEPTANCE_MEMORY_SWAP_LIMIT:-1536m}
     pids_limit: ${ACCEPTANCE_PID_LIMIT:-256}
+    networks:
+      - mindflow-core
 
   admin:
     build:
@@ -124,6 +168,8 @@ services:
     mem_limit: ${ADMIN_MEMORY_LIMIT:-384m}
     memswap_limit: ${ADMIN_MEMORY_SWAP_LIMIT:-512m}
     pids_limit: ${ADMIN_PID_LIMIT:-64}
+    networks:
+      - mindflow-core
 
   postgres:
     image: crpi-8tbzhfoaax5hq44s.cn-shanghai.personal.cr.aliyuncs.com/mind_flow/postgres
@@ -143,7 +189,19 @@ services:
     mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
     memswap_limit: ${POSTGRES_MEMORY_SWAP_LIMIT:-768m}
     pids_limit: ${POSTGRES_PID_LIMIT:-100}
+    networks:
+      - mindflow-core
 
 volumes:
   postgres_data:
   claude_state:
+  research_workspace:
+
+networks:
+  mindflow-core:
+  # Only the bot and research RPC share this internal network. The research
+  # runtime still rejects every private/metadata destination at the policy
+  # layer, including the Bot service address.
+  research-rpc:
+    internal: true
+  research-public:

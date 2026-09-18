@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from starlette.applications import Starlette
@@ -19,26 +20,31 @@ from .executor import SafeExecutor
 from .github import GitHubPublicClient
 from .http_client import PublicHttpClient
 from .policy import ExecPolicy
+from .search import PublicSearchClient
 
 
 class ResearchRuntime:
-    def __init__(self, *, workspace: str | Path = "/workspace", token: str | None = None) -> None:
+    def __init__(self, *, workspace: str | Path | None = None, token: str | None = None) -> None:
+        if workspace is None:
+            workspace = os.environ.get("RESEARCH_WORKSPACE") or (
+                "/workspace" if os.name != "nt" else str(Path(tempfile.gettempdir()) / "mindflow-research-workspace")
+            )
         self.workspace = Path(workspace).resolve()
         self.token = token if token is not None else os.environ.get("RESEARCH_RUNTIME_TOKEN", "")
         self.http = PublicHttpClient()
         self.executor = SafeExecutor(ExecPolicy(self.workspace))
         self.browser = UnavailableBrowser()
         self.github = GitHubPublicClient()
+        self.search_client = PublicSearchClient(self.http)
 
     def _job(self, raw: dict[str, Any]) -> ResearchJobSpec:
         return ResearchJobSpec.from_mapping(raw)
 
     def search(self, raw: dict[str, Any]) -> dict[str, Any]:
         job = self._job(raw)
-        # Search provider calls are deliberately kept behind this RPC.  The
-        # runtime does not silently invent search results when no provider is
-        # configured; callers can use the bounded GitHub/public URL paths.
-        return {"ok": False, "error": "search_provider_not_configured", "topic": job.topic}
+        query = " ".join((job.topic, *job.query_hints))[:500]
+        results = self.search_client.search(query, max_results=min(10, job.max_pages))
+        return {"ok": True, "topic": job.topic, "results": results}
 
     def open_url(self, raw: dict[str, Any]) -> dict[str, Any]:
         job = self._job(raw)
@@ -128,4 +134,3 @@ def create_app(runtime: ResearchRuntime | None = None) -> Starlette:
 
 
 app = create_app()
-

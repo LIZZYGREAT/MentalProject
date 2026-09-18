@@ -699,6 +699,8 @@ class Settings:
             )
         if self.research_runtime_enabled and not self.research_runtime_url:
             raise ValueError("RESEARCH_RUNTIME_URL is required when research runtime is enabled")
+        if self.research_runtime_enabled and not self.research_runtime_token:
+            raise ValueError("RESEARCH_RUNTIME_TOKEN is required when research runtime is enabled")
         if self.research_evidence_ttl_hours > 24:
             raise ValueError("RESEARCH_EVIDENCE_TTL_HOURS must be <= 24")
         if self.feishu_card_action_transport not in {"ws", "http"}:

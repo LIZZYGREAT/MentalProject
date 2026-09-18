@@ -160,5 +160,14 @@ class PublicResearchService:
                 continue
         if not items and result.get("evidence") and isinstance(result["evidence"], Mapping):
             items.append(ResearchEvidenceItem.from_mapping(result["evidence"], topic_label=topic_label))
+        if not items and result.get("ok") and result.get("source_url"):
+            items.append(ResearchEvidenceItem.build(
+                source_kind="web",
+                title=str(result.get("title") or result["source_url"]),
+                canonical_url=str(result["source_url"]),
+                content=str(result.get("content") or "")[:60000],
+                extraction_mode=str(result.get("extraction_mode") or result.get("readability") or "http"),
+                freshness_hours=freshness_hours,
+                topic_label=topic_label,
+            ))
         return items
-

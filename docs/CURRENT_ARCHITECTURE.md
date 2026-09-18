@@ -4,7 +4,7 @@
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0082_public_video_resource_key -->
+<!-- ALEMBIC_HEAD: 0083_public_research_and_brief_topics -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -34,8 +34,9 @@ Vision 请求、严格解析与 Draft 创建共享同一并发上限；同步图
 
 每位参与者使用独立顺序队列与可恢复 session。Backend 向 Agent 暴露封闭 schema 的
 participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线、Calendar 以及独立的
-公共 Web/Video 只读能力。工具 Registry 禁止身份、Token、Secret、SQL、路径与任意 URL
-字段；经审核的公共 URL 入口由 handler 执行 HTTPS、凭据、敏感 query 与 SSRF 校验。
+公共 Web/Video/Research 只读能力。工具 Registry 禁止身份、Token、Secret、SQL、路径与
+任意私有上下文字段；经审核的公共 URL 入口由 handler 执行 HTTPS、凭据、敏感 query 与
+SSRF 校验。
 
 <!-- BUSINESS_TOOLS_BEGIN -->
 - `care_get_today_context`
@@ -70,11 +71,27 @@ participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线、Ca
 - `video_inspect_url`
 - `video_read_transcript`
 
+公共 Research Runtime 工具同样不属于上面的 Care/Calendar 清单：
+
+- `research_search`
+- `research_open_url`
+- `research_browser_open`
+- `research_exec`
+- `research_github`
+- `morning_brief_topic_propose`
+
 `PublicVideoService` 当前只接入 Bilibili。公开视频 URL 先经过复用的 public HTTPS
 redirect/DNS/SSRF 链路，再读取公开 Metadata 与匿名可访问字幕；Transcript 按
 participant、provider、video_id 短期缓存并按 offset 分块。字幕是 untrusted evidence，
 不能改变系统规则、工具授权或 Calendar 状态。无公开字幕时只返回标题/简介可见和明确
 降级说明。本阶段不做 ASR、音频下载、Whisper、逐帧视觉理解、OCR、时间轴对齐或秒级问答。
+
+Public Research Runtime 是独立的非 root 容器，只挂载临时 research workspace。Bot 通过
+内部 RPC 调用，研究运行时不接收 participant、日程、Memory、心理上下文、Cookie 或凭据；
+它只允许公开 HTTPS、无登录 Browser、GitHub public API 和有限 argv 数据处理。每个 DNS
+解析及 redirect 都重新检查公网地址，网页、README、Issue 与搜索摘要统一视为不可信证据，
+不能触发 Structured Tool 或长期偏好写入。Morning Brief 主题存于独立的 participant topic
+表，长期增删必须经过确认提案；一次性公开查询不会自动订阅。
 
 `calendar_update_event` 与批量更新采用 PATCH 合同：Agent 提供 `event_ref`、结构化 `scope`
 以及只包含目标字段的 `changes`。Backend 先绑定 participant-owned 当前对象，再把 partial

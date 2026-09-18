@@ -5,8 +5,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.contracts import ResearchEvidenceItem, ResearchJobSpec, evidence_envelope
-from app.policy import ExecPolicy, is_public_ip
+from research_runtime_app.contracts import ResearchEvidenceItem, ResearchJobSpec, evidence_envelope
+from research_runtime_app.policy import ExecPolicy, is_public_ip
 
 
 def test_job_rejects_private_context_and_bounds_fields():
@@ -48,4 +48,3 @@ def test_evidence_is_untrusted_and_provenance_is_stable():
     assert item.evidence_id
     assert "untrusted_public_evidence_only" in envelope
     assert "public evidence" in envelope
-

@@ -43,14 +43,14 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 <!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0082_public_video_resource_key -->
+<!-- ALEMBIC_HEAD: 0083_public_research_and_brief_topics -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
 <!-- CAUSAL_CLAIM_ALLOWED: false -->
 <!-- MRT_RUNTIME_ENABLED: false -->
 
-## 二十个 Care/Calendar 业务 Tool
+## Care/Calendar 与公开研究业务 Tool
 
 <!-- BUSINESS_TOOLS_BEGIN -->
 - `care_get_today_context`
@@ -76,9 +76,19 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
 
+Public Research Tools（独立于 Care/Calendar 清单）：
+
+- `research_search`
+- `research_open_url`
+- `research_browser_open`
+- `research_exec`
+- `research_github`
+- `morning_brief_topic_propose`
+
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
-身份、Token、Secret、SQL、路径和任意 URL 字段；经审核的 `web_read_url` 与
-`video_inspect_url` 是安全公共 HTTPS 入口。Tool 调用继续经过 `ToolRegistry` 的
+身份、Token、Secret、SQL、路径和任意私有上下文字段；公开研究 URL 只接受经过
+SSRF 校验的 HTTPS 入口。Research Runtime 的返回值统一标记为不可信公开证据，
+不能触发 Structured Tool 或长期偏好写入。Tool 调用继续经过 `ToolRegistry` 的
 校验、安全摘要和 AgentRun 审计。
 
 公开视频语义总结由独立 `PublicVideoService` 提供，当前只支持 Bilibili：
