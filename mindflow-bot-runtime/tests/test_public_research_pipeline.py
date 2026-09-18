@@ -112,6 +112,41 @@ def test_search_candidate_is_opened_before_becoming_evidence():
     assert result["results"][0]["content"]
 
 
+def test_github_source_acquires_repository_readme_and_release_evidence():
+    actions = []
+
+    class Gateway:
+        async def search(self, job):
+            return {"ok": True, "candidate_only": True, "results": [{
+                "candidate_id": "repo", "source_kind": "github", "title": "a/b",
+                "url": "https://github.com/a/b",
+            }]}
+
+        async def github(self, job, payload):
+            actions.append(payload["action"])
+            item = ResearchEvidenceItem.build(
+                source_kind="github", title=payload["action"],
+                canonical_url=f"https://github.com/a/b/{payload['action']}",
+                content=f"{payload['action']} content", extraction_mode="api", freshness_hours=24,
+            )
+            return {"ok": True, "evidence": item.as_dict()}
+
+        async def open_url(self, *_args):
+            raise AssertionError
+
+        async def browser_open(self, *_args):
+            raise AssertionError
+
+        async def exec_public(self, *_args):
+            raise AssertionError
+
+    result = asyncio.run(PublicResearchService(
+        gateway=Gateway(), web_search=None, web_documents=None,
+    ).search(None, topic="Agent", source_kinds=["github"]))
+    assert actions == ["repository", "readme", "releases"]
+    assert {item["title"] for item in result["results"]} == {"repository", "readme", "releases"}
+
+
 def test_ranker_uses_published_time_not_retrieved_time_for_freshness():
     item = ResearchEvidenceItem.build(
         source_kind="web", title="Old article", canonical_url="https://example.com/old",

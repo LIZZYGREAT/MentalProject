@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from research_runtime_app.server import ResearchRuntime
+from research_runtime_app.browser import PlaywrightBrowserProvider
 
 
 def test_runtime_rejects_private_open_url_before_network_request(tmp_path):
@@ -49,3 +50,16 @@ def test_exec_is_disabled_by_default_and_runtime_can_require_token(tmp_path, mon
     monkeypatch.setenv("RESEARCH_RUNTIME_REQUIRE_TOKEN", "true")
     with pytest.raises(RuntimeError, match="TOKEN"):
         ResearchRuntime(workspace=tmp_path)
+
+
+def test_browser_without_optional_dependency_returns_stable_failure(tmp_path, monkeypatch):
+    provider = PlaywrightBrowserProvider()
+    monkeypatch.setattr("research_runtime_app.browser.validate_public_url", lambda url: (url, ("8.8.8.8",)))
+
+    async def missing_browser():
+        raise RuntimeError("playwright_unavailable")
+
+    monkeypatch.setattr(provider, "_ensure_browser", missing_browser)
+    result = asyncio.run(provider.open("https://example.com/"))
+    assert result.ok is False
+    assert result.reason_code == "playwright_unavailable"

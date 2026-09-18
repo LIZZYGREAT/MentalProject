@@ -193,7 +193,14 @@ class PublicResearchService:
                     if candidate.source_kind == "github" and self.gateway is not None:
                         parts = [item for item in urlsplit(candidate.url).path.split("/") if item]
                         if len(parts) >= 2:
-                            result = await self.gateway.github(job, {"action": "readme", "owner": parts[0], "repo": parts[1]})
+                            github_items: list[ResearchEvidenceItem] = []
+                            for action in ("repository", "readme", "releases"):
+                                try:
+                                    result = await self.gateway.github(job, {"action": action, "owner": parts[0], "repo": parts[1]})
+                                    github_items.extend(self._items_from_result(result, topic_label=job.topic, freshness_hours=job.freshness_hours))
+                                except Exception:
+                                    logger.info("public_research_github_source_unavailable", extra={"action": action})
+                            return github_items
                         else:
                             return []
                     elif self.gateway is not None:

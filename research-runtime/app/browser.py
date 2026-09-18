@@ -50,7 +50,10 @@ class PlaywrightBrowserProvider:
 
     async def open(self, url: str, *, wait_seconds: float = 2.0) -> BrowserResult:
         canonical, _ = validate_public_url(url)
-        browser = await self._ensure_browser()
+        try:
+            browser = await self._ensure_browser()
+        except RuntimeError as exc:
+            return BrowserResult(False, canonical, reason_code=str(exc) or "browser_unavailable")
         context = await browser.new_context(
             accept_downloads=False,
             java_script_enabled=True,

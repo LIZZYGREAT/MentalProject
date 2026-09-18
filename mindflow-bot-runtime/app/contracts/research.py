@@ -226,6 +226,8 @@ class ResearchEvidenceItem:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, topic_label: str | None = None) -> "ResearchEvidenceItem":
+        if "content" not in value and not value.get("evidence_id"):
+            raise ValueError("research candidate is not verified evidence")
         content = str(value.get("content") or value.get("snippet") or "")[:60000]
         canonical_url = str(value.get("canonical_url") or value.get("source_url") or value.get("url") or "")
         if not canonical_url.startswith("https://"):
