@@ -36,6 +36,14 @@ def test_exec_policy_is_argv_only_and_allowlisted(tmp_path):
         policy.validate(("bash", "-lc", "echo bad"), timeout_seconds=2)
     with pytest.raises(ValueError):
         policy.validate(("python3", "-c", "print(1); print(2)"), timeout_seconds=2)
+    with pytest.raises(ValueError):
+        policy.validate(("curl", "https://127.0.0.1/"), timeout_seconds=2)
+    with pytest.raises(ValueError):
+        policy.validate(("python3", "-c", "import socket"), timeout_seconds=2)
+    with pytest.raises(ValueError):
+        policy.validate(("git", "push", "https://github.com/example/project"), timeout_seconds=2)
+    with pytest.raises(ValueError):
+        policy.validate(("python3", "-m", "json.tool", "../../etc/passwd"), timeout_seconds=2)
 
 
 def test_evidence_is_untrusted_and_provenance_is_stable():

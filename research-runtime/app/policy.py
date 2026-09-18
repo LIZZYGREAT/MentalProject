@@ -74,9 +74,55 @@ class ExecPolicy:
             raise ValueError("invalid executable argument")
         if any(_SHELL_TOKENS.search(item) for item in values):
             raise ValueError("shell syntax is not allowed")
+        self._validate_command_semantics(values)
         if isinstance(timeout_seconds, bool) or not 1 <= int(timeout_seconds) <= self.max_timeout_seconds:
             raise ValueError("timeout is outside the allowed range")
         if not self.workspace.is_absolute():
             raise ValueError("workspace must be absolute")
         return values
 
+    def _validate_command_semantics(self, values: tuple[str, ...]) -> None:
+        executable = Path(values[0]).name
+        lowered = tuple(item.casefold() for item in values)
+        if executable == "curl":
+            forbidden_flags = {
+                "--proxy", "-x", "--connect-to", "--resolve", "--interface",
+                "--config", "-k", "--insecure", "--cookie", "-b", "--cookie-jar",
+                "-c", "--header", "-h", "--upload-file", "-t", "-d", "--data",
+                "--data-raw", "--data-binary", "-x",
+            }
+            if any(item in forbidden_flags or item.startswith("--proxy=") for item in lowered):
+                raise ValueError("curl network overrides, credentials and writes are not allowed")
+            for item in values[1:]:
+                if item.casefold().startswith(("http://", "https://")):
+                    validate_public_url(item)
+                if item in {"-o", "--output", "-O", "--remote-name"}:
+                    raise ValueError("curl downloads must be handled by the runtime HTTP client")
+        elif executable == "python3":
+            joined = " ".join(lowered[1:])
+            forbidden = (
+                "socket", "subprocess", "requests", "httpx", "urllib", "http.client",
+                "open(", "pathlib", "shutil", "__import__", "importlib", "eval(", "exec(",
+                "os.environ", "os.system", "popen(",
+            )
+            if any(token in joined for token in forbidden):
+                raise ValueError("python network, process and filesystem access is not allowed")
+            if "-m" in lowered:
+                module_index = lowered.index("-m")
+                if module_index + 1 >= len(lowered) or lowered[module_index + 1] not in {"json.tool", "json"}:
+                    raise ValueError("python module is not allowlisted")
+        elif executable == "git":
+            forbidden_subcommands = {"push", "fetch", "pull", "remote", "config", "credential", "submodule"}
+            if any(item in forbidden_subcommands for item in lowered[1:]):
+                raise ValueError("git command is not read-only")
+            for item in values[1:]:
+                if item.casefold().startswith(("http://", "https://")):
+                    validate_public_url(item)
+
+        for item in values[1:]:
+            if item.startswith(("https://", "http://")):
+                continue
+            if item.startswith(("/", "\\", "..")) or "/../" in item.replace("\\", "/"):
+                candidate = (self.workspace / item).resolve()
+                if candidate != self.workspace and self.workspace not in candidate.parents:
+                    raise ValueError("filesystem path escapes research workspace")
