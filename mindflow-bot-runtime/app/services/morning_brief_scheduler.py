@@ -9,6 +9,10 @@ from typing import Any, Callable
 import uuid
 from zoneinfo import ZoneInfo
 
+from app.services.morning_brief_composer import MorningBriefComposer
+from app.services.morning_brief_research_planner import MorningBriefResearchPlanner
+from app.services.research_ranker import MorningBriefResearchRanker
+
 
 logger = logging.getLogger(__name__)
 MORNING_BRIEF_HINT = "给今天留一点余量，按自己的节奏来就好。"
@@ -52,7 +56,7 @@ def render_morning_brief(
 
 
 class MorningBriefScheduler:
-    def __init__(self, *, schedules: Any, participants: Any, bindings: Any, care_preferences: Any, proactive_policy: Any, calendar: Any, sender: Any, reminder_source: Any = None, timezone_name: str = "Asia/Shanghai", poll_interval_seconds: int = 60, catch_up_minutes: int = 120, validity_minutes: int = 120, claim_lease_seconds: int = 120, retry_base_seconds: int = 60, max_attempts: int = 5, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(self, *, schedules: Any, participants: Any, bindings: Any, care_preferences: Any, proactive_policy: Any, calendar: Any, sender: Any, reminder_source: Any = None, brief_preferences: Any = None, topic_preferences: Any = None, research_service: Any = None, research_planner: Any = None, research_ranker: Any = None, brief_composer: Any = None, timezone_name: str = "Asia/Shanghai", poll_interval_seconds: int = 60, catch_up_minutes: int = 120, validity_minutes: int = 120, claim_lease_seconds: int = 120, retry_base_seconds: int = 60, max_attempts: int = 5, clock: Callable[[], datetime] | None = None) -> None:
         self.schedules = schedules
         self.participants = participants
         self.bindings = bindings
@@ -61,6 +65,12 @@ class MorningBriefScheduler:
         self.calendar = calendar
         self.sender = sender
         self.reminder_source = reminder_source
+        self.brief_preferences = brief_preferences
+        self.topic_preferences = topic_preferences
+        self.research_service = research_service
+        self.research_planner = research_planner or MorningBriefResearchPlanner()
+        self.research_ranker = research_ranker or MorningBriefResearchRanker()
+        self.brief_composer = brief_composer or MorningBriefComposer()
         self.timezone = ZoneInfo(timezone_name)
         self.poll_interval_seconds = max(1, poll_interval_seconds)
         self.catch_up_minutes = max(0, catch_up_minutes)
@@ -108,18 +118,69 @@ class MorningBriefScheduler:
                 continue
             item_date = date.fromisoformat(item["local_date"])
             day_start = datetime.combine(item_date, time.min, self.timezone)
+            brief_preferences = {
+                "include_calendar": True, "include_reminders": True,
+                "max_research_items": 10, "lookback_hours": 24, "language": "zh-CN",
+            }
+            topics: list[dict[str, Any]] = []
             try:
-                events = await self.calendar.get_events(participant_id, day_start, day_start + timedelta(days=1))
+                brief_preferences = (
+                    await asyncio.to_thread(self.brief_preferences.get_preferences, participant_id)
+                    if self.brief_preferences is not None else {
+                        "include_calendar": True, "include_reminders": True,
+                        "max_research_items": 10, "lookback_hours": 24, "language": "zh-CN",
+                    }
+                )
+                topics = (
+                    await asyncio.to_thread(self.topic_preferences.list_topics, participant_id)
+                    if self.topic_preferences is not None else []
+                )
+                events = await self.calendar.get_events(participant_id, day_start, day_start + timedelta(days=1)) if brief_preferences.get("include_calendar", True) else []
             except Exception:
-                logger.info("morning_brief_calendar_unavailable")
+                logger.info("morning_brief_context_unavailable")
                 events = []
-            reminders = await asyncio.to_thread(
-                self.reminder_source.for_local_date, participant_id, item_date
-            ) if self.reminder_source is not None else []
-            message = render_morning_brief(
-                item["local_date"], events, reminders,
-                timezone_name=self.timezone.key,
+            reminders = (
+                await asyncio.to_thread(self.reminder_source.for_local_date, participant_id, item_date)
+                if self.reminder_source is not None and brief_preferences.get("include_reminders", True) else []
             )
+            research_by_topic: dict[str, list[Any]] = {}
+            research_unavailable = False
+            if topics and self.research_service is not None:
+                jobs = self.research_planner.plan(
+                    topics,
+                    lookback_hours=brief_preferences.get("lookback_hours", 24),
+                    language=brief_preferences.get("language", "zh-CN"),
+                    max_research_items=brief_preferences.get("max_research_items", 10),
+                )
+                for job in jobs:
+                    try:
+                        result = await self.research_service.search(
+                            participant_id,
+                            topic=job.topic,
+                            query_hints=job.query_hints,
+                            freshness_hours=job.freshness_hours,
+                            source_kinds=job.source_kinds,
+                            max_results=brief_preferences.get("max_research_items", 10),
+                        )
+                        if not result.get("ok"):
+                            research_unavailable = True
+                            continue
+                        topic_items = self.research_ranker.rank(
+                            result.get("results", []), topic_label=job.topic,
+                            max_items=min(3, brief_preferences.get("max_research_items", 10)),
+                        )
+                        research_by_topic[job.topic] = topic_items
+                    except Exception:
+                        logger.info("morning_brief_topic_research_unavailable", extra={"topic_hash": hash(job.topic)})
+                        research_unavailable = True
+                message = self.brief_composer.compose(
+                    item["local_date"], events, reminders, research_by_topic,
+                    include_calendar=brief_preferences.get("include_calendar", True),
+                    include_reminders=brief_preferences.get("include_reminders", True),
+                    research_unavailable=research_unavailable and not research_by_topic,
+                )
+            else:
+                message = render_morning_brief(item["local_date"], events, reminders, timezone_name=self.timezone.key)
             try:
                 provider_id = await asyncio.to_thread(self.sender.send_text, binding["chat_id"], message, message_uuid=item["id"])
             except Exception as exc:

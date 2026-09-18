@@ -34,11 +34,13 @@ from app.repositories_daily_review import (
     RetrospectiveCurveRepository,
 )
 from app.repositories_morning_brief import MorningBriefScheduleRepository
+from app.repositories_morning_brief_preferences import MorningBriefTopicRepository
 from app.repositories_reminder import ReminderRepository
 from app.repositories_followup import CareFollowupCandidateRepository
 from app.repositories_web_search import WebSearchRepository
 from app.repositories_web_document import WebDocumentRepository
 from app.repositories_public_video import PublicVideoRepository
+from app.repositories_research import ResearchRepository
 from app.repositories_memory import ParticipantMemoryRepository
 from app.repositories_preferences import InteractionPreferenceRepository
 from app.repositories_personalization_proposal import (
@@ -95,6 +97,7 @@ from app.tools.video import VideoTools
 from app.tools.memory import MemoryTools
 from app.tools.preferences import InteractionPreferenceTools
 from app.tools.research import ResearchTools
+from app.tools.public_research import PublicResearchTools
 from app.services.memory_service import MemoryService
 from app.services.interaction_preference_service import InteractionPreferenceService
 from app.services.personalization_proposal_service import (
@@ -109,6 +112,7 @@ from app.services.web_search_service import (
 )
 from app.services.public_web_document_service import PublicWebDocumentService
 from app.services.public_video_service import PublicVideoService
+from app.services.public_research_service import PublicResearchService, ResearchRuntimeClient
 from app.services.video_providers.bilibili import BilibiliVideoAdapter
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
@@ -163,6 +167,8 @@ class BusinessServices:
     personalization_proposals: PersonalizationProposalService
     psychological_context: PsychologicalContextBuilder
     research_aggregates: ResearchAggregateService
+    morning_brief_topics: MorningBriefTopicRepository
+    public_research: PublicResearchService
     care_composer: object | None = None
 
 
@@ -242,6 +248,7 @@ def build_business_services(
         default_system_budget=warning_delivery_policy.max_daily_sends,
     )
     morning_brief_schedules = MorningBriefScheduleRepository(database)
+    morning_brief_topics = MorningBriefTopicRepository(database)
     reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
     followup_candidates = CareFollowupCandidateRepository(database)
     if not settings.web_search_enabled:
@@ -271,6 +278,25 @@ def build_business_services(
         max_extracted_chars=settings.web_read_url_max_extracted_chars,
         cache_ttl_minutes=settings.web_read_url_cache_ttl_minutes,
     )
+    research_repository = ResearchRepository(
+        database, evidence_ttl_hours=settings.research_evidence_ttl_hours
+    )
+    research_gateway = (
+        ResearchRuntimeClient(
+            settings.research_runtime_url,
+            token=settings.research_runtime_token,
+            timeout_seconds=settings.research_runtime_timeout_seconds,
+        )
+        if settings.research_runtime_enabled
+        else None
+    )
+    public_research = PublicResearchService(
+        gateway=research_gateway,
+        web_search=web_search,
+        web_documents=public_web_documents,
+        evidence=research_repository,
+        audit=research_repository,
+    )
     public_videos = PublicVideoService(
         PublicVideoRepository(
             database,
@@ -297,6 +323,7 @@ def build_business_services(
         memory,
         interaction_preferences,
         care_preferences,
+        morning_brief_topics,
     )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
@@ -462,6 +489,11 @@ def build_business_services(
         interaction_preferences, presentations, personalization_proposals
     ).register(registry)
     ResearchTools(research_aggregates).register(registry)
+    PublicResearchTools(
+        public_research,
+        topic_preferences=morning_brief_topics,
+        proposals=personalization_proposals,
+    ).register(registry)
     calendar_mutation_plan_runner = CalendarMutationPlanRunner(
         calendar_mutation_plans,
         care_tools.execute_calendar_mutation_plan_item,
@@ -547,5 +579,7 @@ def build_business_services(
         personalization_proposals=personalization_proposals,
         psychological_context=psychological_context,
         research_aggregates=research_aggregates,
+        morning_brief_topics=morning_brief_topics,
+        public_research=public_research,
         care_composer=care_composer,
     )

@@ -1679,6 +1679,46 @@ class ParticipantCarePreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class ParticipantMorningBriefPreference(Base):
+    """Participant-confirmed content preferences for the morning brief."""
+
+    __tablename__ = "participant_morning_brief_preferences"
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    include_calendar: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    include_reminders: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    max_research_items: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    lookback_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    language: Mapped[str] = mapped_column(String(32), nullable=False, default="zh-CN")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantMorningBriefTopic(Base):
+    """Explicitly confirmed public-interest subscription, never inferred."""
+
+    __tablename__ = "participant_morning_brief_topics"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "topic_label", name="uq_morning_brief_topic_label"),
+        Index("ix_morning_brief_topic_participant_enabled", "participant_id", "enabled", "priority"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_label: Mapped[str] = mapped_column(String(160), nullable=False)
+    query_hints_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
+    source_kinds_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=lambda: ["web"])
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class ProactiveNotificationDelivery(Base):
     """Cross-feature reservation and delivery ledger for proactive messages."""
 
@@ -2073,6 +2113,59 @@ class MorningBriefSchedule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class ResearchJobAudit(Base):
+    """Bounded, privacy-minimized audit for a public research job."""
+
+    __tablename__ = "research_job_audits"
+    __table_args__ = (
+        Index("ix_research_job_participant_started", "participant_id", "started_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    browser_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exec_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    failure_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class ResearchEvidence(Base):
+    """Short-lived participant-bound public evidence with provenance."""
+
+    __tablename__ = "research_evidence"
+    __table_args__ = (
+        Index("ix_research_evidence_participant_retrieved", "participant_id", "retrieved_at"),
+        Index("ix_research_evidence_content_hash", "participant_id", "content_hash"),
+    )
+
+    evidence_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_label: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    publisher: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    extraction_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    freshness_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    verified_public_source: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Reminder(Base):
     __tablename__ = "reminders"
     __table_args__ = (
@@ -2165,7 +2258,7 @@ class PersonalizationProposal(Base):
         Index("ix_personalization_proposal_expiry", "status", "expires_at"),
         CheckConstraint(
             "domain IN ('memory', 'interaction_preferences', "
-            "'support_preferences', 'care_preferences')",
+            "'support_preferences', 'care_preferences', 'morning_brief_topics')",
             name="ck_personalization_proposal_domain",
         ),
         CheckConstraint(

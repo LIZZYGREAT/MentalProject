@@ -718,6 +718,7 @@ class CardActionService:
                     "clear": "已清理审核卡中列出的长期记忆。",
                     "update": "表达与支持偏好已更新。",
                     "care_update": "提醒与关怀设置已更新。",
+                    "morning_brief_topic": "早报主题设置已更新。",
                 }.get(str(result.get("operation") or ""), "设置已更新。")
             return {
                 **result,

@@ -151,6 +151,11 @@ class Settings:
     web_search_max_output_tokens: int = 4096
     web_search_retry_max_output_tokens: int = 6144
     web_search_summary_max_chars: int = 12000
+    research_runtime_enabled: bool = False
+    research_runtime_url: str = "http://research-runtime:8080"
+    research_runtime_token: str = ""
+    research_runtime_timeout_seconds: float = 30.0
+    research_evidence_ttl_hours: int = 6
     web_read_url_enabled: bool = True
     web_read_url_timeout_seconds: float = 10.0
     web_read_url_max_bytes: int = 2 * 1024 * 1024
@@ -457,6 +462,17 @@ class Settings:
             web_search_summary_max_chars=_int(
                 values, "WEB_SEARCH_SUMMARY_MAX_CHARS", 12000, minimum=1000
             ),
+            research_runtime_enabled=_bool(values, "RESEARCH_RUNTIME_ENABLED", False),
+            research_runtime_url=values.get(
+                "RESEARCH_RUNTIME_URL", "http://research-runtime:8080"
+            ).strip(),
+            research_runtime_token=values.get("RESEARCH_RUNTIME_TOKEN", "").strip(),
+            research_runtime_timeout_seconds=_float(
+                values, "RESEARCH_RUNTIME_TIMEOUT_SECONDS", 30.0, minimum=1.0
+            ),
+            research_evidence_ttl_hours=_int(
+                values, "RESEARCH_EVIDENCE_TTL_HOURS", 6, minimum=1
+            ),
             web_read_url_enabled=_bool(values, "WEB_READ_URL_ENABLED", True),
             web_read_url_timeout_seconds=_float(
                 values, "WEB_READ_URL_TIMEOUT_SECONDS", 10.0, minimum=1.0
@@ -681,6 +697,10 @@ class Settings:
             raise ValueError(
                 "DEEPSEEK_API_KEY is required when web search is enabled"
             )
+        if self.research_runtime_enabled and not self.research_runtime_url:
+            raise ValueError("RESEARCH_RUNTIME_URL is required when research runtime is enabled")
+        if self.research_evidence_ttl_hours > 24:
+            raise ValueError("RESEARCH_EVIDENCE_TTL_HOURS must be <= 24")
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
         if self.card_action_receipt_ttl_hours > 720:

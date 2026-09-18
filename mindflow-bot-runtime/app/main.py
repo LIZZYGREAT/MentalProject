@@ -1072,6 +1072,9 @@ async def run() -> None:
         calendar=business.calendar,
         sender=sender,
         reminder_source=business.reminders,
+        brief_preferences=business.morning_brief_topics,
+        topic_preferences=business.morning_brief_topics,
+        research_service=business.public_research,
         timezone_name=settings.timezone_name,
     )
     reminder_scheduler = ReminderScheduler(

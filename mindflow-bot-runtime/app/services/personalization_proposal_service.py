@@ -13,12 +13,14 @@ class PersonalizationProposalService:
         memory: Any,
         preferences: Any,
         care_preferences: Any = None,
+        morning_brief_topics: Any = None,
         confirmed_effect_failpoint: Callable[[], None] | None = None,
     ) -> None:
         self.proposals = proposals
         self.memory = memory
         self.preferences = preferences
         self.care_preferences = care_preferences
+        self.morning_brief_topics = morning_brief_topics
         self.confirmed_effect_failpoint = confirmed_effect_failpoint
 
     def stage_memory_remember(
@@ -167,6 +169,33 @@ class PersonalizationProposalService:
             payload={"changes": validated},
         )
 
+    def stage_morning_brief_topic(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        operation: str,
+        topic_label: str,
+        query_hints: list[str] | tuple[str, ...] = (),
+        source_kinds: list[str] | tuple[str, ...] = ("web",),
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        if self.morning_brief_topics is None:
+            raise RuntimeError("morning brief topic preferences are unavailable")
+        payload = self.morning_brief_topics.validate_topic_payload(
+            topic_label=topic_label,
+            query_hints=query_hints,
+            source_kinds=source_kinds,
+            priority=priority,
+        )
+        if operation not in {"add", "update", "remove"}:
+            raise ValueError("unsupported morning brief topic operation")
+        return self.proposals.stage(
+            participant_id,
+            domain="morning_brief_topics",
+            operation=operation,
+            payload=payload,
+        )
+
     def resolve(
         self,
         participant_id: uuid.UUID,
@@ -250,6 +279,17 @@ class PersonalizationProposalService:
                 session, participant_id, dict(payload.get("changes") or {})
             )
             return {"operation": "care_update"}
+        if (
+            domain == "morning_brief_topics"
+            and self.morning_brief_topics is not None
+        ):
+            result = self.morning_brief_topics.apply_in_session(
+                session,
+                participant_id,
+                operation=operation,
+                payload=payload,
+            )
+            return {"operation": "morning_brief_topic", **result}
         raise ValueError("unsupported personalization proposal")
 
     def _execute_memory_in_session(

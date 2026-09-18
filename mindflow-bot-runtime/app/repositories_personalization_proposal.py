@@ -18,6 +18,7 @@ _OPERATIONS = {
     "interaction_preferences": {"update", "delete_rule"},
     "support_preferences": {"update"},
     "care_preferences": {"update"},
+    "morning_brief_topics": {"add", "remove", "update"},
 }
 
 
