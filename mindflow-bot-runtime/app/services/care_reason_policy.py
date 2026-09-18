@@ -35,8 +35,9 @@ class CareReasonSelector:
                 or float(block.get("weighted_load") or 0.0) >= 0.60
             )
         ]
+        selected_dense_block: dict[str, Any] | None = None
         if dense_blocks:
-            block = max(
+            selected_dense_block = max(
                 dense_blocks,
                 key=lambda item: (
                     float(item.get("weighted_load") or 0.0),
@@ -44,12 +45,27 @@ class CareReasonSelector:
                     int(item.get("course_count") or 0),
                 ),
             )
+            block_fact_ids = [
+                str(item) for item in list(selected_dense_block.get("fact_ids") or [])[:4]
+            ]
             candidates.append({
                 "code": "dense_high_load_course_block",
-                "fact_ids": [str(item) for item in list(block.get("fact_ids") or [])[:4]],
+                "fact_ids": block_fact_ids,
+                "block_course_count": int(selected_dense_block.get("course_count") or 0),
+                "block_high_load_course_count": int(
+                    selected_dense_block.get("high_load_course_count") or 0
+                ),
+                "block_weighted_load": round(
+                    float(selected_dense_block.get("weighted_load") or 0.0), 3
+                ),
+                "block_largest_internal_break_minutes": int(
+                    selected_dense_block.get("largest_internal_break_minutes") or 0
+                ),
                 "salience": min(
                     1.0,
-                    0.72 + 0.05 * int(block.get("high_load_course_count") or 0),
+                    0.72
+                    + 0.05
+                    * int(selected_dense_block.get("high_load_course_count") or 0),
                 ),
             })
         continuous = max(
@@ -63,12 +79,17 @@ class CareReasonSelector:
                 "salience": round(min(1.0, continuous), 3),
             })
         if (
-            int(schedule.get("consecutive_course_count") or 0) >= 2
-            and int(schedule.get("largest_break_minutes") or 999) <= 20
+            selected_dense_block is not None
+            and int(selected_dense_block.get("course_count") or 0) >= 2
+            and int(selected_dense_block.get("largest_internal_break_minutes") or 999)
+            <= 20
         ):
             candidates.append({
                 "code": "insufficient_recovery_window",
-                "fact_ids": [str(item["fact_id"]) for item in course_events[:3]],
+                "fact_ids": [
+                    str(item)
+                    for item in list(selected_dense_block.get("fact_ids") or [])[:4]
+                ],
                 "salience": 0.74,
             })
         carryover = dict(trajectory.get("previous_day_carryover") or {})

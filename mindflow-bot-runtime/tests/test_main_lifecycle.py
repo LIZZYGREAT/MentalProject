@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import main as app_main
-from app.integrations.feishu.client import FeishuSendError
+from app.integrations.feishu.client import FeishuClient, FeishuSendError
 
 
 def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
@@ -218,6 +218,106 @@ def test_card_action_handler_uses_callback_token_for_single_delayed_update():
     assert sender.delayed == [
         ("callback-token", "om-card", {"schema": "2.0"})
     ]
+
+
+def test_card_action_handler_falls_back_after_callback_300090_without_repeating_business_effect():
+    participant = SimpleNamespace(id="participant-1")
+    requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    sender = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["card_update_ok"] is True
+    assert card_actions.calls == 1
+    assert len(requests) == 1
+    assert patched == ["om-card"]
+
+
+def test_card_action_handler_reports_after_commit_when_callback_fallback_patch_fails():
+    participant = SimpleNamespace(id="participant-1")
+
+    class Messages:
+        def patch(self, _request):
+            return SimpleNamespace(
+                success=lambda: False,
+                code=230001,
+                msg="message patch rejected",
+            )
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, _request):
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    sender = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card_actions = CardActions()
+    incidents = Incidents()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+        incidents,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["ok"] is True
+    assert result["card_update_ok"] is False
+    assert card_actions.calls == 1
+    assert incidents.records[0]["bot_event_id"] is None
+    assert incidents.records[0]["details"]["callback_event_id"] == "provider-event"
 
 
 def test_card_action_handler_keeps_success_when_card_update_fails_after_commit():

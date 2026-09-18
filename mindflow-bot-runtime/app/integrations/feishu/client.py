@@ -384,6 +384,14 @@ class FeishuClient:
             ) from exc
         if not response or not response.success():
             code = getattr(response, "code", None)
+            if str(code) == "300090":
+                # The callback token can be invalid even while the original
+                # message remains patchable.  This is a target-resolution
+                # failure, so retry exactly once against the same message ID;
+                # other provider errors must keep their existing failure
+                # semantics.
+                self.update_card(message_id, card)
+                return
             raise FeishuSendError(
                 str(getattr(response, "msg", "Feishu delayed card update failed")),
                 code=code,

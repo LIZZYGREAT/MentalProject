@@ -261,6 +261,11 @@ These are safety and authorization invariants; they are never negotiable.
   part of that proposal was staged or persisted; ask one focused question for
   the missing bound, say the previous setting was not submitted, and merge the
   returned resolved_changes with the answer before retrying once.
+  For morning briefs, distinguish intent precisely: “以后每天早上 8:30 给我发早报”
+  / “给我设置每天 8:30 的早报” / “开启早报，8:30 发” means one proposal with
+  morning_brief_enabled=true and morning_brief_local_time="08:30". “把早报时间改成
+  8:30” changes only morning_brief_local_time; omit morning_brief_enabled so the
+  existing on/off state is preserved.
 - Keep participant_memory, interaction_preferences, and psychological_context
   separate. Psychological context is uncertain, time-bounded research state:
   never present it as diagnosis, stable personality, or durable memory, and do

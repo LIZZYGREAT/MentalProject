@@ -841,6 +841,66 @@ def test_feishu_client_prefers_callback_token_without_message_patch():
     assert delayed_requests[0].body == {"token": "callback-token", "card": card}
 
 
+def test_feishu_client_falls_back_to_message_patch_for_callback_target_error():
+    delayed_requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    client.update_card_from_callback(
+        "callback-token", "om-card", {"schema": "2.0"}
+    )
+
+    assert len(delayed_requests) == 1
+    assert patched == ["om-card"]
+
+
+def test_feishu_client_does_not_fallback_for_other_callback_errors():
+    delayed_requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=230001,
+                msg="card update rejected",
+            )
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    with pytest.raises(FeishuSendError) as caught:
+        client.update_card_from_callback(
+            "callback-token", "om-card", {"schema": "2.0"}
+        )
+
+    assert caught.value.code == 230001
+    assert len(delayed_requests) == 1
+    assert patched == []
+
+
 def test_feishu_client_uses_message_patch_without_callback_token():
     patched = []
 

@@ -9,12 +9,14 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 import threading
+from types import SimpleNamespace
 import uuid
 from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select, text
 
+from app import main as app_main
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.db import Base, Database, build_engine
 from app.models import (
@@ -25,6 +27,7 @@ from app.models import (
     ForecastCurrentnessEvent,
     ParameterLearningRun,
     ParticipantInteractionSemanticRule,
+    RuntimeIncident,
     WarningSchedule,
 )
 from app.repositories import (
@@ -34,8 +37,10 @@ from app.repositories import (
     ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
+    RuntimeIncidentRepository,
     WarningScheduleRepository,
 )
+from app.integrations.feishu.client import FeishuSendError
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -116,6 +121,69 @@ def _runtime_repositories(database: Database):
         timezone_name="Asia/Shanghai",
     )
     return warnings, preferences
+
+
+def test_postgres_card_action_update_failure_incident_does_not_use_callback_id_as_bot_event_fk(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-CARD-ACTION-INCIDENT-FK"
+    )
+
+    class Identity:
+        def resolve(self, _app_id, _open_id):
+            return owner
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    class Sender:
+        def update_card(self, _message_id, _card):
+            raise FeishuSendError(
+                "message patch rejected", code=230001, operation="update_card"
+            )
+
+        def send_text(self, _chat_id, _text):
+            return "notice"
+
+    event = SimpleNamespace(
+        event_id="callback-event-not-a-bot-event-id",
+        message_id="om-card",
+        app_id="app",
+        open_id="ou-user",
+        chat_id="oc-chat",
+        action_tag="button",
+        action_value={"mindflow_action": "submit_checkin"},
+        form_value={},
+        callback_token=None,
+    )
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        Identity(),
+        card_actions,
+        Sender(),
+        RuntimeIncidentRepository(postgres_database),
+    )
+
+    result = handler(event)
+
+    assert result["ok"] is True
+    assert result["card_update_ok"] is False
+    assert card_actions.calls == 1
+    with postgres_database.session() as session:
+        incident = session.scalar(
+            select(RuntimeIncident).where(
+                RuntimeIncident.event_name == "card_action_update_failed_after_commit"
+            )
+        )
+        assert incident is not None
+        assert incident.bot_event_id is None
+        assert incident.details_json["callback_event_id"] == event.event_id
 
 
 def _personalization_stack(database: Database, *, failpoint=None):

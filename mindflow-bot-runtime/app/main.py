@@ -277,13 +277,14 @@ def _build_card_action_handler(
                     event_name=event_name,
                     summary=summary,
                     participant_id=participant_id,
-                    bot_event_id=event.event_id,
+                    bot_event_id=None,
                     error_code=error_code,
                     error_class=error_class,
                     details={
                         "message_id": event.message_id,
                         "action_tag": event.action_tag,
                         "action_name": safe_action_name(event),
+                        "callback_event_id": event.event_id,
                         "error_id": error_id,
                         "provider_error_code": provider_error_code,
                     },
@@ -524,10 +525,13 @@ def _build_card_action_handler(
                             event_name="backend_state_event_append_failed",
                             summary="Committed CardAction state could not be added to the Agent continuity ledger.",
                             participant_id=participant.id,
-                            bot_event_id=event.event_id,
+                            bot_event_id=None,
                             error_code="backend_state_event_append_failed",
                             error_class=type(exc).__name__,
-                            details={"action_name": safe_action_name(event)},
+                            details={
+                                "callback_event_id": event.event_id,
+                                "action_name": safe_action_name(event),
+                            },
                         )
                     except Exception:
                         logging.getLogger(__name__).exception(

@@ -86,7 +86,7 @@ def build_card_action_delivery(executor: Any, sender: Any, incidents: Any = None
                 event_name=event_name,
                 summary="CardAction succeeded but source card update failed",
                 participant_id=None,
-                bot_event_id=event.event_id,
+                bot_event_id=None,
                 error_code=(
                     "navigation_update_failed"
                     if navigation_only
@@ -97,6 +97,7 @@ def build_card_action_delivery(executor: Any, sender: Any, incidents: Any = None
                     "message_id": event.message_id,
                     "action_tag": event.action_tag,
                     "action_name": action_name(event),
+                    "callback_event_id": event.event_id,
                     "error_id": error_id,
                     "provider_error_code": provider_error_code,
                 },

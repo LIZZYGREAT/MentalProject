@@ -1,6 +1,9 @@
 from datetime import date
 
 from app.services.care_evidence import CareEvidenceBuilder
+from app.services.care_context import CareContextBuilder
+from app.services.care_intervention_policy import CareInterventionPolicy
+from app.services.care_templates import CareTemplateLibrary
 
 
 TARGET = date(2030, 1, 15)
@@ -23,11 +26,19 @@ def _event(event_id, name, start, end, prior, *, event_type="course", **extra):
     }
 
 
-def _packet(events, *, output=None, profile=None, preferences=None, longitudinal_state=None):
+def _packet(
+    events,
+    *,
+    output=None,
+    profile=None,
+    preferences=None,
+    longitudinal_state=None,
+    risk_time="10:40",
+):
     return CareEvidenceBuilder("Asia/Shanghai").build(
         source="forecast_warning",
         local_date=TARGET,
-        alert={"time": "10:40", "S": 8.1, "V": 4.6, "F": 0.63},
+        alert={"time": risk_time, "S": 8.1, "V": 4.6, "F": 0.63},
         forecast_output=output,
         calendar_events=events,
         longitudinal_state=longitudinal_state,
@@ -48,6 +59,83 @@ def test_dense_high_load_course_block_uses_continuity_and_weighted_load():
     assert packet.schedule["largest_break_minutes"] == 20
     assert packet.schedule["weighted_load"] > 0.7
     assert packet.reason_candidates[0]["code"] == "dense_high_load_course_block"
+    dense = packet.reason_candidates[0]
+    assert dense["block_course_count"] == 4
+    assert dense["block_high_load_course_count"] == 4
+    assert dense["block_weighted_load"] > 0.7
+    assert dense["block_largest_internal_break_minutes"] == 20
+
+
+def test_dense_block_recovery_window_uses_block_internal_gap():
+    packet = _packet([
+        _event("high-1", "高负荷课程 1", "08:00", "08:45", 0.82),
+        _event("high-2", "高负荷课程 2", "09:05", "09:50", 0.82),
+        _event("high-3", "高负荷课程 3", "10:10", "10:55", 0.80),
+    ])
+
+    dense = next(
+        item
+        for item in packet.reason_candidates
+        if item["code"] == "dense_high_load_course_block"
+    )
+
+    assert dense["block_course_count"] == 3
+    assert dense["block_largest_internal_break_minutes"] == 20
+    assert "insufficient_recovery_window" in {
+        item["code"] for item in packet.reason_candidates
+    }
+
+
+def test_unrelated_later_course_does_not_hide_insufficient_recovery_window():
+    packet = _packet([
+        _event("high-1", "高负荷课程 1", "08:00", "08:45", 0.82),
+        _event("high-2", "高负荷课程 2", "09:05", "09:50", 0.82),
+        _event("high-3", "高负荷课程 3", "10:10", "10:55", 0.80),
+        _event("later", "普通课程", "11:55", "12:20", 0.20),
+    ])
+
+    dense = next(
+        item
+        for item in packet.reason_candidates
+        if item["code"] == "dense_high_load_course_block"
+    )
+
+    assert packet.schedule["largest_break_minutes"] == 60
+    assert dense["block_largest_internal_break_minutes"] == 20
+    assert "insufficient_recovery_window" in {
+        item["code"] for item in packet.reason_candidates
+    }
+
+
+def test_dense_block_template_uses_selected_block_count_and_gap():
+    events = [
+        _event("high-1", "高负荷课程 1", "08:00", "08:45", 0.82),
+        _event("high-2", "高负荷课程 2", "09:05", "09:50", 0.82),
+        _event("high-3", "高负荷课程 3", "10:10", "10:55", 0.80),
+        _event("later-1", "普通课程 1", "11:55", "12:20", 0.20),
+        _event("later-2", "普通课程 2", "12:30", "12:55", 0.20),
+        _event("later-3", "普通课程 3", "13:05", "13:30", 0.20),
+        _event("later-4", "普通课程 4", "13:40", "14:05", 0.20),
+    ]
+    packet = _packet(events, risk_time="12:00")
+    context = CareContextBuilder("Asia/Shanghai").build(
+        source="forecast_warning",
+        local_date=TARGET,
+        alert={"time": "12:00", "S": 8.1, "V": 4.6, "F": 0.63},
+        calendar_events=events,
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+    )
+    plan = CareInterventionPolicy().plan(context, evidence=packet)
+
+    rendered = CareTemplateLibrary().render(context, plan, evidence=packet).message
+
+    assert "连续 3 节" in rendered
+    assert "课程间最长间隔约 20 分钟" in rendered
+    assert "连续 4 节" not in rendered
+    assert "最长间隔约 60 分钟" not in rendered
 
 
 def test_many_simple_tasks_do_not_become_a_high_load_reason():

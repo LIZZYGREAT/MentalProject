@@ -133,19 +133,18 @@ class CareTemplateLibrary:
     ) -> str:
         reasons = [str(item.get("code") or "") for item in evidence.reason_candidates]
         risk = self._clock(evidence.risk.get("risk_time") or context.risk_time)
-        course_names = [
-            item
-            for item in evidence.event_facts
-            if item.get("event_type") == "course"
-            and item.get("workload_level") == "high"
-        ][:3]
-        schedule = evidence.schedule
         pieces: list[str] = []
-        if "dense_high_load_course_block" in reasons and course_names:
+        if "dense_high_load_course_block" in reasons:
             block_reason = next(
-                item for item in evidence.reason_candidates
-                if item.get("code") == "dense_high_load_course_block"
+                (
+                    item
+                    for item in evidence.reason_candidates
+                    if item.get("code") == "dense_high_load_course_block"
+                ),
+                None,
             )
+            if block_reason is None:
+                return ""
             fact_ids = set(block_reason.get("fact_ids") or [])
             block_courses = [
                 item for item in evidence.event_facts
@@ -159,8 +158,8 @@ class CareTemplateLibrary:
             joined = "、".join(described) or "这些课程综合任务负荷偏高"
             pieces.append(
                 f"{risk} 前后模型预计压力可能上升，{joined}，"
-                f"连续 {int(schedule.get('consecutive_course_count') or 0)} 节、课程间最长间隔约 "
-                f"{int(schedule.get('largest_break_minutes') or 0)} 分钟"
+                f"连续 {int(block_reason.get('block_course_count') or 0)} 节、课程间最长间隔约 "
+                f"{int(block_reason.get('block_largest_internal_break_minutes') or 0)} 分钟"
             )
         elif "previous_day_carryover" in reasons:
             pieces.append(

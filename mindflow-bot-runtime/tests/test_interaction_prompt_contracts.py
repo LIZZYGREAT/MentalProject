@@ -225,6 +225,19 @@ def test_reminder_complaint_is_not_treated_as_a_direct_preference_request():
     assert "only after the participant confirms" in explicit
 
 
+def test_morning_brief_intent_distinguishes_enable_from_time_only_change():
+    recurring = _skill_example("以后每天早上 8:30 给我发早报")
+    time_only = _skill_example("把早报时间改成 8:30")
+
+    assert "morning_brief_enabled=true" in recurring
+    assert 'morning_brief_local_time="08:30"' in recurring
+    assert 'pass only' in time_only
+    assert 'morning_brief_local_time="08:30"' in time_only
+    assert "preserve the existing enabled state" in time_only
+    assert "morning_brief_enabled=true" in SYSTEM_RULES
+    assert "omit morning_brief_enabled" in SYSTEM_RULES
+
+
 def test_course_series_scope_and_clock_semantics_match_system_and_skill():
     skill_path = (
         Path(__file__).resolve().parents[2]
