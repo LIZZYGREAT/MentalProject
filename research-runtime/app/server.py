@@ -22,6 +22,7 @@ from .http_client import PublicHttpClient
 from .policy import ExecPolicy
 from .search import PublicSearchClient
 from .paper import ArxivPublicClient
+from .api import HackerNewsPublicApi
 from .sessions import ResearchBudgetExceeded, ResearchJobSession
 
 
@@ -50,6 +51,7 @@ class ResearchRuntime:
         self.github = GitHubPublicClient()
         self.search_client = PublicSearchClient(self.http)
         self.paper = ArxivPublicClient(self.http)
+        self.public_api = HackerNewsPublicApi(self.http)
         self.sessions: dict[str, ResearchJobSession] = {}
 
     def _job(self, raw: dict[str, Any]) -> tuple[ResearchJobSpec, ResearchJobSession]:
@@ -74,7 +76,7 @@ class ResearchRuntime:
             elif source_kind == "paper":
                 results.extend(self.paper.search(query, max_results=min(10, job.max_pages)))
             elif source_kind == "api":
-                raise ValueError("api_source_requires_reviewed_adapter")
+                results.extend(self.public_api.search(query, max_results=min(10, job.max_pages)))
         return {"ok": True, "job_id": session.job_id, "topic": job.topic, "results": results[: job.max_pages], "candidate_only": True}
 
     def open_url(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +87,7 @@ class ResearchRuntime:
         if document.extraction_mode == "javascript_shell":
             return {"ok": False, "job_id": session.job_id, "reason_code": "javascript_shell", "candidate_url": url, "verified": False}
         item = ResearchEvidenceItem.build(
-            source_kind=job.source_kinds[0] if job.source_kinds[0] in {"web", "paper"} else "web",
+            source_kind=job.source_kinds[0] if job.source_kinds[0] in {"web", "paper", "api"} else "web",
             title=document.title or url,
             canonical_url=document.canonical_url or response.url,
             content=document.text,

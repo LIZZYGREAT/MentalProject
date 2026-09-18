@@ -34,6 +34,18 @@ def test_search_returns_candidates_and_routes_github_source(tmp_path):
     assert calls == ["agent"]
 
 
+def test_search_routes_api_source_to_fixed_reviewed_adapter(tmp_path):
+    runtime = ResearchRuntime(workspace=tmp_path)
+    calls = []
+    runtime.public_api.search = lambda query, **kwargs: calls.append(query) or [{
+        "candidate_id": "api-1", "source_kind": "api", "title": "Story",
+        "url": "https://hn.algolia.com/api/v1/items/1",
+    }]
+    result = runtime.search({"topic": "agent", "source_kinds": ["api"], "max_searches": 1})
+    assert result["results"][0]["source_kind"] == "api"
+    assert calls == ["agent"]
+
+
 def test_job_budget_is_cumulative_across_runtime_calls(tmp_path):
     runtime = ResearchRuntime(workspace=tmp_path)
     runtime.search_client.search = lambda *_args, **_kwargs: []
