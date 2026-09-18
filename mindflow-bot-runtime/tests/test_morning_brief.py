@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from app.repositories import ParticipantRepository
 from app.repositories_morning_brief import MorningBriefScheduleRepository
+from app.contracts.research import ResearchEvidenceItem
 from app.services.morning_brief_scheduler import (
     FORBIDDEN_BRIEF_TERMS,
     MorningBriefScheduler,
@@ -34,6 +35,29 @@ class _Sender:
     def send_text(self, chat_id, text, *, message_uuid=None):
         self.messages.append((chat_id, text, message_uuid))
         return "provider-message"
+
+
+class _BriefResearchPreferences:
+    def get_preferences(self, _participant_id):
+        return {"include_calendar": True, "include_reminders": True, "max_research_items": 10, "lookback_hours": 24, "language": "zh-CN"}
+
+
+class _BriefTopics:
+    def list_topics(self, _participant_id):
+        return [{"topic_label": "AI", "query_hints": [], "source_kinds": ["web"], "priority": 0, "enabled": True}]
+
+
+class _PreparedResearch:
+    def __init__(self):
+        self.calls = 0
+
+    async def search(self, *_args, **_kwargs):
+        self.calls += 1
+        item = ResearchEvidenceItem.build(
+            source_kind="web", title="AI update", canonical_url="https://example.com/ai",
+            content="A real public update.", extraction_mode="http", freshness_hours=24,
+        )
+        return {"ok": True, "results": [item.as_dict()]}
 
 
 def test_morning_brief_template_never_contains_prediction_fields():
@@ -93,3 +117,25 @@ def test_default_off_creates_no_schedule():
     result = asyncio.run(scheduler.run_once(datetime(2026, 9, 12, 0, 30, tzinfo=timezone.utc)))
     assert result == {"ensured": 0, "sent": 0, "failed": 0, "suppressed": 0}
     assert sender.messages == []
+
+
+def test_morning_brief_prepares_research_before_send_and_reuses_it():
+    database = memory_database()
+    participant(database, "MORNING-PREPARE")
+    sender = _Sender()
+    research = _PreparedResearch()
+    scheduler = MorningBriefScheduler(
+        schedules=MorningBriefScheduleRepository(database),
+        participants=ParticipantRepository(database), bindings=_Bindings(), care_preferences=_Preferences(),
+        proactive_policy=ProactiveNotificationPolicy(database, timezone_name="Asia/Shanghai", default_system_budget=3),
+        calendar=_Calendar(), sender=sender,
+        brief_preferences=_BriefResearchPreferences(), topic_preferences=_BriefTopics(),
+        research_service=research,
+    )
+    before_send = datetime(2026, 9, 11, 23, 50, tzinfo=timezone.utc)
+    assert asyncio.run(scheduler.run_once(before_send))["sent"] == 0
+    assert research.calls == 1
+    at_send = datetime(2026, 9, 12, 0, 0, tzinfo=timezone.utc)
+    assert asyncio.run(scheduler.run_once(at_send))["sent"] == 1
+    assert research.calls == 1
+    assert "AI update" in sender.messages[0][1]
