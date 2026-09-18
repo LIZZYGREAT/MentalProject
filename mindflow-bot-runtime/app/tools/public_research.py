@@ -55,7 +55,7 @@ class PublicResearchTools:
                 "morning_brief_topic_propose",
                 "Propose adding, updating or removing a long-term public-interest morning-brief topic. Persistence requires participant confirmation.",
                 {"type": "object", "properties": {"operation": {"type": "string", "enum": ["add", "update", "remove"]}, "topic_label": {"type": "string", "minLength": 1, "maxLength": 160}, "query_hints": {"type": "array", "items": {"type": "string", "maxLength": 240}, "maxItems": 8}, "source_kinds": {"type": "array", "items": {"type": "string", "enum": ["web", "github", "paper", "api"]}, "minItems": 1, "maxItems": 6}, "priority": {"type": "integer", "minimum": -10, "maximum": 10}}, "required": ["operation", "topic_label"], "additionalProperties": False},
-                self.propose_topic, effect="draft", authorization_requirement="none",
+                self.propose_topic, effect="proposal_stage", authorization_requirement="none",
             )
 
     async def search(self, ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -84,4 +84,3 @@ class PublicResearchTools:
             priority=args.get("priority", 0),
         )
         return {"ok": True, "persisted": False, "confirmation_required": True, "personalization_proposal": "pending_confirmation", "proposal": proposal}
-

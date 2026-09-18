@@ -314,11 +314,16 @@ class ToolRegistry:
         if name in self._tools:
             raise ValueError(f"duplicate tool: {name}")
         forbidden = _schema_fields(parameters) & FORBIDDEN_FIELDS
-        if name in {"web_read_url", "video_inspect_url"}:
+        if name in {
+            "web_read_url", "video_inspect_url", "research_open_url",
+            "research_browser_open",
+        }:
             # These reviewed read-only tools necessarily accept a URL.  Their
             # handlers apply the HTTPS/credential/secret-query/SSRF gate.
             # The handler applies the HTTPS/credential/secret-query/SSRF gate;
-            # URL remains forbidden for every other tool schema.
+            # URL remains forbidden for every other tool schema. Research
+            # handlers use the same public-only SSRF boundary in the isolated
+            # runtime and never accept cookies or credentials.
             forbidden.discard("url")
         if forbidden:
             raise ValueError(f"tool schema contains forbidden identity fields: {sorted(forbidden)}")
