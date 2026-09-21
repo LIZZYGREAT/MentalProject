@@ -266,7 +266,7 @@ $$
 
 $$
 \boxed{
-P_e^{struct}
+\mathbf P_e^{src}(t)
 }
 $$
 
@@ -276,15 +276,15 @@ R_e^{pot}\in[0,1]
 }
 $$
 
-Pressure 不直接压成单一标量，而保留 mechanism-specific structure：
+Pressure 不直接压成单一标量，而保留 mechanism-specific source vector：
 
 $$
 \boxed{
-P_e^{struct}
+\mathbf P_e^{src}(t)
 =
 [
-U_{ddl,e},
-U_{context,e},
+U_{ddl,e}(t),
+U_{context,e}(t),
 D_{s,e}
 ]
 }
@@ -292,13 +292,15 @@ $$
 
 其中：
 
-| 变量 | 名称 | 含义 |
-|---|---|---|
-| $U_{ddl,e}$ | Deadline / Time-Scarcity Structure | 任务在 deadline 约束下的时间稀缺程度 |
-| $U_{context,e}$ | Structural Uncertainty | 事件本身客观存在的不确定结构 |
-| $D_{s,e}$ | Social-Evaluative Structure | 被评价、展示、面试、答辩等社会评价结构 |
+| 变量 | 名称 | 含义 | 时间属性 |
+|---|---|---|---|
+| $U_{ddl,e}(t)$ | Deadline / Time-Scarcity Structure | 任务在 deadline 约束下的时间稀缺程度 | dynamic source |
+| $U_{context,e}(t)$ | Structural Uncertainty | 事件本身客观存在的不确定结构 | 允许随新信息变化 |
+| $D_{s,e}$ | Social-Evaluative Structure | 被评价、展示、面试、答辩等社会评价结构 | 相对稳定的 event structure |
 
-Personal Importance 不属于 $P^{struct}$。
+`src` 表示 Pressure Sources。$\mathbf P_e^{src}(t)$ 是 mechanism source vector，只描述压力来源结构；它不是后续 noisy-OR 得到的标量 Pressure，因此不与聚合量共用符号。
+
+Personal Importance 不属于 $\mathbf P^{src}$。
 
 ---
 
@@ -351,39 +353,45 @@ duration 主要通过事件 active interval 和后续 temporal kernel 表达。
 
 ---
 
-## 七、Deadline Structure $U_{ddl}$
+## 七、Deadline Structure $U_{ddl}(t)$
 
 Deadline Pressure 的事实基础来自：
 
 $$
-W_e^{rem}
+W_e^{rem}(t)
 $$
 
 和：
 
 $$
-T_{e}^{capacity}
+T_{e}^{capacity}(t)
 $$
 
 其中：
 
-- $W_e^{rem}$：当前任务 remaining effective effort；
-- $T_e^{capacity}$：deadline 前真实可用于该任务的 effective available work capacity。
+- $W_e^{rem}(t)$：当前任务 remaining effective effort；
+- $T_e^{capacity}(t)$：deadline 前真实可用于该任务的 effective available work capacity。
 
 定义概念形式：
 
 $$
 \boxed{
-U_{ddl,e}
+U_{ddl,e}(t)
 =
 f\left(
-\frac{W_e^{rem}}
-{T_e^{capacity}}
+\frac{W_e^{rem}(t)}
+{T_e^{capacity}(t)}
 \right)
 }
 $$
 
-其中 $f(\cdot)$ 为 monotonic bounded mapping。
+必须显式保留 $t$。原因是：
+
+- $W^{rem}$ 会随 progress 更新；
+- deadline 前剩余有效 capacity 会随时间缩短；
+- 因此 deadline scarcity 本身已经是 dynamic source，而不是静态 event scalar。
+
+其中 $f(\cdot)$ 为 monotonic bounded mapping，其具体数值属于 representation layer。
 
 必须保持：
 
@@ -403,17 +411,17 @@ $$
 - 其他任务竞争；
 - 合理的有效工作上限。
 
-$U_{ddl}$ 只描述 time scarcity，不表达 Personal Importance。
+$U_{ddl}(t)$ 只描述 time scarcity，不表达 Personal Importance。
 
 ---
 
-## 八、Structural Uncertainty $U_{context}$
+## 八、Structural Uncertainty $U_{context}(t)$
 
 定义：
 
 $$
 \boxed{
-U_{context,e}\in[0,1]
+U_{context,e}(t)\in[0,1]
 }
 $$
 
@@ -425,6 +433,16 @@ $$
 - meeting outcome 未知；
 - task dependency 未解决。
 
+它允许随着新信息到达而改变，例如：
+
+```text
+requirement clarified
+dependency resolved
+result mechanism known
+```
+
+因此它不是必须恒定到事件结束的静态 scalar。
+
 必须保持：
 
 $$
@@ -435,14 +453,14 @@ U^{perc}
 }
 $$
 
-$U_{context}$ 属于 Event Fact / Structure。
+$U_{context}(t)$ 属于 Event Fact / Structure。
 
 $U^{perc}$ 属于 Personal Appraisal。
 
 不能因为：
 
 $$
-U_{context}\uparrow
+U_{context}(t)\uparrow
 $$
 
 就 deterministic 地生成：
@@ -491,6 +509,8 @@ I_{i,e}
 $$
 
 由 Appraisal 模块处理。
+
+$D_{s,e}$ 是相对稳定的 event structure。它何时真正形成 pressure，由后续 mechanism-specific temporal activation 处理，不在事件层提前压成 pressure scalar。
 
 ---
 
@@ -716,7 +736,7 @@ Z_{e}^{exec}\in[0,1]
 }
 $$
 
-表示 Demand execution exposure。
+表示 Demand execution / engagement intensity exposure，而不是已参加时长比例。
 
 $$
 \boxed{
@@ -748,7 +768,7 @@ Z_{e}^{occ}\in[0,1]
 }
 $$
 
-表示 recovery activity 实际 occurrence 程度。
+表示 recovery activity 实际 occurrence 程度，或无法获得具体 duration 时的 occurrence approximation。
 
 必须避免：
 
@@ -767,6 +787,35 @@ Z^{occ}
 $$
 
 因为不同机制可能在同一 lifecycle state 下表现不同。
+
+### Single Exposure Encoding Rule
+
+同一 exposure 的缺失或 partial 信息，只能通过“duration”或“intensity gate”中的一个主要路径编码：
+
+```text
+duration 路径：actual interval
+intensity gate 路径：Z gate 的 fractional value
+```
+
+即：
+
+$$
+\boxed{
+SingleExposureEncodingRule
+}
+$$
+
+不能对同一件事同时使用两条路径。$Z_e^{exec}$ 的语义因此是：
+
+$$
+\boxed{
+Z_e^{exec}(t)
+=
+Execution/Engagement\ Intensity
+}
+$$
+
+它不表示“已参加时长比例”。具体应用见本文第十五节、第十七节与第二十六节。
 
 ---
 
@@ -812,13 +861,16 @@ $$
 0<Z^{exec}<1
 $$
 
-具体比例可由：
+PARTIAL 必须遵守 `SingleExposureEncodingRule`，只能选择一条主要编码路径：
 
-- attendance duration；
+- 若已知具体实际参与区间（例如实际只上了 `10:00–10:25`），则 active interval 只取该区间，duration 由 interval 表达，区间内正常参与时 $Z^{exec}=1$；
+- 若只知道比例而不知道具体时间（例如“大概上了一半”），则用 $Z^{exec}=0.5$ 覆盖 scheduled interval 作为近似，此时不再同时缩短 interval。
+
+不允许对同一 partial 事实同时缩短 interval 又取 $Z^{exec}<1$。证据可以来自：
+
 - explicit user report；
 - high-confidence behavioral evidence；
-
-确定。
+- 由 attendance duration 推导出的单一编码。
 
 ### 4. SKIPPED
 
@@ -1008,6 +1060,10 @@ $$
 $$
 0<Z^{occ}<1
 $$
+
+$Z^{occ}$ 只表示是否发生，或无法获得具体 duration 时的 occurrence approximation。
+
+若已知 recovery activity 的实际发生时长，则 duration 由 actual interval 表示，此时 $Z^{occ}$ 不再用于表达同一比例，避免重复计数。
 
 ### SKIPPED / CANCELLED
 
@@ -1361,6 +1417,29 @@ $$
 
 而不是将总 duration 再整体乘入 potential。
 
+### Single Exposure Encoding Rule 在 duration 上的应用
+
+$$
+\boxed{
+Either\ Duration\ or\ Intensity\ Gate
+}
+$$
+
+- 若已知 actual interval：duration 由 actual interval 表达，对应 gate 取 1；
+- 若只知道比例而不知道具体时间：gate 取 fractional value，覆盖 scheduled interval，此时不再缩短 interval。
+
+因此禁止同时出现：
+
+```text
+actual duration = 50%
+Z_exec = 0.5
+```
+
+```text
+actual duration = 50%
+Z_occ = 0.5
+```
+
 例如三小时课程相对于一小时课程，首先通过更长 active interval 提供更多 Demand exposure，而不是简单：
 
 $$
@@ -1381,9 +1460,10 @@ Recovery 也遵循相同原则。
 | $t_e^{start}$ | scheduled/known event start |
 | $t_e^{end}$ | scheduled/known event end |
 | $D_e^{pot}$ | event-level Demand intensity potential |
-| $U_{ddl,e}$ | deadline/time-scarcity structure |
-| $U_{context,e}$ | structural uncertainty |
-| $D_{s,e}$ | social-evaluative structure |
+| $\mathbf P_e^{src}(t)$ | mechanism-specific pressure source vector |
+| $U_{ddl,e}(t)$ | deadline/time-scarcity structure（dynamic source） |
+| $U_{context,e}(t)$ | structural uncertainty（可随新信息变化） |
+| $D_{s,e}$ | social-evaluative structure（相对稳定） |
 | $R_e^{pot}$ | recovery opportunity potential |
 | $M_e^{context}$ | recovery context compatibility |
 
@@ -1391,11 +1471,11 @@ Recovery 也遵循相同原则。
 
 | 变量 | 含义 |
 |---|---|
-| $Z_e^{exec}$ | actual execution exposure |
+| $Z_e^{exec}(t)$ | execution / engagement intensity gate |
 | $Z_e^{ddl}$ | deadline mechanism active gate |
 | $Z_e^{unc}$ | uncertainty mechanism active gate |
 | $Z_e^{soc}$ | social-evaluative mechanism exposure |
-| $Z_e^{occ}$ | recovery activity occurrence |
+| $Z_e^{occ}$ | recovery activity occurrence / approximation |
 
 ### Task / Obligation
 
@@ -1493,9 +1573,11 @@ $$
 
 $$
 \boxed{
+\mathbf P_e^{src}(t)
+=
 [
-U_{ddl,e},
-U_{context,e},
+U_{ddl,e}(t),
+U_{context,e}(t),
 D_{s,e}
 ]
 }
@@ -1533,19 +1615,27 @@ $$
 $$
 D_{i,e}^{eff},
 \quad
-P_{i,e}^{eff},
+p_{ddl,i,e}^{app}(t),
+\quad
+p_{unc,i,e}^{app}(t),
+\quad
+p_{soc,i,e}^{src},
 \quad
 R_{i,e}^{eff}
 $$
+
+Pressure 在本层只提供 source structure。其 appraisal transformation 与 mechanism-specific temporal activation 由后续模块分别定义，本层不提前聚合出 event-level Pressure scalar。
 
 ---
 
 ## 三十、当前事件层冻结边界
 
+这里的冻结指机制结构冻结（Structure-Frozen）：变量语义、信息路径、禁止的重复编码路径已经确定。其中 $f(\cdot)$、course category prior 数值等 representation mapping 属于 Representation-Pending-Freeze，需经 Scenario Annotation / Synthetic / Pilot 后确定。
+
 1. Event Potential 与 Realized Exposure 分离。
 2. Event Fact、Event/Class Prior、Personal Appraisal 分离。
 3. Demand Potential 表示 intensity，不重复编码 duration。
-4. Pressure 保留 deadline、structural uncertainty、social evaluation 三类 mechanism structure。
+4. Pressure 保留 deadline、structural uncertainty、social evaluation 三类 mechanism structure，并保留各自的时间属性。
 5. Personal Importance 不进入 Event Pressure Structure。
 6. Recovery Opportunity 不等于 Actual Recovery。
 7. Lifecycle 采用 mechanism-specific routing，不使用一个统一 gate。
@@ -1562,3 +1652,7 @@ $$
 18. Lifecycle uncertainty 允许保持概率分布。
 19. 所有 Event revision 必须遵守 `known_at`。
 20. Course Event 与关联 Task/Obligation 保持独立对象。
+21. Pressure source vector 记为 $\mathbf P_e^{src}(t)$，不与聚合后的 Pressure scalar 共用符号。
+22. $U_{ddl}(t)$ 与 $U_{context}(t)$ 是随时间变化的 source；$D_{s,e}$ 是相对稳定的 event structure，不在事件层压成 pressure scalar。
+23. Partial exposure 必须遵守 `SingleExposureEncodingRule`；$Z_e^{exec}$ 表示 execution / engagement intensity，不表示已参加时长比例。
+24. 本层不输出 event-level Pressure scalar；Pressure 的聚合在时间核模块按时刻 $t$ 完成。

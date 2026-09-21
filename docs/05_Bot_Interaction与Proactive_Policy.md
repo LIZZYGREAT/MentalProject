@@ -295,13 +295,15 @@ v1 使用：
 
 $$
 \boxed{
-R_i^{pro}(t)
+Recp_i^{pro}(t)
 \in
 \{
 Low,\ Unknown,\ Likely
 \}
 }
 $$
+
+正文中统一写作 `ProactiveReceptivity`，避免与 Recovery 的 $R^{eff}$、Bot Relevance 的 $Rel_r$ 以及 EMA observation noise 的 $R_{EMA}$ 混淆。
 
 例如：
 
@@ -336,14 +338,14 @@ $$
 定义：
 
 $$
-G_i(t)
+Z_i^{ref}(t)
 =
 \mathbf1(
 \text{refractory passed}
 )
 $$
 
-表示 Bot-Initiated proactive interaction 是否通过 refractory 约束。
+表示 Bot-Initiated proactive interaction 是否通过 refractory 约束。Refractory eligibility 使用 $Z_i^{ref}(t)$；Guidance 继续使用 $G_r$，两者不再共用符号 $G$。
 
 定义：
 
@@ -378,7 +380,7 @@ $$
 E_i^{pro}(t)
 =
 H_i(t)
-G_i(t)
+Z_i^{ref}(t)
 M_i(t)
 }
 $$
@@ -408,7 +410,7 @@ O_i^{care}(t),
 \quad
 O_i^{info}(t),
 \quad
-R_i^{pro}(t)
+Recp_i^{pro}(t)
 $$
 
 选择：
@@ -464,7 +466,7 @@ O^{info},
 \quad
 H,
 \quad
-R^{pro}
+Recp^{pro}
 $$
 
 而不是机械发送过时消息。
@@ -588,7 +590,7 @@ G_{session}=\Delta^*
 }
 $$
 
-Formal Study 前冻结。
+$G_{session}$ 的机制结构已经确定（structure-frozen）：它只由 temporal continuity 决定，属于 representation layer。其具体数值属于 Representation-Pending-Freeze，需由 Pilot inter-message gap 经验分布确定，并在 Formal Study 前冻结。
 
 不得通过 stress forecast MAE 调整 $G_{session}$。
 
@@ -766,7 +768,7 @@ Support Potential 保留三个低维字段：
 
 $$
 \boxed{
-V_r,\quad G_r,\quad R_r
+V_r,\quad G_r,\quad Rel_r
 }
 $$
 
@@ -801,7 +803,7 @@ $$
 ### Relevance
 
 $$
-R_r
+Rel_r
 =
 \text{Contextual Relevance}
 $$
@@ -818,7 +820,7 @@ $$
 
 $$
 \boxed{
-V_r,G_r,R_r\in\{0,0.5,1\}
+V_r,G_r,Rel_r\in\{0,0.5,1\}
 }
 $$
 
@@ -835,7 +837,7 @@ $$
 S_r^{pot}
 =
 J_r^{sup}
-R_r
+Rel_r
 \left[
 1-(1-V_r)(1-G_r)
 \right]
@@ -1000,9 +1002,9 @@ v1 所有 Support Role 与 Interaction Origin 共用统一 kernel：
 
 $$
 \boxed{
-K_B(\Delta t)
+K_{BS}(\Delta t)
 =
-e^{-\Delta t/\tau_B}
+e^{-\Delta t/\tau_{BS}}
 \mathbf1(\Delta t\ge0)
 }
 $$
@@ -1010,16 +1012,28 @@ $$
 其中：
 
 $$
-\tau_B>0
+\tau_{BS}>0
 $$
 
 为 Bot Support effect decay time constant。
+
+必须保持：
+
+$$
+\boxed{
+\tau_B
+=
+\frac{1}{\kappa_B}
+}
+$$
+
+只表示 Background stress time constant（见第 6 份）。Bot Support 的时间常数统一记为 $\tau_{BS}$，不得再写作 $\tau_B^{Bot}$。
 
 也可使用 half-life：
 
 $$
 \boxed{
-h_B=\tau_B\ln2
+h_{BS}=\tau_{BS}\ln2
 }
 $$
 
@@ -1029,11 +1043,11 @@ v1 保持：
 
 $$
 \boxed{
-h_B^{USER}
+h_{BS}^{USER}
 =
-h_B^{BOT}
+h_{BS}^{BOT}
 =
-h_B
+h_{BS}
 }
 $$
 
@@ -1041,15 +1055,17 @@ $$
 
 $$
 \boxed{
-h_B^{validation}
+h_{BS}^{validation}
 =
-h_B^{guidance}
+h_{BS}^{guidance}
 =
-h_B^{care}
+h_{BS}^{care}
 =
-h_B
+h_{BS}
 }
 $$
+
+kernel 的机制结构已经确定（structure-frozen）；$K_{BS}$ 的具体 shape 与 $\tau_{BS}$ 的固定值或先验范围属于 Representation-Pending-Freeze。
 
 原因是控制参数预算与 identifiability，而不是假设真实世界完全相同。
 
@@ -1064,7 +1080,7 @@ $$
 u_r^{BS}(t)
 =
 S_r^{eff}
-e^{-(t-t_r^{seen})/\tau_B}
+e^{-(t-t_r^{seen})/\tau_{BS}}
 \mathbf1(t\ge t_r^{seen})
 }
 $$
@@ -1130,11 +1146,11 @@ $$
 
 $$
 \boxed{
-\tau_B^{USER}
+\tau_{BS}^{USER}
 =
-\tau_B^{BOT}
+\tau_{BS}^{BOT}
 =
-\tau_B
+\tau_{BS}
 }
 $$
 
@@ -1433,7 +1449,7 @@ Bot Interaction Coding Manual v1.0
 J_sup
 Validation V
 Guidance G
-Relevance R
+Relevance Rel
 Personalization Metadata
 Interaction Origin
 Interaction Role
@@ -1674,10 +1690,10 @@ Bot Support Dynamics 用于预测，不自动构成 Care causal claim。
 10. Bot Response Unit 是 Support Dynamics 最小响应单位。
 11. Semantic Acts 不独立产生多个 Support Pulses。
 12. 普通知识问答和 task help 不自动进入 $Q_{BS}$。
-13. Support Representation 只使用 $J^{sup},V,G,R$。
+13. Support Representation 只使用 $J^{sup},V,G,Rel$。
 14. Personalization 不直接提高 Support Potential。
 15. Support 必须经过 Seen / Exposure gate。
-16. User-Origin 与 Bot-Origin v1 共用 $\beta_{BS}$ 与 $\tau_B$。
+16. User-Origin 与 Bot-Origin v1 共用 $\beta_{BS}$ 与 $\tau_{BS}$。
 17. Bot Support 只直接作用于 Acute State。
 18. Predictable burden 优先通过 policy / quality control 规避。
 19. Burden Channel 只作为 candidate extension。
@@ -1685,3 +1701,6 @@ Bot Support Dynamics 用于预测，不自动构成 Care causal claim。
 21. Future Care Trial 只随机化 eligible Bot-Initiated decision points。
 22. User-Initiated Conversation 属于 Base Conversational System。
 23. Bot predictive association 不等于 causal care effect。
+24. Proactive receptivity 记为 $Recp^{pro}$；refractory eligibility 记为 $Z^{ref}$。
+25. $\tau_{BS}$ 只表示 Bot Support effect decay；$\tau_B=1/\kappa_B$ 只表示 Background stress time constant。
+26. Session gap 与 Support kernel 的机制结构已冻结，其数值仍属 Representation-Pending-Freeze。

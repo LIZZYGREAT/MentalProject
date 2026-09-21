@@ -1,6 +1,6 @@
 # MindFlow 时间核、Channel Aggregation 与 Slow Context States 建模
 
-> 本文定义 Effective Demand / Pressure / Recovery 如何映射到连续时间输入 $Q_D,Q_P,Q_R$，以及 Slow Context States $C_D,C_U,F$ 如何构造并进入后续 Background Dynamics。本文默认事件层和 Personal Appraisal 层已经完成，不重复其定义。
+> 本文定义 Effective Demand / Recovery 与 mechanism-specific Pressure appraisal 如何映射到连续时间输入 $Q_D,Q_P,Q_R$，以及 Slow Context States $C_D,C_U,F$ 如何构造并进入后续 Background Dynamics。本文默认事件层和 Personal Appraisal 层已经完成，不重复其定义。
 
 ---
 
@@ -11,27 +11,38 @@
 $$
 D_{i,e}^{eff},
 \quad
-P_{i,e}^{eff},
+p_{ddl,i,e}^{app}(t),
+\quad
+p_{unc,i,e}^{app}(t),
+\quad
+p_{soc,i,e}^{src},
+\quad
+I_{i,e},
 \quad
 R_{i,e}^{eff}
 $$
 
 本模块负责：
 
-1. 给每个 effective input 加上时间作用结构；
+1. 给 Demand / Recovery 与每一条 Pressure mechanism 加上各自的时间作用结构；
 2. 将多个同时或相邻事件聚合为 bounded channel input；
-3. 从历史 Demand、未解决义务和睡眠恢复构造 slow context states。
+3. 在每个时刻 $t$ 完成 event 内 Pressure 聚合，并在该时刻统一应用一次 Personal Importance；
+4. 从历史 Demand、未解决义务和睡眠恢复构造 slow context states。
 
 完整链路：
 
 ```text
-D_eff / P_eff / R_eff
+D_eff / p_ddl_app(t) / p_unc_app(t) / p_soc_src / R_eff
         ↓
-Temporal Kernel
+Mechanism-Specific Temporalization
         ↓
 Per-Event Temporal Contribution
         ↓
-Channel Aggregation
+Within-Event Pressure Noisy-OR
+        ↓
+Personal Importance × 1
+        ↓
+Across-Event Channel Aggregation
         ↓
 Q_D(t), Q_P(t), Q_R(t)
         ↓
@@ -51,11 +62,15 @@ Background Dynamics
 | 变量 | 名称 | 含义 |
 |---|---|---|
 | $K_e^D(t)$ | Demand Kernel | event $e$ 的 Demand 时间作用函数 |
-| $K_e^P(t)$ | Pressure Kernel | event $e$ 的 Pressure 时间作用函数 |
 | $K_e^R(t)$ | Recovery Kernel | event $e$ 的 Recovery 时间作用函数 |
+| $K_e^{soc}(t)$ | Social Temporal Activation | social-evaluative mechanism 的固定时间激活函数 |
 | $q_{D,e}(t)$ | Event Demand Contribution | 单个 event 在时刻 $t$ 对 Demand channel 的贡献 |
-| $q_{P,e}(t)$ | Event Pressure Contribution | 单个 event 在时刻 $t$ 对 Pressure channel 的贡献 |
 | $q_{R,e}(t)$ | Event Recovery Contribution | 单个 event 在时刻 $t$ 对 Recovery channel 的贡献 |
+| $\tilde p_{ddl,i,e}(t)$ | Temporalized Deadline Pressure | deadline mechanism 在时刻 $t$ 的机制贡献 |
+| $\tilde p_{unc,i,e}(t)$ | Temporalized Uncertainty Pressure | uncertainty mechanism 在时刻 $t$ 的机制贡献 |
+| $\tilde p_{soc,i,e}(t)$ | Temporalized Social Pressure | social-evaluative mechanism 在时刻 $t$ 的机制贡献 |
+| $P_{i,e}^{struct}(t)$ | Event Pressure Structure | event 内在时刻 $t$ 经 noisy-OR 聚合的 Pressure |
+| $P_{i,e}^{eff}(t)$ | Event Effective Pressure | 在时刻 $t$ 应用一次 Personal Importance 后的 Pressure |
 | $Q_D(t)$ | Aggregated Demand | 多事件聚合后的 Demand input |
 | $Q_P(t)$ | Aggregated Pressure | 多事件聚合后的 Pressure input |
 | $Q_R(t)$ | Aggregated Recovery | 多事件聚合后的 Recovery input |
@@ -69,21 +84,13 @@ Background Dynamics
 
 对任意 event $e$，有效输入只有在相应时间结构内才作用。
 
-定义：
+Demand 与 Recovery 使用各自独立的 kernel：
 
 $$
 \boxed{
 q_{D,e}(t)
 =
 D_{i,e}^{eff}K_e^D(t)
-}
-$$
-
-$$
-\boxed{
-q_{P,e}(t)
-=
-P_{i,e}^{eff}K_e^P(t)
 }
 $$
 
@@ -98,8 +105,10 @@ $$
 其中：
 
 $$
-0\le K_e^D,K_e^P,K_e^R\le1
+0\le K_e^D,K_e^R\le1
 $$
+
+Pressure 不使用统一的 $K_e^P(t)$，而是按 mechanism 分别 temporalize，见本文第五节。
 
 Effective magnitude 与 temporal shape 分离：
 
@@ -147,31 +156,39 @@ $$
 - event 实际执行时：Demand active；
 - event 结束后：不保留独立 Demand post-tail。
 
+这里使用的是 actual execution interval（`actual_start` / `actual_end`）。按第 2 份的 `SingleExposureEncodingRule`：若已知实际只参与一部分，则 duration 已经由该 actual interval 表达，$Z_e^{exec}$ 在该区间内取 1，不再同时取 fractional value。
+
 Event duration 通过 kernel 的 active interval 自然进入总 exposure。
 
 v1 不再把 duration 大幅重复编码进 $D_e^{pot}$。
 
 ---
 
-## 五、Pressure Kernel
+## 五、Pressure 的 Mechanism-Specific Temporalization 与 Event 内聚合
 
-Pressure 可以在事件发生前出现，因此允许：
+Pressure 不使用统一 kernel。删除：
 
 $$
-\boxed{
-K_e^P(t)
+q_{P,e}(t)
 =
-K_e^{P,pre}(t)
-+
-K_e^{P,active}(t)
-}
+P_{i,e}^{eff}K_e^P(t)
 $$
 
-但 v1 不设置自由的 post-pressure decay：
+以及把全部 Pressure mechanism 统一写成：
+
+$$
+K_e^P
+=
+K_e^{P,pre}+K_e^{P,active}
+$$
+
+的表述。原因是三条 mechanism 的时间结构不同，统一 kernel 会压平其时间语义，并可能重复编码 deadline proximity。
+
+v1 仍然不设置任何自由的 post-pressure decay：
 
 $$
 \boxed{
-K_e^{P,post}=0
+Pressure\ post\text{-}tail=0
 }
 $$
 
@@ -183,39 +200,144 @@ $$
 
 竞争解释“事件结束后压力为什么没有立即下降”。
 
-### 1. Anticipatory Pressure
+### 1. Deadline
 
-对明确 future event，可使用固定形状的 anticipatory kernel。
-
-概念上：
+Deadline source 本身已经随时间变化：
 
 $$
-K_e^{P,pre}(t)
+U_{ddl,e}(t)
+$$
+
+因此：
+
+$$
+\boxed{
+\tilde p_{ddl,i,e}(t)
 =
-f_{pre}(t_e^{start}-t)
+p_{ddl,i,e}^{app}(t)
+}
 $$
 
-满足：
+即：
 
 $$
-\frac{\partial K_e^{P,pre}}{\partial t}>0
+\boxed{
+No\ extra\ deadline\ proximity\ kernel
+}
 $$
 
-即随着事件临近，pre-event influence 增强。
-
-具体形状与参数属于 representation layer，通过 Scenario/Synthetic/Pilot 后冻结，不从 EMA 自由拟合。
-
-### 2. Active Pressure
-
-事件发生期间：
+不再额外乘一个随 deadline 临近增强的 anticipation kernel，否则会与 $U_{ddl}(t)$ 中已经包含的 remaining effort 与 available capacity 重复编码。其 active window 仍由事件层的 mechanism gate 控制：
 
 $$
-K_e^{P,active}(t)
+Z_e^{ddl}(t)
 $$
 
-可取 1 或固定 bounded shape。
+### 2. Structural Uncertainty
 
-对于 task deadline pressure，$U_{ddl}$ 已经编码 remaining effort / deadline capacity，不再额外叠加一个独立自由 urgency kernel。
+其时间存在主要由事件层：
+
+$$
+Z_e^{unc}(t)
+$$
+
+与：
+
+$$
+U_{context,e}(t)
+$$
+
+共同控制，因此：
+
+$$
+\boxed{
+\tilde p_{unc,i,e}(t)
+=
+p_{unc,i,e}^{app}(t)
+}
+$$
+
+如果未来确实需要额外的 temporal shape，只允许使用预先冻结的 representation rule，不新增可学习的 urgency parameter。
+
+### 3. Social Evaluation
+
+social-evaluative structure 可以拥有独立、固定的 temporal activation：
+
+$$
+\boxed{
+K_e^{soc}(t)
+}
+$$
+
+例如允许：
+
+- pre-event anticipation；
+- active-event exposure；
+- v1 不设置自由 post-tail。
+
+具体 shape 在 Scenario Annotation / Synthetic / Pilot 后冻结。定义：
+
+$$
+\boxed{
+\tilde p_{soc,i,e}(t)
+=
+Z_e^{soc}(t)
+D_{s,e}
+K_e^{soc}(t)
+}
+$$
+
+### 4. Event 内 Pressure Noisy-OR
+
+在每个时刻 $t$ 聚合 event 内的三条 Pressure mechanism：
+
+$$
+\boxed{
+P_{i,e}^{struct}(t)
+=
+1-
+\left[
+1-\tilde p_{ddl,i,e}(t)
+\right]
+\left[
+1-\tilde p_{unc,i,e}(t)
+\right]
+\left[
+1-\tilde p_{soc,i,e}(t)
+\right]
+}
+$$
+
+因此：
+
+$$
+0\le P_{i,e}^{struct}(t)\le1
+$$
+
+三条 mechanism 可以同时贡献，但不会线性无限叠加。
+
+### 5. Personal Importance 在时刻 $t$ 只作用一次
+
+$$
+\boxed{
+P_{i,e}^{eff}(t)
+=
+\mathcal T_\epsilon
+\left(
+P_{i,e}^{struct}(t),
+\rho_{app}^{\ell(I_{i,e})}
+\right)
+}
+$$
+
+其中 $\mathcal T_\epsilon$ 与 $I_{i,e}$ 由第 3 份定义。必须保持：
+
+$$
+\boxed{
+Importance\ applied\ once
+}
+$$
+
+即 Personal Importance 不在 deadline、uncertainty、social-evaluation 三个子通道中分别作用，也不在多个时刻被重复应用。
 
 ---
 
@@ -234,6 +356,8 @@ $$
 $$
 K_e^{R,active}(t)>0
 $$
+
+$K_e^{R,active}$ 同样作用在 actual recovery interval 上。按 `SingleExposureEncodingRule`：若已知实际发生时长，则 duration 由该 interval 表达，$Z_e^{occ}$ 只表示是否发生，不再同时取 fractional value。
 
 v1 的 post-recovery tail 采用保守策略：
 
@@ -293,9 +417,9 @@ Q_P(t)
 =
 1-
 \prod_e
-[
-1-q_{P,e}(t)
-]
+\left[
+1-P_{i,e}^{eff}(t)
+\right]
 }
 $$
 
@@ -318,6 +442,26 @@ $$
 $$
 
 多个事件可以共同提高同一 channel，但边际贡献递减。
+
+Pressure 的完整顺序为：
+
+```text
+Pressure Sources
+      ↓
+Mechanism-Specific Appraisal
+      ↓
+Mechanism-Specific Temporal Activation
+      ↓
+Within-Event Noisy-OR
+      ↓
+Personal Importance × 1
+      ↓
+Across-Event Noisy-OR
+      ↓
+Q_P(t)
+```
+
+这替换了此前 `Static P_eff → Generic K_P → Q_P` 的接口。
 
 ---
 
@@ -345,7 +489,7 @@ $$
 与：
 
 $$
-q_{P,e}(t)>0
+\tilde p_{soc,i,e}(t)>0
 $$
 
 可以同时成立。
@@ -616,6 +760,8 @@ $$
 ExposureNormalizationBaseline
 }
 $$
+
+$C_i^{ref}$ 的机制结构已经确定（structure-frozen）：它只表示 typical capacity，不使用当前短期 availability。但 category-to-capacity mapping 与 $\eta_{cap}$ 等具体 representation 数值仍属 Representation-Pending-Freeze，需经 Scenario Annotation / Synthetic / Pilot 后确定。
 
 ---
 
@@ -993,7 +1139,22 @@ SleepTiming_d
 }
 $$
 
-具体 transition mapping 属于 representation layer。
+$$
+\boxed{
+F\ mechanism\ structure\ closed
+}
+$$
+
+但：
+
+$$
+\boxed{
+\Psi_F\ numeric/representation\ mapping
+\ pending\ freeze
+}
+$$
+
+具体 transition mapping 属于 representation layer，需经 Scenario Annotation / Synthetic / Pilot 后确定具体数值；不应把本模块理解为 $F$ 的完整数学 transition 已经确定。
 
 候选 representation 参数可以包括：
 
@@ -1278,7 +1439,7 @@ $$
 \tau_D\ll1/\kappa_B
 $$
 
-### 2. $W^{rem}$ 同时进入 $C_U$ 与 $U_{ddl}$
+### 2. $W^{rem}$ 同时进入 $C_U$ 与 $U_{ddl}(t)$
 
 这是共享事实，不自动构成 double counting。
 
@@ -1327,7 +1488,7 @@ $$
 
 1. Effective magnitude 与 temporal shape 分离。
 2. Demand v1 使用 active-only kernel。
-3. Pressure 允许 pre + active，但 $K_P^{post}=0$。
+3. Pressure 不使用统一 kernel，按 mechanism 分别 temporalize，且不设置自由 post-tail。
 4. Recovery 不设自由 long post-tail。
 5. 多事件通过 bounded noisy-OR 聚合。
 6. $C_D$ 是 recent Demand 的一阶低通状态。
@@ -1342,3 +1503,7 @@ $$
 15. Nap 可以同时影响 $Q_R$ 与 $F$，但 nap-to-$F$ effect 固定且较弱。
 16. Sleep transition parameters 属于 representation layer，不通过 EMA 自由拟合。
 17. $C_D/C_U/F$ 不接受 EMA residual 直接更新。
+18. Pressure 的 within-event noisy-OR 与 Personal Importance 在每个时刻 $t$ 求值，Importance 每个时刻只作用一次。
+19. $U_{ddl}(t)$ 已经包含 deadline proximity，不再叠加额外 anticipation kernel。
+20. social-evaluative mechanism 使用独立固定 activation $K_e^{soc}(t)$，其 shape 属于 Representation-Pending-Freeze。
+21. $C^{ref}$ 与 $F$ 的机制结构已冻结，但其 representation mapping 数值仍待冻结。

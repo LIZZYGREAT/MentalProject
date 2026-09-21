@@ -1,6 +1,6 @@
 # MindFlow Personal Appraisal 与 Effective D/P/R 建模
 
-> 本文定义 participant-specific Personal Appraisal、其证据更新方式，以及 Event Potential 如何转换为 Effective Demand / Pressure / Recovery。本文默认事件层已经提供 $D_e^{pot}$、$U_{ddl,e}$、$U_{context,e}$、$D_{s,e}$、$R_e^{pot}$ 与 mechanism-specific lifecycle gates，不重复事件表示与 lifecycle 规则。
+> 本文定义 participant-specific Personal Appraisal、其证据更新方式，以及 Event Potential 如何转换为 Effective Demand、mechanism-specific Pressure appraisal 与 Effective Recovery。本文默认事件层已经提供 $D_e^{pot}$、pressure source vector $\mathbf P_e^{src}(t)=[U_{ddl,e}(t),U_{context,e}(t),D_{s,e}]$、$R_e^{pot}$ 与 mechanism-specific lifecycle gates，不重复事件表示与 lifecycle 规则。
 
 ---
 
@@ -20,7 +20,11 @@ $$
 \boxed{
 D_{i,e}^{eff},
 \quad
-P_{i,e}^{eff},
+p_{ddl,i,e}^{app}(t),
+\quad
+p_{unc,i,e}^{app}(t),
+\quad
+p_{soc,i,e}^{src},
 \quad
 R_{i,e}^{eff}
 }
@@ -31,8 +35,12 @@ $$
 - $i$：participant；
 - $e$：event / episode；
 - $D_{i,e}^{eff}$：participant-specific effective demand；
-- $P_{i,e}^{eff}$：participant-specific effective pressure；
+- $p_{ddl,i,e}^{app}(t)$：deadline mechanism 经 appraisal 后的时刻 $t$ 取值；
+- $p_{unc,i,e}^{app}(t)$：structural uncertainty mechanism 经 appraisal 后的时刻 $t$ 取值；
+- $p_{soc,i,e}^{src}$：social-evaluative mechanism 的 appraisal 后 source，时间暴露由时间核模块处理；
 - $R_{i,e}^{eff}$：participant-specific effective recovery。
+
+本模块只定义三条 Pressure mechanism 各自的 appraisal transformation，不输出已经聚合的静态 event Pressure scalar。三条 mechanism 的 temporal activation 与聚合在每个时刻 $t$ 由时间核模块完成，因此它们的独立时间结构不会在 appraisal 之后被压平。
 
 Personal Appraisal 是 personalization correction，不是模型运行的必要前提。即使大量 appraisal 为 Unknown，Event Potential 仍然可以正常驱动模型。
 
@@ -718,18 +726,20 @@ $$
 D_e^{pot}\in[0,1]
 $$
 
-与实际 execution exposure：
+与实际 execution / engagement intensity：
 
 $$
-Z_{i,e}^{exec}\in[0,1]
+Z_e^{exec}\in[0,1]
 $$
+
+$Z_e^{exec}$ 按 episode 取值，其语义由第 2 份的 `SingleExposureEncodingRule` 定义：它表示执行/投入强度，不表示已参加时长比例；其时间作用由第 4 份 Demand kernel 承担。
 
 定义基础执行 Demand：
 
 $$
 d_{i,e}^{0}
 =
-Z_{i,e}^{exec}D_e^{pot}
+Z_e^{exec}D_e^{pot}
 $$
 
 Personal Appraisal 只使用：
@@ -746,7 +756,7 @@ D_{i,e}^{eff}
 =
 \mathcal T_{\epsilon}
 \left(
-Z_{i,e}^{exec}D_e^{pot},
+Z_e^{exec}D_e^{pot},
 \rho_{app}^{-\ell(C_{i,e}^{exec})}
 \right)
 }
@@ -786,31 +796,35 @@ SocialEvaluation
 }
 $$
 
-分别由事件层提供：
+分别由事件层的 pressure source vector 提供：
 
 $$
-U_{ddl,e},
+\mathbf P_e^{src}(t)
+=
+[
+U_{ddl,e}(t),
 \quad
-U_{context,e},
+U_{context,e}(t),
 \quad
 D_{s,e}
+]
 $$
 
-Personal Importance $I$ 不在每个 subchannel 中重复作用，而只在三类 Pressure 聚合后作用一次。
+本模块只定义三条 mechanism 各自的 appraisal transformation。Personal Importance $I$ 不在每个 subchannel 中重复作用，而只在时间核模块于每个时刻 $t$ 完成三类 Pressure 聚合后作用一次。
 
 ---
 
-## 二十、Deadline Pressure
+## 二十、Deadline appraisal transformation
 
 定义：
 
 $$
 \boxed{
-p_{ddl,i,e}^{*}
+p_{ddl,i,e}^{app}(t)
 =
 \mathcal T_{\epsilon}
 \left(
-Z_{e}^{ddl}U_{ddl,e},
+Z_{e}^{ddl}(t)U_{ddl,e}(t),
 \rho_{app}^{-\ell(C_{i,e}^{out})}
 \right)
 }
@@ -818,8 +832,8 @@ $$
 
 其中：
 
-- $Z_e^{ddl}$：deadline mechanism lifecycle gate；
-- $U_{ddl,e}$：time scarcity structure；
+- $Z_e^{ddl}(t)$：deadline mechanism lifecycle gate；
+- $U_{ddl,e}(t)$：time scarcity source；
 - $C_{i,e}^{out}$：participant perceived outcome control。
 
 因此：
@@ -827,22 +841,24 @@ $$
 $$
 C^{out}\uparrow
 \Rightarrow
-p_{ddl}^{*}\downarrow
+p_{ddl}^{app}\downarrow
 $$
 
-Deadline proximity、remaining effort 与 available capacity 已经通过 $U_{ddl}$ 表达，不再额外添加 `perceived urgency`。
+命名中的 `app` 表示该量已经过 appraisal。它不是最终 event Pressure，而是 deadline mechanism 在 appraisal 之后的时刻 $t$ 取值。
+
+Deadline proximity、remaining effort 与 available capacity 已经通过 $U_{ddl}(t)$ 表达，不再额外添加 `perceived urgency`；第 4 份也不再为它叠加随 deadline 临近增强的 anticipation kernel。
 
 ---
 
-## 二十一、Uncertainty Pressure
+## 二十一、Uncertainty appraisal transformation
 
 事件层提供：
 
 $$
-U_{context,e}
+U_{context,e}(t)
 $$
 
-表示 structural uncertainty。
+表示随时间变化的 structural uncertainty。
 
 Personal Appraisal 提供：
 
@@ -860,11 +876,11 @@ $$
 
 $$
 \boxed{
-p_{unc,i,e}^{*}
+p_{unc,i,e}^{app}(t)
 =
 \mathcal T_{\epsilon}
 \left(
-Z_e^{unc}U_{context,e},
+Z_e^{unc}(t)U_{context,e}(t),
 \rho_{app}^{
 [\ell(U_{i,e}^{perc})-\ell(C_{i,e}^{out})]/2
 }
@@ -878,7 +894,7 @@ $$
 
 $$
 \boxed{
-U_{context}
+U_{context}(t)
 \not\Rightarrow
 U^{perc}
 }
@@ -888,7 +904,7 @@ $$
 
 ---
 
-## 二十二、Social-Evaluative Pressure
+## 二十二、Social-Evaluative source
 
 事件层提供：
 
@@ -896,44 +912,49 @@ $$
 D_{s,e}
 $$
 
-第一版不再额外加入 outcome control。
+第一版不再额外加入 outcome control，appraisal 上也不额外引入 $C^{out}$。
 
 定义：
 
 $$
 \boxed{
-p_{soc,i,e}^{*}
+p_{soc,i,e}^{src}
 =
-Z_e^{soc}D_{s,e}
+D_{s,e}
 }
 $$
 
-其作用表示 event 中实际暴露的 social-evaluative structure。
+它是 social-evaluative mechanism 经 appraisal 后的 source。其时间暴露，以及 $Z_e^{soc}(t)$ 与固定 temporal activation $K_e^{soc}(t)$ 的作用，由第 4 份处理，因此这里的 $p_{soc}^{src}$ 不带 $t$。
 
 ---
 
-## 二十三、Pressure Structure 聚合
+## 二十三、Pressure 聚合不属于本模块
 
-先对三个 mechanism 做 noisy-OR：
+本模块不输出 event-level static Pressure scalar。Pressure 的完整顺序为：
 
-$$
-\boxed{
-P_{i,e}^{struct}
-=
-1-
-(1-p_{ddl,i,e}^{*})
-(1-p_{unc,i,e}^{*})
-(1-p_{soc,i,e}^{*})
-}
-$$
+```text
+Pressure Sources
+      ↓
+Mechanism-Specific Appraisal            ← 本模块
+      ↓
+Mechanism-Specific Temporal Activation  ← 第 4 份
+      ↓
+Within-Event Noisy-OR                   ← 第 4 份
+      ↓
+Personal Importance × 1                 ← 第 4 份
+      ↓
+Across-Event Noisy-OR                   ← 第 4 份
+      ↓
+Q_P(t)
+```
 
-因此：
+原因是：
 
-$$
-0\le P_{i,e}^{struct}\le1
-$$
+- 三条 mechanism 的时间结构不同；
+- deadline / scarcity 本身已经是 dynamic source；
+- 若在 appraisal 之后立即合并成静态 scalar、再统一乘一个 temporal kernel，会压平 mechanism 的时间语义，并可能重复时间加权。
 
-三个 mechanism 可以同时贡献，但不会线性无限叠加。
+因此 within-event noisy-OR、Personal Importance 与跨 event 聚合都在每个时刻 $t$ 于第 4 份完成。
 
 ---
 
@@ -943,27 +964,27 @@ Personal Importance 表示：
 
 > 整个事件及其后果对该用户有多重要。
 
-因此在三个 Pressure mechanisms 聚合后统一作用：
+本模块只提供 $I_{i,e}$ 本身。Importance 在时刻 $t$、三条 Pressure mechanism 经各自 temporal activation 并完成 within-event noisy-OR 之后，统一作用一次：
 
 $$
 \boxed{
-P_{i,e}^{eff}
+P_{i,e}^{eff}(t)
 =
 \mathcal T_{\epsilon}
 \left(
-P_{i,e}^{struct},
+P_{i,e}^{struct}(t),
 \rho_{app}^{\ell(I_{i,e})}
 \right)
 }
 $$
 
-这样避免：
+该公式的求值位置在第 4 份，不在本模块。这样避免：
 
 $$
 I
 $$
 
-在 deadline、uncertainty、social-evaluation 三个子通道中重复计算。
+在 deadline、uncertainty、social-evaluation 三个子通道中重复计算，也避免 importance 在多个时刻被重复应用。
 
 ---
 
@@ -1016,6 +1037,8 @@ M_e^{context},
 \right)
 }
 $$
+
+$Z_e^{occ}$ 遵守第 2 份的 `SingleExposureEncodingRule`：已知实际发生时长时，duration 由 actual interval 表示，$Z^{occ}$ 只表示是否发生；只有在无法获得具体 duration 时，才用 $Z_e^{occ}\in(0,1)$ 作为 occurrence approximation。两者不重复编码同一 partial 信息。
 
 必须保持：
 
@@ -1107,7 +1130,25 @@ $$
 
 $$
 \boxed{
-P_{i,e}^{eff}
+p_{ddl,i,e}^{app}(t)
+}
+$$
+
+$$
+\boxed{
+p_{unc,i,e}^{app}(t)
+}
+$$
+
+$$
+\boxed{
+p_{soc,i,e}^{src}
+}
+$$
+
+$$
+\boxed{
+I_{i,e}
 }
 $$
 
@@ -1125,11 +1166,16 @@ $$
 - stable-profile posterior；
 - episode-specific posterior。
 
-下一层只使用这些 effective inputs，不再重新解释 appraisal。
+这样不会丢失三条 Pressure mechanism 的独立时间结构。下一层只使用这些 effective inputs 与 mechanism-specific appraisal outputs，不再重新解释 appraisal。
 
 ---
 
 ## 二十九、当前冻结边界
+
+这里的冻结区分两层：
+
+- Structure-Frozen：变量语义、因果与信息路径、哪个量进入哪个通道、哪些参数允许存在、哪些重复计数路径被禁止，已经确定；
+- Representation-Pending-Freeze：$\rho_{app}$ 的具体数值、appraisal ordinal coding 的具体映射等，仍需经 Scenario Annotation → Synthetic → Pilot 后确定。
 
 1. v1 Appraisal 只保留 $C^{exec},I,C^{out},U^{perc},F^{rec}$。
 2. Stress Relevance 不进入 dynamics。
@@ -1143,11 +1189,15 @@ $$
 10. LLM 只抽取 structured evidence，不直接产生心理真值。
 11. EMA 不反向生成 appraisal。
 12. $C^{exec}$ 只调节 Demand。
-13. $I,C^{out},U^{perc}$ 只调节 Pressure。
+13. $I,C^{out},U^{perc}$ 只调节 Pressure，且不改变 mechanism-specific temporal structure。
 14. $F^{rec}$ 只调节 Recovery。
-15. Personal Importance 在 Pressure 中只作用一次。
+15. Personal Importance 在每个时刻 $t$ 的 Pressure 聚合后只作用一次。
 16. Structural Uncertainty 与 Perceived Uncertainty 必须分离。
 17. v1 使用统一 $\rho_{app}$，不分别学习多组 appraisal strength。
 18. $\rho_{app}$ 属于 representation hyperparameter，不通过 EMA 自由拟合。
 19. $D/P/R$ 全部使用 boundary-safe $\mathcal T_\epsilon$。
 20. 大量 Unknown 不阻止模型运行。
+21. 本模块输出 mechanism-specific pressure appraisal 结果，不输出静态 $P_{i,e}^{eff}$。
+22. $Z^{exec}$ 表示 execution / engagement intensity，不表示已参加时长比例；partial exposure 遵守 `SingleExposureEncodingRule`。
+23. $U_{ddl}(t)$ 与 $U_{context}(t)$ 是 dynamic source，$D_{s,e}$ 是相对稳定的 event structure。
+24. 三条 Pressure mechanism 的时间结构不得在 appraisal 之后被统一 kernel 压平。

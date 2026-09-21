@@ -18,11 +18,25 @@ $$
 
 其中：
 
-- $A_i(t)$：Acute Stress State；
+- $A_i(t)$：Signed Acute Stress Component，可正可负；
 - $B_i(t)$：Background Stress State；
 - $S_i(t)$：总的 Latent Momentary Perceived Stress State。
 
-$A/B$ 是模型定义的 latent decomposition，而不是两个可以被独立直接观测的心理量。
+$$
+\boxed{
+A_i(t)
+=
+Signed\ Acute\ Stress\ Component
+}
+$$
+
+$A$ 的解释：
+
+- $A>0$：当前 acute inputs 将总压力推高到 Background 之上；
+- $A\approx0$：当前总压力主要由 Background 决定；
+- $A<0$：Recovery / Support 等使当前压力暂时低于 Background 水平。
+
+$A/B$ 是模型定义的 latent decomposition，而不是两个可以被独立直接观测的心理量。保持 $S=A+B$，不为此增加 clipping 或新的非线性状态约束。
 
 ---
 
@@ -94,11 +108,11 @@ Sleep-Dominant Recovery Debt。
 
 ## 三、Acute Equilibrium
 
-定义：
+Core Stress Model 定义：
 
 $$
 \boxed{
-A_i^{eq}(t)
+A_{i,\mathrm{core}}^{eq}(t)
 =
 g_i^A
 \left[
@@ -108,12 +122,22 @@ g_i^A
 -
 \beta_R^AQ_R(t)
 \right]
+}
+$$
+
+BI1 candidate extension 在此之上叠加 Bot Support：
+
+$$
+\boxed{
+A_{i,BI1}^{eq}(t)
+=
+A_{i,\mathrm{core}}^{eq}(t)
 -
 \beta_{BS}Q_{BS}(t)
 }
 $$
 
-其中 Bot Support 项只在启用 BI1/BI2 candidate model 时存在。
+Bot Support 项只在启用 BI1/BI2 candidate model 时存在，不是无条件进入最小正式模型。
 
 参数含义：
 
@@ -123,7 +147,7 @@ $$
 | $\beta_D^A$ | Acute Demand Effect | Demand 对 Acute Stress 的 population-level effect |
 | $\beta_P^A$ | Acute Pressure Effect | Pressure 对 Acute Stress 的 population-level effect |
 | $\beta_R^A$ | Acute Recovery Effect | Recovery 对 Acute Stress 的 population-level relief effect |
-| $\beta_{BS}$ | Bot Support Effect | Bot Support 对 Acute Stress 的 population-level relief effect |
+| $\beta_{BS}$ | Bot Support Effect | Bot Support 对 Acute Stress 的 population-level relief effect（candidate BI1） |
 
 要求：
 
@@ -251,10 +275,12 @@ $$
 事件层与时间核层已经采用：
 
 $$
-K_P^{post}=0
+\boxed{
+Pressure\ post\text{-}tail=0
+}
 $$
 
-或不设置独立自由 post-pressure decay。
+即不设置统一 Pressure kernel，也不为任何 Pressure mechanism 设置独立自由 post-pressure decay。
 
 原因是如果同时存在：
 
@@ -368,6 +394,14 @@ $$
 $$
 
 表示 Background 的典型响应时间尺度。
+
+全模型三个主要时间常数不再重名：
+
+| 参数 | 含义 |
+|---|---|
+| $\tau_D$ | Recent Demand Accumulation time constant |
+| $\tau_B=1/\kappa_B$ | Background Stress time constant |
+| $\tau_{BS}$ | Bot Support effect decay time constant |
 
 ---
 
@@ -488,7 +522,7 @@ $$
 A/B
 $$
 
-分解属于弱可观测 latent decomposition。
+分解属于弱可观测 latent decomposition。其中 $A$ 是 signed acute component，其恢复检查必须允许负值，不能当作 0–10 量表处理。
 
 正式验证不能只检查：
 
@@ -798,10 +832,10 @@ $$
 Measurement noise：
 
 $$
-R
+R_{EMA}
 $$
 
-其中 $R,q_A,q_B$ 的最终推断策略由 Measurement / Inference 模块进一步定义。
+其中 $R_{EMA},q_A,q_B$ 的最终推断策略由 Measurement / Inference 模块进一步定义。
 
 ---
 
@@ -852,16 +886,16 @@ $$
 Measurement Model 还包含：
 
 $$
-R
+R_{EMA}
 $$
 
-表示 EMA observation noise variance。
+表示 EMA observation noise variance。统一记为 $R_{EMA}=\sigma_{EMA}^2$，避免与 Recovery 的 $R$ 符号混淆。
 
 必须区分：
 
 $$
 \boxed{
-R
+R_{EMA}
 =
 ObservationNoise
 }
@@ -881,7 +915,7 @@ $$
 
 因此推荐：
 
-- $R$ 由 repeated EMA item / Pilot 形成 informative prior；
+- $R_{EMA}$ 由 repeated EMA item / Pilot 形成 informative prior；
 - $q_A,q_B$ 保持 population-level；
 - 若 $q_B$ 无法恢复，优先固定为 small process floor，而不是增加 person-specific noise。
 
@@ -1064,7 +1098,7 @@ $$
 
 推荐将 Dynamic Model 理解为逐层 promotion。
 
-### M0：Baseline Latent Dynamics
+### P0：Population/Baseline Dynamics
 
 只保留：
 
@@ -1072,7 +1106,7 @@ $$
 - population-level acute/background effects；
 - minimal process noise。
 
-### M1：Person Baseline
+### P1：+ Person Baseline $S_i^0$
 
 允许：
 
@@ -1082,7 +1116,7 @@ $$
 
 个体化。
 
-### M2：Acute Susceptibility
+### P2：+ Acute Susceptibility $g_i^A$
 
 当 observability 足够时增加：
 
@@ -1090,7 +1124,7 @@ $$
 g_i^A
 $$
 
-### M3：Background Susceptibility
+### P3：+ Background Susceptibility $g_i^B$
 
 当 slow-state variation 足够时增加：
 
@@ -1098,7 +1132,7 @@ $$
 g_i^B
 $$
 
-### M4：Recovery-Speed Personalization
+### P4：+ Recovery-Speed Personalization $\kappa_{\downarrow,i}$
 
 当 post-event recovery data 足够时增加：
 
@@ -1106,7 +1140,17 @@ $$
 \kappa_{\downarrow,i}
 $$
 
-这里的 M0-M4 仅表示 parameter-promotion logic，不应与其他文档中的实验 ablation 命名混用。
+其中：
+
+$$
+\boxed{
+P
+=
+Parameter\ Personalization\ Level
+}
+$$
+
+P0–P4 只表示 parameter-promotion logic，不再使用 M0–M4，避免与其他文档中的实验 ablation 命名（例如 Bot 的 BI0–BI2）混用。
 
 ---
 
@@ -1116,7 +1160,7 @@ $$
 
 $$
 \boxed{
-A_i^{eq}
+A_{i,\mathrm{core}}^{eq}
 =
 g_i^A
 [
@@ -1131,14 +1175,9 @@ Bot candidate model 再扩展：
 
 $$
 \boxed{
-A_i^{eq}
+A_{i,BI1}^{eq}
 =
-g_i^A
-[
-\beta_D^AQ_D+
-\beta_P^AQ_P-
-\beta_R^AQ_R
-]
+A_{i,\mathrm{core}}^{eq}
 -
 \beta_{BS}Q_{BS}
 }
@@ -1189,7 +1228,7 @@ $$
 ### Noise Separation
 
 $$
-(R,q_A,q_B)
+(R_{EMA},q_A,q_B)
 $$
 
 ### Pressure / Obligation Separation
@@ -1237,6 +1276,8 @@ $$
 RMSE_B
 $$
 
+其中 $A$ 是 signed latent component，$RMSE_A$ 的检查必须允许负值，不能把 $A$ 当作独立的 0–10 量表误差。
+
 不能只因为：
 
 $$
@@ -1267,7 +1308,7 @@ Acute：
 
 $$
 \boxed{
-A_i^{eq}
+A_{i,\mathrm{core}}^{eq}
 =
 g_i^A
 [
@@ -1354,7 +1395,7 @@ Bot Support 通过 BI1 candidate extension 单独验证。
 ## 二十九、当前冻结边界
 
 1. 总压力为 $S=A+B$。
-2. $A$ 为分钟—小时 Acute State；$B$ 为天—周 Background State。
+2. $A$ 为分钟—小时 signed acute component（可正可负）；$B$ 为天—周 Background State。
 3. Acute equilibrium 只使用 $Q_D,Q_P,Q_R$，Bot Support 作为 candidate extension。
 4. Background equilibrium 只使用 $C_D,C_U,F$。
 5. $\beta_D^A,\beta_P^A,\beta_R^A,\beta_D^B,\beta_U^B,\beta_F^B$ 为 population-level effect parameters。
@@ -1364,8 +1405,10 @@ Bot Support 通过 BI1 candidate extension 单独验证。
 9. $\tau_D$ 与 $1/\kappa_B$ 必须保持明显时间尺度分离。
 10. Recovery magnitude $\beta_R^A$ 与 recovery speed $\kappa_{\downarrow}$ 必须区分。
 11. v1 不增加 person-specific process noise。
-12. $R$ 与 $q_A/q_B$ 需要通过 repeated probe / Synthetic 约束。
+12. $R_{EMA}$ 与 $q_A/q_B$ 需要通过 repeated probe / Synthetic 约束。
 13. Sleep transition parameters 不通过 EMA 自由拟合。
 14. Representation layer 与 Dynamic fitting 必须解耦。
 15. Bot Support 参数 $\beta_{BS}$ 只有通过 ablation、recoverability 与 held-out prediction 后才允许晋级。
 16. Synthetic 必须分别检验 $S/A/B$ recovery，而不能只检验总压力。
+17. Parameter promotion 使用 P0–P4 命名，不使用 M0–M4。
+18. $\tau_D$、$\tau_B=1/\kappa_B$、$\tau_{BS}$ 三者不重名。

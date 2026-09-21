@@ -67,17 +67,19 @@ $$
 \boxed{
 \epsilon_{i,k}
 \sim
-\mathcal N(0,R)
+\mathcal N(0,R_{EMA})
 }
 $$
 
 其中：
 
 $$
-R=\sigma_{EMA}^2
+\boxed{
+R_{EMA}=\sigma_{EMA}^2
+}
 $$
 
-表示 Primary EMA observation noise variance。
+表示 Primary EMA observation noise variance。统一使用 $R_{EMA}$，避免与 Recovery 的 $R$、Proactive Receptivity 的 $Recp^{pro}$ 以及 Bot Relevance 的 $Rel_r$ 混淆。
 
 v1 使用 Gaussian observation approximation，不同时使用普通 Gaussian Kalman update 和另外一套 exact clipped likelihood。
 
@@ -237,7 +239,7 @@ Relative EMA 主要用于：
 
 $$
 \boxed{
-Estimate\ / Inform\ R
+Estimate\ / Inform\ R_{EMA}
 }
 $$
 
@@ -262,7 +264,7 @@ $$
 Formal Study 前应使用 Pilot repeated-item data 为：
 
 $$
-R
+R_{EMA}
 $$
 
 建立 informative prior 或固定候选范围。
@@ -868,6 +870,13 @@ Formal Study 前需要冻结：
 - forecasting procedure；
 - primary evaluation metrics。
 
+冻结分为两层：
+
+- Structure-Frozen：变量语义、因果与信息路径、哪些量进入哪个通道、哪些参数允许存在、哪些重复计数路径被禁止；
+- Representation-Pending-Freeze：需要经 Scenario Annotation → Synthetic → Pilot 确定的具体映射与数值，包括 $\Psi_F$ transition mapping、sleep representation 数值、nap-to-$F$ fixed strength、$C^{ref}$ category-to-capacity mapping、social-evaluation temporal activation shape、$\rho_{app}$ 数值、$\tau_{BS}$ 固定值或先验范围、$G_{session}$。
+
+Formal freeze 指两层都已完成并锁定。
+
 Formal Study 中允许：
 
 - state assimilation；
@@ -1408,6 +1417,8 @@ RMSE_B
 }
 $$
 
+$A$ 是 signed latent component，而非独立的 0–10 量表；$RMSE_A$ 的检查必须允许负值，也不能用 $A$ 与 EMA 的绝对尺度直接比较。
+
 因为完全可能：
 
 $$
@@ -1466,7 +1477,7 @@ $$
 
 $$
 \boxed{
-(R,q_A,q_B)
+(R_{EMA},q_A,q_B)
 }
 $$
 
@@ -1629,11 +1640,11 @@ Base
 ### Personalization
 
 ```text
-Population Only
-+ S0
-+ g_A
-+ g_B
-+ kappa_down
+P0: Population Only
+P1: + S0
+P2: + g_A
+P3: + g_B
+P4: + kappa_down
 ```
 
 ### Bot
@@ -1644,7 +1655,7 @@ BI1: Support Only
 BI2: Extended Candidate
 ```
 
-Ablation 命名在最终研究文档中必须唯一，避免和 parameter-promotion 的 M0/M1 等命名冲突。
+Ablation 命名在最终研究文档中必须唯一。Personalization ablation 与第 6 份的 parameter-promotion level 使用同一套 P0–P4 命名，Bot ablation 使用 BI0–BI2，不再出现 M0–M4。
 
 ---
 
@@ -1865,3 +1876,6 @@ prediction_error
 27. Missingness / corruption 必须进入 Synthetic。
 28. Representation、priors、EMA protocol、promotion rule 与 evaluation protocol 在 Formal Study 前冻结。
 29. Prediction Model 与未来 Care causal estimator 必须分离。
+30. Observation noise 统一记为 $R_{EMA}=\sigma_{EMA}^2$。
+31. $A$ 是 signed acute latent component，$A/B$ 不能用 EMA 绝对尺度直接校验。
+32. 机制结构冻结与 representation 数值冻结分开管理。
