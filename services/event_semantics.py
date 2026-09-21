@@ -8,20 +8,14 @@ is applied later by the psychological state model.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import hashlib
 import json
 import math
 import re
-from typing import Any, Dict, Mapping, Optional, Protocol
+from typing import Any, Dict, Mapping
 
 import requests
 
-from services.event_semantic_prompt import (
-    PROMPT_SHA256,
-    PROMPT_VERSION,
-    SEMANTIC_AGENT_SYSTEM_PROMPT,
-)
+from services.event_semantic_prompt import SEMANTIC_AGENT_SYSTEM_PROMPT
 
 
 SEMANTIC_SCHEMA_VERSION = "event_semantics.v4"
@@ -99,39 +93,6 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-@dataclass(frozen=True)
-class SemanticAssessment:
-    schema_version: str
-    rule_version: str
-    prompt_version: str
-    fusion_policy_version: str
-    fingerprint: str
-    source: str
-    values: Dict[str, float]
-    rule_values: Dict[str, float]
-    external_values: Optional[Dict[str, float]]
-    confidence: float
-    evidence_tags: list[str]
-    reasoning_summary: str
-    matched_rules: list[str]
-    constraints_applied: list[str]
-    prompt_sha256: str = PROMPT_SHA256
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    cache_hit: bool = False
-    external_error: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-class SemanticApiClient(Protocol):
-    provider: str
-    model: str
-
-    def infer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 BASE_PROFILES: Dict[str, Dict[str, float]] = {

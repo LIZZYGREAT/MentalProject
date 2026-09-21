@@ -485,7 +485,6 @@ class FeishuGateway:
         self.events = events
         self.queue = queue
         self.parser = FeishuEventParser(app_id)
-        self.channel_adapter = FeishuChannelMessageAdapter(app_id)
         self.channel_factory = channel_factory
         self.process_context = process_context
         self.receiver_target = receiver_target
@@ -510,13 +509,6 @@ class FeishuGateway:
 
         try:
             event = self.parser.parse(payload)
-        except InvalidBotEvent:
-            return False
-        return self.accept_event(event)
-
-    def accept_channel_message(self, message: Any) -> bool:
-        try:
-            event = self.channel_adapter.adapt(message)
         except InvalidBotEvent:
             return False
         return self.accept_event(event)

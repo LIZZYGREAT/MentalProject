@@ -332,29 +332,6 @@ class StateObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
-class PredictionRun(Base):
-    __tablename__ = "prediction_runs"
-    __table_args__ = (
-        Index("ix_prediction_participant_time", "participant_id", "created_at"),
-        UniqueConstraint(
-            "participant_id",
-            "source_message_id",
-            name="uq_prediction_source_message",
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    participant_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
-    )
-    profile_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    source_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    input_snapshot_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    output_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-
-
 class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
     __table_args__ = (

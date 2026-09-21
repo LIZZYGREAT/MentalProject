@@ -13,24 +13,6 @@ VideoExtractionMode = Literal[
 ]
 
 
-VIDEO_REASON_CODES = frozenset(
-    {
-        "unsupported_video_provider",
-        "video_metadata_unavailable",
-        "video_page_not_public",
-        "no_public_subtitle",
-        "subtitle_fetch_failed",
-        "subtitle_provider_failed",
-        "subtitle_parse_failed",
-        "transcript_too_large",
-        "video_url_not_safe",
-        "unsupported_video_variant",
-        "video_disabled",
-        "video_not_inspected",
-    }
-)
-
-
 @dataclass(frozen=True)
 class VideoMetadata:
     """Public, provider-normalized metadata for one video."""

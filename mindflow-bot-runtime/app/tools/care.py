@@ -1899,47 +1899,6 @@ class CareTools:
             }
         }
 
-    async def resolve_calendar_events_plan_authorization_context(
-        self, ctx: AgentContext, args: dict[str, Any]
-    ) -> dict[str, Any]:
-        targets = []
-        for event_id in list(args.get("event_ids") or []):
-            resolved = await self.resolve_calendar_event_authorization_context(
-                ctx, {"event_id": str(event_id)}
-            )
-            targets.append(dict(resolved["target"]))
-        return {
-            "target": {
-                "count": len(targets),
-                "events": targets,
-                "timezone": str(self.timezone),
-            }
-        }
-
-    async def resolve_calendar_updates_plan_authorization_context(
-        self, ctx: AgentContext, args: dict[str, Any]
-    ) -> dict[str, Any]:
-        targets = []
-        for update in list(args.get("updates") or []):
-            update_value = dict(update)
-            resolved = await self.resolve_calendar_event_authorization_context(
-                ctx,
-                {
-                    "event_ref": str(
-                        update_value.get("event_ref")
-                        or update_value.get("event_id")
-                    )
-                },
-            )
-            targets.append(dict(resolved["target"]))
-        return {
-            "target": {
-                "count": len(targets),
-                "events": targets,
-                "timezone": str(self.timezone),
-            }
-        }
-
     @staticmethod
     def _calendar_update_patch_args(raw: dict[str, Any]) -> dict[str, Any]:
         """Convert the Agent PATCH envelope to the internal update shape."""

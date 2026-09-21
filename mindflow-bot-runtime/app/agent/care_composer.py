@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping
 
 import httpx
 
@@ -51,10 +51,6 @@ class CareDraft:
         value["selected_fact_ids"] = list(self.selected_fact_ids)
         value["selected_reason_codes"] = list(self.selected_reason_codes)
         return value
-
-
-class CareComposerProtocol(Protocol):
-    async def compose(self, evidence: CareEvidencePacket) -> CareDraft: ...
 
 
 CARE_COMPOSER_SYSTEM_PROMPT = """你是 MindFlow 的关怀文案组织器。只输出 JSON 对象，不输出推理过程。
@@ -117,7 +113,7 @@ class OpenAICompatibleCareComposerClient:
 
 
 class CareAgentComposer:
-    """Adapt a testable provider into the stable CareComposerProtocol."""
+    """Adapt a testable provider into the stable care-composer contract."""
 
     def __init__(self, provider: Any, *, model: str | None = None):
         self.provider = provider

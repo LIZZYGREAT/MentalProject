@@ -316,28 +316,6 @@ class CourseScheduleTools:
             result = await result
         return dict(result or {})
 
-    def resolve_recent_image_import_authorization_context(
-        self, ctx: AgentContext, _arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        image_session = self._latest_image_session(ctx)
-        if image_session is None:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_not_found"
-            )
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "schedule_image_import",
-            "has_provider_effect": False,
-            "target": {
-                "status": image_session.get("status"),
-                "created_local_datetime": to_participant_local_datetime(
-                    image_session.get("created_at"), self.timezone_name
-                ),
-                "timezone": self.timezone_name,
-                "last_error_code": image_session.get("last_error_code"),
-            },
-        }
-
     def _latest_image_session(self, ctx: AgentContext) -> dict[str, Any] | None:
         if self.image_sessions is None:
             return None
@@ -419,31 +397,6 @@ class CourseScheduleTools:
             "ok": bool(result.get("ok")),
             "status": result.get("status"),
             "reply_text": result.get("reply_text"),
-        }
-
-    def resolve_pending_cancel_authorization_context(
-        self, ctx: AgentContext, _arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        draft = self.imports.drafts.latest_pending_context(ctx.participant_id)
-        if draft is None:
-            raise AuthorizationContextResolutionError("authorization_target_not_found")
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "cancel_or_revert",
-            "has_provider_effect": False,
-            "target": {
-                "status": draft.get("status"),
-                "created_local_datetime": to_participant_local_datetime(
-                    draft.get("created_at"), self.timezone_name
-                ),
-                "timezone": self.timezone_name,
-                "course_names": [
-                    str(course.get("course_name") or "")[:80]
-                    for course in list(
-                        (draft.get("structured_result") or {}).get("courses") or []
-                    )[:10]
-                ],
-            },
         }
 
     def get_recent_imports(

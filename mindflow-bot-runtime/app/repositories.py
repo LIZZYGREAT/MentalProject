@@ -1208,25 +1208,6 @@ class PsychometricAssessmentRepository:
             ).scalars().all()
             return [self._view(row) for row in rows]
 
-    def latest_by_instrument(
-        self, participant_id: uuid.UUID, instrument_name: str
-    ) -> Optional[dict[str, Any]]:
-        name = normalize_instrument_name(instrument_name)
-        with self.database.session() as session:
-            row = session.execute(
-                select(PsychometricAssessment)
-                .where(
-                    PsychometricAssessment.participant_id == participant_id,
-                    PsychometricAssessment.instrument_name == name,
-                )
-                .order_by(
-                    desc(PsychometricAssessment.administered_at),
-                    desc(PsychometricAssessment.created_at),
-                )
-                .limit(1)
-            ).scalar_one_or_none()
-            return self._view(row) if row is not None else None
-
     def latest_by_instrument_as_of(
         self,
         participant_id: uuid.UUID,
@@ -2242,23 +2223,6 @@ class ForecastSnapshotRepository:
                 seen.add(row.local_date)
                 result.append(self._view(row))
             return result
-
-    def latest_before(
-        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
-    ) -> Optional[dict[str, Any]]:
-        """Return the newest snapshot generated before a causal cutoff.
-
-        This is an artifact-generation query only.  Consumers that need the
-        forecast which was current at the cutoff must use :meth:`current_at`.
-        """
-
-        with self.database.session() as session:
-            row = session.execute(select(ForecastSnapshot).where(
-                ForecastSnapshot.participant_id == participant_id,
-                ForecastSnapshot.local_date == local_date,
-                ForecastSnapshot.generated_at < timestamp,
-            ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
-            return self._view(row) if row is not None else None
 
     def current_at(
         self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
@@ -3503,18 +3467,6 @@ class WarningScheduleRepository:
                 WarningSchedule.local_date == local_date,
                 WarningSchedule.status.in_(("sent", "escalated")),
             )).all())
-
-    def latest_successful_delivery(
-        self, participant_id: uuid.UUID, local_date: date
-    ) -> datetime | None:
-        with self.database.session() as session:
-            row = session.execute(select(WarningSchedule).where(
-                WarningSchedule.participant_id == participant_id,
-                WarningSchedule.local_date == local_date,
-                WarningSchedule.status.in_(("sent", "escalated")),
-                WarningSchedule.sent_at.is_not(None),
-            ).order_by(desc(WarningSchedule.sent_at)).limit(1)).scalar_one_or_none()
-            return self._aware(row.sent_at) if row is not None else None
 
     def pending(self, now: datetime, *, limit: int = 100) -> list[dict[str, Any]]:
         now = self._aware(now)

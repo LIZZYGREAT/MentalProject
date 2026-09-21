@@ -35,16 +35,6 @@ from app.models import (
 ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
 QUEUEABLE_STATUSES = {"pending_confirmation", "partial_failed"}
 EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
-DRAFT_FILLABLE_CONTEXT_FIELDS = {
-    "semester_start_date",
-    "period_time_mapping",
-    "weekday",
-    "week_rule",
-    "actual_time",
-}
-# Kept as a compatibility alias for callers that imported the old name. These
-# fields are all draft-fillable; none of them authorizes a Calendar mutation.
-INTERACTIVE_CONTEXT_FIELDS = DRAFT_FILLABLE_CONTEXT_FIELDS
 PROVIDER_EFFECT_STATUSES = frozenset({
     "creating",
     "created",
@@ -1566,55 +1556,6 @@ class CourseScheduleImportRepository:
             result["already_cancelled"] = False
             return result
 
-    def mark_create_cancelled(
-        self,
-        import_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> int:
-        cancelled_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
-            )
-            if row is None:
-                return 0
-            changed = 0
-            for write in session.execute(
-                select(CourseScheduleImportWrite).where(
-                    CourseScheduleImportWrite.import_id == row.id,
-                    CourseScheduleImportWrite.status == "planned",
-                )
-            ).scalars():
-                write.status = "create_cancelled"
-                write.error_code = "cancelled_before_dispatch"
-                write.updated_at = cancelled_at
-                changed += 1
-            self._finalize_cancellation_locked(session, row, cancelled_at)
-            session.flush()
-            return changed
-
-    def materialize_compensation_targets(
-        self,
-        participant_id: uuid.UUID,
-        import_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> list[dict[str, Any]]:
-        materialized_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
-            )
-            self._require_owner(row, participant_id)
-            assert row is not None
-            targets = self._materialize_compensation_targets(
-                session, row, materialized_at
-            )
-            self._finalize_cancellation_locked(session, row, materialized_at)
-            session.flush()
-            return [self._compensation_view(target) for target in targets]
-
     def claim_next_compensation(
         self, *, now: datetime | None = None
     ) -> dict[str, Any] | None:
@@ -1704,42 +1645,6 @@ class CourseScheduleImportRepository:
                     "import_status": parent.status,
                 }
             return None
-
-    def claim_compensation_target(
-        self,
-        target_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        claimed_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            target = session.get(
-                CourseScheduleImportCompensation,
-                uuid.UUID(str(target_id)),
-                with_for_update=True,
-            )
-            if target is None or target.status not in {
-                "delete_pending", "delete_outcome_unknown"
-            }:
-                return None
-            parent = session.get(
-                CourseScheduleImport, target.import_id, with_for_update=True
-            )
-            if parent is None or parent.status not in COMPENSATION_PARENT_STATUSES:
-                return None
-            if self._has_active_create_attempt(session, parent, claimed_at):
-                return None
-            target.delete_started_at = target.delete_started_at or claimed_at
-            target.delete_claim_expires_at = claimed_at + timedelta(
-                seconds=self.run_lease_seconds
-            )
-            target.attempt_count = int(target.attempt_count or 0) + 1
-            target.updated_at = claimed_at
-            if target.status == "delete_pending":
-                target.status = "deleting"
-                target.error_code = None
-            session.flush()
-            return self._compensation_view(target)
 
     def record_delete_success(
         self,
@@ -2222,28 +2127,6 @@ class CourseScheduleImportRepository:
                 return False
             self._set_run_lease(row, claimed_at)
             return True
-
-    def finish_item(
-        self,
-        import_id: uuid.UUID | str,
-        item_id: uuid.UUID | str,
-        *,
-        calendar_event_id: str | None = None,
-        error_code: str | None = None,
-    ) -> None:
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImportItem, uuid.UUID(str(item_id)), with_for_update=True
-            )
-            if row is None or row.import_id != uuid.UUID(str(import_id)):
-                return
-            if error_code:
-                row.status = "failed"
-                row.error_code = str(error_code)[:128]
-            else:
-                row.status = "succeeded"
-                row.calendar_event_id = str(calendar_event_id or "")[:256] or None
-                row.error_code = None
 
     def finalize(self, import_id: uuid.UUID | str) -> dict[str, Any]:
         with self.database.session() as session:

@@ -17,9 +17,6 @@ from app.models import (
 )
 
 
-_EVENT_FIELDS = ("event_type", "resource_kind", "resource_id", "state", "summary")
-
-
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 

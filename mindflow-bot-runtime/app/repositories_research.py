@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import uuid
-from typing import Any, Iterable
+from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.contracts.research import ResearchEvidenceItem
 from app.db import Database
@@ -77,18 +77,6 @@ class ResearchRepository:
             elif row.participant_id != participant_id:
                 raise ValueError("research evidence is participant-bound")
             return self._view(row)
-
-    def list_fresh(self, participant_id: uuid.UUID, *, topic_label: str | None = None, now: datetime | None = None, limit: int = 30) -> list[dict[str, Any]]:
-        instant = _aware(now or utc_now())
-        with self.database.session() as session:
-            query = select(ResearchEvidence).where(
-                ResearchEvidence.participant_id == participant_id,
-                ResearchEvidence.expires_at > instant,
-            )
-            if topic_label:
-                query = query.where(ResearchEvidence.topic_label == topic_label)
-            rows = session.execute(query.order_by(ResearchEvidence.retrieved_at.desc()).limit(max(1, min(int(limit), 30)))).scalars().all()
-            return [self._view(row) for row in rows]
 
     def purge_expired(self, *, now: datetime | None = None) -> int:
         instant = _aware(now or utc_now())

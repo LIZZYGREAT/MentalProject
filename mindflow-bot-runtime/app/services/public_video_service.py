@@ -12,7 +12,6 @@ from app.contracts.public_video import (
     VideoProviderError,
     VideoTranscriptDocument,
     metadata_as_dict,
-    transcript_as_dict,
 )
 
 
