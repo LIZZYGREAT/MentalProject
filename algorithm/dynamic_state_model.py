@@ -1240,22 +1240,6 @@ def step_uncertainty(
     )
 
 
-def assimilate_observation(
-    state: LatentState,
-    observation: Mapping[str, Any],
-) -> LatentState:
-    """Compatibility wrapper for one uncertainty-aware EMA state update."""
-
-    updated, _ = assimilate_observation_with_uncertainty(
-        state,
-        initialize_uncertainty({}, "m3"),
-        observation,
-        config={},
-        model_variant="m3",
-    )
-    return updated
-
-
 def assimilate_observation_with_uncertainty(
     state: LatentState,
     uncertainty: LatentUncertainty,
