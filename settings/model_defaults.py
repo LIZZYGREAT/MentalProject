@@ -1,12 +1,12 @@
 """Centralized defaults and symbolic constants for the local simulator.
 
 This module is the single home for values that used to appear as implicit
-fallbacks in unrelated modules. The runtime model parameters still live in
+fallbacks in unrelated modules. The runtime model parameters live in
 ``entry.config.GLOBAL_DEFAULT_CONFIG``; these constants describe application
-boundaries, state names, event classes, and compatibility aliases.
+boundaries, state names and event classes.
 """
 
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict
 
 DEFAULT_DATE_FORMAT = "%Y-%m-%d"
 DEFAULT_TIME_FORMAT = "%H:%M"
@@ -18,9 +18,6 @@ DEFAULT_EVENT_END = "09:00"
 DEFAULT_UNKNOWN_EVENT_NAME = "未知事件"
 
 DEFAULT_TIME_STEP_MINUTES = 5
-DEFAULT_RANDOM_SEED = 42
-DEFAULT_INITIAL_STRESS = 50.0
-DEFAULT_STRESS_THRESHOLD = 70.0
 DEFAULT_INITIAL_VITALITY = 72.0
 # Compatibility alias: public payloads still expose ``E`` while the model and
 # UI describe it as subjective vitality rather than a physiological reserve.
@@ -43,29 +40,17 @@ DEFAULT_COURSE_PROFILE = {
 
 DEFAULT_TASK_TYPE = "general"
 
-# Compatibility aliases keep older callers working while the public config uses
-# clearer names. Values are resolved by ``settings.parameter_store.get_param``.
-ParamAlias = Union[str, Tuple[str, str]]
-PARAM_ALIASES: Dict[str, ParamAlias] = {
-    "base_task_drain": "task_base_drain",
-    "fatigue_acceleration_k": "fatigue_acceleration",
-    "gym_epoc_rate": ("event_gym", "epoc_rate"),
-}
-
+# Last-resort values for ``settings.parameter_store.get_param``.  They mirror
+# ``GLOBAL_DEFAULT_CONFIG`` and only cover the keys the runtime reads; every one
+# of them is present in the global config, so this map currently never changes
+# an answer.  It is retained as a defensive net for sparse caller-supplied
+# ``params`` and is locked by ``tests/test_parameter_store.py``.
+#
+# ``ctssm_params`` is deliberately absent: an empty-dict fallback would look
+# harmless while silently dropping the whole CTSSM coefficient block.  Callers
+# that read it pass their own ``{}`` default AND merge the global block.
 PARAM_FALLBACKS: Dict[str, Any] = {
     "time_step": DEFAULT_TIME_STEP_MINUTES,
-    "random_seed": DEFAULT_RANDOM_SEED,
-    "S_star_init": DEFAULT_INITIAL_STRESS,
-    "S_threshold": DEFAULT_STRESS_THRESHOLD,
+    "model_family": "stress-ctssm.m0",
     "E_critical": DEFAULT_ENERGY_CRITICAL,
-    "default_wake_time": DEFAULT_WAKE_TIME,
-    "default_sleep_time": DEFAULT_SLEEP_TIME,
-    "course_base_drain": 5.5,
-    "task_base_drain": 5.0,
-    "fatigue_acceleration": 0.15,
-    "K_resilience": 1.0,
-    "Z_awake": 0.5,
-    "Z_factor": 0.5,
-    "D_t_course": 0.80,
-    "D_t_task": 0.55,
 }
