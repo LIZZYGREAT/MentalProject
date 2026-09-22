@@ -73,3 +73,15 @@ manual, evaluate Gate A:
 
 The gate writes an auditable PASS/FAIL result. Missing AI-A/B/C/Human records,
 analysis outputs, construct decisions, or the revised manual are blocking.
+
+After the 96-scenario blind round, evaluate Gate B and then freeze only if every
+required artifact exists:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli evaluate-semantic-gate
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli freeze-representation --manual-version 1.0 --scenario-version 1.0
+```
+
+The freeze command validates prior gates, the final manual, 72 Main + 24 Edge
+scenarios, formal Gold coverage, and final construct decisions. It will not
+overwrite an existing versioned manifest.

@@ -95,6 +95,54 @@ def _manual_gate_command(args: argparse.Namespace) -> int:
     return 0 if result.status == "PASS" else 2
 
 
+def _semantic_gate_command(args: argparse.Namespace) -> int:
+    from .gates import evaluate_semantic_reliability, write_gate_result
+
+    root = Path(__file__).resolve().parent
+    result = evaluate_semantic_reliability(
+        main_scenarios_path=args.main_scenarios or root / "scenarios" / "main.jsonl",
+        edge_scenarios_path=args.edge_scenarios or root / "scenarios" / "edge.jsonl",
+        annotations_dir=args.annotations_dir or root / "annotations" / "validation",
+        analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "validation",
+    )
+    output = args.output or root / "manifests" / "gate_b_semantic_reliability.json"
+    write_gate_result(output, result)
+    print(f"{result.status}: SEMANTIC_RELIABILITY ({len(result.blocking_reasons)} blocker(s)); result={output}")
+    for reason in result.blocking_reasons:
+        print(f"- {reason}")
+    return 0 if result.status == "PASS" else 2
+
+
+def _freeze_command(args: argparse.Namespace) -> int:
+    from .freeze import FreezeBlockedError, freeze_representation
+
+    root = Path(__file__).resolve().parent
+    repository_root = root.parents[1]
+    try:
+        manifest = freeze_representation(
+            repository_root=repository_root,
+            gate_a_path=args.gate_a or root / "manifests" / "gate_a_manual_ready.json",
+            gate_b_path=args.gate_b or root / "manifests" / "gate_b_semantic_reliability.json",
+            manual_path=args.manual or root / "manuals" / "coding_manual_v1.0.md",
+            main_scenarios_path=args.main_scenarios or root / "scenarios" / "main.jsonl",
+            edge_scenarios_path=args.edge_scenarios or root / "scenarios" / "edge.jsonl",
+            gold_path=args.gold or root / "adjudication" / "gold.jsonl",
+            revision_log_path=args.revision_log or root / "adjudication" / "representation_revision_log.jsonl",
+            field_metrics_path=args.field_metrics or root / "analysis" / "outputs" / "validation" / "field_metrics.csv",
+            critical_violation_report_path=args.critical_violations or root / "analysis" / "outputs" / "validation" / "critical_violations.jsonl",
+            output_path=args.output or root / "manifests" / "representation_semantics_v1.0.json",
+            representation_version=args.representation_version,
+            manual_version=args.manual_version,
+            scenario_version=args.scenario_version,
+            gold_version=args.gold_version,
+        )
+    except (FreezeBlockedError, OSError, ValueError) as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    print(f"PASS: froze Representation Semantics {manifest['representation_version']}")
+    return 0
+
+
 def _add_analysis_parser(
     subparsers: argparse._SubParsersAction,
     name: str,
@@ -205,6 +253,35 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--revision-log", type=Path)
     gate.add_argument("--output", type=Path)
     gate.set_defaults(handler=_manual_gate_command)
+
+    semantic_gate = subparsers.add_parser(
+        "evaluate-semantic-gate", help="evaluate Gate B after blind validation"
+    )
+    semantic_gate.add_argument("--main-scenarios", type=Path)
+    semantic_gate.add_argument("--edge-scenarios", type=Path)
+    semantic_gate.add_argument("--annotations-dir", type=Path)
+    semantic_gate.add_argument("--analysis-dir", type=Path)
+    semantic_gate.add_argument("--output", type=Path)
+    semantic_gate.set_defaults(handler=_semantic_gate_command)
+
+    freeze = subparsers.add_parser(
+        "freeze-representation", help="create the immutable v1.0 manifest after all gates pass"
+    )
+    freeze.add_argument("--gate-a", type=Path)
+    freeze.add_argument("--gate-b", type=Path)
+    freeze.add_argument("--manual", type=Path)
+    freeze.add_argument("--main-scenarios", type=Path)
+    freeze.add_argument("--edge-scenarios", type=Path)
+    freeze.add_argument("--gold", type=Path)
+    freeze.add_argument("--revision-log", type=Path)
+    freeze.add_argument("--field-metrics", type=Path)
+    freeze.add_argument("--critical-violations", type=Path)
+    freeze.add_argument("--output", type=Path)
+    freeze.add_argument("--representation-version", default="1.0")
+    freeze.add_argument("--manual-version", default="1.0")
+    freeze.add_argument("--scenario-version", default="1.0")
+    freeze.add_argument("--gold-version", default="1.0")
+    freeze.set_defaults(handler=_freeze_command)
     return parser
 
 

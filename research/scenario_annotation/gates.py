@@ -169,3 +169,153 @@ def write_gate_result(path: str | Path, result: GateResult) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
+def evaluate_semantic_reliability(
+    *,
+    main_scenarios_path: str | Path,
+    edge_scenarios_path: str | Path,
+    annotations_dir: str | Path,
+    analysis_dir: str | Path,
+) -> GateResult:
+    main_scenarios_path = Path(main_scenarios_path)
+    edge_scenarios_path = Path(edge_scenarios_path)
+    analysis_dir = Path(analysis_dir)
+
+    def corpus_check() -> tuple[bool, str]:
+        main = Validator().validate_paths([main_scenarios_path], "scenario")
+        edge = Validator().validate_paths([edge_scenarios_path], "scenario")
+        passed = main.ok and edge.ok and main.checked == 72 and edge.checked == 24
+        return passed, f"main={main.checked}/72 valid={main.ok}; edge={edge.checked}/24 valid={edge.ok}"
+
+    def annotation_check() -> tuple[bool, str]:
+        documents = load_annotation_documents(annotations_dir, validate=True)
+        annotators = {str(document["annotator_id"]) for document in documents}
+        versions = {str(document["manual_version"]) for document in documents}
+        rounds = {str(document["annotation_round"]) for document in documents}
+        scenario_ids = {str(document["scenario_id"]) for document in documents}
+        missing = sorted(PRIMARY_ANNOTATORS - annotators)
+        passed = not missing and versions == {"1.0"} and rounds <= {"VALIDATION", "REANNOTATION"}
+        return passed, (
+            f"annotators={sorted(annotators)}; missing={missing}; manual_versions={sorted(versions)}; "
+            f"rounds={sorted(rounds)}; annotated_scenarios={len(scenario_ids)}"
+        )
+
+    def metrics_check() -> tuple[bool, str]:
+        metrics_path = analysis_dir / "field_metrics.csv"
+        import csv
+
+        with metrics_path.open("r", encoding="utf-8", newline="") as stream:
+            metrics = list(csv.DictReader(stream))
+        blocked = [
+            row["field"]
+            for row in metrics
+            if row.get("freeze_status") in {"RECONSIDER", "INSUFFICIENT_DATA"}
+        ]
+        passed = bool(metrics) and not blocked
+        return passed, f"field_count={len(metrics)}; blocked_fields={blocked}"
+
+    def violation_check() -> tuple[bool, str]:
+        rates = json.loads((analysis_dir / "critical_violation_rates.json").read_text(encoding="utf-8"))
+        nonzero = {
+            name: value.get("rate")
+            for name, value in rates.items()
+            if float(value.get("rate", 0)) > 0
+        }
+        return not nonzero, f"nonzero_critical_violation_rates={nonzero}"
+
+    def outputs_check() -> tuple[bool, str]:
+        required = {
+            "field_metrics.csv",
+            "critical_violation_rates.json",
+            "orthogonality.jsonl",
+            "disagreement_queue.jsonl",
+            "disagreement_report.md",
+            "scenario_annotation_report.md",
+        }
+        present = {path.name for path in analysis_dir.iterdir()} if analysis_dir.exists() else set()
+        missing = sorted(required - present)
+        return not missing, f"missing_analysis_outputs={missing}"
+
+    checks = (
+        _check("formal_corpus_schema_and_count", corpus_check),
+        _check("blind_independent_annotations", annotation_check),
+        _check("field_level_reliability", metrics_check),
+        _check("critical_violation_rates", violation_check),
+        _check("validation_analysis_outputs", outputs_check),
+    )
+    blockers = tuple(check.detail for check in checks if not check.passed)
+    return GateResult(
+        gate="SEMANTIC_RELIABILITY",
+        status="PASS" if not blockers else "FAIL",
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+        checks=checks,
+        blocking_reasons=blockers,
+    )
+
+
+def evaluate_representation_freeze(
+    *,
+    gate_a_path: str | Path,
+    gate_b_path: str | Path,
+    manual_path: str | Path,
+    main_scenarios_path: str | Path,
+    edge_scenarios_path: str | Path,
+    gold_path: str | Path,
+    revision_log_path: str | Path,
+) -> GateResult:
+    gate_a_path = Path(gate_a_path)
+    gate_b_path = Path(gate_b_path)
+    manual_path = Path(manual_path)
+    main_scenarios_path = Path(main_scenarios_path)
+    edge_scenarios_path = Path(edge_scenarios_path)
+    gold_path = Path(gold_path)
+    revision_log_path = Path(revision_log_path)
+
+    def prior_gates_check() -> tuple[bool, str]:
+        values = [json.loads(path.read_text(encoding="utf-8")) for path in (gate_a_path, gate_b_path)]
+        statuses = {value.get("gate"): value.get("status") for value in values}
+        passed = statuses == {"MANUAL_READY": "PASS", "SEMANTIC_RELIABILITY": "PASS"}
+        return passed, f"prior_gate_statuses={statuses}"
+
+    def manual_check() -> tuple[bool, str]:
+        text = manual_path.read_text(encoding="utf-8")
+        passed = "v1.0" in text and "candidate" not in text.lower()
+        return passed, f"final_manual={manual_path}; final_marker={passed}"
+
+    def gold_check() -> tuple[bool, str]:
+        result = Validator().validate_paths([gold_path], "adjudication")
+        rows = load_jsonl(gold_path)
+        formal_ids = {
+            str(row["scenario_id"])
+            for path in (main_scenarios_path, edge_scenarios_path)
+            for row in load_jsonl(path)
+        }
+        gold_ids = {str(row["scenario_id"]) for row in rows}
+        missing = sorted(formal_ids - gold_ids)
+        passed = result.ok and len(formal_ids) == 96 and not missing
+        return passed, f"schema_valid={result.ok}; formal_scenarios={len(formal_ids)}; missing_gold_scenarios={missing}"
+
+    def decision_check() -> tuple[bool, str]:
+        result = Validator().validate_paths([revision_log_path], "revision-log")
+        rows = load_jsonl(revision_log_path)
+        unresolved_revision = [row["construct"] for row in rows if row.get("decision") == "REVISE"]
+        constructs = {str(row["construct"]) for row in rows}
+        missing = sorted(MANUAL_GATE_CONSTRUCTS - constructs)
+        passed = result.ok and not unresolved_revision and not missing
+        return passed, f"schema_valid={result.ok}; unresolved_revise={unresolved_revision}; missing={missing}"
+
+    checks = (
+        _check("prior_gates", prior_gates_check),
+        _check("coding_manual_v1_final", manual_check),
+        _check("adjudicated_reference_set", gold_check),
+        _check("final_construct_decisions", decision_check),
+    )
+    blockers = tuple(check.detail for check in checks if not check.passed)
+    return GateResult(
+        gate="REPRESENTATION_FREEZE",
+        status="PASS" if not blockers else "FAIL",
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+        checks=checks,
+        blocking_reasons=blockers,
+    )
