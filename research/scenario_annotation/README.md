@@ -27,6 +27,10 @@ Run commands from the repository root with the project interpreter:
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli --help
 ```
 
+The isolated package dependencies used by CI are pinned in `requirements.txt`
+and `requirements-dev.txt`; they do not install or start the production runtime,
+PostgreSQL, or the bot service.
+
 Validate a scenario file:
 
 ```powershell
@@ -37,6 +41,12 @@ Run the package tests:
 
 ```powershell
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m pytest research/scenario_annotation/tests -q -p no:cacheprovider
+```
+
+Verify that committed generated artifacts match a clean regeneration:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli check-deterministic-artifacts
 ```
 
 Later sections document assignment, analysis, reporting, and freeze commands once

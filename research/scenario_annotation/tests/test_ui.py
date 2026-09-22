@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import pytest
-from starlette.testclient import TestClient
 
 from research.scenario_annotation.drafts import MODULE_VARIABLES, export_annotations
 from research.scenario_annotation.loader import load_jsonl
@@ -13,6 +14,12 @@ from research.scenario_annotation.validation import Validator
 
 
 PACKAGE_ROOT = Path(__file__).parents[1]
+
+
+async def _request(app, method: str, url: str, **kwargs) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.request(method, url, **kwargs)
 
 
 def _valid_module_b_payload(scenario: dict) -> dict:
@@ -52,22 +59,21 @@ def test_annotation_ui_cannot_access_hidden_metadata(tmp_path: Path) -> None:
         for forbidden in ("hidden", "ai_a", "ai_b", "ai_c", "gold", "analysis")
     )
 
-    with TestClient(app) as client:
-        state = client.get("/api/state")
-        assert state.status_code == 200
-        scenario_id = state.json()["modules"]["A"]["items"][0]["scenario_id"]
-        response = client.get(f"/api/scenario/A/{scenario_id}")
-        assert response.status_code == 200
-        serialized = json.dumps(response.json()).lower()
-        for forbidden in (
-            "coverage_tags",
-            "pair_design",
-            "anchor_reference",
-            "expected_labels",
-            "gold_label",
-        ):
-            assert forbidden not in serialized
-        assert client.get("/api/scenario/A/not_assigned").status_code == 404
+    state = asyncio.run(_request(app, "GET", "/api/state"))
+    assert state.status_code == 200
+    scenario_id = state.json()["modules"]["A"]["items"][0]["scenario_id"]
+    response = asyncio.run(_request(app, "GET", f"/api/scenario/A/{scenario_id}"))
+    assert response.status_code == 200
+    serialized = json.dumps(response.json()).lower()
+    for forbidden in (
+        "coverage_tags",
+        "pair_design",
+        "anchor_reference",
+        "expected_labels",
+        "gold_label",
+    ):
+        assert forbidden not in serialized
+    assert asyncio.run(_request(app, "GET", "/api/scenario/A/not_assigned")).status_code == 404
 
 
 def test_annotation_ui_saves_schema_valid_draft(tmp_path: Path) -> None:
@@ -76,10 +82,14 @@ def test_annotation_ui_saves_schema_valid_draft(tmp_path: Path) -> None:
     store = app.state.annotation_store
     scenario = store.scenarios["B"]["CAL_019"]
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/draft/B/CAL_019", json=_valid_module_b_payload(scenario)
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/api/draft/B/CAL_019",
+            json=_valid_module_b_payload(scenario),
         )
+    )
     assert response.status_code == 200, response.text
     draft = response.json()
     assert draft["status"] == "COMPLETE"
