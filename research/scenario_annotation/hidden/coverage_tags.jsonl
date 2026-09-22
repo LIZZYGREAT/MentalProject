@@ -1,0 +1,24 @@
+{"coverage_tags": ["COURSE", "LIFECYCLE", "SCHEDULED_VS_REALIZED", "BOUNDARY_UNKNOWN"], "scenario_id": "CAL_001"}
+{"coverage_tags": ["COURSE", "LIFECYCLE", "SCHEDULED_VS_REALIZED", "BOUNDARY_UNKNOWN"], "scenario_id": "CAL_002"}
+{"coverage_tags": ["COURSE", "PARTIAL", "ACTUAL_INTERVAL", "SINGLE_EXPOSURE"], "scenario_id": "CAL_003"}
+{"coverage_tags": ["COURSE", "PARTIAL", "ACTUAL_INTERVAL", "SINGLE_EXPOSURE"], "scenario_id": "CAL_004"}
+{"coverage_tags": ["COURSE", "PARTIAL", "FRACTION_ONLY", "SINGLE_EXPOSURE"], "scenario_id": "CAL_005"}
+{"coverage_tags": ["COURSE", "PARTIAL", "FRACTION_ONLY", "SINGLE_EXPOSURE"], "scenario_id": "CAL_006"}
+{"coverage_tags": ["COURSE", "SKIPPED", "MISSED_NOT_OBLIGATION", "ANCHOR"], "scenario_id": "CAL_007"}
+{"coverage_tags": ["COURSE", "SKIPPED", "MISSED_NOT_OBLIGATION", "ANCHOR"], "scenario_id": "CAL_008"}
+{"coverage_tags": ["COURSE", "TASK", "OBLIGATION", "MISSED_WITH_CATCHUP"], "scenario_id": "CAL_009"}
+{"coverage_tags": ["TASK", "OPEN", "OBLIGATION"], "scenario_id": "CAL_010"}
+{"coverage_tags": ["TASK", "IN_PROGRESS", "OBLIGATION"], "scenario_id": "CAL_011"}
+{"coverage_tags": ["TASK", "BLOCKED", "DEPENDENCY", "CROSS_LAYER_TRAP"], "scenario_id": "CAL_012"}
+{"coverage_tags": ["TASK", "OVERDUE", "OBLIGATION_CONTINUES"], "scenario_id": "CAL_013"}
+{"coverage_tags": ["TASK", "PARENT_CHILD", "ACTIVE_LEAF", "DOUBLE_COUNT_TRAP"], "scenario_id": "CAL_014"}
+{"coverage_tags": ["WEEKEND", "FREE_TIME", "RECOVERY_TRAP"], "scenario_id": "CAL_015"}
+{"coverage_tags": ["RECOVERY", "OCCURRENCE", "F_REC_NO_EVIDENCE"], "scenario_id": "CAL_016"}
+{"coverage_tags": ["RECOVERY", "F_REC", "EVENT_CLASS_EVIDENCE"], "scenario_id": "CAL_017"}
+{"coverage_tags": ["D_POT", "C_EXEC", "FORBIDDEN_INFERENCE"], "scenario_id": "CAL_018"}
+{"coverage_tags": ["D_POT", "C_EXEC", "MINIMAL_CONTRAST"], "scenario_id": "CAL_019"}
+{"coverage_tags": ["IMPORTANCE", "OBJECTIVE_STAKES", "FORBIDDEN_INFERENCE"], "scenario_id": "CAL_020"}
+{"coverage_tags": ["C_EXEC", "C_OUT", "APPRAISAL_BOUNDARY"], "scenario_id": "CAL_021"}
+{"coverage_tags": ["U_CONTEXT", "U_PERC", "TASK_HELP", "BOT"], "scenario_id": "CAL_022"}
+{"coverage_tags": ["U_CONTEXT", "U_PERC", "EMOTIONAL_SUPPORT", "COPING_SUPPORT", "SEEN"], "scenario_id": "CAL_023"}
+{"coverage_tags": ["KNOWN_AT", "FUTURE_LEAKAGE", "BOT_RELEVANCE", "REVISION_TIMING", "RECOVERY_SUGGESTION"], "scenario_id": "CAL_024"}

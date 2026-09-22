@@ -9,6 +9,19 @@ from typing import Sequence
 from .validation import Validator
 
 
+def _build_corpus_command(args: argparse.Namespace) -> int:
+    from .corpus import write_calibration
+
+    if args.corpus_set != "calibration":
+        raise ValueError(f"unsupported corpus set: {args.corpus_set}")
+    counts = write_calibration(args.output_root)
+    print(
+        "PASS: wrote calibration corpus "
+        f"({counts['scenarios']} scenarios, {counts['pairs']} pairs, {counts['anchors']} anchors)"
+    )
+    return 0
+
+
 def _validation_command(args: argparse.Namespace) -> int:
     result = Validator(args.schema_dir).validate_paths(args.paths, args.artifact_type)
     for issue in result.issues:
@@ -39,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
             "appraisal-annotation",
             "bot-annotation",
             "pair-design",
+            "anchor-reference",
+            "coverage-tags",
             "adjudication",
             "freeze-manifest",
         ),
@@ -60,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_annotations.add_argument("paths", nargs="+", type=Path)
     validate_annotations.set_defaults(handler=_validate_annotations)
+
+    build_corpus = subparsers.add_parser(
+        "build-corpus", help="write a deterministic visible/hidden scenario corpus"
+    )
+    build_corpus.add_argument("--set", dest="corpus_set", choices=("calibration",), required=True)
+    build_corpus.add_argument(
+        "--output-root", type=Path, default=Path(__file__).resolve().parent
+    )
+    build_corpus.set_defaults(handler=_build_corpus_command)
     return parser
 
 

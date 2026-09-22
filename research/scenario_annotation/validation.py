@@ -63,6 +63,8 @@ class Validator:
             "appraisal-annotation": "appraisal_annotation.schema.json",
             "bot-annotation": "bot_annotation.schema.json",
             "pair-design": "pair_design.schema.json",
+            "anchor-reference": "anchor_reference.schema.json",
+            "coverage-tags": "coverage_tags.schema.json",
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
         }

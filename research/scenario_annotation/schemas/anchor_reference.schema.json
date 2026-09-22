@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/anchor-reference-v1.json",
+  "title": "MindFlow Stage 1 Calibration Design Anchor",
+  "type": "object",
+  "required": ["anchor_id", "scenario_id", "target_ref", "variable", "intended_label", "rationale", "reference_type", "is_gold"],
+  "properties": {
+    "anchor_id": {"type": "string", "minLength": 1},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "target_ref": {"type": "string", "minLength": 1},
+    "variable": {"type": "string", "minLength": 1},
+    "intended_label": {"type": ["string", "number"]},
+    "rationale": {"type": "string", "minLength": 1},
+    "reference_type": {"const": "DESIGN_ANCHOR"},
+    "is_gold": {"const": false}
+  },
+  "additionalProperties": false
+}

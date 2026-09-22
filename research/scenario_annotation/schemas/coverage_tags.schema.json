@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/coverage-tags-v1.json",
+  "title": "MindFlow Stage 1 Hidden Coverage Tags",
+  "type": "object",
+  "required": ["scenario_id", "coverage_tags"],
+  "properties": {
+    "scenario_id": {"type": "string", "minLength": 1},
+    "coverage_tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "additionalProperties": false
+}
