@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
+import re
 from typing import Any, Iterable, Mapping
+import unicodedata
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -37,6 +39,28 @@ COURSE_PERIOD_ENDS = {
     time(13, 40), time(14, 45), time(15, 40), time(16, 45), time(17, 40),
     time(19, 15), time(20, 10), time(21, 15), time(22, 10),
 }
+
+EVENT_SUBTYPES = {
+    "COURSE": {"lecture", "lab", "seminar", "course_presentation"},
+    "TASK": {"assignment", "exam_preparation", "report", "paper", "research_task", "project", "administrative"},
+    "STRUCTURED_EVENT": {"meeting", "presentation", "interview", "competition", "appointment"},
+    "RECOVERY_ACTIVITY": {"exercise", "leisure", "walk", "entertainment", "social_recovery", "meal_break", "short_rest"},
+}
+
+LIFECYCLES = {
+    "COURSE": {"SCHEDULED", "ATTENDED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
+    "TASK": {"PLANNED", "OPEN", "IN_PROGRESS", "BLOCKED", "COMPLETED", "CANCELLED", "OVERDUE", "SUPERSEDED", "UNKNOWN"},
+    "RECOVERY_ACTIVITY": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
+    "SLEEP": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
+    "NAP": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
+    "STRUCTURED_EVENT": {"SCHEDULED", "OCCURRED", "PARTIAL", "CANCELLED", "UNKNOWN"},
+    "CONSEQUENCE_EVENT": {"OCCURRED", "UNKNOWN"},
+    "OTHER": {"SCHEDULED", "OCCURRED", "PARTIAL", "CANCELLED", "UNKNOWN"},
+    "UNKNOWN": {"UNKNOWN"},
+}
+
+DATETIME_FACTS = {"SCHEDULED_START", "SCHEDULED_END", "ACTUAL_START", "ACTUAL_END", "DEADLINE"}
+EFFORT_FACTS = {"ESTIMATED_TOTAL_EFFORT", "REMAINING_EFFORT"}
 
 
 @dataclass(frozen=True)
@@ -79,6 +103,7 @@ class Validator:
             "assignment-manifest": "assignment_manifest.schema.json",
             "revision-log": "revision_log.schema.json",
             "gate-result": "gate_result.schema.json",
+            "quality-thresholds": "quality_thresholds.schema.json",
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
         }
@@ -91,7 +116,14 @@ class Validator:
             raise ValueError(f"schema {name} is not an object")
         return schema
 
-    def validate_paths(self, paths: Iterable[str | Path], artifact_type: str) -> ValidationResult:
+    def validate_paths(
+        self,
+        paths: Iterable[str | Path],
+        artifact_type: str,
+        *,
+        scenarios: Mapping[str, Mapping[str, Any]] | None = None,
+        require_scenario_context: bool = False,
+    ) -> ValidationResult:
         schema = self._schema(artifact_type)
         schema_validator = Draft202012Validator(schema, format_checker=FormatChecker())
         issues: list[ValidationIssue] = []
@@ -107,7 +139,15 @@ class Validator:
                 if artifact_type == "scenario":
                     issues.extend(self._scenario_semantics(value, source))
                 elif artifact_type.endswith("annotation"):
-                    issues.extend(self._annotation_semantics(value, source))
+                    scenario = scenarios.get(str(value.get("scenario_id"))) if scenarios else None
+                    issues.extend(
+                        self._annotation_semantics(
+                            value,
+                            source,
+                            scenario=scenario,
+                            require_scenario_context=require_scenario_context,
+                        )
+                    )
         except ArtifactLoadError as exc:
             issues.append(ValidationIssue(str(next(iter(paths), "artifact")), "", str(exc), "LOAD"))
         return ValidationResult(checked=checked, issues=tuple(issues))
@@ -226,11 +266,69 @@ class Validator:
                     )
         return issues
 
-    def _annotation_semantics(self, document: Mapping[str, Any], source: str) -> list[ValidationIssue]:
+    def _annotation_semantics(
+        self,
+        document: Mapping[str, Any],
+        source: str,
+        *,
+        scenario: Mapping[str, Any] | None,
+        require_scenario_context: bool,
+    ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
-        for index, record in enumerate(document.get("records", [])):
-            if not isinstance(record, Mapping):
-                continue
+        if require_scenario_context and scenario is None:
+            issues.append(
+                ValidationIssue(
+                    source,
+                    "/scenario_id",
+                    "annotation scenario_id is not present in the supplied visible scenarios",
+                    "SCENARIO_CONTEXT_REQUIRED",
+                )
+            )
+
+        records = [record for record in document.get("records", []) if isinstance(record, Mapping)]
+        seen_ids: set[str] = set()
+        by_target: dict[str, dict[str, Any]] = {}
+        for index, record in enumerate(records):
+            annotation_id = str(record.get("annotation_id", ""))
+            if annotation_id in seen_ids:
+                issues.append(
+                    ValidationIssue(source, f"/records/{index}/annotation_id", "duplicate annotation_id", "DUPLICATE_ANNOTATION")
+                )
+            seen_ids.add(annotation_id)
+            target_ref = str(record.get("target_ref", ""))
+            variable = str(record.get("variable", ""))
+            if variable in by_target.setdefault(target_ref, {}):
+                issues.append(
+                    ValidationIssue(
+                        source,
+                        f"/records/{index}/variable",
+                        f"duplicate variable {variable!r} for target {target_ref!r}",
+                        "DUPLICATE_TARGET_VARIABLE",
+                    )
+                )
+            by_target[target_ref][variable] = record.get("label")
+
+            for field in ("scenario_id", "annotation_module", "annotator_id", "annotation_round", "manual_version"):
+                if record.get(field) != document.get(field):
+                    issues.append(
+                        ValidationIssue(
+                            source,
+                            f"/records/{index}/{field}",
+                            f"record {field} must match document {field}",
+                            "ENVELOPE_MISMATCH",
+                        )
+                    )
+            if scenario is not None and record.get("scenario_version") != scenario.get("scenario_version"):
+                issues.append(
+                    ValidationIssue(
+                        source,
+                        f"/records/{index}/scenario_version",
+                        "record scenario_version does not match visible scenario",
+                        "ENVELOPE_MISMATCH",
+                    )
+                )
+
+        for index, record in enumerate(records):
             label = record.get("label")
             if label in {"UNKNOWN", "NO_EVIDENCE", "AMBIGUOUS"} and not record.get("unknown_reason"):
                 issues.append(
@@ -263,6 +361,152 @@ class Validator:
                         "MISSING_PARTIAL_BASIS",
                     )
                 )
+            issues.extend(self._fact_label_semantics(record, source, index))
+
+        if document.get("annotation_module") == "A":
+            issues.extend(self._event_cross_field_semantics(by_target, source))
+        if scenario is not None:
+            issues.extend(self._evidence_integrity(document, records, scenario, source))
+        return issues
+
+    def _event_cross_field_semantics(
+        self, by_target: Mapping[str, Mapping[str, Any]], source: str
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for target_ref, values in by_target.items():
+            family = values.get("EVENT_FAMILY")
+            if "EVENT_SUBTYPE" in values:
+                subtype = values["EVENT_SUBTYPE"]
+                if family is None:
+                    issues.append(
+                        ValidationIssue(source, "/records", f"{target_ref}: EVENT_SUBTYPE requires EVENT_FAMILY in the same document", "CROSS_FIELD_REQUIRED")
+                    )
+                elif not _valid_subtype(str(family), subtype):
+                    issues.append(
+                        ValidationIssue(
+                            source,
+                            "/records",
+                            f"{target_ref}: subtype {subtype!r} is not valid for family {family!r}",
+                            "SUBTYPE_FAMILY_MISMATCH",
+                        )
+                    )
+            if "LIFECYCLE" in values:
+                lifecycle = values["LIFECYCLE"]
+                if family is None:
+                    issues.append(
+                        ValidationIssue(source, "/records", f"{target_ref}: LIFECYCLE requires EVENT_FAMILY in the same document", "CROSS_FIELD_REQUIRED")
+                    )
+                elif lifecycle not in LIFECYCLES.get(str(family), {"UNKNOWN"}):
+                    issues.append(
+                        ValidationIssue(
+                            source,
+                            "/records",
+                            f"{target_ref}: lifecycle {lifecycle!r} is not valid for family {family!r}",
+                            "LIFECYCLE_FAMILY_MISMATCH",
+                        )
+                    )
+        return issues
+
+    def _fact_label_semantics(
+        self, record: Mapping[str, Any], source: str, index: int
+    ) -> list[ValidationIssue]:
+        variable = record.get("variable")
+        label = record.get("label")
+        if variable in DATETIME_FACTS and label not in {"UNKNOWN", "N/A"}:
+            parsed = _parse_time(label)
+            if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+                return [
+                    ValidationIssue(
+                        source,
+                        f"/records/{index}/label",
+                        f"{variable} must be UNKNOWN, N/A, or a timezone-aware ISO datetime",
+                        "FACT_LABEL_TYPE",
+                    )
+                ]
+        if variable == "PROGRESS" and label not in {"UNKNOWN", "N/A"}:
+            if isinstance(label, bool) or not isinstance(label, (int, float)) or not 0 <= label <= 1:
+                return [
+                    ValidationIssue(
+                        source,
+                        f"/records/{index}/label",
+                        "PROGRESS must be UNKNOWN, N/A, or a number in [0, 1]",
+                        "FACT_LABEL_TYPE",
+                    )
+                ]
+        if variable in EFFORT_FACTS and label not in {"UNKNOWN", "N/A", "SMALL", "MEDIUM", "LARGE"}:
+            if isinstance(label, bool) or not isinstance(label, (int, float)) or label < 0:
+                return [
+                    ValidationIssue(
+                        source,
+                        f"/records/{index}/label",
+                        f"{variable} must be non-negative or use an allowed special label",
+                        "FACT_LABEL_TYPE",
+                    )
+                ]
+        return []
+
+    def _evidence_integrity(
+        self,
+        document: Mapping[str, Any],
+        records: list[Mapping[str, Any]],
+        scenario: Mapping[str, Any],
+        source: str,
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        visible_refs, evidence_items, target_refs = _visible_reference_index(scenario)
+        module = str(document.get("annotation_module"))
+        response_units = {
+            str(item.get("response_unit_ref")): item
+            for item in scenario.get("bot_response_units", [])
+            if isinstance(item, Mapping) and item.get("response_unit_ref")
+        }
+        for index, record in enumerate(records):
+            target_ref = str(record.get("target_ref", ""))
+            if target_ref not in target_refs:
+                issues.append(
+                    ValidationIssue(source, f"/records/{index}/target_ref", f"target_ref {target_ref!r} is not visible in this scenario", "INVALID_TARGET_REFERENCE")
+                )
+            refs = [str(ref) for ref in record.get("evidence_refs", [])]
+            missing = [ref for ref in refs if ref not in visible_refs]
+            if missing:
+                issues.append(
+                    ValidationIssue(source, f"/records/{index}/evidence_refs", f"evidence refs are not visible in this scenario: {missing}", "INVALID_EVIDENCE_REFERENCE")
+                )
+
+            label = record.get("label")
+            if module == "B" and label not in {"NO_EVIDENCE", "AMBIGUOUS"}:
+                if not refs:
+                    issues.append(
+                        ValidationIssue(source, f"/records/{index}/evidence_refs", "directional appraisal annotation requires at least one evidence_ref", "MISSING_EVIDENCE_REFERENCE")
+                    )
+                participant_items = [
+                    evidence_items[ref]
+                    for ref in refs
+                    if ref in evidence_items and evidence_items[ref].get("speaker") == "PARTICIPANT"
+                ]
+                span = str(record.get("evidence_span", ""))
+                if refs and (not participant_items or not any(_span_matches(span, str(item.get("text", ""))) for item in participant_items)):
+                    issues.append(
+                        ValidationIssue(source, f"/records/{index}/evidence_span", "evidence_span is not present in the cited participant evidence", "EVIDENCE_SPAN_MISMATCH")
+                    )
+
+            if module == "C":
+                response = response_units.get(target_ref)
+                sent_at = _parse_time(response.get("sent_at")) if response else None
+                for ref in refs:
+                    if ref == target_ref:
+                        continue
+                    item = evidence_items.get(ref)
+                    known_at = _parse_time(item.get("known_at")) if item else None
+                    if item is None or sent_at is None or known_at is None or known_at > sent_at:
+                        issues.append(
+                            ValidationIssue(
+                                source,
+                                f"/records/{index}/evidence_refs",
+                                f"Module C evidence {ref!r} was not known when {target_ref!r} was sent",
+                                "FUTURE_SUPPORT_EVIDENCE",
+                            )
+                        )
         return issues
 
 
@@ -282,6 +526,57 @@ def _parse_clock(value: Any) -> time | None:
         return time.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _valid_subtype(family: str, label: Any) -> bool:
+    if label in {"UNKNOWN", "N/A"}:
+        return True
+    if isinstance(label, str) and label.startswith("OTHER:") and label.partition(":")[2].strip():
+        return True
+    return label in EVENT_SUBTYPES.get(family, set())
+
+
+def _normalized_evidence_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    without_punctuation = "".join(
+        " " if unicodedata.category(character).startswith("P") else character
+        for character in normalized
+    )
+    return re.sub(r"\s+", "", without_punctuation)
+
+
+def _span_matches(span: str, evidence_text: str) -> bool:
+    normalized_span = _normalized_evidence_text(span)
+    return bool(normalized_span) and normalized_span in _normalized_evidence_text(evidence_text)
+
+
+def _visible_reference_index(
+    scenario: Mapping[str, Any],
+) -> tuple[set[str], dict[str, Mapping[str, Any]], set[str]]:
+    visible_refs = {str(ref) for ref in scenario.get("source_refs", [])}
+    evidence_items: dict[str, Mapping[str, Any]] = {}
+    target_refs: set[str] = set()
+    collections = (
+        ("recurring_course_context", "course_ref", False),
+        ("recent_context", "evidence_ref", False),
+        ("current_tasks", "event_ref", True),
+        ("focal_events", "event_ref", True),
+        ("observed_conversation_evidence", "evidence_ref", False),
+        ("bot_response_units", "response_unit_ref", True),
+    )
+    for collection_name, ref_field, is_target in collections:
+        for item in scenario.get(collection_name, []):
+            if not isinstance(item, Mapping) or not item.get(ref_field):
+                continue
+            ref = str(item[ref_field])
+            visible_refs.add(ref)
+            evidence_items[ref] = item
+            source_ref = item.get("source_ref")
+            if isinstance(source_ref, str):
+                visible_refs.add(source_ref)
+            if is_target:
+                target_refs.add(ref)
+    return visible_refs, evidence_items, target_refs
 
 
 def _walk_keys(value: Any, path: str = "") -> Iterable[tuple[str, str]]:

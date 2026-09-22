@@ -46,6 +46,8 @@ def test_critical_boundary_detectors_use_hidden_design_only_in_analysis(tmp_path
         "MissedCourseAutomaticObligationErrorRate",
         "TaskHelpAsSupportErrorRate",
         "PersonalizationAsEffectErrorRate",
+        "HiddenMetadataLeakageRate",
+        "InvalidEvidenceReferenceRate",
     }
 
 

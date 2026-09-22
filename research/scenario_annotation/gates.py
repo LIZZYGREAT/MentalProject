@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
@@ -119,7 +119,13 @@ def evaluate_manual_ready(
         return not missing, f"missing_required_tags={missing}"
 
     def annotation_check() -> tuple[bool, str]:
-        documents = load_annotation_documents(annotations_dir, validate=True)
+        scenarios = {str(row["scenario_id"]): row for row in load_jsonl(scenarios_path)}
+        documents = load_annotation_documents(
+            annotations_dir,
+            validate=True,
+            scenarios=scenarios,
+            require_scenario_context=True,
+        )
         annotators = {str(document["annotator_id"]) for document in documents}
         missing = sorted(PRIMARY_ANNOTATORS - annotators)
         return not missing, f"annotators={sorted(annotators)}; missing={missing}"
@@ -177,10 +183,15 @@ def evaluate_semantic_reliability(
     edge_scenarios_path: str | Path,
     annotations_dir: str | Path,
     analysis_dir: str | Path,
+    quality_thresholds_path: str | Path | None = None,
 ) -> GateResult:
     main_scenarios_path = Path(main_scenarios_path)
     edge_scenarios_path = Path(edge_scenarios_path)
     analysis_dir = Path(analysis_dir)
+    quality_thresholds_path = Path(
+        quality_thresholds_path
+        or Path(__file__).with_name("settings") / "quality_thresholds_v1.json"
+    )
 
     def corpus_check() -> tuple[bool, str]:
         main = Validator().validate_paths([main_scenarios_path], "scenario")
@@ -189,7 +200,17 @@ def evaluate_semantic_reliability(
         return passed, f"main={main.checked}/72 valid={main.ok}; edge={edge.checked}/24 valid={edge.ok}"
 
     def annotation_check() -> tuple[bool, str]:
-        documents = load_annotation_documents(annotations_dir, validate=True)
+        scenarios = {
+            str(row["scenario_id"]): row
+            for path in (main_scenarios_path, edge_scenarios_path)
+            for row in load_jsonl(path)
+        }
+        documents = load_annotation_documents(
+            annotations_dir,
+            validate=True,
+            scenarios=scenarios,
+            require_scenario_context=True,
+        )
         annotators = {str(document["annotator_id"]) for document in documents}
         versions = {str(document["manual_version"]) for document in documents}
         rounds = {str(document["annotation_round"]) for document in documents}
@@ -217,12 +238,16 @@ def evaluate_semantic_reliability(
 
     def violation_check() -> tuple[bool, str]:
         rates = json.loads((analysis_dir / "critical_violation_rates.json").read_text(encoding="utf-8"))
-        nonzero = {
-            name: value.get("rate")
-            for name, value in rates.items()
-            if float(value.get("rate", 0)) > 0
-        }
-        return not nonzero, f"nonzero_critical_violation_rates={nonzero}"
+        settings_result = Validator().validate_paths([quality_thresholds_path], "quality-thresholds")
+        if not settings_result.ok:
+            return False, "invalid quality threshold settings: " + "; ".join(
+                str(issue) for issue in settings_result.issues
+            )
+        settings = json.loads(quality_thresholds_path.read_text(encoding="utf-8"))
+        passed, exceeded = evaluate_violation_thresholds(rates, settings)
+        return passed, (
+            f"settings_version={settings['settings_version']}; exceeded_thresholds={exceeded}"
+        )
 
     def outputs_check() -> tuple[bool, str]:
         required = {
@@ -252,6 +277,26 @@ def evaluate_semantic_reliability(
         checks=checks,
         blocking_reasons=blockers,
     )
+
+
+def evaluate_violation_thresholds(
+    rates: Mapping[str, Mapping[str, Any]], settings: Mapping[str, Any]
+) -> tuple[bool, dict[str, dict[str, float | str]]]:
+    exceeded: dict[str, dict[str, float | str]] = {}
+    groups = (
+        ("HARD_PROTOCOL", settings.get("hard_protocol_max_rates", {})),
+        ("SEMANTIC_MISUNDERSTANDING", settings.get("semantic_misunderstanding_max_rates", {})),
+    )
+    for category, thresholds in groups:
+        for metric, maximum in thresholds.items():
+            actual = float(rates.get(metric, {}).get("rate", 0.0))
+            if actual > float(maximum):
+                exceeded[str(metric)] = {
+                    "category": category,
+                    "actual": actual,
+                    "maximum": float(maximum),
+                }
+    return not exceeded, exceeded
 
 
 def evaluate_representation_freeze(

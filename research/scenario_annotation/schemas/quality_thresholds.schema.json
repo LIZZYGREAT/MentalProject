@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/quality-thresholds-v1.json",
+  "title": "MindFlow Stage 1 Versioned Quality Thresholds",
+  "type": "object",
+  "required": ["settings_version", "hard_protocol_max_rates", "semantic_misunderstanding_max_rates"],
+  "properties": {
+    "settings_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "hard_protocol_max_rates": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+    },
+    "semantic_misunderstanding_max_rates": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "additionalProperties": false
+}

@@ -33,28 +33,44 @@ def annotation_files(path: str | Path) -> list[Path]:
     )
 
 
-def load_annotation_documents(path: str | Path, *, validate: bool = True) -> list[dict[str, Any]]:
+def load_annotation_documents(
+    path: str | Path,
+    *,
+    validate: bool = True,
+    scenarios: Mapping[str, Mapping[str, Any]] | None = None,
+    require_scenario_context: bool = False,
+) -> list[dict[str, Any]]:
     files = annotation_files(path)
     documents: list[dict[str, Any]] = []
     validator = Validator()
     for file_path in files:
         candidates = load_jsonl(file_path) if file_path.suffix == ".jsonl" else [load_json(file_path)]
-        for candidate in candidates:
-            if not isinstance(candidate, dict) or "annotation_module" not in candidate:
-                continue
-            if validate:
-                artifact_type = {
-                    "A": "event-annotation",
-                    "B": "appraisal-annotation",
-                    "C": "bot-annotation",
-                }.get(str(candidate.get("annotation_module")))
-                if artifact_type is None:
-                    raise ValueError(f"{file_path}: unknown annotation module")
-                result = validator.validate_paths([file_path], artifact_type)
-                if not result.ok:
-                    detail = "\n".join(str(issue) for issue in result.issues)
-                    raise ValueError(f"annotation validation failed before analysis:\n{detail}")
-            documents.append(candidate)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and "annotation_module" in candidate
+        ]
+        modules = {str(candidate.get("annotation_module")) for candidate in candidates}
+        if len(modules) > 1:
+            raise ValueError(f"{file_path}: annotation file mixes modules {sorted(modules)}")
+        if validate and candidates:
+            artifact_type = {
+                "A": "event-annotation",
+                "B": "appraisal-annotation",
+                "C": "bot-annotation",
+            }.get(next(iter(modules)))
+            if artifact_type is None:
+                raise ValueError(f"{file_path}: unknown annotation module")
+            result = validator.validate_paths(
+                [file_path],
+                artifact_type,
+                scenarios=scenarios,
+                require_scenario_context=require_scenario_context,
+            )
+            if not result.ok:
+                detail = "\n".join(str(issue) for issue in result.issues)
+                raise ValueError(f"annotation validation failed before analysis:\n{detail}")
+        documents.extend(candidates)
     if not documents:
         raise ValueError(f"no annotation documents found in {path}")
     return documents

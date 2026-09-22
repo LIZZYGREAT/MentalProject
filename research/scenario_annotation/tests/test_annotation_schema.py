@@ -53,7 +53,10 @@ def record(module: str, variable: str, label, **extra):
 )
 def test_valid_module_documents(tmp_path: Path, module: str, artifact_type: str, row: dict) -> None:
     document = deepcopy(BASE)
-    document.update({"annotation_module": module, "records": [row]})
+    rows = [row]
+    if module == "A":
+        rows.insert(0, record("A", "EVENT_FAMILY", "COURSE"))
+    document.update({"annotation_module": module, "records": rows})
     path = tmp_path / "annotation.json"
     path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
     result = Validator().validate_paths([path], artifact_type)
@@ -83,3 +86,61 @@ def test_no_evidence_requires_unknown_reason(tmp_path: Path) -> None:
     path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
     result = Validator().validate_paths([path], "appraisal-annotation")
     assert any(issue.code == "MISSING_UNKNOWN_REASON" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("family", "variable", "label", "error_code"),
+    [
+        ("COURSE", "EVENT_SUBTYPE", "assignment", "SUBTYPE_FAMILY_MISMATCH"),
+        ("COURSE", "LIFECYCLE", "COMPLETED", "LIFECYCLE_FAMILY_MISMATCH"),
+        ("TASK", "LIFECYCLE", "ATTENDED", "LIFECYCLE_FAMILY_MISMATCH"),
+        ("RECOVERY_ACTIVITY", "LIFECYCLE", "OVERDUE", "LIFECYCLE_FAMILY_MISMATCH"),
+    ],
+)
+def test_event_family_constrains_subtype_and_lifecycle(
+    tmp_path: Path, family: str, variable: str, label: str, error_code: str
+) -> None:
+    document = deepcopy(BASE)
+    document.update(
+        {
+            "annotation_module": "A",
+            "records": [
+                record("A", "EVENT_FAMILY", family),
+                record("A", variable, label),
+            ],
+        }
+    )
+    path = tmp_path / "annotation.json"
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+    result = Validator().validate_paths([path], "event-annotation")
+    assert any(issue.code == error_code for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("variable", "label"),
+    [
+        ("SCHEDULED_START", "2026-09-08T10:00:00"),
+        ("ACTUAL_END", "not-a-date"),
+        ("PROGRESS", 1.2),
+        ("PROGRESS", -0.1),
+        ("ESTIMATED_TOTAL_EFFORT", -1),
+        ("REMAINING_EFFORT", -0.5),
+    ],
+)
+def test_event_fact_label_types_are_semantically_validated(
+    tmp_path: Path, variable: str, label
+) -> None:
+    document = deepcopy(BASE)
+    document.update(
+        {
+            "annotation_module": "A",
+            "records": [
+                record("A", "EVENT_FAMILY", "COURSE"),
+                record("A", variable, label),
+            ],
+        }
+    )
+    path = tmp_path / "annotation.json"
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+    result = Validator().validate_paths([path], "event-annotation")
+    assert any(issue.code == "FACT_LABEL_TYPE" for issue in result.issues)

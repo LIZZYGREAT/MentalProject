@@ -230,6 +230,8 @@ def violation_rates(violations: Iterable[CriticalViolation], rows: Iterable[Anno
         "MissedCourseAutomaticObligationErrorRate": "MissedCourseAutomaticObligationError",
         "TaskHelpAsSupportErrorRate": "TaskHelpAsSupportError",
         "PersonalizationAsEffectErrorRate": "PersonalizationAsEffectError",
+        "HiddenMetadataLeakageRate": "HiddenMetadataLeakage",
+        "InvalidEvidenceReferenceRate": "InvalidEvidenceReference",
     }
     return {
         metric_name: {

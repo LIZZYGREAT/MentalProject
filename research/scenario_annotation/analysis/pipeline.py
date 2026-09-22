@@ -48,11 +48,16 @@ def run_analysis(
     only: set[str] | None = None,
 ) -> dict[str, Any]:
     only = only or {"agreement", "violations", "orthogonality", "disagreement", "report"}
-    documents = load_annotation_documents(annotations_dir, validate=True)
+    scenarios = load_scenarios(scenarios_path)
+    documents = load_annotation_documents(
+        annotations_dir,
+        validate=True,
+        scenarios=scenarios,
+        require_scenario_context=True,
+    )
     rows = flatten_annotations(documents)
     if not rows:
         raise ValueError("annotation documents contain no records")
-    scenarios = load_scenarios(scenarios_path)
     coverage = load_hidden_by_scenario(coverage_path)
     pairs = load_jsonl(pairs_path)
     root = Path(output_dir)

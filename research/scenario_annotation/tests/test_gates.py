@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from research.scenario_annotation.freeze import FreezeBlockedError, freeze_representation
-from research.scenario_annotation.gates import evaluate_manual_ready, evaluate_semantic_reliability
+from research.scenario_annotation.gates import (
+    evaluate_manual_ready,
+    evaluate_semantic_reliability,
+    evaluate_violation_thresholds,
+)
 
 
 def test_manual_ready_gate_fails_without_independent_annotations_or_human_revision(tmp_path: Path) -> None:
@@ -69,3 +73,26 @@ def test_freeze_refuses_to_create_manifest_before_gates_pass(tmp_path: Path) -> 
     else:
         raise AssertionError("freeze should have been blocked")
     assert not output.exists()
+
+
+def test_gate_b_uses_versioned_hard_and_semantic_thresholds() -> None:
+    settings = {
+        "hard_protocol_max_rates": {"FutureKnowledgeLeakageRate": 0.0},
+        "semantic_misunderstanding_max_rates": {"TaskHelpAsSupportErrorRate": 0.05},
+    }
+    acceptable = {
+        "FutureKnowledgeLeakageRate": {"rate": 0.0},
+        "TaskHelpAsSupportErrorRate": {"rate": 0.04},
+    }
+    passed, exceeded = evaluate_violation_thresholds(acceptable, settings)
+    assert passed
+    assert exceeded == {}
+
+    rejected = {
+        "FutureKnowledgeLeakageRate": {"rate": 0.01},
+        "TaskHelpAsSupportErrorRate": {"rate": 0.06},
+    }
+    passed, exceeded = evaluate_violation_thresholds(rejected, settings)
+    assert not passed
+    assert exceeded["FutureKnowledgeLeakageRate"]["category"] == "HARD_PROTOCOL"
+    assert exceeded["TaskHelpAsSupportErrorRate"]["category"] == "SEMANTIC_MISUNDERSTANDING"

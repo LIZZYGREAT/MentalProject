@@ -64,6 +64,17 @@ records and rates, orthogonality checks, a disagreement/adjudication queue, and
 construct-level Markdown reports. It refuses to run on an empty annotation drop
 and never edits the coding manual automatically.
 
+Validate completed annotation documents against the exact visible assignment used
+by that annotator:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli validate-annotations B --scenarios research/scenario_annotation/assignments/round_calibration/ai_a/module_b.jsonl <annotation-files>
+```
+
+This validation checks record/document envelope consistency, target and evidence
+references, event-family subtype/lifecycle vocabularies, fact value types,
+participant evidence-span containment, and the bot response send-time boundary.
+
 After human review has produced the revision log and an actual v1.0 candidate
 manual, evaluate Gate A:
 
@@ -85,3 +96,8 @@ required artifact exists:
 The freeze command validates prior gates, the final manual, 72 Main + 24 Edge
 scenarios, formal Gold coverage, and final construct decisions. It will not
 overwrite an existing versioned manifest.
+
+Gate B separates zero-tolerance protocol violations from semantic misunderstanding
+rates. The project thresholds are versioned in
+`settings/quality_thresholds_v1.json`; they are engineering settings, not claimed
+as universal statistical laws.

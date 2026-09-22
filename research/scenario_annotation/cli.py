@@ -104,6 +104,7 @@ def _semantic_gate_command(args: argparse.Namespace) -> int:
         edge_scenarios_path=args.edge_scenarios or root / "scenarios" / "edge.jsonl",
         annotations_dir=args.annotations_dir or root / "annotations" / "validation",
         analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "validation",
+        quality_thresholds_path=args.quality_thresholds,
     )
     output = args.output or root / "manifests" / "gate_b_semantic_reliability.json"
     write_gate_result(output, result)
@@ -213,6 +214,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_annotations.add_argument(
         "module", choices=("A", "B", "C"), help="annotation module"
     )
+    validate_annotations.add_argument(
+        "--scenarios",
+        type=Path,
+        required=True,
+        help="annotator-visible scenario or assignment JSONL used for evidence validation",
+    )
     validate_annotations.add_argument("paths", nargs="+", type=Path)
     validate_annotations.set_defaults(handler=_validate_annotations)
 
@@ -261,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_gate.add_argument("--edge-scenarios", type=Path)
     semantic_gate.add_argument("--annotations-dir", type=Path)
     semantic_gate.add_argument("--analysis-dir", type=Path)
+    semantic_gate.add_argument("--quality-thresholds", type=Path)
     semantic_gate.add_argument("--output", type=Path)
     semantic_gate.set_defaults(handler=_semantic_gate_command)
 
@@ -286,12 +294,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_annotations(args: argparse.Namespace) -> int:
+    from .loader import load_jsonl
+
     args.artifact_type = {
         "A": "event-annotation",
         "B": "appraisal-annotation",
         "C": "bot-annotation",
     }[args.module]
-    return _validation_command(args)
+    scenarios = {str(row["scenario_id"]): row for row in load_jsonl(args.scenarios)}
+    result = Validator(args.schema_dir).validate_paths(
+        args.paths,
+        args.artifact_type,
+        scenarios=scenarios,
+        require_scenario_context=True,
+    )
+    for issue in result.issues:
+        print(issue)
+    if result.ok:
+        print(
+            f"PASS: validated {result.checked} {args.artifact_type} artifact(s) "
+            "with visible evidence integrity"
+        )
+        return 0
+    print(f"FAIL: {len(result.issues)} issue(s) across {result.checked} artifact(s)")
+    return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
