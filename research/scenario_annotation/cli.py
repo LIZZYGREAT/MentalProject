@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import tempfile
 from typing import Sequence
 
 from .validation import Validator
@@ -252,6 +253,33 @@ def _export_annotations_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _determinism_command(_: argparse.Namespace) -> int:
+    from .determinism import (
+        ASSIGNMENT_ARTIFACTS,
+        CORPUS_ARTIFACTS,
+        byte_mismatches,
+        regenerate_calibration,
+    )
+
+    root = Path(__file__).resolve().parent
+    with tempfile.TemporaryDirectory(prefix="mindflow-stage1-") as temporary:
+        generated = Path(temporary)
+        regenerate_calibration(generated)
+        mismatches = byte_mismatches(
+            root, generated, (*CORPUS_ARTIFACTS, *ASSIGNMENT_ARTIFACTS)
+        )
+    if mismatches:
+        print("FAIL: deterministic artifacts differ from the committed files")
+        for mismatch in mismatches:
+            print(f"- {mismatch}")
+        return 1
+    print(
+        "PASS: committed calibration corpus and seed-12001 assignments "
+        "match a clean byte-for-byte regeneration"
+    )
+    return 0
+
+
 def _add_analysis_parser(
     subparsers: argparse._SubParsersAction,
     name: str,
@@ -438,6 +466,12 @@ def build_parser() -> argparse.ArgumentParser:
     export_annotations_parser.add_argument("--module", choices=("A", "B", "C"))
     export_annotations_parser.add_argument("--output-dir", type=Path)
     export_annotations_parser.set_defaults(handler=_export_annotations_command)
+
+    deterministic = subparsers.add_parser(
+        "check-deterministic-artifacts",
+        help="regenerate calibration corpus and assignments and compare committed bytes",
+    )
+    deterministic.set_defaults(handler=_determinism_command)
     return parser
 
 
