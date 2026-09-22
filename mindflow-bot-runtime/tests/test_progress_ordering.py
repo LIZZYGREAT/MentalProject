@@ -457,7 +457,7 @@ def test_threshold_race_waits_for_inflight_processing_send_before_final():
     assert texts[1] == "final"
 
 
-def test_multi_segment_final_never_allows_late_processing():
+def test_rich_final_never_allows_late_processing():
     source = (
         "第一段说明复杂任务的结论已经准备好。"
         "第二段补充必要的上下文与边界条件。"
@@ -495,8 +495,7 @@ def test_multi_segment_final_never_allows_late_processing():
 
     texts = [item[1] for item in sender.sent]
     assert texts[0] == "我正在结合今天的信息进行评估。"
-    assert len(texts[1:]) >= 2
-    assert "".join(texts[1:]) == source
+    assert texts[1:] == [source]
     assert all("正在" not in text for text in texts[1:])
 
 

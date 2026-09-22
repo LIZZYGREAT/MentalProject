@@ -10,11 +10,16 @@ from app.agent.tool_registry import (
     AuthorizationContextResolutionError,
     ToolRegistry,
 )
-from app.integrations.feishu.cards import course_schedule_preview_card
+from app.integrations.feishu.cards import (
+    course_schedule_preview_card,
+    course_schedule_revert_confirmation_card,
+)
 from app.repositories_course_schedule import (
     CourseCorrectionAmbiguityError,
     CourseScheduleImportAmbiguityError,
 )
+from app.services.participant_time import to_participant_local_datetime
+from app.services.presentation_service import ReviewCardPolicy
 
 
 def _empty_schema() -> dict[str, Any]:
@@ -77,6 +82,18 @@ def _cancel_selector_schema() -> dict[str, Any]:
     }
 
 
+def _public_import_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return timestamps in the import's local timezone, never raw UTC."""
+    return {
+        "status": candidate.get("status"),
+        "created_local_datetime": candidate.get("created_local_datetime"),
+        "created_local_date": candidate.get("created_local_date"),
+        "timezone": candidate.get("timezone"),
+        "course_names": list(candidate.get("course_names") or []),
+        "has_provider_effect": bool(candidate.get("has_provider_effect")),
+    }
+
+
 def _public_draft(draft: dict[str, Any]) -> dict[str, Any]:
     structured = dict(draft.get("structured_result") or {})
     metadata = dict(structured.get("_metadata") or {})
@@ -116,11 +133,38 @@ class CourseScheduleTools:
         *,
         image_sessions: Any = None,
         recent_image_importer: Any = None,
+        timezone_name: str | None = None,
     ) -> None:
         self.imports = imports
         self.presentations = presentations
         self.image_sessions = image_sessions
         self.recent_image_importer = recent_image_importer
+        inherited_timezone = getattr(getattr(imports, "timezone", None), "key", None)
+        self.timezone_name = str(timezone_name or inherited_timezone or "Asia/Shanghai")
+
+    def _stage_preview(self, run_id, draft: dict[str, Any]) -> None:
+        if self.presentations is None:
+            return
+        card = course_schedule_preview_card(draft)
+        review_policy = ReviewCardPolicy(
+            fallback_text=(
+                "课程表确认卡暂时未能发送，本次课程表尚未导入，请稍后重试。"
+            )
+        )
+        message_id = str(draft.get("status_card_message_id") or "").strip()
+        if message_id:
+            self.presentations.stage_card_update(
+                run_id,
+                message_id,
+                card,
+                review_policy=review_policy,
+            )
+        else:
+            self.presentations.stage_card(
+                run_id,
+                card,
+                review_policy=review_policy,
+            )
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
@@ -144,11 +188,8 @@ class CourseScheduleTools:
             "Retry the latest retained participant-owned course-schedule image and create or resend its reviewed Preview. This never writes Calendar data.",
             _empty_schema(),
             self.import_from_recent_image,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_recent_image_import_authorization_context
-            ),
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_update_active_draft",
@@ -163,19 +204,16 @@ class CourseScheduleTools:
                 "additionalProperties": False,
             },
             self.update_active_draft,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_cancel_pending_draft",
             "Cancel this participant's latest pending course-schedule draft. Use only when the user directly asks to cancel the pending import. This does not delete Calendar data.",
             _empty_schema(),
             self.cancel_pending_draft,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_pending_cancel_authorization_context
-            ),
+            effect="draft_write",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_get_recent_imports",
@@ -186,20 +224,17 @@ class CourseScheduleTools:
             authorization_requirement="none",
         )
         registry.register(
-            "course_schedule_cancel_or_revert_import",
-            "Cancel a pending/running course-schedule import or revert one completed/partially completed import. Resolve exactly one participant-owned import using latest, course_name, or created_date. This starts a durable cleanup Saga and never accepts a raw import id.",
+            "course_schedule_stage_revert_import",
+            "Stage a fixed destructive review card for reverting one completed or partially completed participant-owned import selected by latest, course_name, or created_date. This tool never starts Calendar cleanup and never accepts a raw import id.",
             {
                 "type": "object",
                 "properties": {"selector": _cancel_selector_schema()},
                 "required": ["selector"],
                 "additionalProperties": False,
             },
-            self.cancel_or_revert_import,
-            effect="internal_write",
-            authorization_requirement="direct_request",
-            authorization_context_resolver=(
-                self.resolve_cancel_or_revert_authorization_context
-            ),
+            self.stage_revert_import,
+            effect="proposal_stage",
+            authorization_requirement="none",
         )
         registry.register(
             "course_schedule_update_active_context",
@@ -240,8 +275,8 @@ class CourseScheduleTools:
                 "additionalProperties": False,
             },
             self.update_active_context,
-            effect="internal_write",
-            authorization_requirement="direct_request",
+            effect="draft_write",
+            authorization_requirement="none",
         )
 
     def get_active_draft(
@@ -281,25 +316,6 @@ class CourseScheduleTools:
             result = await result
         return dict(result or {})
 
-    def resolve_recent_image_import_authorization_context(
-        self, ctx: AgentContext, _arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        image_session = self._latest_image_session(ctx)
-        if image_session is None:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_not_found"
-            )
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "schedule_image_import",
-            "has_provider_effect": False,
-            "target": {
-                "status": image_session.get("status"),
-                "created_at": image_session.get("created_at"),
-                "last_error_code": image_session.get("last_error_code"),
-            },
-        }
-
     def _latest_image_session(self, ctx: AgentContext) -> dict[str, Any] | None:
         if self.image_sessions is None:
             return None
@@ -307,8 +323,7 @@ class CourseScheduleTools:
             ctx.participant_id, chat_id=ctx.chat_id
         )
 
-    @staticmethod
-    def _public_image_session(value: dict[str, Any]) -> dict[str, Any]:
+    def _public_image_session(self, value: dict[str, Any]) -> dict[str, Any]:
         report = dict(value.get("parse_report") or {})
         quarantined = []
         for item in list(report.get("quarantined") or [])[:10]:
@@ -323,8 +338,13 @@ class CourseScheduleTools:
                 quarantined.append({"course_name": None, "reason": str(item)})
         return {
             "status": value.get("status"),
-            "created_at": value.get("created_at"),
-            "updated_at": value.get("updated_at"),
+            "created_local_datetime": to_participant_local_datetime(
+                value.get("created_at"), self.timezone_name
+            ),
+            "updated_local_datetime": to_participant_local_datetime(
+                value.get("updated_at"), self.timezone_name
+            ),
+            "timezone": self.timezone_name,
             "last_error_code": value.get("last_error_code"),
             "error_detail": value.get("error_detail"),
             "parse_report": {
@@ -363,10 +383,7 @@ class CourseScheduleTools:
                 "error": "invalid_course_correction",
                 "detail": str(exc)[:200],
             }
-        if self.presentations is not None:
-            self.presentations.stage_card(
-                ctx.agent_run_id, course_schedule_preview_card(corrected)
-            )
+        self._stage_preview(ctx.agent_run_id, corrected)
         return {"ok": True, "draft": _public_draft(corrected), "preview_staged": True}
 
     def cancel_pending_draft(
@@ -382,28 +399,6 @@ class CourseScheduleTools:
             "reply_text": result.get("reply_text"),
         }
 
-    def resolve_pending_cancel_authorization_context(
-        self, ctx: AgentContext, _arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        draft = self.imports.drafts.latest_pending_context(ctx.participant_id)
-        if draft is None:
-            raise AuthorizationContextResolutionError("authorization_target_not_found")
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "cancel_or_revert",
-            "has_provider_effect": False,
-            "target": {
-                "status": draft.get("status"),
-                "created_at": draft.get("created_at"),
-                "course_names": [
-                    str(course.get("course_name") or "")[:80]
-                    for course in list(
-                        (draft.get("structured_result") or {}).get("courses") or []
-                    )[:10]
-                ],
-            },
-        }
-
     def get_recent_imports(
         self, ctx: AgentContext, _arguments: dict[str, Any]
     ) -> dict[str, Any]:
@@ -413,39 +408,24 @@ class CourseScheduleTools:
         return {
             "ok": True,
             "imports": [
-                {
-                    "status": candidate.get("status"),
-                    "created_at": candidate.get("created_at"),
-                    "created_local_date": candidate.get("created_local_date"),
-                    "course_names": list(candidate.get("course_names") or []),
-                    "has_provider_effect": bool(
-                        candidate.get("has_provider_effect")
-                    ),
-                }
-                for candidate in candidates
+                _public_import_candidate(candidate) for candidate in candidates
             ],
         }
 
-    def cancel_or_revert_import(
+    def stage_revert_import(
         self, ctx: AgentContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         selector = dict(arguments.get("selector") or {})
         try:
-            result = self.imports.cancel_or_revert(ctx.participant_id, selector)
+            candidate = self.imports.drafts.resolve_cancel_selector(
+                ctx.participant_id, selector
+            )
         except CourseScheduleImportAmbiguityError as exc:
             return {
                 "ok": False,
                 "error": "ambiguous_import",
                 "candidates": [
-                    {
-                        "status": candidate.get("status"),
-                        "created_at": candidate.get("created_at"),
-                        "created_local_date": candidate.get("created_local_date"),
-                        "course_names": list(candidate.get("course_names") or []),
-                        "has_provider_effect": bool(
-                            candidate.get("has_provider_effect")
-                        ),
-                    }
+                    _public_import_candidate(candidate)
                     for candidate in exc.candidates
                 ],
             }
@@ -457,40 +437,30 @@ class CourseScheduleTools:
                 "error": "invalid_import_selector",
                 "detail": str(exc)[:200],
             }
+        if (
+            not bool(candidate.get("has_provider_effect"))
+            or str(candidate.get("status") or "")
+            not in {"succeeded", "partial_failed", "cleanup_failed"}
+        ):
+            return {"ok": False, "error": "import_has_no_revertible_effect"}
+        if self.presentations is None:
+            raise RuntimeError("course schedule revert presentation is unavailable")
+        self.presentations.stage_card(
+            ctx.agent_run_id,
+            course_schedule_revert_confirmation_card(candidate),
+            review_policy=ReviewCardPolicy(
+                fallback_text=(
+                    "课程表撤销确认卡暂时未能发送，现有日程尚未撤销，请稍后重试。"
+                )
+            ),
+        )
         return {
-            "ok": bool(result.get("ok")),
-            "status": result.get("status"),
-            "cancel_mode": result.get("cancel_mode"),
-            "already_cancelled": bool(result.get("already_cancelled")),
-            "reply_text": result.get("reply_text"),
-        }
-
-    def resolve_cancel_or_revert_authorization_context(
-        self, ctx: AgentContext, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
-        selector = dict(arguments.get("selector") or {})
-        try:
-            candidate = self.imports.drafts.resolve_cancel_selector(
-                ctx.participant_id, selector
-            )
-        except CourseScheduleImportAmbiguityError as exc:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_ambiguous"
-            ) from exc
-        except (LookupError, ValueError) as exc:
-            raise AuthorizationContextResolutionError(
-                "authorization_target_not_found"
-            ) from exc
-        return {
-            "server_bound_participant_target": True,
-            "operation_intent": "cancel_or_revert",
-            "has_provider_effect": bool(candidate.get("has_provider_effect")),
-            "target": {
-                "status": candidate.get("status"),
-                "created_at": candidate.get("created_at"),
-                "created_local_date": candidate.get("created_local_date"),
-                "course_names": list(candidate.get("course_names") or [])[:10],
-            },
+            "ok": True,
+            "course_schedule_revert": "pending_confirmation",
+            "confirmation_required": True,
+            "provider_effect_started": False,
+            "course_count": int(candidate.get("course_count") or 0),
+            "event_count": int(candidate.get("provider_effect_count") or 0),
         }
 
     def update_active_context(
@@ -532,8 +502,5 @@ class CourseScheduleTools:
                 "error": "invalid_schedule_context",
                 "detail": str(exc)[:200],
             }
-        if self.presentations is not None:
-            self.presentations.stage_card(
-                ctx.agent_run_id, course_schedule_preview_card(draft)
-            )
+        self._stage_preview(ctx.agent_run_id, draft)
         return {"ok": True, "draft": _public_draft(draft), "preview_staged": True}

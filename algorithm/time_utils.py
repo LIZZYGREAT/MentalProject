@@ -1,7 +1,7 @@
 """Shared time parsing and interval helpers for event and schedule logic."""
 
 from datetime import date, datetime, timedelta, tzinfo
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from settings.model_defaults import (
     DEFAULT_DATE_FORMAT,
@@ -102,12 +102,6 @@ def time_to_minutes(value: Any, fallback: str = "00:00") -> int:
     return hour * 60 + minute
 
 
-def minutes_to_hhmm(minutes: int) -> str:
-    """Convert minutes from midnight to a normalized ``HH:MM`` string."""
-    minutes = int(minutes) % (24 * 60)
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
 def parse_datetime_on_date(value: Any, date_str: str, fallback: str = "00:00") -> datetime:
     """Parse a datetime or time string on the requested simulation date."""
     if isinstance(value, datetime):
@@ -136,35 +130,3 @@ def interval_minutes(start: Any, end: Any, default: float = 30.0) -> float:
         return max(MIN_EVENT_DURATION_MINUTES, float(minutes))
     except Exception:
         return max(MIN_EVENT_DURATION_MINUTES, float(default))
-
-
-def elapsed_minutes(start: Any, current_time: datetime, default: float = 0.0) -> float:
-    """Return minutes elapsed from event start to current time on the same day."""
-    try:
-        if isinstance(start, datetime):
-            start_dt = start.replace(
-                year=current_time.year,
-                month=current_time.month,
-                day=current_time.day,
-            )
-        else:
-            start_dt = datetime.strptime(
-                f"{current_time.strftime(DEFAULT_DATE_FORMAT)} {extract_hhmm(start)}",
-                f"{DEFAULT_DATE_FORMAT} {DEFAULT_TIME_FORMAT}",
-            )
-        minutes = (current_time - start_dt).total_seconds() / 60.0
-        if minutes < 0:
-            minutes += 24 * 60
-        return max(0.0, minutes)
-    except Exception:
-        return default
-
-
-def overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
-    """Return whether two same-day time intervals overlap."""
-    return max(a_start, b_start) < min(a_end, b_end)
-
-
-def normalize_interval(start: Any, end: Any) -> Tuple[str, str]:
-    """Return normalized start and end ``HH:MM`` strings."""
-    return extract_hhmm(start), extract_hhmm(end)

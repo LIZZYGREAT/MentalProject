@@ -72,8 +72,19 @@ class ParticipantSessionManager:
         self.input_queue_size = max(1, int(input_queue_size))
         self._sessions: dict[uuid.UUID, ParticipantAgentSession] = {}
         self._connecting: set[uuid.UUID] = set()
+        self._recovery_needed: set[uuid.UUID] = set()
         self._lock = asyncio.Lock()
         self._closing = False
+
+    async def needs_recovery_context(self, participant_id: uuid.UUID) -> bool:
+        async with self._lock:
+            session = self._sessions.get(participant_id)
+            if session is not None and session.client is not None:
+                return False
+            if participant_id in self._recovery_needed:
+                return True
+        saved = await asyncio.to_thread(self.repository.get, participant_id)
+        return saved is None or saved.status != "active"
 
     async def submit(
         self,
@@ -221,6 +232,10 @@ class ParticipantSessionManager:
                     session.queue.task_done()
                     continue
                 try:
+                    # The initial trusted context is needed while constructing
+                    # a participant-specific MCP tool surface.
+                    session.binding.current = request.ctx
+                    session.binding.activity_callback = request.on_activity
                     client = await self._ensure_client(session)
                     async with self._lock:
                         cancelled_before_run = (
@@ -242,16 +257,46 @@ class ParticipantSessionManager:
                         client.run_turn(request.turn_input),
                         timeout=self.turn_timeout_seconds,
                     )
-                    await asyncio.to_thread(
-                        self.repository.save,
-                        session.participant_id,
-                        result.session_id,
-                        last_message_id=request.ctx.message_id,
-                    )
+                    save_kwargs = {
+                        "last_message_id": request.ctx.message_id,
+                        "last_backend_state_event_id": request.turn_input.backend_state_event_cursor
+                        or next(
+                            (
+                                item.get("event_id") or item.get("id")
+                                for item in reversed(
+                                    request.turn_input.backend_state_updates
+                                )
+                                if isinstance(item, dict)
+                                and (item.get("event_id") or item.get("id"))
+                            ),
+                            None,
+                        ),
+                    }
+                    try:
+                        await asyncio.to_thread(
+                            self.repository.save,
+                            session.participant_id,
+                            result.session_id,
+                            **save_kwargs,
+                        )
+                    except TypeError as exc:
+                        # Keep lightweight test doubles and older adapters
+                        # source-compatible while the durable repository rolls
+                        # out the state cursor.
+                        if "last_backend_state_event_id" not in str(exc):
+                            raise
+                        await asyncio.to_thread(
+                            self.repository.save,
+                            session.participant_id,
+                            result.session_id,
+                            last_message_id=request.ctx.message_id,
+                        )
+                    self._recovery_needed.discard(session.participant_id)
                     if not request.future.done():
                         request.future.set_result(result)
                 except asyncio.TimeoutError as exc:
                     await self._interrupt_and_drop(session)
+                    self._recovery_needed.add(session.participant_id)
                     await asyncio.to_thread(
                         self.repository.mark_stale, session.participant_id
                     )
@@ -265,6 +310,10 @@ class ParticipantSessionManager:
                         request.future.set_exception(exc)
                 except Exception as exc:
                     await self._drop_client(session)
+                    self._recovery_needed.add(session.participant_id)
+                    await asyncio.to_thread(
+                        self.repository.mark_stale, session.participant_id
+                    )
                     if not request.future.done():
                         request.future.set_exception(
                             exc
@@ -339,6 +388,7 @@ class ParticipantSessionManager:
                 await asyncio.to_thread(
                     self.repository.mark_stale, session.participant_id
                 )
+            self._recovery_needed.add(session.participant_id)
             raise
         async with self._lock:
             self._connecting.discard(session.participant_id)

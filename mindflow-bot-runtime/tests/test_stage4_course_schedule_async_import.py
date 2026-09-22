@@ -1,6 +1,7 @@
 import asyncio
 from datetime import date, datetime, timezone
 import uuid
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,7 +22,12 @@ from app.models import CalendarMutationReconciliation, CourseScheduleImport
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
+from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.runtime_clock import RuntimeClock
 from helpers import memory_database, participant
+
+
+FIXED_NOW = datetime(2026, 9, 10, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
 
 def _payload(*, courses=None):
@@ -518,8 +524,8 @@ def test_completion_update_failure_resends_result_card_with_retry_action():
         def update_card(self, _message_id, _card):
             raise RuntimeError("original card cannot be updated")
 
-        def send_card(self, chat_id, card):
-            self.cards.append((chat_id, card))
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.cards.append((chat_id, card, message_uuid))
 
         def send_text(self, chat_id, text):
             self.texts.append((chat_id, text))
@@ -540,7 +546,54 @@ def test_completion_update_failure_resends_result_card_with_retry_action():
     assert len(sender.cards) == 1
     assert sender.cards[0][0] == "chat"
     assert "course_schedule_import_confirm" in str(sender.cards[0][1])
+    assert sender.cards[0][2]
+    assert len(sender.cards[0][2]) <= 50
     assert sender.texts == []
+    assert imports.drafts.presented == [draft["id"]]
+
+
+def test_cancelled_completion_update_success_does_not_push_duplicate_notice():
+    class Drafts:
+        def __init__(self):
+            self.presented = []
+
+        def mark_completion_presented(self, import_id):
+            self.presented.append(import_id)
+
+    class Imports:
+        def __init__(self):
+            self.drafts = Drafts()
+            self.calendar = object()
+
+        @staticmethod
+        def _result(_draft):
+            return {"reply_text": "这次课程表导入已撤销，相关日程已清理。"}
+
+    class Sender:
+        def __init__(self):
+            self.updated = []
+            self.sent = []
+
+        def update_card(self, message_id, card):
+            self.updated.append((message_id, card))
+
+        def send_card(self, chat_id, card, **_kwargs):
+            self.sent.append((chat_id, card))
+
+    imports = Imports()
+    sender = Sender()
+    runner = CourseScheduleImportRunner(imports, sender=sender)
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "cancelled",
+        "status_card_message_id": "old-status-card",
+        "status_card_chat_id": "request-chat",
+    }
+
+    asyncio.run(runner._present_completion(draft))
+
+    assert sender.updated[0][0] == "old-status-card"
+    assert sender.sent == []
     assert imports.drafts.presented == [draft["id"]]
 
 
@@ -552,6 +605,12 @@ class _ForecastSnapshotSpy:
         self, _warnings, participant_id, targets, *, reason
     ):
         self.invalidations.append((participant_id, set(targets), reason))
+
+    def invalidate_current_for_date(
+        self, _warnings, participant_id, target, *, reason
+    ):
+        self.invalidations.append((participant_id, {target}, reason))
+        return {"forecasts_invalidated": 1, "warnings_cancelled": 0}
 
 
 class _ForecastCoordinatorSpy:
@@ -591,9 +650,17 @@ def _two_occurrence_draft(database, participant_id):
     return repository, draft
 
 
-def _forecast_import_stack(database, owner, repository, calendar):
+def _forecast_import_stack(database, owner, repository, calendar, *, clock=None):
+    clock = clock or RuntimeClock("Asia/Shanghai", now_fn=lambda: FIXED_NOW)
     reconciliations = CalendarMutationReconciliationRepository(database)
     coordinator = _ForecastCoordinatorSpy()
+    coordinator.dependency_refresh = ForecastDependencyRefreshService(
+        coordinator.forecasts,
+        coordinator.warnings,
+        coordinator,
+        timezone_name="Asia/Shanghai",
+        clock=clock,
+    )
     refresh = ForecastMutationRefreshQueue(
         coordinator,
         reconciliations=reconciliations,
@@ -607,9 +674,150 @@ def _forecast_import_stack(database, owner, repository, calendar):
         forecast_coordinator=coordinator,
         forecast_snapshots=coordinator.forecasts,
         mutation_refresh=refresh,
+        clock=clock,
     )
     runner = _runner(service)
     return reconciliations, coordinator, refresh, service, runner
+
+
+@pytest.mark.parametrize(
+    "reference_local_date",
+    [date(2026, 9, 13), date(2026, 9, 14), date(2026, 9, 15)],
+)
+def test_course_schedule_async_import_is_independent_of_wall_clock_date(
+    reference_local_date,
+):
+    service = CourseScheduleImportService(
+        object(), object(), Tokens(),
+        clock=RuntimeClock(
+            "Asia/Shanghai",
+            now_fn=lambda: datetime.combine(
+                reference_local_date,
+                datetime.min.time(),
+                ZoneInfo("Asia/Shanghai"),
+            ),
+        ),
+    )
+    dates = {date(2026, 9, 14), date(2026, 9, 21)}
+
+    today, direct, refresh, dependencies = service._mutation_work(dates)
+
+    assert today == reference_local_date
+    assert direct == {value for value in dates if value >= reference_local_date}
+    if reference_local_date == date(2026, 9, 14):
+        assert dependencies == {date(2026, 9, 15): date(2026, 9, 14)}
+        assert refresh[date(2026, 9, 15)] is False
+    else:
+        assert dependencies == {}
+
+
+def test_course_schedule_today_effect_adds_tomorrow_dependency():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-TODAY-DEPENDENCY")
+        repository, draft = _draft(database, owner.id, source="today-dependency")
+        clock = RuntimeClock(
+            "Asia/Shanghai",
+            now_fn=lambda: datetime(
+                2026, 9, 14, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+            ),
+        )
+        reconciliations, coordinator, refresh, service, runner = (
+            _forecast_import_stack(
+                database, owner, repository, RecordingCalendar(), clock=clock
+            )
+        )
+        refresh.start()
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        await runner.run_once()
+        await refresh.wait_idle()
+        with database.session() as session:
+            reconciliation_id = session.query(CalendarMutationReconciliation).one().id
+        row = reconciliations.get(reconciliation_id)
+        await refresh.close()
+        return row, coordinator
+
+    row, coordinator = asyncio.run(scenario())
+
+    targets = {
+        date.fromisoformat(item["local_date"]): item
+        for item in row["work"]["targets"]
+    }
+    assert row["work"]["operation"]["reference_local_date"] == "2026-09-14"
+    assert targets[date(2026, 9, 14)]["refresh_calendar"] is True
+    assert targets[date(2026, 9, 15)] == {
+        "local_date": "2026-09-15",
+        "refresh_calendar": False,
+        "requires_invalidation": False,
+        "dependency_source": "2026-09-14",
+    }
+    refresh_flags = {
+        target: refresh_calendar
+        for _participant_id, target, _reason, refresh_calendar, _force in (
+            coordinator.refreshes
+        )
+    }
+    assert refresh_flags[date(2026, 9, 14)] is True
+    assert refresh_flags[date(2026, 9, 15)] is False
+
+
+def test_course_schedule_recovery_keeps_original_reference_date_after_midnight():
+    async def scenario():
+        database = memory_database()
+        owner = participant(database, "STAGE4-CROSS-MIDNIGHT")
+        repository, draft = _draft(database, owner.id, source="cross-midnight")
+        current = {
+            "now": datetime(
+                2026, 9, 14, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+        }
+        clock = RuntimeClock("Asia/Shanghai", now_fn=lambda: current["now"])
+        reconciliations, coordinator, refresh, service, _runner_instance = (
+            _forecast_import_stack(
+                database, owner, repository, RecordingCalendar(), clock=clock
+            )
+        )
+        await service.confirm(
+            owner.id,
+            draft["id"],
+            recurrence_strategy=PRESERVE_SCHEDULE_PATTERN,
+        )
+        claimed = repository.claim_next_import()
+        write = repository.claim_write(draft["id"], claimed["writes"][0]["id"])
+        planned_dates = {
+            date.fromisoformat(value) for value in write["affected_dates"]
+        }
+        reconciliation = await service._prepare_reconciliation(
+            owner.id, claimed, planned_dates, {}
+        )
+        repository.record_write_created(draft["id"], write["id"], "provider-event")
+        repository.finalize_queued_import(draft["id"])
+        with database.session() as session:
+            session.get(
+                CalendarMutationReconciliation,
+                uuid.UUID(reconciliation["id"]),
+            ).next_attempt_at = datetime.now(timezone.utc)
+        current["now"] = datetime(
+            2026, 9, 15, 0, 1, tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+        refresh.start()
+        await refresh.recover_now()
+        await refresh.wait_idle()
+        recovered = reconciliations.get(reconciliation["id"])
+        await refresh.close()
+        return recovered, coordinator
+
+    recovered, coordinator = asyncio.run(scenario())
+
+    assert recovered["status"] == "resolved"
+    assert recovered["work"]["operation"]["reference_local_date"] == "2026-09-14"
+    assert date(2026, 9, 15) in {
+        target for _participant_id, target, *_rest in coordinator.refreshes
+    }
 
 
 def test_course_schedule_all_definite_failures_bind_no_effect_and_skip_forecast():

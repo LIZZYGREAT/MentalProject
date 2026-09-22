@@ -214,3 +214,25 @@ def test_deploy_runtime_injects_head_migrates_then_recreates_services():
     assert "postgres did not become ready for deployment" in source
     assert "RUNNING_BOT_REVISION" in source
     assert "RUNNING_ADMIN_REVISION" in source
+
+
+def test_deploy_runtime_stops_writers_and_restores_old_runtime_on_migration_failure():
+    source = DEPLOY.read_text(encoding="utf-8")
+
+    trap = source.index("trap restore_legacy_runtime EXIT")
+    postgres = source.index("up -d postgres")
+    stop = source.index("stop bot admin")
+    table_check = source.index("LEGACY_PLAN_TABLE")
+    processing_check = source.index("LEGACY_PROCESSING_COUNT")
+    state_init = source.index("run --rm --no-deps claude-state-init")
+    migrate = source.index("run --rm --no-deps migrate")
+    migration_guard = source.index("MIGRATION_SUCCEEDED=1")
+    recreate = source.index("up -d --no-deps --force-recreate bot admin")
+
+    assert trap < postgres < stop < table_check < processing_check
+    assert processing_check < state_init < migrate < migration_guard < recreate
+    assert "docker compose -f \"$COMPOSE_FILE\" start bot admin" in source
+    assert "RUNTIME_STOPPED=1" in source
+    assert "MIGRATION_SUCCEEDED=0" in source
+    assert "MIGRATION_SUCCEEDED:-0}" in source
+    assert "refusing migration" in source

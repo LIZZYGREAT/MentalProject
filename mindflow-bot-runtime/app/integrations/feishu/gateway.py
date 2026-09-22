@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import multiprocessing
+import time
 from queue import Empty
 from typing import Any, Callable, Mapping
 
@@ -144,6 +145,9 @@ class BotEvent:
         )
 
 
+_MAX_CALLBACK_TOKEN_LENGTH = 4096
+
+
 @dataclass(frozen=True)
 class CardActionEvent:
     event_id: str
@@ -154,11 +158,14 @@ class CardActionEvent:
     action_tag: str
     action_value: dict[str, Any]
     form_value: dict[str, Any]
+    callback_token: str | None = None
+    # Transport timing is diagnostic metadata, not part of the event identity.
+    received_monotonic: float | None = field(default=None, compare=False)
 
     def to_ipc_payload(self) -> dict[str, Any]:
         """Return the SDK-free CardAction contract shared with the receiver."""
 
-        return {
+        payload = {
             "event_id": self.event_id,
             "message_id": self.message_id,
             "app_id": self.app_id,
@@ -168,6 +175,11 @@ class CardActionEvent:
             "action_value": dict(self.action_value),
             "form_value": dict(self.form_value),
         }
+        if self.callback_token:
+            payload["callback_token"] = self.callback_token
+        if self.received_monotonic is not None:
+            payload["received_monotonic"] = self.received_monotonic
+        return payload
 
     @classmethod
     def from_ipc_payload(cls, payload: dict[str, Any]) -> "CardActionEvent":
@@ -179,6 +191,20 @@ class CardActionEvent:
             raise InvalidBotEvent("card action IPC event is missing routing fields")
         if not isinstance(action_value, dict) or not isinstance(form_value, dict):
             raise InvalidBotEvent("card action IPC values must be objects")
+        raw_received_monotonic = payload.get("received_monotonic")
+        try:
+            received_monotonic = (
+                float(raw_received_monotonic)
+                if raw_received_monotonic is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise InvalidBotEvent(
+                "card action IPC monotonic timestamp is invalid"
+            ) from exc
+        callback_token = str(payload.get("callback_token") or "").strip()
+        if len(callback_token) > _MAX_CALLBACK_TOKEN_LENGTH:
+            raise InvalidBotEvent("card action callback token is too long")
         return cls(
             event_id=values["event_id"],
             message_id=values["message_id"],
@@ -188,6 +214,8 @@ class CardActionEvent:
             action_tag=str(payload.get("action_tag") or "")[:64],
             action_value=dict(action_value),
             form_value=dict(form_value),
+            callback_token=callback_token or None,
+            received_monotonic=received_monotonic,
         )
 
 
@@ -202,6 +230,7 @@ class FeishuCardActionAdapter:
             chat_id=getattr(event, "chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=getattr(event, "token", None),
         )
 
     def adapt_p2(self, callback: Any) -> CardActionEvent:
@@ -213,11 +242,12 @@ class FeishuCardActionAdapter:
             chat_id=getattr(context, "open_chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=getattr(event, "token", None),
         )
 
     def _build(
         self, *, callback_event_id: Any, message_id: Any, chat_id: Any,
-        open_id: Any, action: Any
+        open_id: Any, action: Any, callback_token: Any = None,
     ) -> CardActionEvent:
         message_id = str(message_id or "").strip()
         chat_id = str(chat_id or "").strip()
@@ -225,10 +255,13 @@ class FeishuCardActionAdapter:
         tag = str(getattr(action, "tag", "") or "")[:64]
         value = getattr(action, "value", None) or {}
         form_value = getattr(action, "form_value", None) or {}
+        normalized_callback_token = str(callback_token or "").strip()
         if not all((message_id, chat_id, open_id)):
             raise InvalidBotEvent("card action is missing routing fields")
         if not isinstance(value, dict) or not isinstance(form_value, dict):
             raise InvalidBotEvent("card action values must be objects")
+        if len(normalized_callback_token) > _MAX_CALLBACK_TOKEN_LENGTH:
+            raise InvalidBotEvent("card action callback token is too long")
         identity_payload = json.dumps(
             {
                 "message_id": message_id,
@@ -255,6 +288,8 @@ class FeishuCardActionAdapter:
             action_tag=tag,
             action_value=dict(value),
             form_value=dict(form_value),
+            callback_token=normalized_callback_token or None,
+            received_monotonic=time.monotonic(),
         )
 
 
@@ -270,12 +305,17 @@ class FeishuChannelCardActionAdapter(FeishuCardActionAdapter):
             if isinstance(header, dict)
             else None
         ) or raw.get("event_id")
+        raw_event = raw.get("event") or {}
+        callback_token = (
+            raw_event.get("token") if isinstance(raw_event, dict) else None
+        )
         return self._build(
             callback_event_id=provider_event_id,
             message_id=getattr(event, "message_id", ""),
             chat_id=getattr(event, "chat_id", ""),
             open_id=getattr(getattr(event, "operator", None), "open_id", ""),
             action=getattr(event, "action", None),
+            callback_token=callback_token,
         )
 
 
@@ -445,7 +485,6 @@ class FeishuGateway:
         self.events = events
         self.queue = queue
         self.parser = FeishuEventParser(app_id)
-        self.channel_adapter = FeishuChannelMessageAdapter(app_id)
         self.channel_factory = channel_factory
         self.process_context = process_context
         self.receiver_target = receiver_target
@@ -470,13 +509,6 @@ class FeishuGateway:
 
         try:
             event = self.parser.parse(payload)
-        except InvalidBotEvent:
-            return False
-        return self.accept_event(event)
-
-    def accept_channel_message(self, message: Any) -> bool:
-        try:
-            event = self.channel_adapter.adapt(message)
         except InvalidBotEvent:
             return False
         return self.accept_event(event)
@@ -768,9 +800,15 @@ class FeishuGateway:
                     continue
                 logger.info(
                     "feishu_gateway_ipc_card_action_received "
-                    "event_id=%s message_id=%s",
+                    "event_id=%s message_id=%s ipc_queue_delay_ms=%.3f",
                     event.event_id,
                     event.message_id,
+                    max(
+                        0.0,
+                        (time.monotonic() - event.received_monotonic) * 1000,
+                    )
+                    if event.received_monotonic is not None
+                    else 0.0,
                 )
                 if self.card_action_handler is None:
                     logger.warning(

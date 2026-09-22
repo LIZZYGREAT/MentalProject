@@ -178,6 +178,8 @@ class ParticipantView:
     participant_code: str
     status: str
     external_llm_consent_at: datetime | None = None
+    access_tier: str = "participant"
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -202,6 +204,21 @@ class PendingReplyPlan:
     next_segment: int
     message_ids: tuple[str, ...]
     plan_version: str
+    presentation_mode: str = "plain_text"
+    rich_text: str | None = None
+    plain_text_fallback: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingStreamingReplyPlan:
+    event_id: str
+    final_text: str | None
+    card_id: str
+    message_id: str
+    element_id: str
+    state: str
+    sequence: int
+    final_text_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -210,6 +227,7 @@ class ClaudeSessionView:
     session_id: str
     status: str
     last_message_id: str | None
+    last_backend_state_event_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 
@@ -224,7 +242,9 @@ class ParticipantRepository:
             session.add(row)
             session.flush()
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get(self, participant_id: uuid.UUID) -> Optional[ParticipantView]:
@@ -233,7 +253,9 @@ class ParticipantRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get_by_code(self, participant_code: str) -> Optional[ParticipantView]:
@@ -246,20 +268,11 @@ class ParticipantRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
-    def set_external_llm_consent(
-        self, participant_id: uuid.UUID, *, allowed: bool
-    ) -> ParticipantView:
-        with self.database.session() as session:
-            row = session.get(Participant, participant_id, with_for_update=True)
-            if row is None:
-                raise ValueError("participant not found")
-            row.external_llm_consent_at = utc_now() if allowed else None
-            return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
-            )
 
     def active_ids(self) -> list[uuid.UUID]:
         with self.database.session() as session:
@@ -304,7 +317,9 @@ class BindingRepository:
             if row is None:
                 return None
             return ParticipantView(
-                row.id, row.participant_code, row.status, row.external_llm_consent_at
+                row.id, row.participant_code, row.status,
+                row.external_llm_consent_at, row.access_tier,
+                tuple(row.scopes_json or ()),
             )
 
     def get_for_participant(self, participant_id: uuid.UUID) -> Optional[dict[str, Any]]:
@@ -316,7 +331,12 @@ class BindingRepository:
             ).scalar_one_or_none()
             if row is None:
                 return None
-            return {"app_id": row.app_id, "open_id": row.open_id, "chat_id": row.chat_id}
+            return {
+                "app_id": row.app_id,
+                "open_id": row.open_id,
+                "chat_id": row.chat_id,
+                "bound_at": row.bound_at,
+            }
 
 
 class ProfileRepository:
@@ -1187,25 +1207,6 @@ class PsychometricAssessmentRepository:
                 .limit(max(1, min(limit, 500)))
             ).scalars().all()
             return [self._view(row) for row in rows]
-
-    def latest_by_instrument(
-        self, participant_id: uuid.UUID, instrument_name: str
-    ) -> Optional[dict[str, Any]]:
-        name = normalize_instrument_name(instrument_name)
-        with self.database.session() as session:
-            row = session.execute(
-                select(PsychometricAssessment)
-                .where(
-                    PsychometricAssessment.participant_id == participant_id,
-                    PsychometricAssessment.instrument_name == name,
-                )
-                .order_by(
-                    desc(PsychometricAssessment.administered_at),
-                    desc(PsychometricAssessment.created_at),
-                )
-                .limit(1)
-            ).scalar_one_or_none()
-            return self._view(row) if row is not None else None
 
     def latest_by_instrument_as_of(
         self,
@@ -2222,23 +2223,6 @@ class ForecastSnapshotRepository:
                 seen.add(row.local_date)
                 result.append(self._view(row))
             return result
-
-    def latest_before(
-        self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
-    ) -> Optional[dict[str, Any]]:
-        """Return the newest snapshot generated before a causal cutoff.
-
-        This is an artifact-generation query only.  Consumers that need the
-        forecast which was current at the cutoff must use :meth:`current_at`.
-        """
-
-        with self.database.session() as session:
-            row = session.execute(select(ForecastSnapshot).where(
-                ForecastSnapshot.participant_id == participant_id,
-                ForecastSnapshot.local_date == local_date,
-                ForecastSnapshot.generated_at < timestamp,
-            ).order_by(desc(ForecastSnapshot.generated_at)).limit(1)).scalar_one_or_none()
-            return self._view(row) if row is not None else None
 
     def current_at(
         self, participant_id: uuid.UUID, local_date: date, timestamp: datetime
@@ -3484,18 +3468,6 @@ class WarningScheduleRepository:
                 WarningSchedule.status.in_(("sent", "escalated")),
             )).all())
 
-    def latest_successful_delivery(
-        self, participant_id: uuid.UUID, local_date: date
-    ) -> datetime | None:
-        with self.database.session() as session:
-            row = session.execute(select(WarningSchedule).where(
-                WarningSchedule.participant_id == participant_id,
-                WarningSchedule.local_date == local_date,
-                WarningSchedule.status.in_(("sent", "escalated")),
-                WarningSchedule.sent_at.is_not(None),
-            ).order_by(desc(WarningSchedule.sent_at)).limit(1)).scalar_one_or_none()
-            return self._aware(row.sent_at) if row is not None else None
-
     def pending(self, now: datetime, *, limit: int = 100) -> list[dict[str, Any]]:
         now = self._aware(now)
         with self.database.session() as session:
@@ -3785,6 +3757,38 @@ class WarningScheduleRepository:
             row.updated_at = now
             return True
 
+    def persist_claimed_composition(
+        self,
+        warning_id: uuid.UUID,
+        *,
+        claim_token: uuid.UUID | str,
+        expected_forecast_version: str,
+        message: str,
+        composition: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        """Persist one validated composition while the delivery claim is held."""
+
+        token = uuid.UUID(str(claim_token))
+        changed_at = self._aware(now)
+        with self.database.session() as session:
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
+            row.payload_json = {
+                **dict(row.payload_json or {}),
+                "message": str(message)[:4000],
+                "care_composition": dict(composition),
+            }
+            row.updated_at = changed_at
+            self._mirror_care(session, row)
+            return True
+
     def finish_claim(
         self, warning_id: uuid.UUID, *, claim_token: uuid.UUID | str,
         expected_forecast_version: str, sent: bool, now: datetime,
@@ -3850,6 +3854,48 @@ class WarningScheduleRepository:
                     row.next_attempt_at = next_attempt
                     row.authorized_at = None
             row.updated_at = now
+            self._mirror_care(session, row)
+            return True
+
+    def suppress_claim(
+        self,
+        warning_id: uuid.UUID,
+        *,
+        claim_token: uuid.UUID | str,
+        expected_forecast_version: str,
+        now: datetime,
+        reason: str,
+    ) -> bool:
+        """Close a current domain claim rejected by the global send gate."""
+
+        changed_at = self._aware(now)
+        token = uuid.UUID(str(claim_token))
+        with self.database.session() as session:
+            candidate = session.get(WarningSchedule, warning_id)
+            if candidate is None:
+                return False
+            session.get(
+                Participant, candidate.participant_id, with_for_update=True
+            )
+            row = session.get(WarningSchedule, warning_id, with_for_update=True)
+            if (
+                row is None
+                or row.status != "claimed"
+                or row.claim_token != token
+                or row.forecast_version != expected_forecast_version
+            ):
+                return False
+            row.status = "suppressed"
+            row.payload_json = {
+                **dict(row.payload_json),
+                "suppression_reason": f"global_{str(reason)[:64]}",
+            }
+            row.claim_token = None
+            row.claimed_at = None
+            row.lease_until = None
+            row.authorized_at = None
+            row.next_attempt_at = None
+            row.updated_at = changed_at
             self._mirror_care(session, row)
             return True
 
@@ -4037,6 +4083,7 @@ class ClaudeSessionRepository:
             session_id=row.session_id,
             status=row.status,
             last_message_id=row.last_message_id,
+            last_backend_state_event_id=row.last_backend_state_event_id,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -4052,6 +4099,7 @@ class ClaudeSessionRepository:
         session_id: str,
         *,
         last_message_id: Optional[str],
+        last_backend_state_event_id: uuid.UUID | str | None = None,
     ) -> ClaudeSessionView:
         value = str(session_id).strip()
         if not value:
@@ -4064,12 +4112,20 @@ class ClaudeSessionRepository:
                     session_id=value,
                     status="active",
                     last_message_id=last_message_id,
+                    last_backend_state_event_id=(
+                        uuid.UUID(str(last_backend_state_event_id))
+                        if last_backend_state_event_id else None
+                    ),
                 )
                 session.add(row)
             else:
                 row.session_id = value
                 row.status = "active"
                 row.last_message_id = last_message_id
+                if last_backend_state_event_id:
+                    row.last_backend_state_event_id = uuid.UUID(
+                        str(last_backend_state_event_id)
+                    )
                 row.updated_at = utc_now()
             session.flush()
             return self._view(row)
@@ -4164,6 +4220,8 @@ class BotEventRepository:
             row = session.get(BotEvent, event_id)
             if row is None or row.status != "reply_pending":
                 return None
+            if str(row.reply_plan_version or "").startswith("streaming-card"):
+                return None
             raw_segments = row.reply_segments_json
             if isinstance(raw_segments, list) and raw_segments:
                 segments = tuple(str(item) for item in raw_segments if str(item))
@@ -4188,7 +4246,115 @@ class BotEventRepository:
                 next_segment=next_segment,
                 message_ids=message_ids,
                 plan_version=version,
+                presentation_mode=str(row.reply_presentation_mode or "plain_text"),
+                rich_text=(str(row.reply_rich_text) if row.reply_rich_text else None),
+                plain_text_fallback=(
+                    str(row.reply_plain_text_fallback)
+                    if row.reply_plain_text_fallback
+                    else None
+                ),
             )
+
+    def pending_streaming_reply_plan(
+        self, event_id: str
+    ) -> PendingStreamingReplyPlan | None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id)
+            if (
+                row is None
+                or row.status != "reply_pending"
+                or not str(row.reply_plan_version or "").startswith("streaming-card")
+                or not row.streaming_card_id
+                or not row.streaming_message_id
+                or not row.streaming_element_id
+            ):
+                return None
+            return PendingStreamingReplyPlan(
+                event_id=row.event_id,
+                final_text=str(row.reply_text) if row.reply_text is not None else None,
+                card_id=str(row.streaming_card_id),
+                message_id=str(row.streaming_message_id),
+                element_id=str(row.streaming_element_id),
+                state=str(row.streaming_state or "progress"),
+                sequence=int(row.streaming_sequence or 0),
+                final_text_hash=(
+                    str(row.streaming_final_text_hash)
+                    if row.streaming_final_text_hash
+                    else None
+                ),
+            )
+
+    def stage_streaming_progress(
+        self,
+        event_id: str,
+        *,
+        card_id: str,
+        message_id: str,
+        element_id: str,
+    ) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status in {"completed", "interrupted"}:
+                return
+            if row.streaming_card_id and row.streaming_card_id != str(card_id):
+                raise ValueError("streaming card is already bound")
+            row.streaming_card_id = str(card_id)[:128]
+            row.streaming_message_id = str(message_id)[:128]
+            row.streaming_element_id = str(element_id)[:128]
+            row.streaming_state = "progress"
+            row.streaming_sequence = int(row.streaming_sequence or 0)
+            row.reply_plan_version = "streaming-card-v1"
+            row.status = "reply_pending"
+            row.error_code = None
+
+    def stage_streaming_final(self, event_id: str, *, full_text: str) -> None:
+        value = str(full_text)
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            if not row.streaming_card_id:
+                raise ValueError("streaming card must be bound before final staging")
+            row.reply_text = value
+            row.reply_segments_json = None
+            row.reply_next_segment = 0
+            row.reply_plan_version = "streaming-card-v1"
+            row.streaming_final_text_hash = hashlib.sha256(
+                value.encode("utf-8")
+            ).hexdigest()
+            row.streaming_state = "final_ready"
+            row.status = "reply_pending"
+            row.error_code = None
+
+    def reserve_streaming_sequence(self, event_id: str) -> int:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or not row.streaming_card_id:
+                raise ValueError("streaming card is not bound")
+            row.streaming_sequence = int(row.streaming_sequence or 0) + 1
+            return row.streaming_sequence
+
+    def finish_streaming_reply(self, event_id: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.streaming_state = "finalized"
+            row.streaming_finalized_at = utc_now()
+            row.reply_message_id = row.streaming_message_id
+            row.status = "completed"
+            row.error_code = None
+            row.image_key = None
+            row.processed_at = utc_now()
+
+    def note_streaming_failure(self, event_id: str, error_code: str) -> None:
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.streaming_state = "failed"
+            row.status = "reply_pending"
+            row.error_code = str(error_code)[:64]
 
     def stage_reply_plan(
         self,
@@ -4197,6 +4363,9 @@ class BotEventRepository:
         full_text: str,
         segments: list[str] | tuple[str, ...],
         plan_version: str = "response-plan-v1",
+        presentation_mode: str = "plain_text",
+        rich_text: str | None = None,
+        plain_text_fallback: str | None = None,
     ) -> None:
         normalized = [str(item) for item in segments if str(item)]
         if not normalized:
@@ -4214,6 +4383,13 @@ class BotEventRepository:
             row.reply_next_segment = 0
             row.reply_message_ids_json = []
             row.reply_plan_version = str(plan_version)[:32]
+            row.reply_presentation_mode = str(presentation_mode)[:32]
+            row.reply_rich_text = str(rich_text) if rich_text is not None else None
+            row.reply_plain_text_fallback = (
+                str(plain_text_fallback)
+                if plain_text_fallback is not None
+                else None
+            )
             row.status = "reply_pending"
             row.error_code = None
 
@@ -4318,6 +4494,15 @@ class BotEventRepository:
                 row.image_key = None
             row.processed_at = utc_now()
 
+    def mark_content_protected(self, event_id: str) -> None:
+        """Mark Safety-handled content so admin projections redact it."""
+
+        with self.database.session() as session:
+            row = session.get(BotEvent, event_id, with_for_update=True)
+            if row is None or row.status == "interrupted":
+                return
+            row.content_privacy_class = "protected"
+
     def save_telemetry(self, event_id: str, metrics: dict[str, Any]) -> None:
         """Persist non-secret delivery timings in an independent transaction."""
 
@@ -4382,6 +4567,35 @@ class RuntimeIncidentRepository:
             session.add(row)
             session.flush()
             return row.id
+
+    def has_incident(
+        self,
+        *,
+        subsystem: str,
+        event_name: str,
+        details_match: dict[str, str],
+        scan_limit: int = 200,
+    ) -> bool:
+        """Best-effort dedupe probe for recurring incident writers."""
+
+        with self.database.session() as session:
+            rows = session.scalars(
+                select(RuntimeIncident)
+                .where(
+                    RuntimeIncident.subsystem == str(subsystem)[:64],
+                    RuntimeIncident.event_name == str(event_name)[:128],
+                )
+                .order_by(desc(RuntimeIncident.created_at))
+                .limit(max(1, int(scan_limit)))
+            )
+            for row in rows:
+                details = dict(row.details_json or {})
+                if all(
+                    details.get(key) == value
+                    for key, value in details_match.items()
+                ):
+                    return True
+            return False
 
 
 class AgentRunRepository:

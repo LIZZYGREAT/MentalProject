@@ -14,7 +14,7 @@ from services.course_catalog import (
 from settings.event_routing import COURSE_HINT_PATTERN, ROUTINE_PATTERNS, TASK_PATTERNS
 
 
-EVENT_CLASSIFICATION_VERSION = "event_classification.v3"
+EVENT_CLASSIFICATION_VERSION = "event_classification.v4"
 CLASSIFIABLE_EVENT_TYPES = {
     "course",
     "task",
@@ -28,6 +28,18 @@ CLASSIFIABLE_EVENT_TYPES = {
 }
 TASK_TYPES = {"general", "homework", "ddl", "exam", "meeting", "course"}
 COMPLETION_RELEVANT_POLICIES = {"work_session", "deliverable", "progress"}
+HARD_EVENT_TYPE_LOCKS = {
+    "explicit",
+    "catalog_exact",
+    "backend_course_provenance",
+}
+WEAK_CLASSIFICATION_SOURCES = {
+    "routine_rule",
+    "task_rule",
+    "catalog_alias",
+    "course_keyword_rule",
+    "fallback",
+}
 
 _WORK_VERBS = re.compile(
     r"完成|写|做|改|赶|准备|复习|预习|整理|制作|修改|推进|刷题|finish|write|prepare|review",
@@ -74,13 +86,11 @@ def classify_event(
         if routine is not None:
             event_type, task_type, event_kind = routine
             source = "routine_rule"
-            lock = "routine"
         else:
             task_rule = _task_classification(folded_title, folded_title)
             if task_rule is not None:
                 event_type, task_type, event_kind = task_rule
                 source = "task_rule"
-                lock = "course_related_task" if resolution.likely_course else ""
             elif resolution.exact_match is not None:
                 event_type, task_type, event_kind = "course", "course", "course_session"
                 source = _candidate_source(resolution.exact_match)
@@ -91,10 +101,17 @@ def classify_event(
                     "catalog_alias"
                     if resolution.alias_match_kind else "catalog_exact"
                 )
-                lock = "catalog_strong_evidence"
             elif re.search(COURSE_HINT_PATTERN, folded_title):
                 event_type, task_type, event_kind = "course", "course", "course_session"
                 source = "course_keyword_rule"
+
+    rule_candidate = None
+    if source in WEAK_CLASSIFICATION_SOURCES:
+        rule_candidate = {
+            "event_type": event_type,
+            "task_type": task_type,
+            "event_kind": event_kind,
+        }
 
     result: dict[str, Any] = {
         "event_type": event_type,
@@ -104,14 +121,12 @@ def classify_event(
             "schema_version": EVENT_CLASSIFICATION_VERSION,
             "source": source,
             "lock": lock,
-            "event_type_locked": lock in {
-                "explicit",
-                "routine",
-                "catalog_exact",
-                "catalog_strong_evidence",
-                "course_related_task",
-            },
+            "authority": (
+                "backend_locked" if lock in HARD_EVENT_TYPE_LOCKS else "semantic_correctable"
+            ),
+            "event_type_locked": lock in HARD_EVENT_TYPE_LOCKS,
             "course_identity_locked": lock == "catalog_exact",
+            "rule_candidate": rule_candidate,
             "explicit_event_type": explicit_type or None,
             "explicit_task_type": explicit_task or None,
             "preliminary_event_type": event_type,
@@ -121,7 +136,7 @@ def classify_event(
         },
     }
     selected = resolution.exact_match
-    if selected is None and event_type == "task" and lock == "course_related_task":
+    if selected is None and event_type == "task" and resolution.likely_course:
         # Task intent words are not part of course identity. A second,
         # deterministic lookup may bind an exact course (for example
         # “写线性代数作业” → “线性代数”), while ambiguous aliases such as
@@ -154,16 +169,10 @@ def finalize_event_classification(
     metadata = dict(result.get("metadata") or {})
     classification = dict(metadata.get("classification") or {})
     lock = str(classification.get("lock") or "")
-    event_type_locked = bool(
-        classification.get("event_type_locked")
-        or lock in {
-            "explicit",
-            "routine",
-            "catalog_exact",
-            "catalog_strong_evidence",
-            "course_related_task",
-        }
-    )
+    # The lock name is the authority record.  Recomputing from the allowlist
+    # also releases legacy v3 broad-rule locks such as ``routine`` and
+    # ``course_related_task`` when old snapshots are finalized.
+    event_type_locked = lock in HARD_EVENT_TYPE_LOCKS
     course_identity_locked = bool(
         classification.get("course_identity_locked") or lock == "catalog_exact"
     )
@@ -234,6 +243,9 @@ def finalize_event_classification(
     classification["final_task_type"] = task_type
     classification["event_type_locked"] = event_type_locked
     classification["course_identity_locked"] = course_identity_locked
+    classification["authority"] = (
+        "backend_locked" if event_type_locked else "semantic_correctable"
+    )
     metadata["classification"] = classification
     metadata["task_type"] = task_type
     result["metadata"] = metadata
@@ -425,13 +437,13 @@ def _candidate_source(candidate: CourseCandidate) -> str:
 def _classification_confidence(source: str) -> float:
     return {
         "explicit": 1.0,
-        "routine_rule": 0.98,
+        "routine_rule": 0.62,
         "catalog_exact": 0.99,
-        "catalog_alias": 0.95,
-        "catalog_candidates": 0.78,
-        "task_rule": 0.90,
-        "course_keyword_rule": 0.78,
-        "fallback": 0.55,
+        "catalog_alias": 0.72,
+        "catalog_candidates": 0.65,
+        "task_rule": 0.68,
+        "course_keyword_rule": 0.60,
+        "fallback": 0.45,
     }.get(source, 0.65)
 
 

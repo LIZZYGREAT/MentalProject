@@ -57,9 +57,8 @@ def main() -> None:
     profile = commands.add_parser("set-profile")
     profile.add_argument("participant_code")
     profile.add_argument("json_file")
-    consent = commands.add_parser("set-llm-consent")
-    consent.add_argument("participant_code")
-    consent.add_argument("--revoke", action="store_true")
+    # No researcher approval entry exists for external LLM processing: that
+    # consent is granted or revoked by the participant only.
     args = parser.parse_args()
     settings = Settings.from_env()
     database = Database(build_engine(settings.database_url))
@@ -84,14 +83,6 @@ def main() -> None:
         version = ProfileRepository(database).save(participant.id, value)
         print(f"participant_id={participant.id}")
         print(f"profile_version={version}")
-        return
-    if args.command == "set-llm-consent":
-        updated = participants.set_external_llm_consent(
-            participant.id, allowed=not args.revoke
-        )
-        state = "revoked" if args.revoke else "granted"
-        print(f"participant_id={updated.id}")
-        print(f"external_llm_consent={state}")
         return
     flow = _build_calendar_device_flow(database, settings)
 

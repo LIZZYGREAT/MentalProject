@@ -22,15 +22,7 @@ from services.event_classifier import (
 
 
 EVENT_SCHEMA_VERSION = "event_instance.v3"
-OUTCOME_SCHEMA_VERSION = "event_outcome.v1"
 
-CONFIRMED_COMPLETED = {"confirmed_completed", "completed", "done"}
-CONFIRMED_INCOMPLETE = {
-    "confirmed_incomplete",
-    "incomplete",
-    "partial",
-    "rescheduled",
-}
 _SUBMISSION_WORDS = re.compile(
     r"交作业|提交|上交|截止|ddl|deadline|due|答辩|汇报",
     flags=re.IGNORECASE,
@@ -213,59 +205,3 @@ def apply_outcome_feedback(
         result.append(event)
     return result
 
-
-def apply_user_appraisals(
-    events: Iterable[Mapping[str, Any]],
-    feedback: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Apply explicit topic-level user appraisal to matching future events."""
-
-    profiles = []
-    for item in feedback:
-        if not isinstance(item, Mapping) or item.get("feedback_type") != "event_appraisal":
-            continue
-        payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
-        topic = _text(payload.get("topic"), 80).casefold()
-        if topic:
-            profiles.append((topic, payload, item.get("reported_at")))
-    result = []
-    for raw in events:
-        event = deepcopy(dict(raw))
-        haystack = f"{event.get('summary', '')} {event.get('description', '')}".casefold()
-        matched = [profile for profile in profiles if profile[0] in haystack]
-        if matched:
-            _, payload, reported_at = matched[-1]
-            metadata = dict(event.get("metadata") or {})
-            appraisal = dict(metadata.get("appraisal") or {})
-            if payload.get("threat") is not None:
-                appraisal["threat"] = payload["threat"]
-            if payload.get("control") is not None:
-                appraisal["control"] = payload["control"]
-            if payload.get("perceived_difficulty") is not None:
-                appraisal["expected_effort"] = payload["perceived_difficulty"]
-            dislike = payload.get("dislike")
-            if dislike is not None:
-                appraisal["challenge"] = max(0.0, 0.55 - 0.45 * float(dislike))
-            metadata["appraisal"] = appraisal
-            metadata["user_appraisal"] = {
-                "topic": payload.get("topic"),
-                "perceived_difficulty": payload.get("perceived_difficulty"),
-                "dislike": dislike,
-                "source": "explicit_user_feedback",
-                "reported_at": reported_at,
-            }
-            event["metadata"] = metadata
-        result.append(event)
-    return result
-
-
-def completion_relevant(event: Mapping[str, Any]) -> bool:
-    lifecycle = event.get("lifecycle")
-    if not isinstance(lifecycle, Mapping):
-        metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
-        lifecycle = metadata.get("lifecycle") if isinstance(metadata.get("lifecycle"), Mapping) else {}
-    return str(lifecycle.get("completion_policy") or "none") in COMPLETION_RELEVANT_POLICIES
-
-
-def outcome_is_incomplete(lifecycle: Mapping[str, Any]) -> bool:
-    return str(lifecycle.get("outcome_status") or "").casefold() in CONFIRMED_INCOMPLETE

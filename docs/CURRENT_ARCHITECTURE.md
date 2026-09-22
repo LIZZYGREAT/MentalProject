@@ -2,9 +2,9 @@
 
 本文只描述 `production_runtime` 当前实现。代码、迁移与自动测试是最终事实来源。
 
-<!-- BUSINESS_TOOL_COUNT: 16 -->
+<!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0046_course_schedule_image_sessions -->
+<!-- ALEMBIC_HEAD: 0084_research_evidence_updated_at -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
@@ -32,9 +32,11 @@ Vision 请求、严格解析与 Draft 创建共享同一并发上限；同步图
 
 ## Agent 与业务工具
 
-每位参与者使用独立顺序队列与可恢复 session。Backend 只向 Agent 暴露 16 个封闭 schema
-的 participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线和 Calendar。工具
-Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
+每位参与者使用独立顺序队列与可恢复 session。Backend 向 Agent 暴露封闭 schema 的
+participant-bound 工具，覆盖 Care、check-in、Forecast、压力曲线、Calendar 以及独立的
+公共 Web/Video/Research 只读能力。工具 Registry 禁止身份、Token、Secret、SQL、路径与
+任意私有上下文字段；经审核的公共 URL 入口由 handler 执行 HTTPS、凭据、敏感 query 与
+SSRF 校验。
 
 <!-- BUSINESS_TOOLS_BEGIN -->
 - `care_get_today_context`
@@ -47,16 +49,114 @@ Registry 禁止身份、Token、Secret、SQL、路径与任意 URL 字段。
 - `care_get_pressure_curve`
 - `care_simulate_schedule_change`
 - `care_get_checkin_card`
+- `help_show_feature_card`
+- `morning_brief_show_settings`
 - `calendar_connection_status`
 - `calendar_list_calendars`
 - `calendar_list_events`
 - `calendar_create_event`
+- `calendar_create_events_plan`
 - `calendar_update_event`
+- `calendar_update_events_plan`
 - `calendar_delete_event`
+- `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
 
-`calendar_update_event` 的 `start_time` 与 `end_time` 是互相依赖字段：两者同时提供或同时
-省略。底层 handler 也执行相同校验，避免 schema 与实现合同漂移。
+公共 Web/Video 工具不属于上面的 Care/Calendar 清单：
+
+- `web_search`
+- `web_read_result`
+- `web_read_url`
+- `web_read_url_chunk`
+- `video_inspect_url`
+- `video_read_transcript`
+
+公共 Research Runtime 工具同样不属于上面的 Care/Calendar 清单：
+
+- `research_search`
+- `research_open_url`
+- `research_browser_open`
+- `research_exec`
+- `research_github`
+- `morning_brief_topic_propose`
+
+`PublicVideoService` 当前只接入 Bilibili。公开视频 URL 先经过复用的 public HTTPS
+redirect/DNS/SSRF 链路，再读取公开 Metadata 与匿名可访问字幕；Transcript 按
+participant、provider、video_id 短期缓存并按 offset 分块。字幕是 untrusted evidence，
+不能改变系统规则、工具授权或 Calendar 状态。无公开字幕时只返回标题/简介可见和明确
+降级说明。本阶段不做 ASR、音频下载、Whisper、逐帧视觉理解、OCR、时间轴对齐或秒级问答。
+
+Public Research Runtime 是独立的非 root 容器，只挂载临时 research workspace。Bot 通过
+内部 RPC 调用，研究运行时不接收 participant、日程、Memory、心理上下文、Cookie 或凭据；
+它只允许公开 HTTPS、无登录 Browser、GitHub public API 和有限 argv 数据处理。每个 DNS
+解析及 redirect 都重新检查公网地址，网页、README、Issue 与搜索摘要统一视为不可信证据，
+不能触发 Structured Tool 或长期偏好写入。Morning Brief 主题存于独立的 participant topic
+表，长期增删必须经过确认提案；一次性公开查询不会自动订阅。
+
+`calendar_update_event` 与批量更新采用 PATCH 合同：Agent 提供 `event_ref`、结构化 `scope`
+以及只包含目标字段的 `changes`。Backend 先绑定 participant-owned 当前对象，再把 partial
+changes 与当前状态合成为完整 proposal；未出现的字段保持原值，`start_time` 与 `end_time`
+可独立修改。Backend 不读取原始聊天文本来推断范围或变更字段。
+
+六个 Calendar mutation Agent 工具统一归类为 `proposal_stage`：它们只保存有 TTL 的
+participant-bound pending plan 并生成固定确认卡，不调用 Calendar Provider，也不经过
+MutationIntent 的二次 LLM 语义校验。操作类型仍受 Backend operation gate 约束；真正的
+external write 只能由原参与者点击确认卡后，通过 receipt/idempotency 与 durable runner
+触发。取消、过期及重复确认均不会重复写 Provider。
+
+自然语言 Check-in 采用 Agent 预填、参与者提交的边界。`care_record_checkin` 只把参与者明确
+表达的字段填入固定状态表单，未明确字段保持空白，不写 Observation，也不经过 mutation
+语义复核。只有原参与者补齐并提交固定卡片后，CardAction executor 才校验完整字段、幂等写入
+Observation，并触发 Forecast refresh；Agent 不得把“卡片已生成”表述为“状态已记录”。
+
+Care 与通知偏好也采用 typed proposal。`care_update_preferences` 只接受封闭 schema 中的
+structured changes，经 Backend 当前状态与安全上限校验后保存短期 participant-bound proposal，
+并生成固定设置差异卡；Agent 不直接持久化。只有绑定参与者的 receipt-protected CardAction
+确认后才更新设置，取消、过期、跨参与者确认与重复确认都不会产生写入。Morning Brief 时间
+继续使用当前研究配置允许的离散时段；是否开放任意 `HH:MM` 属于独立产品能力决策。
+
+Reminder 的创建与取消同样采用 `proposal_stage`。Agent 只提交结构化 message、RFC3339
+时间与 recurrence，Backend 验证格式并保存短期 participant-bound proposal；固定卡展示
+解析后的本地时间。只有原参与者的 CardAction 才能原子地创建或取消 Reminder，取消审核
+卡不会写入或改变 Reminder，Agent 路径不再经过 MutationIntent 的第二次时间语义判断。
+
+Memory 与表达偏好的自然语言 routing 由 Agent 完成。生产代码不再提供 raw preference
+rule parser；偏好工具只接受 enum/boolean/受限文本字段。Memory 的 `preferred_name` 与
+`sleep_routine` 冲突键由固定 `memory_type`/`memory_subtype` 决定，而非中文 Regex。密钥、
+系统/权限覆盖、临床健康与用药内容仍由独立 `DurableMemoryPolicyGuard` fail-closed 拒绝。
+Agent-facing Memory remember/replace/delete/clear 和 interaction/support preference update
+统一写入有 TTL 的 `PersonalizationProposal` 并生成固定审核卡。卡片只携带 proposal id，
+原参与者确认后才由 deterministic executor 调用相应 service；取消审核不改变耐久状态。
+Memory Center 与 Settings 表单本身是用户提交入口，因此继续作为直接 CardAction executor。
+Personalization 确认使用单一数据库事务：先锁定 participant-bound proposal，在同一 session
+内完整应用 Memory、interaction/support 或 Care Preference effect，再把 proposal 写为
+`confirmed` 后一次提交。Memory clear 锁定并处理审核时保存的 exact IDs；任一目标失效或
+terminal status 前发生异常时整笔回滚，proposal 保持可重试，不能出现部分删除或 effect 已
+提交但 proposal 卡在 `executing` 的状态。并发确认通过 proposal 行锁保证只有一个执行者。
+
+表达偏好中的基础 style 与语义沟通规则分开存储。`custom_rules` 只接受 Agent 已经理解的
+结构化 `{scope, instruction}`，最多三条 active rule；不再由 Backend 解析原始中文。规则与
+基础 style 一起进入同一个 Personalization 确认事务，Settings 卡展示具体规则并通过同样的
+proposal 流程删除/替换。确认后的规则只影响表达方式，不能改变安全、授权、工具、身份或
+隐私边界。
+
+CardAction 的确定性业务提交还会写入 participant-scoped 的
+`participant_agent_state_events` 账本。下一轮 Agent 从 Claude session 游标之后读取这些
+后端事实并通过独立的 `backend_state_updates` 通道注入；Agent turn 成功后才推进游标，失败、
+超时或取消则保留游标。账本不保存 callback token、原始卡片 JSON 或私密 payload，导航动作
+不产生事件；卡片 update 失败也不会遮蔽已经提交的业务事实。
+
+Course Schedule 的 Draft correction 与 pending-draft cancel 属于 `draft_write`，不经过
+MutationIntent verifier，且不会写 Calendar。已完成/部分完成导入的 provider revert 使用
+独立 `course_schedule_stage_revert_import`：Backend 先解析唯一 participant-owned import，
+固定卡展示课程数与待清理日程数；只有 receipt-protected external CardAction 才调用 `revert()`
+安装 cleanup Saga fence。Agent Registry 不再暴露混合 cancel/revert executor。
+
+Safety 由独立 `SafetySemanticGate` 分类为 first-person imminent/non-imminent、third-party、
+quoted/academic 或 ordinary，再由 Backend 固定 policy 决定是否锁定回复。明确第一人称风险
+仍不会进入主 Agent；论文、新闻、引用与第三方关切不会仅因关键词被当作本人即时风险。
+分类器异常或无外部语义能力时，未能归类的风险主题继续走保守固定响应，主 Agent 与用户
+都不能覆盖这一门控。
 
 ## Forecast、Calendar 与 freshness
 
@@ -119,9 +219,13 @@ Tomorrow 解析 Today terminal 时使用 `refresh_calendar=False`；Today 无快
 ## Course classification
 
 事件分类先执行确定性规则与有界课程目录检索，再在已授权时使用同一次 semantic API 完成
-语义增强。`event_type_locked` 与 `course_identity_locked` 是独立事实：例如“高数”可以锁定
-为 course，但 canonical identity 仍由 API 从 Top-K 候选中选择；“线代”精确解析为“线性
-代数”时才锁定 identity。API 返回的课程必须属于候选集合。
+语义增强。只有用户显式提供的结构化 `event_type`、精确课程目录身份或 Backend 已知的课程
+导入 provenance 可以 hard-lock 事件类型。routine/task/course keyword 等宽泛词法命中只保存为
+带低置信度的 `rule_candidate`，在 rules-only 模式下作为保守的 provisional fallback，并允许
+专用 semantic model 在 allowlisted enum 内纠正。`event_type_locked` 与
+`course_identity_locked` 是独立事实：“高数”只形成可纠正的 course 候选，canonical identity
+仍由 API 从 Top-K 候选中选择；“线代”精确解析为“线性代数”时才锁定类型和 identity。
+API 返回的课程必须属于候选集合。
 
 `高数A/高数B` 会分别把 semantic candidate set 限制为 A/B-compatible 课程，API 不能反转
 用户明确写出的类别。`高数I/II/1/2/3` 仅作为模糊检索提示，不会用
@@ -212,12 +316,12 @@ authorization、有效 claim lease、current Forecast 且 `sent_at >= authorized
 
 ## Response、Admin 与历史兼容
 
-最终回复先经安全检查、清理与确定性分段，再按展示模式决定是否调用展示模型。回复计划、
-稳定消息 UUID 与发送进度均持久化，可在重启后恢复。`reply_text` 保存当前回复计划的
-authoritative full text，`reply_segments_json` 保存当前分段；只有历史行缺少 segments 时，
-`reply_text` 才额外承担 legacy single-segment recovery。
-展示模型只能选择 SemanticSegmenter 批准的边界，权威 slice 不执行 `strip`，各段拼接后与
-清理后的权威正文逐字一致，且不会切断 URL、链接或未闭合结构。
+最终回复先经安全检查，再进入确定性 PresentationCompiler。联网、URL 读取和长分析回答
+使用 Feishu-safe Markdown，并在检查完成后通过同一张 CardKit 卡片累积更新；原始模型 delta
+只用于首 token telemetry，不会在安全检查前对用户可见。卡片 ID、严格递增 sequence、最终
+正文 hash 与 finalize 状态均持久化，可在重启后恢复。普通消息继续使用稳定消息 UUID 与分段
+发送进度恢复；`reply_text` 保存 authoritative full text，只有历史行缺少 segments 时才额外
+承担 legacy single-segment recovery。旧 PresentationAgent 默认关闭，只保留显式诊断开关。
 
 Admin 是独立 HTTP 服务，提供参与者、Forecast、Warning、Calendar、Daily Review、Care
 Timeline 和运行事件查询。研究评估页按日期窗口展示 cohort 数据完整性、Forecast 误差、
@@ -228,7 +332,7 @@ mutation pending，而不会把诊断 events 当成可用 Forecast 输入。
 
 ## PostgreSQL 与迁移
 
-当前 Alembic 唯一 head 是 `0046_course_schedule_image_sessions`。0017 增加 Warning/Daily Review
+当前 Alembic 唯一 head 是 `0071_streaming_reply_plan`。0017 增加 Warning/Daily Review
 实际授权时间、Snooze provenance FK/唯一约束及 Calendar snapshot state。升级会将 0016
 Warning JSON 中能与真实 CareIntervention UUID 匹配的 snooze provenance 安全回填；缺失或
 无效值保留 NULL，不会因 UUID cast 失败阻断迁移。已有 `degraded=true` CalendarSnapshot
@@ -444,6 +548,50 @@ effectiveness 当前只允许 `observational_descriptive`：`causal_claim_allowe
 CardAction 默认使用 `FEISHU_CARD_ACTION_TRANSPORT=ws` 且
 `FEISHU_CARD_CALLBACK_ENABLED=false`。WS 模式不要求公网 HTTPS；HTTP 是显式 fallback，启用时
 必须使用 `FEISHU_CARD_ACTION_TRANSPORT=http`、打开 callback 并配置验签所需参数。
+
+## 冷启动与功能发现
+
+未绑定用户只能触发绑定：`/bind 绑定码` 或形态符合单一 URL-safe token 的文本；其余输入
+只得到欢迎引导，不触发 token 查询。绑定成功后发送渐进式欢迎卡（按钮仅导航，不产生写
+操作），卡片发送失败时回退为持久文本首屏。精确帮助词走确定性 fast-path 直接发送功能
+总览卡；自然语言帮助问题由 Agent 通过 `help_show_feature_card`（ui_effect，schema 只接受
+后端枚举 feature key 或 overview）排队固定功能卡。`feature_open`/`feature_back` 回调只携带
+`feature_key` 与 `version`，经 CardActionService 后端枚举校验后原位更新来源卡片。功能卡由
+`app/presentation/feature_cards.py` 单一数据源渲染；capability 关闭的功能在所有入口隐藏。
+AgentTurnInput 携带由 `FeishuBinding.bound_at`（首次真实使用时间，非 Participant.created_at）
+推导的 `participant_stage`（day1/week1/active），`_text_transport_prompt` 渲染
+`backend_participant_stage` 上下文块；`interaction_preferences` 为预留槽，当前恒为 None 且
+对应块不出现。SYSTEM_RULES 为单一结构化常量（Role and voice / Conversation defaults /
+Hard boundaries / Presentation / Failure handling），七条 hard boundary 不变量由
+`tests/test_interaction_prompt_contracts.py` 锁定。
+
+## External LLM Consent 与 Safety 边界
+
+External LLM 处理（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的
+`participant_consents` 记录（versioned history-preserving，`consent_type=external_llm_processing`，
+带 `consent_version`；Repository 取最新记录，只有 active 且版本匹配才算同意）。
+`ConsentService.require_external_llm_consent()` 是唯一 gate：fail closed、授权
+持久化、撤销立即生效、版本不匹配视为未同意。Worker 的三处入口（recent-image
+复用、图片消息、文本 Agent turn）与 ForecastCoordinator 的语义分类开关统一读取
+该 gate；无同意时发送固定 Consent 卡（回调只携带 action 与 version，绝不携带
+participant/image/open 标识，绑定关系由鉴权回调解析）。Consent 的授权/撤销走
+CardActionService 固定 allowlist，accept/revoke 是仅有的两个写动作；decline 与
+状态/详情卡均为 navigation_only。Admin/CLI 没有 approve external LLM 的入口；旧字段
+`participants.external_llm_consent_at` 只作过渡期审计显示（admin 读模型单独命名为
+`legacy_external_llm_consent_at`），不迁移、不授权。Worker / ForecastCoordinator
+在缺少 ConsentService 时 fail closed，不存在 legacy fallback。Accept 回调必须携带
+用户实际看到的 `consent_version`，与当前版本不一致时零写入并重新渲染最新说明卡；
+重复 accept 幂等；revoke 与 disclosure 版本无关、始终可用。
+
+Safety 命中（文本或图片证据中的高风险语义）只返回固定审核文案并短路 Agent：
+不通知研究者、不产生 participant-linked incident、不写入长期画像/记忆/标签、
+不触发次日强制关怀（supportive follow-up 属于后续主动消息批次的 Care Policy，
+须走 care context、care preferences、allow_follow_up、proactive budget 与
+quiet hours）。`tests/test_safety_boundary.py` 以源级契约锁定上述禁用引用；
+第三方语境（新闻/论文含高风险词）保持既有语义回归。Safety 命中的 BotEvent 记录
+`content_privacy_class=protected`（只有 normal/protected 两值，不保存任何风险标签），
+admin 消息读模型对 protected 内容返回 `[内容受隐私保护]` 占位并置
+`content_redacted=true`，原始 Safety 文本与固定支持文案不进入研究者/管理员视图。
 
 ## 自动漂移保护
 

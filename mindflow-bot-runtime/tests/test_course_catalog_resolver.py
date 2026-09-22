@@ -121,7 +121,7 @@ def test_high_math_a_variant_rejects_b_candidate():
         },
     )
 
-    assert event["metadata"]["classification"]["event_type_locked"] is True
+    assert event["metadata"]["classification"]["event_type_locked"] is False
     assert event["metadata"]["classification"]["course_identity_locked"] is False
     context = event["metadata"]["classification"]["course_catalog_context"]
     assert context["identity_constraints"] == {"variant": "A"}
@@ -179,13 +179,14 @@ def test_unconstrained_high_math_keeps_multiple_variants():
     assert any("B类" in name for name in names)
 
 
-def test_ambiguous_high_math_suffixes_never_lock_a_wrong_identity():
+def test_ambiguous_high_math_suffixes_remain_semantically_correctable():
     for title in ("高数", "高数I", "高数II", "高数1", "高数2", "高数3"):
         event = prepare_event_instances([_event(title)], "2030-01-15")[0]
         classification = event["metadata"]["classification"]
         assert event["event_type"] == "course"
-        assert classification["event_type_locked"] is True
+        assert classification["event_type_locked"] is False
         assert classification["course_identity_locked"] is False
+        assert classification["rule_candidate"]["event_type"] == "course"
         assert not event.get("course_name")
 
 

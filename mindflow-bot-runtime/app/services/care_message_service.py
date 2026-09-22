@@ -6,6 +6,9 @@ from datetime import date
 from typing import Any, Mapping
 
 from app.services.care_context import CareContextBuilder
+from app.services.care_evidence import CareEvidenceBuilder
+from app.services.care_reason_policy import CARE_REASON_POLICY_VERSION
+from app.contracts.care_evidence import CARE_EVIDENCE_SCHEMA_VERSION
 from app.services.care_intervention_policy import (
     CARE_INTERVENTION_POLICY_VERSION,
     CareInterventionPolicy,
@@ -20,7 +23,7 @@ from app.services.care_jitai import (
 )
 
 
-CARE_MESSAGE_SCHEMA_VERSION = "care_message.v3"
+CARE_MESSAGE_SCHEMA_VERSION = "care_message.v4"
 
 
 class CareMessageService:
@@ -29,6 +32,7 @@ class CareMessageService:
         self.policy = CareInterventionPolicy()
         self.templates = CareTemplateLibrary()
         self.jitai = CareJITAIEngine(timezone_name)
+        self.evidence = CareEvidenceBuilder(timezone_name)
 
     def contextualize_alert(
         self,
@@ -43,6 +47,8 @@ class CareMessageService:
         profile_version: int | None,
         care_preferences: Mapping[str, Any] | None = None,
         care_history: Mapping[str, Any] | None = None,
+        forecast_output: Mapping[str, Any] | None = None,
+        longitudinal_state: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         effective_preferences = dict(care_preferences or {})
         explicit_types = normalized_intervention_types(
@@ -67,11 +73,37 @@ class CareMessageService:
             profile_version=profile_version,
             care_preferences=effective_preferences or None,
         )
-        plan = self.policy.plan(context)
-        rendered = self.templates.render(context, plan)
+        base_evidence = self.evidence.build(
+            source=source,
+            local_date=local_date,
+            alert=alert,
+            forecast_output=forecast_output,
+            calendar_events=calendar_events,
+            recent_observation=recent_observation,
+            longitudinal_state=longitudinal_state,
+            profile=profile,
+            care_preferences=effective_preferences or None,
+            care_history=care_history,
+        )
+        plan = self.policy.plan(context, evidence=base_evidence)
+        evidence_workload = (
+            base_evidence.schedule.get("weighted_load")
+            if base_evidence.event_facts
+            else alert.get("workload", 0.0)
+        )
+        evidence_continuous = (
+            base_evidence.trajectory.get("continuous_load_factor")
+            if base_evidence.event_facts or (forecast_output or {}).get("trajectory")
+            else alert.get("continuous_load_factor", 0.5)
+        )
+        jitai_alert = {
+            **dict(alert),
+            "workload": evidence_workload,
+            "continuous_load_factor": evidence_continuous,
+        }
         decision = self.jitai.decide(
             context=context,
-            alert=alert,
+            alert=jitai_alert,
             proposed_type=plan.intervention_type,
             preferences=effective_preferences,
             history=care_history,
@@ -86,6 +118,23 @@ class CareMessageService:
                     "scheduled_at": None,
                 }
             )
+        final_evidence = self.evidence.build(
+            source=source,
+            local_date=local_date,
+            alert=alert,
+            forecast_output=forecast_output,
+            calendar_events=calendar_events,
+            recent_observation=recent_observation,
+            longitudinal_state=longitudinal_state,
+            profile=profile,
+            care_preferences=effective_preferences or None,
+            care_history=care_history,
+            intervention={
+                **plan.to_dict(),
+                "decision_rule": decision.decision_rule,
+            },
+        )
+        rendered = self.templates.render(context, plan, evidence=final_evidence)
         plan_payload = {
             **plan.to_dict(),
             "option_type": decision.option_type,
@@ -130,13 +179,18 @@ class CareMessageService:
             "receptivity_score": decision.receptivity_score,
             "decision_score": decision.decision_score,
             "decision_rule": decision.decision_rule,
+            "care_evidence_schema_version": CARE_EVIDENCE_SCHEMA_VERSION,
+            "care_reason_policy_version": CARE_REASON_POLICY_VERSION,
+            "care_evidence": final_evidence.to_dict(),
         }
         result = dict(alert)
         result.pop("message", None)
         result.update(
             {
                 "message": rendered.message,
+                "fallback_message": rendered.message,
                 "care_plan": plan_payload,
+                "care_evidence": final_evidence.to_dict(),
                 "care_context": context.to_dict(),
                 "care_provenance": provenance,
             }

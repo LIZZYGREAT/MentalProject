@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 import logging
 from typing import TYPE_CHECKING
 import uuid
-from zoneinfo import ZoneInfo
-
 from app.repositories import ForecastSnapshotRepository, WarningScheduleRepository
+from app.services.runtime_clock import RuntimeClock
 
 if TYPE_CHECKING:
     from app.services.forecast_coordinator import ForecastCoordinator
 
 
 logger = logging.getLogger(__name__)
+
+
+def dependent_date_for(source_date: date, local_today: date) -> date | None:
+    """Return the only supported next-day dependency for a reference date."""
+
+    if source_date in {local_today - timedelta(days=1), local_today}:
+        return source_date + timedelta(days=1)
+    return None
 
 
 class ForecastDependencyRefreshService:
@@ -28,11 +35,12 @@ class ForecastDependencyRefreshService:
         coordinator: "ForecastCoordinator",
         *,
         timezone_name: str,
+        clock: RuntimeClock | None = None,
     ) -> None:
         self.forecasts = forecasts
         self.warnings = warnings
         self.coordinator = coordinator
-        self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: dict[tuple[uuid.UUID, date], asyncio.Task[None]] = {}
         self._requested: dict[tuple[uuid.UUID, date], tuple[int, str]] = {}
@@ -46,11 +54,16 @@ class ForecastDependencyRefreshService:
             raise RuntimeError("forecast dependency refresh service is already bound")
         self._loop = loop
 
-    def dependent_date(self, source_date: date) -> date | None:
-        today = datetime.now(self.timezone).date()
-        if source_date in {today - timedelta(days=1), today}:
-            return source_date + timedelta(days=1)
-        return None
+    def dependent_date(
+        self,
+        source_date: date,
+        *,
+        reference_local_date: date | None = None,
+    ) -> date | None:
+        return dependent_date_for(
+            source_date,
+            reference_local_date or self.clock.local_date(),
+        )
 
     def invalidate_dependent_now(
         self,
@@ -58,8 +71,11 @@ class ForecastDependencyRefreshService:
         source_date: date,
         *,
         reason: str,
+        reference_local_date: date | None = None,
     ) -> dict[str, int]:
-        dependent = self.dependent_date(source_date)
+        dependent = self.dependent_date(
+            source_date, reference_local_date=reference_local_date
+        )
         if dependent is None:
             return {"forecasts_invalidated": 0, "warnings_cancelled": 0}
         return self.forecasts.invalidate_current_for_date(
@@ -75,8 +91,11 @@ class ForecastDependencyRefreshService:
         source_date: date,
         *,
         reason: str,
+        reference_local_date: date | None = None,
     ) -> dict | None:
-        dependent = self.dependent_date(source_date)
+        dependent = self.dependent_date(
+            source_date, reference_local_date=reference_local_date
+        )
         if dependent is None:
             return None
         return await self.coordinator.ensure_forecast(

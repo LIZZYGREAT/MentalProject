@@ -43,15 +43,62 @@ def _warning_authorization_deadline(context: object) -> datetime:
 
 class Participant(Base):
     __tablename__ = "participants"
+    __table_args__ = (
+        CheckConstraint(
+            "access_tier IN ('participant', 'researcher')",
+            name="ck_participant_access_tier",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     participant_code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     student_no_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    access_tier: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="participant"
+    )
+    scopes_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
+    # Legacy researcher/CLI-set flag kept for transition and audit only; it
+    # never authorizes external LLM processing (see participant_consents).
     external_llm_consent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantConsent(Base):
+    """Versioned, history-preserving, participant-owned consent records.
+
+    The current record is the latest row per (participant_id, consent_type);
+    only an active row whose consent_version matches the expected version
+    authorizes processing. Grant rows keep prior lifecycle state visible
+    (revoke updates the current row instead of deleting it). Legacy
+    researcher-set flags are never migrated into this table: user consent
+    must come from the user.
+    """
+
+    __tablename__ = "participant_consents"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id",
+            "consent_type",
+            "consent_version",
+            "consented_at",
+            name="uq_participant_consent_version_time",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    consent_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    consent_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    consented_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class ParticipantInvite(Base):
@@ -285,29 +332,6 @@ class StateObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
-class PredictionRun(Base):
-    __tablename__ = "prediction_runs"
-    __table_args__ = (
-        Index("ix_prediction_participant_time", "participant_id", "created_at"),
-        UniqueConstraint(
-            "participant_id",
-            "source_message_id",
-            name="uq_prediction_source_message",
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    participant_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
-    )
-    profile_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    source_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    input_snapshot_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    output_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-
-
 class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
     __table_args__ = (
@@ -382,10 +406,40 @@ class ClaudeSession(Base):
     session_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     last_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_backend_state_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ParticipantAgentStateEvent(Base):
+    """Durable, participant-scoped facts committed by backend actions."""
+
+    __tablename__ = "participant_agent_state_events"
+    __table_args__ = (
+        Index("ix_agent_state_event_participant_created", "participant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
 
@@ -395,6 +449,10 @@ class BotEvent(Base):
     __table_args__ = (
         Index("ix_bot_event_participant_received", "participant_id", "received_at"),
         Index("ix_bot_event_status_received", "status", "received_at"),
+        CheckConstraint(
+            "content_privacy_class IN ('normal', 'protected')",
+            name="ck_bot_event_content_privacy_class",
+        ),
     )
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -415,12 +473,30 @@ class BotEvent(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # normal | protected. "protected" marks Safety-handled content: researcher
+    # and admin projections show a redaction placeholder, never the original
+    # text and never a classifier label.
+    content_privacy_class: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="normal"
+    )
     reply_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_segments_json: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     reply_next_segment: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reply_message_ids_json: Mapped[list | None] = mapped_column(JSON_VALUE, nullable=True)
     reply_plan_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reply_presentation_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reply_rich_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_plain_text_fallback: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_card_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_element_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    streaming_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    streaming_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    streaming_final_text_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    streaming_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     telemetry_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -892,6 +968,123 @@ class CalendarMutationReconciliation(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class CalendarMutationPlan(Base):
+    """Participant-bound batch Calendar proposal, editable only before queuing."""
+
+    __tablename__ = "calendar_mutation_plans"
+    __table_args__ = (
+        Index(
+            "ix_calendar_mutation_plan_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_calendar_mutation_plan_expiry", "status", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    items_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False)
+    presentation_context_json: Mapped[dict] = mapped_column(
+        JSON_VALUE, nullable=False, default=dict
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="awaiting_confirmation"
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    run_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status_card_message_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    status_card_chat_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    completion_presented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completion_presentation_error: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    completion_presentation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+
+class CalendarMutationPlanItem(Base):
+    """One durable effect; its payload is editable only while its plan is pending."""
+
+    __tablename__ = "calendar_mutation_plan_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id", "item_index", name="uq_calendar_mutation_plan_item_index"
+        ),
+        UniqueConstraint(
+            "source_identity", name="uq_calendar_mutation_plan_item_source"
+        ),
+        Index("ix_calendar_mutation_plan_item_status", "plan_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("calendar_mutation_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    provider_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_identity: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -1431,10 +1624,23 @@ class ParticipantCarePreference(Base):
     warning_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     daily_review_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     morning_brief_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    morning_brief_local_time: Mapped[time] = mapped_column(
+        Time(), nullable=False, default=lambda: time(8, 0)
+    )
+    morning_brief_paused_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     weekly_summary_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    weekly_summary_local_time: Mapped[time] = mapped_column(
+        Time(), nullable=False, default=lambda: time(9, 0)
+    )
+    weekly_summary_weekday: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
     max_proactive_care_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Kept separate from the historical care-only budget so expanding the
+    # policy cannot silently change existing study semantics.
+    max_system_proactive_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     allow_schedule_suggestions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     allow_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     preferred_support_types: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
@@ -1443,8 +1649,108 @@ class ParticipantCarePreference(Base):
     interruption_tolerance: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
     preferred_reminder_windows: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    global_proactive_muted_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantMorningBriefPreference(Base):
+    """Participant-confirmed content preferences for the morning brief."""
+
+    __tablename__ = "participant_morning_brief_preferences"
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    include_calendar: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    include_reminders: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    max_research_items: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    lookback_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    language: Mapped[str] = mapped_column(String(32), nullable=False, default="zh-CN")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantMorningBriefTopic(Base):
+    """Explicitly confirmed public-interest subscription, never inferred."""
+
+    __tablename__ = "participant_morning_brief_topics"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "topic_label", name="uq_morning_brief_topic_label"),
+        Index("ix_morning_brief_topic_participant_enabled", "participant_id", "enabled", "priority"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_label: Mapped[str] = mapped_column(String(160), nullable=False)
+    query_hints_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
+    source_kinds_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=lambda: ["web"])
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ProactiveNotificationDelivery(Base):
+    """Cross-feature reservation and delivery ledger for proactive messages."""
+
+    __tablename__ = "proactive_notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "participant_id", "message_kind", "dedupe_key",
+            name="uq_proactive_notification_dedupe",
+        ),
+        Index(
+            "ix_proactive_notification_budget",
+            "participant_id", "message_class", "scheduled_at", "status",
+        ),
+        CheckConstraint(
+            "message_class IN ('system_proactive', 'user_requested')",
+            name="ck_proactive_notification_class",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    message_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    message_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="reserved")
+    suppression_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ResearchAggregateQueryAudit(Base):
+    __tablename__ = "research_aggregate_query_audit"
+    __table_args__ = (
+        Index("ix_research_aggregate_audit_researcher", "researcher_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    researcher_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="RESTRICT"), nullable=False
+    )
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    date_start: Mapped[date] = mapped_column(Date, nullable=False)
+    date_end: Mapped[date] = mapped_column(Date, nullable=False)
+    cohort_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class CareInterventionEvent(Base):
@@ -1639,6 +1945,7 @@ class AdminUser(Base):
     username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="viewer")
+    scopes_json: Mapped[list] = mapped_column(JSON_VALUE, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     is_environment_bootstrap: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
@@ -1655,6 +1962,67 @@ class AdminUser(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class CardActionReceipt(Base):
+    """Durable replay barrier for provider CardAction retries."""
+
+    __tablename__ = "card_action_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('processing', 'succeeded', 'rejected', 'failed')",
+            name="ck_card_action_receipt_status",
+        ),
+        Index(
+            "ix_card_action_receipt_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_card_action_receipt_expiry", "expires_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    action_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="processing"
+    )
+    result_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AdminResearchDetailAccessAudit(Base):
+    __tablename__ = "admin_research_detail_access_audit"
+    __table_args__ = (
+        Index("ix_admin_research_detail_access", "admin_id", "created_at"),
+        Index("ix_participant_research_detail_access", "participant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    admin_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="RESTRICT"), nullable=False
+    )
+    endpoint: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class DailyReviewSchedule(Base):
@@ -1691,6 +2059,540 @@ class DailyReviewSchedule(Base):
     last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class MorningBriefSchedule(Base):
+    """One restart-safe, opt-in deterministic brief for a participant-day."""
+
+    __tablename__ = "morning_brief_schedules"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "local_date", name="uq_morning_brief_day"),
+        Index("ix_morning_brief_due", "status", "scheduled_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ResearchJobAudit(Base):
+    """Bounded, privacy-minimized audit for a public research job."""
+
+    __tablename__ = "research_job_audits"
+    __table_args__ = (
+        Index("ix_research_job_participant_started", "participant_id", "started_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    browser_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exec_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    failure_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class ResearchEvidence(Base):
+    """Short-lived participant-bound public evidence with provenance."""
+
+    __tablename__ = "research_evidence"
+    __table_args__ = (
+        Index("ix_research_evidence_participant_retrieved", "participant_id", "retrieved_at"),
+        Index("ix_research_evidence_content_hash", "participant_id", "content_hash"),
+    )
+
+    evidence_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_label: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    publisher: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    extraction_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    freshness_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    verified_public_source: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        Index("ix_reminder_due", "status", "next_attempt_at", "next_fire_at"),
+        CheckConstraint("recurrence_type IN ('none', 'daily', 'weekly')", name="ck_reminder_recurrence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    message: Mapped[str] = mapped_column(String(500), nullable=False)
+    remind_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recurrence_type: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    weekday: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ReminderProposal(Base):
+    """Short-lived participant-owned reminder change awaiting a card action."""
+
+    __tablename__ = "reminder_proposals"
+    __table_args__ = (
+        Index(
+            "ix_reminder_proposal_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_reminder_proposal_expiry", "status", "expires_at"),
+        CheckConstraint(
+            "operation IN ('create', 'cancel')",
+            name="ck_reminder_proposal_operation",
+        ),
+        CheckConstraint(
+            "status IN ('awaiting_confirmation', 'confirmed', 'cancelled', 'expired')",
+            name="ck_reminder_proposal_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="awaiting_confirmation"
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class PersonalizationProposal(Base):
+    """Typed memory/preference effect awaiting participant review."""
+
+    __tablename__ = "personalization_proposals"
+    __table_args__ = (
+        Index(
+            "ix_personalization_proposal_participant_created",
+            "participant_id",
+            "created_at",
+        ),
+        Index("ix_personalization_proposal_expiry", "status", "expires_at"),
+        CheckConstraint(
+            "domain IN ('memory', 'interaction_preferences', "
+            "'support_preferences', 'care_preferences', 'morning_brief_topics')",
+            name="ck_personalization_proposal_domain",
+        ),
+        CheckConstraint(
+            "status IN ('awaiting_confirmation', 'executing', 'confirmed', "
+            "'cancelled', 'expired', 'failed')",
+            name="ck_personalization_proposal_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    domain: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="awaiting_confirmation"
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class CareFollowupCandidate(Base):
+    """Short-lived neutral follow-up intent; never stores participant wording."""
+
+    __tablename__ = "care_followup_candidates"
+    __table_args__ = (
+        Index("ix_care_followup_due", "status", "due_at"),
+        CheckConstraint(
+            "reason_category IN ('check_in', 'task_transition', 'recovery')",
+            name="ck_care_followup_reason_category",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    reason_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class WebSearchRun(Base):
+    __tablename__ = "web_search_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalized_query: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    freshness: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WebSearchResult(Base):
+    __tablename__ = "web_search_results"
+    __table_args__ = (Index("ix_web_search_result_run", "run_id", "rank"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("web_search_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    snippet: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WebDocument(Base):
+    __tablename__ = "web_documents"
+    __table_args__ = (
+        Index(
+            "ix_web_document_participant_url_expiry",
+            "participant_id",
+            "url_hash",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    extraction_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="article"
+    )
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WebDocumentChunk(Base):
+    __tablename__ = "web_document_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "chunk_index",
+            name="uq_web_document_chunk_index",
+        ),
+        Index("ix_web_document_chunk_expiry", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("web_documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PublicVideoCache(Base):
+    """Short-lived participant-bound metadata and transcript cache."""
+
+    __tablename__ = "public_video_caches"
+    __table_args__ = (
+        Index(
+            "ix_public_video_cache_participant_video_expiry",
+            "participant_id",
+            "video_id",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    resource_key: Mapped[str] = mapped_column(String(192), nullable=False, default="")
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    author: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cover_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subtitle_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="v1"
+    )
+    transcript_json: Mapped[str] = mapped_column(Text, nullable=False)
+    total_chars: Mapped[int] = mapped_column(Integer, nullable=False)
+    extraction_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ParticipantMemoryItem(Base):
+    __tablename__ = "participant_memory_items"
+    __table_args__ = (
+        Index("ix_memory_participant_status", "participant_id", "status", "updated_at"),
+        CheckConstraint(
+            "memory_type IN ('stable_fact', 'goal', 'routine', 'context', 'preferred_name')",
+            name="ck_memory_type",
+        ),
+        CheckConstraint(
+            "source IN ('user_explicit', 'system_candidate')",
+            name="ck_memory_source",
+        ),
+        CheckConstraint(
+            "consent_basis IN ('user_requested_memory', 'candidate_only')",
+            name="ck_memory_consent_basis",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted', 'candidate')",
+            name="ck_memory_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(String(500), nullable=False)
+    normalized_content: Mapped[str] = mapped_column(String(500), nullable=False)
+    conflict_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    consent_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participant_memory_items.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ParticipantInteractionStyle(Base):
+    __tablename__ = "participant_interaction_styles"
+    __table_args__ = (
+        CheckConstraint(
+            "verbosity IN ('concise', 'balanced', 'detailed')",
+            name="ck_interaction_style_verbosity",
+        ),
+        CheckConstraint(
+            "tone IN ('neutral', 'warm', 'direct')",
+            name="ck_interaction_style_tone",
+        ),
+        CheckConstraint(
+            "suggestion_style IN ('ask_first', 'light_suggestions', 'proactive_suggestions')",
+            name="ck_interaction_style_suggestion",
+        ),
+    )
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    verbosity: Mapped[str] = mapped_column(String(16), nullable=False, default="balanced")
+    tone: Mapped[str] = mapped_column(String(16), nullable=False, default="warm")
+    suggestion_style: Mapped[str] = mapped_column(String(32), nullable=False, default="light_suggestions")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantInteractionRule(Base):
+    __tablename__ = "participant_interaction_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted')",
+            name="ck_interaction_rule_status",
+        ),
+        Index("ix_interaction_rule_active", "participant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    raw_text: Mapped[str] = mapped_column(String(200), nullable=False)
+    normalized_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantInteractionSemanticRule(Base):
+    """Participant-reviewed semantic communication rules.
+
+    These are deliberately separate from the legacy identity rule table so a
+    concrete communication preference cannot be collapsed into a style enum
+    or accidentally treated as durable memory.
+    """
+
+    __tablename__ = "participant_interaction_semantic_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('all_responses', 'explanations', 'technical_explanations', 'code_and_engineering')",
+            name="ck_semantic_rule_scope",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'deleted')",
+            name="ck_semantic_rule_status",
+        ),
+        Index("ix_semantic_rule_active", "participant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    source_proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("personalization_proposals.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ParticipantSupportPreference(Base):
+    __tablename__ = "participant_support_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "max_suggestions BETWEEN 1 AND 3",
+            name="ck_support_preference_max_suggestions",
+        ),
+        CheckConstraint(
+            "preferred_support_style IN ('gentle', 'practical', 'listening')",
+            name="ck_support_preference_style",
+        ),
+    )
+
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("participants.id", ondelete="CASCADE"), primary_key=True
+    )
+    acknowledge_before_advice: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    ask_before_suggestion: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    max_suggestions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    allow_supportive_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    preferred_support_style: Mapped[str] = mapped_column(String(24), nullable=False, default="gentle")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

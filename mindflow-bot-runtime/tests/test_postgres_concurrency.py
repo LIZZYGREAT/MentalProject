@@ -9,20 +9,25 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 import threading
+from types import SimpleNamespace
 import uuid
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
+from app import main as app_main
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.db import Base, Database, build_engine
 from app.models import (
     CareInterventionEvent,
+    ParticipantConsent,
     CareInterventionFeedback,
     DatasetSnapshot,
     ForecastCurrentnessEvent,
     ParameterLearningRun,
+    ParticipantInteractionSemanticRule,
+    RuntimeIncident,
     WarningSchedule,
 )
 from app.repositories import (
@@ -32,8 +37,10 @@ from app.repositories import (
     ForecastSnapshotRepository,
     ObservationRepository,
     ParticipantRepository,
+    RuntimeIncidentRepository,
     WarningScheduleRepository,
 )
+from app.integrations.feishu.client import FeishuSendError
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
@@ -41,12 +48,25 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from app.repositories_consent import ParticipantConsentRepository
+from app.repositories_memory import ParticipantMemoryRepository
+from app.repositories_personalization_proposal import (
+    PersonalizationProposalRepository,
+)
+from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_support_preferences import SupportPreferenceRepository
+from app.services.consent_service import ConsentService
 from helpers import seed_calendar_snapshot
 from app.repositories_daily_review import DailyReviewScheduleRepository
 from app.services.forecast_coordinator import _sha
 from app.services.hierarchical_personalization import (
     MODEL_FAMILY,
     ParameterLearningService,
+)
+from app.services.interaction_preference_service import InteractionPreferenceService
+from app.services.memory_service import MemoryService
+from app.services.personalization_proposal_service import (
+    PersonalizationProposalService,
 )
 from app.services.token_service import (
     OAuthTokenSet,
@@ -101,6 +121,326 @@ def _runtime_repositories(database: Database):
         timezone_name="Asia/Shanghai",
     )
     return warnings, preferences
+
+
+def test_postgres_card_action_update_failure_incident_does_not_use_callback_id_as_bot_event_fk(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-CARD-ACTION-INCIDENT-FK"
+    )
+
+    class Identity:
+        def resolve(self, _app_id, _open_id):
+            return owner
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    class Sender:
+        def update_card(self, _message_id, _card):
+            raise FeishuSendError(
+                "message patch rejected", code=230001, operation="update_card"
+            )
+
+        def send_text(self, _chat_id, _text):
+            return "notice"
+
+    event = SimpleNamespace(
+        event_id="callback-event-not-a-bot-event-id",
+        message_id="om-card",
+        app_id="app",
+        open_id="ou-user",
+        chat_id="oc-chat",
+        action_tag="button",
+        action_value={"mindflow_action": "submit_checkin"},
+        form_value={},
+        callback_token=None,
+    )
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        Identity(),
+        card_actions,
+        Sender(),
+        RuntimeIncidentRepository(postgres_database),
+    )
+
+    result = handler(event)
+
+    assert result["ok"] is True
+    assert result["card_update_ok"] is False
+    assert card_actions.calls == 1
+    with postgres_database.session() as session:
+        incident = session.scalar(
+            select(RuntimeIncident).where(
+                RuntimeIncident.event_name == "card_action_update_failed_after_commit"
+            )
+        )
+        assert incident is not None
+        assert incident.bot_event_id is None
+        assert incident.details_json["callback_event_id"] == event.event_id
+
+
+def _personalization_stack(database: Database, *, failpoint=None):
+    memory = MemoryService(ParticipantMemoryRepository(database))
+    preferences = InteractionPreferenceService(
+        InteractionPreferenceRepository(database),
+        SupportPreferenceRepository(database),
+    )
+    proposals = PersonalizationProposalService(
+        PersonalizationProposalRepository(database),
+        memory,
+        preferences,
+        confirmed_effect_failpoint=failpoint,
+    )
+    return memory, proposals
+
+
+def test_postgres_concurrent_personalization_confirm_executes_once(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-CONCURRENT"
+    )
+    memory, proposals = _personalization_stack(postgres_database)
+    proposal = proposals.stage_memory_remember(
+        owner.id,
+        memory_type="context",
+        memory_subtype=None,
+        content="PostgreSQL 并发确认",
+    )
+    barrier = threading.Barrier(2)
+
+    def confirm():
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: confirm(), range(2)))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    assert len(memory.list(owner.id)) == 1
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "confirmed"
+
+
+def test_postgres_concurrent_semantic_rule_confirm_respects_limit(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-SEMANTIC-RULE-LIMIT-RACE"
+    )
+    _memory, proposals = _personalization_stack(postgres_database)
+    proposal_a = proposals.stage_preferences(
+        owner.id,
+        domain="interaction_preferences",
+        custom_rules=[
+            {"scope": "all_responses", "instruction": "先说结论"},
+            {"scope": "explanations", "instruction": "给出一个例子"},
+        ],
+    )
+    proposal_b = proposals.stage_preferences(
+        owner.id,
+        domain="interaction_preferences",
+        custom_rules=[
+            {"scope": "technical_explanations", "instruction": "解释术语"},
+            {"scope": "code_and_engineering", "instruction": "说明边界"},
+        ],
+    )
+    barrier = threading.Barrier(2)
+
+    def confirm(proposal):
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(confirm, (proposal_a, proposal_b)))
+
+    assert sum(result.get("ok") is True for result in results) == 1
+    with postgres_database.session() as session:
+        active = session.query(ParticipantInteractionSemanticRule).filter(
+            ParticipantInteractionSemanticRule.participant_id == owner.id,
+            ParticipantInteractionSemanticRule.status == "active",
+        ).count()
+    assert active <= 3
+
+
+def test_postgres_concurrent_personalization_confirm_serializes_per_participant(
+    postgres_database,
+):
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-SERIALIZED"
+    )
+    entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    callback_lock = threading.Lock()
+    callback_count = 0
+
+    def failpoint():
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            call_number = callback_count
+        if call_number == 1:
+            entered.set()
+            release.wait(timeout=10)
+        else:
+            second_entered.set()
+
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=failpoint
+    )
+    proposal_ids = [
+        proposals.stage_memory_remember(
+            owner.id,
+            memory_type="context",
+            memory_subtype=None,
+            content=f"串行确认 {index}",
+        )["id"]
+        for index in (1, 2)
+    ]
+    barrier = threading.Barrier(2)
+
+    def confirm(proposal_id):
+        barrier.wait(timeout=10)
+        return proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(confirm, proposal_id) for proposal_id in proposal_ids]
+            assert entered.wait(timeout=10)
+            assert not second_entered.wait(timeout=1)
+            release.set()
+            results = [future.result(timeout=10) for future in futures]
+    finally:
+        release.set()
+
+    assert all(result.get("ok") is True for result in results)
+    assert len(memory.list(owner.id)) == 2
+
+
+def test_postgres_personalization_confirm_does_not_cross_lock_participants(
+    postgres_database,
+):
+    owners = [
+        ParticipantRepository(postgres_database).create(
+            f"PG-PERSONALIZATION-PARALLEL-{index}"
+        )
+        for index in (1, 2)
+    ]
+    entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    callback_lock = threading.Lock()
+    callback_count = 0
+
+    def failpoint():
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            call_number = callback_count
+        if call_number == 1:
+            entered.set()
+            release.wait(timeout=10)
+        else:
+            second_entered.set()
+
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=failpoint
+    )
+    proposal_ids = [
+        proposals.stage_memory_remember(
+            owner.id,
+            memory_type="context",
+            memory_subtype=None,
+            content=f"并行确认 {index}",
+        )["id"]
+        for index, owner in enumerate(owners, start=1)
+    ]
+    barrier = threading.Barrier(2)
+
+    def confirm(item):
+        barrier.wait(timeout=10)
+        owner, proposal_id = item
+        return proposals.resolve(owner.id, proposal_id, confirmed=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(confirm, item)
+                for item in zip(owners, proposal_ids)
+            ]
+            assert entered.wait(timeout=10)
+            assert second_entered.wait(timeout=2)
+            release.set()
+            results = [future.result(timeout=10) for future in futures]
+    finally:
+        release.set()
+
+    assert all(result.get("ok") is True for result in results)
+    assert all(len(memory.list(owner.id)) == 1 for owner in owners)
+
+
+def test_postgres_personalization_failpoint_rolls_back_effect(
+    postgres_database,
+):
+    def fail_before_terminal():
+        raise RuntimeError("injected PostgreSQL terminal failure")
+
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-PERSONALIZATION-ROLLBACK"
+    )
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=fail_before_terminal
+    )
+    proposal = proposals.stage_memory_remember(
+        owner.id,
+        memory_type="context",
+        memory_subtype=None,
+        content="PostgreSQL 回滚确认",
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    assert memory.list(owner.id) == []
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "awaiting_confirmation"
+
+
+def test_postgres_memory_clear_is_all_or_nothing(postgres_database):
+    def fail_before_terminal():
+        raise RuntimeError("injected PostgreSQL clear failure")
+
+    owner = ParticipantRepository(postgres_database).create(
+        "PG-MEMORY-CLEAR-ROLLBACK"
+    )
+    memory, proposals = _personalization_stack(
+        postgres_database, failpoint=fail_before_terminal
+    )
+    for index in range(10):
+        memory.remember_explicit(
+            owner.id,
+            memory_type="context",
+            content=f"PostgreSQL 待清理 {index}",
+        )
+    proposal = proposals.stage_memory_clear(owner.id)
+
+    with pytest.raises(RuntimeError, match="clear failure"):
+        proposals.resolve(owner.id, proposal["id"], confirmed=True)
+
+    assert len(memory.list(owner.id)) == 10
+    assert proposals.proposals.get_for_participant(
+        owner.id, proposal["id"]
+    )["status"] == "awaiting_confirmation"
 
 
 def _forecast(database: Database, participant_id: uuid.UUID, local_date):
@@ -857,3 +1197,40 @@ def test_postgres_oauth_refresh_lease_has_one_authoritative_owner(
     assert asyncio.run(scenario()) == ["access-new", "access-new"]
     assert refresh_count == 1
     assert repository.status(participant.id)["token_version"] == 2
+
+
+def test_postgres_concurrent_consent_accept_yields_single_active_grant(
+    postgres_database,
+):
+    """Two truly concurrent accepts must end with exactly one active grant."""
+
+    database = postgres_database
+    person = ParticipantRepository(database).create("CONSENT-RACE")
+    service = ConsentService(ParticipantConsentRepository(database))
+    barrier = threading.Barrier(2)
+    results = []
+
+    def accept():
+        barrier.wait()
+        results.append(service.grant_external_llm_consent(person.id))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(accept) for _ in range(2)]:
+            future.result(timeout=30)
+
+    assert len(results) == 2
+    assert all(result["status"] == "active" for result in results)
+    assert all(
+        result["consent_version"] == result["consent_version"] for result in results
+    )
+    with database.session() as session:
+        rows = list(
+            session.execute(
+                select(ParticipantConsent).where(
+                    ParticipantConsent.participant_id == person.id
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].status == "active"
+    assert service.is_active(person.id) is True

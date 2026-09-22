@@ -10,7 +10,7 @@ from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.contracts.course_schedule import ScheduleVisionResult
@@ -35,16 +35,6 @@ from app.models import (
 ACTIVE_DRAFT_STATUSES = {"pending_context", "pending_confirmation"}
 QUEUEABLE_STATUSES = {"pending_confirmation", "partial_failed"}
 EXPIRABLE_STATUSES = {"pending_context", "pending_confirmation"}
-DRAFT_FILLABLE_CONTEXT_FIELDS = {
-    "semester_start_date",
-    "period_time_mapping",
-    "weekday",
-    "week_rule",
-    "actual_time",
-}
-# Kept as a compatibility alias for callers that imported the old name. These
-# fields are all draft-fillable; none of them authorizes a Calendar mutation.
-INTERACTIVE_CONTEXT_FIELDS = DRAFT_FILLABLE_CONTEXT_FIELDS
 PROVIDER_EFFECT_STATUSES = frozenset({
     "creating",
     "created",
@@ -114,6 +104,86 @@ class CourseScheduleImportRepository:
     ):
         self.database = database
         self.run_lease_seconds = max(1, int(run_lease_seconds))
+
+    def resolve_calendar_event_provenance(
+        self,
+        participant_id: uuid.UUID,
+        event_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve an imported Calendar event to its exact course item."""
+
+        normalized_event_id = str(event_id or "").strip()
+        if not normalized_event_id:
+            return None
+        with self.database.session() as session:
+            match = session.execute(
+                select(
+                    CourseScheduleImport,
+                    CourseScheduleImportItem,
+                    CourseScheduleImportWrite,
+                )
+                .join(
+                    CourseScheduleImportItem,
+                    CourseScheduleImportItem.import_id == CourseScheduleImport.id,
+                )
+                .join(
+                    CourseScheduleImportWrite,
+                    CourseScheduleImportWrite.item_id == CourseScheduleImportItem.id,
+                )
+                .where(
+                    CourseScheduleImport.participant_id == participant_id,
+                    CourseScheduleImportWrite.provider_event_id
+                    == normalized_event_id,
+                    CourseScheduleImportWrite.status == "created",
+                )
+                .limit(1)
+            ).first()
+            if match is None:
+                return None
+            import_row, item_row, _write_row = match
+            provider_event_ids = tuple(
+                str(value)
+                for value in session.scalars(
+                    select(CourseScheduleImportWrite.provider_event_id)
+                    .where(
+                        CourseScheduleImportWrite.import_id == import_row.id,
+                        CourseScheduleImportWrite.item_id == item_row.id,
+                        CourseScheduleImportWrite.status == "created",
+                        CourseScheduleImportWrite.provider_event_id.is_not(None),
+                    )
+                    .order_by(
+                        CourseScheduleImportWrite.created_at,
+                        CourseScheduleImportWrite.id,
+                    )
+                )
+                if value
+            )
+            return {
+                "import_id": str(import_row.id),
+                "course_item_id": str(item_row.id),
+                "display_name": item_row.course_name,
+                "semester_start_date": (
+                    import_row.semester_start_date.isoformat()
+                    if import_row.semester_start_date
+                    else None
+                ),
+                "timezone": import_row.timezone,
+                "weekday": item_row.weekday,
+                "start_time": (
+                    item_row.start_time.strftime("%H:%M")
+                    if item_row.start_time
+                    else None
+                ),
+                "end_time": (
+                    item_row.end_time.strftime("%H:%M")
+                    if item_row.end_time
+                    else None
+                ),
+                "location": item_row.location,
+                "week_rule": dict(item_row.week_rule_json or {}),
+                "recurrence_strategy": import_row.recurrence_strategy,
+                "provider_event_ids": provider_event_ids,
+            }
 
     def create_draft(
         self,
@@ -446,6 +516,7 @@ class CourseScheduleImportRepository:
         participant_id: uuid.UUID,
         import_id: uuid.UUID | str,
         *,
+        item_id: uuid.UUID | str | None = None,
         course_name: str | None = None,
         selector_weekday: int | None = None,
         new_weekday: int | None = None,
@@ -466,6 +537,13 @@ class CourseScheduleImportRepository:
 
         if selector_weekday is not None and weekday is not None:
             raise ValueError("selector weekday was provided more than once")
+        if item_id is not None and (
+            course_name is not None or selector_weekday is not None
+        ):
+            raise ValueError("item id cannot be combined with semantic selectors")
+        normalized_item_id = (
+            uuid.UUID(str(item_id)) if item_id is not None else None
+        )
         selector_weekday = selector_weekday if selector_weekday is not None else weekday
         for value, label in (
             (selector_weekday, "selector weekday"),
@@ -522,7 +600,16 @@ class CourseScheduleImportRepository:
                 raise ValueError("draft no longer accepts corrections")
             structured = dict(row.structured_result or {})
             courses = [dict(value) for value in structured.get("courses") or []]
-            candidates = list(range(len(courses)))
+            items = self._items(session, row.id)
+            candidates = (
+                [
+                    index
+                    for index, item in enumerate(items)
+                    if item.id == normalized_item_id
+                ]
+                if normalized_item_id is not None
+                else list(range(len(courses)))
+            )
             if course_name:
                 needle = str(course_name).strip().lower()
                 candidates = [
@@ -546,7 +633,6 @@ class CourseScheduleImportRepository:
                 ])
             index = candidates[0]
             course = courses[index]
-            items = self._items(session, row.id)
             item = items[index]
             metadata = dict(structured.get("_metadata") or {})
             sources = list(metadata.get("course_time_sources") or [])
@@ -717,6 +803,69 @@ class CourseScheduleImportRepository:
             if self._has_identity_conflict(session, row.id):
                 self._normalize_identity_conflict_row(session, row, checked_at)
             return self._view(session, row)
+
+    def bind_preview_card(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        message_id: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Bind the one canonical card used across preview, edit, and import."""
+
+        bound_at = _aware(now or datetime.now(timezone.utc))
+        normalized_message_id = str(message_id).strip()[:128]
+        normalized_chat_id = str(chat_id).strip()[:128]
+        if not normalized_message_id or not normalized_chat_id:
+            raise ValueError("course schedule preview card identity is required")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=bound_at)
+            if not row.status_card_message_id:
+                row.status_card_message_id = normalized_message_id
+                row.status_card_chat_id = normalized_chat_id
+                row.last_progress_at = bound_at
+            session.flush()
+            return self._view(session, row)
+
+    def rebind_preview_card(
+        self,
+        participant_id: uuid.UUID,
+        import_id: uuid.UUID | str,
+        *,
+        expected_old_message_id: str,
+        message_id: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """CAS-replace a canonical Preview whose old message is permanently stale."""
+
+        rebound_at = _aware(now or datetime.now(timezone.utc))
+        expected = str(expected_old_message_id).strip()[:128]
+        replacement = str(message_id).strip()[:128]
+        normalized_chat_id = str(chat_id).strip()[:128]
+        if not expected or not replacement or not normalized_chat_id:
+            raise ValueError("course schedule preview rebind identity is required")
+        with self.database.session() as session:
+            row = session.get(
+                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
+            )
+            self._require_owner(row, participant_id)
+            self._expire_if_needed(row, session, now=rebound_at)
+            rebound = row.status_card_message_id == expected
+            if rebound:
+                row.status_card_message_id = replacement
+                row.status_card_chat_id = normalized_chat_id
+                row.last_progress_at = rebound_at
+            session.flush()
+            value = self._view(session, row)
+            value["preview_card_rebound"] = rebound
+            return value
 
     def set_recurrence_strategy(
         self,
@@ -956,11 +1105,57 @@ class CourseScheduleImportRepository:
                 .where(
                     CourseScheduleImport.status.in_(FINAL_PRESENTATION_STATUSES),
                     CourseScheduleImport.completion_presented_at.is_(None),
+                    or_(
+                        and_(
+                            CourseScheduleImport.status_card_message_id.is_not(None),
+                            CourseScheduleImport.status_card_message_id != "",
+                        ),
+                        and_(
+                            CourseScheduleImport.status_card_chat_id.is_not(None),
+                            CourseScheduleImport.status_card_chat_id != "",
+                        ),
+                    ),
                 )
                 .order_by(CourseScheduleImport.completed_at, CourseScheduleImport.created_at)
                 .limit(max(1, min(int(limit), 500)))
             ).scalars().all()
             return [self._view(session, row) for row in rows]
+
+    def abandon_missing_completion_presentations(
+        self, *, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Durably stop startup replay when no presentation target exists."""
+
+        abandoned_at = _aware(now or datetime.now(timezone.utc))
+        with self.database.session() as session:
+            rows = list(session.execute(
+                select(CourseScheduleImport).where(
+                    CourseScheduleImport.status.in_(FINAL_PRESENTATION_STATUSES),
+                    CourseScheduleImport.completion_presented_at.is_(None),
+                    or_(
+                        CourseScheduleImport.status_card_message_id.is_(None),
+                        CourseScheduleImport.status_card_message_id == "",
+                    ),
+                    or_(
+                        CourseScheduleImport.status_card_chat_id.is_(None),
+                        CourseScheduleImport.status_card_chat_id == "",
+                    ),
+                    or_(
+                        CourseScheduleImport.completion_presentation_error.is_(None),
+                        CourseScheduleImport.completion_presentation_error
+                        != "presentation_target_missing",
+                    ),
+                ).with_for_update()
+            ).scalars())
+            abandoned = []
+            for row in rows:
+                row.completion_presentation_error = "presentation_target_missing"
+                row.last_progress_at = abandoned_at
+                abandoned.append({
+                    "id": str(row.id),
+                    "participant_id": row.participant_id,
+                })
+            return abandoned
 
     def mark_completion_presented(
         self, import_id: uuid.UUID | str, *, now: datetime | None = None
@@ -1266,6 +1461,7 @@ class CourseScheduleImportRepository:
         *,
         mode: str | None = None,
         cancel_mode: str | None = None,
+        status_card_chat_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Install the durable cancellation fence and materialize delete targets."""
@@ -1277,6 +1473,8 @@ class CourseScheduleImportRepository:
             )
             self._require_owner(row, participant_id)
             assert row is not None
+            if status_card_chat_id:
+                row.status_card_chat_id = str(status_card_chat_id)[:128]
             if (
                 row.status in EXPIRABLE_STATUSES
                 and _aware(row.expires_at) <= requested_at
@@ -1357,55 +1555,6 @@ class CourseScheduleImportRepository:
             }
             result["already_cancelled"] = False
             return result
-
-    def mark_create_cancelled(
-        self,
-        import_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> int:
-        cancelled_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
-            )
-            if row is None:
-                return 0
-            changed = 0
-            for write in session.execute(
-                select(CourseScheduleImportWrite).where(
-                    CourseScheduleImportWrite.import_id == row.id,
-                    CourseScheduleImportWrite.status == "planned",
-                )
-            ).scalars():
-                write.status = "create_cancelled"
-                write.error_code = "cancelled_before_dispatch"
-                write.updated_at = cancelled_at
-                changed += 1
-            self._finalize_cancellation_locked(session, row, cancelled_at)
-            session.flush()
-            return changed
-
-    def materialize_compensation_targets(
-        self,
-        participant_id: uuid.UUID,
-        import_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> list[dict[str, Any]]:
-        materialized_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImport, uuid.UUID(str(import_id)), with_for_update=True
-            )
-            self._require_owner(row, participant_id)
-            assert row is not None
-            targets = self._materialize_compensation_targets(
-                session, row, materialized_at
-            )
-            self._finalize_cancellation_locked(session, row, materialized_at)
-            session.flush()
-            return [self._compensation_view(target) for target in targets]
 
     def claim_next_compensation(
         self, *, now: datetime | None = None
@@ -1496,42 +1645,6 @@ class CourseScheduleImportRepository:
                     "import_status": parent.status,
                 }
             return None
-
-    def claim_compensation_target(
-        self,
-        target_id: uuid.UUID | str,
-        *,
-        now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        claimed_at = _aware(now or datetime.now(timezone.utc))
-        with self.database.session() as session:
-            target = session.get(
-                CourseScheduleImportCompensation,
-                uuid.UUID(str(target_id)),
-                with_for_update=True,
-            )
-            if target is None or target.status not in {
-                "delete_pending", "delete_outcome_unknown"
-            }:
-                return None
-            parent = session.get(
-                CourseScheduleImport, target.import_id, with_for_update=True
-            )
-            if parent is None or parent.status not in COMPENSATION_PARENT_STATUSES:
-                return None
-            if self._has_active_create_attempt(session, parent, claimed_at):
-                return None
-            target.delete_started_at = target.delete_started_at or claimed_at
-            target.delete_claim_expires_at = claimed_at + timedelta(
-                seconds=self.run_lease_seconds
-            )
-            target.attempt_count = int(target.attempt_count or 0) + 1
-            target.updated_at = claimed_at
-            if target.status == "delete_pending":
-                target.status = "deleting"
-                target.error_code = None
-            session.flush()
-            return self._compensation_view(target)
 
     def record_delete_success(
         self,
@@ -1784,16 +1897,21 @@ class CourseScheduleImportRepository:
     resume_cleanup = resume_cleanup_for_participant
 
     def recent_cancel_candidates(
-        self, participant_id: uuid.UUID, *, limit: int = 10
+        self,
+        participant_id: uuid.UUID,
+        *,
+        limit: int = 10,
+        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         statuses = {
             "pending_context", "pending_confirmation", "queued", "running",
             "cancelling", "succeeded", "partial_failed", "cleanup_failed",
             "cancelled",
         }
+        query_now = _aware(now or datetime.now(timezone.utc))
         with self.database.session() as session:
             self._expire_participant_drafts(
-                session, participant_id, now=datetime.now(timezone.utc)
+                session, participant_id, now=query_now
             )
             rows = list(
                 session.execute(
@@ -1831,20 +1949,27 @@ class CourseScheduleImportRepository:
                     )
                 except Exception:
                     import_timezone = ZoneInfo(DEFAULT_IMPORT_TIMEZONE)
-                created_local_date = (
-                    _aware(row.created_at)
-                    .astimezone(import_timezone)
-                    .date()
-                    .isoformat()
+                created_local_datetime = _aware(row.created_at).astimezone(
+                    import_timezone
                 )
                 output.append({
                     "id": str(row.id),
                     "participant_id": str(row.participant_id),
                     "status": row.status,
                     "created_at": _aware(row.created_at).isoformat(),
-                    "created_local_date": created_local_date,
+                    "created_local_datetime": created_local_datetime.isoformat(),
+                    "created_local_date": created_local_datetime.date().isoformat(),
+                    "timezone": str(row.timezone or DEFAULT_IMPORT_TIMEZONE),
                     "source_image_hash": row.source_image_hash,
                     "course_names": [name[:80] for name in names[:10]],
+                    "course_count": len(names),
+                    "provider_effect_count": sum(
+                        1
+                        for write in writes
+                        if write.status in PROVIDER_EFFECT_STATUSES
+                        or bool(write.provider_event_id)
+                        or bool(write.provider_conflict_event_id)
+                    ),
                     "has_provider_effect": any(
                         write.status in PROVIDER_EFFECT_STATUSES
                         or bool(write.provider_event_id)
@@ -1882,10 +2007,16 @@ class CourseScheduleImportRepository:
         return len(rows)
 
     def resolve_cancel_selector(
-        self, participant_id: uuid.UUID, selector: dict[str, Any]
+        self,
+        participant_id: uuid.UUID,
+        selector: dict[str, Any],
+        *,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         selector = dict(selector or {})
-        candidates = self.recent_cancel_candidates(participant_id, limit=50)
+        candidates = self.recent_cancel_candidates(
+            participant_id, limit=50, now=now
+        )
         if selector.get("latest") is True:
             matches = candidates[:1]
         elif selector.get("course_name"):
@@ -1996,28 +2127,6 @@ class CourseScheduleImportRepository:
                 return False
             self._set_run_lease(row, claimed_at)
             return True
-
-    def finish_item(
-        self,
-        import_id: uuid.UUID | str,
-        item_id: uuid.UUID | str,
-        *,
-        calendar_event_id: str | None = None,
-        error_code: str | None = None,
-    ) -> None:
-        with self.database.session() as session:
-            row = session.get(
-                CourseScheduleImportItem, uuid.UUID(str(item_id)), with_for_update=True
-            )
-            if row is None or row.import_id != uuid.UUID(str(import_id)):
-                return
-            if error_code:
-                row.status = "failed"
-                row.error_code = str(error_code)[:128]
-            else:
-                row.status = "succeeded"
-                row.calendar_event_id = str(calendar_event_id or "")[:256] or None
-                row.error_code = None
 
     def finalize(self, import_id: uuid.UUID | str) -> dict[str, Any]:
         with self.database.session() as session:

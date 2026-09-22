@@ -1993,59 +1993,6 @@ class ResearchEvaluationService:
             requested_family=requested_family,
             config=config,
         )
-    def _frozen_calendar_recovery(
-        calendar: Mapping[str, Any], observed_at: str
-    ) -> float:
-        """Derive only observable v1 calendar recovery resources."""
-
-        try:
-            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return 0.0
-        demanding: list[tuple[datetime, datetime]] = []
-        active_recovery = 0.0
-        for event in calendar.get("calendar_representation") or []:
-            try:
-                start = datetime.fromisoformat(
-                    str(event.get("start_time") or "").replace("Z", "+00:00")
-                )
-                end = datetime.fromisoformat(
-                    str(event.get("end_time") or "").replace("Z", "+00:00")
-                )
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=observed.tzinfo)
-                if end.tzinfo is None:
-                    end = end.replace(tzinfo=observed.tzinfo)
-                start = start.astimezone(timezone.utc)
-                end = end.astimezone(timezone.utc)
-                current = observed.astimezone(timezone.utc)
-            except (TypeError, ValueError):
-                continue
-            event_type = str(event.get("event_type") or "").lower()
-            metadata = dict(event.get("metadata") or {})
-            name = str(event.get("summary") or event.get("name") or "").lower()
-            is_protected = bool(
-                metadata.get("protected_break")
-                or event_type in {"rest", "nap"}
-                or "protected break" in name
-                or "保护性休息" in name
-            )
-            if start <= current < end and is_protected:
-                active_recovery = max(active_recovery, 0.65)
-            if event_type == "sleep" and start <= current < end:
-                active_recovery = 1.0
-            if event_type not in {"rest", "nap", "sleep", "meal"}:
-                demanding.append((start, end))
-        if active_recovery > 0.0:
-            return active_recovery
-        current = observed.astimezone(timezone.utc)
-        previous = [end for _, end in demanding if end <= current]
-        following = [start for start, _ in demanding if start > current]
-        if not previous or not following:
-            return 0.0
-        gap_minutes = (min(following) - max(previous)).total_seconds() / 60.0
-        return 0.35 * min(1.0, max(0.0, gap_minutes) / 60.0) if gap_minutes >= 10 else 0.0
-
     @staticmethod
     def _run_view(row: ModelEvaluationRun) -> dict[str, Any]:
         return {

@@ -8,10 +8,21 @@ import uuid
 from sqlalchemy import func, select
 
 from app.db import Database
-from app.models import AdminUser
+from app.models import AdminResearchDetailAccessAudit, AdminUser
 
 
 ROLES = ("viewer", "admin", "superadmin")
+PARTICIPANT_RESEARCH_DETAIL_SCOPE = "participant_research_detail_read"
+ADMIN_SCOPES = frozenset({PARTICIPANT_RESEARCH_DETAIL_SCOPE})
+
+
+def _validate_scopes(scopes: object) -> list[str]:
+    if not isinstance(scopes, (list, tuple, set, frozenset)):
+        raise ValueError("invalid admin scopes")
+    normalized = sorted({str(scope) for scope in scopes})
+    if set(normalized) - ADMIN_SCOPES:
+        raise ValueError("invalid admin scopes")
+    return normalized
 
 
 def normalize_username(value: str) -> str:
@@ -39,6 +50,7 @@ class AdminUserRepository:
                     username=normalized,
                     password_hash=password_hash,
                     role="superadmin",
+                    scopes_json=[PARTICIPANT_RESEARCH_DETAIL_SCOPE],
                     status="active",
                     is_environment_bootstrap=True,
                     created_at=now,
@@ -49,6 +61,7 @@ class AdminUserRepository:
             else:
                 row.password_hash = password_hash
                 row.role = "superadmin"
+                row.scopes_json = [PARTICIPANT_RESEARCH_DETAIL_SCOPE]
                 row.status = "active"
                 row.is_environment_bootstrap = True
                 row.updated_at = now
@@ -80,11 +93,13 @@ class AdminUserRepository:
             return [self.public(row) for row in rows]
 
     def create(
-        self, username: str, password_hash: str, role: str, *, created_by: uuid.UUID
+        self, username: str, password_hash: str, role: str, *, created_by: uuid.UUID,
+        scopes: object = (),
     ) -> dict:
         normalized = normalize_username(username)
         if role not in ROLES:
             raise ValueError("invalid role")
+        normalized_scopes = _validate_scopes(scopes)
         now = datetime.now(timezone.utc)
         with self.database.session() as session:
             if session.execute(
@@ -95,6 +110,7 @@ class AdminUserRepository:
                 username=normalized,
                 password_hash=password_hash,
                 role=role,
+                scopes_json=normalized_scopes,
                 status="active",
                 created_by=created_by,
                 created_at=now,
@@ -111,6 +127,7 @@ class AdminUserRepository:
         role: str | None = None,
         status: str | None = None,
         password_hash: str | None = None,
+        scopes: object | None = None,
         actor_id: uuid.UUID,
     ) -> dict | None:
         try:
@@ -121,6 +138,7 @@ class AdminUserRepository:
             raise ValueError("invalid role")
         if status is not None and status not in {"active", "disabled"}:
             raise ValueError("invalid status")
+        normalized_scopes = _validate_scopes(scopes) if scopes is not None else None
         with self.database.session() as session:
             row = session.get(AdminUser, value)
             if row is None:
@@ -148,6 +166,8 @@ class AdminUserRepository:
                 row.status = status
             if password_hash is not None:
                 row.password_hash = password_hash
+            if normalized_scopes is not None:
+                row.scopes_json = normalized_scopes
             row.updated_at = datetime.now(timezone.utc)
             session.flush()
             return self.public(row)
@@ -158,12 +178,23 @@ class AdminUserRepository:
             if row:
                 row.last_login_at = datetime.now(timezone.utc)
 
+    def record_research_detail_access(
+        self, admin_id: uuid.UUID | str, participant_id: uuid.UUID,
+        endpoint: str,
+    ) -> None:
+        with self.database.session() as session:
+            session.add(AdminResearchDetailAccessAudit(
+                admin_id=uuid.UUID(str(admin_id)), participant_id=participant_id,
+                endpoint=str(endpoint)[:128],
+            ))
+
     @staticmethod
     def public(row: AdminUser) -> dict:
         return {
             "id": str(row.id),
             "username": row.username,
             "role": row.role,
+            "scopes": list(row.scopes_json or ()),
             "status": row.status,
             "is_environment_bootstrap": bool(row.is_environment_bootstrap),
             "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None,

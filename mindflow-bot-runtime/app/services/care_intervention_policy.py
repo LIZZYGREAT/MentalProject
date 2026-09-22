@@ -11,7 +11,7 @@ from app.services.care_context import CareContext
 from app.services.care_jitai import normalized_intervention_type
 
 
-CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v3"
+CARE_INTERVENTION_POLICY_VERSION = "care_intervention_policy.v4"
 _DEADLINE = re.compile(
     r"ddl|deadline|截止|提交|交作业|报告|论文|答辩",
     flags=re.IGNORECASE,
@@ -37,7 +37,7 @@ class CareMessagePlan:
 
 
 class CareInterventionPolicy:
-    def plan(self, context: CareContext) -> CareMessagePlan:
+    def plan(self, context: CareContext, *, evidence: Any | None = None) -> CareMessagePlan:
         level = self._level(context.warning_level)
         if level >= 3 or context.care_action == "pause_and_seek_support":
             return self._plan(
@@ -59,6 +59,43 @@ class CareInterventionPolicy:
 
         dense = self._dense_transition(context)
         deadline = self._has_deadline(context)
+        reason_codes = {
+            str(item.get("code") or "")
+            for item in list(getattr(evidence, "reason_candidates", ()) or ())
+        }
+        evidence_schedule = dict(getattr(evidence, "schedule", {}) or {})
+        evidence_trajectory = dict(getattr(evidence, "trajectory", {}) or {})
+        evidence_personalization = dict(getattr(evidence, "personalization", {}) or {})
+        longitudinal = dict(getattr(evidence, "longitudinal_state", {}) or {})
+        has_evidence = evidence is not None
+        evidence_has_qualified_events = any(
+            float(fact.get("workload_prior") or 0.0) > 0.0
+            or bool(fact.get("semantic"))
+            for fact in list(getattr(evidence, "event_facts", ()) or ())
+        ) if has_evidence else False
+        evidence_has_course_block = any(
+            int(block.get("course_count") or 0) >= 2
+            for block in list(evidence_schedule.get("continuous_course_blocks") or [])
+        ) if has_evidence else False
+        evidence_dense = "dense_high_load_course_block" in reason_codes
+        evidence_recovery_window = (
+            "insufficient_recovery_window" in reason_codes
+            and float(evidence_schedule.get("weighted_load") or 0.0) >= 0.60
+        )
+        dense_signal = (
+            evidence_dense or evidence_recovery_window
+            if has_evidence and evidence_has_qualified_events and evidence_has_course_block
+            else dense
+        )
+        sustained_load = (
+            "sustained_continuous_load" in reason_codes
+            or float(evidence_trajectory.get("local_continuous_load_factor") or 0.0) >= 0.60
+        ) if has_evidence else False
+        carryover = "previous_day_carryover" in reason_codes
+        slow_recovery = evidence_personalization.get("recovery_rate") == "slower_than_population_prior"
+        declining_recovery = longitudinal.get("recovery_trend") == "declining"
+        low_energy = "low_recent_energy" in reason_codes
+        high_task = self._has_high_workload_task(evidence) if has_evidence else False
         has_workload = bool(
             context.current_events
             or context.dominant_stressors
@@ -75,35 +112,54 @@ class CareInterventionPolicy:
                 "score": 0.40,
             }
         ]
-        if context.profile_summary.recent_energy_tendency == "low":
+        if context.profile_summary.recent_energy_tendency == "low" or low_energy or carryover or slow_recovery or declining_recovery:
             candidates.append({
                 "intervention_type": "recovery",
                 "template_id": "recovery-v1",
-                "reason_code": "low_recent_energy_before_risk",
+                "reason_code": (
+                    "low_recent_energy_before_risk"
+                    if low_energy or context.profile_summary.recent_energy_tendency == "low"
+                    else "declining_recovery_trend"
+                    if declining_recovery
+                    else "personal_recovery_evidence"
+                ),
                 "action_minutes": 10,
-                "score": 0.90,
+                "score": 0.94 if carryover or slow_recovery or declining_recovery else 0.90,
             })
-        if dense or has_workload:
+        if dense_signal or has_workload:
             candidates.append({
                 "intervention_type": "transition_buffer",
                 "template_id": "transition-buffer-v1",
                 "reason_code": (
-                    "dense_schedule_before_high_risk"
+                    "dense_high_load_course_block"
+                    if evidence_dense
+                    else "insufficient_recovery_window"
+                    if evidence_recovery_window
+                    else "dense_schedule_before_high_risk"
                     if dense else "transition_support_preference"
                 ),
                 "action_minutes": 10,
-                "score": 0.80 if dense else 0.31,
+                "score": (
+                    0.88
+                    if evidence_dense or evidence_recovery_window
+                    else 0.80
+                    if dense_signal
+                    else 0.31
+                ),
             })
-        if deadline or has_workload:
+        if deadline or high_task or has_workload:
             candidates.append({
                 "intervention_type": "workload_decomposition",
                 "template_id": "workload-decomposition-v1",
                 "reason_code": (
                     "deadline_workload_near_risk"
-                    if deadline else "decomposition_support_preference"
+                    if deadline
+                    else "single_high_load_event"
+                    if high_task
+                    else "decomposition_support_preference"
                 ),
                 "action_minutes": 15,
-                "score": 0.78 if deadline else 0.32,
+                "score": 0.82 if deadline or high_task else 0.32,
             })
         candidates.append({
             "intervention_type": "protected_break",
@@ -115,7 +171,9 @@ class CareInterventionPolicy:
             ),
             "action_minutes": 15,
             "score": (
-                0.72
+                0.84
+                if sustained_load
+                else 0.72
                 if level >= 2 or context.care_action == "protected_break"
                 else 0.33
             ),
@@ -127,7 +185,7 @@ class CareInterventionPolicy:
             "action_minutes": 3,
             "score": 0.34,
         })
-        if context.allow_schedule_suggestions and (dense or deadline):
+        if context.allow_schedule_suggestions and (dense_signal or deadline):
             candidates.append({
                 "intervention_type": "schedule_adjustment",
                 "template_id": "schedule-adjustment-v1",
@@ -156,6 +214,24 @@ class CareInterventionPolicy:
             action_minutes=int(selected["action_minutes"]),
             ranking_score=float(selected["score"]),
             preference_matched=selected.get("preference_matched"),
+        )
+
+    @staticmethod
+    def _has_high_workload_task(evidence: Any) -> bool:
+        if evidence is None:
+            return False
+        reason_ids = {
+            str(fact_id)
+            for reason in list(getattr(evidence, "reason_candidates", ()) or ())
+            if str(reason.get("code") or "") == "single_high_load_event"
+            for fact_id in list(reason.get("fact_ids") or [])
+        }
+        if not reason_ids:
+            return False
+        return any(
+            str(fact.get("fact_id") or "") in reason_ids
+            and str(fact.get("event_type") or "") in {"task", "exam"}
+            for fact in list(getattr(evidence, "event_facts", ()) or ())
         )
 
     @staticmethod

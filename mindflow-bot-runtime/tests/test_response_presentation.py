@@ -2,20 +2,31 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import time
+import uuid
 
 import pytest
 
 from app.integrations.feishu.client import FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
-from app.presentation.contracts import AgentActivityEvent, ResponsePlan, ResponseSegment, RuntimeResponse
+from app.integrations.feishu.streaming_card import FeishuStreamingCardSession
+from app.presentation.contracts import (
+    AgentActivityEvent,
+    ExternalEvidenceSource,
+    PresentationEvidence,
+    ResponsePlan,
+    ResponseSegment,
+    RuntimeResponse,
+)
+from app.presentation.presentation_compiler import PresentationCompiler
 from app.presentation.markdown_sanitizer import MarkdownSanitizer
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.presentation_agent import ProductionPresentationAgent
 from app.presentation.response_orchestrator import ResponseOrchestrator
 from app.presentation.semantic_segmenter import SemanticSegmenter
 from app.repositories import BotEventRepository
+from app.services.presentation_service import PresentationOutbox, ReviewCardPolicy
 from app.models import BotEvent as BotEventRow
-from app.worker import BotWorker, ProgressState
+from app.worker import BotWorker, ProgressState, _with_card_delivery_failure
 from helpers import memory_database
 
 
@@ -134,10 +145,10 @@ def test_progress_presenter_keeps_generic_copy_available_after_tool_activity():
 @pytest.mark.parametrize(
     ("tool_name", "expected"),
     [
-        ("care_record_checkin", "我在记录这次状态。"),
+        ("care_record_checkin", "我在准备这次状态记录。"),
         ("care_get_support", "我在结合当前状态整理更合适的支持建议。"),
         ("care_simulate_schedule_change", "我正在比较这次时间调整前后的压力变化。"),
-        ("care_update_preferences", "我正在更新你的提醒与关怀设置。"),
+        ("care_update_preferences", "我在整理设置变更并准备确认卡。"),
         ("care_respond_to_latest_intervention", "我正在记录这次反馈。"),
     ],
 )
@@ -173,6 +184,262 @@ def test_generic_progress_copy_uses_a_bounded_deterministic_template_pool():
     assert 1 < len(set(first_pass)) <= 4
     assert all(message and len(message) <= 20 for message in first_pass)
     assert all("已完成" not in message for message in first_pass)
+
+
+def test_presentation_v2_routes_web_long_and_fixed_card_modes():
+    orchestrator = ResponseOrchestrator(segmenter=SemanticSegmenter(min_total_chars=20))
+
+    web = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("**结论**\n\n1. 第一项\n2. 第二项"),
+        cards=[],
+        used_tools={"web_search"},
+    ))
+    url_read = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("链接摘要"),
+        cards=[],
+        used_tools={"web_read_url"},
+    ))
+    short = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("你好呀"),
+        cards=[],
+        used_tools=set(),
+    ))
+    calendar = asyncio.run(orchestrator.build_plan(
+        RuntimeResponse("请在卡片中确认"),
+        cards=[{"schema": "2.0"}],
+        used_tools={"calendar_delete_event"},
+    ))
+
+    assert web.presentation_mode == "streaming_markdown"
+    assert url_read.presentation_mode == "streaming_markdown"
+    assert short.presentation_mode == "plain_text"
+    assert calendar.presentation_mode == "fixed_card"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "calendar_create_event",
+        "calendar_create_events_plan",
+        "calendar_update_event",
+        "calendar_update_events_plan",
+        "calendar_delete_event",
+        "calendar_delete_events_plan",
+    ],
+)
+def test_all_calendar_mutation_tools_share_fixed_card_transaction_policy(tool_name):
+    plan = asyncio.run(ResponseOrchestrator().build_plan(
+        RuntimeResponse("请在卡片中确认"),
+        cards=[{"schema": "2.0"}],
+        used_tools={tool_name},
+    ))
+
+    assert plan.kind == "transactional"
+    assert plan.presentation_mode == "fixed_card"
+    assert plan.presentation_agent_used is False
+    assert plan.use_cards is True
+    assert plan.segments == ()
+    assert plan.full_text == ""
+
+
+def test_calendar_confirmation_card_failure_keeps_text_fallback():
+    plan = asyncio.run(ResponseOrchestrator().build_plan(
+        RuntimeResponse("已生成待确认方案，请确认。"),
+        cards=[],
+        used_tools={"calendar_update_event"},
+    ))
+
+    assert plan.kind == "transactional"
+    assert plan.presentation_mode == "plain_text"
+    assert [segment.text for segment in plan.segments] == [
+        "已生成待确认方案，请确认。"
+    ]
+
+
+def _self_contained_review_plan(tool_name):
+    return asyncio.run(
+        ResponseOrchestrator().build_plan(
+            RuntimeResponse("这段模型说明不应与审核卡重复发送。"),
+            cards=[{"schema": "2.0"}],
+            used_tools={tool_name},
+            suppress_card_companion=True,
+        )
+    )
+
+
+def test_reminder_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("reminder_create")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_memory_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("memory_replace")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_preference_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("interaction_preferences_update")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_care_preference_review_card_has_no_duplicate_companion():
+    plan = _self_contained_review_plan("care_update_preferences")
+
+    assert plan.use_cards is True
+    assert plan.segments == ()
+
+
+def test_review_card_delivery_failure_keeps_text_fallback():
+    run_id = uuid.uuid4()
+    outbox = PresentationOutbox()
+    fallback = "提醒确认卡暂时未能发送，本次提醒尚未保存，请稍后重试。"
+    outbox.stage_card(
+        run_id,
+        {"schema": "2.0"},
+        review_policy=ReviewCardPolicy(fallback_text=fallback),
+    )
+    cards, policy = outbox.take_delivery(run_id)
+
+    assert cards == [{"schema": "2.0"}]
+    assert policy is not None
+    failed = _with_card_delivery_failure(
+        RuntimeResponse("卡片已经准备好了，请查看。"),
+        deterministic_fallback=policy.fallback_text,
+    )
+    plan = asyncio.run(
+        ResponseOrchestrator().build_plan(
+            failed,
+            cards=[],
+            used_tools={"reminder_create"},
+        )
+    )
+
+    assert "本次提醒尚未保存" in plan.full_text
+    assert "卡片已经准备好了" not in plan.full_text
+    assert plan.segments
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    [
+        ("calendar_create_event", "我在核对日程信息并准备确认卡。"),
+        ("calendar_update_event", "我在核对修改内容并准备确认卡。"),
+        ("calendar_delete_event", "我在核对要删除的日程并准备确认卡。"),
+        ("calendar_create_events_plan", "我在整理这些日程并准备确认卡。"),
+        ("calendar_update_events_plan", "我在整理这些日程并准备确认卡。"),
+        ("calendar_delete_events_plan", "我在整理这些日程并准备确认卡。"),
+    ],
+)
+def test_calendar_progress_copy_prepares_confirmation_without_claiming_write(
+    tool_name, expected
+):
+    assert ProgressPresenter().present(
+        AgentActivityEvent(kind="tool_started", tool_name=tool_name),
+        state=ProgressState(),
+    ) == expected
+
+
+def test_feishu_rich_markdown_preserves_structure_and_rejects_html():
+    compiled = PresentationCompiler().compile(
+        "# 结论\n\n**重点**\n\n1. 第一项\n2. 第二项\n<script>alert(1)</script>",
+        mode="rich_markdown",
+    )
+
+    assert "**结论**" in compiled
+    assert "**重点**" in compiled
+    assert "1. 第一项" in compiled
+    assert "2. 第二项" in compiled
+    assert "<script>" not in compiled
+    assert "</script>" not in compiled
+
+
+def test_source_footer_uses_only_backend_sources_and_deduplicates_urls():
+    evidence = PresentationEvidence((
+        ExternalEvidenceSource("Official", "https://Example.com/a#fragment"),
+        ExternalEvidenceSource("Duplicate", "https://example.com/a"),
+        ExternalEvidenceSource("Unsafe", "javascript:alert(1)"),
+        ExternalEvidenceSource("Second", "https://example.com/b"),
+    ))
+
+    compiled = PresentationCompiler().compile(
+        "正文不包含来源。",
+        mode="streaming_markdown",
+        evidence=evidence,
+    )
+
+    assert compiled.count("https://example.com/a") == 1
+    assert "javascript:" not in compiled
+    assert "[Official](https://example.com/a)" in compiled
+    assert "[Second](https://example.com/b)" in compiled
+    assert "Duplicate" not in compiled
+
+
+def test_rich_web_answer_strips_hallucinated_markdown_link():
+    compiled = PresentationCompiler().compile(
+        "请看[不可信页面](https://hallucinated.example/claim)。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "[不可信页面]" not in compiled
+    assert "不可信页面" in compiled
+    assert "hallucinated.example" not in compiled
+
+
+def test_rich_web_answer_keeps_backend_verified_link():
+    compiled = PresentationCompiler().compile(
+        "可查看[原始报道](https://Verified.example/article#section)。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "[原始报道](https://verified.example/article)" in compiled
+
+
+def test_rich_web_answer_does_not_expose_unverified_raw_url():
+    compiled = PresentationCompiler().compile(
+        "模型给出了 https://hallucinated.example/path ，请不要采用。",
+        mode="streaming_markdown",
+        evidence=PresentationEvidence((
+            ExternalEvidenceSource("已验证来源", "https://verified.example/article"),
+        )),
+        restrict_body_urls=True,
+    )
+
+    assert "https://hallucinated.example/path" not in compiled
+    assert "链接已省略" in compiled
+    assert "https://verified.example/article" in compiled
+
+
+def test_streaming_rich_path_does_not_call_presentation_agent():
+    agent = GoodPresentationAgent()
+    plan = asyncio.run(ResponseOrchestrator(
+        presentation_agent=agent,
+        presentation_agent_mode="always",
+        presentation_agent_min_chars=1,
+        segmenter=SemanticSegmenter(min_total_chars=1),
+    ).build_plan(
+        RuntimeResponse("**结论**\n\n1. 完整回答", response_kind="analysis"),
+        cards=[],
+        used_tools={"web_search"},
+    ))
+
+    assert plan.presentation_mode == "streaming_markdown"
+    assert plan.presentation_agent_attempted is False
+    assert plan.presentation_agent_outcome == "bypassed_rich"
+    assert agent.calls == 0
 
 
 class GoodPresentationAgent:
@@ -214,6 +481,7 @@ def test_response_orchestrator_routes_only_long_analysis_to_presentation_agent()
         presentation_agent_mode="always",
         presentation_agent_min_chars=10,
         segmenter=SemanticSegmenter(min_total_chars=10, max_chars=650),
+        rich_presentation_enabled=False,
     )
     source = RuntimeResponse(
         "下午的分析比较长，峰值在 15:45，数值为 74.06。",
@@ -269,6 +537,7 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     bad_plan = asyncio.run(bad.build_plan(source, cards=[], used_tools=set()))
     assert bad_plan.presentation_agent_used is False
@@ -284,6 +553,7 @@ def test_presentation_agent_validation_and_timeout_fall_back_deterministically()
         presentation_agent_min_chars=1,
         presentation_agent_timeout_seconds=0.01,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     slow_plan = asyncio.run(slow.build_plan(source, cards=[], used_tools=set()))
     assert slow_plan.presentation_agent_used is False
@@ -302,6 +572,7 @@ def test_presentation_rejects_free_text_even_when_all_numbers_are_preserved():
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     ).build_plan(source, cards=[], used_tools=set()))
 
     assert plan.presentation_agent_used is False
@@ -316,6 +587,7 @@ def test_presentation_agent_output_always_passes_through_markdown_sanitizer():
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
         segmenter=SemanticSegmenter(min_total_chars=1),
+        rich_presentation_enabled=False,
     )
     plan = asyncio.run(
         orchestrator.build_plan(
@@ -349,6 +621,7 @@ def test_invalid_presentation_fallback_keeps_complete_authoritative_answer():
         presentation_agent=BadNumericPresentationAgent(),
         presentation_agent_mode="always",
         presentation_agent_min_chars=1,
+        rich_presentation_enabled=False,
     )
     plan = asyncio.run(
         orchestrator.build_plan(
@@ -379,6 +652,7 @@ def test_adaptive_mode_skips_secondary_model_when_local_plan_is_lossless_and_bou
         segmenter=SemanticSegmenter(
             min_total_chars=100, target_chars=260, max_chars=650, max_segments=3
         ),
+        rich_presentation_enabled=False,
     )
 
     plan = asyncio.run(orchestrator.build_plan(
@@ -411,6 +685,7 @@ def test_timeout_is_a_hard_user_visible_deadline_and_cleanup_applies_backpressur
             presentation_agent_timeout_seconds=0.01,
             presentation_agent_max_pending_cleanups=1,
             segmenter=SemanticSegmenter(min_total_chars=1),
+            rich_presentation_enabled=False,
         )
         source = RuntimeResponse(
             "完整权威结论：15:45 的数值是 74.06。", response_kind="analysis"
@@ -565,6 +840,74 @@ class ProviderSender:
         return message_id
 
 
+class RichFallbackSender(ProviderSender):
+    def __init__(self, *, fail_card=False):
+        super().__init__()
+        self.fail_card = fail_card
+        self.cards = []
+
+    def send_card(self, chat_id, card, *, message_uuid=None):
+        if self.fail_card:
+            raise FeishuSendError(
+                "planned rich card failure",
+                retryable=False,
+                operation="send_card",
+            )
+        self.cards.append((chat_id, card, message_uuid))
+        return f"card-out-{len(self.cards)}"
+
+
+class StreamingStartFailureSender(RichFallbackSender):
+    async def start_streaming_card(self, *_args, **_kwargs):
+        raise FeishuSendError(
+            "planned streaming start failure",
+            retryable=False,
+            operation="create_card_instance",
+        )
+
+
+class StreamingProviderSender(ProviderSender):
+    def __init__(self, *, fail_after_updates=None):
+        super().__init__()
+        self.card_operations = []
+        self.fail_after_updates = fail_after_updates
+
+    async def start_streaming_card(
+        self,
+        _chat_id,
+        initial_content,
+        **options,
+    ):
+        self.card_operations.append(("create", initial_content))
+        return FeishuStreamingCardSession(
+            client=self,
+            card_id="card-1",
+            message_id="card-message-1",
+            visible_content=initial_content,
+            update_interval_ms=options["update_interval_ms"],
+            min_update_chars=options["min_update_chars"],
+            max_update_interval_ms=options["max_update_interval_ms"],
+        )
+
+    def update_card_element_content(
+        self, card_id, element_id, content, sequence
+    ):
+        update_count = sum(
+            operation[0] == "update" for operation in self.card_operations
+        )
+        if (
+            self.fail_after_updates is not None
+            and update_count >= self.fail_after_updates
+        ):
+            raise FeishuSendError("stream failed", retryable=False)
+        self.card_operations.append(
+            ("update", card_id, element_id, content, sequence)
+        )
+
+    def finish_streaming_card(self, card_id, sequence):
+        self.card_operations.append(("close", card_id, sequence))
+
+
 def _event_and_repository(event_id="delivery-1"):
     database = memory_database()
     repository = BotEventRepository(database)
@@ -617,6 +960,179 @@ def _three_segment_plan():
         ),
         use_cards=False,
     )
+
+
+def _streaming_plan(text):
+    return ResponsePlan(
+        kind="analysis",
+        full_text=text,
+        segments=(ResponseSegment(0, text),),
+        use_cards=True,
+        presentation_mode="streaming_markdown",
+    )
+
+
+def test_validated_streaming_delivery_is_cumulative_durable_and_closed():
+    repository, event = _event_and_repository("stream-success")
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    worker.streaming_update_interval_ms = 10
+    worker.streaming_min_chars_per_update = 10
+    worker.streaming_max_update_interval_ms = 30
+    final = "**结论**\n\n" + ("完整且已经通过安全检查的回答。" * 12)
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    updates = [item for item in sender.card_operations if item[0] == "update"]
+    contents = [item[3] for item in updates]
+    sequences = [item[-1] for item in sender.card_operations if item[0] != "create"]
+    assert contents
+    assert contents[-1] == final
+    assert all(new.startswith(old) for old, new in zip(contents, contents[1:]))
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+    assert sender.card_operations[-1][0] == "close"
+    assert repository.pending_streaming_reply_plan(event.event_id) is None
+    with repository.database.session() as session:
+        row = session.get(BotEventRow, event.event_id)
+        assert row.streaming_state == "finalized"
+        assert row.streaming_finalized_at is not None
+        assert row.reply_text == final
+
+
+def test_streaming_failure_before_answer_falls_back_to_durable_text_once():
+    repository, event = _event_and_repository("stream-fallback")
+    sender = StreamingProviderSender(fail_after_updates=0)
+    worker = _worker(repository, sender)
+    final = "validated full answer"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert [item[1] for item in sender.visible] == [final]
+    assert sum(item[1] == final for item in sender.visible) == 1
+
+
+def test_streaming_start_failure_falls_back_to_rich_card():
+    repository, event = _event_and_repository("stream-start-rich-fallback")
+    sender = StreamingStartFailureSender()
+    worker = _worker(repository, sender)
+    final = "**结论**\n\n1. [来源](https://example.com/article)"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert sender.visible == []
+    assert len(sender.cards) == 1
+    markdown = sender.cards[0][1]["body"]["elements"][0]
+    assert markdown == {"tag": "markdown", "content": final}
+
+
+def test_rich_card_failure_falls_back_to_clean_plain_text():
+    repository, event = _event_and_repository("rich-clean-plain-fallback")
+    sender = RichFallbackSender(fail_card=True)
+    worker = _worker(repository, sender)
+    final = "**来源**\n\n1. [公开页面](https://example.com/article)"
+
+    delivered = asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert delivered is True
+    assert [item[1] for item in sender.visible] == [
+        "来源\n\n• 公开页面：https://example.com/article"
+    ]
+    assert "**" not in sender.visible[0][1]
+    assert "[公开页面](" not in sender.visible[0][1]
+
+
+def test_streaming_markdown_never_reaches_send_text_raw():
+    repository, event = _event_and_repository("stream-no-raw-text")
+    sender = RichFallbackSender(fail_card=True)
+    worker = _worker(repository, sender)
+    raw_markdown = "**来源**\n\n- [文档](https://example.com/doc)"
+
+    asyncio.run(worker._deliver_plan(event, _streaming_plan(raw_markdown)))
+
+    sent_texts = [item[1] for item in sender.calls]
+    assert raw_markdown not in sent_texts
+    assert sent_texts == ["来源\n\n• 文档：https://example.com/doc"]
+
+
+def test_source_footer_is_rendered_in_rich_card_not_literal_plain_text():
+    repository, event = _event_and_repository("source-footer-rich-card")
+    sender = RichFallbackSender()
+    worker = _worker(repository, sender)
+    final = "回答。\n\n**来源**\n\n1. [文档](https://example.com/doc)"
+
+    asyncio.run(worker._deliver_plan(event, _streaming_plan(final)))
+
+    assert sender.visible == []
+    assert sender.cards[0][1]["body"]["elements"] == [
+        {"tag": "markdown", "content": final}
+    ]
+
+
+def test_progress_card_is_closed_when_final_uses_plain_text_fallback():
+    repository, event = _event_and_repository("stream-plain-final")
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    session = asyncio.run(sender.start_streaming_card(
+        event.chat_id,
+        "正在搜索公开网页…",
+        update_interval_ms=10,
+        min_update_chars=10,
+        max_update_interval_ms=30,
+    ))
+    repository.stage_streaming_progress(
+        event.event_id,
+        card_id=session.card_id,
+        message_id=session.message_id,
+        element_id=session.element_id,
+    )
+    worker._attach_streaming_sequence_allocator(event.event_id, session)
+    plan = ResponsePlan(
+        kind="error",
+        full_text="安全的降级答复",
+        segments=(ResponseSegment(0, "安全的降级答复"),),
+        use_cards=False,
+        presentation_mode="plain_text",
+    )
+
+    delivered = asyncio.run(
+        worker._deliver_plan(event, plan, streaming_session=session)
+    )
+
+    assert delivered is True
+    assert session.closed is True
+    assert sender.card_operations[-1][0] == "close"
+    assert [item[1] for item in sender.visible] == ["安全的降级答复"]
+
+
+def test_streaming_recovery_finishes_durable_final_without_full_text_duplicate():
+    repository, event = _event_and_repository("stream-recovery")
+    repository.stage_streaming_progress(
+        event.event_id,
+        card_id="card-1",
+        message_id="card-message-1",
+        element_id="mindflow_answer",
+    )
+    final = "recovered validated answer"
+    repository.stage_streaming_final(event.event_id, full_text=final)
+    assert repository.reserve_streaming_sequence(event.event_id) == 1
+    pending = repository.pending_streaming_reply_plan(event.event_id)
+    sender = StreamingProviderSender()
+    worker = _worker(repository, sender)
+    worker.streaming_update_interval_ms = 10
+    worker.streaming_min_chars_per_update = 5
+
+    delivered = asyncio.run(worker._resume_streaming_reply(event, pending))
+
+    assert delivered is True
+    assert sender.visible == []
+    updates = [item for item in sender.card_operations if item[0] == "update"]
+    assert updates[-1][3] == final
+    assert min(item[-1] for item in updates) >= 2
+    assert sender.card_operations[-1][0] == "close"
 
 
 def test_crash_after_send_reuses_provider_uuid_and_does_not_duplicate_visible_segment():

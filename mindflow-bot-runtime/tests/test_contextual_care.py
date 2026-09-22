@@ -347,6 +347,74 @@ def test_schedule_adjustment_candidate_is_strictly_gated_by_hard_preference():
     )
 
 
+def test_care_policy_uses_evidence_to_distinguish_high_and_low_course_blocks():
+    care = CareMessageService("Asia/Shanghai")
+    high = care.contextualize_alert(
+        _alert(),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=[
+            _event(
+                "high-1", "高等数学", "15:00", "15:45", event_type="course",
+                workload_prior=0.82,
+                semantic_values={"cognitive_demand": 0.85, "expected_effort": 0.8},
+            ),
+            _event(
+                "high-2", "数据结构", "15:55", "16:40", event_type="course",
+                workload_prior=0.80,
+                semantic_values={"cognitive_demand": 0.82, "expected_effort": 0.78},
+            ),
+        ],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+    )
+    low = care.contextualize_alert(
+        _alert(),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=[
+            _event("low-1", "通识选修 A", "15:00", "15:45", event_type="course", workload_prior=0.30),
+            _event("low-2", "轻量选修 B", "15:55", "16:40", event_type="course", workload_prior=0.32),
+        ],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+    )
+
+    assert high["care_plan"]["intervention_type"] == "transition_buffer"
+    assert low["care_plan"]["intervention_type"] != "transition_buffer"
+
+
+def test_fallback_semantic_wording_does_not_turn_time_pressure_into_cognitive_load():
+    contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
+        _alert(),
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=[
+            _event(
+                "pressure-1", "提交窗口 A", "15:00", "15:45", event_type="course",
+                workload_prior=0.82,
+                semantic_values={"cognitive_demand": 0.2, "time_pressure": 0.9},
+            ),
+            _event(
+                "pressure-2", "提交窗口 B", "15:55", "16:40", event_type="course",
+                workload_prior=0.80,
+                semantic_values={"cognitive_demand": 0.25, "time_pressure": 0.88},
+            ),
+        ],
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+    )
+
+    assert "时间压力偏高" in contextual["message"]
+    assert "认知负荷偏高" not in contextual["message"]
+
+
 def test_missing_calendar_state_and_preference_uses_audited_generic_fallback():
     contextual = CareMessageService("Asia/Shanghai").contextualize_alert(
         _alert(current_events=[], dominant_stressors=[]),

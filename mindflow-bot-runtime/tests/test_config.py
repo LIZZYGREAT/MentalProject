@@ -38,6 +38,81 @@ def test_all_claude_model_roles_are_loaded_explicitly():
     assert settings.claude_code_subagent_model == "deepseek-v4-flash"
 
 
+def test_participant_diagnostics_allowlist_is_explicit_and_normalized():
+    environment = valid_environment()
+    environment["PARTICIPANT_DIAGNOSTICS_ALLOWLIST"] = " P002, p001, P002 "
+
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.participant_diagnostics_allowlist == ("p001", "p002")
+
+
+def test_card_action_receipt_ttl_defaults_and_bounds():
+    base = valid_environment()
+    settings = Settings.from_env(
+        base, base_dir=Path(__file__).resolve().parents[1]
+    )
+    assert settings.card_action_receipt_ttl_hours == 168
+
+    base["CARD_ACTION_RECEIPT_TTL_HOURS"] = "24"
+    assert Settings.from_env(
+        base, base_dir=Path(__file__).resolve().parents[1]
+    ).card_action_receipt_ttl_hours == 24
+    for invalid in ("23", "721"):
+        base["CARD_ACTION_RECEIPT_TTL_HOURS"] = invalid
+        with pytest.raises(ValueError, match="CARD_ACTION_RECEIPT_TTL_HOURS"):
+            Settings.from_env(base, base_dir=Path(__file__).resolve().parents[1])
+
+
+def test_web_search_uses_deepseek_credential_and_native_defaults():
+    environment = valid_environment()
+    environment["WEB_SEARCH_ENABLED"] = "true"
+    settings = Settings.from_env(
+        environment, base_dir=Path(__file__).resolve().parents[1]
+    )
+
+    assert settings.web_search_enabled is True
+    assert settings.web_search_provider == "deepseek_native"
+    assert settings.web_search_model == "deepseek-v4-flash"
+    assert settings.web_search_timeout_seconds == 10
+    assert settings.web_search_max_uses == 3
+    assert settings.web_search_max_output_tokens == 4096
+    assert settings.web_search_retry_max_output_tokens == 6144
+    assert settings.web_search_summary_max_chars == 12000
+    assert settings.web_read_url_enabled is True
+    assert settings.web_read_url_timeout_seconds == 10
+    assert settings.web_read_url_max_bytes == 2097152
+    assert settings.web_read_url_max_redirects == 3
+    assert settings.web_read_url_max_extracted_chars == 60000
+    assert settings.web_read_url_cache_ttl_minutes == 30
+    assert not hasattr(settings, "web_search_api_url")
+    assert not hasattr(settings, "web_search_api_key")
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("WEB_SEARCH_PROVIDER", "http_json", "WEB_SEARCH_PROVIDER"),
+        ("WEB_SEARCH_MAX_USES", "6", "WEB_SEARCH_MAX_USES"),
+        ("WEB_SEARCH_MAX_OUTPUT_TOKENS", "255", "WEB_SEARCH_MAX_OUTPUT_TOKENS"),
+        (
+            "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS",
+            "255",
+            "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS",
+        ),
+    ],
+)
+def test_web_search_settings_reject_unsupported_provider_limits(name, value, message):
+    environment = valid_environment()
+    environment[name] = value
+    with pytest.raises(ValueError, match=message):
+        Settings.from_env(
+            environment, base_dir=Path(__file__).resolve().parents[1]
+        )
+
+
 def test_mutation_intent_verifier_has_independent_on_demand_configuration():
     settings = Settings.from_env(
         valid_environment(), base_dir=Path(__file__).resolve().parents[1]
@@ -125,6 +200,11 @@ def test_response_ux_defaults_and_presentation_model_fallback():
     assert settings.presentation_agent_timeout_seconds == 4
     assert settings.presentation_model == "deepseek-v4-flash"
     assert settings.claude_partial_messages_enabled is False
+    assert settings.feishu_streaming_card_enabled is True
+    assert settings.feishu_streaming_update_interval_ms == 120
+    assert settings.feishu_streaming_min_chars_per_update == 30
+    assert settings.feishu_streaming_max_update_interval_ms == 300
+    assert settings.feishu_streaming_finalize_timeout_seconds == 5
 
 
 def test_progress_timers_have_independent_configuration():
@@ -346,7 +426,7 @@ def test_presentation_agent_performance_policy_defaults_and_validation():
     settings = Settings.from_env(
         environment, base_dir=Path(__file__).resolve().parents[1]
     )
-    assert settings.presentation_agent_mode == "adaptive"
+    assert settings.presentation_agent_mode == "off"
     assert settings.presentation_agent_timeout_seconds == 4.0
     assert settings.presentation_agent_disconnect_timeout_seconds == 0.5
     assert settings.presentation_agent_max_pending_cleanups == 1

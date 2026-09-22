@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import logging
 import uuid
 from zoneinfo import ZoneInfo
 
 from app.repositories import ForecastSnapshotRepository, WarningScheduleRepository
 from app.services.forecast_coordinator import ForecastCoordinator
-from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.forecast_dependency_refresh import (
+    ForecastDependencyRefreshService,
+    dependent_date_for,
+)
+from app.services.runtime_clock import RuntimeClock
 
 
 logger = logging.getLogger(__name__)
@@ -27,11 +31,13 @@ class ObservationForecastRefreshService:
         *,
         timezone_name: str,
         dependency_refresh: ForecastDependencyRefreshService | None = None,
+        clock: RuntimeClock | None = None,
     ) -> None:
         self.forecasts = forecasts
         self.warnings = warnings
         self.coordinator = coordinator
         self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self.dependency_refresh = dependency_refresh
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: dict[tuple[uuid.UUID, date], asyncio.Task[None]] = {}
@@ -123,7 +129,12 @@ class ObservationForecastRefreshService:
                             reason="previous_day_observation_terminal_changed",
                         )
                     else:
-                        dependent_date = local_date + timedelta(days=1)
+                        dependent_date = dependent_date_for(
+                            local_date, self.clock.local_date()
+                        )
+                        if dependent_date is None:
+                            processed = requested
+                            continue
                         await asyncio.to_thread(
                             self.coordinator.mark_dependency_dirty,
                             participant_id,

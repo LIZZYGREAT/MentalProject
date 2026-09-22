@@ -6,6 +6,21 @@ MindFlow personalization asks which participant-specific parameters can be estim
 
 The design uses hierarchical partial pooling and explicit promotion gates.
 
+## 1.1 Reviewed communication preferences
+
+Conversation presentation preferences are a separate, non-clinical domain. The
+base style (`verbosity`, `tone`, and `suggestion_style`) is kept separate from
+participant-reviewed semantic communication rules. Each semantic rule has a
+coarse scope (`all_responses`, `explanations`, `technical_explanations`, or
+`code_and_engineering`) and a bounded instruction of at most 500 characters;
+there can be at most three active rules per participant.
+
+The Agent interprets natural language into these structured fields. The
+Backend validates ownership, bounds, and proposal state, then persists rules
+only after the participant confirms the fixed review card. Confirmed rules
+shape communication style only; they never alter safety, authorization, tool
+contracts, identity, privacy, or durable memory.
+
 ## 2. Evidence threshold
 
 The Stage 5 workflow requires a minimum longitudinal basis before a participant-specific fit is eligible.

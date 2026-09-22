@@ -33,6 +33,7 @@ class DailyReviewScheduler:
         validity_minutes: int = 1440, catch_up_minutes: int = 120,
         care_preferences: object | None = None,
         clock: Callable[[], datetime] | None = None,
+        proactive_policy: object | None = None,
     ):
         self.schedules = schedules
         self.participants = participants
@@ -51,6 +52,7 @@ class DailyReviewScheduler:
         self.care_preferences = care_preferences
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._clock_is_explicit = clock is not None
+        self.proactive_policy = proactive_policy
         if self.catch_up_minutes > self.validity_minutes:
             raise ValueError("catch_up_minutes must not exceed validity_minutes")
         self._stop = asyncio.Event()
@@ -198,6 +200,26 @@ class DailyReviewScheduler:
                 now=operation_now(),
             ):
                 continue
+            reservation_id = None
+            if self.proactive_policy is not None:
+                decision = await asyncio.to_thread(
+                    self.proactive_policy.reserve,
+                    participant_id,
+                    message_kind="daily_review",
+                    dedupe_key=f"daily_review:{item['id']}",
+                    scheduled_at=operation_now(),
+                    now=operation_now(),
+                )
+                if not decision.allowed:
+                    await asyncio.to_thread(
+                        self.schedules.mark_cancelled,
+                        item["id"],
+                        item["claim_token"],
+                        now=operation_now(),
+                        error_code=f"global_policy_{decision.reason}",
+                    )
+                    continue
+                reservation_id = decision.reservation_id
             try:
                 message_id = await asyncio.to_thread(
                     self.sender.send_card, binding["chat_id"], card,
@@ -208,6 +230,12 @@ class DailyReviewScheduler:
                     "daily_review_send_failed schedule_id=%s error_class=%s",
                     item["id"], type(exc).__name__,
                 )
+                if reservation_id is not None:
+                    await asyncio.to_thread(
+                        self.proactive_policy.release,
+                        reservation_id,
+                        reason="provider_failed",
+                    )
                 await asyncio.to_thread(
                     self.schedules.mark_failed, item["id"], item["claim_token"],
                     now=operation_now(), error=exc, max_attempts=self.max_attempts,
@@ -215,6 +243,12 @@ class DailyReviewScheduler:
                 )
                 counts["failed"] += 1
                 continue
+            if reservation_id is not None:
+                await asyncio.to_thread(
+                    self.proactive_policy.mark_sent,
+                    reservation_id,
+                    now=operation_now(),
+                )
             await asyncio.to_thread(
                 self.schedules.mark_sent, item["id"], item["claim_token"],
                 now=operation_now(), provider_message_id=message_id,

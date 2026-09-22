@@ -1,7 +1,5 @@
 """Keyword routing rules for converting calendar text into event classes."""
 
-EXPLICIT_EVENT_TYPES = ("course", "rest", "gym", "library", "task")
-
 ROUTINE_PATTERNS = {
     "meal": r"饭|餐|食堂|breakfast|lunch|dinner",
     "nap": r"午休|睡觉|打盹|nap|sleep",

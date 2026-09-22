@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.agent.tool_registry import ToolRegistry
+from app.agent.care_composer import OpenAICompatibleCareComposerClient
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.config import Settings
 from app.db import Database
@@ -21,7 +22,10 @@ from app.repositories import (
     ProfileRepository,
     LearnedProfileRepository,
     PsychometricAssessmentRepository,
+    ParticipantSlowStateRepository,
+    EventAppraisalFeedbackRepository,
     WarningScheduleRepository,
+    RuntimeIncidentRepository,
 )
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.repositories_daily_review import (
@@ -29,15 +33,33 @@ from app.repositories_daily_review import (
     DailyReviewScheduleRepository,
     RetrospectiveCurveRepository,
 )
+from app.repositories_morning_brief import MorningBriefScheduleRepository
+from app.repositories_morning_brief_preferences import MorningBriefTopicRepository
+from app.repositories_reminder import ReminderRepository
+from app.repositories_followup import CareFollowupCandidateRepository
+from app.repositories_web_search import WebSearchRepository
+from app.repositories_web_document import WebDocumentRepository
+from app.repositories_public_video import PublicVideoRepository
+from app.repositories_research import ResearchRepository
+from app.repositories_memory import ParticipantMemoryRepository
+from app.repositories_preferences import InteractionPreferenceRepository
+from app.repositories_personalization_proposal import (
+    PersonalizationProposalRepository,
+)
+from app.repositories_support_preferences import SupportPreferenceRepository
 from app.repositories_calendar_mutation import (
     CalendarMutationReconciliationRepository,
 )
+from app.repositories_calendar_plan import CalendarMutationPlanRepository
+from app.repositories_consent import ParticipantConsentRepository
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
 )
 from app.services.course_schedule_import import CourseScheduleImportService
 from app.services.course_schedule_import_runner import CourseScheduleImportRunner
+from app.services.calendar_mutation_plan_runner import CalendarMutationPlanRunner
+from app.services.course_series_resolver import CourseSeriesResolver
 from app.services.course_schedule_vision import CourseScheduleVisionService
 from app.services.generic_image_vision import GenericImageVisionService
 from app.services.daily_review_service import DailyReviewService
@@ -45,15 +67,18 @@ from app.repositories_care import (
     CareInterventionRepository,
     ParticipantCarePreferenceRepository,
 )
+from app.services.consent_service import ConsentService
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.prediction_service import PredictionService
 from app.services.pressure_curve_service import PressureCurveService
 from app.services.presentation_service import PresentationOutbox
 from app.services.card_action_service import CardActionService
+from app.services.proactive_notification_policy import ProactiveNotificationPolicy
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
 from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
 from app.services.forecast_mutation_refresh import ForecastMutationRefreshQueue
+from app.services.runtime_clock import RuntimeClock
 from app.services.hierarchical_personalization import ParameterLearningService
 from app.services.mutation_intent_verifier import (
     MutationIntentVerifier,
@@ -66,6 +91,29 @@ from app.services.token_service import (
 )
 from app.tools.care import CareTools
 from app.tools.course_schedule import CourseScheduleTools
+from app.tools.reminder import ReminderTools
+from app.tools.web import WebTools
+from app.tools.video import VideoTools
+from app.tools.memory import MemoryTools
+from app.tools.preferences import InteractionPreferenceTools
+from app.tools.research import ResearchTools
+from app.tools.public_research import PublicResearchTools
+from app.services.memory_service import MemoryService
+from app.services.interaction_preference_service import InteractionPreferenceService
+from app.services.personalization_proposal_service import (
+    PersonalizationProposalService,
+)
+from app.services.psychological_context_builder import PsychologicalContextBuilder
+from app.services.research_aggregate_service import ResearchAggregateService
+from app.services.web_search_service import (
+    DeepSeekNativeSearchProvider,
+    DisabledSearchProvider,
+    WebSearchService,
+)
+from app.services.public_web_document_service import PublicWebDocumentService
+from app.services.public_video_service import PublicVideoService
+from app.services.public_research_service import PublicResearchService, ResearchRuntimeClient
+from app.services.video_providers.bilibili import BilibiliVideoAdapter
 from mindflow_core.assessment import AssessmentModel
 from services.event_semantics import OpenAICompatibleSemanticClient
 
@@ -102,16 +150,36 @@ class BusinessServices:
     course_schedule_import_runner: CourseScheduleImportRunner
     course_schedule_vision: CourseScheduleVisionService
     generic_image_vision: GenericImageVisionService
+    consent_service: ConsentService
     course_schedule_image_sessions: CourseScheduleImageSessionRepository
     course_schedule_tools: CourseScheduleTools
+    calendar_mutation_plans: CalendarMutationPlanRepository
+    calendar_mutation_plan_runner: CalendarMutationPlanRunner
+    proactive_notifications: ProactiveNotificationPolicy
+    morning_brief_schedules: MorningBriefScheduleRepository
+    reminders: ReminderRepository
+    followup_candidates: CareFollowupCandidateRepository
+    web_search: WebSearchService
+    public_web_documents: PublicWebDocumentService
+    public_videos: PublicVideoService
+    memory: MemoryService
+    interaction_preferences: InteractionPreferenceService
+    personalization_proposals: PersonalizationProposalService
+    psychological_context: PsychologicalContextBuilder
+    research_aggregates: ResearchAggregateService
+    morning_brief_topics: MorningBriefTopicRepository
+    public_research: PublicResearchService
+    care_composer: object | None = None
 
 
 def build_business_services(
     database: Database, settings: Settings, runs: AgentRunRepository
 ) -> BusinessServices:
+    runtime_clock = RuntimeClock(settings.timezone_name)
     profiles = ProfileRepository(database)
     observations = ObservationRepository(database)
     conversations = ConversationRepository(database)
+    consent_service = ConsentService(ParticipantConsentRepository(database))
     encryption = TokenEncryptionService(settings.token_encryption_key)
     token_repository = TokenRepository(
         database, encryption, oauth_app_id=settings.feishu_calendar_app_id
@@ -141,11 +209,18 @@ def build_business_services(
     )
     prediction_service = PredictionService(AssessmentModel(settings.timezone_name))
     semantic_client = None
+    care_composer = None
     if settings.semantic_api_enabled and settings.deepseek_api_key:
         semantic_client = OpenAICompatibleSemanticClient(
             settings.semantic_api_url, settings.deepseek_api_key,
             settings.semantic_api_model, timeout=settings.semantic_api_timeout_seconds,
             provider="deepseek",
+        )
+        care_composer = OpenAICompatibleCareComposerClient(
+            settings.semantic_api_url,
+            settings.deepseek_api_key,
+            settings.semantic_api_model,
+            timeout_seconds=settings.semantic_api_timeout_seconds,
         )
     semantic_preprocessor = EventSemanticPreprocessor(
         EventSemanticCacheRepository(database), client=semantic_client,
@@ -167,10 +242,102 @@ def build_business_services(
         system_max_daily_sends=warning_delivery_policy.max_daily_sends,
         timezone_name=settings.timezone_name,
     )
+    proactive_notifications = ProactiveNotificationPolicy(
+        database,
+        timezone_name=settings.timezone_name,
+        default_system_budget=warning_delivery_policy.max_daily_sends,
+    )
+    morning_brief_schedules = MorningBriefScheduleRepository(database)
+    morning_brief_topics = MorningBriefTopicRepository(database)
+    reminders = ReminderRepository(database, timezone_name=settings.timezone_name)
+    followup_candidates = CareFollowupCandidateRepository(database)
+    if not settings.web_search_enabled:
+        search_provider = DisabledSearchProvider()
+    elif settings.web_search_provider == "deepseek_native":
+        search_provider = DeepSeekNativeSearchProvider(
+            base_url=settings.claude_anthropic_base_url,
+            api_key=settings.deepseek_api_key,
+            model=settings.web_search_model,
+            timeout_seconds=settings.web_search_timeout_seconds,
+            max_uses=settings.web_search_max_uses,
+            max_output_tokens=settings.web_search_max_output_tokens,
+            retry_max_output_tokens=settings.web_search_retry_max_output_tokens,
+            summary_max_chars=settings.web_search_summary_max_chars,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported WEB_SEARCH_PROVIDER: {settings.web_search_provider}"
+        )
+    web_search = WebSearchService(WebSearchRepository(database), search_provider)
+    public_web_documents = PublicWebDocumentService(
+        WebDocumentRepository(database),
+        enabled=settings.web_read_url_enabled,
+        timeout_seconds=settings.web_read_url_timeout_seconds,
+        max_bytes=settings.web_read_url_max_bytes,
+        max_redirects=settings.web_read_url_max_redirects,
+        max_extracted_chars=settings.web_read_url_max_extracted_chars,
+        cache_ttl_minutes=settings.web_read_url_cache_ttl_minutes,
+    )
+    research_repository = ResearchRepository(
+        database, evidence_ttl_hours=settings.research_evidence_ttl_hours
+    )
+    research_gateway = (
+        ResearchRuntimeClient(
+            settings.research_runtime_url,
+            token=settings.research_runtime_token,
+            timeout_seconds=settings.research_runtime_timeout_seconds,
+        )
+        if settings.research_runtime_enabled
+        else None
+    )
+    public_research = PublicResearchService(
+        gateway=research_gateway,
+        web_search=web_search,
+        web_documents=public_web_documents,
+        evidence=research_repository,
+        audit=research_repository,
+    )
+    public_videos = PublicVideoService(
+        PublicVideoRepository(
+            database,
+            ttl_minutes=settings.public_video_transcript_cache_ttl_minutes,
+        ),
+        enabled=settings.public_video_enabled,
+        max_transcript_chars=settings.public_video_transcript_max_chars,
+        max_tool_reads=settings.public_video_max_tool_reads,
+    )
+    public_videos.register_adapter(
+        BilibiliVideoAdapter(
+            public_web_documents,
+            transcript_max_chars=settings.public_video_transcript_max_chars,
+            timeout_seconds=settings.public_video_timeout_seconds,
+        )
+    )
+    memory = MemoryService(ParticipantMemoryRepository(database))
+    interaction_preferences = InteractionPreferenceService(
+        InteractionPreferenceRepository(database),
+        SupportPreferenceRepository(database),
+    )
+    personalization_proposals = PersonalizationProposalService(
+        PersonalizationProposalRepository(database),
+        memory,
+        interaction_preferences,
+        care_preferences,
+        morning_brief_topics,
+    )
     care_interventions = CareInterventionRepository(database, care_preferences)
     forecast_snapshots = ForecastSnapshotRepository(database)
     learned_profiles = LearnedProfileRepository(database)
     psychometrics = PsychometricAssessmentRepository(database)
+    psychological_context = PsychologicalContextBuilder(
+        observations=observations,
+        slow_states=ParticipantSlowStateRepository(database),
+        appraisals=EventAppraisalFeedbackRepository(database),
+        learned_profiles=learned_profiles,
+    )
+    research_aggregates = ResearchAggregateService(
+        database, timezone_name=settings.timezone_name
+    )
     # Stage 5 replaces per-EMA refitting with a weekly immutable-snapshot run.
     # The scheduler still consumes the small maybe_calibrate interface.
     profile_calibration = ParameterLearningService(
@@ -192,16 +359,21 @@ def build_business_services(
         retrospective_curves=retrospective_curves,
         care_preferences=care_preferences,
         care_interventions=care_interventions,
+        psychological_context=psychological_context,
+        consent_service=consent_service,
+        clock=runtime_clock,
     )
     dependency_refresh = ForecastDependencyRefreshService(
         forecast_snapshots,
         warning_schedules,
         forecast_coordinator,
         timezone_name=settings.timezone_name,
+        clock=runtime_clock,
     )
     forecast_coordinator.dependency_refresh = dependency_refresh
     daily_reviews.dependency_refresh = dependency_refresh
     course_schedule_import_repository = CourseScheduleImportRepository(database)
+    calendar_mutation_plans = CalendarMutationPlanRepository(database)
     course_schedule_image_sessions = CourseScheduleImageSessionRepository(database)
     mutation_refresh = ForecastMutationRefreshQueue(
         forecast_coordinator,
@@ -214,6 +386,7 @@ def build_business_services(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
         dependency_refresh=dependency_refresh,
+        clock=runtime_clock,
     )
     care_outcome_refresh = CareOutcomeRefreshService(database)
     course_schedule_imports = CourseScheduleImportService(
@@ -225,11 +398,13 @@ def build_business_services(
         forecast_snapshots=forecast_snapshots,
         mutation_refresh=mutation_refresh,
         max_calendar_writes=settings.vision_schedule_max_calendar_writes,
+        clock=runtime_clock,
     )
     device_flows.cleanup_resumer = course_schedule_imports.resume_cleanup_for_participant
     course_schedule_import_runner = CourseScheduleImportRunner(
         course_schedule_imports,
         max_concurrency=1,
+        incidents=RuntimeIncidentRepository(database),
     )
     course_schedule_imports.queue_notifier = course_schedule_import_runner.wake
     course_schedule_vision = CourseScheduleVisionService(
@@ -249,16 +424,6 @@ def build_business_services(
         timeout_seconds=settings.vision_api_timeout_seconds,
         max_concurrency=settings.vision_max_concurrency,
     )
-    card_actions = CardActionService(
-        observations,
-        calendar,
-        timezone_name=settings.timezone_name,
-        daily_reviews=daily_reviews,
-        observation_refresh=observation_refresh,
-        care_interventions=care_interventions,
-        care_outcome_refresh=care_outcome_refresh,
-        course_schedule_imports=course_schedule_imports,
-    )
     pressure_curves = PressureCurveService(
         forecast_coordinator,
         timezone_name=settings.timezone_name,
@@ -277,10 +442,11 @@ def build_business_services(
         )
     registry = ToolRegistry(
         runs,
+        incidents=RuntimeIncidentRepository(database),
         mutation_verifier=mutation_verifier,
         sync_max_concurrency=settings.tool_sync_max_concurrency,
     )
-    CareTools(
+    care_tools = CareTools(
         profiles,
         observations,
         calendar,
@@ -294,13 +460,75 @@ def build_business_services(
         observation_refresh=observation_refresh,
         mutation_refresh=mutation_refresh,
         care_preferences=care_preferences,
+        personalization_proposals=personalization_proposals,
         care_interventions=care_interventions,
         care_outcome_refresh=care_outcome_refresh,
+        calendar_mutation_plans=calendar_mutation_plans,
+        course_series_resolver=CourseSeriesResolver(
+            calendar,
+            timezone_name=settings.timezone_name,
+            course_imports=course_schedule_import_repository,
+        ),
+        feature_capabilities={
+            "daily_review_enabled": settings.daily_review_enabled,
+            "web_search_enabled": settings.web_search_enabled,
+        },
+        clock=runtime_clock,
+    )
+    care_tools.register(registry)
+    ReminderTools(
+        reminders,
+        proactive_notifications,
+        presentations,
+        timezone_name=settings.timezone_name,
     ).register(registry)
+    WebTools(web_search, public_web_documents).register(registry)
+    VideoTools(public_videos).register(registry)
+    MemoryTools(memory, presentations, personalization_proposals).register(registry)
+    InteractionPreferenceTools(
+        interaction_preferences, presentations, personalization_proposals
+    ).register(registry)
+    ResearchTools(research_aggregates).register(registry)
+    PublicResearchTools(
+        public_research,
+        topic_preferences=morning_brief_topics,
+        proposals=personalization_proposals,
+    ).register(registry)
+    calendar_mutation_plan_runner = CalendarMutationPlanRunner(
+        calendar_mutation_plans,
+        care_tools.execute_calendar_mutation_plan_item,
+    )
+    care_tools.calendar_mutation_plan_notifier = calendar_mutation_plan_runner.wake
+    card_actions = CardActionService(
+        observations,
+        calendar,
+        timezone_name=settings.timezone_name,
+        daily_reviews=daily_reviews,
+        observation_refresh=observation_refresh,
+        care_interventions=care_interventions,
+        care_outcome_refresh=care_outcome_refresh,
+        course_schedule_imports=course_schedule_imports,
+        calendar_delete_executor=care_tools.confirm_calendar_delete,
+        calendar_mutation_plan_executor=(
+            care_tools.execute_calendar_mutation_plan
+        ),
+        calendar_mutation_plans=calendar_mutation_plans,
+        feature_capabilities={
+            "daily_review_enabled": settings.daily_review_enabled,
+            "web_search_enabled": settings.web_search_enabled,
+        },
+        consent_service=consent_service,
+        care_preferences=care_preferences,
+        memory=memory,
+        interaction_preferences=interaction_preferences,
+        reminders=reminders,
+        personalization_proposals=personalization_proposals,
+    )
     course_schedule_tools = CourseScheduleTools(
         course_schedule_imports,
         presentations,
         image_sessions=course_schedule_image_sessions,
+        timezone_name=settings.timezone_name,
     )
     course_schedule_tools.register(registry)
     return BusinessServices(
@@ -335,5 +563,23 @@ def build_business_services(
         course_schedule_vision=course_schedule_vision,
         generic_image_vision=generic_image_vision,
         course_schedule_image_sessions=course_schedule_image_sessions,
+        consent_service=consent_service,
         course_schedule_tools=course_schedule_tools,
+        calendar_mutation_plans=calendar_mutation_plans,
+        calendar_mutation_plan_runner=calendar_mutation_plan_runner,
+        proactive_notifications=proactive_notifications,
+        morning_brief_schedules=morning_brief_schedules,
+        reminders=reminders,
+        followup_candidates=followup_candidates,
+        web_search=web_search,
+        public_web_documents=public_web_documents,
+        public_videos=public_videos,
+        memory=memory,
+        interaction_preferences=interaction_preferences,
+        personalization_proposals=personalization_proposals,
+        psychological_context=psychological_context,
+        research_aggregates=research_aggregates,
+        morning_brief_topics=morning_brief_topics,
+        public_research=public_research,
+        care_composer=care_composer,
     )

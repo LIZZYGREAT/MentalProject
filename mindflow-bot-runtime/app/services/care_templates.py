@@ -8,9 +8,10 @@ from typing import Any
 
 from app.services.care_context import CareContext
 from app.services.care_intervention_policy import CareMessagePlan
+from app.contracts.care_evidence import CareEvidencePacket
 
 
-CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v3"
+CARE_TEMPLATE_LIBRARY_VERSION = "care_template_library.v4"
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,13 @@ class CareTemplateLibrary:
     }
 
     def render(
-        self, context: CareContext, plan: CareMessagePlan
+        self,
+        context: CareContext,
+        plan: CareMessagePlan,
+        *,
+        evidence: CareEvidencePacket | None = None,
     ) -> RenderedCareMessage:
-        context_line = "为什么提醒我：" + self._context_line(context)
+        context_line = "为什么提醒我：" + self._context_line(context, evidence)
         action = self._action_line(context, plan)
         choice = (
             "这只是根据日程和近期状态做出的趋势提醒；如果你现在感觉还好，可以直接忽略。"
@@ -47,7 +52,7 @@ class CareTemplateLibrary:
             else "这只是根据今天安排做出的趋势提醒；如果你现在感觉还好，可以直接忽略。"
         )
         message = f"{context_line}\n\n{action}{choice}"
-        if len(message) > 220:
+        if len(message) > 360:
             message = f"{context_line}\n\n{action}如果当前感觉还好，可以直接忽略。"
         return RenderedCareMessage(
             message=message,
@@ -66,7 +71,13 @@ class CareTemplateLibrary:
     def _name(event: dict[str, Any] | None) -> str:
         return str((event or {}).get("display_name") or "一项安排")[:36]
 
-    def _context_line(self, context: CareContext) -> str:
+    def _context_line(
+        self, context: CareContext, evidence: CareEvidencePacket | None = None
+    ) -> str:
+        if evidence is not None:
+            enhanced = self._evidence_context_line(context, evidence)
+            if enhanced:
+                return enhanced
         risk = self._clock(context.risk_time)
         active = context.active_event
         following = context.next_event
@@ -116,6 +127,85 @@ class CareTemplateLibrary:
         if state_phrase:
             return f"模型预计 {risk} 前后压力可能上升{state_phrase}。"
         return f"模型预计 {risk} 前后可能出现一段压力偏高的时段，但当前可用上下文较少。"
+
+    def _evidence_context_line(
+        self, context: CareContext, evidence: CareEvidencePacket
+    ) -> str:
+        reasons = [str(item.get("code") or "") for item in evidence.reason_candidates]
+        risk = self._clock(evidence.risk.get("risk_time") or context.risk_time)
+        pieces: list[str] = []
+        if "dense_high_load_course_block" in reasons:
+            block_reason = next(
+                (
+                    item
+                    for item in evidence.reason_candidates
+                    if item.get("code") == "dense_high_load_course_block"
+                ),
+                None,
+            )
+            if block_reason is None:
+                return ""
+            fact_ids = set(block_reason.get("fact_ids") or [])
+            block_courses = [
+                item for item in evidence.event_facts
+                if item.get("event_type") == "course"
+                and (not fact_ids or item.get("fact_id") in fact_ids)
+            ][:3]
+            described = [
+                f"{str(item.get('display_name') or '一段课程')[:24]}{self._semantic_load_phrase(item)}"
+                for item in block_courses
+            ]
+            joined = "、".join(described) or "这些课程综合任务负荷偏高"
+            pieces.append(
+                f"{risk} 前后模型预计压力可能上升，{joined}，"
+                f"连续 {int(block_reason.get('block_course_count') or 0)} 节、课程间最长间隔约 "
+                f"{int(block_reason.get('block_largest_internal_break_minutes') or 0)} 分钟"
+            )
+        elif "previous_day_carryover" in reasons:
+            pieces.append(
+                f"{risk} 前后模型预计压力可能上升；今天的预测起点承接了昨天较高的终值，"
+                "再叠加当前安排后恢复空间会更小"
+            )
+        elif "low_recent_energy" in reasons:
+            active = self._name(context.active_event)
+            pieces.append(
+                f"{risk} 前后模型预计压力可能上升，最近一次状态记录显示精力偏低"
+                + (f"，当时的安排是{active}" if context.active_event else "")
+            )
+        elif "single_high_load_event" in reasons and evidence.event_facts:
+            item = next(
+                (item for item in evidence.event_facts if item.get("workload_level") == "high"),
+                evidence.event_facts[0],
+            )
+            pieces.append(
+                f"{risk} 前后模型预计压力可能上升，主要关联到{str(item.get('display_name') or '一项安排')[:32]}"
+                "这段较高负荷的安排"
+            )
+        if "insufficient_recovery_window" in reasons and pieces:
+            pieces[0] += "，中间缺少完整的恢复窗口"
+        if "high_personal_workload_sensitivity" in reasons and pieces:
+            pieces[0] += "；最近数据形成的个体化模型也显示你对连续负荷更敏感"
+        if pieces:
+            return pieces[0] + "。"
+        return ""
+
+    @staticmethod
+    def _semantic_load_phrase(event: dict[str, Any]) -> str:
+        semantic = dict(event.get("semantic") or {})
+        labels = []
+        if float(semantic.get("cognitive_demand") or 0.0) >= 0.70:
+            labels.append("认知负荷")
+        if float(semantic.get("time_pressure") or 0.0) >= 0.70:
+            labels.append("时间压力")
+        if float(semantic.get("expected_effort") or 0.0) >= 0.70:
+            labels.append("预计投入")
+        if float(semantic.get("uncertainty") or 0.0) >= 0.70:
+            labels.append("不确定性")
+        if float(semantic.get("difficulty") or 0.0) >= 0.70:
+            labels.append("难度")
+        if not labels:
+            return "综合任务负荷偏高"
+        return "".join(["在当前语义评估里", "、".join(labels), "偏高"])
 
     def _action_line(self, context: CareContext, plan: CareMessagePlan) -> str:
         if plan.intervention_type == "pause_and_seek_support":

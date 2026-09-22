@@ -16,6 +16,11 @@ from app.agent.tool_registry import ToolRegistry
 from app.integrations.feishu.calendar import CalendarService, build_recurrence_rule
 from app.tools.care import _creation_recurrence_from_args, _recurrence_from_args
 from app.integrations.feishu.cards import (
+    _format_calendar_datetime_range,
+    calendar_delete_confirmation_card,
+    calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_edit_card,
+    calendar_mutation_plan_item_time_card,
     care_intervention_card,
     care_intervention_result_card,
     daily_checkin_card,
@@ -58,6 +63,263 @@ from helpers import memory_database, participant, skill_path
 TZ = ZoneInfo("Asia/Shanghai")
 
 
+def test_calendar_delete_confirmation_card_uses_fixed_backend_actions():
+    card = calendar_delete_confirmation_card({
+        "id": "event/1",
+        "summary": "测试日程",
+        "start_time": "2026-09-11T09:00:00+08:00",
+        "end_time": "2026-09-11T10:00:00+08:00",
+    })
+    buttons = [
+        element
+        for element in card["body"]["elements"]
+        if element.get("tag") == "button"
+    ]
+    actions = [button["behaviors"][0]["value"] for button in buttons]
+    assert actions == [
+        {
+            "mindflow_action": "calendar_delete_confirm",
+            "version": "1",
+            "event_id": "event/1",
+        },
+        {"mindflow_action": "calendar_delete_cancel", "version": "1"},
+    ]
+
+
+def test_calendar_cards_format_same_day_and_never_render_raw_iso():
+    plan = {
+        "id": str(uuid.uuid4()),
+        "operation": "create",
+        "items": [
+            {
+                "summary": "第一项",
+                "start_time": "2026-09-14T04:00:00Z",
+                "end_time": "2026-09-14T05:40:00Z",
+            },
+            {
+                "summary": "第二项",
+                "start_time": "2026-09-14T10:30:00+00:00",
+                "end_time": "2026-09-14T11:00:00+00:00",
+            },
+        ],
+    }
+    plan["ledger_items"] = [
+        {
+            "id": str(uuid.uuid4()),
+            "item_index": index,
+            "status": "pending",
+            "payload": item,
+        }
+        for index, item in enumerate(plan["items"])
+    ]
+
+    card_text = json.dumps(
+        calendar_mutation_plan_confirmation_card(plan), ensure_ascii=False
+    )
+
+    assert "2026-09-14 12:00–13:40" in card_text
+    assert "2026-09-14T04:00:00Z" not in card_text
+    assert "+00:00" not in card_text
+
+
+def test_calendar_cards_format_cross_day_in_configured_timezone():
+    event = {
+        "id": "event/1",
+        "summary": "跨日任务",
+        "start_time": "2026-09-14T15:30:00Z",
+        "end_time": "2026-09-14T16:30:00Z",
+    }
+
+    card_text = json.dumps(
+        calendar_delete_confirmation_card(event), ensure_ascii=False
+    )
+
+    assert "2026-09-14 23:30 – 2026-09-15 00:30" in card_text
+    assert "2026-09-14T15:30:00Z" not in card_text
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("", "2026-09-14T10:00:00+08:00"),
+        ("not-a-date", "2026-09-14T10:00:00+08:00"),
+        ("2026-09-14T09:00:00", "2026-09-14T10:00:00+08:00"),
+        ("2026-09-14T10:00:00+08:00", "2026-09-14T09:00:00+08:00"),
+    ],
+)
+def test_calendar_time_formatter_fails_closed(start, end):
+    with pytest.raises(ValueError):
+        _format_calendar_datetime_range(start, end)
+
+
+def test_today_calendar_card_converts_start_to_configured_timezone():
+    card = today_calendar_card(
+        [{"summary": "午间日程", "start_time": "2026-09-14T04:15:00Z"}],
+        local_date="2026-09-14",
+    )
+
+    assert "**12:15**" in card["body"]["elements"][0]["content"]
+
+
+def test_calendar_plan_time_card_preserves_off_grid_minute_and_opaque_callback():
+    plan_id = str(uuid.uuid4())
+    item_id = str(uuid.uuid4())
+    item = {
+        "summary": "非整五分钟日程",
+        "start_time": "2026-09-14T13:43:12+08:00",
+        "end_time": "2026-09-14T14:17:59+08:00",
+    }
+    plan = {
+        "id": plan_id,
+        "operation": "create",
+        "status": "awaiting_confirmation",
+        "items": [item],
+        "ledger_items": [{
+            "id": item_id,
+            "item_index": 0,
+            "status": "pending",
+            "payload": item,
+        }],
+    }
+
+    card = calendar_mutation_plan_item_time_card(plan, item_id)
+    form = card["body"]["elements"][0]
+    selects = {
+        element["name"]: element
+        for element in form["elements"]
+        if element.get("tag") == "select_static"
+    }
+    minute_values = {
+        option["value"] for option in selects["start_minute"]["options"]
+    }
+    submit = next(
+        element
+        for element in form["elements"]
+        if element.get("tag") == "button"
+    )
+    callback = submit["behaviors"][0]["value"]
+
+    assert selects["start_minute"]["initial_option"] == "43"
+    assert "43" in minute_values
+    assert callback == {
+        "mindflow_action": "calendar_mutation_plan_item_time_submit",
+        "version": "1",
+        "plan_id": plan_id,
+        "item_id": item_id,
+    }
+    assert "summary" not in callback and "start_time" not in callback
+
+
+def test_calendar_plan_confirmation_and_edit_cards_use_opaque_item_identity():
+    plan_id = str(uuid.uuid4())
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    items = [
+        {
+            "summary": "同名日程",
+            "start_time": "2026-09-14T13:43:12+08:00",
+            "end_time": "2026-09-14T14:17:59+08:00",
+        },
+        {
+            "summary": "同名日程",
+            "start_time": "2026-09-15T09:05:00+08:00",
+            "end_time": "2026-09-15T10:10:00+08:00",
+        },
+    ]
+    plan = {
+        "id": plan_id,
+        "operation": "update",
+        "status": "awaiting_confirmation",
+        "items": items,
+        "ledger_items": [
+            {"id": first_id, "item_index": 0, "status": "pending", "payload": items[0]},
+            {"id": second_id, "item_index": 1, "status": "pending", "payload": items[1]},
+        ],
+    }
+
+    confirmation = calendar_mutation_plan_confirmation_card(plan)
+    edit_values = [
+        element["behaviors"][0]["value"]
+        for element in confirmation["body"]["elements"]
+        if element.get("tag") == "button"
+        and element["behaviors"][0]["value"]["mindflow_action"]
+        == "calendar_mutation_plan_item_edit_open"
+    ]
+    edit_card = calendar_mutation_plan_item_edit_card(plan, second_id)
+    form = edit_card["body"]["elements"][0]
+    summary_input = next(
+        element for element in form["elements"] if element.get("name") == "summary"
+    )
+    submit = next(
+        element for element in form["elements"] if element.get("tag") == "button"
+    )["behaviors"][0]["value"]
+
+    assert edit_values == [
+        {
+            "mindflow_action": "calendar_mutation_plan_item_edit_open",
+            "version": "1",
+            "plan_id": plan_id,
+            "item_id": first_id,
+        },
+        {
+            "mindflow_action": "calendar_mutation_plan_item_edit_open",
+            "version": "1",
+            "plan_id": plan_id,
+            "item_id": second_id,
+        },
+    ]
+    assert summary_input["default_value"] == "同名日程"
+    assert submit["mindflow_action"] == "calendar_mutation_plan_item_edit_submit"
+    assert submit["item_id"] == second_id
+
+    delete_plan = {**plan, "operation": "delete", "ledger_items": []}
+    delete_card = calendar_mutation_plan_confirmation_card(delete_plan)
+    assert "calendar_mutation_plan_item_edit_open" not in json.dumps(delete_card)
+
+
+def test_calendar_delete_callback_executes_only_on_confirm():
+    database = memory_database()
+    person = participant(database, "P-CALENDAR-DELETE")
+    calls = []
+
+    async def execute(participant_id, event_id, *, source_message_id):
+        calls.append((participant_id, event_id, source_message_id))
+        return {"ok": True, "calendar_mutation": "succeeded"}
+
+    service = CardActionService(
+        ObservationRepository(database),
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+        calendar_delete_executor=execute,
+    )
+    cancelled = service.handle(
+        person.id,
+        message_id="om-delete",
+        callback_event_id="callback-cancel",
+        action_value={
+            "mindflow_action": "calendar_delete_cancel",
+            "version": "1",
+        },
+        form_value={},
+    )
+    confirmed = service.handle(
+        person.id,
+        message_id="om-delete",
+        callback_event_id="callback-confirm",
+        action_value={
+            "mindflow_action": "calendar_delete_confirm",
+            "version": "1",
+            "event_id": "event/1",
+        },
+        form_value={},
+    )
+
+    assert cancelled["reply_text"] == "已取消删除，日程未更改。"
+    assert confirmed["reply_text"] == "日程已删除。"
+    assert calls == [(person.id, "event/1", "callback-confirm")]
+
+
 def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
     analysis = analyze_curve(
         [
@@ -91,7 +353,68 @@ def test_pressure_curve_card_contains_python_image_key_nodes_and_actions():
         for item in card["body"]["elements"]
         if item.get("tag") == "button"
     }
-    assert actions == {"request_checkin", "view_today_calendar"}
+    assert actions == {"request_checkin", "view_calendar_date"}
+
+
+def test_historical_pressure_curve_opens_the_requested_calendar_date():
+    analysis = analyze_curve([
+        {"time": "09:00", "stress_0_10": 4.5, "vitality_0_10": 7.0},
+    ])
+    card = pressure_curve_card(
+        analysis,
+        image_key="img-key",
+        local_date="2026-09-10",
+        requested_date_is_today=False,
+    )
+    calendar_button = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("tag") == "button"
+        and "日程" in item.get("text", {}).get("content", "")
+    )
+    assert calendar_button["text"]["content"] == "查看当日日程"
+    assert calendar_button["behaviors"][0]["value"] == {
+        "mindflow_action": "view_calendar_date",
+        "version": "1",
+        "local_date": "2026-09-10",
+    }
+
+
+def test_calendar_date_callback_queries_the_date_carried_by_the_card():
+    database = memory_database()
+    person = participant(database, "P-HISTORY-CALENDAR")
+
+    class Calendar:
+        def __init__(self):
+            self.calls = []
+
+        async def get_events(self, participant_id, start, end):
+            self.calls.append((participant_id, start, end))
+            return []
+
+    calendar = Calendar()
+    service = CardActionService(
+        ObservationRepository(database),
+        calendar,
+        observation_refresh=SimpleNamespace(
+            on_observation_committed=lambda **_values: None
+        ),
+    )
+    result = service.handle(
+        person.id,
+        message_id="om-history",
+        action_value={
+            "mindflow_action": "view_calendar_date",
+            "version": "1",
+            "local_date": "2026-09-10",
+        },
+        form_value={},
+    )
+
+    assert result["reply_text"] == "已加载 2026-09-10 的日程。"
+    assert calendar.calls[0][1].date().isoformat() == "2026-09-10"
+    assert calendar.calls[0][2] - calendar.calls[0][1] == timedelta(days=1)
+    assert result["card"]["header"]["title"]["content"] == "当日日程"
 
 
 def test_daily_checkin_card_uses_json_2_form_submit_contract():
@@ -138,6 +461,28 @@ def test_daily_checkin_card_uses_json_2_form_submit_contract():
         "version": "1",
         },
     }]
+
+
+def test_daily_checkin_card_prefills_only_agent_supplied_fields():
+    card = daily_checkin_card(prefill={
+        "stress": 8,
+        "activity": "在写报告",
+        "event_ongoing": True,
+    })
+    form = next(
+        item for item in card["body"]["elements"] if item["tag"] == "form"
+    )
+    fields = {
+        item.get("name"): item
+        for item in form["elements"]
+        if item.get("name")
+    }
+
+    assert fields["stress"]["initial_option"] == "8"
+    assert fields["activity"]["default_value"] == "在写报告"
+    assert fields["event_ongoing"]["initial_option"] == "true"
+    assert "initial_option" not in fields["energy"]
+    assert "initial_option" not in fields["stress_event_since_last"]
 
 
 def test_card_callback_server_exposes_only_configured_callback_and_health_routes():
@@ -227,11 +572,12 @@ def test_card_callback_server_exposes_only_configured_callback_and_health_routes
         event = handled[0]
         assert event.message_id == "om-card"
         assert event.action_value["mindflow_action"] == "submit_checkin"
+        assert event.callback_token == "update-token"
 
     asyncio.run(verify_url_challenge())
 
 
-def test_http_card_callback_stays_successful_when_source_card_update_fails():
+def test_http_card_callback_returns_card_without_active_message_patch():
     participant = SimpleNamespace(id="participant-1")
     replacement_card = {
         "schema": "2.0",
@@ -276,7 +622,7 @@ def test_http_card_callback_stays_successful_when_source_card_update_fails():
     handler = app_main._build_card_action_handler(
         SimpleNamespace(resolve=lambda *_args: participant),
         card_actions,
-        sender,
+        None,
         incidents,
     )
     server = FeishuCardCallbackServer(
@@ -351,16 +697,9 @@ def test_http_card_callback_stays_successful_when_source_card_update_fails():
         "data": replacement_card,
     }
     assert card_actions.calls == 1
-    assert sender.update_calls == 1
-    assert sender.messages == [
-        (
-            "oc-chat",
-            "操作已记录，但卡片状态暂未更新，无需重复提交。",
-        )
-    ]
-    assert incidents.records[0]["event_name"] == (
-        "card_action_card_update_failed_after_commit"
-    )
+    assert sender.update_calls == 0
+    assert sender.messages == []
+    assert incidents.records == []
 
 
 def test_recurrence_builder_exposes_only_reviewed_rfc5545_subset():
@@ -475,6 +814,112 @@ def test_feishu_client_updates_interactive_card():
     assert json.loads(requests[0].request_body.content) == card
 
 
+def test_feishu_client_prefers_callback_token_without_message_patch():
+    delayed_requests = []
+
+    class Messages:
+        def patch(self, _request):
+            raise AssertionError("message.patch must not run when callback token exists")
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(success=lambda: True)
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    client.update_card_from_callback("callback-token", "om-card", card)
+
+    assert len(delayed_requests) == 1
+    assert delayed_requests[0].uri == "/open-apis/interactive/v1/card/update"
+    assert delayed_requests[0].headers["Content-Type"] == (
+        "application/json; charset=utf-8"
+    )
+    assert delayed_requests[0].body == {"token": "callback-token", "card": card}
+
+
+def test_feishu_client_falls_back_to_message_patch_for_callback_target_error():
+    delayed_requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    client.update_card_from_callback(
+        "callback-token", "om-card", {"schema": "2.0"}
+    )
+
+    assert len(delayed_requests) == 1
+    assert patched == ["om-card"]
+
+
+def test_feishu_client_does_not_fallback_for_other_callback_errors():
+    delayed_requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            delayed_requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=230001,
+                msg="card update rejected",
+            )
+
+    client = FeishuClient("app", "secret", sdk_client=SdkClient())
+    with pytest.raises(FeishuSendError) as caught:
+        client.update_card_from_callback(
+            "callback-token", "om-card", {"schema": "2.0"}
+        )
+
+    assert caught.value.code == 230001
+    assert len(delayed_requests) == 1
+    assert patched == []
+
+
+def test_feishu_client_uses_message_patch_without_callback_token():
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    client.update_card_from_callback(None, "om-card", {"schema": "2.0"})
+    assert patched == ["om-card"]
+
+
 def test_feishu_client_update_card_surfaces_error():
     class Messages:
         def patch(self, _request):
@@ -493,6 +938,28 @@ def test_feishu_client_update_card_surfaces_error():
         client.update_card("om-card", {"schema": "2.0"})
     assert caught.value.operation == "update_card"
     assert caught.value.retryable is False
+    assert caught.value.replacement_allowed is False
+
+
+def test_feishu_client_marks_permanently_stale_card_as_replaceable():
+    class Messages:
+        def patch(self, _request):
+            return SimpleNamespace(
+                success=lambda: False, code=230006, msg="message recalled"
+            )
+
+    client = FeishuClient(
+        "app",
+        "secret",
+        sdk_client=SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+        ),
+    )
+    with pytest.raises(FeishuSendError) as caught:
+        client.update_card("om-stale-card", {"schema": "2.0"})
+    assert caught.value.operation == "update_card"
+    assert caught.value.retryable is False
+    assert caught.value.replacement_allowed is True
 
 
 def test_feishu_client_message_uuid_accepts_50_and_rejects_51_characters():
@@ -710,6 +1177,7 @@ def test_pressure_curve_tool_stages_reviewed_card_for_current_run():
     result = asyncio.run(tools.get_pressure_curve(context, {}))
 
     assert result["card_queued"] is True
+    assert result["delivery_state"] == "queued_not_delivered"
     assert result["predicted_peak"] == {"time": "10:00", "stress_0_10": 7.5}
     cards = outbox.take_cards(context.agent_run_id)
     assert len(cards) == 1
@@ -803,7 +1271,7 @@ def test_worker_logs_feishu_card_failure_details_and_sends_fallback(caplog):
                 "schema": "2.0",
                 "body": {"elements": [{"content": sensitive_card_value}]},
             })
-            return "曲线卡片已生成。"
+            return "曲线卡片已经发出了。"
 
     class Sender:
         def __init__(self):
@@ -855,8 +1323,9 @@ def test_worker_logs_feishu_card_failure_details_and_sends_fallback(caplog):
     asyncio.run(scenario())
 
     assert [item[0] for item in sender.sent[-2:]] == ["card", "text"]
+    assert "卡片已经发出" not in sender.sent[-1][2]
     assert sender.sent[-1][2] == (
-        "曲线卡片已生成。\n\n卡片暂时未能发送，请稍后再试。"
+        "曲线卡片已生成，但尚未成功发送。\n\n卡片暂时未能发送，请稍后再试。"
     )
     assert "230099" in caplog.text
     assert "Failed to create card content" in caplog.text

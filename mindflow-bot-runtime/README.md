@@ -24,8 +24,10 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 
 ## 安全边界
 
-- 未绑定用户只能执行 `/bind`；仅允许私聊。
-- `external_llm_consent_at` 为空时不会创建 Claude SDK client。
+- 未绑定用户只能触发绑定（发送 `/bind 绑定码`，或直接发送符合绑定码形态的文本）；其余任何输入只会得到欢迎引导，不会触发 token 查询。仅允许私聊。
+- External LLM（对话模型、图片 Vision、日历事件语义分类）只认参与者本人的 `participant_consents` 记录（v2 disclosure 覆盖对话文字、图片与最少必要日程文本）；Consent 回调绑定用户实际看到的 `consent_version`，旧卡 accept 零写入并刷新最新说明，revoke 始终可用。无同意时 fail closed 并发送固定 Consent 卡，未授权用户不会看到“联系研究者”类提示。
+- Safety 命中只返回固定审核文案：不通知研究者、不写入长期画像/记忆、不触发次日强制关怀；Safety 内容在 Admin 消息视图中显示为“[内容受隐私保护]”，不暴露原文与分类标签；只允许匿名聚合的运营指标。
+- 没有当前版本 active 的 `participant_consents` 记录时，不会启动该参与者的 External LLM 对话/图片处理；legacy `external_llm_consent_at` 不具备授权能力，Worker/Forecast 缺少 ConsentService 时一律 fail closed。
 - `/calendar` 由 Backend Device Flow 处理。
 - `/stop` 只中断当前 participant 的 active turn；普通新消息默认排队。
 - Claude built-in tools 只保留指定 Skill；Bash、Read、Write、Edit、Web、Agent 等明确禁止。
@@ -39,16 +41,16 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - 应用读取配置后会把父进程环境收敛到运行白名单；Claude 子进程只显式获得 DeepSeek endpoint、模型名和认证 Token。
 - `.env`、数据库密码、飞书 Secret、DeepSeek Key 和 OAuth Token 不进入 Prompt、Tool schema 或 Claude stderr 日志。
 
-<!-- BUSINESS_TOOL_COUNT: 16 -->
+<!-- BUSINESS_TOOL_COUNT: 21 -->
 <!-- MODEL_VERSION: mindflow-ctssm-runtime-v7 -->
-<!-- ALEMBIC_HEAD: 0046_course_schedule_image_sessions -->
+<!-- ALEMBIC_HEAD: 0084_research_evidence_updated_at -->
 <!-- CARD_ACTION_TRANSPORT_DEFAULT: ws -->
 <!-- CARD_ACTION_CALLBACK_DEFAULT: false -->
 <!-- CARE_EFFECT_ANALYSIS_TYPE: observational_descriptive -->
 <!-- CAUSAL_CLAIM_ALLOWED: false -->
 <!-- MRT_RUNTIME_ENABLED: false -->
 
-## 十六个业务 Tool
+## Care/Calendar 与公开研究业务 Tool
 
 <!-- BUSINESS_TOOLS_BEGIN -->
 - `care_get_today_context`
@@ -61,17 +63,39 @@ Direct `DeepSeekClient.chat()`，Agent SDK 失败时也不会绕过 Claude Code�
 - `care_get_pressure_curve`
 - `care_simulate_schedule_change`
 - `care_get_checkin_card`
+- `help_show_feature_card`
+- `morning_brief_show_settings`
 - `calendar_connection_status`
 - `calendar_list_calendars`
 - `calendar_list_events`
 - `calendar_create_event`
+- `calendar_create_events_plan`
 - `calendar_update_event`
+- `calendar_update_events_plan`
 - `calendar_delete_event`
+- `calendar_delete_events_plan`
 <!-- BUSINESS_TOOLS_END -->
 
+Public Research Tools（独立于 Care/Calendar 清单）：
+
+- `research_search`
+- `research_open_url`
+- `research_browser_open`
+- `research_exec`
+- `research_github`
+- `morning_brief_topic_propose`
+
 所有参数 schema 都设置 `additionalProperties: false`，并禁止 participant、飞书
-身份、Token、Secret、SQL、路径和 URL 字段。Tool 调用继续经过 `ToolRegistry` 的
+身份、Token、Secret、SQL、路径和任意私有上下文字段；公开研究 URL 只接受经过
+SSRF 校验的 HTTPS 入口。Research Runtime 的返回值统一标记为不可信公开证据，
+不能触发 Structured Tool 或长期偏好写入。Tool 调用继续经过 `ToolRegistry` 的
 校验、安全摘要和 AgentRun 审计。
+
+公开视频语义总结由独立 `PublicVideoService` 提供，当前只支持 Bilibili：
+`video_inspect_url` 读取公开视频 Metadata 和公开字幕可用性，
+`video_read_transcript` 按 participant 绑定读取有界字幕块。字幕是外部不可信证据，
+不能成为工具指令或授权；无公开字幕时只说明标题/简介可见，绝不假装看过视频。
+本阶段不下载音频、不做 ASR/Whisper、不抽帧、不做 OCR 或逐秒视觉理解。
 
 ## 对话与意图路由
 
@@ -82,7 +106,23 @@ LLM，而由固定后端 action allowlist 处理。
 
 只有当业务域和 Tool 数量继续显著扩大，并且线上审计数据证明单 Agent 路由出现稳定、
 可复现的误调用时，才考虑增加轻量意图分类层。该分类层只能提供路由建议，不能获得
-日历写权限，也不能替代 Backend 对每次写 Tool proposal 的语义授权、schema 校验与幂等边界。
+日历写权限，也不能替代 Backend 的 schema、operation gate 与幂等边界。Calendar Agent
+工具只生成 participant-bound 待确认计划（`proposal_stage`），不调用 Provider；真正
+外部写入只由参与者点击固定确认卡后交给 durable runner 执行。
+
+## 冷启动与功能发现
+
+未绑定用户发送普通文本会收到自然欢迎引导；只有 `/bind 绑定码` 或形态符合绑定码规范
+（单一 URL-safe token）的文本才会进入绑定查询，绑定失败不区分“无效/过期/已使用”。
+绑定成功后发送轻量的渐进式欢迎卡，按钮只做导航（状态记录、日程、课程表、全部功能），
+不直接产生任何写操作；卡片不可发送时回退为同等内容的持久文本首屏。
+
+精确帮助词（功能/帮助/你会什么等）由确定性 fast-path 直接发送功能总览卡；其余自然
+语言帮助问题交给 Agent，Agent 只能通过 `help_show_feature_card`（仅接受后端枚举
+feature key 或 overview）排队由后端渲染的固定功能卡。`feature_open`/`feature_back`
+回调只携带 `feature_key` 与 `version`，经固定后端 allowlist 校验后原位更新来源卡片，
+不新发卡片。功能卡由 `app/presentation/feature_cards.py` 单一数据源渲染，禁用的
+capability（如 Daily Review）会直接隐藏对应功能。
 
 ## 配置
 
@@ -94,7 +134,7 @@ LLM，而由固定后端 action allowlist 处理。
 - CardAction 默认设置 `FEISHU_CARD_ACTION_TRANSPORT=ws`，在飞书开放平台用 WebSocket/长连接接收 `card.action.trigger`；此模式不需要公网 HTTPS、Verification Token 或 Encrypt Key，并保持 `FEISHU_CARD_CALLBACK_ENABLED=false`。
 - HTTP fallback 使用 `FEISHU_CARD_ACTION_TRANSPORT=http` 和 `FEISHU_CARD_CALLBACK_ENABLED=true`，同时配置 `FEISHU_CARD_CALLBACK_HOST`、`FEISHU_CARD_CALLBACK_PORT`、`FEISHU_CARD_CALLBACK_PATH`、`FEISHU_CARD_VERIFICATION_TOKEN` 和 `FEISHU_CARD_ENCRYPT_KEY`。同一 CardAction 不得同时启用 WS 与 HTTP ingress。
 - `DEEPSEEK_API_KEY`
-- `MUTATION_INTENT_API_ENABLED`、`MUTATION_INTENT_API_URL`、`MUTATION_INTENT_API_MODEL`、`MUTATION_INTENT_API_TIMEOUT_SECONDS`、`MUTATION_INTENT_MAX_CONCURRENCY`：仅在 Agent 提议内部或外部写操作时调用的 Backend 授权校验；不可用或响应非法时写操作 fail closed，read/compute/UI 不受影响。
+- `MUTATION_INTENT_API_ENABLED`、`MUTATION_INTENT_API_URL`、`MUTATION_INTENT_API_MODEL`、`MUTATION_INTENT_API_TIMEOUT_SECONDS`、`MUTATION_INTENT_MAX_CONCURRENCY`：用于真正的 Agent 内部/外部写操作授权；`draft_write` 和 `proposal_stage` 不调用该语义校验，Provider 写入仍必须经过参与者固定卡确认。不可用或响应非法时其它写操作 fail closed，read/compute/UI/draft/proposal stage 不受影响。
 - `VISION_API_ENABLED`、`VISION_API_URL`、`VISION_API_MODEL`、`VISION_API_TIMEOUT_SECONDS`：独立课程表 Vision 开关与 endpoint/model/timeout。
 - `VISION_MAX_CONCURRENCY`、`VISION_MAX_IMAGE_BYTES`、`VISION_IMPORT_DRAFT_TTL_MINUTES`、`VISION_SCHEDULE_MAX_ITEMS`、`VISION_SCHEDULE_MAX_CALENDAR_WRITES`：完整图片流水线并发、图片、待确认 Draft、条目和日历写入上限；生产并发默认 `1`，V1 条目上限默认 `20`，单次导入写入上限默认 `400`。
 - `CLAUDE_ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
@@ -103,6 +143,7 @@ LLM，而由固定后端 action allowlist 处理。
 - `CLAUDE_DEFAULT_HAIKU_MODEL`、`CLAUDE_CODE_SUBAGENT_MODEL`：都填写云端已验证的 DeepSeek `v4-flash` 模型 ID；两者不一致时启动会拒绝配置。当前生产权限仍禁止 `Agent/Task`，不会因此开放子代理能力。
 - `POSTGRES_PASSWORD`、`DATABASE_URL`
 - `TOKEN_ENCRYPTION_KEY`
+- `PARTICIPANT_DIAGNOSTICS_ALLOWLIST`：由后端控制的诊断 participant code 逗号分隔 allowlist；留空时所有 Agent 只收到 participant-safe 结果。不要让 Agent 根据 participant code 自行开启诊断。
 - session pool、timeout 和 progress policy 参数
 
 不要保留旧的 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BOT_HISTORY_LIMIT`、
@@ -156,6 +197,25 @@ docker compose -f compose.yaml -f compose.smoke.yaml up -d --no-deps bot
 docker compose run --rm bot python3 -m app.smoke.feishu_gateway --seconds 30
 ```
 
+可直接验证 DeepSeek Native Web Search 的真实 provider contract。该脚本只发送固定
+公共查询，不连接数据库，也不会打印 API Key：
+
+```bash
+python3 scripts/smoke_deepseek_web_search.py
+```
+
+成功时输出 `PASS provider=deepseek_native sources=N`，失败时输出稳定的
+`reason_code` 供部署排查。
+
+公开链接读取由 `web_read_url` / `web_read_url_chunk` 提供，只接受不含凭据或
+敏感 query 参数的公开 HTTPS HTML/纯文本页面。每一跳重定向都会重新进行 DNS
+与 SSRF 校验，正文通过 Trafilatura 抽取后按 participant 隔离并仅缓存 30 分钟；
+私网、metadata、登录页面、PDF 和其他二进制内容均会稳定拒绝。生产网络层仍应
+使用安全组或出站防火墙阻止容器访问 loopback、link-local 和 VPC 私网服务。
+
+公开视频读取复用同一 HTTPS-only、public-IP-only、重定向逐跳复验、超时和响应大小
+边界；缓存按参与者和视频标识隔离，默认保留 1 小时。
+
 Agent SDK Python 包自带固定版本的 Claude Code runtime，不依赖宿主机安装的
 `claude`。Compose 把 `/home/mindflow/.claude` 挂到 `claude_state` volume，确保
 container recreate 后 transcript 仍可用于 `resume=session_id`。
@@ -174,8 +234,13 @@ Copy-Item .\profiles\profile.example.json .\profiles\P001.json
 docker compose exec bot python3 -m app.admin create-participant P001
 docker compose cp .\profiles\P001.json bot:/tmp/P001.json
 docker compose exec bot python3 -m app.admin set-profile P001 /tmp/P001.json
-docker compose exec bot python3 -m app.admin set-llm-consent P001
 ```
+
+外部 LLM 处理没有研究者/管理员批准入口：参与者绑定后，首次触发对话或图片
+处理时会收到固定的用户 Consent 卡，同意后写入 `participant_consents`（带
+consent version），用户可在“数据与隐私”中随时关闭。旧字段
+`participants.external_llm_consent_at` 只作为过渡期审计数据显示，不再授权
+任何 external LLM 调用。
 
 第一条命令只显示一次 `/bind <code>`；数据库仅保存绑定码 Hash。撤回外部 LLM
 授权：
@@ -264,12 +329,13 @@ contracts，不能声称已完成随机 MRT 或证明了因果干预效果。
 
 ## Response Presentation 性能策略
 
-生产默认使用 `PRESENTATION_AGENT_MODE=adaptive`：本地 sanitizer 与确定性分段
-已经可以无损生成 1–3 段时，不再串行等待第二个模型。只有本地结果超出投递容量
-才尝试 PresentationAgent；超时采用硬截止，SDK 断连清理不会继续阻塞最终回复。
+生产默认使用 `PRESENTATION_AGENT_MODE=off`：联网、URL 读取和长分析回答由确定性
+PresentationCompiler 编译，并在最终安全检查后通过 CardKit 累积展示；普通短对话直接发送，
+不再串行等待第二个模型。旧 PresentationAgent 实现暂时保留，可显式设置 `adaptive` 或
+`always` 用于受控对比；超时采用硬截止，SDK 断连清理不会继续阻塞最终回复。
 
 诊断时查看 BotEvent telemetry 的 `presentation_agent_outcome`，可区分
-`skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
+`disabled`、`skipped_adaptive`、`timeout`、`validation_reject`、`agent_error`、
 `cleanup_backpressure` 和 `used`。当前运行边界、模型版本和各持久化链路统一见
 [`CURRENT_ARCHITECTURE.md`](../docs/CURRENT_ARCHITECTURE.md)。
 

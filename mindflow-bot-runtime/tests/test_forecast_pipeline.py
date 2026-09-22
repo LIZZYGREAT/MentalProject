@@ -20,6 +20,8 @@ from app.repositories import (
     ParticipantRepository,
     ProfileRepository,
 )
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import (
     CalendarRefreshPendingError,
@@ -115,8 +117,9 @@ def build_pipeline(
     database = memory_database()
     participants = ParticipantRepository(database)
     participant = participants.create("FORECAST-TEST")
+    consent_service = ConsentService(ParticipantConsentRepository(database))
     if consent:
-        participant = participants.set_external_llm_consent(participant.id, allowed=True)
+        consent_service.grant_external_llm_consent(participant.id)
     cache = EventSemanticCacheRepository(database)
     semantics = EventSemanticPreprocessor(
         cache, client=client, model="semantic-test-v1",
@@ -131,6 +134,7 @@ def build_pipeline(
         calendar_snapshots=CalendarSnapshotRepository(database), semantics=semantics,
         prediction=prediction, forecasts=ForecastSnapshotRepository(database),
         warnings=warnings, timezone_name="Asia/Shanghai", materiality_threshold=0.03,
+        consent_service=consent_service,
     )
     return database, participant, calendar, semantics, prediction, warnings, coordinator
 

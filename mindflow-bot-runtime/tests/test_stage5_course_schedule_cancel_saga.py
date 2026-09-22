@@ -123,6 +123,52 @@ def test_pending_cancel_has_no_provider_effect():
     assert asyncio.run(runner.run_once()) == 0
 
 
+def test_revert_persists_request_chat_and_pushes_completion_without_followup():
+    database = memory_database()
+    owner = participant(database, "STAGE5-CANCEL-NOTICE")
+    calendar = Calendar()
+    repository = CourseScheduleImportRepository(database)
+    service = CourseScheduleImportService(repository, calendar, Tokens())
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.cards.append((chat_id, card, message_uuid))
+            return "om-completion"
+
+        def send_text(self, chat_id, text):
+            raise AssertionError(f"unexpected text fallback: {chat_id} {text}")
+
+        def update_card(self, _message_id, _card):
+            raise AssertionError("no status card message was supplied")
+
+    sender = Sender()
+    runner = CourseScheduleImportRunner(service, sender=sender)
+    service.queue_notifier = runner.wake
+    draft = _draft(repository, owner.id)
+    _queue(service, owner, draft)
+    assert asyncio.run(runner.run_once()) == 1
+    assert repository.get(draft["id"])["status"] == "succeeded"
+
+    result = service.cancel(
+        owner.id,
+        draft["id"],
+        status_card_chat_id="oc-cancel-request",
+    )
+    assert result["status"] == "cancelling"
+    assert repository.get(draft["id"])["status_card_chat_id"] == (
+        "oc-cancel-request"
+    )
+    assert asyncio.run(runner.run_once()) == 1
+
+    assert repository.get(draft["id"])["status"] == "cancelled"
+    assert sender.cards[-1][0] == "oc-cancel-request"
+    assert sender.cards[-1][2]
+    assert "已撤销" in str(sender.cards[-1][1])
+
+
 def test_queued_cancel_marks_planned_writes_without_delete():
     database = memory_database()
     owner = participant(database, "STAGE5-QUEUED")
@@ -361,14 +407,41 @@ def test_cancel_created_date_selector_uses_import_timezone():
     draft = _draft(
         repository, owner.id, now=created_at, ttl_minutes=3 * 24 * 60
     )
+    query_now = created_at + timedelta(minutes=1)
 
-    candidates = repository.recent_cancel_candidates(owner.id)
+    candidates = repository.recent_cancel_candidates(owner.id, now=query_now)
     assert candidates[0]["created_local_date"] == "2026-09-09"
+    assert candidates[0]["created_local_datetime"] == "2026-09-09T00:30:00+08:00"
+    assert candidates[0]["timezone"] == "Asia/Shanghai"
+    assert candidates[0]["created_at"] == "2026-09-08T16:30:00+00:00"
     assert repository.resolve_cancel_selector(
-        owner.id, {"created_date": "2026-09-09"}
+        owner.id, {"created_date": "2026-09-09"}, now=query_now
     )["id"] == draft["id"]
     with pytest.raises(LookupError):
-        repository.resolve_cancel_selector(owner.id, {"created_date": "2026-09-08"})
+        repository.resolve_cancel_selector(
+            owner.id, {"created_date": "2026-09-08"}, now=query_now
+        )
+
+
+def test_recent_cancel_candidates_explicit_now_controls_expiry():
+    database = memory_database()
+    owner = participant(database, "STAGE5-EXPLICIT-NOW")
+    repository = CourseScheduleImportRepository(database)
+    created_at = datetime(2026, 9, 8, 16, 30, tzinfo=timezone.utc)
+    draft = _draft(
+        repository, owner.id, now=created_at, ttl_minutes=3 * 24 * 60
+    )
+
+    before_ttl = repository.recent_cancel_candidates(
+        owner.id, now=created_at + timedelta(minutes=1)
+    )
+    assert [candidate["id"] for candidate in before_ttl] == [draft["id"]]
+
+    after_ttl = repository.recent_cancel_candidates(
+        owner.id, now=created_at + (3 * 24 * 60 + 1) * timedelta(minutes=1)
+    )
+    assert after_ttl == []
+    assert repository.get(draft["id"])["status"] == "expired"
 
 
 def test_expired_draft_is_archived_and_omitted_from_current_cancel_candidates():
@@ -395,7 +468,9 @@ def test_cancelled_completion_is_restart_recoverable():
     repository, service, _runner = _stack(database, owner, Calendar())
     draft = _draft(repository, owner.id)
 
-    assert service.cancel(owner.id, draft["id"])["status"] == "cancelled"
+    assert service.cancel(
+        owner.id, draft["id"], status_card_chat_id="oc-recovery"
+    )["status"] == "cancelled"
     pending = repository.pending_completion_presentations()
     assert [item["id"] for item in pending] == [draft["id"]]
     assert repository.mark_completion_presentation_failed(
@@ -404,6 +479,39 @@ def test_cancelled_completion_is_restart_recoverable():
     assert repository.pending_completion_presentations()[0]["status"] == "cancelled"
     assert repository.mark_completion_presented(draft["id"])
     assert repository.pending_completion_presentations() == []
+
+
+def test_missing_completion_target_is_abandoned_once_with_incident():
+    database = memory_database()
+    owner = participant(database, "STAGE5-PRESENTATION-MISSING")
+    repository, service, _runner = _stack(database, owner, Calendar())
+    draft = _draft(repository, owner.id)
+    assert service.cancel(owner.id, draft["id"])["status"] == "cancelled"
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    first_incidents = Incidents()
+    first = CourseScheduleImportRunner(service, incidents=first_incidents)
+    asyncio.run(first._run_startup_recovery())
+
+    assert repository.pending_completion_presentations() == []
+    assert repository.get(draft["id"])["completion_presentation_error"] == (
+        "presentation_target_missing"
+    )
+    assert len(first_incidents.records) == 1
+    assert first_incidents.records[0]["event_name"] == (
+        "completion_presentation_abandoned"
+    )
+
+    second_incidents = Incidents()
+    restarted = CourseScheduleImportRunner(service, incidents=second_incidents)
+    asyncio.run(restarted._run_startup_recovery())
+    assert second_incidents.records == []
 
 
 def test_oauth_resume_reopens_cleanup_failed_presentation():

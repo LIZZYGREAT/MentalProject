@@ -103,7 +103,10 @@ def channel_card_action(*, event_id="card-provider-1"):
             value={"mindflow_action": "care_helpful", "version": "1"},
             form_value={"note": "private"},
         ),
-        raw={"header": {"event_id": event_id}},
+        raw={
+            "header": {"event_id": event_id},
+            "event": {"token": "callback-token-secret"},
+        },
     )
 
 
@@ -121,6 +124,43 @@ class CardActionFakeChannel:
     def start(self):
         self.is_ready = True
         self.handlers["cardAction"](channel_card_action())
+        self.stop_event.set()
+
+    def stop(self):
+        self.stop_event.set()
+
+
+class DirectAckCardActionFakeChannel:
+    def __init__(self, stop_event, responses, **_kwargs):
+        self.stop_event = stop_event
+        self.responses = responses
+        self.is_ready = False
+        self._dispatcher = None
+
+    def on(self, name, _handler):
+        assert name == "message"
+
+    def _on_p2_card_action_trigger(self, _callback):
+        raise AssertionError("receiver must replace the SDK async card handler")
+
+    def start(self):
+        self.is_ready = True
+        callback = SimpleNamespace(
+            header=SimpleNamespace(event_id="card-direct-ack"),
+            event=SimpleNamespace(
+                token="direct-callback-token",
+                context=SimpleNamespace(
+                    open_message_id="om-direct", open_chat_id="oc-direct"
+                ),
+                operator=SimpleNamespace(open_id="ou-direct"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={"mindflow_action": "care_helpful", "version": "1"},
+                    form_value={},
+                ),
+            ),
+        )
+        self.responses.append(self._on_p2_card_action_trigger(callback))
         self.stop_event.set()
 
     def stop(self):
@@ -417,7 +457,54 @@ def test_gateway_preserves_card_action_identity():
     assert event.action_tag == "button"
     assert event.action_value["mindflow_action"] == "care_helpful"
     assert event.form_value == {"note": "private"}
+    assert event.callback_token == "callback-token-secret"
     assert CardActionEvent.from_ipc_payload(event.to_ipc_payload()) == event
+
+
+def test_card_action_rejects_oversized_callback_token():
+    action = channel_card_action()
+    action.raw["event"]["token"] = "x" * 4097
+    with pytest.raises(InvalidBotEvent, match="token is too long"):
+        FeishuChannelCardActionAdapter("cli_test").adapt(action)
+
+    payload = FeishuChannelCardActionAdapter("cli_test").adapt(
+        channel_card_action()
+    ).to_ipc_payload()
+    payload["callback_token"] = "x" * 4097
+    with pytest.raises(InvalidBotEvent, match="token is too long"):
+        CardActionEvent.from_ipc_payload(payload)
+
+
+def test_card_action_identity_ignores_receive_timing_but_ipc_preserves_it():
+    first = CardActionEvent(
+        event_id="event-1",
+        message_id="message-1",
+        app_id="app-1",
+        open_id="user-1",
+        chat_id="chat-1",
+        action_tag="button",
+        action_value={"mindflow_action": "care_helpful", "version": "1"},
+        form_value={"note": "private"},
+        callback_token="callback-token",
+        received_monotonic=10.25,
+    )
+    second = CardActionEvent(
+        event_id=first.event_id,
+        message_id=first.message_id,
+        app_id=first.app_id,
+        open_id=first.open_id,
+        chat_id=first.chat_id,
+        action_tag=first.action_tag,
+        action_value=first.action_value,
+        form_value=first.form_value,
+        callback_token=first.callback_token,
+        received_monotonic=11.75,
+    )
+
+    assert first == second
+    restored = CardActionEvent.from_ipc_payload(first.to_ipc_payload())
+    assert restored == first
+    assert restored.received_monotonic == 10.25
 
 
 def test_receiver_registers_card_action():
@@ -450,6 +537,8 @@ def test_receiver_card_action_emits_ipc_envelope():
     while not output.empty():
         envelopes.append(output.get_nowait())
     card_envelope = next(item for item in envelopes if item["kind"] == "card_action")
+    received_monotonic = card_envelope["payload"].pop("received_monotonic")
+    assert received_monotonic > 0
     assert card_envelope["payload"] == {
         "event_id": "card-provider-1",
         "message_id": "om-card",
@@ -459,7 +548,30 @@ def test_receiver_card_action_emits_ipc_envelope():
         "action_tag": "button",
         "action_value": {"mindflow_action": "care_helpful", "version": "1"},
         "form_value": {"note": "private"},
+        "callback_token": "callback-token-secret",
     }
+
+
+def test_receiver_direct_sdk_handler_acks_only_after_ipc_enqueue():
+    output = sync_queue.Queue()
+    stop_event = threading.Event()
+    responses = []
+    receiver_process_main(
+        "cli_test",
+        "secret",
+        output,
+        stop_event,
+        partial(DirectAckCardActionFakeChannel, stop_event, responses),
+        card_action_enabled=True,
+    )
+
+    assert len(responses) == 1
+    assert responses[0].toast.content == "处理中…"
+    envelope = next(
+        item for item in list(output.queue) if item["kind"] == "card_action"
+    )
+    assert envelope["payload"]["callback_token"] == "direct-callback-token"
+    assert envelope["payload"]["event_id"] == "card-direct-ack"
 
 
 def test_gateway_start_forwards_events_and_stop_cleans_receiver(caplog):

@@ -8,7 +8,7 @@ import hashlib
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.calendar import CalendarService
@@ -26,6 +26,8 @@ from app.repositories import (
 )
 from algorithm.dynamic_state_model import model_variant_metadata, normalize_model_variant
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.services.care_message_service import (
     CARE_MESSAGE_SCHEMA_VERSION,
     CareMessageService,
@@ -41,7 +43,13 @@ from app.services.forecast_initial_state import (
     ForecastInitialState,
     ForecastInitialStateResolver,
 )
-from app.services.forecast_dependency_refresh import ForecastDependencyRefreshService
+from app.services.forecast_dependency_refresh import (
+    ForecastDependencyRefreshService,
+    dependent_date_for,
+)
+from app.contracts.care_evidence import CARE_EVIDENCE_SCHEMA_VERSION
+from app.services.care_reason_policy import CARE_REASON_POLICY_VERSION
+from app.services.runtime_clock import RuntimeClock
 from app.services.prediction_service import PredictionService
 from app.services.warning_policy import WarningPolicy
 from app.services.profile_calibration import layered_profile
@@ -255,6 +263,7 @@ def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, A
         classification = dict(metadata.get("classification") or {})
         catalog_context = dict(classification.get("course_catalog_context") or {})
         semantic = dict(metadata.get("semantic") or {})
+        semantic_values = dict(semantic.get("values") or {})
         classified.append(
             {
                 "id": str(event.get("id") or event.get("event_id") or ""),
@@ -278,12 +287,71 @@ def classified_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, A
                 "classification_source": classification.get("source"),
                 "classification_confidence": classification.get("confidence"),
                 "semantic_source": semantic.get("source"),
+                "semantic_confidence": semantic.get("confidence"),
+                "semantic_values": {
+                    key: semantic_values.get(key)
+                    for key in (
+                        "difficulty", "cognitive_demand", "expected_effort",
+                        "time_pressure", "uncertainty",
+                    )
+                    if semantic_values.get(key) is not None
+                },
+                "semantic_evidence_tags": list(
+                    (semantic.get("external") or {}).get("evidence_tags") or []
+                )[:6],
                 "workload_feature_vector": semantic.get("workload_feature_vector"),
                 "workload_prior": semantic.get("workload_prior"),
                 "workload_model_version": semantic.get("workload_model_version"),
+                "course_catalog": _matched_course_catalog(
+                    event, classification, catalog_context
+                ),
             }
         )
     return classified
+
+
+def _matched_course_catalog(
+    event: Mapping[str, Any],
+    classification: Mapping[str, Any],
+    catalog_context: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    course_match = dict(classification.get("course_match") or {})
+    name = str(
+        event.get("course_name")
+        or event.get("related_course_name")
+        or course_match.get("canonical_name")
+        or ""
+    ).strip()
+    code = str(
+        event.get("course_code")
+        or event.get("related_course_code")
+        or course_match.get("code")
+        or ""
+    ).strip()
+    confidence = event.get("course_match_confidence", course_match.get("confidence"))
+    try:
+        if float(confidence) < 0.55:
+            return None
+    except (TypeError, ValueError):
+        return None
+    candidates = [
+        item for item in list(catalog_context.get("candidates") or [])
+        if isinstance(item, dict)
+        and (
+            (code and str(item.get("code") or "").strip() == code)
+            or (name and str(item.get("canonical_name") or "").strip() == name)
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    return {
+        "canonical_name": str(candidate.get("canonical_name") or "")[:200],
+        "code": str(candidate.get("code") or "")[:64],
+        "credits": candidate.get("credits"),
+        "hours": candidate.get("hours"),
+        "hours_per_week": candidate.get("hours_per_week"),
+    }
 
 
 class ForecastCoordinator:
@@ -300,6 +368,9 @@ class ForecastCoordinator:
         retrospective_curves: RetrospectiveCurveRepository | None = None,
         care_preferences: ParticipantCarePreferenceRepository | None = None,
         care_interventions: Any | None = None,
+        psychological_context: Any | None = None,
+        consent_service: Any | None = None,
+        clock: RuntimeClock | None = None,
     ):
         self.participants = participants
         self.profiles = profiles
@@ -311,6 +382,7 @@ class ForecastCoordinator:
         self.forecasts = forecasts
         self.warnings = warnings
         self.timezone = ZoneInfo(timezone_name)
+        self.clock = clock or RuntimeClock(timezone_name)
         self.materiality_threshold = materiality_threshold
         self.warning_lead_minutes = warning_lead_minutes
         self.warning_late_grace_minutes = warning_late_grace_minutes
@@ -322,9 +394,31 @@ class ForecastCoordinator:
         self.care_messages = CareMessageService(timezone_name)
         self.care_preferences = care_preferences
         self.care_interventions = care_interventions
+        self.psychological_context = psychological_context
+        if consent_service is False:
+            # Explicitly disabled: the gate fails closed.
+            self.consent_service = None
+        else:
+            self.consent_service = consent_service or ConsentService(
+                ParticipantConsentRepository(participants.database)
+            )
         self._inflight: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
         self._guard = asyncio.Lock()
         self.dependency_refresh: ForecastDependencyRefreshService | None = None
+
+    async def _has_external_llm_consent(self, participant_id) -> bool:
+        """External-LLM gate for calendar-content classification.
+
+        Fails closed when no consent service is wired: the legacy
+        researcher/CLI flag never authorizes external LLM processing, and
+        production always constructs the coordinator with the service.
+        """
+
+        if self.consent_service is None:
+            return False
+        return await asyncio.to_thread(
+            self.consent_service.is_active, participant_id
+        )
 
     def mark_dependency_dirty(
         self,
@@ -353,6 +447,8 @@ class ForecastCoordinator:
                 CARE_RECENT_OBSERVATION_MAX_AGE_MINUTES
             ),
             "care_message_schema_version": CARE_MESSAGE_SCHEMA_VERSION,
+            "care_evidence_schema_version": CARE_EVIDENCE_SCHEMA_VERSION,
+            "care_reason_policy_version": CARE_REASON_POLICY_VERSION,
             "care_intervention_policy_version": CARE_INTERVENTION_POLICY_VERSION,
             "care_template_library_version": CARE_TEMPLATE_LIBRARY_VERSION,
             "care_jitai_version": CARE_JITAI_VERSION,
@@ -387,10 +483,12 @@ class ForecastCoordinator:
                     facts.get("calendar_degraded", output.get("calendar_degraded"))
                 ),
                 recent_observation=facts.get("recent_observation"),
+                longitudinal_state=facts.get("longitudinal_state"),
                 profile=facts.get("profile"),
                 profile_version=facts.get("profile_version"),
                 care_preferences=preferences or None,
                 care_history=facts.get("care_history"),
+                forecast_output=output,
             )
             for alert in raw_candidates
         ]
@@ -686,8 +784,7 @@ class ForecastCoordinator:
         calendar_snapshot, calendar_changed = await self._calendar_snapshot(
             participant_id, target, refresh_calendar
         )
-        participant = await asyncio.to_thread(self.participants.get, participant_id)
-        consent = bool(participant and participant.external_llm_consent_at)
+        consent = await self._has_external_llm_consent(participant_id)
         events = prepare_event_instances(calendar_snapshot["events"], target.isoformat())
         semantic_events, semantic_revision, semantic_status, misses = await asyncio.to_thread(
             self.semantics.prepare, participant_id, events, consent=consent
@@ -699,7 +796,7 @@ class ForecastCoordinator:
             or (item.get("metadata") or {}).get("classification")
             for item in semantic_events
         )
-        local_now = datetime.now(self.timezone)
+        local_now = self.clock.now()
         observation_window_start = None
         observation_window_end = None
         if target == local_now.date():
@@ -744,6 +841,7 @@ class ForecastCoordinator:
             "calendar_events": presentation_events,
             "calendar_degraded": bool(calendar_snapshot["degraded"]),
             "recent_observation": recent_care_observation,
+            "longitudinal_state": {},
             "profile": effective_profile,
             "profile_version": profile_row.get("version") if profile_row else None,
             "care_preferences": (
@@ -763,6 +861,19 @@ class ForecastCoordinator:
                 else None
             ),
         }
+        if self.psychological_context is not None:
+            try:
+                care_inputs["longitudinal_state"] = await asyncio.to_thread(
+                    self.psychological_context.build,
+                    participant_id,
+                    now=local_now,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "care_longitudinal_state_unavailable participant_id=%s error_class=%s",
+                    participant_id,
+                    type(exc).__name__,
+                )
         observation_revision = _sha(observations)
         profile_revision = _sha({
             "explicit": profile_row,
@@ -927,8 +1038,12 @@ class ForecastCoordinator:
                         target,
                         reason="previous_day_semantic_terminal_changed",
                     )
-                elif target == datetime.now(self.timezone).date():
-                    dependent_date = target + timedelta(days=1)
+                else:
+                    dependent_date = dependent_date_for(
+                        target, self.clock.local_date()
+                    )
+                    if dependent_date is None:
+                        return
                     await asyncio.to_thread(
                         self.mark_dependency_dirty,
                         participant_id,
@@ -956,7 +1071,7 @@ class ForecastCoordinator:
         refresh_calendar: bool,
         effective_profile: dict[str, Any],
     ) -> ForecastInitialState:
-        local_today = datetime.now(self.timezone).date()
+        local_today = self.clock.local_date()
         previous = None
         if target == local_today:
             previous = await asyncio.to_thread(

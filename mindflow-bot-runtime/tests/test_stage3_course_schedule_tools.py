@@ -1,16 +1,19 @@
 import asyncio
-from datetime import date, time
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 import uuid
 
 from app.agent.context import AgentContext
 from app.agent.tool_registry import ToolRegistry
 from app.contracts.course_schedule import ScheduleVisionResult
-from app.services.presentation_service import PresentationOutbox
+from app.services.presentation_service import PendingCardUpdate, PresentationOutbox
 from app.repositories_course_schedule import CourseScheduleImportRepository
 from app.repositories_course_schedule_image import (
     CourseScheduleImageSessionRepository,
 )
 from app.services.mutation_intent_verifier import MutationIntentDecision
+from app.services.card_action_service import CardActionService
+from app.card_actions.registry import card_action_spec
 from app.tools.course_schedule import CourseScheduleTools
 from helpers import memory_database, participant
 
@@ -88,7 +91,7 @@ class _Imports:
     def __init__(self, drafts):
         self.drafts = drafts
 
-    def cancel(self, participant_id, import_id):
+    def cancel(self, participant_id, import_id, **_kwargs):
         draft = self.drafts.cancel(participant_id, import_id)
         return {
             "ok": draft["status"] == "cancelled",
@@ -96,7 +99,7 @@ class _Imports:
             "reply_text": "已取消这次课程表导入。",
         }
 
-    def cancel_or_revert(self, participant_id, selector):
+    def cancel_or_revert(self, participant_id, selector, **_kwargs):
         candidate = self.drafts.resolve_cancel_selector(participant_id, selector)
         draft = self.drafts.request_cancel(participant_id, candidate["id"])
         return {
@@ -188,11 +191,89 @@ def test_participant_bound_tools_read_update_and_stage_preview_without_calendar_
     cards = presentations.take_cards(run_id)
     assert len(cards) == 1
     assert "学校默认作息" in str(cards[0])
-    assert len(verifier.calls) == 1
-    assert "participant" not in str(verifier.calls[0]["proposal_summary"]).lower()
+    assert verifier.calls == []
+    draft_spec = next(
+        spec
+        for spec in registry.specs
+        if spec.name == "course_schedule_update_active_draft"
+    )
+    assert draft_spec.effect == "draft_write"
+    assert draft_spec.authorization_requirement == "none"
+    assert draft_spec.authorization_context_resolver is None
 
 
-def test_hypothetical_correction_is_denied_before_draft_mutation():
+def test_draft_correction_updates_bound_preview_instead_of_sending_another_card():
+    database = memory_database()
+    owner = participant(database, "STAGE3-CANONICAL-PREVIEW")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id)
+    repo.bind_preview_card(
+        owner.id,
+        draft["id"],
+        message_id="om-existing-preview",
+        chat_id="chat",
+    )
+    presentations = PresentationOutbox()
+    registry = ToolRegistry(
+        mutation_verifier=_Verifier(
+            MutationIntentDecision("allow", "direct_action", "direct_request")
+        )
+    )
+    CourseScheduleTools(_Imports(repo), presentations).register(registry)
+    ctx = _context(owner.id, uuid.uuid4(), "高数改到周四")
+
+    result = asyncio.run(
+        registry.execute(
+            ctx,
+            "course_schedule_update_active_draft",
+            {
+                "selector": {"course_name": "高等数学"},
+                "updates": {"new_weekday": 4},
+            },
+        )
+    )
+
+    assert result.result["ok"] is True
+    staged = presentations.take_cards(ctx.agent_run_id)
+    assert len(staged) == 1
+    assert isinstance(staged[0], PendingCardUpdate)
+    assert staged[0].message_id == "om-existing-preview"
+
+
+def test_preview_card_rebind_uses_expected_old_message_compare_and_set():
+    database = memory_database()
+    owner = participant(database, "STAGE3-PREVIEW-REBIND")
+    repo = CourseScheduleImportRepository(database)
+    draft = _draft(repo, owner.id)
+    repo.bind_preview_card(
+        owner.id,
+        draft["id"],
+        message_id="om-old-preview",
+        chat_id="chat",
+    )
+
+    rebound = repo.rebind_preview_card(
+        owner.id,
+        draft["id"],
+        expected_old_message_id="om-old-preview",
+        message_id="om-replacement",
+        chat_id="chat",
+    )
+    stale_race = repo.rebind_preview_card(
+        owner.id,
+        draft["id"],
+        expected_old_message_id="om-old-preview",
+        message_id="om-late-replacement",
+        chat_id="chat",
+    )
+
+    assert rebound["preview_card_rebound"] is True
+    assert rebound["status_card_message_id"] == "om-replacement"
+    assert stale_race["preview_card_rebound"] is False
+    assert stale_race["status_card_message_id"] == "om-replacement"
+
+
+def test_draft_write_uses_typed_fields_without_reparsing_raw_user_text():
     database = memory_database()
     owner = participant(database, "STAGE3-HYPOTHETICAL")
     repo = CourseScheduleImportRepository(database)
@@ -216,10 +297,11 @@ def test_hypothetical_correction_is_denied_before_draft_mutation():
         )
     )
 
-    assert result.status == "tool_effect_not_authorized"
-    unchanged = repo.get(original["id"])["structured_result"]["courses"][0]
-    assert (unchanged["period_start"], unchanged["period_end"]) == (1, 2)
-    assert presentations.take_cards(ctx.agent_run_id) == []
+    assert result.status == "succeeded"
+    changed = repo.get(original["id"])["structured_result"]["courses"][0]
+    assert (changed["period_start"], changed["period_end"]) == (3, 4)
+    assert len(presentations.take_cards(ctx.agent_run_id)) == 1
+    assert verifier.calls == []
 
 
 def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
@@ -227,11 +309,17 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
     owner = participant(database, "STAGE3-IMAGE-RETRY")
     drafts = CourseScheduleImportRepository(database)
     image_sessions = CourseScheduleImageSessionRepository(database)
+    # Relative times keep the 24h session TTL out of the assertion: the
+    # fixture must never expire just because the wall clock moved on.
+    reference_now = datetime.now(timezone.utc).replace(microsecond=0)
+    created_at = reference_now - timedelta(minutes=10)
+    failed_at = reference_now - timedelta(minutes=5)
     image_sessions.start(
         owner.id,
         chat_id="chat",
         image_message_id="image-message",
         image_key="image-key",
+        now=created_at,
     )
     image_sessions.mark_failed(
         owner.id,
@@ -245,6 +333,7 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
             ],
             "missing": ["week_rule"],
         },
+        now=failed_at,
     )
     imported = []
 
@@ -272,10 +361,14 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
         return failure, retried
 
     failure, retried = asyncio.run(scenario())
+    tz = ZoneInfo("Asia/Shanghai")
+    expected_created_local = created_at.astimezone(tz).isoformat()
+    expected_updated_local = failed_at.astimezone(tz).isoformat()
     assert failure.result["image_session"] == {
         "status": "needs_retry",
-        "created_at": failure.result["image_session"]["created_at"],
-        "updated_at": failure.result["image_session"]["updated_at"],
+        "created_local_datetime": expected_created_local,
+        "updated_local_datetime": expected_updated_local,
+        "timezone": "Asia/Shanghai",
         "last_error_code": "schedule_validation_failed",
         "error_detail": "week range is missing",
         "parse_report": {
@@ -292,6 +385,8 @@ def test_recent_image_failure_is_readable_and_retry_uses_bound_session():
     assert imported[0][1]["image_message_id"] == "image-message"
     assert imported[0][1]["image_key"] == "image-key"
     assert verifier.calls == []
+    assert "created_at" not in failure.result["image_session"]
+    assert "updated_at" not in failure.result["image_session"]
 
 
 def test_active_draft_includes_bound_image_session_status():
@@ -328,6 +423,9 @@ def test_active_draft_includes_bound_image_session_status():
 
     assert result.result["ok"] is True
     assert result.result["image_session"]["status"] == "needs_information"
+    assert result.result["image_session"]["timezone"] == "Asia/Shanghai"
+    assert "created_at" not in result.result["image_session"]
+    assert "updated_at" not in result.result["image_session"]
     assert result.result["image_session"]["parse_report"]["missing"] == [
         "semester_start_date"
     ]
@@ -352,49 +450,123 @@ def test_participant_bound_pending_cancel_without_provider_effect_skips_verifier
     assert verifier.calls == []
 
 
-def test_cancel_with_provider_effect_still_requires_semantic_verification():
+def test_completed_import_revert_stages_fixed_review_without_starting_cleanup():
+    import_id = uuid.uuid4()
+
     class Drafts:
         def resolve_cancel_selector(self, participant_id, selector):
             assert participant_id == owner.id
             assert selector == {"latest": True}
             return {
-                "id": "private-import-id",
+                "id": str(import_id),
                 "status": "succeeded",
                 "created_at": "2026-09-10T08:00:00+00:00",
+                "created_local_datetime": "2026-09-10T16:00:00+08:00",
                 "created_local_date": "2026-09-10",
+                "timezone": "Asia/Shanghai",
                 "course_names": ["高等数学"],
+                "course_count": 1,
+                "provider_effect_count": 16,
                 "has_provider_effect": True,
             }
 
     class Imports:
         drafts = Drafts()
 
-        def cancel_or_revert(self, participant_id, selector):
-            assert participant_id == owner.id
-            return {"ok": True, "status": "cancelling", "cancel_mode": "revert"}
-
     database = memory_database()
     owner = participant(database, "STAGE3-REVERT-VERIFY")
-    verifier = _Verifier(
-        MutationIntentDecision("allow", "cancel_or_revert", "explicit_cleanup")
-    )
+    verifier = _Verifier(None)
     registry = ToolRegistry(mutation_verifier=verifier)
-    CourseScheduleTools(Imports(), PresentationOutbox()).register(registry)
+    outbox = PresentationOutbox()
+    CourseScheduleTools(Imports(), outbox).register(registry)
     ctx = _context(owner.id, uuid.uuid4(), "撤销刚才导入到日历的课程")
 
     result = asyncio.run(
         registry.execute(
             ctx,
-            "course_schedule_cancel_or_revert_import",
+            "course_schedule_stage_revert_import",
             {"selector": {"latest": True}},
         )
     )
 
     assert result.status == "succeeded"
-    assert result.result["status"] == "cancelling"
-    assert len(verifier.calls) == 1
-    serialized = str(verifier.calls[0]["proposal_summary"])
-    assert "private-import-id" not in serialized
+    assert result.result["course_schedule_revert"] == "pending_confirmation"
+    assert result.result["provider_effect_started"] is False
+    assert verifier.calls == []
+    serialized = str(outbox.take_cards(ctx.agent_run_id)[0])
+    assert str(import_id) in serialized
+    assert "16" in serialized
+
+
+def test_course_revert_card_action_is_the_only_cleanup_executor():
+    import_id = uuid.uuid4()
+
+    class Imports:
+        def __init__(self):
+            self.calls = []
+
+        def revert(self, participant_id, selected_id, **kwargs):
+            self.calls.append((participant_id, selected_id, kwargs))
+            return {
+                "ok": True,
+                "status": "cancelling",
+                "import_id": str(selected_id),
+                "cancel_mode": "revert",
+                "reply_text": "正在清理。",
+            }
+
+    database = memory_database()
+    owner = participant(database, "STAGE3-REVERT-CARD")
+    imports = Imports()
+    actions = CardActionService(
+        observations=None,
+        observation_refresh=None,
+        course_schedule_imports=imports,
+    )
+    result = actions.handle(
+        owner.id,
+        message_id="revert-card",
+        chat_id="chat",
+        callback_event_id="revert-confirm",
+        action_value={
+            "mindflow_action": "course_schedule_revert_confirm",
+            "version": "1",
+            "import_id": str(import_id),
+        },
+        form_value={},
+    )
+
+    assert result["ok"] is True
+    assert imports.calls == [
+        (owner.id, import_id, {"status_card_chat_id": "chat"})
+    ]
+    assert card_action_spec("course_schedule_revert_confirm").kind == "external_write"
+    assert card_action_spec(
+        "course_schedule_revert_confirm"
+    ).replay_policy == "receipt_required"
+
+
+def test_recent_imports_expose_local_timestamp_without_raw_utc():
+    database = memory_database()
+    owner = participant(database, "STAGE3-RECENT-LOCAL-TIME")
+    repo = CourseScheduleImportRepository(database)
+    _draft(repo, owner.id)
+    registry = ToolRegistry()
+    CourseScheduleTools(_Imports(repo), PresentationOutbox()).register(registry)
+
+    result = asyncio.run(
+        registry.execute(
+            _context(owner.id, uuid.uuid4(), "最近一次课表是什么时候导入的"),
+            "course_schedule_get_recent_imports",
+            {},
+        )
+    )
+
+    item = result.result["imports"][0]
+    assert item["timezone"] == "Asia/Shanghai"
+    assert item["created_local_datetime"].endswith("+08:00")
+    assert item["created_local_date"] == item["created_local_datetime"][:10]
+    assert "created_at" not in item
 
 
 def test_context_tool_applies_user_period_mapping_and_semester_monday():

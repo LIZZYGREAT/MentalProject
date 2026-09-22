@@ -6,7 +6,7 @@ validation here are the authority for any state change triggered by a card.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -16,12 +16,38 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.integrations.feishu.cards import (
+    calendar_course_series_edit_card,
+    calendar_course_series_occurrences_card,
+    calendar_mutation_plan_confirmation_card,
+    calendar_mutation_plan_item_edit_card,
+    calendar_mutation_plan_item_time_card,
+    card_action_result_card,
     care_intervention_result_card,
     course_schedule_context_card,
+    course_schedule_item_time_card,
     course_schedule_preview_card,
     course_schedule_result_card,
     daily_checkin_card,
+    external_llm_consent_card,
+    external_llm_consent_details_card,
+    external_llm_consent_status_card,
+    morning_brief_settings_card,
+    memory_center_card,
+    memory_clear_all_confirmation_card,
+    memory_delete_confirmation_card,
+    memory_detail_card,
+    memory_edit_card,
+    personalization_proposal_confirmation_card,
+    preference_settings_card,
+    reminder_proposal_confirmation_card,
+    reminder_proposal_edit_card,
     today_calendar_card,
+)
+from app.presentation.consent_texts import external_llm_consent_declined_text
+from app.presentation.feature_cards import (
+    OVERVIEW_FEATURE_KEY,
+    build_feature_card,
+    visible_feature_keys,
 )
 from app.repositories import ObservationRepository
 from app.services.observation_forecast_refresh import ObservationForecastRefreshService
@@ -43,6 +69,108 @@ _SLASH_DATE = re.compile(
     r"^\s*(?P<year>\d{4})\s*/\s*(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})\s*$"
 )
 _WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_CLOCK_TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+def _structured_clock(values: dict[str, Any], prefix: str) -> str:
+    hour = str(values.get(f"{prefix}_hour") or "").strip()
+    minute = str(values.get(f"{prefix}_minute") or "").strip()
+    if not hour.isdigit() or not minute.isdigit():
+        raise ValueError("请选择完整的小时和分钟")
+    hour_value = int(hour)
+    minute_value = int(minute)
+    if not 0 <= hour_value <= 23 or not 0 <= minute_value <= 59:
+        raise ValueError("请选择有效的小时和分钟")
+    return f"{hour_value:02d}:{minute_value:02d}"
+
+
+def _legacy_clock(value: Any) -> str:
+    normalized = str(value or "").strip().replace("：", ":")
+    pieces = normalized.split(":", 1)
+    if len(pieces) == 2 and all(piece.isdigit() for piece in pieces):
+        normalized = f"{int(pieces[0]):02d}:{int(pieces[1]):02d}"
+    return normalized
+
+
+def _aware_calendar_datetime(value: object) -> datetime:
+    raw = str(value or "").strip()
+    if raw.endswith(("Z", "z")):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("日程原始时间无效，请重新发起日程操作。") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("日程原始时间缺少时区，请重新发起日程操作。")
+    return parsed
+
+
+def _replace_local_clock(
+    original: datetime,
+    clock: str,
+    display_timezone: ZoneInfo,
+) -> datetime:
+    local_date = original.astimezone(display_timezone).date()
+    naive = datetime.combine(local_date, time.fromisoformat(clock))
+    candidate = naive.replace(tzinfo=display_timezone, fold=0)
+    alternative = naive.replace(tzinfo=display_timezone, fold=1)
+    if candidate.utcoffset() != alternative.utcoffset():
+        raise ValueError("所选时间处于夏令时切换区间，请选择其他时间。")
+    round_trip = (
+        candidate.astimezone(timezone.utc)
+        .astimezone(display_timezone)
+        .replace(tzinfo=None)
+    )
+    if round_trip != naive:
+        raise ValueError("所选本地时间不存在，请选择其他时间。")
+    return candidate
+
+
+def _reminder_form_datetime(
+    values: dict[str, Any],
+    display_timezone: ZoneInfo,
+) -> datetime:
+    try:
+        local_date = date.fromisoformat(str(values.get("date") or "").strip())
+        hour = int(str(values.get("hour") or "").strip())
+        minute = int(str(values.get("minute") or "").strip())
+        naive = datetime.combine(local_date, time(hour, minute))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请填写有效的日期、小时和分钟。") from exc
+    candidate = naive.replace(tzinfo=display_timezone, fold=0)
+    alternative = naive.replace(tzinfo=display_timezone, fold=1)
+    if candidate.utcoffset() != alternative.utcoffset():
+        raise ValueError("所选时间处于夏令时切换区间，请选择其他时间。")
+    round_trip = (
+        candidate.astimezone(timezone.utc)
+        .astimezone(display_timezone)
+        .replace(tzinfo=None)
+    )
+    if round_trip != naive:
+        raise ValueError("所选本地时间不存在，请选择其他时间。")
+    return candidate
+
+
+def _calendar_plan_state_result(
+    plan_id: str,
+    *,
+    error: str,
+    status: str | None = None,
+) -> dict[str, Any]:
+    if error == "calendar_mutation_plan_expired":
+        reply_text = "该确认已过期，请重新发起日程操作。"
+    elif error == "calendar_mutation_plan_not_editable":
+        reply_text = "该日程操作已经开始处理，不能再修改信息。"
+    else:
+        reply_text = "没有找到这项待确认的日程操作。"
+    return {
+        "ok": True,
+        "error": error,
+        "status": status,
+        "plan_id": plan_id,
+        "reply_text": reply_text,
+        "card": card_action_result_card(message=reply_text),
+    }
 
 
 def _expired_schedule_card_result(import_id: uuid.UUID | str) -> dict[str, Any]:
@@ -157,6 +285,16 @@ class CardActionService:
         care_interventions: Any = None,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         course_schedule_imports: Any = None,
+        calendar_delete_executor: Any = None,
+        calendar_mutation_plan_executor: Any = None,
+        calendar_mutation_plans: Any = None,
+        feature_capabilities: Any = None,
+        consent_service: Any = None,
+        care_preferences: Any = None,
+        memory: Any = None,
+        interaction_preferences: Any = None,
+        reminders: Any = None,
+        personalization_proposals: Any = None,
     ):
         self.observations = observations
         self.calendar = calendar
@@ -166,6 +304,16 @@ class CardActionService:
         self.care_interventions = care_interventions
         self.care_outcome_refresh = care_outcome_refresh
         self.course_schedule_imports = course_schedule_imports
+        self.calendar_delete_executor = calendar_delete_executor
+        self.calendar_mutation_plan_executor = calendar_mutation_plan_executor
+        self.calendar_mutation_plans = calendar_mutation_plans
+        self.feature_keys = visible_feature_keys(feature_capabilities)
+        self.consent_service = consent_service
+        self.care_preferences = care_preferences
+        self.memory = memory
+        self.interaction_preferences = interaction_preferences
+        self.reminders = reminders
+        self.personalization_proposals = personalization_proposals
 
     @staticmethod
     def _fallback_event_id(
@@ -196,8 +344,891 @@ class CardActionService:
         action_value: dict[str, Any] | None,
         form_value: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        """Handle a callback and expose a safe backend-state event directive."""
+
+        result = self._handle(
+            participant_id,
+            message_id=message_id,
+            chat_id=chat_id,
+            callback_event_id=callback_event_id,
+            action_value=action_value,
+            form_value=form_value,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        action_name = str((action_value or {}).get("mindflow_action") or "")
+        if result.get("navigation_only"):
+            return result
+        directive = self._backend_state_directive(
+            action_name, action_value or {}, result
+        )
+        return {**result, **({"backend_state_update": directive} if directive else {})}
+
+    @staticmethod
+    def _backend_state_directive(
+        action_name: str, action_value: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, str] | None:
+        """Return only opaque, participant-safe facts for the Agent ledger."""
+
+        direct_actions = {
+            "preference_settings_save": (
+                "interaction_preferences_updated", "interaction_preferences"
+            ),
+            "support_acknowledge_first": (
+                "support_preferences_updated", "support_preferences"
+            ),
+            "support_followup_disable": (
+                "support_preferences_updated", "support_preferences"
+            ),
+            "memory_clear_confirm": ("memory_cleared", "memory"),
+            "memory_delete_confirm": ("memory_deleted", "memory"),
+            "memory_edit_save": ("memory_updated", "memory"),
+            "submit_checkin": ("checkin_recorded", "checkin"),
+            "daily_review_submit": ("daily_review_recorded", "daily_review"),
+            "external_llm_consent_accept": (
+                "external_llm_consent_updated", "consent"
+            ),
+            "external_llm_consent_revoke": (
+                "external_llm_consent_updated", "consent"
+            ),
+        }
+        if action_name in {"personalization_proposal_confirm", "personalization_proposal_cancel"}:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "personalization_proposal_cancelled"
+                if state == "cancelled"
+                else "personalization_proposal_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "personalization_proposal",
+                "resource_id": str(action_value.get("proposal_id") or action_name)[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "设置审核结果已更新")[:240],
+            }
+        if action_name in {"reminder_proposal_confirm", "reminder_proposal_cancel"}:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "reminder_proposal_cancelled"
+                if state == "cancelled"
+                else "reminder_proposal_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "reminder_proposal",
+                "resource_id": str(action_value.get("proposal_id") or action_name)[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "提醒审核结果已更新")[:240],
+            }
+        if action_name in {
+            "calendar_mutation_plan_confirm",
+            "calendar_mutation_plan_cancel",
+            "calendar_delete_confirm",
+            "course_schedule_import_confirm",
+            "course_schedule_import_cancel",
+            "course_schedule_revert_confirm",
+        }:
+            state = "cancelled" if result.get("status") == "cancelled" else "confirmed"
+            event_type = (
+                "calendar_plan_cancelled"
+                if action_name == "calendar_mutation_plan_cancel" and state == "cancelled"
+                else "calendar_plan_queued"
+                if action_name == "calendar_mutation_plan_confirm"
+                else "course_import_revert_confirmed"
+                if action_name == "course_schedule_revert_confirm"
+                else "calendar_action_confirmed"
+            )
+            return {
+                "event_type": event_type,
+                "resource_kind": "calendar_plan",
+                "resource_id": str(
+                    action_value.get("plan_id")
+                    or action_value.get("proposal_id")
+                    or action_value.get("import_id")
+                    or action_value.get("event_id")
+                    or action_value.get("item_id")
+                    or action_name
+                    or ""
+                )[:64],
+                "state": state,
+                "summary": str(result.get("reply_text") or "日历操作状态已更新")[:240],
+            }
+        direct = direct_actions.get(action_name)
+        if direct is None:
+            return None
+        event_type, resource_kind = direct
+        return {
+            "event_type": event_type,
+            "resource_kind": resource_kind,
+            "resource_id": str(
+                result.get(f"{resource_kind}_id")
+                or action_value.get("memory_id")
+                or action_value.get("intervention_id")
+                or action_name
+                or ""
+            )[:64],
+            "state": "committed",
+            "summary": str(result.get("reply_text") or "后端状态已更新")[:240],
+        }
+
+    def _handle(
+        self,
+        participant_id: uuid.UUID,
+        *,
+        message_id: str,
+        chat_id: str | None = None,
+        callback_event_id: str | None = None,
+        action_value: dict[str, Any] | None,
+        form_value: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         action = dict(action_value or {})
         action_name = str(action.get("mindflow_action") or "")
+        from app.card_actions.registry import card_action_spec
+
+        spec = card_action_spec(action_name)
+        if spec is None:
+            return {"ok": False, "error": "unsupported_card_action"}
+        if str(action.get("version") or "") not in spec.versions:
+            return {"ok": False, "error": "unsupported_card_action_version"}
+        if action_name in {
+            "preference_settings_save", "support_acknowledge_first",
+            "support_followup_disable",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.interaction_preferences is None:
+                raise RuntimeError("preference settings are unavailable")
+            if action_name == "preference_settings_save":
+                values = dict(form_value or {})
+                style = {
+                    key: str(values.get(key) or "")
+                    for key in ("verbosity", "tone", "suggestion_style")
+                }
+                if style["verbosity"] not in {"concise", "balanced", "detailed"} or style["tone"] not in {"neutral", "warm", "direct"} or style["suggestion_style"] not in {"ask_first", "light_suggestions", "proactive_suggestions"}:
+                    return {"ok": False, "error": "invalid_interaction_preferences"}
+                try:
+                    max_suggestions = int(values.get("max_suggestions"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "invalid_support_preferences"}
+                try:
+                    self.interaction_preferences.update_preferences(
+                        participant_id,
+                        style_changes=style,
+                        support_changes={"max_suggestions": max_suggestions},
+                    )
+                except ValueError:
+                    return {
+                        "ok": False,
+                        "error": "invalid_interaction_preferences",
+                    }
+            elif action_name == "support_acknowledge_first":
+                self.interaction_preferences.update_support(
+                    participant_id,
+                    {"acknowledge_before_advice": True, "ask_before_suggestion": True},
+                )
+            else:
+                self.interaction_preferences.update_support(
+                    participant_id, {"allow_supportive_follow_up": False}
+                )
+            updated = self.interaction_preferences.get(participant_id)
+            return {"ok": True, "reply_text": "表达与支持偏好已更新。", "card": preference_settings_card(updated)}
+        if action_name in {
+            "reminder_proposal_edit_open",
+            "reminder_proposal_edit_submit",
+            "reminder_proposal_view",
+        }:
+            if self.reminders is None:
+                raise RuntimeError("reminder proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_reminder_proposal_id"}
+            proposal = self.reminders.get_proposal_for_participant(
+                participant_id,
+                proposal_id,
+            )
+            if proposal is None:
+                return {"ok": False, "error": "reminder_proposal_not_found"}
+            if str(proposal.get("status") or "") != "awaiting_confirmation":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_already_resolved",
+                    "status": proposal.get("status"),
+                }
+            if _aware_calendar_datetime(proposal.get("expires_at")) <= datetime.now(
+                timezone.utc
+            ):
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_expired",
+                    "status": "expired",
+                }
+            if str(proposal.get("operation") or "") != "create":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_not_editable",
+                }
+            if action_name == "reminder_proposal_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请核对提醒内容。",
+                    "card": reminder_proposal_confirmation_card(
+                        proposal,
+                        timezone_name=self.timezone.key,
+                    ),
+                }
+            edit_card = reminder_proposal_edit_card(
+                proposal,
+                timezone_name=self.timezone.key,
+            )
+            if action_name == "reminder_proposal_edit_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请修改提醒内容、时间和重复方式。",
+                    "card": edit_card,
+                }
+            values = dict(form_value or {})
+            try:
+                message = " ".join(str(values.get("message") or "").split())
+                if not 1 <= len(message) <= 500:
+                    raise ValueError("提醒内容不能为空且不能超过 500 个字符。")
+                remind_at = _reminder_form_datetime(values, self.timezone)
+                recurrence = str(values.get("recurrence") or "").strip()
+                if recurrence not in {"none", "daily", "weekly"}:
+                    raise ValueError("请选择有效的重复方式。")
+                updated = self.reminders.update_pending_create_proposal(
+                    participant_id,
+                    proposal_id,
+                    message=message,
+                    remind_at=remind_at,
+                    recurrence_type=recurrence,
+                )
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_reminder_proposal_edit",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            if updated is None:
+                return {"ok": False, "error": "reminder_proposal_not_found"}
+            if updated.get("update_status") == "expired":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_expired",
+                    "status": "expired",
+                }
+            if updated.get("update_status") != "updated":
+                return {
+                    "ok": False,
+                    "error": "reminder_proposal_not_editable",
+                    "status": updated.get("status"),
+                }
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "提醒内容已修改，请再次核对后确认。",
+                "card": reminder_proposal_confirmation_card(
+                    updated,
+                    timezone_name=self.timezone.key,
+                ),
+            }
+        if action_name in {
+            "reminder_proposal_confirm", "reminder_proposal_cancel"
+        }:
+            if self.reminders is None:
+                raise RuntimeError("reminder proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_reminder_proposal_id"}
+            result = self.reminders.resolve_proposal(
+                participant_id,
+                proposal_id,
+                confirmed=action_name == "reminder_proposal_confirm",
+            )
+            if not result.get("ok"):
+                return result
+            if result.get("status") == "cancelled":
+                reply_text = "已取消，提醒没有发生变化。"
+            elif result.get("operation") == "cancel":
+                reply_text = "提醒已取消。"
+            else:
+                reminder = dict(result.get("reminder") or {})
+                local_time = datetime.fromisoformat(
+                    str(reminder.get("remind_at") or "")
+                ).astimezone(self.timezone)
+                reply_text = (
+                    f"提醒已创建，将在 {local_time.strftime('%Y-%m-%d %H:%M')} 提醒。"
+                )
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {
+            "interaction_preference_rule_delete",
+        }:
+            if self.personalization_proposals is None:
+                raise RuntimeError("personalization proposals are unavailable")
+            try:
+                rule_id = uuid.UUID(str(action.get("rule_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_semantic_rule_id"}
+            try:
+                proposal = self.personalization_proposals.stage_preference_rule_delete(
+                    participant_id, rule_id=rule_id
+                )
+            except LookupError:
+                return {"ok": False, "error": "semantic_rule_not_found"}
+            return {
+                "ok": True,
+                "reply_text": "请确认是否删除这条沟通规则。",
+                "personalization_proposal": "pending_confirmation",
+                "confirmation_required": True,
+                "persisted": False,
+                "card": personalization_proposal_confirmation_card(proposal),
+            }
+        if action_name in {
+            "personalization_proposal_confirm",
+            "personalization_proposal_cancel",
+        }:
+            if self.personalization_proposals is None:
+                raise RuntimeError("personalization proposals are unavailable")
+            try:
+                proposal_id = uuid.UUID(str(action.get("proposal_id") or ""))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_personalization_proposal_id"}
+            result = self.personalization_proposals.resolve(
+                participant_id,
+                proposal_id,
+                confirmed=action_name == "personalization_proposal_confirm",
+            )
+            if not result.get("ok"):
+                return result
+            if result.get("status") == "cancelled":
+                reply_text = "已取消，长期记忆与偏好没有变化。"
+            else:
+                reply_text = {
+                    "remember": "长期记忆已保存。",
+                    "replace": "长期记忆已修改。",
+                    "delete": "长期记忆已删除。",
+                    "clear": "已清理审核卡中列出的长期记忆。",
+                    "update": "表达与支持偏好已更新。",
+                    "care_update": "提醒与关怀设置已更新。",
+                    "morning_brief_topic": "早报主题设置已更新。",
+                }.get(str(result.get("operation") or ""), "设置已更新。")
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {
+            "memory_delete_prompt", "memory_delete_confirm",
+            "memory_clear_prompt", "memory_clear_confirm",
+            "memory_center_refresh",
+            "memory_detail_open",
+            "memory_edit_open", "memory_edit_save",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.memory is None:
+                raise RuntimeError("Memory Center is unavailable")
+            memories = self.memory.list(participant_id)
+            if action_name == "memory_center_refresh":
+                return {"ok": True, "reply_text": "已返回 Memory Center。", "card": memory_center_card(memories)}
+            if action_name == "memory_clear_prompt":
+                return {"ok": True, "reply_text": "请确认是否清空全部长期记忆。", "card": memory_clear_all_confirmation_card()}
+            if action_name == "memory_clear_confirm":
+                deleted = self.memory.clear_all(participant_id)
+                return {"ok": True, "reply_text": f"已清空 {deleted} 条长期记忆。", "card": memory_center_card([])}
+            try:
+                memory_id = uuid.UUID(str(action.get("memory_id") or ""))
+            except ValueError:
+                return {"ok": False, "error": "invalid_memory_id"}
+            target = next((item for item in memories if item["id"] == str(memory_id)), None)
+            if target is None:
+                return {"ok": False, "error": "memory_not_found"}
+            if action_name == "memory_detail_open":
+                return {"ok": True, "reply_text": "已打开记忆详情。", "card": memory_detail_card(target)}
+            if action_name == "memory_edit_open":
+                return {"ok": True, "reply_text": "请修改这条记忆。", "card": memory_edit_card(target)}
+            if action_name == "memory_edit_save":
+                content = str((form_value or {}).get("content") or "").strip()
+                try:
+                    replacement = self.memory.replace(
+                        participant_id, memory_id, content=content
+                    )
+                except ValueError as exc:
+                    return {"ok": False, "error": "invalid_memory_content", "reply_text": str(exc)}
+                if replacement is None:
+                    return {"ok": False, "error": "memory_not_found"}
+                return {
+                    "ok": True, "reply_text": "这条记忆已修改。",
+                    "card": memory_detail_card(replacement),
+                }
+            if action_name == "memory_delete_prompt":
+                return {"ok": True, "reply_text": "请确认是否删除这条记忆。", "card": memory_delete_confirmation_card(target)}
+            deleted = self.memory.delete(participant_id, memory_id)
+            remaining = self.memory.list(participant_id)
+            return {"ok": deleted, "reply_text": "这条记忆已删除。" if deleted else "没有找到这条记忆。", "card": memory_center_card(remaining)}
+        if action_name in {
+            "morning_brief_toggle", "morning_brief_time_update",
+            "morning_brief_pause_week",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.care_preferences is None:
+                raise RuntimeError("morning brief settings are unavailable")
+            changes: dict[str, Any]
+            if action_name == "morning_brief_toggle":
+                changes = {"morning_brief_enabled": _boolean(action.get("enabled"), "enabled")}
+            elif action_name == "morning_brief_pause_week":
+                changes = {
+                    "morning_brief_paused_until": (
+                        datetime.now(self.timezone) + timedelta(days=7)
+                    ).isoformat()
+                }
+            else:
+                selected = str((form_value or {}).get("morning_brief_local_time") or "")
+                if selected not in {"07:00", "07:30", "08:00", "08:30", "09:00"}:
+                    return {"ok": False, "error": "invalid_morning_brief_time"}
+                changes = {"morning_brief_local_time": selected}
+            updated = self.care_preferences.update(participant_id, changes)
+            return {
+                "ok": True,
+                "reply_text": "早报设置已更新。",
+                "card": morning_brief_settings_card(updated),
+            }
+        if action_name in {
+            "course_schedule_item_time_open",
+            "course_schedule_item_time_submit",
+        }:
+            action_version = str(action.get("version") or "")
+            if action_version not in {"1", "2"}:
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+                item_id = uuid.UUID(str(action.get("item_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule item target is invalid") from exc
+            drafts = self.course_schedule_imports.drafts
+            draft = drafts.get(import_id)
+            if draft is None or str(draft.get("participant_id")) != str(participant_id):
+                return {"ok": False, "error": "course_schedule_import_not_found"}
+            if action_name.endswith("_open"):
+                return {
+                    "ok": True,
+                    "reply_text": "请修改这门课程的起止时间。",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            values = dict(form_value or {})
+            try:
+                if action_version == "2":
+                    start_value = _structured_clock(values, "start")
+                    end_value = _structured_clock(values, "end")
+                else:
+                    start_value = _legacy_clock(values.get("start_time"))
+                    end_value = _legacy_clock(values.get("end_time"))
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "reply_text": str(exc),
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            if not _CLOCK_TIME.fullmatch(start_value) or not _CLOCK_TIME.fullmatch(
+                end_value
+            ):
+                return {
+                    "ok": True,
+                    "reply_text": "请选择完整、有效的开始和结束时间。",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            try:
+                corrected = drafts.apply_correction(
+                    participant_id,
+                    import_id,
+                    item_id=item_id,
+                    start_time=start_value,
+                    end_time=end_value,
+                )
+            except (LookupError, PermissionError):
+                return {"ok": False, "error": "course_schedule_import_not_found"}
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "reply_text": f"课程时间需要调整：{str(exc)[:120]}",
+                    "card": course_schedule_item_time_card(draft, str(item_id)),
+                }
+            return {
+                "ok": True,
+                "status": corrected.get("status"),
+                "reply_text": "课程时间已修改，请核对更新后的预览。",
+                "card": course_schedule_preview_card(corrected),
+            }
+        if action_name in {
+            "calendar_course_series_edit_open",
+            "calendar_course_series_edit_submit",
+            "calendar_course_series_occurrences_view",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.calendar_mutation_plans is None:
+                raise RuntimeError("calendar mutation plans are unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            plan = self.calendar_mutation_plans.get_for_participant(
+                participant_id, plan_id
+            )
+            if plan is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            expires_at = _aware_calendar_datetime(plan.get("expires_at"))
+            if (
+                str(plan.get("status") or "") == "expired"
+                or expires_at <= datetime.now(timezone.utc)
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if (
+                str(plan.get("operation") or "") != "update"
+                or str(plan.get("status") or "") != "awaiting_confirmation"
+                or dict(plan.get("presentation_context") or {}).get("kind")
+                != "course_series_update"
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(plan.get("status") or ""),
+                )
+            if action_name == "calendar_course_series_occurrences_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "已列出这次修改包含的课程场次。",
+                    "card": calendar_course_series_occurrences_card(
+                        plan, timezone_name=self.timezone.key
+                    ),
+                }
+            edit_card = calendar_course_series_edit_card(
+                plan, timezone_name=self.timezone.key
+            )
+            if action_name == "calendar_course_series_edit_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请统一修改课程名称和起止时间。",
+                    "card": edit_card,
+                }
+            values = dict(form_value or {})
+            try:
+                summary = str(values.get("summary") or "").strip()
+                if not summary or len(summary) > 200:
+                    raise ValueError("课程名称不能为空且不能超过 200 个字符。")
+                start_clock = _structured_clock(values, "start")
+                end_clock = _structured_clock(values, "end")
+                if end_clock <= start_clock:
+                    raise ValueError("结束时间必须晚于开始时间。")
+                updated = self.calendar_mutation_plans.update_pending_course_series(
+                    participant_id,
+                    plan_id,
+                    summary=summary,
+                    start_clock=start_clock,
+                    end_clock=end_clock,
+                    timezone_name=self.timezone.key,
+                )
+            except ValueError as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_calendar_course_series_edit",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            if updated is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if updated.get("update_status") == "expired":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if updated.get("update_status") != "updated":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(updated.get("status") or ""),
+                )
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "课程系列信息已统一修改，请核对确认内容。",
+                "card": calendar_mutation_plan_confirmation_card(
+                    updated, timezone_name=self.timezone.key
+                ),
+            }
+        if action_name in {
+            "calendar_mutation_plan_item_edit_open",
+            "calendar_mutation_plan_item_edit_submit",
+            "calendar_mutation_plan_item_time_open",
+            "calendar_mutation_plan_item_time_submit",
+            "calendar_mutation_plan_view",
+        }:
+            if self.calendar_mutation_plans is None:
+                raise RuntimeError("calendar mutation plans are unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            item_id = ""
+            if action_name != "calendar_mutation_plan_view":
+                try:
+                    item_id = str(uuid.UUID(str(action.get("item_id") or "")))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "calendar mutation plan item target is invalid"
+                    ) from exc
+            plan = self.calendar_mutation_plans.get_for_participant(
+                participant_id, plan_id
+            )
+            if plan is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            expires_at = _aware_calendar_datetime(plan.get("expires_at"))
+            if (
+                str(plan.get("status") or "") == "expired"
+                or expires_at <= datetime.now(timezone.utc)
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if (
+                str(plan.get("operation") or "") not in {"create", "update"}
+                or str(plan.get("status") or "") != "awaiting_confirmation"
+            ):
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(plan.get("status") or ""),
+                )
+            if action_name == "calendar_mutation_plan_view":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "已返回最新的日程确认内容。",
+                    "card": calendar_mutation_plan_confirmation_card(
+                        plan, timezone_name=self.timezone.key
+                    ),
+                }
+            try:
+                builder = (
+                    calendar_mutation_plan_item_edit_card
+                    if action_name.startswith("calendar_mutation_plan_item_edit_")
+                    else calendar_mutation_plan_item_time_card
+                )
+                edit_card = builder(plan, item_id, timezone_name=self.timezone.key)
+            except (LookupError, ValueError):
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if action_name in {
+                "calendar_mutation_plan_item_edit_open",
+                "calendar_mutation_plan_item_time_open",
+            }:
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "请修改这项日程的名称和起止时间。",
+                    "card": edit_card,
+                }
+
+            values = dict(form_value or {})
+            try:
+                start_clock = _structured_clock(values, "start")
+                end_clock = _structured_clock(values, "end")
+                ledger_item = next(
+                    value
+                    for value in list(plan.get("ledger_items") or [])
+                    if str(value.get("id") or "") == item_id
+                )
+                payload = dict(ledger_item.get("payload") or {})
+                summary = str(
+                    values.get("summary")
+                    if values.get("summary") is not None
+                    else payload.get("summary")
+                    or ""
+                ).strip()
+                if not summary or len(summary) > 200:
+                    raise ValueError("日程名称不能为空且不能超过 200 个字符。")
+                original_start = _aware_calendar_datetime(
+                    payload.get("start_time")
+                )
+                original_end = _aware_calendar_datetime(payload.get("end_time"))
+                new_start = _replace_local_clock(
+                    original_start, start_clock, self.timezone
+                )
+                new_end = _replace_local_clock(original_end, end_clock, self.timezone)
+                if new_end <= new_start:
+                    raise ValueError("结束时间必须晚于开始时间。")
+            except (StopIteration, ValueError) as exc:
+                return {
+                    "ok": True,
+                    "error": "invalid_calendar_plan_item_time",
+                    "reply_text": str(exc),
+                    "card": edit_card,
+                }
+            updated = self.calendar_mutation_plans.update_pending_item(
+                participant_id,
+                plan_id,
+                item_id,
+                summary=summary,
+                start_time=new_start,
+                end_time=new_end,
+            )
+            if updated is None:
+                return _calendar_plan_state_result(
+                    plan_id, error="calendar_mutation_plan_not_found"
+                )
+            if updated.get("update_status") == "expired":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_expired",
+                    status="expired",
+                )
+            if updated.get("update_status") != "updated":
+                return _calendar_plan_state_result(
+                    plan_id,
+                    error="calendar_mutation_plan_not_editable",
+                    status=str(updated.get("status") or ""),
+                )
+            return {
+                "ok": True,
+                "status": updated.get("status"),
+                "reply_text": "日程信息已修改，请核对更新后的确认内容。",
+                "card": calendar_mutation_plan_confirmation_card(
+                    updated, timezone_name=self.timezone.key
+                ),
+            }
+        if action_name in {
+            "calendar_mutation_plan_confirm",
+            "calendar_mutation_plan_cancel",
+        }:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.calendar_mutation_plan_executor is None:
+                raise RuntimeError("calendar mutation plan executor is unavailable")
+            try:
+                plan_id = str(uuid.UUID(str(action.get("plan_id") or "")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("calendar mutation plan target is invalid") from exc
+            import asyncio
+
+            result = asyncio.run(
+                self.calendar_mutation_plan_executor(
+                    participant_id,
+                    plan_id,
+                    confirmed=action_name.endswith("_confirm"),
+                    source_message_id=(
+                        str(callback_event_id or "").strip()
+                        or self._fallback_event_id(
+                            message_id, action, dict(form_value or {})
+                        )
+                    ),
+                    status_card_message_id=message_id,
+                    status_card_chat_id=chat_id,
+                )
+            )
+            if not result.get("ok"):
+                return result
+            reply_text = str(result.get("reply_text") or "操作已处理。")
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {"calendar_delete_confirm", "calendar_delete_cancel"}:
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if action_name == "calendar_delete_cancel":
+                reply_text = "已取消删除，日程未更改。"
+                return {
+                    "ok": True,
+                    "reply_text": reply_text,
+                    "card": card_action_result_card(message=reply_text),
+                }
+            if self.calendar_delete_executor is None:
+                raise RuntimeError("calendar delete executor is unavailable")
+            event_id = str(action.get("event_id") or "").strip()
+            if not event_id or len(event_id) > 256:
+                raise ValueError("calendar event id is invalid")
+            import asyncio
+
+            result = asyncio.run(
+                self.calendar_delete_executor(
+                    participant_id,
+                    event_id,
+                    source_message_id=(
+                        str(callback_event_id or "").strip()
+                        or self._fallback_event_id(
+                            message_id, action, dict(form_value or {})
+                        )
+                    ),
+                )
+            )
+            if not result.get("ok"):
+                return result
+            reply_text = "日程已删除。"
+            return {
+                **result,
+                "reply_text": reply_text,
+                "card": card_action_result_card(message=reply_text),
+            }
+        if action_name in {
+            "course_schedule_revert_confirm", "course_schedule_revert_cancel"
+        }:
+            if self.course_schedule_imports is None:
+                raise RuntimeError("course schedule import service is unavailable")
+            try:
+                import_id = uuid.UUID(str(action.get("import_id") or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("course schedule import id is invalid") from exc
+            if action_name == "course_schedule_revert_cancel":
+                reply_text = "已取消撤销，课程日程没有变化。"
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": reply_text,
+                    "card": card_action_result_card(message=reply_text),
+                }
+            result = self.course_schedule_imports.revert(
+                participant_id,
+                import_id,
+                status_card_chat_id=chat_id,
+            )
+            reply_text = str(result.get("reply_text") or "课程表撤销已开始。")
+            return {
+                **result,
+                "card": course_schedule_result_card(
+                    reply_text,
+                    status=str(result.get("status") or "") or None,
+                    import_id=str(result.get("import_id") or import_id),
+                    error=str(result.get("error") or "") or None,
+                ),
+            }
         if action_name in {
             "course_schedule_import_confirm",
             "course_schedule_import_cancel",
@@ -287,7 +1318,11 @@ class CardActionService:
                     "card": course_schedule_preview_card(draft),
                 }
             if action_name.endswith("_cancel"):
-                result = self.course_schedule_imports.cancel(participant_id, import_id)
+                result = self.course_schedule_imports.cancel(
+                    participant_id,
+                    import_id,
+                    status_card_chat_id=chat_id,
+                )
             else:
                 import asyncio
 
@@ -379,26 +1414,144 @@ class CardActionService:
                     result_text=result_text,
                 ),
             }
+        if action_name in {"feature_open", "feature_back"}:
+            # Feature cards are navigation only; the callback carries just the
+            # backend-validated feature key and version, and the response
+            # updates the source card in place instead of sending a new one.
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            wanted = (
+                OVERVIEW_FEATURE_KEY
+                if action_name == "feature_back"
+                else str(action.get("feature_key") or "")
+            )
+            card = build_feature_card(wanted, self.feature_keys)
+            if card is None:
+                return {"ok": False, "error": "unsupported_feature"}
+            reply_text = (
+                "这些是我目前能帮你做的事情。"
+                if wanted == OVERVIEW_FEATURE_KEY
+                else "这一项的用法如下，随时可以直接对我说。"
+            )
+            # Navigation only: nothing is committed, so a failed in-place
+            # update must not be reported as a recorded operation.
+            return {
+                "ok": True,
+                "navigation_only": True,
+                "reply_text": reply_text,
+                "card": card,
+            }
+        if action_name.startswith("external_llm_consent_"):
+            # User-owned external LLM consent. The callback binds to the
+            # clicking participant only; grant/revoke are the fixed backend
+            # workflow and the consent record is the sole authority.
+            if str(action.get("version") or "") != "1":
+                return {"ok": False, "error": "unsupported_card_action_version"}
+            if self.consent_service is None:
+                raise RuntimeError("consent service is unavailable")
+            if action_name == "external_llm_consent_accept":
+                # The card must carry the disclosure version the user actually
+                # saw. A stale card never grants a newer consent: zero writes,
+                # re-render the current disclosure instead.
+                from app.services.consent_service import EXTERNAL_LLM_CONSENT_VERSION
+
+                if str(action.get("consent_version") or "") != (
+                    EXTERNAL_LLM_CONSENT_VERSION
+                ):
+                    return {
+                        "ok": True,
+                        "navigation_only": True,
+                        "reply_text": (
+                            "外部 AI 处理说明已经更新，请先查看最新说明后再选择。"
+                        ),
+                        "card": external_llm_consent_card(),
+                    }
+                self.consent_service.grant_external_llm_consent(participant_id)
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "reply_text": (
+                        "已开启外部 AI 处理。请重新发送图片，我会直接处理；"
+                        "对话也会正常回复。"
+                    ),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_decline":
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": external_llm_consent_declined_text(),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_revoke":
+                self.consent_service.revoke_external_llm_consent(participant_id)
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "reply_text": (
+                        "已关闭外部 AI 处理。已保存的记录、本地日历和压力功能不受影响。"
+                    ),
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_status_open":
+                status = self.consent_service.status(participant_id)
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "这是外部 AI 处理的当前状态。",
+                    "card": external_llm_consent_status_card(status),
+                }
+            if action_name == "external_llm_consent_details_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "这是外部 AI 处理的数据范围。",
+                    "card": external_llm_consent_details_card(),
+                }
+            if action_name == "external_llm_consent_prompt_open":
+                return {
+                    "ok": True,
+                    "navigation_only": True,
+                    "reply_text": "开启后即可使用图片识别和对话处理。",
+                    "card": external_llm_consent_card(),
+                }
+            return {"ok": False, "error": "unsupported_card_action"}
         if action_name == "request_checkin":
             return {
                 "ok": True,
                 "reply_text": "请填写此刻状态。",
                 "card": daily_checkin_card(),
             }
-        if action_name == "view_today_calendar":
+        if action_name in {"view_today_calendar", "view_calendar_date"}:
             if self.calendar is None:
                 raise RuntimeError("calendar service is unavailable")
             import asyncio
 
             today = datetime.now(self.timezone).date()
-            start = datetime.combine(today, time.min, self.timezone)
+            requested_date = (
+                date.fromisoformat(str(action.get("local_date") or ""))
+                if action_name == "view_calendar_date"
+                else today
+            )
+            start = datetime.combine(requested_date, time.min, self.timezone)
             events = asyncio.run(
                 self.calendar.get_events(participant_id, start, start + timedelta(days=1))
             )
+            requested_date_is_today = requested_date == today
             return {
                 "ok": True,
-                "reply_text": "已加载今日日程。",
-                "card": today_calendar_card(events, local_date=today.isoformat()),
+                "reply_text": (
+                    "已加载今日日程。"
+                    if requested_date_is_today
+                    else f"已加载 {requested_date.isoformat()} 的日程。"
+                ),
+                "card": today_calendar_card(
+                    events,
+                    local_date=requested_date.isoformat(),
+                    requested_date_is_today=requested_date_is_today,
+                    timezone_name=self.timezone.key,
+                ),
             }
         if action_name == "daily_review_submit":
             if self.daily_reviews is None:

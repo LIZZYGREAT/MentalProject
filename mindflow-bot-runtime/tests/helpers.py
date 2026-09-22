@@ -6,6 +6,11 @@ import uuid
 from app.db import Database, build_engine
 from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.repositories import ParticipantRepository
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import (
+    EXTERNAL_LLM_CONSENT_TYPE,
+    EXTERNAL_LLM_CONSENT_VERSION,
+)
 from app.models import CalendarSnapshot
 
 
@@ -16,9 +21,33 @@ def memory_database() -> Database:
 
 
 def participant(database: Database, code: str):
+    """Create a participant whose external LLM processing is user-consented."""
+
     repository = ParticipantRepository(database)
     created = repository.create(code)
-    return repository.set_external_llm_consent(created.id, allowed=True)
+    ParticipantConsentRepository(database).grant(
+        created.id,
+        EXTERNAL_LLM_CONSENT_TYPE,
+        EXTERNAL_LLM_CONSENT_VERSION,
+    )
+    return created
+
+
+def seed_legacy_external_llm_consent(database: Database, participant_id) -> None:
+    """Seed the legacy researcher/CLI flag directly for audit-path tests.
+
+    Legacy data has no production write entry anymore: the flag must never
+    authorize external LLM processing, so tests construct it at the DB layer.
+    """
+
+    from datetime import datetime, timezone
+
+    from app.models import Participant
+
+    with database.session() as session:
+        row = session.get(Participant, participant_id)
+        if row is not None:
+            row.external_llm_consent_at = datetime.now(timezone.utc)
 
 
 def warning_repository(

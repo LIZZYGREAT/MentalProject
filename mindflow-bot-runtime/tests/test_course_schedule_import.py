@@ -17,6 +17,7 @@ from app.contracts.course_schedule import (
 from app.integrations.feishu.gateway import BotEvent, FeishuEventParser, InvalidBotEvent
 from app.integrations.feishu.cards import (
     course_schedule_context_card,
+    course_schedule_item_time_card,
     course_schedule_preview_card,
     course_schedule_result_card,
 )
@@ -35,7 +36,9 @@ from app.repositories_course_schedule import (
 from app.agent.skill_loader import SkillLoader
 from app.identity.service import IdentityService
 from app.integrations.feishu.gateway import FeishuGateway
-from app.presentation.user_capabilities import help_text, onboarding_text
+from app.presentation.consent_texts import external_llm_consent_prompt_text
+from app.presentation.feature_cards import feature_overview_text
+from app.presentation.onboarding import welcome_first_screen_text
 from app.repositories import (
     AgentRunRepository, BindingRepository, BotEventRepository, ParticipantRepository,
 )
@@ -337,6 +340,214 @@ def test_context_card_submission_completes_draft_without_calendar_write():
     assert "按课程规律添加（推荐）" in payload
     assert "course_schedule_import_confirm" in payload
     assert repository.get(draft["id"])["status"] == "pending_confirmation"
+
+
+def test_item_bound_time_form_edits_one_same_name_course_without_calendar_write():
+    database = memory_database()
+    person = participant(database, "ITEM-TIME-EDIT")
+    repository = CourseScheduleImportRepository(database)
+    payload = vision_payload()
+    first = dict(payload["courses"][0])
+    first.update({
+        "course_name": "计算机体系结构(0965)",
+        "weekday": 1,
+        "period_start": 2,
+        "period_end": 4,
+        "start_time": "08:55",
+        "end_time": "11:40",
+    })
+    second = dict(first)
+    second.update({
+        "period_start": 5,
+        "period_end": 6,
+        "start_time": "12:00",
+        "end_time": "13:40",
+    })
+    payload["courses"] = [first, second]
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-item-edit",
+        source_image_hash="e" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(payload),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    preview = course_schedule_preview_card(draft)
+    edit_actions = [
+        element["behaviors"][0]["value"]
+        for element in preview["body"]["elements"]
+        if element.get("tag") == "button"
+        and element.get("behaviors", [{}])[0]
+        .get("value", {})
+        .get("mindflow_action") == "course_schedule_item_time_open"
+    ]
+    assert len(edit_actions) == 2
+    target_item_id = draft["items"][0]["id"]
+    assert edit_actions[0]["item_id"] == target_item_id
+    visible = json.dumps(preview, ensure_ascii=False)
+    assert "1. **计算机体系结构(0965)**" in visible
+    assert "2. **计算机体系结构(0965)**" in visible
+    assert "修改第 1 门课时间" not in visible
+    assert "修改第 2 门课时间" not in visible
+    assert "修改 计算机体系结构" not in visible
+    elements = preview["body"]["elements"]
+    first_course = next(
+        index
+        for index, element in enumerate(elements)
+        if element.get("tag") == "markdown"
+        and "1. **计算机体系结构(0965)**" in element.get("content", "")
+    )
+    second_course = next(
+        index
+        for index, element in enumerate(elements)
+        if element.get("tag") == "markdown"
+        and "2. **计算机体系结构(0965)**" in element.get("content", "")
+    )
+    assert elements[first_course + 1]["text"]["content"] == "修改时间"
+    assert elements[second_course + 1]["text"]["content"] == "修改时间"
+    assert elements[first_course + 1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][0]["id"]
+    )
+    assert elements[second_course + 1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][1]["id"]
+    )
+    form = course_schedule_item_time_card(draft, target_item_id)
+    form_json = json.dumps(form, ensure_ascii=False)
+    assert "mindflow_course_schedule_item_time" in form_json
+    assert '"tag": "input"' not in form_json
+
+
+    assert form_json.count('"tag": "select_static"') == 4
+    assert "HH:MM" not in form_json
+
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+    submitted = handler.handle(
+        person.id,
+        message_id="om-item-form",
+        action_value={
+            "mindflow_action": "course_schedule_item_time_submit",
+            "version": "2",
+            "import_id": draft["id"],
+            "item_id": target_item_id,
+        },
+        form_value={
+            "start_hour": "08",
+            "start_minute": "55",
+            "end_hour": "11",
+            "end_minute": "30",
+        },
+    )
+
+    assert submitted["ok"] is True
+    updated = repository.get(draft["id"])["structured_result"]["courses"]
+    assert (updated[0]["start_time"], updated[0]["end_time"]) == (
+        "08:55",
+        "11:30",
+    )
+    assert (updated[1]["start_time"], updated[1]["end_time"]) == (
+        "12:00",
+        "13:40",
+    )
+
+
+def test_course_edit_button_keeps_visual_index_when_middle_item_is_not_editable():
+    course = dict(vision_payload()["courses"][0])
+    draft = {
+        "id": str(uuid.uuid4()),
+        "status": "pending_confirmation",
+        "timezone": "Asia/Shanghai",
+        "semester_start_date": "2026-09-07",
+        "structured_result": {
+            "courses": [
+                {**course, "course_name": "同名长课程" * 10},
+                {**course, "course_name": "同名长课程" * 10},
+                {**course, "course_name": "同名长课程" * 10},
+            ],
+            "missing_context": ["weekday"],
+        },
+        "items": [
+            {"id": str(uuid.uuid4())},
+            {"id": ""},
+            {"id": str(uuid.uuid4())},
+        ],
+    }
+
+    card = course_schedule_preview_card(draft)
+    buttons = [
+        element
+        for element in card["body"]["elements"]
+        if element.get("tag") == "button"
+        and element.get("behaviors", [{}])[0]
+        .get("value", {})
+        .get("mindflow_action") == "course_schedule_item_time_open"
+    ]
+
+    assert [button["text"]["content"] for button in buttons] == [
+        "修改时间",
+        "修改时间",
+    ]
+    assert buttons[0]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][0]["id"]
+    )
+    assert buttons[1]["behaviors"][0]["value"]["item_id"] == (
+        draft["items"][2]["id"]
+    )
+    assert all(len(button["text"]["content"]) < 20 for button in buttons)
+    elements = card["body"]["elements"]
+    course_positions = [
+        next(
+            index
+            for index, element in enumerate(elements)
+            if element.get("tag") == "markdown"
+            and f"{display_index}. **" in element.get("content", "")
+        )
+        for display_index in (1, 2, 3)
+    ]
+    assert elements[course_positions[0] + 1] is buttons[0]
+    assert elements[course_positions[1] + 1].get("tag") == "markdown"
+    assert elements[course_positions[2] + 1] is buttons[1]
+
+
+def test_legacy_time_card_submission_accepts_unpadded_and_full_width_colon():
+    database = memory_database()
+    person = participant(database, "ITEM-TIME-LEGACY")
+    repository = CourseScheduleImportRepository(database)
+    draft = repository.create_draft(
+        person.id,
+        source_message_id="om-item-edit-legacy",
+        source_image_hash="f" * 64,
+        vision_model="vision-model",
+        result=ScheduleVisionResult.from_dict(vision_payload()),
+        timezone_name="Asia/Shanghai",
+        semester_start_date=date(2026, 9, 7),
+    )
+    target_item_id = draft["items"][0]["id"]
+    handler = CardActionService(
+        object(),
+        observation_refresh=object(),
+        course_schedule_imports=SimpleNamespace(drafts=repository),
+    )
+
+    result = handler.handle(
+        person.id,
+        message_id="om-legacy-card",
+        action_value={
+            "mindflow_action": "course_schedule_item_time_submit",
+            "version": "1",
+            "import_id": draft["id"],
+            "item_id": target_item_id,
+        },
+        form_value={"start_time": "8：05", "end_time": "9:40"},
+    )
+
+    assert result["ok"] is True
+    course = repository.get(draft["id"])["structured_result"]["courses"][0]
+    assert (course["start_time"], course["end_time"]) == ("08:05", "09:40")
 
 
 def test_create_draft_outcome_distinguishes_new_from_idempotent_existing():
@@ -851,9 +1062,9 @@ def test_bind_and_help_use_stable_copy_without_agent():
 
     asyncio.run(scenario())
     assert sender.sent == [
-        onboarding_text("P009"),
-        help_text(),
-        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
+        welcome_first_screen_text(),
+        feature_overview_text(),
+        external_llm_consent_prompt_text(),
     ]
     assert runtime.calls == 0
     assert vision.calls == 0
@@ -1035,7 +1246,10 @@ def test_image_workflow_does_not_write_before_card_confirmation():
         await worker.process(await queue.get())
 
     asyncio.run(scenario())
-    assert len(sender.cards) == 1
+    # Card 1 is the bind-success welcome screen; card 2 is the schedule
+    # preview produced by the image workflow.
+    assert len(sender.cards) == 2
+    assert sender.cards[1]["header"]["title"]["content"] == "课程表识别结果"
     assert runtime.calls == 1
     assert calendar.calls == []
 
@@ -2289,6 +2503,7 @@ def _pipeline_worker(resources, tracker):
         return True
 
     worker._deliver_card = deliver_card
+    worker._deliver_course_schedule_preview = deliver_card
     return worker
 
 

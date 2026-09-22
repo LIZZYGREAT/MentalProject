@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
+import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
 from app.agent.context import AgentContext, CalendarMutationOperation, TurnEffectPolicy
+from app.agent.participant_safe_result import participant_safe_result
 from app.repositories import AgentRunRepository
 from app.services.mutation_intent_verifier import (
     MutationIntentVerifier,
     redact_sensitive_text,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 FORBIDDEN_FIELDS = {
@@ -41,6 +49,9 @@ ToolEffect = Literal[
     "read",
     "compute",
     "ui_effect",
+    "draft_write",
+    "proposal_stage",
+    "confirmed_effect",
     "internal_write",
     "external_write",
     "destructive_external_write",
@@ -56,7 +67,6 @@ STATE_CHANGING_EFFECTS = frozenset(
 )
 _SERVER_BOUND_NO_PROVIDER_EFFECT_TOOLS = {
     "course_schedule_cancel_pending_draft": "cancel_or_revert",
-    "course_schedule_cancel_or_revert_import": "cancel_or_revert",
     "course_schedule_import_from_recent_image": "schedule_image_import",
 }
 
@@ -68,6 +78,8 @@ _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
             "read",
             "compute",
             "ui_effect",
+            "draft_write",
+            "proposal_stage",
             "internal_write",
             "external_write",
             "destructive_external_write",
@@ -79,9 +91,21 @@ _ALLOWED_EFFECTS_BY_TURN_POLICY: dict[
 
 CALENDAR_MUTATION_TOOLS: dict[str, CalendarMutationOperation] = {
     "calendar_create_event": "create",
+    "calendar_create_events_plan": "create",
     "calendar_update_event": "update",
+    "calendar_update_events_plan": "update",
     "calendar_delete_event": "delete",
+    "calendar_delete_events_plan": "delete",
 }
+
+_DETERMINISTIC_TOOL_ERRORS = frozenset({
+    "invalid_arguments",
+    "calendar_invalid_range",
+    "calendar_range_too_large",
+    "mutation_needs_clarification",
+    "tool_effect_not_authorized",
+    "calendar_mutation_not_authorized",
+})
 
 
 @dataclass(frozen=True)
@@ -94,6 +118,7 @@ class ToolSpec:
     handler: ToolHandler
     execution_mode: Literal["async", "sync_io"]
     authorization_context_resolver: AuthorizationContextResolver | None = None
+    required_scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,7 +155,10 @@ def _safe_summary(value: Any, depth: int = 0) -> Any:
         return {
             str(key): "[redacted]"
             if str(key).lower() in FORBIDDEN_FIELDS
-            or str(key).lower().endswith("_id")
+            or (
+                str(key).lower() != "error_id"
+                and str(key).lower().endswith(("_id", "_ids"))
+            )
             else _safe_summary(child, depth + 1)
             for key, child in list(value.items())[:30]
         }
@@ -151,7 +179,7 @@ def _safe_authorization_context(value: Any, depth: int = 0) -> Any:
             str(key): _safe_authorization_context(child, depth + 1)
             for key, child in list(value.items())[:30]
             if str(key).lower() not in FORBIDDEN_FIELDS
-            and not str(key).lower().endswith("_id")
+            and not str(key).lower().endswith(("_id", "_ids"))
             and "provider" not in str(key).lower()
         }
     if isinstance(value, list):
@@ -166,19 +194,24 @@ def _safe_authorization_context(value: Any, depth: int = 0) -> Any:
 def _verifier_proposal_summary(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Describe proposal scope without sending provider/database identifiers."""
 
-    exact_target = bool(arguments.get("event_id")) if name in {
-        "calendar_update_event",
-        "calendar_delete_event",
-    } else None
+    exact_target = (
+        bool(arguments.get("event_id"))
+        if name in {"calendar_update_event", "calendar_delete_event"}
+        else None
+    )
     semantic_arguments = {
         str(key): _safe_summary(value)
         for key, value in arguments.items()
         if str(key).lower() not in FORBIDDEN_FIELDS
-        and not str(key).lower().endswith("_id")
+        and not str(key).lower().endswith(("_id", "_ids"))
     }
     summary: dict[str, Any] = {"proposed_operation": str(name)[:128]}
     if exact_target is not None:
         summary["exact_target_supplied"] = exact_target
+    if name == "calendar_delete_events_plan":
+        summary["exact_target_count"] = len(arguments.get("event_ids") or [])
+    if name == "calendar_update_events_plan":
+        summary["exact_target_count"] = len(arguments.get("updates") or [])
     if semantic_arguments:
         summary["requested_values"] = semantic_arguments
     return summary
@@ -219,13 +252,51 @@ class ToolRegistry:
         self,
         runs: AgentRunRepository | None = None,
         *,
+        incidents: Any = None,
         mutation_verifier: MutationIntentVerifier | None = None,
         sync_max_concurrency: int = 8,
     ):
         self._tools: dict[str, ToolSpec] = {}
         self.runs = runs
+        self.incidents = incidents
         self.mutation_verifier = mutation_verifier
         self._sync_slots = asyncio.Semaphore(max(1, int(sync_max_concurrency)))
+        self._non_retryable_failures: dict[tuple[str, str, str], str] = {}
+
+    @staticmethod
+    def _present(ctx: AgentContext, result: dict[str, Any], status: str) -> ToolExecution:
+        return ToolExecution(participant_safe_result(ctx, result), status)
+
+    @staticmethod
+    def _tool_call_key(
+        ctx: AgentContext, name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str, str]:
+        canonical = json.dumps(
+            arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return str(ctx.agent_run_id), str(name), digest
+
+    def _remember_non_retryable(
+        self,
+        ctx: AgentContext,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        error = str(result.get("error") or "")
+        if not (
+            result.get("do_not_retry") is True
+            or result.get("retryable") is False
+            or error in _DETERMINISTIC_TOOL_ERRORS
+        ):
+            return
+        if len(self._non_retryable_failures) >= 2048:
+            self._non_retryable_failures.pop(next(iter(self._non_retryable_failures)))
+        self._non_retryable_failures[
+            self._tool_call_key(ctx, name, arguments)
+        ] = str(result.get("reason_code") or error or "non_retryable_failure")[:80]
 
     def register(
         self,
@@ -238,10 +309,22 @@ class ToolRegistry:
         authorization_requirement: AuthorizationRequirement,
         execution_mode: Literal["async", "sync_io"] | None = None,
         authorization_context_resolver: AuthorizationContextResolver | None = None,
+        required_scope: str | None = None,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"duplicate tool: {name}")
         forbidden = _schema_fields(parameters) & FORBIDDEN_FIELDS
+        if name in {
+            "web_read_url", "video_inspect_url", "research_open_url",
+            "research_browser_open",
+        }:
+            # These reviewed read-only tools necessarily accept a URL.  Their
+            # handlers apply the HTTPS/credential/secret-query/SSRF gate.
+            # The handler applies the HTTPS/credential/secret-query/SSRF gate;
+            # URL remains forbidden for every other tool schema. Research
+            # handlers use the same public-only SSRF boundary in the isolated
+            # runtime and never accept cookies or credentials.
+            forbidden.discard("url")
         if forbidden:
             raise ValueError(f"tool schema contains forbidden identity fields: {sorted(forbidden)}")
         schema = dict(parameters)
@@ -257,11 +340,18 @@ class ToolRegistry:
             "read",
             "compute",
             "ui_effect",
+            "draft_write",
+            "proposal_stage",
+            "confirmed_effect",
             "internal_write",
             "external_write",
             "destructive_external_write",
         }:
             raise ValueError("invalid tool effect")
+        if effect == "confirmed_effect":
+            raise ValueError(
+                "confirmed_effect executors cannot be exposed through ToolRegistry"
+            )
         if authorization_requirement not in {
             "none",
             "direct_request",
@@ -296,6 +386,7 @@ class ToolRegistry:
             handler,
             mode,
             authorization_context_resolver,
+            str(required_scope).strip() if required_scope else None,
         )
 
     @property
@@ -306,7 +397,26 @@ class ToolRegistry:
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(self._tools.values())
 
-    def schemas(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _scope_allowed(spec: ToolSpec, ctx: AgentContext | None) -> bool:
+        if spec.required_scope is None:
+            return True
+        return bool(
+            ctx is not None
+            and ctx.access_tier == "researcher"
+            and spec.required_scope in ctx.scopes
+        )
+
+    def specs_for(self, ctx: AgentContext | None) -> tuple[ToolSpec, ...]:
+        return tuple(
+            spec for spec in self._tools.values()
+            if self._scope_allowed(spec, ctx)
+        )
+
+    def names_for(self, ctx: AgentContext | None) -> tuple[str, ...]:
+        return tuple(spec.name for spec in self.specs_for(ctx))
+
+    def schemas(self, ctx: AgentContext | None = None) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -316,7 +426,7 @@ class ToolRegistry:
                     "parameters": spec.parameters,
                 },
             }
-            for spec in self._tools.values()
+            for spec in self.specs_for(ctx)
         ]
 
     async def execute(
@@ -335,7 +445,18 @@ class ToolRegistry:
                 "not_evaluated",
                 "invalid_tool",
             )
-            return ToolExecution(result, "invalid_tool")
+            return self._present(ctx, result, "invalid_tool")
+        if not self._scope_allowed(spec, ctx):
+            result = {
+                "ok": False,
+                "error": "tool_not_authorized",
+                "reason_code": "required_scope_missing",
+            }
+            await self._log(
+                ctx, name, spec, None, result, "tool_not_authorized",
+                "deny", "required_scope_missing",
+            )
+            return self._present(ctx, result, "tool_not_authorized")
         if not isinstance(arguments, dict):
             result = {"ok": False, "error": "invalid_arguments"}
             await self._log(
@@ -348,7 +469,29 @@ class ToolRegistry:
                 "not_evaluated",
                 "arguments_not_object",
             )
-            return ToolExecution(result, "invalid_arguments")
+            return self._present(ctx, result, "invalid_arguments")
+        repeated_reason = self._non_retryable_failures.get(
+            self._tool_call_key(ctx, name, arguments)
+        )
+        if repeated_reason is not None:
+            result = {
+                "ok": False,
+                "error": "repeated_non_retryable_tool_call",
+                "reason_code": repeated_reason,
+                "retryable": False,
+                "do_not_retry": True,
+            }
+            await self._log(
+                ctx,
+                name,
+                spec,
+                arguments,
+                result,
+                "repeated_non_retryable_tool_call",
+                "not_evaluated",
+                repeated_reason,
+            )
+            return self._present(ctx, result, "repeated_non_retryable_tool_call")
         errors = sorted(
             Draft202012Validator(
                 spec.parameters, format_checker=FormatChecker()
@@ -360,7 +503,10 @@ class ToolRegistry:
                 "ok": False,
                 "error": "invalid_arguments",
                 "detail": errors[0].message[:300],
+                "retryable": False,
+                "do_not_retry": True,
             }
+            self._remember_non_retryable(ctx, name, arguments, result)
             await self._log(
                 ctx,
                 name,
@@ -371,7 +517,7 @@ class ToolRegistry:
                 "not_evaluated",
                 "schema_validation_failed",
             )
-            return ToolExecution(result, "invalid_arguments")
+            return self._present(ctx, result, "invalid_arguments")
 
         allowed_effects = _ALLOWED_EFFECTS_BY_TURN_POLICY.get(
             ctx.turn_effect_policy, frozenset()
@@ -397,7 +543,7 @@ class ToolRegistry:
                 "deny",
                 reason_code,
             )
-            return ToolExecution(result, "tool_effect_not_authorized")
+            return self._present(ctx, result, "tool_effect_not_authorized")
 
         authorization_decision = "not_required"
         reason_code = "authorization_not_required"
@@ -456,7 +602,7 @@ class ToolRegistry:
                         "unavailable",
                         reason_code,
                     )
-                    return ToolExecution(result, "authorization_unavailable")
+                    return self._present(ctx, result, "authorization_unavailable")
             if deterministic_authorization:
                 authorization_decision = "allow"
                 reason_code = "server_bound_no_provider_effect"
@@ -476,7 +622,7 @@ class ToolRegistry:
                     "unavailable",
                     "verifier_unavailable",
                 )
-                return ToolExecution(result, "authorization_unavailable")
+                return self._present(ctx, result, "authorization_unavailable")
             if not deterministic_authorization:
                 try:
                     decision = await self.mutation_verifier.verify(
@@ -506,7 +652,7 @@ class ToolRegistry:
                         "unavailable",
                         "verifier_failure",
                     )
-                    return ToolExecution(result, "authorization_unavailable")
+                    return self._present(ctx, result, "authorization_unavailable")
                 authorization_decision = decision.decision
                 reason_code = decision.reason_code
                 if decision.decision == "deny":
@@ -525,7 +671,7 @@ class ToolRegistry:
                         authorization_decision,
                         reason_code,
                     )
-                    return ToolExecution(result, "tool_effect_not_authorized")
+                    return self._present(ctx, result, "tool_effect_not_authorized")
                 if decision.decision == "needs_clarification":
                     result = {
                         "ok": False,
@@ -542,7 +688,7 @@ class ToolRegistry:
                         authorization_decision,
                         reason_code,
                     )
-                    return ToolExecution(result, "mutation_needs_clarification")
+                    return self._present(ctx, result, "mutation_needs_clarification")
 
         calendar_operation = CALENDAR_MUTATION_TOOLS.get(name)
         if (
@@ -564,7 +710,7 @@ class ToolRegistry:
                 "deny",
                 "calendar_operation_not_allowed",
             )
-            return ToolExecution(result, "calendar_mutation_not_authorized")
+            return self._present(ctx, result, "calendar_mutation_not_authorized")
         try:
             if spec.execution_mode == "async":
                 value = spec.handler(ctx, arguments)
@@ -575,6 +721,7 @@ class ToolRegistry:
                 value = await value
             result = value if isinstance(value, dict) else {"value": value}
             safe = _safe_summary(result)
+            self._remember_non_retryable(ctx, name, arguments, result)
             await self._log(
                 ctx,
                 name,
@@ -585,9 +732,45 @@ class ToolRegistry:
                 authorization_decision,
                 reason_code,
             )
-            return ToolExecution(safe, "succeeded")
-        except Exception:
-            result = {"ok": False, "error": "tool_exception"}
+            return self._present(ctx, safe, "succeeded")
+        except Exception as exc:
+            structured_result_factory = getattr(exc, "as_tool_result", None)
+            if callable(structured_result_factory):
+                structured_result = structured_result_factory()
+                if isinstance(structured_result, dict):
+                    structured_result = dict(structured_result)
+                    structured_result.setdefault("ok", False)
+                    structured_result.setdefault("do_not_retry", True)
+                    self._remember_non_retryable(
+                        ctx, name, arguments, structured_result
+                    )
+                    await self._log(
+                        ctx,
+                        name,
+                        spec,
+                        arguments,
+                        _safe_summary(structured_result),
+                        "needs_clarification",
+                        authorization_decision,
+                        str(structured_result.get("reason_code") or "needs_clarification"),
+                    )
+                    return self._present(ctx, structured_result, "needs_clarification")
+            error_id = uuid.uuid4().hex
+            result = {
+                "ok": False,
+                "error": "tool_exception",
+                "reason_code": "internal_tool_error",
+                "error_id": error_id,
+            }
+            logger.exception(
+                "agent_tool_execution_failed error_id=%s agent_run_id=%s "
+                "tool_name=%s participant_id=%s error_class=%s",
+                error_id,
+                ctx.agent_run_id,
+                name,
+                ctx.participant_id,
+                type(exc).__name__,
+            )
             await self._log(
                 ctx,
                 name,
@@ -596,9 +779,53 @@ class ToolRegistry:
                 result,
                 "tool_exception",
                 authorization_decision,
-                reason_code,
+                "internal_tool_error",
             )
-            return ToolExecution(result, "tool_exception")
+            await self._record_tool_incident(
+                ctx,
+                name=name,
+                error_id=error_id,
+                error_class=type(exc).__name__,
+            )
+            return self._present(ctx, result, "tool_exception")
+
+    async def _record_tool_incident(
+        self,
+        ctx: AgentContext,
+        *,
+        name: str,
+        error_id: str,
+        error_class: str,
+    ) -> None:
+        if self.incidents is None:
+            return
+        try:
+            async with self._sync_slots:
+                await asyncio.to_thread(
+                    self.incidents.record,
+                    severity="error",
+                    subsystem="agent_tool",
+                    event_name="tool_execution_failed",
+                    summary="A participant-bound agent tool failed internally.",
+                    participant_id=ctx.participant_id,
+                    error_code="internal_tool_error",
+                    error_class=error_class,
+                    details={
+                        "error_id": error_id,
+                        "agent_run_id": str(ctx.agent_run_id),
+                        "tool_name": str(name)[:128],
+                        "error_class": str(error_class)[:128],
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "agent_tool_incident_record_failed error_id=%s agent_run_id=%s "
+                "tool_name=%s participant_id=%s",
+                error_id,
+                ctx.agent_run_id,
+                name,
+                ctx.participant_id,
+            )
 
     async def _log(
         self,

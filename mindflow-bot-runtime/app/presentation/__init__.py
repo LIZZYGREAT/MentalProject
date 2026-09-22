@@ -3,6 +3,9 @@
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
+    ExternalEvidenceSource,
+    PresentationEvidence,
+    PresentationMode,
     ResponsePlan,
     ResponseSegment,
     RuntimeResponse,
@@ -11,6 +14,9 @@ from app.presentation.contracts import (
 __all__ = [
     "AgentActivityCallback",
     "AgentActivityEvent",
+    "ExternalEvidenceSource",
+    "PresentationEvidence",
+    "PresentationMode",
     "ResponsePlan",
     "ResponseSegment",
     "RuntimeResponse",

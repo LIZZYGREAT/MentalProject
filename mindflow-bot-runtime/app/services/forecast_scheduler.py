@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, time, timedelta, timezone
+import hashlib
 import logging
 from typing import Protocol
 import uuid
@@ -20,6 +21,8 @@ from app.repositories import (
 )
 from app.services.forecast_coordinator import ForecastCoordinator
 from app.services.care_outcome_refresh import CareOutcomeRefreshService
+from app.contracts.care_evidence import CareEvidencePacket
+from app.services.care_draft_validator import CareDraftValidator
 
 
 class CalibrationService(Protocol):
@@ -44,6 +47,8 @@ class ForecastScheduler:
         care_card_enabled: bool = False,
         care_outcome_refresh: CareOutcomeRefreshService | None = None,
         care_outcome_reconcile_interval_seconds: int = 1200,
+        proactive_policy: object | None = None,
+        care_composer: object | None = None,
     ):
         self.coordinator = coordinator
         self.participants = participants
@@ -75,6 +80,9 @@ class ForecastScheduler:
         self.care_outcome_reconcile_interval = min(
             1800, max(600, int(care_outcome_reconcile_interval_seconds))
         )
+        self.proactive_policy = proactive_policy
+        self.care_composer = care_composer
+        self.care_draft_validator = CareDraftValidator()
         self._stop = asyncio.Event()
         self.started = asyncio.Event()
 
@@ -310,12 +318,83 @@ class ForecastScheduler:
             now=datetime.now(timezone.utc),
         ):
             return
+        reservation_id = None
+        if self.proactive_policy is not None:
+            decision = await asyncio.to_thread(
+                self.proactive_policy.reserve,
+                uuid.UUID(claimed["participant_id"]),
+                message_kind="warning",
+                dedupe_key=f"warning:{warning_id}",
+                scheduled_at=now,
+                now=now,
+            )
+            if not decision.allowed:
+                await asyncio.to_thread(
+                    self.warnings.suppress_claim,
+                    warning_id,
+                    claim_token=claim_token,
+                    expected_forecast_version=expected_forecast_version,
+                    now=now,
+                    reason=decision.reason,
+                )
+                return
+            reservation_id = decision.reservation_id
         payload = claimed["payload"]
         text = str(
             payload.get("message")
             or payload.get("fallback_message")
             or "预测到临近的高压时段，可以提前安排短暂休息。"
         )
+        stored_composition = dict(payload.get("care_composition") or {})
+        if not stored_composition and self.care_composer is not None:
+            evidence_payload = payload.get("care_evidence")
+            consent_check = getattr(self.coordinator, "_has_external_llm_consent", None)
+            consent_active = False
+            if callable(consent_check):
+                try:
+                    consent_active = await consent_check(uuid.UUID(claimed["participant_id"]))
+                except Exception:
+                    consent_active = False
+            if consent_active and isinstance(evidence_payload, dict):
+                try:
+                    evidence = CareEvidencePacket.from_dict(evidence_payload)
+                    timeout = max(1.0, min(15.0, float(getattr(self.care_composer, "timeout_seconds", 8.0))))
+                    draft = await asyncio.wait_for(
+                        self.care_composer.compose(evidence), timeout=timeout
+                    )
+                    validation = self.care_draft_validator.validate(evidence, draft)
+                    if validation.valid and validation.draft is not None:
+                        candidate = validation.draft
+                        generated_at = datetime.now(timezone.utc).isoformat()
+                        composition = {
+                            "mode": "agent",
+                            "prompt_version": candidate.prompt_version,
+                            "model": candidate.model,
+                            "selected_fact_ids": list(candidate.selected_fact_ids),
+                            "selected_reason_codes": list(candidate.selected_reason_codes),
+                            "message_hash": hashlib.sha256(
+                                candidate.message.encode("utf-8")
+                            ).hexdigest(),
+                            "generated_at": generated_at,
+                            "validator_version": self.care_draft_validator.version,
+                        }
+                        persisted = await asyncio.to_thread(
+                            self.warnings.persist_claimed_composition,
+                            warning_id,
+                            claim_token=claim_token,
+                            expected_forecast_version=expected_forecast_version,
+                            message=candidate.message,
+                            composition=composition,
+                            now=datetime.now(timezone.utc),
+                        )
+                        if persisted:
+                            text = candidate.message
+                except Exception as exc:
+                    logger.info(
+                        "care_agent_composition_fallback warning_id=%s error_class=%s",
+                        warning_id,
+                        type(exc).__name__,
+                    )
         try:
             plan = dict(payload.get("care_plan") or {})
             care_actions = [
@@ -362,6 +441,12 @@ class ForecastScheduler:
                 summary="A forecast warning could not be delivered.",
                 details={"warning_id": str(warning_id)},
             )
+            if reservation_id is not None:
+                await asyncio.to_thread(
+                    self.proactive_policy.release,
+                    reservation_id,
+                    reason="provider_failed",
+                )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
                 claim_token=claim_token,
@@ -386,6 +471,12 @@ class ForecastScheduler:
                 summary="A forecast warning could not be delivered.",
                 details={"warning_id": str(warning_id)},
             )
+            if reservation_id is not None:
+                await asyncio.to_thread(
+                    self.proactive_policy.release,
+                    reservation_id,
+                    reason="provider_failed",
+                )
             await asyncio.to_thread(
                 self.warnings.finish_claim, warning_id, sent=False,
                 claim_token=claim_token,
@@ -395,6 +486,10 @@ class ForecastScheduler:
                 retry_base_seconds=self.warning_retry_base_seconds,
             )
             return
+        if reservation_id is not None:
+            await asyncio.to_thread(
+                self.proactive_policy.mark_sent, reservation_id, now=now
+            )
         await asyncio.to_thread(
             self.warnings.finish_claim, warning_id, sent=True,
             claim_token=claim_token,

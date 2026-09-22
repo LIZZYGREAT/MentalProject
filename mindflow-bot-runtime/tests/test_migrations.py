@@ -162,6 +162,19 @@ def test_migration_revision_ids_fit_alembic_version_capacity():
     assert migration_0037.down_revision == "0036_stage5_effective_profile"
 
 
+def test_0048_documents_fail_closed_legacy_processing_and_expiry_strategy():
+    migration = _migration(VERSIONS / "0048_calendar_mutation_plan_items.py")
+    source = (VERSIONS / "0048_calendar_mutation_plan_items.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert migration.down_revision == "0047_calendar_mutation_plans"
+    assert "legacy_plan_expired_on_0048_upgrade" in source
+    assert "0048 refuses to upgrade while legacy processing Calendar plans" in source
+    assert "WHERE status = 'processing'" in source
+    assert "status = 'expired'" in source
+
+
 def test_course_schedule_import_migration_extends_stage6_head():
     migration_0038 = _migration(VERSIONS / "0038_course_schedule_import.py")
     assert migration_0038.down_revision == "0037_stage6_care_jitai"
@@ -1036,3 +1049,129 @@ def test_0017_adds_calendar_state_and_safe_snooze_backfill(monkeypatch):
     assert "intervention.id::text" in snooze_backfill
     assert "candidate.candidate_rank = 1" in snooze_backfill
     assert "::uuid" not in snooze_backfill
+
+
+def test_0067_adds_nullable_web_search_provider_audit_fields(monkeypatch):
+    migration = _migration(VERSIONS / "0067_web_search_provider_audit.py")
+    columns = []
+    dropped = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: columns.append((table, column.name, column.nullable)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_column",
+        lambda table, name: dropped.append((table, name)),
+    )
+
+    migration.upgrade()
+    assert columns == [
+        ("web_search_runs", "provider", True),
+        ("web_search_runs", "provider_summary", True),
+        ("web_search_runs", "provider_request_id", True),
+    ]
+
+    migration.downgrade()
+    assert dropped == [
+        ("web_search_runs", "provider_request_id"),
+        ("web_search_runs", "provider_summary"),
+        ("web_search_runs", "provider"),
+    ]
+
+
+def test_0068_adds_durable_card_action_receipts(monkeypatch):
+    migration = _migration(VERSIONS / "0068_card_action_receipts.py")
+    tables = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "create_table",
+        lambda name, *columns, **_kwargs: tables.append((name, columns)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, columns, **_kwargs: indexes.append(
+            (name, table, columns)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0067_web_search_provider_audit"
+    assert tables[0][0] == "card_action_receipts"
+    column_names = {
+        column.name for column in tables[0][1] if hasattr(column, "name")
+    }
+    assert {
+        "event_id",
+        "participant_id",
+        "action_name",
+        "action_version",
+        "action_fingerprint",
+        "message_id_hash",
+        "status",
+        "result_kind",
+        "result_json",
+        "error_code",
+        "created_at",
+        "completed_at",
+    } <= column_names
+    assert indexes == [
+        (
+            "ix_card_action_receipt_participant_created",
+            "card_action_receipts",
+            ["participant_id", "created_at"],
+        )
+    ]
+
+
+def test_0069_minimizes_receipts_and_backfills_expiry(monkeypatch):
+    migration = _migration(
+        VERSIONS / "0069_card_action_receipt_minimization.py"
+    )
+    added = []
+    altered = []
+    dropped = []
+    statements = []
+    indexes = []
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: added.append((table, column.name, column.nullable)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda table, name, **kwargs: altered.append((table, name, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_column",
+        lambda table, name: dropped.append((table, name)),
+    )
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, columns, **kwargs: indexes.append(
+            (name, table, columns, kwargs)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0068_card_action_receipts"
+    assert added == [("card_action_receipts", "expires_at", True)]
+    assert "created_at + INTERVAL '168 hours'" in statements[0]
+    assert altered[0][0:2] == ("card_action_receipts", "expires_at")
+    assert altered[0][2]["nullable"] is False
+    assert dropped == [("card_action_receipts", "result_json")]
+    assert indexes == [(
+        "ix_card_action_receipt_expiry",
+        "card_action_receipts",
+        ["expires_at"],
+        {"unique": False},
+    )]

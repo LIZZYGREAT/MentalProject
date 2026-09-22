@@ -44,12 +44,25 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _allowlist(env: Mapping[str, str], name: str) -> tuple[str, ...]:
+    values = {
+        item.strip().casefold()
+        for item in env.get(name, "").split(",")
+        if item.strip()
+    }
+    if any(len(item) > 32 for item in values):
+        raise ValueError(f"{name} entries must be <= 32 characters")
+    if len(values) > 100:
+        raise ValueError(f"{name} must contain <= 100 entries")
+    return tuple(sorted(values))
+
+
 def _presentation_agent_mode(env: Mapping[str, str]) -> str:
     explicit = env.get("PRESENTATION_AGENT_MODE", "").strip().lower()
     if explicit:
         return explicit
     if "PRESENTATION_AGENT_ENABLED" not in env:
-        return "adaptive"
+        return "off"
 
     global _legacy_presentation_warning_emitted
     if not _legacy_presentation_warning_emitted:
@@ -87,6 +100,7 @@ class Settings:
     feishu_card_callback_path: str = "/feishu/card/callback"
     feishu_card_verification_token: str = ""
     feishu_card_encrypt_key: str = ""
+    card_action_receipt_ttl_hours: int = 168
     timezone_name: str = "Asia/Shanghai"
     queue_max_size: int = 100
     participant_input_queue_size: int = 20
@@ -104,7 +118,7 @@ class Settings:
     response_segment_target_chars: int = 260
     response_segment_max_chars: int = 650
     response_max_segments: int = 3
-    presentation_agent_mode: str = "adaptive"
+    presentation_agent_mode: str = "off"
     presentation_agent_min_chars: int = 600
     presentation_agent_timeout_seconds: float = 4.0
     presentation_agent_disconnect_timeout_seconds: float = 0.5
@@ -112,6 +126,11 @@ class Settings:
     presentation_agent_max_segments: int = 3
     presentation_model: str = ""
     claude_partial_messages_enabled: bool = False
+    feishu_streaming_card_enabled: bool = True
+    feishu_streaming_update_interval_ms: int = 120
+    feishu_streaming_min_chars_per_update: int = 30
+    feishu_streaming_max_update_interval_ms: int = 300
+    feishu_streaming_finalize_timeout_seconds: float = 5.0
     feishu_send_max_retries: int = 1
     feishu_gateway_start_timeout_seconds: int = 30
     feishu_gateway_stop_timeout_seconds: int = 8
@@ -124,6 +143,31 @@ class Settings:
     semantic_api_timeout_seconds: float = 8.0
     semantic_max_concurrency: int = 2
     semantic_materiality_threshold: float = 0.03
+    web_search_enabled: bool = False
+    web_search_provider: str = "deepseek_native"
+    web_search_model: str = "deepseek-v4-flash"
+    web_search_timeout_seconds: float = 10.0
+    web_search_max_uses: int = 3
+    web_search_max_output_tokens: int = 4096
+    web_search_retry_max_output_tokens: int = 6144
+    web_search_summary_max_chars: int = 12000
+    research_runtime_enabled: bool = False
+    research_runtime_url: str = "http://research-runtime:8080"
+    research_runtime_token: str = ""
+    research_runtime_timeout_seconds: float = 30.0
+    research_evidence_ttl_hours: int = 6
+    web_read_url_enabled: bool = True
+    web_read_url_timeout_seconds: float = 10.0
+    web_read_url_max_bytes: int = 2 * 1024 * 1024
+    web_read_url_max_redirects: int = 3
+    web_read_url_max_extracted_chars: int = 60000
+    web_read_url_cache_ttl_minutes: int = 30
+    public_video_enabled: bool = True
+    public_video_transcript_max_chars: int = 120000
+    public_video_transcript_cache_ttl_minutes: int = 60
+    public_video_timeout_seconds: float = 10.0
+    public_video_max_tool_reads: int = 6
+    participant_diagnostics_allowlist: tuple[str, ...] = ()
     mutation_intent_api_enabled: bool = True
     mutation_intent_api_url: str = "https://api.deepseek.com/chat/completions"
     mutation_intent_api_model: str = "deepseek-v4-flash"
@@ -289,6 +333,9 @@ class Settings:
             feishu_card_encrypt_key=values.get(
                 "FEISHU_CARD_ENCRYPT_KEY", ""
             ).strip(),
+            card_action_receipt_ttl_hours=_int(
+                values, "CARD_ACTION_RECEIPT_TTL_HOURS", 168, minimum=24
+            ),
             timezone_name=values.get("APP_TIMEZONE", "Asia/Shanghai").strip(),
             queue_max_size=_int(values, "BOT_QUEUE_MAX_SIZE", 100),
             participant_input_queue_size=_int(
@@ -356,6 +403,24 @@ class Settings:
             claude_partial_messages_enabled=_bool(
                 values, "CLAUDE_PARTIAL_MESSAGES_ENABLED", False
             ),
+            feishu_streaming_card_enabled=_bool(
+                values, "FEISHU_STREAMING_CARD_ENABLED", True
+            ),
+            feishu_streaming_update_interval_ms=_int(
+                values, "FEISHU_STREAMING_UPDATE_INTERVAL_MS", 120, minimum=50
+            ),
+            feishu_streaming_min_chars_per_update=_int(
+                values, "FEISHU_STREAMING_MIN_CHARS_PER_UPDATE", 30, minimum=10
+            ),
+            feishu_streaming_max_update_interval_ms=_int(
+                values, "FEISHU_STREAMING_MAX_UPDATE_INTERVAL_MS", 300, minimum=100
+            ),
+            feishu_streaming_finalize_timeout_seconds=_float(
+                values,
+                "FEISHU_STREAMING_FINALIZE_TIMEOUT_SECONDS",
+                5.0,
+                minimum=0.5,
+            ),
             feishu_send_max_retries=_int(
                 values, "FEISHU_SEND_MAX_RETRIES", 1, minimum=0
             ),
@@ -377,6 +442,69 @@ class Settings:
                 values, "FORECAST_CALENDAR_SYNC_INTERVAL_SECONDS", 300, minimum=60
             ),
             semantic_api_enabled=_bool(values, "SEMANTIC_API_ENABLED", False),
+            web_search_enabled=_bool(values, "WEB_SEARCH_ENABLED", False),
+            web_search_provider=values.get(
+                "WEB_SEARCH_PROVIDER", "deepseek_native"
+            ).strip(),
+            web_search_model=values.get(
+                "WEB_SEARCH_MODEL", "deepseek-v4-flash"
+            ).strip(),
+            web_search_timeout_seconds=_float(
+                values, "WEB_SEARCH_TIMEOUT_SECONDS", 10.0, minimum=1.0
+            ),
+            web_search_max_uses=_int(values, "WEB_SEARCH_MAX_USES", 3),
+            web_search_max_output_tokens=_int(
+                values, "WEB_SEARCH_MAX_OUTPUT_TOKENS", 4096, minimum=256
+            ),
+            web_search_retry_max_output_tokens=_int(
+                values, "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS", 6144, minimum=256
+            ),
+            web_search_summary_max_chars=_int(
+                values, "WEB_SEARCH_SUMMARY_MAX_CHARS", 12000, minimum=1000
+            ),
+            research_runtime_enabled=_bool(values, "RESEARCH_RUNTIME_ENABLED", False),
+            research_runtime_url=values.get(
+                "RESEARCH_RUNTIME_URL", "http://research-runtime:8080"
+            ).strip(),
+            research_runtime_token=values.get("RESEARCH_RUNTIME_TOKEN", "").strip(),
+            research_runtime_timeout_seconds=_float(
+                values, "RESEARCH_RUNTIME_TIMEOUT_SECONDS", 30.0, minimum=1.0
+            ),
+            research_evidence_ttl_hours=_int(
+                values, "RESEARCH_EVIDENCE_TTL_HOURS", 6, minimum=1
+            ),
+            web_read_url_enabled=_bool(values, "WEB_READ_URL_ENABLED", True),
+            web_read_url_timeout_seconds=_float(
+                values, "WEB_READ_URL_TIMEOUT_SECONDS", 10.0, minimum=1.0
+            ),
+            web_read_url_max_bytes=_int(
+                values, "WEB_READ_URL_MAX_BYTES", 2 * 1024 * 1024, minimum=1024
+            ),
+            web_read_url_max_redirects=_int(
+                values, "WEB_READ_URL_MAX_REDIRECTS", 3, minimum=1
+            ),
+            web_read_url_max_extracted_chars=_int(
+                values, "WEB_READ_URL_MAX_EXTRACTED_CHARS", 60000, minimum=1000
+            ),
+            web_read_url_cache_ttl_minutes=_int(
+                values, "WEB_READ_URL_CACHE_TTL_MINUTES", 30, minimum=5
+            ),
+            public_video_enabled=_bool(values, "PUBLIC_VIDEO_ENABLED", True),
+            public_video_transcript_max_chars=_int(
+                values, "PUBLIC_VIDEO_TRANSCRIPT_MAX_CHARS", 120000, minimum=1000
+            ),
+            public_video_transcript_cache_ttl_minutes=_int(
+                values, "PUBLIC_VIDEO_TRANSCRIPT_CACHE_TTL_MINUTES", 60, minimum=5
+            ),
+            public_video_timeout_seconds=_float(
+                values, "PUBLIC_VIDEO_TIMEOUT_SECONDS", 10.0, minimum=0.1
+            ),
+            public_video_max_tool_reads=_int(
+                values, "PUBLIC_VIDEO_MAX_TOOL_READS", 6, minimum=1
+            ),
+            participant_diagnostics_allowlist=_allowlist(
+                values, "PARTICIPANT_DIAGNOSTICS_ALLOWLIST"
+            ),
             semantic_api_url=values.get(
                 "SEMANTIC_API_URL", "https://api.deepseek.com/chat/completions"
             ).strip(),
@@ -414,7 +542,7 @@ class Settings:
                 "VISION_API_URL", "https://api.deepseek.com/chat/completions"
             ).strip(),
             vision_api_model=values.get(
-                "VISION_API_MODEL", "deepseek-v4-flash-vision-exp"
+                "VISION_API_MODEL", "deepseek-flash"
             ).strip(),
             vision_api_timeout_seconds=_float(
                 values, "VISION_API_TIMEOUT_SECONDS", 90.0, minimum=0.1
@@ -541,8 +669,44 @@ class Settings:
                 "MUTATION_INTENT_API_URL and MUTATION_INTENT_API_MODEL are required "
                 "when mutation intent verification is enabled"
             )
+        if self.web_search_provider != "deepseek_native":
+            raise ValueError("WEB_SEARCH_PROVIDER must be deepseek_native")
+        if not self.web_search_model:
+            raise ValueError("WEB_SEARCH_MODEL must be non-empty")
+        if self.web_search_max_uses > 5:
+            raise ValueError("WEB_SEARCH_MAX_USES must be <= 5")
+        if self.web_search_max_output_tokens < 256:
+            raise ValueError("WEB_SEARCH_MAX_OUTPUT_TOKENS must be >= 256")
+        if self.web_search_retry_max_output_tokens < self.web_search_max_output_tokens:
+            raise ValueError(
+                "WEB_SEARCH_RETRY_MAX_OUTPUT_TOKENS must be >= WEB_SEARCH_MAX_OUTPUT_TOKENS"
+            )
+        if self.web_read_url_max_redirects > 10:
+            raise ValueError("WEB_READ_URL_MAX_REDIRECTS must be <= 10")
+        if self.web_read_url_cache_ttl_minutes > 120:
+            raise ValueError("WEB_READ_URL_CACHE_TTL_MINUTES must be <= 120")
+        if self.public_video_transcript_max_chars > 500_000:
+            raise ValueError("PUBLIC_VIDEO_TRANSCRIPT_MAX_CHARS must be <= 500000")
+        if self.public_video_transcript_cache_ttl_minutes > 360:
+            raise ValueError(
+                "PUBLIC_VIDEO_TRANSCRIPT_CACHE_TTL_MINUTES must be <= 360"
+            )
+        if self.public_video_max_tool_reads > 20:
+            raise ValueError("PUBLIC_VIDEO_MAX_TOOL_READS must be <= 20")
+        if self.web_search_enabled and not self.deepseek_api_key:
+            raise ValueError(
+                "DEEPSEEK_API_KEY is required when web search is enabled"
+            )
+        if self.research_runtime_enabled and not self.research_runtime_url:
+            raise ValueError("RESEARCH_RUNTIME_URL is required when research runtime is enabled")
+        if self.research_runtime_enabled and not self.research_runtime_token:
+            raise ValueError("RESEARCH_RUNTIME_TOKEN is required when research runtime is enabled")
+        if self.research_evidence_ttl_hours > 24:
+            raise ValueError("RESEARCH_EVIDENCE_TTL_HOURS must be <= 24")
         if self.feishu_card_action_transport not in {"ws", "http"}:
             raise ValueError("FEISHU_CARD_ACTION_TRANSPORT must be ws or http")
+        if self.card_action_receipt_ttl_hours > 720:
+            raise ValueError("CARD_ACTION_RECEIPT_TTL_HOURS must be <= 720")
         if (
             self.feishu_card_action_transport == "ws"
             and self.feishu_card_callback_enabled

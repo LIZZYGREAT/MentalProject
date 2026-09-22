@@ -559,6 +559,66 @@ def _normalize_runtime_parameters(source: Mapping[str, Any] | None) -> dict[str,
     }
 
 
+def care_personalization_projection(
+    effective_parameters: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Expose the already-authorized Stage-5 values needed by Care.
+
+    Care must not recreate Stage-5 parameter or prior resolution.  Runtime
+    profiles normally contain ``hierarchical_parameters`` and the stored
+    leave-one-participant-out ``hierarchical_population_prior``.  The
+    normalized CTSSM mapping is retained only as a compatibility fallback for
+    older authorized profiles that predate the hierarchical projection.
+    """
+
+    value = dict(effective_parameters or {})
+    hierarchical = dict(value.get("hierarchical_parameters") or {})
+    normalized = _normalize_runtime_parameters(value)
+
+    def scalar(raw: Any, fallback: float | None = None) -> float | None:
+        if isinstance(raw, Mapping):
+            raw = raw.get("estimate", raw.get("mean"))
+        return _number(raw) if _number(raw) is not None else fallback
+
+    parameters = {
+        name: scalar(hierarchical.get(name), normalized.get(name))
+        for name in PARAMETERS
+    }
+    parameters = {
+        name: value
+        for name, value in parameters.items()
+        if value is not None
+    }
+
+    raw_prior = (
+        value.get("hierarchical_population_prior")
+        or value.get("population_prior")
+        or {}
+    )
+    population_prior: dict[str, Any] = {}
+    if isinstance(raw_prior, Mapping):
+        for name in PARAMETERS:
+            item = raw_prior.get(name)
+            if isinstance(item, Mapping):
+                mean_value = scalar(item.get("mean"), None)
+                if mean_value is not None:
+                    population_prior[name] = {
+                        **dict(item),
+                        "mean": mean_value,
+                    }
+            else:
+                mean_value = scalar(item, None)
+                if mean_value is not None:
+                    population_prior[name] = {"mean": mean_value}
+        if isinstance(raw_prior.get("_metadata"), Mapping):
+            population_prior["_metadata"] = dict(raw_prior["_metadata"])
+
+    return {
+        "parameters": parameters,
+        "population_prior": population_prior,
+    }
+
+
 def runtime_candidate_parameters(fitted: Mapping[str, Any]) -> dict[str, Any]:
     value = dict(fitted["parameters"])
     return {

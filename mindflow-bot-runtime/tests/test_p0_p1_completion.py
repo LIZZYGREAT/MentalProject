@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.agent.context import AgentContext
+from app.agent.tool_registry import ToolRegistry
 from app.db import Database, build_engine
 from app.integrations.feishu.cards import pressure_curve_card
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
@@ -30,6 +31,7 @@ from settings.visual_defaults import FIGSIZE
 from app.services.presentation_service import (
     IMAGE_KEY_PLACEHOLDER,
     PendingImageCard,
+    PresentationOutbox,
 )
 from app.tools.care import CareTools
 from app.worker import BotWorker
@@ -601,6 +603,44 @@ def test_care_record_checkin_uses_observation_refresh_service():
         assert session.query(StateObservation).count() == 1
 
 
+def test_agent_checkin_stages_prefilled_card_without_persisting_observation():
+    database = memory_database()
+    person = participant(database, "CARE-CARD-PREFILL")
+
+    class Cards:
+        def __init__(self):
+            self.items = []
+
+        def stage_card(self, run_id, card):
+            self.items.append((run_id, card))
+
+    cards = Cards()
+    tools = CareTools(
+        None,
+        ObservationRepository(database),
+        None,
+        None,
+        "Asia/Shanghai",
+        object(),
+        presentations=cards,
+    )
+    registry = ToolRegistry()
+    tools.register(registry)
+    ctx = AgentContext(person.id, "P", "ou", "oc", "care-card", uuid.uuid4())
+
+    result = asyncio.run(registry.execute(ctx, "care_record_checkin", {
+        "stress": 8,
+        "activity": "在写报告",
+    }))
+
+    assert result.status == "succeeded"
+    assert result.result["observation_persisted"] is False
+    assert result.result["prefilled_fields"] == ["activity", "stress"]
+    assert len(cards.items) == 1
+    with database.session() as session:
+        assert session.query(StateObservation).count() == 0
+
+
 def _prediction_with_optional_afternoon_checkin(include: bool):
     observations = []
     if include:
@@ -1025,17 +1065,19 @@ class _RecordingMutationQueue:
 def _mutation_tools():
     coordinator = _MutationCoordinator()
     mutation_refresh = _RecordingMutationQueue()
+    presentations = PresentationOutbox()
     tools = CareTools(
         None, None, _MutationCalendar(), None, "Asia/Shanghai",
-        coordinator, mutation_refresh=mutation_refresh,
+        coordinator, presentations=presentations,
+        mutation_refresh=mutation_refresh,
     )
     ctx = AgentContext(uuid.uuid4(), "P", "ou", "oc", "message", uuid.uuid4())
-    return tools, coordinator, mutation_refresh, ctx
+    return tools, coordinator, mutation_refresh, ctx, presentations
 
 
 def test_calendar_create_queues_forecast_refresh():
-    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
-    result = asyncio.run(tools.create_calendar_event(ctx, {
+    tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
+    result = asyncio.run(tools._execute_calendar_create_effect(ctx, {
         "summary": "复盘",
         "recurrence_mode": "single",
         "start_time": "2030-01-15T09:00:00+08:00",
@@ -1050,8 +1092,8 @@ def test_calendar_create_queues_forecast_refresh():
 
 
 def test_calendar_update_queues_refresh_for_old_and_new_dates():
-    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
-    result = asyncio.run(tools.update_calendar_event(ctx, {
+    tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
+    result = asyncio.run(tools._execute_calendar_update_effect(ctx, {
         "event_id": "e1",
         "start_time": "2030-01-16T09:00:00+08:00",
         "end_time": "2030-01-16T10:00:00+08:00",
@@ -1065,11 +1107,13 @@ def test_calendar_update_queues_refresh_for_old_and_new_dates():
 
 
 def test_calendar_delete_queues_forecast_refresh():
-    tools, coordinator, mutation_refresh, ctx = _mutation_tools()
-    result = asyncio.run(tools.delete_calendar_event(ctx, {
-        "event_id": "e1",
-        "confirmed": True,
-    }))
+    tools, coordinator, mutation_refresh, ctx, _presentations = _mutation_tools()
+    assert mutation_refresh.requests == []
+    result = asyncio.run(
+        tools.confirm_calendar_delete(
+            ctx.participant_id, "e1", source_message_id="callback-1"
+        )
+    )
     assert result["forecast_refresh_queued_dates"] == ["2030-01-15"]
     assert coordinator.calls == []
     assert mutation_refresh.requests[0][2] == "calendar_delete_event"
@@ -1097,13 +1141,16 @@ def test_calendar_mutation_reschedules_warning():
     mutation_refresh = _RecordingMutationQueue()
     tools = CareTools(
         None, None, calendar, None, "Asia/Shanghai", coordinator,
-        mutation_refresh=mutation_refresh,
+        presentations=PresentationOutbox(), mutation_refresh=mutation_refresh,
     )
     ctx = AgentContext(person.id, "P", "ou", "oc", "message", uuid.uuid4())
-    result = asyncio.run(tools.delete_calendar_event(ctx, {
-        "event_id": old_event["id"],
-        "confirmed": True,
-    }))
+    result = asyncio.run(
+        tools.confirm_calendar_delete(
+            ctx.participant_id,
+            old_event["id"],
+            source_message_id="callback-2",
+        )
+    )
     assert result["forecast_refresh_queued_dates"] == ["2030-01-15"]
     assert mutation_refresh.requests[0][2] == "calendar_delete_event"
     with database.session() as session:

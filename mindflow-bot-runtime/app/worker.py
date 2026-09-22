@@ -9,9 +9,9 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
-from typing import Literal, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 from app.agent.claude_runtime import (
     FALLBACK_INTERRUPTED,
@@ -30,13 +30,13 @@ from app.agent.skill_loader import SkillLoader
 from app.identity.service import BindingError, IdentityService
 from app.integrations.feishu.client import FeishuClient, FeishuSendError
 from app.integrations.feishu.gateway import BotEvent
-from app.integrations.feishu.cards import course_schedule_preview_card
 from app.integrations.feishu.message_resources import (
     MessageResourceError,
     MessageResourceTooLarge,
     UnsupportedImageFormat,
 )
 from app.integrations.feishu.oauth import DeviceFlowService
+from app.integrations.feishu.streaming_card import FeishuStreamingCardSession
 from app.repositories import (
     AgentRunRepository,
     BotEventRepository,
@@ -52,16 +52,44 @@ from app.repositories_course_schedule_image import (
 from app.presentation.contracts import (
     AgentActivityCallback,
     AgentActivityEvent,
+    ExternalEvidenceSource,
+    PresentationEvidence,
     ResponsePlan,
     ResponseSegment,
     RuntimeResponse,
 )
+from app.integrations.feishu.cards import (
+    course_schedule_preview_card,
+    external_llm_consent_card,
+    rich_answer_card,
+)
+from app.presentation.markdown_sanitizer import sanitize_markdown
+from app.presentation.consent_texts import external_llm_consent_prompt_text
+from app.repositories_consent import ParticipantConsentRepository
+from app.services.consent_service import ConsentService
 from app.presentation.progress_policy import should_force_silent_progress
-from app.presentation.user_capabilities import help_text, onboarding_text
+from app.presentation.feature_cards import (
+    feature_overview_card,
+    feature_overview_text,
+    onboarding_welcome_card,
+    visible_feature_keys,
+)
+from app.presentation.onboarding import (
+    already_bound_text,
+    bind_unavailable_text,
+    invalid_invite_text,
+    unbound_welcome_text,
+    welcome_first_screen_text,
+)
 from app.presentation.progress_presenter import ProgressPresenter
 from app.presentation.response_orchestrator import ResponseOrchestrator
-from app.services.presentation_service import PresentationOutbox
-from app.services.presentation_service import PendingImageCard
+from app.presentation.streaming_boundaries import safe_stream_prefix_boundaries
+from app.services.presentation_service import (
+    PendingCardUpdate,
+    PendingImageCard,
+    PresentationOutbox,
+)
+from app.services.psychological_context_builder import psych_context_relevant
 from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
     CourseScheduleVisionUnavailable,
@@ -72,6 +100,7 @@ from app.services.generic_image_vision import (
     GenericImageVisionUnavailable,
     GenericImageVisionValidationFailure,
 )
+from app.services.participant_stage import participant_stage_from_bound_at
 from app.services.multimodal_turn_coordinator import (
     MultimodalInputSnapshot,
     MultimodalTurnCoordinator,
@@ -81,13 +110,79 @@ from app.services.multimodal_turn_coordinator import (
 
 
 logger = logging.getLogger(__name__)
+_CARD_DELIVERED_CLAIM = re.compile(
+    r"(?:卡片|设置卡片?|功能卡片?)(?:已经|已)(?:成功)?(?:发出|发送|投递)(?:了)?"
+)
+
+
+def _streaming_failure_fields(
+    exc: BaseException,
+    *,
+    default_stage: str,
+) -> dict[str, object | None]:
+    operation = str(getattr(exc, "operation", "") or "unknown")
+    stage = {
+        "create_card_instance": "create_card",
+        "send_message": "send_reference",
+        "update_card_element_content": "update",
+        "finish_streaming_card": "finalize",
+    }.get(operation, default_stage)
+    return {
+        "operation": operation,
+        "provider_error_code": getattr(exc, "code", None),
+        "provider_request_id": getattr(exc, "provider_request_id", None),
+        "retryable": bool(getattr(exc, "retryable", False)),
+        "stage": stage,
+    }
+_STREAMING_WEB_TOOLS = {
+    "web_search",
+    "web_read_result",
+    "web_read_url",
+    "web_read_url_chunk",
+    "video_inspect_url",
+    "video_read_transcript",
+}
+
+
+def _with_card_delivery_failure(
+    response: RuntimeResponse | str,
+    *,
+    deterministic_fallback: str | None = None,
+) -> RuntimeResponse:
+    authoritative = (
+        response
+        if isinstance(response, RuntimeResponse)
+        else RuntimeResponse(text=str(response))
+    )
+    text = str(deterministic_fallback or "").strip()
+    if not text:
+        text = _CARD_DELIVERED_CLAIM.sub(
+            "卡片已生成，但尚未成功发送", authoritative.text
+        ).rstrip()
+    notice = "卡片暂时未能发送，请稍后再试。"
+    if notice not in text:
+        text = f"{text}\n\n{notice}" if text else notice
+    return RuntimeResponse(
+        text=text,
+        safety_locked=authoritative.safety_locked,
+        response_kind=authoritative.response_kind,
+    )
+
+
 BIND_PATTERN = re.compile(r"^/bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
+# Minimal shape gate before any token lookup: a bare URL-safe token as
+# produced by secrets.token_urlsafe. Ordinary sentences (spaces, CJK,
+# punctuation) never reach the binding query.
+INVITE_TOKEN_SHAPE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 CALENDAR_CONNECT_PATTERN = re.compile(
     r"^/(?:calendar|connect-calendar)\s*$", re.IGNORECASE
 )
+CALENDAR_STATUS_PATTERN = re.compile(
+    r"^/(?:calendar|connect-calendar)\s+status\s*$", re.IGNORECASE
+)
 STOP_PATTERN = re.compile(r"^/stop\s*$", re.IGNORECASE)
 HELP_PATTERN = re.compile(
-    r"^(?:/help|帮助|功能|功能介绍|你能做什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
+    r"^(?:/help|帮助|功能|功能介绍|你会什么|你能做什么|你能干什么|怎么用|怎么使用|MindFlow能做什么)[？?。！!\s]*$",
     re.IGNORECASE,
 )
 # These are infrastructure gates only. Natural-language intent is delegated to
@@ -243,6 +338,7 @@ class ProgressState:
     sent: int = 0
     last_sent_at: float = 0.0
     used_tools: set[str] = field(default_factory=set)
+    evidence_sources: list[ExternalEvidenceSource] = field(default_factory=list)
     sent_keys: set[str] = field(default_factory=set)
     last_stage: str | None = None
     first_activity_at: float | None = None
@@ -308,6 +404,11 @@ class BotWorker:
         progress_presenter: ProgressPresenter | None = None,
         response_orchestrator: ResponseOrchestrator | None = None,
         max_retries: int = 1,
+        streaming_card_enabled: bool = True,
+        streaming_update_interval_ms: int = 120,
+        streaming_min_chars_per_update: int = 30,
+        streaming_max_update_interval_ms: int = 300,
+        streaming_finalize_timeout_seconds: float = 5.0,
         generic_progress_delay_seconds: float = 10.0,
         tool_progress_grace_seconds: float = 1.2,
         progress_cooldown_seconds: int = 3,
@@ -324,6 +425,13 @@ class BotWorker:
         multimodal_association_seconds: float = 15.0,
         multimodal_recent_context_seconds: float = 600.0,
         course_default_semester_start_date: str = "",
+        feature_capabilities: Mapping[str, bool] | None = None,
+        consent_service: Any = None,
+        memory_service: Any = None,
+        interaction_preferences: Any = None,
+        psychological_context_builder: Any = None,
+        backend_state_events: Any = None,
+        participant_diagnostics_allowlist: tuple[str, ...] = (),
     ):
         self.queue = queue
         self.identity = identity
@@ -331,13 +439,45 @@ class BotWorker:
         self.runs = runs
         self.skill_loader = skill_loader
         self.runtime = runtime
+        if consent_service is False:
+            # Explicitly disabled: the gate fails closed.
+            self.consent_service = None
+        else:
+            database = getattr(events, "database", None)
+            self.consent_service = consent_service or (
+                ConsentService(ParticipantConsentRepository(database))
+                if database is not None
+                else None
+            )
         self.sender = sender
+        self.memory_service = memory_service
+        self.interaction_preferences = interaction_preferences
+        self.psychological_context_builder = psychological_context_builder
+        self.backend_state_events = backend_state_events
+        self.participant_diagnostics_allowlist = frozenset(
+            str(item).strip().casefold()
+            for item in participant_diagnostics_allowlist
+            if str(item).strip()
+        )
+        self.feature_keys = visible_feature_keys(feature_capabilities)
         self.device_flows = device_flows
         self.presentations = presentations
         self.progress_presenter = progress_presenter or ProgressPresenter()
         self.response_orchestrator = response_orchestrator or ResponseOrchestrator()
         self.model = model
         self.max_retries = max_retries
+        self.streaming_card_enabled = bool(streaming_card_enabled)
+        self.streaming_update_interval_ms = max(50, int(streaming_update_interval_ms))
+        self.streaming_min_chars_per_update = max(
+            10, int(streaming_min_chars_per_update)
+        )
+        self.streaming_max_update_interval_ms = max(
+            self.streaming_update_interval_ms,
+            int(streaming_max_update_interval_ms),
+        )
+        self.streaming_finalize_timeout_seconds = max(
+            0.5, float(streaming_finalize_timeout_seconds)
+        )
         self.generic_progress_delay_seconds = max(
             0.0, float(generic_progress_delay_seconds)
         )
@@ -566,6 +706,21 @@ class BotWorker:
             participant = await asyncio.to_thread(
                 self.identity.resolve, event.app_id, event.open_id
             )
+            pending_streaming_reader = getattr(
+                self.events, "pending_streaming_reply_plan", None
+            )
+            pending_streaming = (
+                await asyncio.to_thread(pending_streaming_reader, event.event_id)
+                if callable(pending_streaming_reader)
+                else None
+            )
+            if pending_streaming is not None:
+                await self._resume_streaming_reply(
+                    event,
+                    pending_streaming,
+                    participant_id=(participant.id if participant is not None else None),
+                )
+                return
             pending_plan = await asyncio.to_thread(
                 self.events.pending_reply_plan, event.event_id
             )
@@ -588,12 +743,16 @@ class BotWorker:
                 return
             bind_match = BIND_PATTERN.match(event.text) if event.message_type == "text" else None
             if participant is None:
-                if bind_match is None:
-                    await self._deliver(event, "尚未绑定。请发送：/bind 你的绑定码")
-                    return
-                raw_token = bind_match.group(1)
+                raw_token = None
+                if bind_match is not None:
+                    raw_token = str(bind_match.group(1) or "").strip()
+                elif (
+                    event.message_type == "text"
+                    and INVITE_TOKEN_SHAPE.fullmatch(event.text.strip())
+                ):
+                    raw_token = event.text.strip()
                 if not raw_token:
-                    await self._deliver(event, "请在 /bind 后填写一次性绑定码。")
+                    await self._deliver(event, unbound_welcome_text())
                     return
                 try:
                     participant = await asyncio.to_thread(
@@ -604,18 +763,18 @@ class BotWorker:
                         chat_id=event.chat_id,
                     )
                 except BindingError:
-                    await self._deliver(event, "绑定码无效、已使用或已过期。")
+                    await self._deliver(event, invalid_invite_text())
                     return
                 except Exception:
-                    await self._deliver(event, "绑定服务暂时不可用，请稍后重试。")
+                    await self._deliver(event, bind_unavailable_text())
                     return
                 await asyncio.to_thread(
                     self.events.assign_participant, event.event_id, participant.id
                 )
-                await self._deliver(event, onboarding_text(participant.participant_code))
+                await self._deliver_welcome(event)
                 return
             if bind_match is not None:
-                await self._deliver(event, "当前飞书账号已经绑定。")
+                await self._deliver(event, already_bound_text())
                 return
             if STOP_PATTERN.match(event.text):
                 stop_generation = (
@@ -684,6 +843,31 @@ class BotWorker:
                     "已请求停止当前处理。" if stopped else "当前没有正在处理的任务。",
                 )
                 return
+            if CALENDAR_STATUS_PATTERN.match(event.text):
+                if self.device_flows is None:
+                    await self._deliver(event, "日历授权状态暂时不可查询。")
+                    return
+                status = await asyncio.to_thread(
+                    self.device_flows.status, participant.id
+                )
+                state = str(status.get("status") or "disconnected")
+                if status.get("connected"):
+                    state_text = {
+                        "connected": "已连接",
+                        "refresh_required": "已连接，访问凭证将在使用时自动刷新",
+                    }.get(state, "已连接")
+                    await self._deliver(event, f"日历状态：{state_text}。")
+                elif state == "reconnect_required":
+                    await self._deliver(
+                        event,
+                        "日历状态：需要重新授权。请发送 /calendar 开始授权。",
+                    )
+                else:
+                    await self._deliver(
+                        event,
+                        "日历状态：尚未连接。请发送 /calendar 开始授权。",
+                    )
+                return
             if CALENDAR_CONNECT_PATTERN.match(event.text):
                 if self.device_flows is None:
                     await self._deliver(event, "日历授权暂时不可用。")
@@ -704,7 +888,11 @@ class BotWorker:
                 self.resume_device_flow(participant.id)
                 return
             if event.message_type == "text" and HELP_PATTERN.match(event.text):
-                await self._deliver(event, help_text())
+                if not await self._deliver_card(
+                    event,
+                    feature_overview_card(self.feature_keys),
+                ):
+                    await self._deliver(event, feature_overview_text(self.feature_keys))
                 return
             if event.message_type == "text":
                 attached = await self.multimodal_turns.attach_text(
@@ -761,11 +949,8 @@ class BotWorker:
                     )
                 )
                 if reuse_recent and recent is not None:
-                    if participant.external_llm_consent_at is None:
-                        await self._deliver(
-                            event,
-                            "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
-                        )
+                    if not await self._has_external_llm_consent(participant):
+                        await self._deliver_consent_prompt(event)
                         return
                     task_generation = self._current_stop_generation(
                         participant.id
@@ -799,11 +984,8 @@ class BotWorker:
             if long_task is not None:
                 pass
             elif event.message_type == "image":
-                if participant.external_llm_consent_at is None:
-                    await self._deliver(
-                        event,
-                        "目前还没有记录图片交给外部模型处理的授权，所以我暂时不能读取这张图片。请先联系研究者完成授权。",
-                    )
+                if not await self._has_external_llm_consent(participant):
+                    await self._deliver_consent_prompt(event)
                     return
                 opened_turn = await self.multimodal_turns.open_image(
                     participant.id, event.chat_id, event
@@ -834,11 +1016,8 @@ class BotWorker:
                         self._active_multimodal_tasks.pop(multimodal_key, None)
 
                 long_task.add_done_callback(clear_multimodal)
-            elif participant.external_llm_consent_at is None:
-                await self._deliver(
-                    event,
-                    "尚未记录将本次对话发送给外部模型的实验授权，请先联系研究者。",
-                )
+            elif not await self._has_external_llm_consent(participant):
+                await self._deliver_consent_prompt(event)
                 return
 
             elif long_task is None:
@@ -860,7 +1039,14 @@ class BotWorker:
                     agent_run_id=run_id,
                     turn_effect_policy="verify_on_demand",
                     user_request_text=event.text,
+                    received_at_utc=event.create_time,
                     source_kind="text",
+                    access_tier=participant.access_tier,
+                    scopes=participant.scopes,
+                    participant_diagnostics_enabled=(
+                        participant.participant_code.strip().casefold()
+                        in self.participant_diagnostics_allowlist
+                    ),
                 )
                 # Creating the task under the routing lock preserves arrival order;
                 # the lock is released before the long Agent turn so /stop can pass.
@@ -1541,7 +1727,14 @@ class BotWorker:
             calendar_mutation_policy=calendar_mutation_policy,
             turn_effect_policy=turn_effect_policy,
             user_request_text=turn_input.text,
+            received_at_utc=event.create_time,
             source_kind=source_kind,
+            access_tier=participant.access_tier,
+            scopes=participant.scopes,
+            participant_diagnostics_enabled=(
+                participant.participant_code.strip().casefold()
+                in self.participant_diagnostics_allowlist
+            ),
         )
         self._active_agent_events.setdefault(participant.id, {})[
             event.event_id
@@ -1726,8 +1919,8 @@ class BotWorker:
                 await self._mark_schedule_image_ready(
                     event, participant_id, draft=existing
                 )
-                delivered = await self._deliver_card(
-                    delivery_event, course_schedule_preview_card(existing)
+                delivered = await self._deliver_course_schedule_preview(
+                    delivery_event, participant_id, existing
                 )
                 await self._ensure_task_not_stopped(
                     participant_id, delivery_event.event_id, task_generation
@@ -1762,8 +1955,8 @@ class BotWorker:
                     await self._mark_schedule_image_ready(
                         event, participant_id, draft=existing
                     )
-                    delivered = await self._deliver_card(
-                        delivery_event, course_schedule_preview_card(existing)
+                    delivered = await self._deliver_course_schedule_preview(
+                        delivery_event, participant_id, existing
                     )
                     await self._ensure_task_not_stopped(
                         participant_id, delivery_event.event_id, task_generation
@@ -1887,8 +2080,8 @@ class BotWorker:
                         task_generation,
                     )
                 try:
-                    delivered = await self._deliver_card(
-                        delivery_event, course_schedule_preview_card(draft)
+                    delivered = await self._deliver_course_schedule_preview(
+                        delivery_event, participant_id, draft
                     )
                 except asyncio.CancelledError:
                     if created_new:
@@ -2094,6 +2287,101 @@ class BotWorker:
                 exc_info=True,
             )
 
+    async def _with_backend_context(
+        self, ctx: AgentContext, turn_input: AgentTurnInput
+    ) -> AgentTurnInput:
+        """Attach isolated backend-owned personalization domains to one turn."""
+
+        stage = None
+        if turn_input.participant_stage is None:
+            try:
+                binding = await asyncio.to_thread(
+                    self.identity.bindings.get_for_participant, ctx.participant_id
+                )
+                stage = participant_stage_from_bound_at((binding or {}).get("bound_at"))
+            except Exception:
+                logger.warning(
+                    "participant_stage_lookup_failed participant_id=%s",
+                    ctx.participant_id,
+                    exc_info=True,
+                )
+
+        async def load(
+            service: Any, method: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            if service is None:
+                return None
+            try:
+                return await asyncio.to_thread(
+                    getattr(service, method), *args, **kwargs
+                )
+            except Exception:
+                logger.warning(
+                    "personalization_context_lookup_failed domain=%s participant_id=%s",
+                    method,
+                    ctx.participant_id,
+                    exc_info=True,
+                )
+                return None
+
+        psychological_service = (
+            self.psychological_context_builder
+            if psych_context_relevant(turn_input.text)
+            else None
+        )
+        memories, preferences, psychological = await asyncio.gather(
+            load(self.memory_service, "retrieve", ctx.participant_id, turn_input.text),
+            load(self.interaction_preferences, "get", ctx.participant_id),
+            load(
+                psychological_service,
+                "build",
+                ctx.participant_id,
+                current_text=turn_input.text,
+            ),
+        )
+        if not (psychological or {}).get("features"):
+            psychological = None
+        backend_state_updates: tuple[Mapping[str, str], ...] = ()
+        backend_state_cursor: str | None = None
+        if self.backend_state_events is not None:
+            try:
+                rows, backend_state_cursor = await asyncio.to_thread(
+                    self.backend_state_events.pending_for_turn,
+                    ctx.participant_id,
+                )
+                backend_state_updates = tuple(
+                    {
+                        key: str(row.get(key) or "")
+                        for key in (
+                            "event_type",
+                            "resource_kind",
+                            "state",
+                            "summary",
+                        )
+                        if row.get(key) is not None
+                    }
+                    for row in rows
+                )
+            except Exception:
+                logger.warning(
+                    "backend_state_event_lookup_failed participant_id=%s",
+                    ctx.participant_id,
+                    exc_info=True,
+                )
+        safe_memories = tuple(
+            {"memory_type": row.get("memory_type"), "content": row.get("content")}
+            for row in (memories or [])
+        )
+        return replace(
+            turn_input,
+            participant_stage=turn_input.participant_stage or stage,
+            participant_memory=safe_memories,
+            interaction_preferences=preferences,
+            psychological_context=psychological,
+            backend_state_updates=backend_state_updates,
+            backend_state_event_cursor=backend_state_cursor,
+        )
+
     async def _run_agent(
         self,
         event: BotEvent,
@@ -2104,10 +2392,99 @@ class BotWorker:
         run_generation: int,
     ) -> None:
         turn_input = turn_input or AgentTurnInput(text=event.text)
+        if turn_input.reference_time_utc is None:
+            reference_time = event.create_time
+            if reference_time.tzinfo is None:
+                reference_time = reference_time.replace(tzinfo=timezone.utc)
+            turn_input = replace(
+                turn_input,
+                reference_time_utc=reference_time.astimezone(timezone.utc),
+            )
+        turn_input = await self._with_backend_context(ctx, turn_input)
         started = time.monotonic()
         progress = ProgressState(
             force_silent=should_force_silent_progress(turn_input.text)
         )
+        streaming_session: FeishuStreamingCardSession | None = None
+        streaming_session_lock = asyncio.Lock()
+
+        async def ensure_streaming_progress(
+            tool_name: str,
+        ) -> FeishuStreamingCardSession | None:
+            nonlocal streaming_session
+            start_streaming = getattr(self.sender, "start_streaming_card", None)
+            if (
+                not self.streaming_card_enabled
+                or tool_name not in _STREAMING_WEB_TOOLS
+                or not callable(start_streaming)
+                or not callable(getattr(self.events, "stage_streaming_progress", None))
+            ):
+                return None
+            async with streaming_session_lock:
+                if streaming_session is not None:
+                    return streaming_session
+                initial = (
+                    "正在搜索公开网页…"
+                    if tool_name == "web_search"
+                    else "正在读取网页内容…"
+                )
+                try:
+                    created = await start_streaming(
+                        event.chat_id,
+                        initial,
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:stream:{event.event_id}"
+                        ),
+                        update_interval_ms=self.streaming_update_interval_ms,
+                        min_update_chars=self.streaming_min_chars_per_update,
+                        max_update_interval_ms=self.streaming_max_update_interval_ms,
+                    )
+                    await asyncio.to_thread(
+                        self.events.stage_streaming_progress,
+                        event.event_id,
+                        card_id=created.card_id,
+                        message_id=created.message_id,
+                        element_id=created.element_id,
+                    )
+                    self._attach_streaming_sequence_allocator(
+                        event.event_id, created
+                    )
+                except Exception as exc:
+                    failure = _streaming_failure_fields(
+                        exc, default_stage="create_card"
+                    )
+                    logger.warning(
+                        "streaming_progress_start_failed event_id=%s "
+                        "operation=%s provider_error_code=%s "
+                        "provider_request_id=%s retryable=%s stage=%s",
+                        event.event_id,
+                        failure["operation"],
+                        failure["provider_error_code"],
+                        failure["provider_request_id"],
+                        failure["retryable"],
+                        failure["stage"],
+                        exc_info=True,
+                    )
+                    await self._record_incident(
+                        severity="warning",
+                        subsystem="feishu",
+                        event_name="streaming_progress_start_failed",
+                        participant_id=ctx.participant_id,
+                        bot_event_id=event.event_id,
+                        error_code=(
+                            str(failure["provider_error_code"])
+                            if failure["provider_error_code"] is not None
+                            else None
+                        ),
+                        error_class=type(exc).__name__,
+                        summary="CardKit progress card could not be started.",
+                        details=failure,
+                    )
+                    return None
+                streaming_session = created
+                async with progress.lock:
+                    progress.force_silent = True
+                return streaming_session
         message_created_at = event.create_time
         if message_created_at.tzinfo is None:
             message_created_at = message_created_at.replace(tzinfo=timezone.utc)
@@ -2206,13 +2583,18 @@ class BotWorker:
 
         async def on_activity(activity: AgentActivityEvent) -> None:
             nonlocal tool_timer
+            activity_tool_name = str(activity.tool_name or "")
+            if activity.kind == "tool_started":
+                await ensure_streaming_progress(activity_tool_name)
             async with progress.lock:
                 now = time.monotonic()
                 if progress.first_activity_at is None:
                     progress.first_activity_at = now
-                tool_name = str(activity.tool_name or "")
+                tool_name = activity_tool_name
                 if tool_name:
                     progress.used_tools.add(tool_name)
+                if activity.evidence is not None:
+                    progress.evidence_sources.extend(activity.evidence.sources)
                 if activity.kind == "tool_started" and tool_name:
                     if progress.first_tool_started_at is None:
                         progress.first_tool_started_at = now
@@ -2247,6 +2629,19 @@ class BotWorker:
                         name=f"tool-progress-{event.event_id}-{generation}",
                     )
                     tool_timers.add(tool_timer)
+            if (
+                streaming_session is not None
+                and activity.kind in {"tool_succeeded", "tool_failed"}
+                and tool_name in _STREAMING_WEB_TOOLS
+            ):
+                try:
+                    await streaming_session.set_progress("正在整理结果…")
+                except Exception:
+                    logger.warning(
+                        "streaming_progress_card_update_failed event_id=%s",
+                        event.event_id,
+                        exc_info=True,
+                    )
 
         async def close_progress_before_final() -> None:
             # If a processing send already owns the lock, wait until the
@@ -2276,13 +2671,19 @@ class BotWorker:
             metrics["agent_result_ms"] = round(
                 (time.monotonic() - agent_started) * 1000, 1
             )
+            if isinstance(response, RuntimeResponse) and response.safety_locked:
+                # Safety-handled content is durable but protected: admin and
+                # researcher projections must never show the original text.
+                await asyncio.to_thread(
+                    self.events.mark_content_protected, event.event_id
+                )
             await close_progress_before_final()
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 raise ClaudeRuntimeInterrupted(FALLBACK_INTERRUPTED)
-            cards = (
-                self.presentations.take_cards(run_id)
+            cards, review_policy = (
+                self.presentations.take_delivery(run_id)
                 if self.presentations is not None
-                else []
+                else ([], None)
             )
             card_delivery_failed = False
             delivered_cards: list[object] = []
@@ -2293,6 +2694,10 @@ class BotWorker:
                 try:
                     if isinstance(card, PendingImageCard):
                         await self._send_image_card(event.chat_id, card)
+                    elif isinstance(card, PendingCardUpdate):
+                        await asyncio.to_thread(
+                            self.sender.update_card, card.message_id, card.card
+                        )
                     else:
                         await self._send_card(event.chat_id, card)
                     delivered_cards.append(card)
@@ -2324,15 +2729,13 @@ class BotWorker:
                 (time.monotonic() - card_started) * 1000, 1
             )
             if card_delivery_failed:
-                authoritative = (
-                    response
-                    if isinstance(response, RuntimeResponse)
-                    else RuntimeResponse(text=str(response))
-                )
-                response = RuntimeResponse(
-                    text=authoritative.text + "\n\n卡片暂时未能发送，请稍后再试。",
-                    safety_locked=authoritative.safety_locked,
-                    response_kind=authoritative.response_kind,
+                response = _with_card_delivery_failure(
+                    response,
+                    deterministic_fallback=(
+                        review_policy.fallback_text
+                        if review_policy is not None
+                        else None
+                    ),
                 )
             presentation_started = time.monotonic()
             if self._run_was_stopped(ctx.participant_id, run_generation):
@@ -2341,6 +2744,14 @@ class BotWorker:
                 response,
                 cards=delivered_cards,
                 used_tools=progress.used_tools,
+                evidence=PresentationEvidence(tuple(progress.evidence_sources)),
+                suppress_card_companion=bool(
+                    review_policy is not None
+                    and review_policy.self_contained
+                    and review_policy.suppress_companion
+                    and delivered_cards
+                    and not card_delivery_failed
+                ),
             )
             metrics["presentation_ms"] = round(
                 (time.monotonic() - presentation_started) * 1000, 1
@@ -2369,6 +2780,7 @@ class BotWorker:
                 metrics=metrics,
                 delivery_started_at=started,
                 run_generation=run_generation,
+                streaming_session=streaming_session,
             )
             if self._run_was_stopped(ctx.participant_id, run_generation):
                 await asyncio.to_thread(self.runs.finish, run_id, "interrupted")
@@ -2430,6 +2842,22 @@ class BotWorker:
             for pending_timer in tool_timers:
                 pending_timer.cancel()
             await asyncio.gather(*timers, return_exceptions=True)
+            if streaming_session is not None and not streaming_session.closed:
+                try:
+                    await streaming_session.fail("本次回复中断，请重新发送。")
+                    finish_streaming = getattr(
+                        self.events, "finish_streaming_reply", None
+                    )
+                    if callable(finish_streaming):
+                        await asyncio.to_thread(
+                            finish_streaming, event.event_id
+                        )
+                except Exception:
+                    logger.warning(
+                        "streaming_card_shutdown_finalize_failed event_id=%s",
+                        event.event_id,
+                        exc_info=True,
+                    )
             participant_events = self._active_agent_events.get(
                 ctx.participant_id
             )
@@ -2503,6 +2931,164 @@ class BotWorker:
         )
         return True
 
+    async def _has_external_llm_consent(self, participant) -> bool:
+        """Single external-LLM gate read; the service is the only authority.
+
+        The service reads participant_consents only - the legacy
+        researcher/CLI flag never authorizes external LLM processing. When no
+        service is available the gate fails closed. The read runs off the
+        event loop like every other DB access.
+        """
+
+        if self.consent_service is None:
+            return False
+        return await asyncio.to_thread(
+            self.consent_service.is_active, participant.id
+        )
+
+    async def _deliver_consent_prompt(self, event: BotEvent) -> None:
+        """Fixed user-consent prompt; never mentions researcher approval."""
+
+        try:
+            message_id = await self._send_card(
+                event.chat_id,
+                external_llm_consent_card(),
+                message_uuid=self._stable_message_uuid(
+                    f"mindflow:card:{event.event_id}"
+                ),
+            )
+        except FeishuSendError:
+            await self._deliver(event, external_llm_consent_prompt_text())
+            return
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+
+    async def _deliver_welcome(self, event: BotEvent) -> bool:
+        """Progressive first screen after binding.
+
+        The interactive card is primary; when card sending is unavailable the
+        durable text first screen keeps the same guidance without duplicating
+        the welcome through later replays.
+        """
+
+        try:
+            message_id = await self._send_card(
+                event.chat_id,
+                onboarding_welcome_card(self.feature_keys),
+                message_uuid=self._stable_message_uuid(
+                    f"mindflow:card:{event.event_id}"
+                ),
+            )
+        except FeishuSendError:
+            return await self._deliver(event, welcome_first_screen_text())
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
+    async def _deliver_course_schedule_preview(
+        self,
+        event: BotEvent,
+        participant_id,
+        draft: dict,
+    ) -> bool:
+        """Send once per draft, then update the same canonical Preview card."""
+
+        card = course_schedule_preview_card(draft)
+        import_id = str(draft.get("id") or "").strip()
+        message_id = str(draft.get("status_card_message_id") or "").strip()
+        try:
+            if message_id and callable(getattr(self.sender, "update_card", None)):
+                try:
+                    await asyncio.to_thread(self.sender.update_card, message_id, card)
+                    route = "update"
+                except FeishuSendError as exc:
+                    if not (
+                        exc.operation == "update_card"
+                        and exc.replacement_allowed
+                        and not exc.retryable
+                    ):
+                        raise
+                    old_message_id = message_id
+                    message_id = await self._send_card(
+                        event.chat_id,
+                        card,
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:course-preview:{import_id}:replace:{old_message_id}"
+                        ),
+                    )
+                    rebind = getattr(
+                        self.schedule_imports.drafts, "rebind_preview_card", None
+                    )
+                    if not callable(rebind):
+                        raise RuntimeError(
+                            "course schedule preview rebind is unavailable"
+                        )
+                    bound = await asyncio.to_thread(
+                        rebind,
+                        participant_id,
+                        import_id,
+                        expected_old_message_id=old_message_id,
+                        message_id=message_id,
+                        chat_id=event.chat_id,
+                    )
+                    message_id = str(
+                        bound.get("status_card_message_id") or message_id
+                    )
+                    route = "replacement"
+            else:
+                message_id = await self._send_card(
+                    event.chat_id,
+                    card,
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:course-preview:{import_id}"
+                    ),
+                )
+                route = "send"
+            bind = getattr(self.schedule_imports.drafts, "bind_preview_card", None)
+            if callable(bind):
+                bound = await asyncio.to_thread(
+                    bind,
+                    participant_id,
+                    import_id,
+                    message_id=message_id,
+                    chat_id=event.chat_id,
+                )
+                message_id = str(
+                    bound.get("status_card_message_id") or message_id
+                )
+        except FeishuSendError:
+            await asyncio.to_thread(
+                self.events.finish,
+                event.event_id,
+                status="received",
+                error_code="card_send_failed",
+            )
+            return False
+        logger.info(
+            "course_schedule_preview_presented event_id=%s image_message_id=%s "
+            "draft_id=%s card_message_id=%s presentation_route=%s",
+            event.event_id,
+            event.message_id,
+            import_id,
+            message_id,
+            route,
+        )
+        await asyncio.to_thread(
+            self.events.finish,
+            event.event_id,
+            status="completed",
+            reply_message_id=message_id,
+        )
+        return True
+
     async def _deliver_plan(
         self,
         event: BotEvent,
@@ -2512,6 +3098,7 @@ class BotWorker:
         metrics: dict[str, object] | None = None,
         delivery_started_at: float | None = None,
         run_generation: int | None = None,
+        streaming_session: FeishuStreamingCardSession | None = None,
     ) -> bool:
         if (
             participant_id is not None
@@ -2527,11 +3114,49 @@ class BotWorker:
                 self.events.finish, event.event_id, status="completed"
             )
             return True
+        if (
+            self.streaming_card_enabled
+            and plan.presentation_mode == "streaming_markdown"
+        ):
+            streamed = await self._deliver_streaming_plan(
+                event,
+                plan,
+                session=streaming_session,
+                participant_id=participant_id,
+                metrics=metrics,
+                delivery_started_at=delivery_started_at,
+            )
+            if streamed is not None:
+                return streamed
+        if streaming_session is not None and not streaming_session.closed:
+            try:
+                await streaming_session.fail("结果已通过普通消息发送。")
+            except Exception:
+                logger.warning(
+                    "unused_streaming_card_finalize_failed event_id=%s",
+                    event.event_id,
+                    exc_info=True,
+                )
         await asyncio.to_thread(
             self.events.stage_reply_plan,
             event.event_id,
             full_text=plan.full_text,
             segments=[segment.text for segment in plan.segments],
+            presentation_mode=(
+                "rich_markdown"
+                if plan.presentation_mode == "streaming_markdown"
+                else plan.presentation_mode
+            ),
+            rich_text=(
+                plan.full_text
+                if plan.presentation_mode in {"rich_markdown", "streaming_markdown"}
+                else None
+            ),
+            plain_text_fallback=(
+                sanitize_markdown(plan.full_text)
+                if plan.presentation_mode in {"rich_markdown", "streaming_markdown"}
+                else plan.full_text
+            ),
         )
         pending = await asyncio.to_thread(
             self.events.pending_reply_plan, event.event_id
@@ -2546,6 +3171,215 @@ class BotWorker:
             delivery_started_at=delivery_started_at,
             run_generation=run_generation,
         )
+
+    async def _deliver_streaming_plan(
+        self,
+        event: BotEvent,
+        plan: ResponsePlan,
+        *,
+        session: FeishuStreamingCardSession | None,
+        participant_id=None,
+        metrics: dict[str, object] | None = None,
+        delivery_started_at: float | None = None,
+    ) -> bool | None:
+        start_streaming = getattr(self.sender, "start_streaming_card", None)
+        if session is None:
+            if not callable(start_streaming):
+                return None
+            try:
+                session = await start_streaming(
+                    event.chat_id,
+                    "正在整理结果…",
+                    message_uuid=self._stable_message_uuid(
+                        f"mindflow:stream:{event.event_id}"
+                    ),
+                    update_interval_ms=self.streaming_update_interval_ms,
+                    min_update_chars=self.streaming_min_chars_per_update,
+                    max_update_interval_ms=self.streaming_max_update_interval_ms,
+                )
+                await asyncio.to_thread(
+                    self.events.stage_streaming_progress,
+                    event.event_id,
+                    card_id=session.card_id,
+                    message_id=session.message_id,
+                    element_id=session.element_id,
+                )
+            except Exception as exc:
+                failure = _streaming_failure_fields(
+                    exc, default_stage="create_card"
+                )
+                logger.warning(
+                    "streaming_card_start_failed event_id=%s operation=%s "
+                    "provider_error_code=%s provider_request_id=%s "
+                    "retryable=%s stage=%s",
+                    event.event_id,
+                    failure["operation"],
+                    failure["provider_error_code"],
+                    failure["provider_request_id"],
+                    failure["retryable"],
+                    failure["stage"],
+                    exc_info=True,
+                )
+                await self._record_incident(
+                    severity="warning",
+                    subsystem="feishu",
+                    event_name="streaming_card_start_failed",
+                    participant_id=participant_id,
+                    bot_event_id=event.event_id,
+                    error_code=(
+                        str(failure["provider_error_code"])
+                        if failure["provider_error_code"] is not None
+                        else None
+                    ),
+                    error_class=type(exc).__name__,
+                    summary="CardKit answer card could not be started.",
+                    details=failure,
+                )
+                return None
+        self._attach_streaming_sequence_allocator(event.event_id, session)
+        await asyncio.to_thread(
+            self.events.stage_streaming_final,
+            event.event_id,
+            full_text=plan.full_text,
+        )
+        delivery_started = time.monotonic()
+        try:
+            await self._stream_validated_text(session, plan.full_text)
+            await asyncio.wait_for(
+                session.finalize(plan.full_text),
+                timeout=self.streaming_finalize_timeout_seconds,
+            )
+        except Exception as exc:
+            failure = _streaming_failure_fields(exc, default_stage="update")
+            logger.warning(
+                "streaming_card_final_delivery_failed event_id=%s visible_chars=%s "
+                "operation=%s provider_error_code=%s provider_request_id=%s "
+                "retryable=%s stage=%s",
+                event.event_id,
+                session.answer_visible_chars,
+                failure["operation"],
+                failure["provider_error_code"],
+                failure["provider_request_id"],
+                failure["retryable"],
+                failure["stage"],
+                exc_info=True,
+            )
+            try:
+                await asyncio.wait_for(
+                    session.finalize(plan.full_text),
+                    timeout=self.streaming_finalize_timeout_seconds,
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    self.events.note_streaming_failure,
+                    event.event_id,
+                    "streaming_card_failed",
+                )
+                if session.answer_visible_chars == 0:
+                    try:
+                        await session.fail("卡片更新失败，以下改用普通消息发送。")
+                    except Exception:
+                        pass
+                    return None
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                try:
+                    await self._send(
+                        event.chat_id,
+                        "回复展示中断，请重新发送这条问题。",
+                        message_uuid=self._stable_message_uuid(
+                            f"mindflow:stream-interrupted:{event.event_id}"
+                        ),
+                    )
+                except FeishuSendError:
+                    return False
+                await asyncio.to_thread(
+                    self.events.finish_streaming_reply, event.event_id
+                )
+                return True
+        await asyncio.to_thread(self.events.finish_streaming_reply, event.event_id)
+        if metrics is not None:
+            metrics["first_final_send_ms"] = round(
+                (delivery_started - (delivery_started_at or delivery_started)) * 1000,
+                1,
+            )
+            metrics["total_delivery_ms"] = round(
+                (time.monotonic() - delivery_started) * 1000,
+                1,
+            )
+        return True
+
+    async def _stream_validated_text(
+        self,
+        session: FeishuStreamingCardSession,
+        text: str,
+    ) -> None:
+        value = str(text)
+        if not value:
+            return
+        for end in safe_stream_prefix_boundaries(
+            value,
+            max_updates=60,
+            min_chars=self.streaming_min_chars_per_update,
+        ):
+            if end < len(value):
+                await session.update(value[:end])
+
+    def _attach_streaming_sequence_allocator(
+        self,
+        event_id: str,
+        session: FeishuStreamingCardSession,
+    ) -> None:
+        async def allocate() -> int:
+            return await asyncio.to_thread(
+                self.events.reserve_streaming_sequence, event_id
+            )
+
+        session.sequence_allocator = allocate
+
+    async def _resume_streaming_reply(
+        self,
+        event: BotEvent,
+        pending,
+        *,
+        participant_id=None,
+    ) -> bool:
+        session = FeishuStreamingCardSession(
+            client=self.sender,
+            card_id=pending.card_id,
+            message_id=pending.message_id,
+            element_id=pending.element_id,
+            sequence=pending.sequence,
+            visible_content="",
+            update_interval_ms=self.streaming_update_interval_ms,
+            min_update_chars=self.streaming_min_chars_per_update,
+            max_update_interval_ms=self.streaming_max_update_interval_ms,
+        )
+        self._attach_streaming_sequence_allocator(event.event_id, session)
+        if pending.final_text is None:
+            try:
+                await session.fail("本次回复中断，请重新发送。")
+            finally:
+                await asyncio.to_thread(
+                    self.events.finish_streaming_reply, event.event_id
+                )
+            return True
+        plan = ResponsePlan(
+            kind="analysis",
+            full_text=pending.final_text,
+            segments=(ResponseSegment(0, pending.final_text),),
+            use_cards=True,
+            presentation_mode="streaming_markdown",
+        )
+        result = await self._deliver_streaming_plan(
+            event,
+            plan,
+            session=session,
+            participant_id=participant_id,
+        )
+        return bool(result)
 
     async def _resume_delivery_plan(
         self,
@@ -2570,13 +3404,43 @@ class BotWorker:
                 )
                 return False
             try:
-                message_id = await self._send(
-                    event.chat_id,
-                    pending_plan.segments[index],
-                    message_uuid=self._stable_message_uuid(
-                        f"mindflow:reply:{event.event_id}:{index}"
-                    ),
+                message_uuid = self._stable_message_uuid(
+                    f"mindflow:reply:{event.event_id}:{index}"
                 )
+                if (
+                    index == 0
+                    and pending_plan.presentation_mode == "rich_markdown"
+                    and pending_plan.rich_text
+                ):
+                    try:
+                        message_id = await self._send_card(
+                            event.chat_id,
+                            rich_answer_card(pending_plan.rich_text),
+                            message_uuid=message_uuid,
+                        )
+                    except FeishuSendError as exc:
+                        logger.warning(
+                            "rich_answer_card_send_failed event_id=%s "
+                            "error_code=%s retryable=%s operation=%s",
+                            event.event_id,
+                            exc.code,
+                            exc.retryable,
+                            exc.operation,
+                        )
+                        message_id = await self._send(
+                            event.chat_id,
+                            pending_plan.plain_text_fallback
+                            or sanitize_markdown(pending_plan.rich_text),
+                            message_uuid=self._stable_message_uuid(
+                                f"mindflow:reply-plain:{event.event_id}:{index}"
+                            ),
+                        )
+                else:
+                    message_id = await self._send(
+                        event.chat_id,
+                        pending_plan.segments[index],
+                        message_uuid=message_uuid,
+                    )
             except FeishuSendError as exc:
                 await asyncio.to_thread(
                     self.events.note_reply_failure, event.event_id

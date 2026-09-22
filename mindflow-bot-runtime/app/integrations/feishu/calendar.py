@@ -611,6 +611,9 @@ class CalendarService:
                 ).isoformat()
             return value.get("date")
 
+        location = item.get("location")
+        if isinstance(location, dict):
+            location = location.get("name") or location.get("address")
         return {
             "id": str(item.get("event_id") or ""),
             "summary": str(item.get("summary") or "")[:200],
@@ -621,4 +624,5 @@ class CalendarService:
             "status": str(item.get("status") or ""),
             "is_exception": bool(item.get("is_exception")),
             "recurring_event_id": str(item.get("recurring_event_id") or ""),
+            "location": str(location or "")[:300],
         }

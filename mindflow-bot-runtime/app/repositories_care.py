@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.db import Database
 from app.models import (
@@ -43,6 +44,85 @@ CARE_ACTIONS = {
 CARE_CARD_ACTIONS = ["helpful", "not_relevant", "snooze_30", "disable_type"]
 OPERATIONAL_CARE_ACTIONS = {"ack", "snooze_30", "mute_today"}
 PREFERRED_SUPPORT_TYPES = set(INTERVENTION_OPTIONS)
+CARE_PREFERENCE_CHANGE_FIELDS = {
+    "care_enabled",
+    "warning_enabled",
+    "daily_review_enabled",
+    "morning_brief_enabled",
+    "weekly_summary_enabled",
+    "morning_brief_local_time",
+    "morning_brief_paused_until",
+    "weekly_summary_local_time",
+    "weekly_summary_weekday",
+    "quiet_hours_start",
+    "quiet_hours_end",
+    "max_proactive_care_per_day",
+    "max_system_proactive_per_day",
+    "allow_schedule_suggestions",
+    "allow_follow_up",
+    "global_proactive_muted_until",
+    "preferred_support_types",
+    "reenable_intervention_types",
+}
+
+
+class CarePreferenceClarificationRequired(ValueError):
+    """The proposed quiet-hours patch would leave one bound unresolved."""
+
+    code = "care_preference_incomplete"
+
+    def __init__(
+        self,
+        *,
+        missing_fields: tuple[str, ...],
+        resolved_changes: Mapping[str, Any],
+    ) -> None:
+        self.missing_fields = tuple(missing_fields)
+        self.resolved_changes = dict(resolved_changes)
+        super().__init__(
+            "quiet hours require both quiet_hours_start and quiet_hours_end; "
+            f"missing {', '.join(self.missing_fields)}"
+        )
+
+    def as_tool_result(self) -> dict[str, Any]:
+        start = self.resolved_changes.get("quiet_hours_start")
+        end = self.resolved_changes.get("quiet_hours_end")
+        known: dict[str, Any] = {}
+        if start not in (None, ""):
+            known["start"] = str(start)
+        if end not in (None, ""):
+            known["end"] = str(end)
+        morning_brief = self.resolved_changes.get("morning_brief_local_time")
+        if morning_brief not in (None, ""):
+            known["morning_brief"] = str(morning_brief)
+        if "quiet_hours_start" in self.missing_fields:
+            guidance = "从几点开始免打扰，到几点恢复提醒？"
+            need = "start_time"
+        else:
+            guidance = (
+                f"晚上 {known.get('start', '')} 开始免打扰，到几点恢复提醒？"
+            )
+            need = "end_time"
+        return {
+            "ok": False,
+            "error": self.code,
+            "reason_code": self.code,
+            "kind": "clarification_required",
+            "clarification": {
+                "topic": "quiet_hours",
+                "known": known,
+                "need": need,
+            },
+            "public_guidance": guidance,
+            "diagnostic_summary": {
+                "reason_code": self.code,
+                "missing_fields": list(self.missing_fields),
+                "resolved_changes": dict(self.resolved_changes),
+            },
+            "staged": False,
+            "persisted": False,
+            "do_not_retry": True,
+        }
 
 
 def _aware(value: datetime) -> datetime:
@@ -93,11 +173,17 @@ class ParticipantCarePreferenceRepository:
             "warning_enabled": True,
             "daily_review_enabled": True,
             "morning_brief_enabled": False,
+            "morning_brief_local_time": "08:00",
+            "morning_brief_paused_until": None,
             "weekly_summary_enabled": False,
+            "weekly_summary_local_time": "09:00",
+            "weekly_summary_weekday": 1,
             "quiet_hours_start": None,
             "quiet_hours_end": None,
             "max_proactive_care_per_day": self.system_max_daily_sends,
             "effective_max_proactive_care_per_day": self.system_max_daily_sends,
+            "max_system_proactive_per_day": self.system_max_daily_sends,
+            "effective_max_system_proactive_per_day": self.system_max_daily_sends,
             "allow_schedule_suggestions": False,
             "allow_follow_up": True,
             "preferred_support_types": [],
@@ -106,6 +192,7 @@ class ParticipantCarePreferenceRepository:
             "interruption_tolerance": 0.5,
             "preferred_reminder_windows": [],
             "muted_until": None,
+            "global_proactive_muted_until": None,
             "version": 0,
             "updated_at": None,
         }
@@ -123,60 +210,145 @@ class ParticipantCarePreferenceRepository:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         changed_at = _aware(now or utc_now())
-        allowed = {
-            "care_enabled",
-            "warning_enabled",
-            "daily_review_enabled",
-            "morning_brief_enabled",
-            "weekly_summary_enabled",
-            "quiet_hours_start",
-            "quiet_hours_end",
-            "max_proactive_care_per_day",
-            "allow_schedule_suggestions",
-            "allow_follow_up",
-            "preferred_support_types",
-            "reenable_intervention_types",
-        }
-        unknown = set(changes) - allowed
-        if unknown:
-            raise ValueError(f"unsupported care preference fields: {sorted(unknown)}")
+        self._validate_change_fields(changes)
         with self.database.session() as session:
-            participant = session.get(
-                Participant, participant_id, with_for_update=True
+            return self.update_in_session(
+                session,
+                participant_id,
+                changes,
+                now=changed_at,
             )
+
+    def update_in_session(
+        self,
+        session: Session,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        changed_at = _aware(now or utc_now())
+        self._validate_change_fields(changes)
+        participant = session.get(
+            Participant, participant_id, with_for_update=True
+        )
+        if participant is None:
+            raise ValueError("participant does not exist")
+        row = session.get(
+            ParticipantCarePreference, participant_id, with_for_update=True
+        )
+        created_preference = row is None
+        if row is None:
+            row = ParticipantCarePreference(
+                participant_id=participant_id,
+                version=0,
+            )
+            session.add(row)
+            session.flush()
+        before = self._view(row)
+        self._apply_changes(row, changes)
+        after_values = self._view(row)
+        material_keys = (
+            CARE_PREFERENCE_CHANGE_FIELDS - {"reenable_intervention_types"}
+        ) | {"disabled_intervention_types"}
+        if (
+            (created_preference and bool(changes))
+            or any(
+                before.get(key) != after_values.get(key)
+                for key in material_keys
+            )
+        ):
+            row.version = int(row.version or 0) + 1
+            row.updated_at = changed_at
+        self._cancel_disallowed_in_session(
+            session, participant_id, row, now=changed_at
+        )
+        session.flush()
+        return self._view(row)
+
+    def validate_changes(
+        self,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate a proposal against current state without persisting it."""
+
+        normalized = dict(changes)
+        if not normalized:
+            raise ValueError("care preference proposal has no changes")
+        self._validate_change_fields(normalized)
+        with self.database.session() as session:
+            participant = session.get(Participant, participant_id)
             if participant is None:
                 raise ValueError("participant does not exist")
-            row = session.get(
-                ParticipantCarePreference, participant_id, with_for_update=True
-            )
-            created_preference = row is None
+            row = session.get(ParticipantCarePreference, participant_id)
             if row is None:
-                row = ParticipantCarePreference(
-                    participant_id=participant_id,
-                    version=0,
-                )
-                session.add(row)
-                session.flush()
-            before = self._view(row)
-            self._apply_changes(row, changes)
-            after_values = self._view(row)
-            material_keys = (
-                allowed - {"reenable_intervention_types"}
-            ) | {"disabled_intervention_types"}
-            if (
-                (created_preference and bool(changes))
-                or any(
-                    before.get(key) != after_values.get(key)
-                    for key in material_keys
-                )
-            ):
-                row.version = int(row.version or 0) + 1
-                row.updated_at = changed_at
-            self._cancel_disallowed_in_session(
-                session, participant_id, row, now=changed_at
+                current = self.defaults()
+                # A transient row is only used for field validation. Keep it
+                # out of the session so incomplete requests cannot create a
+                # preference record as a side effect.
+                row = ParticipantCarePreference(participant_id=participant_id)
+            else:
+                current = self._view(row)
+            proposed_start = (
+                _parse_clock(normalized["quiet_hours_start"])
+                if "quiet_hours_start" in normalized
+                else _parse_clock(current.get("quiet_hours_start"))
             )
-            session.flush()
-            return self._view(row)
+            proposed_end = (
+                _parse_clock(normalized["quiet_hours_end"])
+                if "quiet_hours_end" in normalized
+                else _parse_clock(current.get("quiet_hours_end"))
+            )
+            missing: list[str] = []
+            if proposed_start is None and proposed_end is not None and "quiet_hours_start" not in normalized:
+                missing.append("quiet_hours_start")
+            if proposed_end is None and proposed_start is not None and "quiet_hours_end" not in normalized:
+                missing.append("quiet_hours_end")
+            if missing:
+                raise CarePreferenceClarificationRequired(
+                    missing_fields=tuple(missing),
+                    resolved_changes={
+                        key: value for key, value in normalized.items()
+                    },
+                )
+            self._apply_changes(row, normalized)
+            session.rollback()
+        for key in (
+            "morning_brief_local_time",
+            "weekly_summary_local_time",
+            "quiet_hours_start",
+            "quiet_hours_end",
+        ):
+            if key in normalized:
+                parsed = _parse_clock(normalized[key])
+                normalized[key] = parsed.strftime("%H:%M") if parsed else None
+        if "preferred_support_types" in normalized:
+            normalized["preferred_support_types"] = normalized_intervention_types(
+                normalized["preferred_support_types"]
+            )
+        if "reenable_intervention_types" in normalized:
+            normalized["reenable_intervention_types"] = normalized_intervention_types(
+                normalized["reenable_intervention_types"]
+            )
+        return normalized
+
+    def validate_effective_changes(
+        self,
+        participant_id: uuid.UUID,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Preflight current state plus a proposed patch by its effective values."""
+
+        return self.validate_changes(participant_id, changes)
+
+    @staticmethod
+    def _validate_change_fields(changes: Mapping[str, Any]) -> None:
+        unknown = set(changes) - CARE_PREFERENCE_CHANGE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unsupported care preference fields: {sorted(unknown)}"
+            )
 
     def mute_today(
         self,
@@ -290,6 +462,42 @@ class ParticipantCarePreferenceRepository:
                 )
             else:
                 row.max_proactive_care_per_day = raw_max
+        if "max_system_proactive_per_day" in changes:
+            raw_max = changes["max_system_proactive_per_day"]
+            if raw_max is None:
+                row.max_system_proactive_per_day = None
+            elif (
+                not isinstance(raw_max, int)
+                or isinstance(raw_max, bool)
+                or not 0 <= raw_max <= self.system_max_daily_sends
+            ):
+                raise ValueError(
+                    "max_system_proactive_per_day exceeds the backend safety cap"
+                )
+            else:
+                row.max_system_proactive_per_day = raw_max
+        for key in ("morning_brief_local_time", "weekly_summary_local_time"):
+            if key in changes:
+                parsed = _parse_clock(changes[key])
+                if parsed is None:
+                    raise ValueError(f"{key} is required")
+                setattr(row, key, parsed)
+        if "weekly_summary_weekday" in changes:
+            weekday = changes["weekly_summary_weekday"]
+            if not isinstance(weekday, int) or isinstance(weekday, bool) or not 1 <= weekday <= 7:
+                raise ValueError("weekly_summary_weekday must be between 1 and 7")
+            row.weekly_summary_weekday = weekday
+        for key in ("morning_brief_paused_until", "global_proactive_muted_until"):
+            if key in changes:
+                value = changes[key]
+                if value in (None, ""):
+                    setattr(row, key, None)
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(str(value))
+                except ValueError as exc:
+                    raise ValueError(f"{key} must be ISO 8601") from exc
+                setattr(row, key, _aware(parsed))
         start = (
             _parse_clock(changes["quiet_hours_start"])
             if "quiet_hours_start" in changes
@@ -429,12 +637,25 @@ class ParticipantCarePreferenceRepository:
             self.system_max_daily_sends,
             self.system_max_daily_sends if configured_max is None else configured_max,
         )
+        configured_system_max = row.max_system_proactive_per_day
+        effective_system_max = min(
+            self.system_max_daily_sends,
+            self.system_max_daily_sends
+            if configured_system_max is None else configured_system_max,
+        )
         return {
             "care_enabled": bool(row.care_enabled),
             "warning_enabled": bool(row.warning_enabled),
             "daily_review_enabled": bool(row.daily_review_enabled),
             "morning_brief_enabled": bool(row.morning_brief_enabled),
+            "morning_brief_local_time": row.morning_brief_local_time.strftime("%H:%M"),
+            "morning_brief_paused_until": (
+                _aware(row.morning_brief_paused_until).isoformat()
+                if row.morning_brief_paused_until else None
+            ),
             "weekly_summary_enabled": bool(row.weekly_summary_enabled),
+            "weekly_summary_local_time": row.weekly_summary_local_time.strftime("%H:%M"),
+            "weekly_summary_weekday": int(row.weekly_summary_weekday),
             "quiet_hours_start": (
                 row.quiet_hours_start.strftime("%H:%M")
                 if row.quiet_hours_start else None
@@ -449,6 +670,12 @@ class ParticipantCarePreferenceRepository:
                 else self.system_max_daily_sends
             ),
             "effective_max_proactive_care_per_day": effective_max,
+            "max_system_proactive_per_day": (
+                configured_system_max
+                if configured_system_max is not None
+                else self.system_max_daily_sends
+            ),
+            "effective_max_system_proactive_per_day": effective_system_max,
             "allow_schedule_suggestions": bool(row.allow_schedule_suggestions),
             "allow_follow_up": bool(row.allow_follow_up),
             "preferred_support_types": list(row.preferred_support_types or []),
@@ -458,6 +685,10 @@ class ParticipantCarePreferenceRepository:
             "preferred_reminder_windows": list(row.preferred_reminder_windows or []),
             "muted_until": (
                 _aware(row.muted_until).isoformat() if row.muted_until else None
+            ),
+            "global_proactive_muted_until": (
+                _aware(row.global_proactive_muted_until).isoformat()
+                if row.global_proactive_muted_until else None
             ),
             "version": int(row.version),
             "updated_at": _aware(row.updated_at).isoformat(),
@@ -519,6 +750,8 @@ class CareInterventionRepository:
                 "care_context": context,
                 "care_plan": plan,
                 "care_provenance": provenance,
+                "care_evidence": dict(payload.get("care_evidence") or {}),
+                "care_composition": dict(payload.get("care_composition") or {}),
             },
             "actions_json": list(plan.get("actions") or CARE_CARD_ACTIONS),
             "updated_at": warning.updated_at,
@@ -628,11 +861,43 @@ class CareInterventionRepository:
                     ),
                 ).order_by(desc(CareInterventionFeedback.submitted_at)).limit(1)
             ).scalar_one_or_none()
+            feedback_rows = session.execute(
+                select(CareInterventionFeedback, CareInterventionEvent)
+                .join(
+                    CareInterventionEvent,
+                    CareInterventionEvent.id == CareInterventionFeedback.intervention_id,
+                )
+                .where(
+                    CareInterventionFeedback.participant_id == participant_id,
+                    CareInterventionFeedback.submitted_at <= decision_time,
+                    CareInterventionFeedback.action_selected.in_(
+                        ("helpful", "not_relevant", "disable_type")
+                    ),
+                )
+                .order_by(desc(CareInterventionFeedback.submitted_at))
+                .limit(100)
+            ).all()
+            helpful_summary: dict[str, dict[str, int]] = {}
+            disabled_types: set[str] = set()
+            for feedback, intervention in feedback_rows:
+                intervention_type = str(intervention.intervention_type or "brief_check_in")
+                summary = helpful_summary.setdefault(
+                    intervention_type, {"helpful_count": 0, "rated_count": 0}
+                )
+                if feedback.action_selected in {"helpful", "not_relevant"}:
+                    summary["rated_count"] += 1
+                if feedback.action_selected == "helpful":
+                    summary["helpful_count"] += 1
+                if feedback.action_selected == "disable_type":
+                    disabled_types.add(intervention_type)
             return {
                 "last_intervention_at": _aware(latest.sent_at).isoformat()
                 if latest and latest.sent_at else None,
                 "last_dismissal_at": _aware(dismissal.submitted_at).isoformat()
                 if dismissal is not None else None,
+                "explicit_helpful_summary": helpful_summary,
+                "disabled_intervention_types": sorted(disabled_types),
+                "feedback_source": "explicit_user_feedback",
             }
 
     def latest_sent(self, participant_id: uuid.UUID) -> dict[str, Any] | None:

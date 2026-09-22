@@ -18,13 +18,16 @@ TOOL_STAGE = {
     "care_get_pressure_curve": "forecast",
     "care_simulate_schedule_change": "what_if",
     "care_get_checkin_card": "card",
-    "care_record_checkin": "record_checkin",
+    "care_record_checkin": "card",
     "care_get_support": "support",
     "care_update_preferences": "preferences",
     "care_respond_to_latest_intervention": "intervention_feedback",
     "calendar_create_event": "calendar_mutation",
+    "calendar_create_events_plan": "calendar_mutation_plan",
     "calendar_update_event": "calendar_mutation",
+    "calendar_update_events_plan": "calendar_mutation_plan",
     "calendar_delete_event": "calendar_mutation",
+    "calendar_delete_events_plan": "calendar_mutation_plan",
 }
 
 _GENERIC_PROGRESS_MESSAGES = (
@@ -71,20 +74,20 @@ class ProgressPresenter:
                 if previous_stage == "forecast":
                     return "压力趋势已经算好了，我在整理成更直观的结果。"
                 return "我在准备这次状态记录。"
-            if stage == "record_checkin":
-                return "我在记录这次状态。"
             if stage == "support":
                 return "我在结合当前状态整理更合适的支持建议。"
             if stage == "preferences":
-                return "我正在更新你的提醒与关怀设置。"
+                return "我在整理设置变更并准备确认卡。"
             if stage == "intervention_feedback":
                 return "我正在记录这次反馈。"
             if tool_name == "calendar_create_event":
-                return "我正在核对时间并创建这条日程。"
+                return "我在核对日程信息并准备确认卡。"
             if tool_name == "calendar_update_event":
-                return "我正在修改这条日程。"
+                return "我在核对修改内容并准备确认卡。"
             if tool_name == "calendar_delete_event":
-                return "我正在处理这条已确认的删除操作。"
+                return "我在核对要删除的日程并准备确认卡。"
+            if stage == "calendar_mutation_plan":
+                return "我在整理这些日程并准备确认卡。"
         return None
 
     def delayed(

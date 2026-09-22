@@ -77,8 +77,8 @@ class TimelineManager:
         for ev in self.events:
             if ev.get_event_type() in ROUTINE_EVENT_TYPES:
                 try:
-                    s_dt = self._parse_time_robust(ev.start_time, current_time)
-                    e_dt = self._parse_time_robust(ev.end_time, current_time)
+                    s_dt = parse_datetime_on_date(ev.start_time, self.date_str)
+                    e_dt = parse_datetime_on_date(ev.end_time, self.date_str)
                     if s_dt <= current_time < e_dt: return ev
                 except Exception: continue
         return None

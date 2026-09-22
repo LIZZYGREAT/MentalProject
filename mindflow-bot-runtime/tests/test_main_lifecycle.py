@@ -1,9 +1,64 @@
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
 from app import main as app_main
+from app.integrations.feishu.client import FeishuClient, FeishuSendError
+
+
+def test_web_search_startup_diagnostic_logs_only_configuration_booleans(caplog):
+    settings = SimpleNamespace(
+        web_search_enabled=True,
+        web_search_provider="deepseek_native",
+        web_search_model="deepseek-v4-flash",
+        deepseek_api_key="secret-key-value",
+    )
+
+    with caplog.at_level("INFO"):
+        app_main._log_web_search_config(settings)
+
+    assert (
+        "web_search_config enabled=True provider=deepseek_native "
+        "model=deepseek-v4-flash key_configured=True"
+    ) in caplog.text
+    assert "secret-key-value" not in caplog.text
+
+
+def test_streaming_capability_preflight_logs_supported_sender(caplog):
+    settings = SimpleNamespace(feishu_streaming_card_enabled=True)
+    sender = SimpleNamespace(start_streaming_card=lambda *_args, **_kwargs: None)
+    incidents = SimpleNamespace(record=lambda **_kwargs: pytest.fail("unexpected"))
+
+    with caplog.at_level("INFO"):
+        app_main._record_streaming_capability(settings, sender, incidents)
+
+    assert (
+        "feishu_streaming_capability enabled=True sender_supported=True"
+        in caplog.text
+    )
+
+
+def test_streaming_capability_preflight_records_enabled_but_unsupported(caplog):
+    records = []
+    settings = SimpleNamespace(feishu_streaming_card_enabled=True)
+    sender = SimpleNamespace()
+    incidents = SimpleNamespace(record=lambda **values: records.append(values))
+
+    with caplog.at_level("INFO"):
+        app_main._record_streaming_capability(settings, sender, incidents)
+
+    assert "enabled=True sender_supported=False" in caplog.text
+    assert records == [{
+        "severity": "warning",
+        "subsystem": "feishu",
+        "event_name": "feishu_streaming_capability_unavailable",
+        "summary": (
+            "Streaming is enabled but the configured sender has no CardKit capability."
+        ),
+        "details": {"enabled": True, "sender_supported": False},
+    }]
 
 
 def test_daily_review_scheduler_fails_closed_without_card_action_transport():
@@ -72,6 +127,7 @@ def _card_action_event():
         action_tag="button",
         action_value={"mindflow_action": "submit_checkin"},
         form_value={},
+        callback_token="callback-token",
     )
 
 
@@ -105,6 +161,163 @@ def test_card_action_handler_updates_original_card_after_success():
     assert result["card_update_ok"] is True
     assert card_actions.calls == 1
     assert sender.updated == [("om-card", result["card"])]
+
+
+def test_card_action_executor_never_calls_delivery_transport():
+    participant = SimpleNamespace(id="participant-1")
+
+    executor = app_main._build_card_action_executor(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        SimpleNamespace(
+            handle=lambda *_args, **_kwargs: {
+                "ok": True,
+                "reply_text": "已完成",
+                "card": {"schema": "2.0"},
+            }
+        ),
+    )
+    assert "sender" not in inspect.signature(
+        app_main._build_card_action_executor
+    ).parameters
+    assert executor(_card_action_event()) == {
+        "ok": True,
+        "reply_text": "已完成",
+        "card": {"schema": "2.0"},
+    }
+
+
+def test_card_action_handler_uses_callback_token_for_single_delayed_update():
+    participant = SimpleNamespace(id="participant-1")
+
+    class Sender:
+        def __init__(self):
+            self.delayed = []
+
+        def update_card_from_callback(self, token, message_id, card):
+            self.delayed.append((token, message_id, card))
+
+        def update_card(self, _message_id, _card):
+            raise AssertionError("direct message patch must not also run")
+
+    sender = Sender()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        SimpleNamespace(
+            handle=lambda *_args, **_kwargs: {
+                "ok": True,
+                "reply_text": "已记录",
+                "card": {"schema": "2.0"},
+            }
+        ),
+        sender,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["card_update_ok"] is True
+    assert sender.delayed == [
+        ("callback-token", "om-card", {"schema": "2.0"})
+    ]
+
+
+def test_card_action_handler_falls_back_after_callback_300090_without_repeating_business_effect():
+    participant = SimpleNamespace(id="participant-1")
+    requests = []
+    patched = []
+
+    class Messages:
+        def patch(self, request):
+            patched.append(request.message_id)
+            return SimpleNamespace(success=lambda: True)
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, request):
+            requests.append(request)
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    sender = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["card_update_ok"] is True
+    assert card_actions.calls == 1
+    assert len(requests) == 1
+    assert patched == ["om-card"]
+
+
+def test_card_action_handler_reports_after_commit_when_callback_fallback_patch_fails():
+    participant = SimpleNamespace(id="participant-1")
+
+    class Messages:
+        def patch(self, _request):
+            return SimpleNamespace(
+                success=lambda: False,
+                code=230001,
+                msg="message patch rejected",
+            )
+
+    class SdkClient:
+        im = SimpleNamespace(v1=SimpleNamespace(message=Messages()))
+
+        def request(self, _request):
+            return SimpleNamespace(
+                success=lambda: False,
+                code=300090,
+                msg="callback token target not found",
+            )
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, _participant_id, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "reply_text": "已记录"}
+
+    class Incidents:
+        def __init__(self):
+            self.records = []
+
+        def record(self, **kwargs):
+            self.records.append(kwargs)
+
+    sender = FeishuClient("app", "secret", sdk_client=SdkClient())
+    card_actions = CardActions()
+    incidents = Incidents()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant),
+        card_actions,
+        sender,
+        incidents,
+    )
+
+    result = handler(_card_action_event())
+
+    assert result["ok"] is True
+    assert result["card_update_ok"] is False
+    assert card_actions.calls == 1
+    assert incidents.records[0]["bot_event_id"] is None
+    assert incidents.records[0]["details"]["callback_event_id"] == "provider-event"
 
 
 def test_card_action_handler_keeps_success_when_card_update_fails_after_commit():
@@ -157,13 +370,68 @@ def test_card_action_handler_keeps_success_when_card_update_fails_after_commit()
     assert sender.messages == [
         (
             "oc-chat",
-            "操作已记录，但卡片状态暂未更新，无需重复提交。",
+            "操作已经完成，但卡片状态暂未更新，无需重复点击。",
         )
     ]
     assert incidents.records[0]["event_name"] == (
-        "card_action_card_update_failed_after_commit"
+        "card_action_update_failed_after_commit"
     )
     assert incidents.records[0]["error_code"] == "card_update_failed_after_commit"
+
+
+def test_card_action_handler_uses_idempotent_replacement_card_after_patch_failure():
+    participant = SimpleNamespace(id="participant-1")
+
+    class CardActions:
+        def __init__(self):
+            self.calls = 0
+
+        def handle(self, participant_id, **_kwargs):
+            self.calls += 1
+            assert participant_id == participant.id
+            return {
+                "ok": True,
+                "navigation_only": True,
+                "reply_text": "已打开",
+                "card": {"schema": "2.0"},
+            }
+
+    class Sender:
+        def __init__(self):
+            self.cards = []
+            self.messages = []
+
+        def update_card(self, _message_id, _card):
+            raise FeishuSendError(
+                "card patch failed",
+                operation="update_card",
+                replacement_allowed=True,
+            )
+
+        def send_card(self, chat_id, card, *, message_uuid=None):
+            self.cards.append((chat_id, card, message_uuid))
+
+        def send_text(self, chat_id, text):
+            self.messages.append((chat_id, text))
+
+    sender = Sender()
+    card_actions = CardActions()
+    handler = app_main._build_card_action_handler(
+        SimpleNamespace(resolve=lambda *_args: participant), card_actions, sender
+    )
+
+    first = handler(_card_action_event())
+    second = handler(_card_action_event())
+
+    assert first["card_update_ok"] is False
+    assert first["card_replacement_ok"] is True
+    assert second["card_replacement_ok"] is True
+    assert card_actions.calls == 2
+    assert len(sender.cards) == 2
+    assert sender.cards[0][2] == sender.cards[1][2]
+    assert sender.cards[0][2]
+    assert len(sender.cards[0][2]) <= 50
+    assert sender.messages == []
 
 
 def test_card_action_handler_preserves_business_failure_behavior():

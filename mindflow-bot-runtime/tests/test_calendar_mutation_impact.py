@@ -304,7 +304,7 @@ def test_recurring_calendar_create_invalidates_real_persisted_forecasts():
 
     async def scenario():
         mutation_refresh.start()
-        result = await tools.create_calendar_event(
+        result = await tools._execute_calendar_create_effect(
             ctx,
             {
                 "summary": "重复课程",
@@ -386,7 +386,7 @@ def test_large_recurring_mutation_invalidates_all_before_return_without_waiting_
 
         pulse_task = asyncio.create_task(pulse())
         result = await asyncio.wait_for(
-            tools.create_calendar_event(
+            tools._execute_calendar_create_effect(
                 ctx,
                 {
                     "summary": "长期重复课程",
@@ -493,7 +493,7 @@ def test_recurrence_only_update_invalidates_old_and_new_dates_with_provider_resp
     )
 
     result = asyncio.run(
-        tools.update_calendar_event(
+            tools._execute_calendar_update_effect(
             ctx,
             {
                 "event_id": "calendar-event",
@@ -561,7 +561,7 @@ def test_clear_recurrence_with_partial_response_invalidates_old_occurrences_only
     )
 
     asyncio.run(
-        tools.update_calendar_event(
+            tools._execute_calendar_update_effect(
             ctx,
             {"event_id": "calendar-event", "clear_recurrence": True},
         )

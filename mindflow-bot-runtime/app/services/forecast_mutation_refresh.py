@@ -732,16 +732,21 @@ class ForecastMutationRefreshQueue:
         target: date,
         reason: str,
     ) -> bool:
-        dependency_refresh = getattr(
-            self.coordinator, "dependency_refresh", None
-        )
-        invalidate = getattr(
-            dependency_refresh, "invalidate_dependent_now", None
-        )
-        args = (participant_id, source)
+        # This edge was validated and persisted during planning. Recovery
+        # executes the durable target instead of reinterpreting it against a
+        # later wall-clock date.
+        invalidate = getattr(self.coordinator, "mark_dependency_dirty", None)
+        args = (participant_id, target)
+        extra_kwargs: dict[str, object] = {}
         if not callable(invalidate):
-            invalidate = getattr(self.coordinator, "mark_dependency_dirty", None)
-            args = (participant_id, target)
+            dependency_refresh = getattr(
+                self.coordinator, "dependency_refresh", None
+            )
+            invalidate = getattr(
+                dependency_refresh, "invalidate_dependent_now", None
+            )
+            args = (participant_id, source)
+            extra_kwargs["reference_local_date"] = source
         if not callable(invalidate):
             logger.error(
                 "forecast_mutation_dependency_retry_unavailable "
@@ -757,6 +762,7 @@ class ForecastMutationRefreshQueue:
                     invalidate,
                     *args,
                     reason=reason,
+                    **extra_kwargs,
                 )
                 return True
             except asyncio.CancelledError:

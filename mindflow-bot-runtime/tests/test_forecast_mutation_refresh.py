@@ -181,10 +181,16 @@ def test_transient_dependency_invalidation_is_retried_before_refresh():
             self.attempts = 0
 
         def invalidate_dependent_now(
-            self, _participant_id, source_date, *, reason
+            self,
+            _participant_id,
+            source_date,
+            *,
+            reason,
+            reference_local_date=None,
         ):
             self.attempts += 1
             assert source_date == source
+            assert reference_local_date == source
             assert reason == "calendar_update_event"
             if self.attempts == 1:
                 raise RuntimeError("transient dependency invalidation")

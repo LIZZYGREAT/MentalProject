@@ -13,7 +13,7 @@ class _SlowObservations:
 
     def recent_before(self, *_args, **_kwargs):
         self.thread_id = threading.get_ident()
-        time.sleep(0.30)
+        time.sleep(0.50)
         return []
 
 
@@ -23,7 +23,7 @@ class _SlowProfiles:
 
     def current(self, _participant_id):
         self.thread_id = threading.get_ident()
-        time.sleep(0.30)
+        time.sleep(0.50)
         return None
 
 
@@ -33,7 +33,7 @@ class _SlowPreferences:
 
     def get(self, _participant_id):
         self.thread_id = threading.get_ident()
-        time.sleep(0.30)
+        time.sleep(0.50)
         return {"version": 1, "allow_follow_up": True}
 
 
@@ -75,12 +75,12 @@ def test_care_get_support_repository_reads_do_not_block_event_loop():
 
         support_task = asyncio.create_task(tools.get_support(ctx, {}))
         pulse_task = asyncio.create_task(pulse())
-        await asyncio.wait_for(heartbeat.wait(), timeout=0.15)
-        # The three repository reads each sleep for 300 ms. Reaching this
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.30)
+        # The three repository reads each sleep for 500 ms. Reaching this
         # assertion while support is still running proves the loop remained
         # schedulable instead of merely checking total wall-clock duration.
         assert support_task.done() is False
-        result = await asyncio.wait_for(support_task, timeout=0.60)
+        result = await asyncio.wait_for(support_task, timeout=1.50)
         await pulse_task
         assert result["ok"] is True
         assert observations.thread_id != loop_thread

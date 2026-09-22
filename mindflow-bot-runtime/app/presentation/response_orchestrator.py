@@ -8,42 +8,62 @@ import time
 from typing import Any
 
 from app.presentation.contracts import (
+    PresentationEvidence,
+    PresentationMode,
     ResponseKind,
     ResponsePlan,
     ResponseSegment,
     RuntimeResponse,
 )
 from app.presentation.markdown_sanitizer import MarkdownSanitizer
+from app.presentation.presentation_compiler import PresentationCompiler
 from app.presentation.presentation_agent import PresentationAgentProtocol
 from app.presentation.semantic_segmenter import SemanticSegmenter
 
 
 _TRANSACTIONAL_TOOLS = {
     "calendar_create_event",
+    "calendar_create_events_plan",
     "calendar_update_event",
+    "calendar_update_events_plan",
     "calendar_delete_event",
+    "calendar_delete_events_plan",
 }
 _ANALYSIS_TOOLS = {
     "care_run_today_assessment",
     "care_get_pressure_curve",
 }
 _CHECKIN_TOOLS = {"care_get_checkin_card"}
+_WEB_TOOLS = {
+    "web_search",
+    "web_read_result",
+    "web_read_url",
+    "web_read_url_chunk",
+    "video_inspect_url",
+    "video_read_transcript",
+}
+
+
 class ResponseOrchestrator:
     def __init__(
         self,
         *,
         sanitizer: MarkdownSanitizer | None = None,
+        compiler: PresentationCompiler | None = None,
         segmenter: SemanticSegmenter | None = None,
         presentation_agent: PresentationAgentProtocol | None = None,
         presentation_agent_min_chars: int = 600,
         presentation_agent_timeout_seconds: float = 4.0,
         presentation_agent_max_segments: int = 3,
-        presentation_agent_mode: str = "adaptive",
+        presentation_agent_mode: str = "off",
         presentation_agent_max_pending_cleanups: int = 1,
+        rich_presentation_enabled: bool = True,
     ):
         self.sanitizer = sanitizer or MarkdownSanitizer()
+        self.compiler = compiler or PresentationCompiler()
         self.segmenter = segmenter or SemanticSegmenter()
         self.presentation_agent = presentation_agent
+        self.rich_presentation_enabled = bool(rich_presentation_enabled)
         self.presentation_agent_min_chars = max(1, int(presentation_agent_min_chars))
         self.presentation_agent_timeout_seconds = max(
             0.01, float(presentation_agent_timeout_seconds)
@@ -66,10 +86,27 @@ class ResponseOrchestrator:
         *,
         cards: list[object],
         used_tools: set[str],
+        evidence: PresentationEvidence | None = None,
+        suppress_card_companion: bool = False,
     ) -> ResponsePlan:
         authoritative = self._coerce(response)
         tools = {str(name) for name in used_tools}
         kind = self._response_kind(authoritative, cards=cards, used_tools=tools)
+        mode = self._presentation_mode(
+            authoritative,
+            kind=kind,
+            cards=cards,
+            used_tools=tools,
+        )
+
+        if suppress_card_companion and cards:
+            return self._plan(
+                kind,
+                (),
+                True,
+                False,
+                presentation_mode=mode,
+            )
 
         if kind in {"fixed", "error"} or authoritative.safety_locked:
             return ResponsePlan(
@@ -77,17 +114,54 @@ class ResponseOrchestrator:
                 full_text=authoritative.text,
                 segments=(ResponseSegment(index=0, text=authoritative.text),),
                 use_cards=bool(cards),
+                presentation_mode=mode,
                 presentation_agent_used=False,
             )
 
         sanitized = self.sanitizer.sanitize(authoritative.text)
         if kind == "transactional":
-            return self._plan(kind, (sanitized,), False, False)
+            if mode == "fixed_card" and cards:
+                return self._plan(
+                    kind,
+                    (),
+                    True,
+                    False,
+                    presentation_mode="fixed_card",
+                )
+            return self._plan(
+                kind,
+                (sanitized,),
+                False,
+                False,
+                presentation_mode=mode,
+            )
 
-        if kind == "rich":
+        if mode == "fixed_card":
             companion = self._rich_companion(sanitized, tools)
             segments = (companion,) if companion else ()
-            return self._plan(kind, segments, True, False)
+            return self._plan(
+                kind,
+                segments,
+                True,
+                False,
+                presentation_mode=mode,
+            )
+
+        if mode in {"rich_markdown", "streaming_markdown"}:
+            compiled = self.compiler.compile(
+                authoritative.text,
+                mode=mode,
+                evidence=evidence,
+                restrict_body_urls=bool(tools & _WEB_TOOLS),
+            )
+            return self._plan(
+                kind,
+                (compiled,),
+                False,
+                False,
+                presentation_mode=mode,
+                presentation_agent_outcome="bypassed_rich",
+            )
 
         deterministic = self.segmenter.segment(sanitized)
         if not deterministic and sanitized:
@@ -129,6 +203,7 @@ class ResponseOrchestrator:
                 presentation_agent_outcome=outcome,
                 presentation_agent_latency_ms=agent_latency_ms,
                 presentation_cleanup_pending=len(self._presentation_cleanups),
+                presentation_mode=mode,
             )
 
         return self._plan(
@@ -137,6 +212,7 @@ class ResponseOrchestrator:
             presentation_agent_outcome=outcome,
             presentation_agent_latency_ms=agent_latency_ms,
             presentation_cleanup_pending=len(self._presentation_cleanups),
+            presentation_mode=mode,
         )
 
     async def _compose_with_hard_deadline(
@@ -242,6 +318,26 @@ class ResponseOrchestrator:
             return False, "skipped_adaptive"
         return True, "attempting"
 
+    def _presentation_mode(
+        self,
+        response: RuntimeResponse,
+        *,
+        kind: ResponseKind,
+        cards: list[object],
+        used_tools: set[str],
+    ) -> PresentationMode:
+        if response.safety_locked or kind in {"fixed", "error"}:
+            return "plain_text"
+        if cards:
+            return "fixed_card"
+        if not self.rich_presentation_enabled:
+            return "plain_text"
+        if used_tools & _WEB_TOOLS or kind == "analysis":
+            return "streaming_markdown"
+        if kind == "rich":
+            return "rich_markdown"
+        return "plain_text"
+
     def _within_delivery_envelope(self, segments: tuple[str, ...]) -> bool:
         return (
             1 <= len(segments) <= self.presentation_agent_max_segments
@@ -318,6 +414,7 @@ class ResponseOrchestrator:
         use_cards: bool,
         presentation_agent_used: bool,
         *,
+        presentation_mode: PresentationMode = "plain_text",
         presentation_agent_attempted: bool = False,
         presentation_agent_outcome: str = "not_eligible",
         presentation_agent_latency_ms: float = 0.0,
@@ -339,6 +436,7 @@ class ResponseOrchestrator:
                 for index, text in enumerate(normalized)
             ),
             use_cards=use_cards,
+            presentation_mode=presentation_mode,
             presentation_agent_used=presentation_agent_used,
             presentation_agent_attempted=presentation_agent_attempted,
             presentation_agent_outcome=presentation_agent_outcome,

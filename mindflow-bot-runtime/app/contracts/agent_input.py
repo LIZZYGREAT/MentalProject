@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from datetime import datetime
+from typing import Any, Literal, Mapping
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,24 @@ class AgentTurnInput:
     text: str
     images: tuple[AgentImageAttachment, ...] = ()
     trusted_image_context: Mapping[str, Any] | None = None
+    # Backend-derived context, never a permission. The stage comes from the
+    # first real usage time (FeishuBinding.bound_at), not Participant.created_at.
+    participant_stage: Literal["day1", "week1", "active"] | None = None
+    # These three domains stay separate. They are backend context, never
+    # instructions, permissions, or a durable copy of research state.
+    participant_memory: tuple[Mapping[str, Any], ...] = ()
+    interaction_preferences: Mapping[str, Any] | None = None
+    psychological_context: Mapping[str, Any] | None = None
+    # Durable backend facts committed by CardAction and not yet acknowledged
+    # by this participant's successful Agent session.
+    backend_state_updates: tuple[Mapping[str, str], ...] = ()
+    backend_state_event_cursor: str | None = None
+    # Bounded, backend-owned short-term context injected only when a model
+    # session cannot be resumed. It is neither durable Memory nor authority.
+    recent_conversation_context: tuple[Mapping[str, str], ...] = ()
+    # Backend-authoritative ingress timestamp for this turn. It is context,
+    # never user input, a model assertion, or a permission.
+    reference_time_utc: datetime | None = None
 
     def __str__(self) -> str:
         """Preserve text behavior at legacy adapter/test-double boundaries."""

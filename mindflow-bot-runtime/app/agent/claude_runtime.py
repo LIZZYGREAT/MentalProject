@@ -23,7 +23,9 @@ from app.repositories import ConversationRepository
 from app.services.safety_service import SafetyService
 
 
-FALLBACK_TEMPORARY = "服务暂时繁忙，我没有保存未经确认的结果。请稍后再试。"
+FALLBACK_TEMPORARY = (
+    "这次处理没有完成。上一条请求仍保留，你可以直接说“继续”。"
+)
 FALLBACK_INTERRUPTED = "当前处理已停止。"
 
 
@@ -66,6 +68,7 @@ class ClaudeAgentRuntime:
                 safety_locked=True,
                 response_kind="fixed",
             )
+        turn_input = await self._with_recovery_context(ctx, turn_input)
         ctx = await self._with_authorization_semantic_context(ctx, turn_input)
         try:
             result = await self.sessions.submit(
@@ -129,3 +132,30 @@ class ClaudeAgentRuntime:
             ctx,
             authorization_semantic_context=tuple(turns[-4:]),
         )
+
+    async def _with_recovery_context(
+        self, ctx: AgentContext, turn_input: AgentTurnInput
+    ) -> AgentTurnInput:
+        checker = getattr(self.sessions, "needs_recovery_context", None)
+        if not callable(checker) or not await checker(ctx.participant_id):
+            return turn_input
+        previous = await asyncio.to_thread(
+            self.conversations.recent,
+            ctx.participant_id,
+            6,
+            exclude_feishu_message_id=ctx.message_id,
+            chat_id=ctx.chat_id,
+        )
+        remaining = 3000
+        bounded: list[dict[str, str]] = []
+        for item in previous[-6:]:
+            role = str(item.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content") or "").strip()
+            if not content or remaining <= 0:
+                continue
+            content = content[: min(1000, remaining)]
+            remaining -= len(content)
+            bounded.append({"role": role, "text": content})
+        return replace(turn_input, recent_conversation_context=tuple(bounded))
