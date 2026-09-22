@@ -267,32 +267,32 @@ def _self_contained_review_plan(tool_name):
     )
 
 
-def test_reminder_review_card_has_no_duplicate_companion():
-    plan = _self_contained_review_plan("reminder_create")
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "reminder_create",
+        "memory_replace",
+        "interaction_preferences_update",
+        "care_update_preferences",
+    ],
+)
+def test_self_contained_review_card_suppresses_duplicate_companion_text(tool_name):
+    """A review card must not be accompanied by the model's own narration.
 
+    The proposal-stage tools below are deliberately *not* transactional card
+    tools, so ``cards`` alone decides the kind and mode.  Asserting the whole
+    plan (rather than only ``use_cards``/``segments``) makes a tool silently
+    becoming transactional, or the companion text resurfacing, fail loudly.
+    """
+
+    plan = _self_contained_review_plan(tool_name)
+
+    assert plan.kind == "rich"
+    assert plan.presentation_mode == "fixed_card"
+    assert plan.presentation_agent_used is False
     assert plan.use_cards is True
     assert plan.segments == ()
-
-
-def test_memory_review_card_has_no_duplicate_companion():
-    plan = _self_contained_review_plan("memory_replace")
-
-    assert plan.use_cards is True
-    assert plan.segments == ()
-
-
-def test_preference_review_card_has_no_duplicate_companion():
-    plan = _self_contained_review_plan("interaction_preferences_update")
-
-    assert plan.use_cards is True
-    assert plan.segments == ()
-
-
-def test_care_preference_review_card_has_no_duplicate_companion():
-    plan = _self_contained_review_plan("care_update_preferences")
-
-    assert plan.use_cards is True
-    assert plan.segments == ()
+    assert plan.full_text == ""
 
 
 def test_review_card_delivery_failure_keeps_text_fallback():

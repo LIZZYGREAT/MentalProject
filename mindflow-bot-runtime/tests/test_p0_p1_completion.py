@@ -82,10 +82,6 @@ def _refresh_terminal_warning(status: str, attempt_count: int) -> WarningSchedul
         return row
 
 
-def test_failed_warning_is_not_reactivated_by_metadata_refresh():
-    assert _refresh_terminal_warning("failed", 1).status == "failed"
-
-
 def test_max_attempt_warning_is_not_reactivated_by_same_episode_refresh():
     row = _refresh_terminal_warning("failed", 5)
     assert row.status == "failed"

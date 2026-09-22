@@ -23,6 +23,7 @@ from app.repositories import (
 )
 from app.repositories_care import (
     CareInterventionRepository,
+    CarePreferenceClarificationRequired,
     ParticipantCarePreferenceRepository,
 )
 from app.repositories_daily_review import DailyReviewScheduleRepository
@@ -1324,3 +1325,36 @@ def test_disabling_daily_review_prevents_new_schedules_and_survives_restart():
     ] is False
     assert schedules.ensured == []
     assert counts["ensured"] == 0
+
+
+def test_care_incomplete_patch_is_structured_and_does_not_stage_other_fields():
+    """An incomplete care-preference patch must ask for the missing field only.
+
+    The repository-level guard is what keeps a partially specified quiet-hours
+    change from being half-written, so this drives ``validate_changes`` rather
+    than constructing the exception directly.
+    """
+
+    database = memory_database()
+    owner = ParticipantRepository(database).create("CARE-CLOSURE")
+    care = ParticipantCarePreferenceRepository(
+        database, system_max_daily_sends=3, timezone_name="Asia/Shanghai"
+    )
+
+    try:
+        care.validate_changes(owner.id, {
+            "morning_brief_local_time": "08:30",
+            "quiet_hours_start": "23:00",
+        })
+    except CarePreferenceClarificationRequired as exc:
+        result = exc.as_tool_result()
+    else:
+        raise AssertionError("expected a focused quiet-hours clarification")
+
+    assert result["diagnostic_summary"]["missing_fields"] == ["quiet_hours_end"]
+    assert result["diagnostic_summary"]["resolved_changes"][
+        "morning_brief_local_time"
+    ] == "08:30"
+    assert result["public_guidance"] == "晚上 23:00 开始免打扰，到几点恢复提醒？"
+    assert result["staged"] is False
+    assert care.get(owner.id)["morning_brief_local_time"] == "08:00"

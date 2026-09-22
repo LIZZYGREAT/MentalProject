@@ -86,8 +86,23 @@ def service(database, fetcher, **overrides):
         ("https://192.168.1.1/a", "url_private_address"),
         ("https://169.254.169.254/latest/meta-data", "url_private_address"),
         ("https://user:pass@example.com/a", "url_credentials_not_allowed"),
-        ("https://example.com/a?access_token=secret", "secret_query_not_allowed"),
+        # Every key of _STRONG_CREDENTIAL_QUERY_KEYS must be rejected; the list
+        # is spelled out here rather than imported so that shrinking the
+        # production denylist fails this contract instead of shrinking with it.
         ("https://example.com/a?token=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?access_token=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?api_key=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?apikey=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?authorization=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?bearer_token=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?password=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?passwd=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?session_token=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?refresh_token=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?private_key=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?client_secret=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?app_secret=secret", "secret_query_not_allowed"),
+        ("https://example.com/a?id_token=secret", "secret_query_not_allowed"),
     ],
 )
 def test_url_gate_rejects_unsafe_targets(url, reason):
@@ -124,23 +139,6 @@ def test_signature_like_public_param_is_not_credential():
     url = "https://share.example.test/article?signature=public&sig=public&sig_source=share"
 
     assert validate_public_https_url(url) == url
-
-
-def _assert_strong_credential_query_is_rejected(key):
-    with pytest.raises(PublicWebReadError, match="secret_query_not_allowed"):
-        validate_public_https_url(f"https://share.example.test/article?{key}=secret")
-
-
-def test_access_token_query_is_rejected():
-    _assert_strong_credential_query_is_rejected("access_token")
-
-
-def test_api_key_query_is_rejected():
-    _assert_strong_credential_query_is_rejected("api_key")
-
-
-def test_password_query_is_rejected():
-    _assert_strong_credential_query_is_rejected("password")
 
 
 def test_url_userinfo_credentials_are_rejected():

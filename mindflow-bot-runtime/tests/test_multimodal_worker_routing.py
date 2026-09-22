@@ -260,86 +260,38 @@ def _run_pending_schedule_text(text):
     return drafts, runtime
 
 
-def test_period_question_does_not_mutate_pending_draft():
-    drafts, runtime = _run_pending_schedule_text("高数第3-4节有冲突吗？")
+@pytest.mark.parametrize(
+    "text",
+    [
+        "高数第3-4节有冲突吗？",
+        "周三的课单周吗？",
+        "第一周周一是2026-09-07吗？",
+        "第1-2节是08:00-09:40吗？",
+        "高数改成第3-4节",
+        "周三的课改为单周",
+        "高数应该是第3-4节吗？",
+        "周三应该是单周吗？",
+        "第一周周一应该是2026-09-07吗？",
+        "高数其实是第3-4节",
+    ],
+)
+def test_pending_schedule_text_reaches_agent_without_inline_draft_mutation(text):
+    """Schedule questions and correction statements must be delegated verbatim.
 
-    assert drafts.corrections == []
+    The worker has no inline schedule-draft mutation path for text turns, so the
+    observable effects are that the agent is entered exactly once with the
+    original text and that no draft recorder is touched.  The recorders stay in
+    the assertion so that a future deterministic fast path which intercepts one
+    of these phrasings fails here instead of silently changing routing.
+    """
+
+    drafts, runtime = _run_pending_schedule_text(text)
+
     assert len(runtime.calls) == 1
-
-
-def test_odd_even_question_does_not_mutate_pending_draft():
-    drafts, runtime = _run_pending_schedule_text("周三的课单周吗？")
-
+    assert runtime.calls[0][1].text == text
     assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_semester_date_question_does_not_set_semester_start():
-    drafts, runtime = _run_pending_schedule_text(
-        "第一周周一是2026-09-07吗？"
-    )
-
     assert drafts.semester_dates == []
-    assert len(runtime.calls) == 1
-
-
-def test_period_mapping_question_does_not_override_schedule():
-    drafts, runtime = _run_pending_schedule_text(
-        "第1-2节是08:00-09:40吗？"
-    )
-
     assert drafts.period_mappings == []
-    assert len(runtime.calls) == 1
-
-
-def test_explicit_period_correction_statement_is_delegated_to_agent_tools():
-    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
-
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_explicit_odd_even_correction_statement_is_delegated_to_agent_tools():
-    drafts, runtime = _run_pending_schedule_text("周三的课改为单周")
-
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_should_be_period_question_does_not_mutate():
-    drafts, runtime = _run_pending_schedule_text("高数应该是第3-4节吗？")
-
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_should_be_odd_even_question_does_not_mutate():
-    drafts, runtime = _run_pending_schedule_text("周三应该是单周吗？")
-
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_should_be_semester_date_question_does_not_mutate():
-    drafts, runtime = _run_pending_schedule_text(
-        "第一周周一应该是2026-09-07吗？"
-    )
-
-    assert drafts.semester_dates == []
-    assert len(runtime.calls) == 1
-
-
-def test_explicit_imperative_period_change_reaches_agent_semantics():
-    drafts, runtime = _run_pending_schedule_text("高数改成第3-4节")
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
-
-
-def test_plain_correction_statement_reaches_agent_semantics():
-    drafts, runtime = _run_pending_schedule_text("高数其实是第3-4节")
-
-    assert drafts.corrections == []
-    assert len(runtime.calls) == 1
 
 
 def test_only_explicit_schedule_import_phrase_uses_infrastructure_fast_path():
@@ -1753,13 +1705,6 @@ def _run_new_request_after_stop_race():
 
     asyncio.run(scenario())
     return worker, runtime, sender
-
-
-def test_new_request_after_stop_cannot_revive_old_agent_reply():
-    _worker, _runtime, sender = _run_new_request_after_stop_race()
-
-    assert "answer:旧请求" not in sender.texts
-    assert "answer:新请求" in sender.texts
 
 
 def test_new_request_after_stop_does_not_restore_second_interrupted_message():

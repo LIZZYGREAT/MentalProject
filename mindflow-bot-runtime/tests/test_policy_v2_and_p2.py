@@ -589,16 +589,6 @@ def test_cancelled_sibling_does_not_bypass_failed_terminal_same_episode():
     assert not any(status in WarningScheduleRepository.ACTIVE for status, _ in states)
 
 
-def test_expired_sibling_does_not_block_new_future_delivery_window():
-    # Existing regression explicitly proves that expired is not part of the
-    # blocking terminal sibling set.
-    test_expired_audit_row_is_preserved_and_future_window_creates_new_row()
-
-
-def test_minimum_interval_suppressed_sibling_can_use_later_legal_window():
-    test_minimum_interval_suppressed_warning_can_use_later_valid_window()
-
-
 def test_episode_reconciliation_survives_time_bucket_boundary_drift():
     database = memory_database()
     participant = ParticipantRepository(database).create("BOUNDARY-ACTIVE")

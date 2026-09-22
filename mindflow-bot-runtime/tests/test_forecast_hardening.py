@@ -38,7 +38,13 @@ TEST_LOCAL_DATE = date(2030, 1, 15)
 TEST_NOW = datetime(2030, 1, 15, 5, 45, tzinfo=timezone.utc)
 
 
-def test_single_flight_forced_same_mode_update_runs_followup_before_completion():
+@pytest.mark.parametrize("first_generation_raises", [False, True])
+def test_single_flight_forced_followup_survives_same_mode_and_first_failure(
+    first_generation_raises,
+):
+    """A forced followup must run before completion and must not be dropped when
+    the first generation fails after the followup request already arrived."""
+
     async def scenario():
         coordinator = object.__new__(ForecastCoordinator)
         coordinator._inflight = {}
@@ -52,6 +58,8 @@ def test_single_flight_forced_same_mode_update_runs_followup_before_completion()
             if len(calls) == 1:
                 started.set()
                 await release.wait()
+                if first_generation_raises:
+                    raise RuntimeError("transient first-generation failure")
             return {"call": len(calls), "reason": reason}
 
         coordinator._ensure_once = ensure_once
@@ -79,50 +87,6 @@ def test_single_flight_forced_same_mode_update_runs_followup_before_completion()
     assert len(calls) == 2
     assert calls[1][0] == "observation_committed"
     assert calls[1][1]["refresh_calendar"] is False
-    assert first == forced == {"call": 2, "reason": "observation_committed"}
-
-
-def test_single_flight_failure_does_not_drop_already_dirty_followup():
-    async def scenario():
-        coordinator = object.__new__(ForecastCoordinator)
-        coordinator._inflight = {}
-        coordinator._guard = asyncio.Lock()
-        started = asyncio.Event()
-        release = asyncio.Event()
-        calls = []
-
-        async def ensure_once(_participant_id, _target, reason, **kwargs):
-            calls.append((reason, kwargs))
-            if len(calls) == 1:
-                started.set()
-                await release.wait()
-                raise RuntimeError("transient first-generation failure")
-            return {"call": len(calls), "reason": reason}
-
-        coordinator._ensure_once = ensure_once
-        participant_id = uuid.uuid4()
-        first = asyncio.create_task(coordinator.ensure_forecast(
-            participant_id,
-            TEST_LOCAL_DATE,
-            "initial",
-            refresh_calendar=False,
-        ))
-        await started.wait()
-        forced = asyncio.create_task(coordinator.ensure_forecast(
-            participant_id,
-            TEST_LOCAL_DATE,
-            "observation_committed",
-            refresh_calendar=False,
-            force_followup=True,
-        ))
-        await asyncio.sleep(0)
-        release.set()
-        return await first, await forced, calls
-
-    first, forced, calls = asyncio.run(scenario())
-
-    assert len(calls) == 2
-    assert calls[1][0] == "observation_committed"
     assert first == forced == {"call": 2, "reason": "observation_committed"}
 
 

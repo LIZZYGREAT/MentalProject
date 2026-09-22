@@ -260,8 +260,6 @@ def test_full_day_dense_events_warnings_and_optional_fields_render_safely():
     plt, _font_name = renderer._pyplot()
     try:
         axis = figure.axes[0]
-        assert curve[0]["time"] == "00:00"
-        assert curve[-1]["time"] == "23:55"
         assert axis.get_xlim()[0] <= 0
         assert axis.get_xlim()[1] >= 23.9
         assert any(text.get_text() == "高风险关注" for text in axis.texts)

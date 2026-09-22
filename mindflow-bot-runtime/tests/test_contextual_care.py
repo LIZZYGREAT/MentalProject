@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.agent.context import AgentContext
+from app.contracts.warning import WarningDeliveryPolicyConfig
 from app.models import WarningSchedule
 from app.repositories import (
     CalendarSnapshotRepository,
@@ -18,6 +19,7 @@ from app.repositories import (
 from app.services.care_message_service import CareMessageService
 from app.services.event_semantic_preprocessor import EventSemanticPreprocessor
 from app.services.forecast_coordinator import ForecastCoordinator
+from app.services.warning_policy import WarningPolicy
 from app.tools.care import CareTools
 from helpers import memory_database, warning_repository
 from mindflow_core.assessment import AssessmentModel, sanitize_forecast_alert
@@ -649,3 +651,69 @@ def test_user_requested_support_reuses_context_policy_and_templates(monkeypatch)
     assert support["care_provenance"]["source_forecast_id"] == "forecast-support"
     assert "高等数学" in support["suggestion"]
     assert "短暂散步" in support["suggestion"]
+
+
+def _contextualize(care, alert, *, care_preferences=None):
+    return care.contextualize_alert(
+        alert,
+        source="forecast_warning",
+        local_date=TARGET,
+        calendar_events=_calendar(),
+        calendar_degraded=False,
+        recent_observation=None,
+        profile=None,
+        profile_version=None,
+        care_preferences=care_preferences,
+    )
+
+
+def test_disabled_intervention_is_held_and_never_selected_as_warning():
+    """A care option the participant disabled must be held, not delivered.
+
+    ``CareMessageService`` rewrites the JITAI decision to
+    ``hold_explicitly_disabled`` when the chosen option sits in the
+    participant's disabled list, and ``ForecastCoordinator._derive_warning_state``
+    must drop such a candidate instead of turning it into a warning window.
+    Both halves of that contract are asserted here because neither had coverage.
+    """
+
+    care = CareMessageService("Asia/Shanghai")
+    baseline = _contextualize(care, _alert())
+    disabled_type = baseline["care_plan"]["option_type"]
+    assert disabled_type
+    # Guard the delta: without the disabled list the option is actually planned.
+    assert baseline["care_plan"]["decision_rule"] != "hold_explicitly_disabled"
+
+    held = _contextualize(
+        care,
+        _alert(),
+        care_preferences={"disabled_intervention_types": [disabled_type]},
+    )
+
+    assert held["care_plan"]["option_type"] == disabled_type
+    assert held["care_plan"]["decision_rule"] == "hold_explicitly_disabled"
+    assert held["care_plan"]["scheduled_at"] is None
+
+    coordinator = object.__new__(ForecastCoordinator)
+    coordinator.care_messages = care
+    coordinator.warning_policy = WarningPolicy(
+        WarningDeliveryPolicyConfig(max_daily_sends=2, min_interval_minutes=0)
+    )
+    coordinator.care_preferences = None
+    coordinator.warning_lead_minutes = 20
+    coordinator.warning_late_grace_minutes = 10
+    coordinator.warning_episode_drift_minutes = 15
+    coordinator.timezone = ZoneInfo("Asia/Shanghai")
+
+    selected, windows, serialized = coordinator._derive_warning_state(
+        {"alerts": [_alert()], "classified_calendar_events": _calendar()},
+        TARGET,
+        {
+            "care_preferences": {"disabled_intervention_types": [disabled_type]},
+            "calendar_events": _calendar(),
+        },
+    )
+
+    assert selected == []
+    assert windows == []
+    assert serialized == []

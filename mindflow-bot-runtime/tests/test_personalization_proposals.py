@@ -8,8 +8,10 @@ import uuid
 import pytest
 
 from app.agent.context import AgentContext
+from app.agent.sdk_adapter import _text_transport_prompt
 from app.agent.tool_registry import ToolRegistry
 from app.card_actions.registry import card_action_spec
+from app.contracts.agent_input import AgentTurnInput
 from app.models import PersonalizationProposal
 from app.repositories import ObservationRepository
 from app.repositories_memory import ParticipantMemoryRepository
@@ -591,3 +593,62 @@ def test_concurrent_personalization_confirm_executes_once():
         for result in results
     ) == 1
     assert len(memory.list(owner.id)) == 1
+
+
+def test_semantic_rule_stays_pending_until_confirmation_and_is_transportable():
+    database = memory_database()
+    owner = participant(database, "SEMANTIC-PENDING")
+    memory = MemoryService(ParticipantMemoryRepository(database))
+    preferences = InteractionPreferenceService(
+        InteractionPreferenceRepository(database),
+        SupportPreferenceRepository(database),
+    )
+    proposals = PersonalizationProposalService(
+        PersonalizationProposalRepository(database), memory, preferences
+    )
+    outbox = PresentationOutbox()
+    registry = ToolRegistry()
+    InteractionPreferenceTools(preferences, outbox, proposals).register(registry)
+    context = AgentContext(
+        participant_id=owner.id,
+        participant_code="P-TEST",
+        open_id="open",
+        chat_id="chat",
+        message_id="message",
+        agent_run_id=uuid.uuid4(),
+        user_request_text="保存表达偏好",
+    )
+
+    staged = asyncio.run(registry.execute(
+        context,
+        "interaction_preferences_update",
+        {
+            "verbosity": "detailed",
+            "custom_rules": [{
+                "scope": "technical_explanations",
+                "instruction": "先给整体框架，再展开细节；公式说明变量含义。",
+            }],
+        },
+    ))
+
+    assert staged.result["persisted"] is False
+    assert preferences.get(owner.id)["semantic_rules"] == []
+
+    card = outbox.take_cards(context.agent_run_id)[0]
+    assert "先给整体框架" in str(card)
+
+    confirmed = proposals.resolve(
+        owner.id,
+        _action(card, "personalization_proposal_confirm")["proposal_id"],
+        confirmed=True,
+    )
+
+    assert confirmed["ok"] is True
+    saved = preferences.get(owner.id)["semantic_rules"]
+    assert saved[0]["scope"] == "technical_explanations"
+    prompt = _text_transport_prompt(
+        AgentTurnInput(text="解释一下", interaction_preferences=preferences.get(owner.id))
+    )
+    assert "semantic_communication_rules" in prompt
+    assert "先给整体框架" in prompt
+    assert "permissions" in prompt

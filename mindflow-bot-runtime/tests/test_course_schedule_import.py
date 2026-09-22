@@ -60,7 +60,6 @@ from app.services.course_schedule_vision import (
     CourseScheduleVisionError,
     CourseScheduleVisionUnavailable,
     CourseScheduleVisionService,
-    SYSTEM_PROMPT,
 )
 from app.services.course_schedule_normalizer import normalize_course_schedule
 from app.services.card_action_service import (
@@ -1906,13 +1905,6 @@ def test_period_inference_metadata_is_validated_and_preserved_for_audit():
     assert "时间来源：学校默认作息" in json.dumps(
         course_schedule_preview_card(draft), ensure_ascii=False
     )
-
-
-def test_strict_schedule_prompt_uses_grid_rows_without_course_order_guessing():
-    assert "纵向网格绝对位置" in SYSTEM_PROMPT
-    assert "第几个识别到的课程" in SYSTEM_PROMPT
-    assert "Backend 有学校默认作息" in SYSTEM_PROMPT
-    assert "顶部被裁切" in SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize(

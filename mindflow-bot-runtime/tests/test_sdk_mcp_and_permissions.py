@@ -5,6 +5,8 @@ import time
 import uuid
 from pathlib import Path
 
+import pytest
+
 from app.agent.context import AgentContext
 from app.agent.sdk_adapter import (
     DISALLOWED_TOOLS,
@@ -239,7 +241,22 @@ def test_direct_image_create_allows_create_only():
     assert calls == [{}]
 
 
-def _assert_direct_image_create_blocks(tool_name):
+@pytest.mark.parametrize(
+    ("tool_name", "effect", "authorization_requirement"),
+    [
+        ("calendar_update_event", "external_write", "direct_request"),
+        (
+            "calendar_delete_event",
+            "destructive_external_write",
+            "explicit_destructive_request",
+        ),
+    ],
+)
+def test_direct_image_create_cannot_escalate_to_update_or_delete(
+    tool_name, effect, authorization_requirement
+):
+    """A calendar_create_only policy must block update and delete outright."""
+
     calls = []
     registry = ToolRegistry(mutation_verifier=AllowMutationVerifier())
 
@@ -252,16 +269,8 @@ def _assert_direct_image_create_blocks(tool_name):
         tool_name,
         {"type": "object", "properties": {}, "additionalProperties": False},
         handler,
-        effect=(
-            "destructive_external_write"
-            if tool_name == "calendar_delete_event"
-            else "external_write"
-        ),
-        authorization_requirement=(
-            "explicit_destructive_request"
-            if tool_name == "calendar_delete_event"
-            else "direct_request"
-        ),
+        effect=effect,
+        authorization_requirement=authorization_requirement,
     )
     ctx = AgentContext(
         uuid.uuid4(),
@@ -277,14 +286,6 @@ def _assert_direct_image_create_blocks(tool_name):
 
     assert result.status == "calendar_mutation_not_authorized"
     assert calls == []
-
-
-def test_direct_image_create_blocks_update():
-    _assert_direct_image_create_blocks("calendar_update_event")
-
-
-def test_direct_image_create_blocks_delete():
-    _assert_direct_image_create_blocks("calendar_delete_event")
 
 
 def test_image_prompt_injection_cannot_escalate_create_permission_to_delete():
