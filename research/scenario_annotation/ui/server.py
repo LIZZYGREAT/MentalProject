@@ -129,11 +129,13 @@ class AdjudicationStore:
         self.output_root = self.package_root / "adjudication" / "drafts" / "calibration"
         required_analysis = {
             "disagreement_queue.jsonl",
+            "disagreement_report.md",
             "field_metrics.csv",
+            "confusion_matrices.json",
             "critical_violations.jsonl",
             "critical_violation_rates.json",
-            "orthogonality_checks.jsonl",
-            "construct_report.md",
+            "orthogonality.jsonl",
+            "scenario_annotation_report.md",
         }
         missing_analysis = sorted(
             name for name in required_analysis if not (self.analysis_root / name).exists()

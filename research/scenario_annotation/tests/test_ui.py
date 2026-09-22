@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import shutil
 
 import httpx
 import pytest
@@ -134,3 +135,74 @@ def test_completed_human_draft_exports_to_validated_jsonl(tmp_path: Path) -> Non
 def test_adjudication_mode_not_available_before_analysis() -> None:
     with pytest.raises(RuntimeError, match="analysis is complete"):
         create_app(package_root=PACKAGE_ROOT, mode="adjudication")
+
+
+def test_adjudication_mode_available_after_complete_inputs(tmp_path: Path) -> None:
+    root = tmp_path / "package"
+    shutil.copytree(
+        PACKAGE_ROOT / "assignments" / "round_calibration",
+        root / "assignments" / "round_calibration",
+    )
+    (root / "scenarios").mkdir(parents=True)
+    shutil.copy2(
+        PACKAGE_ROOT / "scenarios" / "calibration.jsonl",
+        root / "scenarios" / "calibration.jsonl",
+    )
+    (root / "manuals").mkdir(parents=True)
+    shutil.copy2(
+        PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md",
+        root / "manuals" / "coding_manual_v0.1.md",
+    )
+
+    annotations_root = root / "annotations" / "calibration"
+    annotations_root.mkdir(parents=True)
+    for annotator_id in ("AI-A", "AI-B", "AI-C", "Human"):
+        slug = annotator_id.lower().replace("-", "_")
+        for module in ("A", "B", "C"):
+            assignment_path = (
+                root
+                / "assignments"
+                / "round_calibration"
+                / slug
+                / f"module_{module.lower()}.jsonl"
+            )
+            documents = [
+                {
+                    "scenario_id": scenario["scenario_id"],
+                    "annotation_module": module,
+                    "annotator_id": annotator_id,
+                    "records": [],
+                }
+                for scenario in load_jsonl(assignment_path)
+            ]
+            output = annotations_root / slug / f"module_{module.lower()}.jsonl"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                "".join(json.dumps(document) + "\n" for document in documents),
+                encoding="utf-8",
+            )
+
+    analysis_root = root / "analysis" / "outputs" / "calibration"
+    analysis_root.mkdir(parents=True)
+    for name in (
+        "disagreement_queue.jsonl",
+        "disagreement_report.md",
+        "field_metrics.csv",
+        "critical_violations.jsonl",
+        "orthogonality.jsonl",
+        "scenario_annotation_report.md",
+    ):
+        (analysis_root / name).write_text("", encoding="utf-8")
+    for name in ("confusion_matrices.json", "critical_violation_rates.json"):
+        (analysis_root / name).write_text("{}\n", encoding="utf-8")
+
+    app = create_app(package_root=root, mode="adjudication")
+    response = asyncio.run(_request(app, "GET", "/api/state"))
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "adjudication",
+        "round": "calibration",
+        "items": [],
+        "complete": 0,
+        "total": 0,
+    }
