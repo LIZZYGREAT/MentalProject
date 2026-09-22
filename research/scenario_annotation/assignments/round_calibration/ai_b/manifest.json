@@ -1,0 +1,29 @@
+{
+  "annotation_round": "CALIBRATION",
+  "annotator_id": "AI-B",
+  "assignment_version": "1.0",
+  "counterbalance_rule": "one presentation variant per pair per annotator",
+  "files": [
+    {
+      "module": "A",
+      "path": "module_a.jsonl",
+      "scenario_count": 19,
+      "sha256": "3e21d90204f1608d6e96ea5bd1003464c77a681d93a1093ec6c73427a72c4cba"
+    },
+    {
+      "module": "B",
+      "path": "module_b.jsonl",
+      "scenario_count": 9,
+      "sha256": "813ce32e98ea9393e70c6b51c488984779a8d1b77239d901dfbc7aa67648661b"
+    },
+    {
+      "module": "C",
+      "path": "module_c.jsonl",
+      "scenario_count": 3,
+      "sha256": "f149a4145d033ea68208d052730c872bbb85c060b3ecef2baaa2305c9b031ac9"
+    }
+  ],
+  "manual_version": "0.1",
+  "randomization_seed": 12001,
+  "scenario_version": "0.1"
+}

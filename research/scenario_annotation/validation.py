@@ -65,6 +65,7 @@ class Validator:
             "pair-design": "pair_design.schema.json",
             "anchor-reference": "anchor_reference.schema.json",
             "coverage-tags": "coverage_tags.schema.json",
+            "assignment-manifest": "assignment_manifest.schema.json",
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
         }

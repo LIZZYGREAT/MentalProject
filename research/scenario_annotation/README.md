@@ -41,3 +41,13 @@ Run the package tests:
 
 Later sections document assignment, analysis, reporting, and freeze commands once
 their corresponding workflow parts are available.
+
+Build the four calibration assignments (AI-A, AI-B, AI-C, Human):
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli build-assignments --round calibration --seed 12001
+```
+
+Each annotator receives a separately randomized Module A/B/C file and a manifest
+binding the manual and scenario versions. Natural/structured counterparts are
+counterbalanced so no annotator sees both in the same round.

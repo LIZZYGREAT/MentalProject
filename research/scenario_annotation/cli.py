@@ -22,6 +22,29 @@ def _build_corpus_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_assignments_command(args: argparse.Namespace) -> int:
+    from .assignments import build_assignments
+
+    if args.round_name != "calibration":
+        raise ValueError("validation assignments require the formal corpus from Part 8")
+    root = Path(__file__).resolve().parent
+    summary = build_assignments(
+        args.scenarios or root / "scenarios" / "calibration.jsonl",
+        args.pair_design or root / "hidden" / "pair_design.jsonl",
+        args.output_dir or root / "assignments" / "round_calibration",
+        annotation_round="CALIBRATION",
+        manual_version=args.manual_version,
+        scenario_version=args.scenario_version,
+        seed=args.seed,
+    )
+    counts = {
+        annotator: info["selected_scenarios"]
+        for annotator, info in summary["annotators"].items()
+    }
+    print(f"PASS: built calibration assignments {counts}")
+    return 0
+
+
 def _validation_command(args: argparse.Namespace) -> int:
     result = Validator(args.schema_dir).validate_paths(args.paths, args.artifact_type)
     for issue in result.issues:
@@ -54,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pair-design",
             "anchor-reference",
             "coverage-tags",
+            "assignment-manifest",
             "adjudication",
             "freeze-manifest",
         ),
@@ -84,6 +108,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root", type=Path, default=Path(__file__).resolve().parent
     )
     build_corpus.set_defaults(handler=_build_corpus_command)
+
+    assignments = subparsers.add_parser(
+        "build-assignments", help="build blind, randomized, counterbalanced assignment inputs"
+    )
+    assignments.add_argument("--round", dest="round_name", choices=("calibration",), required=True)
+    assignments.add_argument("--manual-version", default="0.1")
+    assignments.add_argument("--scenario-version", default="0.1")
+    assignments.add_argument("--seed", type=int, default=12001)
+    assignments.add_argument("--scenarios", type=Path)
+    assignments.add_argument("--pair-design", type=Path)
+    assignments.add_argument("--output-dir", type=Path)
+    assignments.set_defaults(handler=_build_assignments_command)
     return parser
 
 

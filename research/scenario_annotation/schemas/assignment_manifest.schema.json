@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/assignment-manifest-v1.json",
+  "title": "MindFlow Stage 1 Assignment Manifest",
+  "type": "object",
+  "required": ["assignment_version", "annotation_round", "annotator_id", "manual_version", "scenario_version", "randomization_seed", "counterbalance_rule", "files"],
+  "properties": {
+    "assignment_version": {"const": "1.0"},
+    "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
+    "annotator_id": {"enum": ["AI-A", "AI-B", "AI-C", "Human"]},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "randomization_seed": {"type": "integer"},
+    "counterbalance_rule": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["module", "path", "scenario_count", "sha256"],
+        "properties": {
+          "module": {"enum": ["A", "B", "C"]},
+          "path": {"type": "string", "pattern": "^module_[abc]\\.jsonl$"},
+          "scenario_count": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
