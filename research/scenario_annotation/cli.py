@@ -75,6 +75,26 @@ def _analysis_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _manual_gate_command(args: argparse.Namespace) -> int:
+    from .gates import evaluate_manual_ready, write_gate_result
+
+    root = Path(__file__).resolve().parent
+    result = evaluate_manual_ready(
+        manual_path=args.manual or root / "manuals" / "coding_manual_v1.0.md",
+        scenarios_path=args.scenarios or root / "scenarios" / "calibration.jsonl",
+        coverage_path=args.coverage or root / "hidden" / "coverage_tags.jsonl",
+        annotations_dir=args.annotations_dir or root / "annotations" / "calibration",
+        analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "calibration",
+        revision_log_path=args.revision_log or root / "adjudication" / "representation_revision_log.jsonl",
+    )
+    output = args.output or root / "manifests" / "gate_a_manual_ready.json"
+    write_gate_result(output, result)
+    print(f"{result.status}: MANUAL_READY ({len(result.blocking_reasons)} blocker(s)); result={output}")
+    for reason in result.blocking_reasons:
+        print(f"- {reason}")
+    return 0 if result.status == "PASS" else 2
+
+
 def _add_analysis_parser(
     subparsers: argparse._SubParsersAction,
     name: str,
@@ -124,6 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
             "anchor-reference",
             "coverage-tags",
             "assignment-manifest",
+            "revision-log",
+            "gate-result",
             "adjudication",
             "freeze-manifest",
         ),
@@ -173,6 +195,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_analysis_parser(subparsers, "analyze-orthogonality", "write minimal-pair checks", "orthogonality")
     _add_analysis_parser(subparsers, "build-disagreement-queue", "build the adjudication queue", "disagreement")
     _add_analysis_parser(subparsers, "build-report", "write the construct-level report", "report")
+
+    gate = subparsers.add_parser("evaluate-manual-gate", help="evaluate Gate A without fabricating evidence")
+    gate.add_argument("--manual", type=Path)
+    gate.add_argument("--scenarios", type=Path)
+    gate.add_argument("--coverage", type=Path)
+    gate.add_argument("--annotations-dir", type=Path)
+    gate.add_argument("--analysis-dir", type=Path)
+    gate.add_argument("--revision-log", type=Path)
+    gate.add_argument("--output", type=Path)
+    gate.set_defaults(handler=_manual_gate_command)
     return parser
 
 

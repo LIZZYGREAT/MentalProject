@@ -63,3 +63,13 @@ The pipeline writes `field_metrics.csv`, confusion matrices, critical violation
 records and rates, orthogonality checks, a disagreement/adjudication queue, and
 construct-level Markdown reports. It refuses to run on an empty annotation drop
 and never edits the coding manual automatically.
+
+After human review has produced the revision log and an actual v1.0 candidate
+manual, evaluate Gate A:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli evaluate-manual-gate
+```
+
+The gate writes an auditable PASS/FAIL result. Missing AI-A/B/C/Human records,
+analysis outputs, construct decisions, or the revised manual are blocking.

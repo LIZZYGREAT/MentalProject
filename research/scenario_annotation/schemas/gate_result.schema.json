@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/gate-result-v1.json",
+  "title": "MindFlow Representation Gate Result",
+  "type": "object",
+  "required": ["gate", "status", "evaluated_at", "checks", "blocking_reasons"],
+  "properties": {
+    "gate": {"enum": ["MANUAL_READY", "SEMANTIC_RELIABILITY", "REPRESENTATION_FREEZE"]},
+    "status": {"enum": ["PASS", "FAIL"]},
+    "evaluated_at": {"type": "string", "format": "date-time"},
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "passed", "detail"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "detail": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

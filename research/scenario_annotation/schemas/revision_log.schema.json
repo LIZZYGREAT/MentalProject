@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/revision-log-v1.json",
+  "title": "MindFlow Representation Revision Decision",
+  "type": "object",
+  "required": ["revision_id", "construct", "decision", "reason", "source_disagreement_ids", "changed_manual_sections", "reviewer", "reviewed_at", "status"],
+  "properties": {
+    "revision_id": {"type": "string", "minLength": 1},
+    "construct": {"type": "string", "minLength": 1},
+    "decision": {"enum": ["KEEP", "REVISE", "SIMPLIFY", "DROP"]},
+    "reason": {"type": "string", "minLength": 1},
+    "source_disagreement_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "changed_manual_sections": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "reviewer": {"type": "string", "minLength": 1},
+    "reviewed_at": {"type": "string", "format": "date-time"},
+    "status": {"const": "RESOLVED"},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": false
+}
