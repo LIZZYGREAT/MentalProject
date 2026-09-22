@@ -1,0 +1,43 @@
+# Scenario Annotation (Stage 1)
+
+This package is the offline research workflow defined by
+`docs/modeling/12_Stage1_Scenario_Annotation_Implementation.md`.
+
+It is intentionally isolated from the production runtime, CTSSM, databases, and
+forecast path. Its job is to validate representation semantics before Event V2,
+appraisal, bot-representation, synthetic, or latent-dynamics work begins.
+
+## Artifact boundary
+
+- `scenarios/` contains only annotator-visible facts available by each scenario's
+  `known_at_cutoff`.
+- `hidden/` contains design metadata and is never copied into assignments.
+- `annotations/` contains independent coder output.
+- `adjudication/` is populated only after independent annotation and review.
+- `manifests/` is populated only after all freeze gates pass.
+
+No generator output is treated as Gold. No annotation produced by this package
+contains latent stress, EMA, support effect, or forecast values.
+
+## Environment
+
+Run commands from the repository root with the project interpreter:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli --help
+```
+
+Validate a scenario file:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli validate-scenarios research/scenario_annotation/scenarios/calibration.jsonl
+```
+
+Run the package tests:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m pytest research/scenario_annotation/tests -q -p no:cacheprovider
+```
+
+Later sections document assignment, analysis, reporting, and freeze commands once
+their corresponding workflow parts are available.

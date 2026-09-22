@@ -1,0 +1,56 @@
+{
+  "scenario_id": "CAL_001",
+  "scenario_version": "0.1",
+  "pack_id": "PACK_01",
+  "participant_id": "P01",
+  "presentation_mode": "STRUCTURED",
+  "annotation_modules": ["A", "B"],
+  "annotation_time": "2026-09-08T12:00:00+08:00",
+  "known_at_cutoff": "2026-09-08T12:00:00+08:00",
+  "participant_context": {
+    "text": "大二学生，本周课程负荷较低。",
+    "known_at": "2026-09-01T08:00:00+08:00",
+    "source_ref": "profile:P01"
+  },
+  "recurring_course_context": [
+    {
+      "course_ref": "COURSE_MATH",
+      "title": "高等数学",
+      "weekdays": [2],
+      "start_time": "10:00",
+      "end_time": "11:40",
+      "week2_same_as_week1": true,
+      "known_at": "2026-09-01T08:00:00+08:00",
+      "source_ref": "calendar:P01"
+    }
+  ],
+  "recent_context": [],
+  "current_tasks": [],
+  "focal_window": {
+    "start": "2026-09-08T10:00:00+08:00",
+    "end": "2026-09-08T12:00:00+08:00",
+    "narrative": "高数课原定 10:00 开始；参与者明确说今天没去。"
+  },
+  "focal_events": [
+    {
+      "event_ref": "EVENT_MATH_0908",
+      "title": "高等数学课程",
+      "description": "课表中的常规课程；对话中明确未出席。",
+      "scheduled_start": "2026-09-08T10:00:00+08:00",
+      "scheduled_end": "2026-09-08T11:40:00+08:00",
+      "known_at": "2026-09-08T11:45:00+08:00",
+      "source_ref": "calendar:P01"
+    }
+  ],
+  "observed_conversation_evidence": [
+    {
+      "evidence_ref": "MSG_001",
+      "speaker": "PARTICIPANT",
+      "text": "今天高数我明确没去。",
+      "known_at": "2026-09-08T11:45:00+08:00",
+      "source_ref": "conversation:P01"
+    }
+  ],
+  "bot_response_units": [],
+  "source_refs": ["profile:P01", "calendar:P01", "conversation:P01"]
+}

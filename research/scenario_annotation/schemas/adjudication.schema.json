@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/adjudication-v1.json",
+  "title": "MindFlow Stage 1 Adjudicated Reference Record",
+  "type": "object",
+  "required": ["gold_id", "scenario_id", "target_ref", "variable", "gold_label", "adjudication_reason", "decision", "manual_version", "scenario_version", "adjudicated_by", "adjudicated_at", "source_annotation_ids"],
+  "properties": {
+    "gold_id": {"type": "string", "minLength": 1},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "target_ref": {"type": "string", "minLength": 1},
+    "variable": {"type": "string", "minLength": 1},
+    "gold_label": {"type": ["string", "number", "null"]},
+    "adjudication_reason": {"type": "string", "minLength": 1},
+    "decision": {"enum": ["KEEP", "REVISE", "SIMPLIFY", "DROP"]},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "adjudicated_by": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "adjudicated_at": {"type": "string", "format": "date-time"},
+    "source_annotation_ids": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

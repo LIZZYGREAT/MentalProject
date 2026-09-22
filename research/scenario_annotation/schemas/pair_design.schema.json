@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/pair-design-v1.json",
+  "title": "MindFlow Stage 1 Hidden Pair Design",
+  "type": "object",
+  "required": ["pair_id", "scenario_ids", "manipulated_factor", "expected_sensitive_constructs", "expected_invariant_constructs", "coverage_tags", "design_notes"],
+  "properties": {
+    "pair_id": {"type": "string", "minLength": 1},
+    "scenario_ids": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"type": "string"}},
+    "manipulated_factor": {"type": "string", "minLength": 1},
+    "expected_sensitive_constructs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "expected_invariant_constructs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "coverage_tags": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "design_notes": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

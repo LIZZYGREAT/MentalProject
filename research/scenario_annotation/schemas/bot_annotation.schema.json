@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/bot-annotation-v1.json",
+  "title": "MindFlow Stage 1 Module C Annotation",
+  "type": "object",
+  "required": ["schema_version", "scenario_id", "annotation_module", "annotator_id", "annotation_round", "manual_version", "scenario_validity", "records"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "annotation_module": {"const": "C"},
+    "annotator_id": {"type": "string", "minLength": 1},
+    "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_validity": {
+      "type": "object",
+      "required": ["scenario_valid", "scenario_plausibility", "contradiction_present"],
+      "properties": {
+        "scenario_valid": {"enum": ["YES", "NO", "UNCERTAIN"]},
+        "scenario_plausibility": {"enum": ["HIGH", "MEDIUM", "LOW"]},
+        "contradiction_present": {"enum": ["YES", "NO"]}
+      },
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["annotation_id", "scenario_id", "scenario_version", "annotation_module", "target_ref", "variable", "label", "evidence_refs", "evidence_strength", "ambiguity_flag", "annotator_confidence", "manual_version", "annotator_id", "annotation_round", "created_at"],
+        "properties": {
+          "annotation_id": {"type": "string", "minLength": 1},
+          "scenario_id": {"type": "string", "minLength": 1},
+          "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+          "annotation_module": {"const": "C"},
+          "target_ref": {"type": "string", "minLength": 1},
+          "variable": {"enum": ["ORIGIN", "ROLE", "SUPPORT_GATE", "VALIDATION", "GUIDANCE", "RELEVANCE", "PERSONALIZATION", "SEEN_STATUS"]},
+          "label": {"type": ["string", "number"]},
+          "evidence_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+          "evidence_span": {"type": "string"},
+          "evidence_strength": {"enum": ["STRONG", "MODERATE", "WEAK", "N/A"]},
+          "unknown_reason": {"enum": ["NOT_MENTIONED", "INSUFFICIENT_DETAIL", "CONFLICTING_EVIDENCE", "TEMPORAL_SCOPE_UNCLEAR", "TARGET_UNCLEAR", "SOURCE_UNRELIABLE", "OTHER"]},
+          "ambiguity_flag": {"type": "boolean"},
+          "annotator_confidence": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+          "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+          "annotator_id": {"type": "string", "minLength": 1},
+          "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
+          "created_at": {"type": "string", "format": "date-time"},
+          "notes": {"type": "string"}
+        },
+        "allOf": [
+          {"if": {"properties": {"variable": {"const": "ORIGIN"}}}, "then": {"properties": {"label": {"enum": ["USER_INITIATED", "BOT_INITIATED", "SYSTEM_TRANSACTIONAL", "UNKNOWN"]}}}},
+          {"if": {"properties": {"variable": {"const": "ROLE"}}}, "then": {"properties": {"label": {"enum": ["ORDINARY_INFORMATION", "TASK_EXECUTION_SUPPORT", "EMOTIONAL_SUPPORT", "COPING_SUPPORT", "SENSING", "RECOVERY_SUGGESTION", "SAFETY_SUPPORT", "MIXED", "OTHER", "UNKNOWN"]}}}},
+          {"if": {"properties": {"variable": {"const": "SUPPORT_GATE"}}}, "then": {"properties": {"label": {"enum": ["SUPPORTIVE", "NON_SUPPORTIVE", "SAFETY_ONLY", "AMBIGUOUS"]}}}},
+          {"if": {"properties": {"variable": {"enum": ["VALIDATION", "GUIDANCE", "RELEVANCE"]}}}, "then": {"properties": {"label": {"enum": [0, 0.5, 1]}}}},
+          {"if": {"properties": {"variable": {"const": "PERSONALIZATION"}}}, "then": {"properties": {"label": {"enum": ["NONE", "CURRENT_CONTEXT", "HISTORICAL_PREFERENCE", "STABLE_PROFILE", "MIXED", "UNKNOWN"]}}}},
+          {"if": {"properties": {"variable": {"const": "SEEN_STATUS"}}}, "then": {"properties": {"label": {"enum": ["SEEN", "NOT_SEEN", "UNKNOWN", "N/A"]}}}}
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

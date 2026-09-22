@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/scenario-v1.json",
+  "title": "MindFlow Stage 1 Annotator-Visible Scenario",
+  "type": "object",
+  "required": [
+    "scenario_id",
+    "scenario_version",
+    "pack_id",
+    "participant_id",
+    "presentation_mode",
+    "annotation_modules",
+    "annotation_time",
+    "known_at_cutoff",
+    "participant_context",
+    "recurring_course_context",
+    "recent_context",
+    "current_tasks",
+    "focal_window",
+    "focal_events",
+    "observed_conversation_evidence",
+    "bot_response_units",
+    "source_refs"
+  ],
+  "properties": {
+    "scenario_id": {"type": "string", "pattern": "^[A-Z0-9][A-Z0-9_-]+$"},
+    "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "pack_id": {"type": "string", "pattern": "^PACK_[0-9]{2}$"},
+    "participant_id": {"type": "string", "minLength": 1},
+    "presentation_mode": {"enum": ["NATURAL", "STRUCTURED"]},
+    "annotation_modules": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["A", "B", "C"]}
+    },
+    "annotation_time": {"type": "string", "format": "date-time"},
+    "known_at_cutoff": {"type": "string", "format": "date-time"},
+    "participant_context": {"$ref": "#/$defs/contextObject"},
+    "recurring_course_context": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/course"}
+    },
+    "recent_context": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "current_tasks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/event"}
+    },
+    "focal_window": {
+      "type": "object",
+      "required": ["start", "end", "narrative"],
+      "properties": {
+        "start": {"type": "string", "format": "date-time"},
+        "end": {"type": "string", "format": "date-time"},
+        "narrative": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "focal_events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/event"}
+    },
+    "observed_conversation_evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "bot_response_units": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/botResponse"}
+    },
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "contextObject": {
+      "type": "object",
+      "required": ["text", "known_at", "source_ref"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "format": "date-time"},
+        "source_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "course": {
+      "type": "object",
+      "required": ["course_ref", "title", "weekdays", "start_time", "end_time", "known_at", "source_ref"],
+      "properties": {
+        "course_ref": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "weekdays": {"type": "array", "minItems": 1, "items": {"enum": [1, 2, 3, 4, 5, 6, 7]}},
+        "start_time": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]$"},
+        "end_time": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]$"},
+        "week2_same_as_week1": {"type": "boolean"},
+        "known_at": {"type": "string", "format": "date-time"},
+        "source_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidence_ref", "text", "known_at", "source_ref"],
+      "properties": {
+        "evidence_ref": {"type": "string", "minLength": 1},
+        "speaker": {"enum": ["PARTICIPANT", "BOT", "SYSTEM", "OBSERVER"]},
+        "text": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "format": "date-time"},
+        "source_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["event_ref", "title", "description", "known_at", "source_ref"],
+      "properties": {
+        "event_ref": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "scheduled_start": {"type": "string", "format": "date-time"},
+        "scheduled_end": {"type": "string", "format": "date-time"},
+        "actual_start": {"type": "string", "format": "date-time"},
+        "actual_end": {"type": "string", "format": "date-time"},
+        "deadline": {"type": "string", "format": "date-time"},
+        "progress": {"type": ["number", "string"], "enum": [0, 0.25, 0.5, 0.75, 1, "UNKNOWN"]},
+        "estimated_total_effort": {"type": ["number", "string"]},
+        "remaining_effort": {"type": ["number", "string"]},
+        "exposure_fraction": {"type": ["number", "string"], "enum": [0, 0.25, 0.5, 0.75, 1, "UNKNOWN"]},
+        "parent_ref": {"type": ["string", "null"]},
+        "known_at": {"type": "string", "format": "date-time"},
+        "source_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "botResponse": {
+      "type": "object",
+      "required": ["response_unit_ref", "text", "sent_at", "known_at", "source_ref"],
+      "properties": {
+        "response_unit_ref": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1},
+        "sent_at": {"type": "string", "format": "date-time"},
+        "known_at": {"type": "string", "format": "date-time"},
+        "read_at": {"type": "string", "format": "date-time"},
+        "interaction_context": {"type": "string"},
+        "source_ref": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

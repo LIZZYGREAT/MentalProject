@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/event-annotation-v1.json",
+  "title": "MindFlow Stage 1 Module A Annotation",
+  "type": "object",
+  "required": ["schema_version", "scenario_id", "annotation_module", "annotator_id", "annotation_round", "manual_version", "scenario_validity", "records"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "annotation_module": {"const": "A"},
+    "annotator_id": {"type": "string", "minLength": 1},
+    "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_validity": {"$ref": "#/$defs/validity"},
+    "records": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/record"}}
+  },
+  "$defs": {
+    "validity": {
+      "type": "object",
+      "required": ["scenario_valid", "scenario_plausibility", "contradiction_present"],
+      "properties": {
+        "scenario_valid": {"enum": ["YES", "NO", "UNCERTAIN"]},
+        "scenario_plausibility": {"enum": ["HIGH", "MEDIUM", "LOW"]},
+        "contradiction_present": {"enum": ["YES", "NO"]}
+      },
+      "additionalProperties": false
+    },
+    "record": {
+      "type": "object",
+      "required": ["annotation_id", "scenario_id", "scenario_version", "annotation_module", "target_ref", "variable", "label", "evidence_refs", "evidence_strength", "ambiguity_flag", "annotator_confidence", "manual_version", "annotator_id", "annotation_round", "created_at"],
+      "properties": {
+        "annotation_id": {"type": "string", "minLength": 1},
+        "scenario_id": {"type": "string", "minLength": 1},
+        "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "annotation_module": {"const": "A"},
+        "target_ref": {"type": "string", "minLength": 1},
+        "variable": {"enum": ["EVENT_FAMILY", "EVENT_SUBTYPE", "SCHEDULED_START", "SCHEDULED_END", "ACTUAL_START", "ACTUAL_END", "DEADLINE", "PROGRESS", "ESTIMATED_TOTAL_EFFORT", "REMAINING_EFFORT", "PARENT_RELATION", "CANCELLATION", "LIFECYCLE", "OBLIGATION_EXISTS", "OBLIGATION_STATUS", "ACTIVE_LEAF", "D_POT", "U_CONTEXT", "D_S", "R_POT", "M_CONTEXT", "EXECUTION_EXPOSURE", "DEADLINE_EXPOSURE", "UNCERTAINTY_EXPOSURE", "SOCIAL_EXPOSURE", "RECOVERY_OCCURRENCE", "DEADLINE_SCARCITY_BAND"]},
+        "label": {"type": ["string", "number", "null"]},
+        "evidence_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "evidence_span": {"type": "string"},
+        "evidence_strength": {"enum": ["STRONG", "MODERATE", "WEAK", "N/A"]},
+        "unknown_reason": {"enum": ["NOT_MENTIONED", "INSUFFICIENT_DETAIL", "CONFLICTING_EVIDENCE", "TEMPORAL_SCOPE_UNCLEAR", "TARGET_UNCLEAR", "SOURCE_UNRELIABLE", "OTHER"]},
+        "ambiguity_flag": {"type": "boolean"},
+        "annotator_confidence": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+        "partial_encoding_basis": {"enum": ["ACTUAL_INTERVAL", "FRACTION_ONLY", "OTHER_EXPLICIT"]},
+        "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "annotator_id": {"type": "string", "minLength": 1},
+        "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
+        "created_at": {"type": "string", "format": "date-time"},
+        "notes": {"type": "string"}
+      },
+      "allOf": [
+        {"if": {"properties": {"variable": {"const": "EVENT_FAMILY"}}}, "then": {"properties": {"label": {"enum": ["COURSE", "TASK", "STRUCTURED_EVENT", "RECOVERY_ACTIVITY", "SLEEP", "NAP", "CONSEQUENCE_EVENT", "OTHER", "UNKNOWN"]}}}},
+        {"if": {"properties": {"variable": {"const": "OBLIGATION_EXISTS"}}}, "then": {"properties": {"label": {"enum": ["YES", "NO", "UNKNOWN"]}}}},
+        {"if": {"properties": {"variable": {"enum": ["ACTIVE_LEAF", "CANCELLATION"]}}}, "then": {"properties": {"label": {"enum": ["YES", "NO", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"enum": ["D_POT", "U_CONTEXT", "R_POT", "DEADLINE_SCARCITY_BAND"]}}}, "then": {"properties": {"label": {"enum": ["LOW", "MEDIUM", "HIGH", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"const": "D_S"}}}, "then": {"properties": {"label": {"enum": ["ABSENT", "PRESENT", "STRONG", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"const": "M_CONTEXT"}}}, "then": {"properties": {"label": {"enum": ["POOR", "PARTIAL", "GOOD", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"enum": ["EXECUTION_EXPOSURE", "DEADLINE_EXPOSURE", "UNCERTAINTY_EXPOSURE", "SOCIAL_EXPOSURE", "RECOVERY_OCCURRENCE"]}}}, "then": {"properties": {"label": {"enum": ["INACTIVE", "ACTIVE", "PARTIAL", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"const": "OBLIGATION_STATUS"}}}, "then": {"properties": {"label": {"enum": ["OPEN", "IN_PROGRESS", "BLOCKED", "COMPLETED", "CANCELLED", "SUPERSEDED", "UNKNOWN", "N/A"]}}}},
+        {"if": {"properties": {"variable": {"const": "LIFECYCLE"}}}, "then": {"properties": {"label": {"enum": ["SCHEDULED", "ATTENDED", "PARTIAL", "SKIPPED", "CANCELLED", "PLANNED", "OPEN", "IN_PROGRESS", "BLOCKED", "COMPLETED", "OVERDUE", "SUPERSEDED", "OCCURRED", "UNKNOWN"]}}}}
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
