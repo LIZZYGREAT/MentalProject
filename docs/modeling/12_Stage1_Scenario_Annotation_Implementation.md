@@ -6,8 +6,6 @@
 >
 > 本阶段为离线 Research 工具链，不接入生产 Bot Runtime、不修改当前 CTSSM、不依赖生产 PostgreSQL。
 >
-> 旧版 `Scenario Annotation 设计与执行规范` 中的 Two-Week Context Pack、大学生现实约束、课程节次、coverage 设计、独立标注、reliability 与 adjudication 流程继续保留；本文件按最新模型边界重新组织 Annotation Schema 与 Freeze Gate。
-
 ---
 
 # 一、阶段目标
