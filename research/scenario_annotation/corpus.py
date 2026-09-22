@@ -155,7 +155,7 @@ def _scenario(
         "focal_window": {
             "start": _iso(cutoff - timedelta(hours=2)),
             "end": _iso(cutoff),
-            "narrative": f"{title}：{narrative}",
+            "narrative": narrative,
         },
         "focal_events": focal_events,
         "observed_conversation_evidence": evidence or [],
@@ -197,17 +197,17 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
 
     # 1–2: same scheduled-only course in natural/structured presentation.
     for number, mode, narrative in (
-        (1, "NATURAL", "课表显示上午有高数；到中午为止没有签到、对话或其他到课证据。"),
-        (2, "STRUCTURED", "scheduled=10:00–11:40；attendance evidence=none。"),
+        (1, "NATURAL", "课表显示上午 10:00–11:40 有高等数学。到中午为止，资料中没有签到、对话或其他到课记录。"),
+        (2, "STRUCTURED", "高等数学课表时间为 10:00–11:40。截至 12:00，可见资料中没有出席记录。"),
     ):
         cutoff = at(1, 12)
-        event = _event("E_COURSE_SCHEDULED", "高等数学", "课表中的常规课程，仅有 scheduled fact。", at(0, 8), "P01", scheduled_start=at(1, 10), scheduled_end=at(1, 11, 40))
+        event = _event("E_COURSE_SCHEDULED", "高等数学", "课表中的常规课程。", at(0, 8), "P01", scheduled_start=at(1, 10), scheduled_end=at(1, 11, 40))
         artifacts.append(_scenario(number, 1, mode, ["A"], "Scheduled vs Realized", narrative, ["COURSE", "LIFECYCLE", "SCHEDULED_VS_REALIZED", "BOUNDARY_UNKNOWN"], focal_events=[event], cutoff=cutoff))
 
     # 3–4: precise partial interval, dual presentation.
     for number, mode, narrative in (
         (3, "NATURAL", "课程原定 10:00–11:40，签到与离场记录显示只参加到 10:25。"),
-        (4, "STRUCTURED", "scheduled=10:00–11:40；actual=10:00–10:25；没有 fraction 字段。"),
+        (4, "STRUCTURED", "统计学课表时间为 10:00–11:40；签到和离场记录分别为 10:00 与 10:25。资料中没有参与比例记录。"),
     ):
         cutoff = at(2, 12)
         event = _event("E_COURSE_PARTIAL_INTERVAL", "统计学", "有精确实际参与区间。", at(2, 10, 25), "P02", scheduled_start=at(2, 10), scheduled_end=at(2, 11, 40), actual_start=at(2, 10), actual_end=at(2, 10, 25))
@@ -216,30 +216,30 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
     # 5–6: fraction-only partial, dual presentation.
     for number, mode, narrative in (
         (5, "NATURAL", "参与者只记得实验课大约上了一半，无法回忆到离场时间。"),
-        (6, "STRUCTURED", "actual interval=unknown；explicit exposure fraction=0.5。"),
+        (6, "STRUCTURED", "参与者报告自己参加了大约一半的实验课，但没有提供到场和离场的具体时间。"),
     ):
         cutoff = at(3, 18)
-        event = _event("E_COURSE_PARTIAL_FRACTION", "计算机实验", "只有明确比例，没有实际区间。", cutoff - timedelta(minutes=10), "P02", scheduled_start=at(3, 14), scheduled_end=at(3, 15, 40), exposure_fraction=0.5)
+        event = _event("E_COURSE_PARTIAL_FRACTION", "计算机实验", "参与者只提供了大致参与比例。", cutoff - timedelta(minutes=10), "P02", scheduled_start=at(3, 14), scheduled_end=at(3, 15, 40), exposure_fraction=0.5)
         artifacts.append(_scenario(number, 2, mode, ["A"], "Course PARTIAL / fraction only", narrative, ["COURSE", "PARTIAL", "FRACTION_ONLY", "SINGLE_EXPOSURE"], focal_events=[event], cutoff=cutoff, anchor=("E_COURSE_PARTIAL_FRACTION", "PARTIAL_ENCODING_BASIS", "FRACTION_ONLY", "没有 actual interval，比例是唯一明确编码。")))
 
     # 7–8: missed course without a catch-up obligation, dual presentation.
     for number, mode, narrative in (
         (7, "NATURAL", "参与者明确说今天高数没去；没有提补课、补录像或任何未来行动。"),
-        (8, "STRUCTURED", "attendance=explicitly absent；future action commitment=none mentioned。"),
+        (8, "STRUCTURED", "参与者明确表示没有参加当天的高等数学；截至当前，没有提到补课、补看录像或其他后续安排。"),
     ):
         cutoff = at(4, 12)
-        event = _event("E_COURSE_SKIPPED", "高等数学", "明确缺席，无 catch-up commitment。", cutoff - timedelta(minutes=15), "P01", scheduled_start=at(4, 10), scheduled_end=at(4, 11, 40))
+        event = _event("E_COURSE_SKIPPED", "高等数学", "课表记录与参与者陈述见当前可见资料。", cutoff - timedelta(minutes=15), "P01", scheduled_start=at(4, 10), scheduled_end=at(4, 11, 40))
         evidence = [_evidence("MSG_SKIPPED", "今天高数我明确没去。", cutoff - timedelta(minutes=15), "P01")]
         artifacts.append(_scenario(number, 1, mode, ["A"], "Skipped course without obligation", narrative, ["COURSE", "SKIPPED", "MISSED_NOT_OBLIGATION", "ANCHOR"], focal_events=[event], evidence=evidence, cutoff=cutoff, anchor=("E_COURSE_SKIPPED", "LIFECYCLE", "SKIPPED", "参与者明确报告未出席。")))
 
     cutoff = at(5, 13)
-    catchup = _event("E_COURSE_CATCHUP", "补看高数录像", "缺课后明确承诺的未来行动。", cutoff - timedelta(minutes=5), "P01", deadline=at(5, 21), progress=0, estimated_total_effort=2, remaining_effort=2, parent_ref="E_COURSE_MISSED_PARENT")
+    catchup = _event("E_COURSE_CATCHUP", "补看高数录像", "参与者安排在今晚补看课程录像。", cutoff - timedelta(minutes=5), "P01", deadline=at(5, 21), progress=0, estimated_total_effort=2, remaining_effort=2, parent_ref="E_COURSE_MISSED_PARENT")
     evidence = [_evidence("MSG_009", "上午没去高数，我承诺今晚九点前把两小时录像补完。", cutoff - timedelta(minutes=5), "P01")]
-    artifacts.append(_scenario(9, 1, "NATURAL", ["A"], "Skipped course with catch-up obligation", "缺课之外出现明确 commitment、future action 与 unresolved work。", ["COURSE", "TASK", "OBLIGATION", "MISSED_WITH_CATCHUP"], focal_events=[catchup], tasks=[catchup], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(9, 1, "NATURAL", ["A"], "Skipped course with catch-up obligation", "参与者上午没有参加高等数学，并表示会在当晚九点前补看两小时课程录像；截至当前尚未开始。", ["COURSE", "TASK", "OBLIGATION", "MISSED_WITH_CATCHUP"], focal_events=[catchup], tasks=[catchup], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(6, 11)
     open_task = _event("E_TASK_OPEN", "研究方法文献摘要", "任务已发布但未开始。", at(6, 9), "P03", deadline=at(9, 20), progress=0, estimated_total_effort=4, remaining_effort=4)
-    artifacts.append(_scenario(10, 3, "STRUCTURED", ["A"], "Task OPEN", "task accepted；progress=0；没有开始证据。", ["TASK", "OPEN", "OBLIGATION"], focal_events=[open_task], tasks=[open_task], cutoff=cutoff))
+    artifacts.append(_scenario(10, 3, "STRUCTURED", ["A"], "Task OPEN", "文献摘要任务已发布，截止时间为本周三 20:00。任务记录显示完成比例为 0，资料中没有开始处理的记录。", ["TASK", "OPEN", "OBLIGATION"], focal_events=[open_task], tasks=[open_task], cutoff=cutoff))
 
     cutoff = at(6, 16)
     doing_task = _event("E_TASK_PROGRESS", "研究方法文献摘要", "已经开始并完成约一半。", cutoff - timedelta(minutes=10), "P03", deadline=at(9, 20), progress=0.5, estimated_total_effort=4, remaining_effort=2)
@@ -248,69 +248,69 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
     cutoff = at(7, 10)
     blocked = _event("E_TASK_BLOCKED", "研究数据清洗", "必须等待导师提供解密密钥才能继续。", cutoff - timedelta(minutes=10), "P03", deadline=at(10, 20), progress=0.25, estimated_total_effort=8, remaining_effort=6)
     evidence = [_evidence("MSG_012", "不是我不想做，没有导师的解密密钥我现在一步也推进不了。", cutoff - timedelta(minutes=10), "P03")]
-    artifacts.append(_scenario(12, 3, "NATURAL", ["A", "B"], "Blocked task", "外部 dependency 未解决；文本没有表达一般能力感。", ["TASK", "BLOCKED", "DEPENDENCY", "CROSS_LAYER_TRAP"], focal_events=[blocked], tasks=[blocked], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(12, 3, "NATURAL", ["A", "B"], "Blocked task", "研究数据文件需要导师提供解密密钥。参与者目前尚未收到密钥，并表示在收到前无法继续处理文件。", ["TASK", "BLOCKED", "DEPENDENCY", "CROSS_LAYER_TRAP"], focal_events=[blocked], tasks=[blocked], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(7, 22)
     overdue = _event("E_TASK_OVERDUE", "统计作业", "deadline 已过但 obligation 继续存在。", cutoff - timedelta(minutes=5), "P02", deadline=at(7, 20), progress=0.75, estimated_total_effort=4, remaining_effort=1)
     evidence = [_evidence("MSG_013", "已经过截止时间了，但老师允许迟交，我今晚继续做完。", cutoff - timedelta(minutes=5), "P02")]
-    artifacts.append(_scenario(13, 2, "NATURAL", ["A"], "Overdue continuing obligation", "deadline 已过；明确仍将继续完成。", ["TASK", "OVERDUE", "OBLIGATION_CONTINUES"], focal_events=[overdue], tasks=[overdue], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(13, 2, "NATURAL", ["A"], "Overdue continuing obligation", "统计作业原定 20:00 截止。当前时间为 22:00；参与者说老师允许迟交，自己会在今晚继续完成剩余部分。", ["TASK", "OVERDUE", "OBLIGATION_CONTINUES"], focal_events=[overdue], tasks=[overdue], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(8, 12)
     parent = _event("E_PROJECT_PARENT", "课程项目", "概括性 parent obligation。", cutoff - timedelta(hours=2), "P02", deadline=at(12, 20), progress=0.25, remaining_effort="UNKNOWN")
     child = _event("E_PROJECT_CHILD", "完成项目数据图", "当前唯一 active child。", cutoff - timedelta(minutes=10), "P02", deadline=at(9, 20), progress=0.5, remaining_effort=2, parent_ref="E_PROJECT_PARENT")
-    artifacts.append(_scenario(14, 2, "STRUCTURED", ["A"], "Parent-child active leaf", "parent unresolved；child active；不得将两者默认同时计为 active leaves。", ["TASK", "PARENT_CHILD", "ACTIVE_LEAF", "DOUBLE_COUNT_TRAP"], focal_events=[parent, child], tasks=[parent, child], cutoff=cutoff))
+    artifacts.append(_scenario(14, 2, "STRUCTURED", ["A"], "Parent-child active leaf", "课程项目尚未完成。任务记录显示“完成项目数据图”属于该课程项目，目前已完成一半，仍需约两小时。", ["TASK", "PARENT_CHILD", "ACTIVE_LEAF", "DOUBLE_COUNT_TRAP"], focal_events=[parent, child], tasks=[parent, child], cutoff=cutoff))
 
     cutoff = at(8, 18)
     empty = _event("E_EMPTY_WINDOW", "周六下午空档", "日历没有安排；没有活动发生证据。", cutoff - timedelta(hours=1), "P03", scheduled_start=at(8, 14), scheduled_end=at(8, 18))
-    artifacts.append(_scenario(15, 3, "NATURAL", ["A"], "Free time is not recovery", "周末日历为空，但 participant 没有报告休息、娱乐或其他 recovery activity。", ["WEEKEND", "FREE_TIME", "RECOVERY_TRAP"], focal_events=[empty], cutoff=cutoff, anchor=("E_EMPTY_WINDOW", "RECOVERY_OCCURRENCE", "INACTIVE", "空闲本身不是 recovery occurrence。")))
+    artifacts.append(_scenario(15, 3, "NATURAL", ["A"], "Free time is not recovery", "周六下午 14:00–18:00 的日历没有安排。截至 18:00，参与者没有报告这段时间做了什么。", ["WEEKEND", "FREE_TIME", "RECOVERY_TRAP"], focal_events=[empty], cutoff=cutoff, anchor=("E_EMPTY_WINDOW", "RECOVERY_OCCURRENCE", "INACTIVE", "空闲本身不是 recovery occurrence。")))
 
     cutoff = at(9, 18)
     walk = _event("E_WALK", "湖边散步", "自主、无任务内容的 45 分钟散步。", cutoff - timedelta(minutes=5), "P03", actual_start=at(9, 16), actual_end=at(9, 16, 45))
     evidence = [_evidence("MSG_016", "下午我沿湖走了四十五分钟，手机也放在包里。", cutoff - timedelta(minutes=5), "P03")]
-    artifacts.append(_scenario(16, 3, "NATURAL", ["A", "B"], "Recovery occurrence without fit evidence", "散步明确发生；participant 没说它是否让自己恢复。", ["RECOVERY", "OCCURRENCE", "F_REC_NO_EVIDENCE"], focal_events=[walk], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(16, 3, "NATURAL", ["A", "B"], "Recovery occurrence without fit evidence", "参与者报告下午 16:00–16:45 沿湖散步，并把手机放在包里。资料中没有其他关于散步后体验的陈述。", ["RECOVERY", "OCCURRENCE", "F_REC_NO_EVIDENCE"], focal_events=[walk], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(9, 20)
     walk_fit = _event("E_WALK_FIT", "湖边散步", "同类散步活动。", cutoff - timedelta(minutes=5), "P03", actual_start=at(9, 18), actual_end=at(9, 18, 45))
     evidence = [_evidence("MSG_017", "这种不看手机的散步通常能让我真正缓过来。", cutoff - timedelta(minutes=5), "P03")]
-    artifacts.append(_scenario(17, 3, "NATURAL", ["A", "B"], "Recovery fit evidence", "活动发生，且出现 participant-specific recovery fit 陈述。", ["RECOVERY", "F_REC", "EVENT_CLASS_EVIDENCE"], focal_events=[walk_fit], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(17, 3, "NATURAL", ["A", "B"], "Recovery fit evidence", "参与者报告下午 18:00–18:45 沿湖散步，并说这种不看手机的散步通常能让自己真正缓过来。", ["RECOVERY", "F_REC", "EVENT_CLASS_EVIDENCE"], focal_events=[walk_fit], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(10, 12)
-    hard_task = _event("E_HARD_TASK", "高难算法证明", "要求完成多步形式证明，客观难度高。", cutoff - timedelta(minutes=10), "P04", deadline=at(11, 20), progress=0, remaining_effort=6)
-    artifacts.append(_scenario(18, 4, "STRUCTURED", ["A", "B"], "Difficulty is not C_exec", "objective complexity=high；participant appraisal evidence=none。", ["D_POT", "C_EXEC", "FORBIDDEN_INFERENCE"], focal_events=[hard_task], tasks=[hard_task], cutoff=cutoff))
+    hard_task = _event("E_HARD_TASK", "算法形式证明", "任务要求独立完成包含五个推导步骤的形式证明。", cutoff - timedelta(minutes=10), "P04", deadline=at(11, 20), progress=0, remaining_effort=6)
+    artifacts.append(_scenario(18, 4, "STRUCTURED", ["A", "B"], "Difficulty is not C_exec", "算法作业要求独立完成包含五个推导步骤的形式证明，预计仍需六小时。资料中没有参与者对自己能否完成的陈述。", ["D_POT", "C_EXEC", "FORBIDDEN_INFERENCE"], focal_events=[hard_task], tasks=[hard_task], cutoff=cutoff))
 
     cutoff = at(10, 13)
     hard_task_2 = deepcopy(hard_task)
     hard_task_2["event_ref"] = "E_HARD_TASK_LOW_CEXEC"
     hard_task_2["known_at"] = _iso(cutoff - timedelta(minutes=5))
     evidence = [_evidence("MSG_019", "证明要求我看懂了，但我完全不知道怎么下手，今天肯定做不出来。", cutoff - timedelta(minutes=5), "P04")]
-    artifacts.append(_scenario(19, 4, "NATURAL", ["A", "B"], "Same difficulty, explicit C_exec", "objective difficulty 与前例相同；新增明确执行能力陈述。", ["D_POT", "C_EXEC", "MINIMAL_CONTRAST"], focal_events=[hard_task_2], tasks=[hard_task_2], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(19, 4, "NATURAL", ["A", "B"], "Same difficulty, explicit C_exec", "算法作业要求独立完成包含五个推导步骤的形式证明，预计仍需六小时。参与者说自己看懂了要求，但完全不知道如何下手，认为今天做不出来。", ["D_POT", "C_EXEC", "MINIMAL_CONTRAST"], focal_events=[hard_task_2], tasks=[hard_task_2], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(10, 16)
     required = _event("E_REQUIRED_COURSE", "专业必修期中考试", "4 学分必修课考试。", cutoff - timedelta(minutes=5), "P04", scheduled_start=at(11, 14), scheduled_end=at(11, 15, 40))
-    artifacts.append(_scenario(20, 4, "STRUCTURED", ["A", "B"], "Objective stakes are not importance", "required=true；credits=4；participant importance statement=none。", ["IMPORTANCE", "OBJECTIVE_STAKES", "FORBIDDEN_INFERENCE"], focal_events=[required], cutoff=cutoff))
+    artifacts.append(_scenario(20, 4, "STRUCTURED", ["A", "B"], "Objective stakes are not importance", "明天下午有一场专业必修课期中考试，该课程为 4 学分。资料中没有参与者谈及这场考试对自己的意义或优先级。", ["IMPORTANCE", "OBJECTIVE_STAKES", "FORBIDDEN_INFERENCE"], focal_events=[required], cutoff=cutoff))
 
     cutoff = at(10, 18)
-    controllability = _event("E_EXEC_OUTCOME", "课程报告修订", "participant 能执行修改，但最终成绩已锁定。", cutoff - timedelta(minutes=5), "P04", deadline=at(11, 20), progress=0.5, remaining_effort=2)
+    controllability = _event("E_EXEC_OUTCOME", "课程报告修订", "课程报告仍可修改；系统显示最终成绩已经锁定。", cutoff - timedelta(minutes=5), "P04", deadline=at(11, 20), progress=0.5, remaining_effort=2)
     evidence = [_evidence("MSG_021", "我知道怎么改，也肯定能改完；但成绩已经锁定，再改也影响不了结果。", cutoff - timedelta(minutes=5), "P04")]
-    artifacts.append(_scenario(21, 4, "NATURAL", ["B"], "C_exec differs from C_out", "同一句话分别提供执行把握与结果不可控 evidence。", ["C_EXEC", "C_OUT", "APPRAISAL_BOUNDARY"], focal_events=[controllability], tasks=[controllability], evidence=evidence, cutoff=cutoff))
+    artifacts.append(_scenario(21, 4, "NATURAL", ["B"], "C_exec differs from C_out", "课程报告还可以继续修改，但系统显示最终成绩已经锁定。参与者说自己知道怎么改、肯定能改完，同时认为修改已经影响不了成绩。", ["C_EXEC", "C_OUT", "APPRAISAL_BOUNDARY"], focal_events=[controllability], tasks=[controllability], evidence=evidence, cutoff=cutoff))
 
     cutoff = at(11, 14)
     uncertain_structure = _event("E_RULES_UNKNOWN", "临时课程展示", "题目和评分规则尚未公布。", cutoff - timedelta(minutes=10), "P04", scheduled_start=at(11, 16), scheduled_end=at(11, 16, 45))
     evidence = [_evidence("MSG_022", "规则还没发，不过类似展示我做过很多，我很确定能应付。", cutoff - timedelta(minutes=10), "P04")]
     bot = [_bot("BOT_022", "先确认已知要求，再列两个你能控制的准备动作。", cutoff - timedelta(minutes=5), "P04", interaction_context="用户主动询问准备方法")]
-    artifacts.append(_scenario(22, 4, "NATURAL", ["A", "B", "C"], "High U_context / low U_perc", "结构规则未知，但 participant 明确主观有把握；bot 给任务准备建议。", ["U_CONTEXT", "U_PERC", "TASK_HELP", "BOT"], focal_events=[uncertain_structure], evidence=evidence, bot_units=bot, cutoff=cutoff))
+    artifacts.append(_scenario(22, 4, "NATURAL", ["A", "B", "C"], "High U_context / low U_perc", "课程展示将在当天下午进行。截至当前，题目和评分规则尚未公布。参与者表示自己以前做过多次类似展示，并认为自己能够应付。随后机器人建议先确认已知要求，再列出两个可控制的准备动作。", ["U_CONTEXT", "U_PERC", "TASK_HELP", "BOT"], focal_events=[uncertain_structure], evidence=evidence, bot_units=bot, cutoff=cutoff))
 
     cutoff = at(11, 15)
     clear_structure = _event("E_RULES_CLEAR", "实验报告", "模板、评分规则和依赖均已公布。", cutoff - timedelta(minutes=10), "P04", deadline=at(12, 20), progress=0.25, remaining_effort=4)
     evidence = [_evidence("MSG_023", "要求都很清楚，但我还是完全没底，也一直绷着。", cutoff - timedelta(minutes=10), "P04")]
     bot = [_bot("BOT_023", "要求都清楚但你还是没底，这种绷着的感觉很难受。先慢慢呼吸三次，然后只选一个最小步骤；我可以陪你一起定。", cutoff - timedelta(minutes=5), "P04", interaction_context="用户表达主观不确定和紧张", read_at=cutoff - timedelta(minutes=1))]
-    artifacts.append(_scenario(23, 4, "NATURAL", ["A", "B", "C"], "Low U_context / high U_perc", "结构清楚但 participant 主观没底；bot 提供 validation 与 coping guidance。", ["U_CONTEXT", "U_PERC", "EMOTIONAL_SUPPORT", "COPING_SUPPORT", "SEEN"], focal_events=[clear_structure], tasks=[clear_structure], evidence=evidence, bot_units=bot, cutoff=cutoff))
+    artifacts.append(_scenario(23, 4, "NATURAL", ["A", "B", "C"], "Low U_context / high U_perc", "实验报告的模板、评分规则和依赖均已公布。参与者说要求都很清楚，但自己仍然完全没底、一直绷着。机器人回应了这种感受，并建议先做三次慢呼吸，再选择一个最小步骤。", ["U_CONTEXT", "U_PERC", "EMOTIONAL_SUPPORT", "COPING_SUPPORT", "SEEN"], focal_events=[clear_structure], tasks=[clear_structure], evidence=evidence, bot_units=bot, cutoff=cutoff))
 
     cutoff = at(11, 15)
     appointment = _event("E_APPOINTMENT_PENDING", "导师会面", "截至 15:00 日历仍显示 16:00 会面；系统状态为 pending。", cutoff - timedelta(minutes=15), "P01", scheduled_start=at(11, 16), scheduled_end=at(11, 16, 45))
     recent = [_evidence("SYS_024", "15:00 查询结果：会面仍为 pending，未收到取消。", cutoff, "P01", speaker="SYSTEM")]
     bot = [_bot("BOT_024", "离会面还有一小时，如果你愿意，我们先用两分钟整理最想问的一个问题。", cutoff - timedelta(minutes=10), "P01", interaction_context="发送时会面仍显示 pending")]
-    artifacts.append(_scenario(24, 1, "STRUCTURED", ["A", "C"], "Known now vs known later", "cutoff=15:00；未来可能发生的状态变化不在可见输入中，不得用于 relevance 或 lifecycle。", ["KNOWN_AT", "FUTURE_LEAKAGE", "BOT_RELEVANCE", "REVISION_TIMING", "RECOVERY_SUGGESTION"], focal_events=[appointment], recent=recent, bot_units=bot, cutoff=cutoff))
+    artifacts.append(_scenario(24, 1, "STRUCTURED", ["A", "C"], "Known now vs known later", "当前时间为 15:00。日历仍显示 16:00 与导师会面，系统查询结果为 pending，尚未收到取消通知。机器人在 14:50 建议先用两分钟整理最想问的一个问题。", ["KNOWN_AT", "FUTURE_LEAKAGE", "BOT_RELEVANCE", "REVISION_TIMING", "RECOVERY_SUGGESTION"], focal_events=[appointment], recent=recent, bot_units=bot, cutoff=cutoff))
 
     pairs = [
         _pair("PRES_SCHEDULED", ["CAL_001", "CAL_002"], "presentation_mode", ["LIFECYCLE"], ["EVENT_FAMILY", "EXECUTION_EXPOSURE"], ["NATURAL_STRUCTURED", "COURSE"], "同一 scheduled-only 事实的 natural/structured 双版本。"),

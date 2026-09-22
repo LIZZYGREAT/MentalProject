@@ -8,19 +8,19 @@
       "module": "A",
       "path": "module_a.jsonl",
       "scenario_count": 19,
-      "sha256": "eefa52b1353cecd07423644be0c280248b6c3f79bd25564c449244893adbae66"
+      "sha256": "293151dce2faca70e86bf5d316fb97e7322d468cedb87fdbb3a826d46a0ad594"
     },
     {
       "module": "B",
       "path": "module_b.jsonl",
       "scenario_count": 9,
-      "sha256": "93533f6ea1720a01aafe794182eb3e50659ce11395dcd81b764a2f2661fcaaf0"
+      "sha256": "49ccbbd125867f02ca812c7ef92998328f9dd78149a29a94f738068657d86a92"
     },
     {
       "module": "C",
       "path": "module_c.jsonl",
       "scenario_count": 3,
-      "sha256": "b6788c3218b6d59abac8b1490d30fb34ea0529510345b4125d75c4f2880e82ef"
+      "sha256": "2a9a034c9430de62266542925753500fbb8d3680638e90310f62ee7108b3f4da"
     }
   ],
   "manual_version": "0.1",

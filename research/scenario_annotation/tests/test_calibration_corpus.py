@@ -37,6 +37,29 @@ def test_visible_scenarios_contain_no_hidden_design_keys() -> None:
         assert f'"{key}"' not in serialized
 
 
+def test_visible_scenarios_do_not_contain_design_language() -> None:
+    artifacts, _ = build_calibration()
+    forbidden = {
+        "u_context",
+        "u_perc",
+        "c_exec",
+        "c_out",
+        "d_pot",
+        "r_pot",
+        "f_rec",
+        "support_gate",
+        "expected",
+        "minimal pair",
+        "same difficulty",
+        "objective stakes",
+        "用于测试",
+    }
+    for artifact in artifacts:
+        narrative = artifact.visible["focal_window"]["narrative"].casefold()
+        leaked = {term for term in forbidden if term in narrative}
+        assert not leaked, f"{artifact.visible['scenario_id']} leaks {sorted(leaked)}"
+
+
 def test_generated_calibration_artifacts_validate(tmp_path) -> None:
     counts = write_calibration(tmp_path)
     assert counts == {"scenarios": 24, "pairs": 8, "anchors": 7}
