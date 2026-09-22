@@ -222,6 +222,36 @@ def _import_ai_output_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_annotations_command(args: argparse.Namespace) -> int:
+    from .drafts import export_annotations
+
+    root = Path(__file__).resolve().parent
+    if args.round_name != "calibration":
+        print("FAIL: formal annotation export is unavailable before Gate A")
+        return 2
+    slug = args.annotator.lower().replace("-", "_")
+    assignment_root = root / "assignments" / "round_calibration" / slug
+    draft_root = root / "annotations" / "drafts" / slug / "calibration"
+    output_root = args.output_dir or root / "annotations" / "calibration" / slug
+    modules = (args.module,) if args.module else ("A", "B", "C")
+    exported: list[str] = []
+    try:
+        for module in modules:
+            count = export_annotations(
+                annotator_id=args.annotator,
+                module=module,
+                assignment_path=assignment_root / f"module_{module.lower()}.jsonl",
+                draft_dir=draft_root / f"module_{module.lower()}",
+                output_path=output_root / f"module_{module.lower()}.jsonl",
+            )
+            exported.append(f"Module {module}={count}")
+    except (OSError, ValueError) as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    print("PASS: exported validated annotation documents " + ", ".join(exported))
+    return 0
+
+
 def _add_analysis_parser(
     subparsers: argparse._SubParsersAction,
     name: str,
@@ -394,6 +424,20 @@ def build_parser() -> argparse.ArgumentParser:
     import_output.add_argument("--request-id", required=True)
     import_output.add_argument("--attempt", type=int, default=1)
     import_output.set_defaults(handler=_import_ai_output_command)
+
+    export_annotations_parser = subparsers.add_parser(
+        "export-annotations",
+        help="merge complete per-scenario drafts into validated annotation JSONL",
+    )
+    export_annotations_parser.add_argument(
+        "--round", dest="round_name", choices=("calibration",), required=True
+    )
+    export_annotations_parser.add_argument(
+        "--annotator", choices=("AI-A", "AI-B", "AI-C", "Human"), required=True
+    )
+    export_annotations_parser.add_argument("--module", choices=("A", "B", "C"))
+    export_annotations_parser.add_argument("--output-dir", type=Path)
+    export_annotations_parser.set_defaults(handler=_export_annotations_command)
     return parser
 
 

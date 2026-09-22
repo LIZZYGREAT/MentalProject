@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/human-draft-v1.json",
+  "title": "MindFlow Atomic Human Annotation Draft",
+  "type": "object",
+  "required": ["draft_version", "status", "scenario_id", "annotation_module", "annotator_id", "manual_version", "scenario_version", "flagged_for_review", "updated_at", "payload", "validation_errors", "annotation_document"],
+  "properties": {
+    "draft_version": {"const": "1.0"},
+    "status": {"enum": ["IN_PROGRESS", "COMPLETE"]},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "annotation_module": {"enum": ["A", "B", "C"]},
+    "annotator_id": {"const": "Human"},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "flagged_for_review": {"type": "boolean"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "payload": {
+      "type": "object",
+      "required": ["scenario_validity", "records"],
+      "properties": {
+        "scenario_validity": {"type": ["object", "null"]},
+        "records": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
+    "validation_errors": {"type": "array", "items": {"type": "string"}},
+    "annotation_document": {"type": ["object", "null"]}
+  },
+  "additionalProperties": false
+}

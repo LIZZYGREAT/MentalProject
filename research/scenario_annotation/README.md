@@ -74,6 +74,28 @@ The runner owns IDs, versions, annotator/round metadata, timestamps, and provena
 It records provider/model/settings/request/attempt and the raw-output digest, then
 validates the enriched draft against the exact assignment scenario.
 
+Start the Human calibration UI from the repository root:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.ui --round calibration --annotator Human
+```
+
+The server listens only on `127.0.0.1`. Annotation mode has fixed backend paths
+for the Human assignment, Coding Manual, schemas, and Human drafts; it has no
+reader for hidden design metadata, AI output, Gold, or analysis reports. Drafts
+are written atomically as one JSON file per Scenario × Module so work can be
+resumed without rewriting a shared JSONL file.
+
+When every scenario in a module is marked complete, export and revalidate the
+formal annotation documents:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli export-annotations --round calibration --annotator Human
+```
+
+The export refuses missing or incomplete drafts and validates target/evidence
+references against the exact Human assignment before replacing an output file.
+
 After all independent annotation documents have passed schema validation, run the
 field-level analysis pipeline:
 
@@ -85,6 +107,18 @@ The pipeline writes `field_metrics.csv`, confusion matrices, critical violation
 records and rates, orthogonality checks, a disagreement/adjudication queue, and
 construct-level Markdown reports. It refuses to run on an empty annotation drop
 and never edits the coding manual automatically.
+
+Only after all four independent assignment sets have been exported and the full
+calibration analysis output exists, start the adjudication view:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.ui --mode adjudication --round calibration
+```
+
+It presents all independent labels and evidence, agreement counts, and related
+critical-violation flags. A reviewer must explicitly enter the final label,
+reason, and `KEEP` / `REVISE` / `SIMPLIFY` / `DROP` decision; the UI never
+preselects a majority label.
 
 Validate completed annotation documents against the exact visible assignment used
 by that annotator:

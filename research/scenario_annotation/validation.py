@@ -105,6 +105,7 @@ class Validator:
             "gate-result": "gate_result.schema.json",
             "quality-thresholds": "quality_thresholds.schema.json",
             "ai-output": "ai_output.schema.json",
+            "human-draft": "human_draft.schema.json",
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
         }

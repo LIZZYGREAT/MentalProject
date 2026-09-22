@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MindFlow Stage 1 Annotation</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">MindFlow · Representation Semantics</p>
+      <h1>Stage 1 Annotation</h1>
+    </div>
+    <div class="status-grid">
+      <span id="current-id">未选择</span>
+      <span id="progress">0 / 0</span>
+      <span id="save-status" class="status-pill">未保存</span>
+    </div>
+  </header>
+
+  <nav class="toolbar" id="annotation-toolbar">
+    <label>Module
+      <select id="module-select"><option>A</option><option>B</option><option>C</option></select>
+    </label>
+    <label class="check"><input id="incomplete-only" type="checkbox"> 仅未完成</label>
+    <select id="scenario-select" aria-label="Scenario"></select>
+    <button id="previous">Previous</button>
+    <button id="next">Next</button>
+  </nav>
+
+  <main id="annotation-view" class="workspace">
+    <section class="context-pane">
+      <div id="scenario-context"></div>
+      <h2>Visible Evidence</h2>
+      <p class="hint">点击一条 evidence 会把引用加入当前正在编辑的变量。</p>
+      <div id="evidence-list"></div>
+      <details class="manual-card">
+        <summary>当前 Module Coding Manual</summary>
+        <pre id="manual-excerpt"></pre>
+      </details>
+    </section>
+
+    <section class="form-pane">
+      <div class="validity-card">
+        <h2>Scenario Validity</h2>
+        <label>Valid <select id="scenario-valid"><option value="">—</option><option>YES</option><option>NO</option><option>UNCERTAIN</option></select></label>
+        <label>Plausibility <select id="scenario-plausibility"><option value="">—</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select></label>
+        <label>Contradiction <select id="contradiction-present"><option value="">—</option><option>YES</option><option>NO</option></select></label>
+        <label class="check"><input id="flag-review" type="checkbox"> Flag for review</label>
+      </div>
+      <div id="record-forms"></div>
+    </section>
+  </main>
+
+  <main id="adjudication-view" class="adjudication hidden"></main>
+
+  <footer class="actions" id="annotation-actions">
+    <button id="save-draft">Save Draft</button>
+    <button id="save-next" class="primary">Save &amp; Next</button>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
