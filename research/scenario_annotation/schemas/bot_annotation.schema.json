@@ -11,6 +11,21 @@
     "annotator_id": {"type": "string", "minLength": 1},
     "annotation_round": {"enum": ["CALIBRATION", "VALIDATION", "REANNOTATION"]},
     "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "runner_provenance": {
+      "type": "object",
+      "required": ["provider", "model", "prompt_manual_version", "temperature", "seed", "request_id", "attempt", "raw_output_sha256"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "prompt_manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "temperature": {"type": "number", "minimum": 0},
+        "seed": {"type": ["integer", "null"]},
+        "request_id": {"type": "string", "minLength": 1},
+        "attempt": {"type": "integer", "minimum": 1},
+        "raw_output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "scenario_validity": {
       "type": "object",
       "required": ["scenario_valid", "scenario_plausibility", "contradiction_present"],

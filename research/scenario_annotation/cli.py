@@ -144,6 +144,84 @@ def _freeze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_ai_packets_command(args: argparse.Namespace) -> int:
+    from .ai_runner.packets import export_ai_packets
+
+    root = Path(__file__).resolve().parent
+    if args.round_name != "calibration":
+        print("FAIL: formal packet export is unavailable before Gate A")
+        return 2
+    slug = args.annotator.lower().replace("-", "_")
+    assignment_root = root / "assignments" / "round_calibration" / slug
+    modules = (args.module,) if args.module else ("A", "B", "C")
+    summaries = []
+    for module in modules:
+        output_dir = (
+            args.output_dir / f"module_{module.lower()}"
+            if args.output_dir and len(modules) > 1
+            else args.output_dir
+            or root / "ai_runner" / "packets" / "round_calibration" / slug / f"module_{module.lower()}"
+        )
+        summaries.append(
+            export_ai_packets(
+                annotator_id=args.annotator,
+                annotation_round="CALIBRATION",
+                module=module,
+                assignment_path=assignment_root / f"module_{module.lower()}.jsonl",
+                assignment_manifest_path=assignment_root / "manifest.json",
+                manual_path=root / "manuals" / "coding_manual_v0.1.md",
+                output_schema_path=root / "schemas" / "ai_output.schema.json",
+                output_dir=output_dir,
+            )
+        )
+    print(
+        "PASS: exported AI packets "
+        + ", ".join(
+            f"Module {summary['annotation_module']}={summary['scenario_count']}"
+            for summary in summaries
+        )
+    )
+    return 0
+
+
+def _import_ai_output_command(args: argparse.Namespace) -> int:
+    from .ai_runner.importer import import_ai_output
+
+    root = Path(__file__).resolve().parent
+    if args.round_name != "calibration":
+        print("FAIL: formal annotation import is unavailable before Gate A")
+        return 2
+    slug = args.annotator.lower().replace("-", "_")
+    assignment_root = root / "assignments" / "round_calibration" / slug
+    output_dir = (
+        args.output_dir
+        or root / "annotations" / "drafts" / slug / "calibration" / f"module_{args.module.lower()}"
+    )
+    try:
+        path = import_ai_output(
+            annotator_id=args.annotator,
+            annotation_round="CALIBRATION",
+            module=args.module,
+            scenario_id=args.scenario_id,
+            assignment_path=assignment_root / f"module_{args.module.lower()}.jsonl",
+            assignment_manifest_path=assignment_root / "manifest.json",
+            raw_output_path=args.input,
+            raw_output_schema_path=root / "schemas" / "ai_output.schema.json",
+            output_dir=output_dir,
+            provider=args.provider,
+            model=args.model,
+            temperature=args.temperature,
+            seed=args.seed,
+            request_id=args.request_id,
+            attempt=args.attempt,
+        )
+    except ValueError as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    print(f"PASS: imported validated AI annotation draft {path}")
+    return 0
+
+
 def _add_analysis_parser(
     subparsers: argparse._SubParsersAction,
     name: str,
@@ -290,6 +368,32 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--scenario-version", default="1.0")
     freeze.add_argument("--gold-version", default="1.0")
     freeze.set_defaults(handler=_freeze_command)
+
+    export_packets = subparsers.add_parser(
+        "export-ai-packets", help="export provider-neutral one-scenario prompt packets"
+    )
+    export_packets.add_argument("--round", dest="round_name", choices=("calibration",), required=True)
+    export_packets.add_argument("--annotator", choices=("AI-A", "AI-B", "AI-C"), required=True)
+    export_packets.add_argument("--module", choices=("A", "B", "C"))
+    export_packets.add_argument("--output-dir", type=Path)
+    export_packets.set_defaults(handler=_export_ai_packets_command)
+
+    import_output = subparsers.add_parser(
+        "import-ai-output", help="validate model fields and create a system-owned annotation draft"
+    )
+    import_output.add_argument("--round", dest="round_name", choices=("calibration",), required=True)
+    import_output.add_argument("--annotator", choices=("AI-A", "AI-B", "AI-C"), required=True)
+    import_output.add_argument("--module", choices=("A", "B", "C"), required=True)
+    import_output.add_argument("--scenario-id", required=True)
+    import_output.add_argument("--input", type=Path, required=True)
+    import_output.add_argument("--output-dir", type=Path)
+    import_output.add_argument("--provider", required=True)
+    import_output.add_argument("--model", required=True)
+    import_output.add_argument("--temperature", type=float, default=0.0)
+    import_output.add_argument("--seed", type=int)
+    import_output.add_argument("--request-id", required=True)
+    import_output.add_argument("--attempt", type=int, default=1)
+    import_output.set_defaults(handler=_import_ai_output_command)
     return parser
 
 

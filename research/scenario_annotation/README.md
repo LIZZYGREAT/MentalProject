@@ -52,6 +52,28 @@ Each annotator receives a separately randomized Module A/B/C file and a manifest
 binding the manual and scenario versions. Natural/structured counterparts are
 counterbalanced so no annotator sees both in the same round.
 
+Export one-scenario provider-neutral packets for an AI annotator:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli export-ai-packets --round calibration --annotator AI-A
+```
+
+The command creates one packet per Scenario × Module. A packet includes only the
+relevant manual section, that annotator's purpose-scoped scenario view, and the
+model-controlled output contract. Submit packets independently to different model
+families; do not expose another annotator's output, Human output, hidden metadata,
+analysis, or Gold.
+
+Import a returned JSON object through the runner instead of editing system fields:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli import-ai-output --round calibration --annotator AI-A --module B --scenario-id CAL_019 --input returned.json --provider provider-a --model model-a --request-id request-001
+```
+
+The runner owns IDs, versions, annotator/round metadata, timestamps, and provenance.
+It records provider/model/settings/request/attempt and the raw-output digest, then
+validates the enriched draft against the exact assignment scenario.
+
 After all independent annotation documents have passed schema validation, run the
 field-level analysis pipeline:
 

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/ai-output-v1.json",
+  "title": "Model-Controlled Stage 1 Annotation Output",
+  "type": "object",
+  "required": ["scenario_validity", "records"],
+  "properties": {
+    "scenario_validity": {
+      "type": "object",
+      "required": ["scenario_valid", "scenario_plausibility", "contradiction_present"],
+      "properties": {
+        "scenario_valid": {"enum": ["YES", "NO", "UNCERTAIN"]},
+        "scenario_plausibility": {"enum": ["HIGH", "MEDIUM", "LOW"]},
+        "contradiction_present": {"enum": ["YES", "NO"]}
+      },
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["variable", "target_ref", "label", "evidence_refs", "evidence_strength", "ambiguity_flag", "annotator_confidence"],
+        "properties": {
+          "variable": {"type": "string", "minLength": 1},
+          "target_ref": {"type": "string", "minLength": 1},
+          "label": {"type": ["string", "number", "null"]},
+          "evidence_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+          "evidence_span": {"type": "string"},
+          "evidence_strength": {"enum": ["STRONG", "MODERATE", "WEAK", "N/A"]},
+          "scope": {"enum": ["EPISODE", "EVENT_CLASS", "STABLE_GENERAL", "UNKNOWN_SCOPE"]},
+          "unknown_reason": {"enum": ["NOT_MENTIONED", "INSUFFICIENT_DETAIL", "CONFLICTING_EVIDENCE", "TEMPORAL_SCOPE_UNCLEAR", "TARGET_UNCLEAR", "SOURCE_UNRELIABLE", "OTHER"]},
+          "ambiguity_flag": {"type": "boolean"},
+          "partial_encoding_basis": {"enum": ["ACTUAL_INTERVAL", "FRACTION_ONLY", "OTHER_EXPLICIT"]},
+          "annotator_confidence": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+          "notes": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
