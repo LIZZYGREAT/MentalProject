@@ -51,3 +51,15 @@ Build the four calibration assignments (AI-A, AI-B, AI-C, Human):
 Each annotator receives a separately randomized Module A/B/C file and a manifest
 binding the manual and scenario versions. Natural/structured counterparts are
 counterbalanced so no annotator sees both in the same round.
+
+After all independent annotation documents have passed schema validation, run the
+field-level analysis pipeline:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli analyze --round calibration
+```
+
+The pipeline writes `field_metrics.csv`, confusion matrices, critical violation
+records and rates, orthogonality checks, a disagreement/adjudication queue, and
+construct-level Markdown reports. It refuses to run on an empty annotation drop
+and never edits the coding manual automatically.

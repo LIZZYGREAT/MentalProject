@@ -45,6 +45,52 @@ def _build_assignments_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _analysis_command(args: argparse.Namespace) -> int:
+    from .analysis.pipeline import run_analysis
+
+    root = Path(__file__).resolve().parent
+    round_name = args.round_name
+    if round_name == "calibration":
+        scenarios = root / "scenarios" / "calibration.jsonl"
+        annotations = root / "annotations" / "calibration"
+        output = root / "analysis" / "outputs" / "calibration"
+    else:
+        scenarios = root / "scenarios" / ("main.jsonl" if round_name == "validation" else "calibration.jsonl")
+        annotations = root / "annotations" / round_name
+        output = root / "analysis" / "outputs" / round_name
+    only = None if args.analysis_kind == "all" else {args.analysis_kind}
+    try:
+        summary = run_analysis(
+            annotations_dir=args.annotations_dir or annotations,
+            scenarios_path=args.scenarios or scenarios,
+            coverage_path=args.coverage or root / "hidden" / "coverage_tags.jsonl",
+            pairs_path=args.pair_design or root / "hidden" / "pair_design.jsonl",
+            output_dir=args.output_dir or output,
+            only=only,
+        )
+    except ValueError as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    print(f"PASS: analysis complete {summary}")
+    return 0
+
+
+def _add_analysis_parser(
+    subparsers: argparse._SubParsersAction,
+    name: str,
+    help_text: str,
+    analysis_kind: str,
+) -> None:
+    command = subparsers.add_parser(name, help=help_text)
+    command.add_argument("--round", dest="round_name", choices=("calibration", "validation"), required=True)
+    command.add_argument("--annotations-dir", type=Path)
+    command.add_argument("--scenarios", type=Path)
+    command.add_argument("--coverage", type=Path)
+    command.add_argument("--pair-design", type=Path)
+    command.add_argument("--output-dir", type=Path)
+    command.set_defaults(handler=_analysis_command, analysis_kind=analysis_kind)
+
+
 def _validation_command(args: argparse.Namespace) -> int:
     result = Validator(args.schema_dir).validate_paths(args.paths, args.artifact_type)
     for issue in result.issues:
@@ -120,6 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
     assignments.add_argument("--pair-design", type=Path)
     assignments.add_argument("--output-dir", type=Path)
     assignments.set_defaults(handler=_build_assignments_command)
+
+    _add_analysis_parser(subparsers, "analyze", "run every Stage 1 field-level analysis", "all")
+    _add_analysis_parser(subparsers, "analyze-agreement", "write agreement and confusion outputs", "agreement")
+    _add_analysis_parser(subparsers, "analyze-critical-violations", "write critical-boundary audits", "violations")
+    _add_analysis_parser(subparsers, "analyze-orthogonality", "write minimal-pair checks", "orthogonality")
+    _add_analysis_parser(subparsers, "build-disagreement-queue", "build the adjudication queue", "disagreement")
+    _add_analysis_parser(subparsers, "build-report", "write the construct-level report", "report")
     return parser
 
 
