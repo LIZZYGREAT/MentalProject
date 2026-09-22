@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from research.scenario_annotation.validation import Validator
 
@@ -32,3 +33,24 @@ def test_future_known_information_is_rejected() -> None:
     finally:
         path.unlink(missing_ok=True)
     assert any(issue.code == "FUTURE_KNOWLEDGE" for issue in result.issues)
+
+
+def test_nonstandard_course_time_requires_explicit_edge_context(tmp_path) -> None:
+    scenario = json.loads((FIXTURES / "valid_scenario.json").read_text(encoding="utf-8"))
+    scenario["recurring_course_context"][0]["start_time"] = "09:15"
+    path = tmp_path / "nonstandard.json"
+    path.write_text(json.dumps(scenario, ensure_ascii=False), encoding="utf-8")
+    result = Validator().validate_paths([path], "scenario")
+    assert any(issue.code == "COURSE_TIMETABLE" for issue in result.issues)
+
+
+def test_unexplained_event_overlap_is_rejected(tmp_path) -> None:
+    scenario = json.loads((FIXTURES / "valid_scenario.json").read_text(encoding="utf-8"))
+    second = dict(scenario["focal_events"][0])
+    second["event_ref"] = "EVENT_OVERLAP"
+    second["title"] = "重叠事件"
+    scenario["focal_events"].append(second)
+    path = tmp_path / "overlap.json"
+    path.write_text(json.dumps(scenario, ensure_ascii=False), encoding="utf-8")
+    result = Validator().validate_paths([path], "scenario")
+    assert any(issue.code == "EVENT_TIME_OVERLAP" for issue in result.issues)

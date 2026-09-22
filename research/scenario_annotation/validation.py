@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -26,6 +26,17 @@ FORBIDDEN_VISIBLE_KEYS = frozenset(
         "gold_label",
     }
 )
+
+COURSE_PERIOD_STARTS = {
+    time(8, 0), time(8, 55), time(10, 0), time(10, 55), time(12, 0),
+    time(12, 55), time(14, 0), time(14, 55), time(16, 0), time(16, 55),
+    time(18, 30), time(19, 25), time(20, 30), time(21, 25),
+}
+COURSE_PERIOD_ENDS = {
+    time(8, 45), time(9, 40), time(10, 45), time(11, 40), time(12, 45),
+    time(13, 40), time(14, 45), time(15, 40), time(16, 45), time(17, 40),
+    time(19, 15), time(20, 10), time(21, 15), time(22, 10),
+}
 
 
 @dataclass(frozen=True)
@@ -142,6 +153,77 @@ class Validator:
                         "EXPOSURE_DOUBLE_ENCODING",
                     )
                 )
+        issues.extend(self._course_semantics(scenario, source))
+        issues.extend(self._event_overlap_semantics(scenario, source))
+        return issues
+
+    def _course_semantics(self, scenario: Mapping[str, Any], source: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        context_text = " ".join(
+            str(item.get("text", ""))
+            for item in scenario.get("recent_context", [])
+            if isinstance(item, Mapping)
+        )
+        edge_explained = any(token in context_text for token in ("调课", "停课", "节假日", "临时课程变更"))
+        for index, course in enumerate(scenario.get("recurring_course_context", [])):
+            if not isinstance(course, Mapping):
+                continue
+            path = f"/recurring_course_context/{index}"
+            start = _parse_clock(course.get("start_time"))
+            end = _parse_clock(course.get("end_time"))
+            if (start not in COURSE_PERIOD_STARTS or end not in COURSE_PERIOD_ENDS or (start and end and start >= end)) and not edge_explained:
+                issues.append(
+                    ValidationIssue(
+                        source,
+                        path,
+                        "course time is outside the standard timetable without an explicit schedule-change context",
+                        "COURSE_TIMETABLE",
+                    )
+                )
+            if any(day in {6, 7} for day in course.get("weekdays", [])) and not edge_explained:
+                issues.append(
+                    ValidationIssue(
+                        source,
+                        f"{path}/weekdays",
+                        "weekend recurring course requires an explicit edge-case explanation",
+                        "WEEKEND_RECURRING_COURSE",
+                    )
+                )
+            if course.get("week2_same_as_week1") is False and not edge_explained:
+                issues.append(
+                    ValidationIssue(
+                        source,
+                        f"{path}/week2_same_as_week1",
+                        "Week 2 differs from Week 1 without an explicit schedule-change context",
+                        "TWO_WEEK_COURSE_INCONSISTENCY",
+                    )
+                )
+        return issues
+
+    def _event_overlap_semantics(self, scenario: Mapping[str, Any], source: str) -> list[ValidationIssue]:
+        unique_events: dict[str, Mapping[str, Any]] = {}
+        for _, event in _named_objects(scenario, ("current_tasks", "focal_events")):
+            event_ref = str(event.get("event_ref", ""))
+            if event_ref:
+                unique_events[event_ref] = event
+        intervals: list[tuple[str, datetime, datetime]] = []
+        for event_ref, event in unique_events.items():
+            start = _parse_time(event.get("actual_start") or event.get("scheduled_start"))
+            end = _parse_time(event.get("actual_end") or event.get("scheduled_end"))
+            if start is not None and end is not None:
+                intervals.append((event_ref, start, end))
+        issues: list[ValidationIssue] = []
+        for index, (left_ref, left_start, left_end) in enumerate(intervals):
+            for right_ref, right_start, right_end in intervals[index + 1 :]:
+                if left_start < right_end and right_start < left_end:
+                    issues.append(
+                        ValidationIssue(
+                            source,
+                            "/focal_events",
+                            f"unexplained time overlap between {left_ref} and {right_ref}",
+                            "EVENT_TIME_OVERLAP",
+                        )
+                    )
         return issues
 
     def _annotation_semantics(self, document: Mapping[str, Any], source: str) -> list[ValidationIssue]:
@@ -189,6 +271,15 @@ def _parse_time(value: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _parse_clock(value: Any) -> time | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return time.fromisoformat(value)
     except ValueError:
         return None
 

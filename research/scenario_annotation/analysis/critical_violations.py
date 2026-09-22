@@ -220,18 +220,22 @@ def violation_rates(violations: Iterable[CriticalViolation], rows: Iterable[Anno
     rows = list(rows)
     counts = Counter(item.violation_type for item in violations)
     denominator = max(1, len(rows))
-    expected = (
-        "UnsupportedAppraisalInference",
-        "LayerLeakage",
-        "FutureKnowledgeLeakage",
-        "ExposureDoubleEncodingViolation",
-        "ParentChildObligationDoubleCount",
-        "FreeTimeAsRecoveryError",
-        "MissedCourseAutomaticObligationError",
-        "TaskHelpAsSupportError",
-        "PersonalizationAsEffectError",
-    )
+    expected = {
+        "UnsupportedAppraisalInferenceRate": "UnsupportedAppraisalInference",
+        "LayerLeakageRate": "LayerLeakage",
+        "FutureKnowledgeLeakageRate": "FutureKnowledgeLeakage",
+        "ExposureDoubleEncodingViolationRate": "ExposureDoubleEncodingViolation",
+        "ParentChildObligationDoubleCountRate": "ParentChildObligationDoubleCount",
+        "FreeTimeAsRecoveryErrorRate": "FreeTimeAsRecoveryError",
+        "MissedCourseAutomaticObligationErrorRate": "MissedCourseAutomaticObligationError",
+        "TaskHelpAsSupportErrorRate": "TaskHelpAsSupportError",
+        "PersonalizationAsEffectErrorRate": "PersonalizationAsEffectError",
+    }
     return {
-        name: {"count": counts[name], "rate": counts[name] / denominator, "denominator": denominator}
-        for name in expected
+        metric_name: {
+            "count": counts[violation_type],
+            "rate": counts[violation_type] / denominator,
+            "denominator": denominator,
+        }
+        for metric_name, violation_type in expected.items()
     }

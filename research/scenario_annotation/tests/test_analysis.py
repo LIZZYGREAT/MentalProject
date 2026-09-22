@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from research.scenario_annotation.analysis.common import AnnotationRow
-from research.scenario_annotation.analysis.critical_violations import find_critical_violations
+from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality
 from research.scenario_annotation.analysis.pipeline import run_analysis
 from research.scenario_annotation.corpus import write_calibration
@@ -34,6 +34,18 @@ def test_critical_boundary_detectors_use_hidden_design_only_in_analysis(tmp_path
         "FreeTimeAsRecoveryError",
         "UnsupportedAppraisalInference",
         "TaskHelpAsSupportError",
+    }
+    rates = violation_rates(find_critical_violations(rows, scenarios, coverage), rows)
+    assert set(rates) == {
+        "UnsupportedAppraisalInferenceRate",
+        "LayerLeakageRate",
+        "FutureKnowledgeLeakageRate",
+        "ExposureDoubleEncodingViolationRate",
+        "ParentChildObligationDoubleCountRate",
+        "FreeTimeAsRecoveryErrorRate",
+        "MissedCourseAutomaticObligationErrorRate",
+        "TaskHelpAsSupportErrorRate",
+        "PersonalizationAsEffectErrorRate",
     }
 
 
