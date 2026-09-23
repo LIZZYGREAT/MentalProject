@@ -28,6 +28,8 @@ Unknown reason 只能取：`NOT_MENTIONED`、`INSUFFICIENT_DETAIL`、
 
 ## 3. Module A — Event / Lifecycle / Exposure / Obligation / Recovery
 
+Module A 的时间事实字段为 `SCHEDULED_START`、`SCHEDULED_END`、`ACTUAL_START`、`ACTUAL_END` 与 `DEADLINE`。
+
 ### A1. EVENT_FAMILY
 
 - **Unit of Annotation:** 一个 `target_event_ref`。

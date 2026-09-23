@@ -11,6 +11,7 @@ import unicodedata
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .annotation_catalog import EVENT_SUBTYPES, LIFECYCLES
 from .loader import ArtifactLoadError, iter_artifacts, load_json
 
 
@@ -38,25 +39,6 @@ COURSE_PERIOD_ENDS = {
     time(8, 45), time(9, 40), time(10, 45), time(11, 40), time(12, 45),
     time(13, 40), time(14, 45), time(15, 40), time(16, 45), time(17, 40),
     time(19, 15), time(20, 10), time(21, 15), time(22, 10),
-}
-
-EVENT_SUBTYPES = {
-    "COURSE": {"lecture", "lab", "seminar", "course_presentation"},
-    "TASK": {"assignment", "exam_preparation", "report", "paper", "research_task", "project", "administrative"},
-    "STRUCTURED_EVENT": {"meeting", "presentation", "interview", "competition", "appointment"},
-    "RECOVERY_ACTIVITY": {"exercise", "leisure", "walk", "entertainment", "social_recovery", "meal_break", "short_rest"},
-}
-
-LIFECYCLES = {
-    "COURSE": {"SCHEDULED", "ATTENDED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
-    "TASK": {"PLANNED", "OPEN", "IN_PROGRESS", "BLOCKED", "COMPLETED", "CANCELLED", "OVERDUE", "SUPERSEDED", "UNKNOWN"},
-    "RECOVERY_ACTIVITY": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
-    "SLEEP": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
-    "NAP": {"PLANNED", "OCCURRED", "PARTIAL", "SKIPPED", "CANCELLED", "UNKNOWN"},
-    "STRUCTURED_EVENT": {"SCHEDULED", "OCCURRED", "PARTIAL", "CANCELLED", "UNKNOWN"},
-    "CONSEQUENCE_EVENT": {"OCCURRED", "UNKNOWN"},
-    "OTHER": {"SCHEDULED", "OCCURRED", "PARTIAL", "CANCELLED", "UNKNOWN"},
-    "UNKNOWN": {"UNKNOWN"},
 }
 
 DATETIME_FACTS = {"SCHEDULED_START", "SCHEDULED_END", "ACTUAL_START", "ACTUAL_END", "DEADLINE"}
