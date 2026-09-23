@@ -39,7 +39,12 @@ def write_metrics(path: Path, metrics: list[FieldMetric]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(metric.to_dict() for metric in metrics)
+        for metric in metrics:
+            row = metric.to_dict()
+            row["rater_count_distribution"] = json.dumps(
+                row["rater_count_distribution"], sort_keys=True
+            )
+            writer.writerow(row)
 
 
 def run_analysis(

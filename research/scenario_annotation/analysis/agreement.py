@@ -1,10 +1,9 @@
-"""Field-level agreement metrics, including Krippendorff alpha."""
+"""Field-level agreement metrics with coincidence-normalized Krippendorff alpha."""
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from itertools import combinations
 from typing import Any, Callable, Iterable
 
 from .common import AnnotationRow
@@ -48,6 +47,12 @@ class FieldMetric:
     n_valid: int
     n_unknown: int
     unknown_rate: float
+    n_units: int
+    pairable_units: int
+    min_raters_per_unit: int
+    max_raters_per_unit: int
+    mean_raters_per_unit: float
+    rater_count_distribution: dict[int, int]
     raw_agreement: float | None
     krippendorff_alpha: float | None
     alpha_type: str
@@ -63,47 +68,99 @@ class FieldMetric:
         return asdict(self)
 
 
-def _distance(variable: str) -> tuple[str, Callable[[Any, Any], float]]:
+def _ordinal_distance(
+    order: tuple[Any, ...], units: list[list[Any]]
+) -> tuple[str, Callable[[Any, Any], float]]:
+    ranks = {label: index for index, label in enumerate(order)}
+    pairable = [[label for label in unit if label is not None] for unit in units]
+    pairable = [unit for unit in pairable if len(unit) >= 2]
+    frequencies = Counter(label for unit in pairable for label in unit if label in ranks)
+
+    def distance(left: Any, right: Any) -> float:
+        if left == right:
+            return 0.0
+        if left not in ranks or right not in ranks:
+            return 1.0
+        low, high = sorted((ranks[left], ranks[right]))
+        between = sum(frequencies[order[index]] for index in range(low, high + 1))
+        endpoint_half = (frequencies[left] + frequencies[right]) / 2
+        return float((between - endpoint_half) ** 2)
+
+    values = [label for unit in pairable for label in unit]
+    all_ordered = all(label in ranks for label in values)
+    return ("ordinal" if all_ordered else "ordinal_mixed"), distance
+
+
+def _distance(
+    variable: str, units: list[list[Any]] | None = None
+) -> tuple[str, Callable[[Any, Any], float]]:
     if variable in FACT_FIELDS:
         def fact_distance(left: Any, right: Any) -> float:
-            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            numeric_left = isinstance(left, (int, float)) and not isinstance(left, bool)
+            numeric_right = isinstance(right, (int, float)) and not isinstance(right, bool)
+            if numeric_left and numeric_right:
                 return float(abs(left - right))
             return 0.0 if left == right else 1.0
+
         return "fact", fact_distance
     order = ORDINAL_ORDERS.get(variable)
     if order:
-        ranks = {label: index for index, label in enumerate(order)}
-        denominator = max(1, len(order) - 1)
-
-        def ordinal_distance(left: Any, right: Any) -> float:
-            if left in UNKNOWN_LABELS or right in UNKNOWN_LABELS:
-                return 0.0 if left == right else 1.0
-            if left not in ranks or right not in ranks:
-                return 0.0 if left == right else 1.0
-            return ((ranks[left] - ranks[right]) / denominator) ** 2
-
-        return "ordinal", ordinal_distance
+        return _ordinal_distance(order, units or [])
     return "nominal", lambda left, right: 0.0 if left == right else 1.0
 
 
-def krippendorff_alpha(units: Iterable[list[Any]], distance: Callable[[Any, Any], float]) -> float | None:
-    unit_pairs: list[tuple[Any, Any]] = []
-    pooled: list[Any] = []
-    for labels in units:
-        present = [label for label in labels if label is not None]
-        pooled.extend(present)
-        unit_pairs.extend(combinations(present, 2))
-    if not unit_pairs or len(pooled) < 2:
+def krippendorff_alpha(
+    units: Iterable[list[Any]], distance: Callable[[Any, Any], float]
+) -> float | None:
+    """Compute alpha from the standard coincidence matrix.
+
+    Each unit with ``m`` observed ratings contributes ordered coincidences with
+    weight ``1 / (m - 1)``. Units with fewer than two observed ratings do not
+    contribute. This keeps units with different rater counts correctly
+    normalized and supports missing ratings without listwise deletion.
+    """
+    pairable: list[list[Any]] = []
+    for unit in units:
+        present = [label for label in unit if label is not None]
+        if len(present) >= 2:
+            pairable.append(present)
+    if not pairable:
         return None
-    observed = sum(distance(left, right) for left, right in unit_pairs) / len(unit_pairs)
-    expected_pairs = list(combinations(pooled, 2))
-    expected = sum(distance(left, right) for left, right in expected_pairs) / len(expected_pairs)
-    if expected == 0:
-        return 1.0 if observed == 0 else None
-    return 1.0 - observed / expected
+
+    coincidence: Counter[tuple[Any, Any]] = Counter()
+    for unit in pairable:
+        counts = Counter(unit)
+        denominator = len(unit) - 1
+        for left, left_count in counts.items():
+            for right, right_count in counts.items():
+                distinct_pairs = left_count * (right_count - int(left == right))
+                if distinct_pairs:
+                    coincidence[(left, right)] += distinct_pairs / denominator
+
+    marginals: Counter[Any] = Counter()
+    for (left, _), count in coincidence.items():
+        marginals[left] += count
+    n = sum(marginals.values())
+    if n < 2:
+        return None
+
+    observed_disagreement = sum(
+        weight * distance(left, right)
+        for (left, right), weight in coincidence.items()
+    ) / n
+    expected_disagreement = sum(
+        left_count * right_count * distance(left, right)
+        for left, left_count in marginals.items()
+        for right, right_count in marginals.items()
+    ) / (n * (n - 1))
+    if expected_disagreement == 0:
+        return 1.0 if observed_disagreement == 0 else None
+    return 1.0 - observed_disagreement / expected_disagreement
 
 
-def _pair_agreement(grouped: dict[tuple[str, str], dict[str, Any]], left: str, right: str) -> float | None:
+def _pair_agreement(
+    grouped: dict[tuple[str, str], dict[str, Any]], left: str, right: str
+) -> float | None:
     pairs = [
         labels[left] == labels[right]
         for labels in grouped.values()
@@ -122,23 +179,30 @@ def analyze_agreement(rows: Iterable[AnnotationRow]) -> list[FieldMetric]:
         units: dict[tuple[str, str], dict[str, Any]] = defaultdict(dict)
         for row in field_rows:
             units[(row.scenario_id, row.target_ref)][row.annotator_id] = row.label
-        label_lists = [list(labels.values()) for labels in units.values()]
-        comparable_pairs = [pair for labels in label_lists for pair in combinations(labels, 2)]
+        unit_labels = [list(labels.values()) for labels in units.values()]
+        rater_counts = [sum(value is not None for value in labels) for labels in unit_labels]
+        pairable = sum(count >= 2 for count in rater_counts)
+        rater_distribution = dict(sorted(Counter(rater_counts).items()))
+        comparable_pairs = [
+            (left, right)
+            for labels in unit_labels
+            for index, left in enumerate(labels)
+            for right in labels[index + 1:]
+        ]
         exact = [left == right for left, right in comparable_pairs]
         raw_agreement = sum(exact) / len(exact) if exact else None
-        alpha_type, distance = _distance(variable)
-        alpha = None if alpha_type == "fact" else krippendorff_alpha(label_lists, distance)
+        alpha_type, distance = _distance(variable, unit_labels)
+        alpha = None if alpha_type == "fact" else krippendorff_alpha(unit_labels, distance)
 
         major = 0
         minor = 0
-        disagreeing_units = 0
         order = ORDINAL_ORDERS.get(variable)
-        for labels in label_lists:
-            if len(set(map(str, labels))) <= 1:
+        for labels in unit_labels:
+            present = [label for label in labels if label is not None]
+            if len(set(map(str, present))) <= 1:
                 continue
-            disagreeing_units += 1
-            if order and all(label in order for label in labels):
-                ranks = [order.index(label) for label in labels]
+            if order and all(label in order for label in present):
+                ranks = [order.index(label) for label in present]
                 if max(ranks) - min(ranks) >= 2:
                     major += 1
                 else:
@@ -149,7 +213,8 @@ def analyze_agreement(rows: Iterable[AnnotationRow]) -> list[FieldMetric]:
         deviations = [
             abs(float(left) - float(right))
             for left, right in comparable_pairs
-            if isinstance(left, (int, float)) and isinstance(right, (int, float))
+            if isinstance(left, (int, float)) and not isinstance(left, bool)
+            and isinstance(right, (int, float)) and not isinstance(right, bool)
         ]
         unknown = sum(row.label in UNKNOWN_LABELS for row in field_rows)
         n_valid = len(field_rows)
@@ -170,6 +235,14 @@ def analyze_agreement(rows: Iterable[AnnotationRow]) -> list[FieldMetric]:
                 n_valid=n_valid,
                 n_unknown=unknown,
                 unknown_rate=unknown / n_valid if n_valid else 0.0,
+                n_units=len(unit_labels),
+                pairable_units=pairable,
+                min_raters_per_unit=min(rater_counts, default=0),
+                max_raters_per_unit=max(rater_counts, default=0),
+                mean_raters_per_unit=(
+                    sum(rater_counts) / len(rater_counts) if rater_counts else 0.0
+                ),
+                rater_count_distribution=rater_distribution,
                 raw_agreement=raw_agreement,
                 krippendorff_alpha=alpha,
                 alpha_type=alpha_type,

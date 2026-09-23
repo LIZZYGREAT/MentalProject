@@ -1,0 +1,20 @@
+{
+  "source": "Ratings: Hughes (2021), The R Journal 13(1), Figure 2. Expected value: Hayes' Kalpha worked output for the same Krippendorff example (https://www.afhayes.com/public/kalpha.pdf).",
+  "level": "nominal",
+  "expected_alpha": 0.7434,
+  "alternative_published_estimate": 0.7429,
+  "ratings_by_unit": [
+    [1, 1, null, 1],
+    [2, 2, 3, 2],
+    [3, 3, 3, 3],
+    [3, 3, 3, 3],
+    [2, 2, 2, 2],
+    [1, 2, 3, 4],
+    [4, 4, 4, 4],
+    [1, 1, 2, 1],
+    [2, 2, 2, 2],
+    [null, 5, 5, 5],
+    [null, null, 1, 1],
+    [null, 3, null, null]
+  ]
+}
