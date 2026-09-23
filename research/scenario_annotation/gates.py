@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 
 from .annotation_contract import check_submission_integrity
 from .analysis_manifest import verify_analysis_manifest_current
+from .artifact_fingerprint import sha256_file
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
 from .reference_set import expected_reference_keys
@@ -71,6 +72,7 @@ class GateResult:
     evaluated_at: str
     checks: tuple[GateCheck, ...]
     blocking_reasons: tuple[str, ...]
+    input_manifest_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +81,7 @@ class GateResult:
             "evaluated_at": self.evaluated_at,
             "checks": [asdict(check) for check in self.checks],
             "blocking_reasons": list(self.blocking_reasons),
+            "input_manifest_sha256": self.input_manifest_sha256,
         }
 
 
@@ -189,6 +192,11 @@ def evaluate_manual_ready(
         evaluated_at=datetime.now(timezone.utc).isoformat(),
         checks=checks,
         blocking_reasons=blockers,
+        input_manifest_sha256=(
+            sha256_file(analysis_dir / "analysis_manifest.json")
+            if (analysis_dir / "analysis_manifest.json").exists()
+            else None
+        ),
     )
 
 
@@ -329,6 +337,11 @@ def evaluate_semantic_reliability(
         evaluated_at=datetime.now(timezone.utc).isoformat(),
         checks=checks,
         blocking_reasons=blockers,
+        input_manifest_sha256=(
+            sha256_file(analysis_dir / "analysis_manifest.json")
+            if (analysis_dir / "analysis_manifest.json").exists()
+            else None
+        ),
     )
 
 
@@ -358,6 +371,8 @@ def evaluate_representation_freeze(
     edge_scenarios_path: str | Path,
     gold_path: str | Path,
     revision_log_path: str | Path,
+    gate_a_analysis_manifest_path: str | Path | None = None,
+    gate_b_analysis_manifest_path: str | Path | None = None,
 ) -> GateResult:
     gate_a_path = Path(gate_a_path)
     gate_b_path = Path(gate_b_path)
@@ -366,12 +381,21 @@ def evaluate_representation_freeze(
     edge_scenarios_path = Path(edge_scenarios_path)
     gold_path = Path(gold_path)
     revision_log_path = Path(revision_log_path)
+    gate_a_analysis_manifest_path = Path(gate_a_analysis_manifest_path) if gate_a_analysis_manifest_path else None
+    gate_b_analysis_manifest_path = Path(gate_b_analysis_manifest_path) if gate_b_analysis_manifest_path else None
 
     def prior_gates_check() -> tuple[bool, str]:
         values = [json.loads(path.read_text(encoding="utf-8")) for path in (gate_a_path, gate_b_path)]
         statuses = {value.get("gate"): value.get("status") for value in values}
-        passed = statuses == {"MANUAL_READY": "PASS", "SEMANTIC_RELIABILITY": "PASS"}
-        return passed, f"prior_gate_statuses={statuses}"
+        manifest_paths = (gate_a_analysis_manifest_path, gate_b_analysis_manifest_path)
+        hashes_match = all(
+            path is not None
+            and path.exists()
+            and value.get("input_manifest_sha256") == sha256_file(path)
+            for value, path in zip(values, manifest_paths)
+        )
+        passed = statuses == {"MANUAL_READY": "PASS", "SEMANTIC_RELIABILITY": "PASS"} and hashes_match
+        return passed, f"prior_gate_statuses={statuses}; input_manifest_hashes_match={hashes_match}"
 
     def manual_check() -> tuple[bool, str]:
         text = manual_path.read_text(encoding="utf-8")
@@ -422,4 +446,9 @@ def evaluate_representation_freeze(
         evaluated_at=datetime.now(timezone.utc).isoformat(),
         checks=checks,
         blocking_reasons=blockers,
+        input_manifest_sha256=(
+            sha256_file(gate_b_analysis_manifest_path)
+            if gate_b_analysis_manifest_path and gate_b_analysis_manifest_path.exists()
+            else None
+        ),
     )

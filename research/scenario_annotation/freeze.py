@@ -8,8 +8,9 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from .artifact_fingerprint import sha256_file, sha256_fileset
 from .gates import evaluate_representation_freeze
-from .loader import load_jsonl
+from .loader import load_json, load_jsonl
 from .validation import Validator
 
 
@@ -41,11 +42,23 @@ def freeze_representation(
     field_metrics_path: str | Path,
     critical_violation_report_path: str | Path,
     output_path: str | Path,
+    gate_a_analysis_manifest_path: str | Path | None = None,
+    analysis_manifest_path: str | Path | None = None,
+    quality_thresholds_path: str | Path | None = None,
+    schema_dir: str | Path | None = None,
     representation_version: str = "1.0",
     manual_version: str = "1.0",
     scenario_version: str = "1.0",
     gold_version: str = "1.0",
 ) -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parent
+    analysis_manifest_path = Path(
+        analysis_manifest_path or Path(field_metrics_path).parent / "analysis_manifest.json"
+    )
+    quality_thresholds_path = Path(
+        quality_thresholds_path or package_root / "settings" / "quality_thresholds_v1.json"
+    )
+    schema_dir = Path(schema_dir or package_root / "schemas")
     gate = evaluate_representation_freeze(
         gate_a_path=gate_a_path,
         gate_b_path=gate_b_path,
@@ -54,6 +67,8 @@ def freeze_representation(
         edge_scenarios_path=edge_scenarios_path,
         gold_path=gold_path,
         revision_log_path=revision_log_path,
+        gate_a_analysis_manifest_path=gate_a_analysis_manifest_path,
+        gate_b_analysis_manifest_path=analysis_manifest_path,
     )
     if gate.status != "PASS":
         raise FreezeBlockedError("representation freeze blocked: " + " | ".join(gate.blocking_reasons))
@@ -62,12 +77,24 @@ def freeze_representation(
         decision: sorted(str(row["construct"]) for row in decisions if row["decision"] == decision)
         for decision in ("KEEP", "REVISE", "SIMPLIFY", "DROP")
     }
+    schema_paths = sorted(schema_dir.glob("*.schema.json"))
+    thresholds = load_json(quality_thresholds_path)
     manifest = {
         "representation_version": representation_version,
         "frozen_at": datetime.now(timezone.utc).isoformat(),
         "manual_version": manual_version,
         "scenario_bank_version": scenario_version,
         "gold_set_version": gold_version,
+        "manual_sha256": sha256_file(manual_path),
+        "scenario_corpus_sha256": sha256_fileset([main_scenarios_path, edge_scenarios_path]),
+        "reference_set_sha256": sha256_file(gold_path),
+        "quality_threshold_settings_version": thresholds["settings_version"],
+        "quality_threshold_sha256": sha256_file(quality_thresholds_path),
+        "analysis_manifest_sha256": sha256_file(analysis_manifest_path),
+        "gate_a_analysis_manifest_sha256": sha256_file(gate_a_analysis_manifest_path),
+        "schema_bundle_version": "1.0",
+        "schema_bundle_sha256": sha256_fileset(schema_paths),
+        "schema_digests": {path.name: sha256_file(path) for path in schema_paths},
         "schema_versions": {
             "scenario": "1.0",
             "event_annotation": "1.0",
@@ -87,7 +114,7 @@ def freeze_representation(
     # Validate through the schema directly without writing an invalid manifest.
     from jsonschema import Draft202012Validator, FormatChecker
 
-    schema = Validator()._schema("freeze-manifest")
+    schema = Validator(schema_dir)._schema("freeze-manifest")
     errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(manifest))
     if errors:
         raise FreezeBlockedError("generated freeze manifest failed schema validation")

@@ -141,6 +141,10 @@ def _freeze_command(args: argparse.Namespace) -> int:
             field_metrics_path=args.field_metrics or root / "analysis" / "outputs" / "validation" / "field_metrics.csv",
             critical_violation_report_path=args.critical_violations or root / "analysis" / "outputs" / "validation" / "critical_violations.jsonl",
             output_path=args.output or root / "manifests" / "representation_semantics_v1.0.json",
+            gate_a_analysis_manifest_path=args.gate_a_analysis_manifest or root / "analysis" / "outputs" / "calibration" / "analysis_manifest.json",
+            analysis_manifest_path=args.analysis_manifest or root / "analysis" / "outputs" / "validation" / "analysis_manifest.json",
+            quality_thresholds_path=args.quality_thresholds or root / "settings" / "quality_thresholds_v1.json",
+            schema_dir=root / "schemas",
             representation_version=args.representation_version,
             manual_version=args.manual_version,
             scenario_version=args.scenario_version,
@@ -457,6 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--field-metrics", type=Path)
     freeze.add_argument("--critical-violations", type=Path)
     freeze.add_argument("--output", type=Path)
+    freeze.add_argument("--gate-a-analysis-manifest", type=Path)
+    freeze.add_argument("--analysis-manifest", type=Path)
+    freeze.add_argument("--quality-thresholds", type=Path)
     freeze.add_argument("--representation-version", default="1.0")
     freeze.add_argument("--manual-version", default="1.0")
     freeze.add_argument("--scenario-version", default="1.0")
