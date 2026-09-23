@@ -21,6 +21,7 @@ from ..ai_runner.packets import _manual_excerpt
 from ..analysis.common import flatten_annotations, load_annotation_documents
 from ..drafts import module_targets, save_human_draft
 from ..loader import load_json, load_jsonl
+from ..sessions import AdjudicationSession, AnnotationSession
 from ..validation import Validator
 from .fields import module_field_specs
 
@@ -36,25 +37,24 @@ class AnnotationStore:
         annotator_id: str = "Human",
         draft_root: str | Path | None = None,
     ) -> None:
-        if round_name != "calibration" or annotator_id != "Human":
-            raise ValueError("the current local annotation UI supports Human calibration only")
-        self.package_root = Path(package_root).resolve()
-        self.assignment_root = (
-            self.package_root / "assignments" / "round_calibration" / "human"
-        ).resolve()
-        self.manual_path = (self.package_root / "manuals" / "coding_manual_v0.1.md").resolve()
+        self.session = AnnotationSession.resolve(
+            package_root,
+            round_name=round_name,
+            annotator_id=annotator_id,
+            draft_root=draft_root,
+        )
+        self.package_root = self.session.package_root
+        self.assignment_root = self.session.assignment_root
+        self.manual_path = self.session.manual_path
         self.schema_root = (self.package_root / "schemas").resolve()
-        self.draft_root = Path(
-            draft_root
-            or self.package_root / "annotations" / "drafts" / "human" / "calibration"
-        ).resolve()
+        self.draft_root = self.session.draft_root
         self.allowed_roots = (
             self.assignment_root,
             self.manual_path,
             self.schema_root,
             self.draft_root,
         )
-        self.manifest = load_json(self.assignment_root / "manifest.json")
+        self.manifest = self.session.manifest
         self.manual_text = self.manual_path.read_text(encoding="utf-8")
         self.scenarios = {
             module: {
@@ -88,7 +88,7 @@ class AnnotationStore:
                 "complete": sum(row["status"] == "COMPLETE" for row in rows),
                 "total": len(rows),
             }
-        return {"mode": "annotation", "annotator_id": "Human", "round": "calibration", "modules": modules}
+        return {"mode": "annotation", "annotator_id": self.session.annotator_id, "round": self.session.round_name, "modules": modules}
 
     def scenario_payload(self, module: str, scenario_id: str) -> dict[str, Any]:
         scenario = self.scenarios[module][scenario_id]
@@ -123,12 +123,11 @@ class AnnotationStore:
 
 class AdjudicationStore:
     def __init__(self, package_root: str | Path, round_name: str = "calibration") -> None:
-        if round_name != "calibration":
-            raise ValueError("formal adjudication is unavailable before Gate A")
-        self.package_root = Path(package_root).resolve()
-        self.analysis_root = self.package_root / "analysis" / "outputs" / "calibration"
-        self.annotations_root = self.package_root / "annotations" / "calibration"
-        self.output_root = self.package_root / "adjudication" / "drafts" / "calibration"
+        self.session = AdjudicationSession.resolve(package_root, round_name=round_name)
+        self.package_root = self.session.package_root
+        self.analysis_root = self.session.analysis_root
+        self.annotations_root = self.session.annotations_root
+        self.output_root = self.session.output_root
         required_analysis = {
             "disagreement_queue.jsonl",
             "disagreement_report.md",
@@ -150,15 +149,15 @@ class AdjudicationStore:
             verify_analysis_manifest_current(
                 self.analysis_root / "analysis_manifest.json",
                 annotations_dir=self.annotations_root,
-                scenario_paths=[self.package_root / "scenarios" / "calibration.jsonl"],
-                coverage_path=self.package_root / "hidden" / "coverage_tags.jsonl",
-                pair_design_path=self.package_root / "hidden" / "pair_design.jsonl",
-                quality_thresholds_path=self.package_root / "settings" / "quality_thresholds_v1.json",
+                scenario_paths=self.session.scenario_paths,
+                coverage_path=self.session.coverage_path,
+                pair_design_path=self.session.pair_design_path,
+                quality_thresholds_path=self.session.quality_thresholds_path,
             )
         except ValueError as exc:
             raise RuntimeError(f"adjudication is unavailable; {exc}") from exc
         queue_path = self.analysis_root / "disagreement_queue.jsonl"
-        assignments_root = self.package_root / "assignments" / "round_calibration"
+        assignments_root = self.session.assignments_root
         _, assigned_scenarios = expected_submission_documents(assignments_root)
         scenario_context = {
             scenario_id: scenario
@@ -181,9 +180,10 @@ class AdjudicationStore:
         self.rows = flatten_annotations(documents)
         self.scenarios = {
             str(row["scenario_id"]): row
-            for row in load_jsonl(self.package_root / "scenarios" / "calibration.jsonl")
+            for path in self.session.scenario_paths
+            for row in load_jsonl(path)
         }
-        self.manual = (self.package_root / "manuals" / "coding_manual_v0.1.md").read_text(encoding="utf-8")
+        self.manual = self.session.manual_path.read_text(encoding="utf-8")
 
     def state(self) -> dict[str, Any]:
         completed = sum(
@@ -192,7 +192,7 @@ class AdjudicationStore:
         )
         return {
             "mode": "adjudication",
-            "round": "calibration",
+            "round": self.session.round_name,
             "items": self.queue,
             "complete": completed,
             "total": len(self.queue),

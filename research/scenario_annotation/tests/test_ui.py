@@ -137,7 +137,7 @@ def test_adjudication_mode_not_available_before_analysis() -> None:
         create_app(package_root=PACKAGE_ROOT, mode="adjudication")
 
 
-def test_adjudication_mode_available_after_complete_inputs(tmp_path: Path) -> None:
+def test_adjudication_mode_rejects_unbound_or_incomplete_inputs(tmp_path: Path) -> None:
     root = tmp_path / "package"
     shutil.copytree(
         PACKAGE_ROOT / "assignments" / "round_calibration",
@@ -196,13 +196,26 @@ def test_adjudication_mode_available_after_complete_inputs(tmp_path: Path) -> No
     for name in ("confusion_matrices.json", "semantic_violation_rates.json", "artifact_validity.json"):
         (analysis_root / name).write_text("{}\n", encoding="utf-8")
 
-    app = create_app(package_root=root, mode="adjudication")
-    response = asyncio.run(_request(app, "GET", "/api/state"))
-    assert response.status_code == 200
-    assert response.json() == {
-        "mode": "adjudication",
-        "round": "calibration",
-        "items": [],
-        "complete": 0,
-        "total": 0,
-    }
+    with pytest.raises(RuntimeError, match="analysis"):
+        create_app(package_root=root, mode="adjudication")
+
+
+def test_annotation_session_selects_round_manifest_manual(tmp_path: Path) -> None:
+    root = tmp_path / "package"
+    source = PACKAGE_ROOT / "assignments" / "round_calibration" / "human"
+    target = root / "assignments" / "round_validation" / "human"
+    shutil.copytree(source, target)
+    manifest_path = target / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["annotation_round"] = "VALIDATION"
+    manifest["manual_version"] = "1.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "manuals").mkdir(parents=True)
+    (root / "manuals" / "coding_manual_v1.0.md").write_text("manual v1.0", encoding="utf-8")
+
+    store = AnnotationStore(root, round_name="validation", annotator_id="Human")
+
+    assert store.session.round_name == "validation"
+    assert store.session.manual_version == "1.0"
+    assert store.manual_text == "manual v1.0"
+    assert store.draft_root == (root / "annotations" / "drafts" / "human" / "validation").resolve()

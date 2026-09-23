@@ -10,7 +10,7 @@ from .server import create_app
 def main() -> int:
     parser = argparse.ArgumentParser(description="MindFlow loopback-only Stage 1 annotation UI")
     parser.add_argument("--mode", choices=("annotation", "adjudication"), default="annotation")
-    parser.add_argument("--round", dest="round_name", choices=("calibration",), required=True)
+    parser.add_argument("--round", dest="round_name", choices=("calibration", "validation", "reannotation"), required=True)
     parser.add_argument("--annotator", choices=("Human",), default="Human")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
