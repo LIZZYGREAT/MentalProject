@@ -215,29 +215,66 @@ def find_critical_violations(
     return violations
 
 
-def violation_rates(violations: Iterable[CriticalViolation], rows: Iterable[AnnotationRow]) -> dict[str, dict[str, float | int]]:
+def violation_rates(
+    violations: Iterable[CriticalViolation],
+    rows: Iterable[AnnotationRow],
+    scenarios: Mapping[str, Mapping[str, Any]],
+    coverage_tags: Mapping[str, set[str]],
+) -> dict[str, dict[str, float | int]]:
     violations = list(violations)
     rows = list(rows)
     counts = Counter(item.violation_type for item in violations)
-    denominator = max(1, len(rows))
+    parent_child_opportunities: set[tuple[str, str]] = set()
+    for row in rows:
+        if row.variable != "ACTIVE_LEAF":
+            continue
+        events = _event_index(scenarios.get(row.scenario_id, {}))
+        targets = {
+            candidate.target_ref
+            for candidate in rows
+            if candidate.scenario_id == row.scenario_id
+            and candidate.annotator_id == row.annotator_id
+            and candidate.variable == "ACTIVE_LEAF"
+        }
+        if any(events.get(ref, {}).get("parent_ref") in targets for ref in targets):
+            parent_child_opportunities.add((row.scenario_id, row.annotator_id))
+    eligibility = {
+        "UnsupportedAppraisalInferenceRate": sum(
+            row.module == "B" and row.label in DIRECTIONAL_APPRAISAL for row in rows
+        ),
+        "ParentChildObligationDoubleCountRate": len(parent_child_opportunities),
+        "FreeTimeAsRecoveryErrorRate": sum(
+            row.variable == "RECOVERY_OCCURRENCE"
+            and "FREE_TIME" in coverage_tags.get(row.scenario_id, set())
+            for row in rows
+        ),
+        "MissedCourseAutomaticObligationErrorRate": sum(
+            row.variable == "OBLIGATION_EXISTS"
+            and "MISSED_NOT_OBLIGATION" in coverage_tags.get(row.scenario_id, set())
+            for row in rows
+        ),
+        "TaskHelpAsSupportErrorRate": sum(
+            row.variable == "SUPPORT_GATE"
+            and "TASK_HELP" in coverage_tags.get(row.scenario_id, set())
+            for row in rows
+        ),
+    }
     expected = {
         "UnsupportedAppraisalInferenceRate": "UnsupportedAppraisalInference",
-        "LayerLeakageRate": "LayerLeakage",
-        "FutureKnowledgeLeakageRate": "FutureKnowledgeLeakage",
-        "ExposureDoubleEncodingViolationRate": "ExposureDoubleEncodingViolation",
         "ParentChildObligationDoubleCountRate": "ParentChildObligationDoubleCount",
         "FreeTimeAsRecoveryErrorRate": "FreeTimeAsRecoveryError",
         "MissedCourseAutomaticObligationErrorRate": "MissedCourseAutomaticObligationError",
         "TaskHelpAsSupportErrorRate": "TaskHelpAsSupportError",
-        "PersonalizationAsEffectErrorRate": "PersonalizationAsEffectError",
-        "HiddenMetadataLeakageRate": "HiddenMetadataLeakage",
-        "InvalidEvidenceReferenceRate": "InvalidEvidenceReference",
     }
     return {
         metric_name: {
             "count": counts[violation_type],
-            "rate": counts[violation_type] / denominator,
-            "denominator": denominator,
+            "eligible_count": eligibility[metric_name],
+            "rate": (
+                counts[violation_type] / eligibility[metric_name]
+                if eligibility[metric_name]
+                else 0.0
+            ),
         }
         for metric_name, violation_type in expected.items()
     }

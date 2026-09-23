@@ -134,7 +134,8 @@ class AdjudicationStore:
             "field_metrics.csv",
             "confusion_matrices.json",
             "critical_violations.jsonl",
-            "critical_violation_rates.json",
+            "semantic_violation_rates.json",
+            "artifact_validity.json",
             "orthogonality.jsonl",
             "scenario_annotation_report.md",
         }

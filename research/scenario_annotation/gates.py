@@ -141,7 +141,8 @@ def evaluate_manual_ready(
     def analysis_check() -> tuple[bool, str]:
         required = {
             "field_metrics.csv",
-            "critical_violation_rates.json",
+            "semantic_violation_rates.json",
+            "artifact_validity.json",
             "disagreement_report.md",
             "scenario_annotation_report.md",
         }
@@ -249,7 +250,7 @@ def evaluate_semantic_reliability(
         return passed, f"field_count={len(metrics)}; blocked_fields={blocked}"
 
     def violation_check() -> tuple[bool, str]:
-        rates = json.loads((analysis_dir / "critical_violation_rates.json").read_text(encoding="utf-8"))
+        rates = json.loads((analysis_dir / "semantic_violation_rates.json").read_text(encoding="utf-8"))
         settings_result = Validator().validate_paths([quality_thresholds_path], "quality-thresholds")
         if not settings_result.ok:
             return False, "invalid quality threshold settings: " + "; ".join(
@@ -261,10 +262,18 @@ def evaluate_semantic_reliability(
             f"settings_version={settings['settings_version']}; exceeded_thresholds={exceeded}"
         )
 
+    def artifact_validity_check() -> tuple[bool, str]:
+        validity = json.loads((analysis_dir / "artifact_validity.json").read_text(encoding="utf-8"))
+        passed = validity.get("status") == "PASS" and all(
+            value == "PASS" for value in validity.get("checks", {}).values()
+        )
+        return passed, f"artifact_validity={validity.get('status')}; checks={validity.get('checks', {})}"
+
     def outputs_check() -> tuple[bool, str]:
         required = {
             "field_metrics.csv",
-            "critical_violation_rates.json",
+            "semantic_violation_rates.json",
+            "artifact_validity.json",
             "orthogonality.jsonl",
             "disagreement_queue.jsonl",
             "disagreement_report.md",
@@ -278,7 +287,8 @@ def evaluate_semantic_reliability(
         _check("formal_corpus_schema_and_count", corpus_check),
         _check("blind_independent_annotations", annotation_check),
         _check("field_level_reliability", metrics_check),
-        _check("critical_violation_rates", violation_check),
+        _check("artifact_validity", artifact_validity_check),
+        _check("semantic_violation_rates", violation_check),
         _check("validation_analysis_outputs", outputs_check),
     )
     blockers = tuple(check.detail for check in checks if not check.passed)
@@ -295,10 +305,7 @@ def evaluate_violation_thresholds(
     rates: Mapping[str, Mapping[str, Any]], settings: Mapping[str, Any]
 ) -> tuple[bool, dict[str, dict[str, float | str]]]:
     exceeded: dict[str, dict[str, float | str]] = {}
-    groups = (
-        ("HARD_PROTOCOL", settings.get("hard_protocol_max_rates", {})),
-        ("SEMANTIC_MISUNDERSTANDING", settings.get("semantic_misunderstanding_max_rates", {})),
-    )
+    groups = (("SEMANTIC_MISUNDERSTANDING", settings.get("semantic_misunderstanding_max_rates", {})),)
     for category, thresholds in groups:
         for metric, maximum in thresholds.items():
             actual = float(rates.get(metric, {}).get("rate", 0.0))

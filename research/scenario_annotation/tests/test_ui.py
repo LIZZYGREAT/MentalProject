@@ -193,7 +193,7 @@ def test_adjudication_mode_available_after_complete_inputs(tmp_path: Path) -> No
         "scenario_annotation_report.md",
     ):
         (analysis_root / name).write_text("", encoding="utf-8")
-    for name in ("confusion_matrices.json", "critical_violation_rates.json"):
+    for name in ("confusion_matrices.json", "semantic_violation_rates.json", "artifact_validity.json"):
         (analysis_root / name).write_text("{}\n", encoding="utf-8")
 
     app = create_app(package_root=root, mode="adjudication")

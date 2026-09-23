@@ -35,19 +35,18 @@ def test_critical_boundary_detectors_use_hidden_design_only_in_analysis(tmp_path
         "UnsupportedAppraisalInference",
         "TaskHelpAsSupportError",
     }
-    rates = violation_rates(find_critical_violations(rows, scenarios, coverage), rows)
+    rates = violation_rates(find_critical_violations(rows, scenarios, coverage), rows, scenarios, coverage)
     assert set(rates) == {
         "UnsupportedAppraisalInferenceRate",
-        "LayerLeakageRate",
-        "FutureKnowledgeLeakageRate",
-        "ExposureDoubleEncodingViolationRate",
         "ParentChildObligationDoubleCountRate",
         "FreeTimeAsRecoveryErrorRate",
         "MissedCourseAutomaticObligationErrorRate",
         "TaskHelpAsSupportErrorRate",
-        "PersonalizationAsEffectErrorRate",
-        "HiddenMetadataLeakageRate",
-        "InvalidEvidenceReferenceRate",
+    }
+    assert rates["TaskHelpAsSupportErrorRate"] == {
+        "count": 1,
+        "eligible_count": 1,
+        "rate": 1.0,
     }
 
 
@@ -133,7 +132,8 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
         "field_metrics.csv",
         "confusion_matrices.json",
         "critical_violations.jsonl",
-        "critical_violation_rates.json",
+        "semantic_violation_rates.json",
+        "artifact_validity.json",
         "orthogonality.jsonl",
         "disagreement_queue.jsonl",
         "disagreement_report.md",

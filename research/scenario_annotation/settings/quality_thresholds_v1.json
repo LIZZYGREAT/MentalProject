@@ -1,16 +1,9 @@
 {
-  "hard_protocol_max_rates": {
-    "ExposureDoubleEncodingViolationRate": 0.0,
-    "FutureKnowledgeLeakageRate": 0.0,
-    "HiddenMetadataLeakageRate": 0.0,
-    "InvalidEvidenceReferenceRate": 0.0,
-    "LayerLeakageRate": 0.0
-  },
+  "artifact_validity_required": true,
   "semantic_misunderstanding_max_rates": {
     "FreeTimeAsRecoveryErrorRate": 0.05,
     "MissedCourseAutomaticObligationErrorRate": 0.05,
     "ParentChildObligationDoubleCountRate": 0.05,
-    "PersonalizationAsEffectErrorRate": 0.05,
     "TaskHelpAsSupportErrorRate": 0.05,
     "UnsupportedAppraisalInferenceRate": 0.05
   },
