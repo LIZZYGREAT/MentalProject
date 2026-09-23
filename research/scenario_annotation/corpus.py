@@ -16,6 +16,12 @@ from typing import Any, Iterable
 
 TZ = timezone(timedelta(hours=8))
 CALIBRATION_START = datetime(2026, 9, 7, 8, 0, tzinfo=TZ)
+COURSE_LOAD_COVERAGE_TAGS = {
+    1: "COURSE_LOAD_LOW",
+    2: "COURSE_LOAD_LOW",
+    3: "COURSE_LOAD_MODERATE",
+    4: "COURSE_LOAD_HIGH_DENSITY_BOUNDARY",
+}
 
 
 @dataclass(frozen=True)
@@ -47,26 +53,22 @@ def _pack(pack_number: int) -> dict[str, Any]:
     participant_id = f"P{pack_number:02d}"
     known_at = CALIBRATION_START - timedelta(days=1)
     if pack_number == 1:
-        load = "低课程负荷；每周 4 个 recurring course blocks"
         courses = [
             _course("P01_MATH", "高等数学", [2], "10:00", "11:40", known_at),
             _course("P01_ENGLISH", "大学英语", [4], "14:00", "15:40", known_at),
         ]
     elif pack_number == 2:
-        load = "低课程负荷；周末无 recurring course"
         courses = [
             _course("P02_STATS", "统计学", [1, 4], "08:00", "09:40", known_at),
             _course("P02_LAB", "计算机实验", [3], "14:00", "15:40", known_at),
         ]
     elif pack_number == 3:
-        load = "中等课程负荷；课程外有研究任务"
         courses = [
             _course("P03_METHOD", "研究方法", [1, 3], "10:00", "11:40", known_at),
             _course("P03_SEMINAR", "专业研讨", [5], "14:00", "15:40", known_at),
             _course("P03_PE", "体育", [2], "16:00", "17:40", known_at),
         ]
     else:
-        load = "高密度边界课程负荷；周末无 recurring course"
         courses = [
             _course("P04_CORE1", "核心课一", [1, 3], "08:00", "09:40", known_at),
             _course("P04_CORE2", "核心课二", [1, 3], "10:00", "11:40", known_at),
@@ -77,7 +79,7 @@ def _pack(pack_number: int) -> dict[str, Any]:
         "pack_id": pack_id,
         "participant_id": participant_id,
         "participant_context": {
-            "text": f"两周 Context Pack（2026-09-07 至 2026-09-20）；{load}。Week 2 recurring course schedule 与 Week 1 相同。",
+            "text": "两周 Context Pack（2026-09-07 至 2026-09-20）；Week 2 recurring course schedule 与 Week 1 相同。",
             "known_at": _iso(known_at),
             "source_ref": f"profile:{participant_id}",
         },
@@ -172,7 +174,10 @@ def _scenario(
             }
         ),
     }
-    coverage = {"scenario_id": scenario_id, "coverage_tags": tags}
+    coverage = {
+        "scenario_id": scenario_id,
+        "coverage_tags": [*tags, COURSE_LOAD_COVERAGE_TAGS[pack_number]],
+    }
     anchor_value = None
     if anchor:
         target_ref, variable, intended_label, rationale = anchor

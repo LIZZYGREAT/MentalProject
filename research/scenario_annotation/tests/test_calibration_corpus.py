@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-from research.scenario_annotation.corpus import build_calibration, write_calibration
+from research.scenario_annotation.corpus import (
+    COURSE_LOAD_COVERAGE_TAGS,
+    build_calibration,
+    write_calibration,
+)
 from research.scenario_annotation.validation import FORBIDDEN_VISIBLE_KEYS, Validator
 
 
@@ -62,6 +66,34 @@ def test_visible_scenarios_do_not_contain_design_language() -> None:
         narrative = artifact.visible["focal_window"]["narrative"].casefold()
         leaked = {term for term in forbidden if term in narrative}
         assert not leaked, f"{artifact.visible['scenario_id']} leaks {sorted(leaked)}"
+
+
+def test_visible_context_has_no_coverage_class_labels() -> None:
+    artifacts, _ = build_calibration()
+    forbidden_labels = {
+        "低课程负荷",
+        "中等课程负荷",
+        "高密度边界课程负荷",
+        *COURSE_LOAD_COVERAGE_TAGS.values(),
+    }
+    visible_contexts = [artifact.visible["participant_context"]["text"] for artifact in artifacts]
+    for scenario_id, context in zip(
+        (artifact.visible["scenario_id"] for artifact in artifacts), visible_contexts
+    ):
+        leaked = {label for label in forbidden_labels if label.casefold() in context.casefold()}
+        assert not leaked, f"{scenario_id} participant context leaks {sorted(leaked)}"
+
+    class_tag_counts = {tag: 0 for tag in set(COURSE_LOAD_COVERAGE_TAGS.values())}
+    for artifact in artifacts:
+        class_tags = set(artifact.coverage["coverage_tags"]) & class_tag_counts.keys()
+        assert class_tags == {COURSE_LOAD_COVERAGE_TAGS[int(artifact.visible["pack_id"][-2:])]}
+        for tag in class_tags:
+            class_tag_counts[tag] += 1
+    assert class_tag_counts == {
+        "COURSE_LOAD_LOW": 12,
+        "COURSE_LOAD_MODERATE": 6,
+        "COURSE_LOAD_HIGH_DENSITY_BOUNDARY": 6,
+    }
 
 
 def test_generated_calibration_artifacts_validate(tmp_path) -> None:
