@@ -87,6 +87,7 @@ def _manual_gate_command(args: argparse.Namespace) -> int:
         annotations_dir=args.annotations_dir or root / "annotations" / "calibration",
         analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "calibration",
         revision_log_path=args.revision_log or root / "adjudication" / "representation_revision_log.jsonl",
+        assignments_root=root / "assignments" / "round_calibration",
     )
     output = args.output or root / "manifests" / "gate_a_manual_ready.json"
     write_gate_result(output, result)
@@ -106,6 +107,7 @@ def _semantic_gate_command(args: argparse.Namespace) -> int:
         annotations_dir=args.annotations_dir or root / "annotations" / "validation",
         analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "validation",
         quality_thresholds_path=args.quality_thresholds,
+        assignments_root=root / "assignments" / "round_validation",
     )
     output = args.output or root / "manifests" / "gate_b_semantic_reliability.json"
     write_gate_result(output, result)

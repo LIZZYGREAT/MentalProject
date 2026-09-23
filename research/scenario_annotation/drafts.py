@@ -9,49 +9,24 @@ from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .annotation_catalog import field_specs
+from .annotation_contract import (
+    check_annotation_completeness,
+    module_targets,
+)
 from .loader import load_json, load_jsonl
 from .validation import Validator
 
 
 MODULE_VARIABLES = {
-    "A": (
-        "EVENT_FAMILY", "EVENT_SUBTYPE", "SCHEDULED_START", "SCHEDULED_END",
-        "ACTUAL_START", "ACTUAL_END", "DEADLINE", "PROGRESS",
-        "ESTIMATED_TOTAL_EFFORT", "REMAINING_EFFORT", "PARENT_RELATION",
-        "CANCELLATION", "LIFECYCLE", "OBLIGATION_EXISTS", "OBLIGATION_STATUS",
-        "ACTIVE_LEAF", "D_POT", "U_CONTEXT", "D_S", "R_POT", "M_CONTEXT",
-        "EXECUTION_EXPOSURE", "DEADLINE_EXPOSURE", "UNCERTAINTY_EXPOSURE",
-        "SOCIAL_EXPOSURE", "RECOVERY_OCCURRENCE",
-    ),
-    "B": ("C_EXEC", "IMPORTANCE", "C_OUT", "U_PERC", "F_REC"),
-    "C": ("ORIGIN", "ROLE", "SUPPORT_GATE", "VALIDATION", "GUIDANCE", "RELEVANCE", "PERSONALIZATION", "SEEN_STATUS"),
+    module: tuple(spec.variable for spec in field_specs(module))
+    for module in ("A", "B", "C")
 }
 
 
-def module_targets(scenario: Mapping[str, Any], module: str) -> list[str]:
-    if module == "C":
-        return [str(item["response_unit_ref"]) for item in scenario.get("bot_response_units", [])]
-    refs: list[str] = []
-    for key in ("focal_events", "current_tasks"):
-        for item in scenario.get(key, []):
-            ref = str(item.get("event_ref", ""))
-            if ref and ref not in refs:
-                refs.append(ref)
-    return refs
-
-
 def missing_required_records(payload: Mapping[str, Any], scenario: Mapping[str, Any], module: str) -> list[str]:
-    provided = {
-        (str(record.get("target_ref")), str(record.get("variable")))
-        for record in payload.get("records", [])
-        if record.get("label") not in (None, "")
-    }
-    return [
-        f"{target_ref}:{variable}"
-        for target_ref in module_targets(scenario, module)
-        for variable in MODULE_VARIABLES[module]
-        if (target_ref, variable) not in provided
-    ]
+    result = check_annotation_completeness(payload, scenario, module)
+    return [f"{target_ref}:{variable}" for target_ref, variable in result.missing_keys]
 
 
 def build_annotation_document(
@@ -123,9 +98,9 @@ def save_human_draft(
     errors: list[str] = []
     annotation_document = None
     if mark_complete:
-        missing = missing_required_records(payload, scenario, module)
-        if missing:
-            errors.append(f"missing required target/variable records: {missing}")
+        completeness = check_annotation_completeness(payload, scenario, module)
+        if not completeness.ok:
+            errors.extend(completeness.messages())
         else:
             annotation_document = build_annotation_document(
                 payload=payload,
@@ -200,6 +175,9 @@ def export_annotations(
             continue
         if document.get("annotator_id") != annotator_id or document.get("annotation_module") != module:
             raise ValueError(f"{path}: annotator/module mismatch")
+        completeness = check_annotation_completeness(document, scenarios[scenario_id], module)
+        if not completeness.ok:
+            raise ValueError(f"{path}: " + "; ".join(completeness.messages()))
         documents.append(document)
     if missing:
         raise ValueError(f"cannot export: missing or incomplete scenarios {missing}")

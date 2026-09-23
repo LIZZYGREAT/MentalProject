@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from ..annotation_contract import check_annotation_completeness
 from ..loader import load_json, load_jsonl
 from ..validation import Validator
 
@@ -109,6 +110,9 @@ def import_ai_output(
         },
         "records": records,
     }
+    completeness = check_annotation_completeness(document, scenario, module)
+    if not completeness.ok:
+        raise ValueError("formal annotation completeness failure: " + "; ".join(completeness.messages()))
     artifact_type = {"A": "event-annotation", "B": "appraisal-annotation", "C": "bot-annotation"}[module]
     draft_path = Path(output_dir) / f"{scenario_id}.json"
     # Validate the enriched document through a temporary sibling before publishing it.

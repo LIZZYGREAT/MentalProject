@@ -15,6 +15,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from ..annotation_contract import check_submission_integrity, expected_submission_documents
 from ..ai_runner.packets import _manual_excerpt
 from ..analysis.common import flatten_annotations, load_annotation_documents
 from ..drafts import module_targets, save_human_draft
@@ -94,7 +95,7 @@ class AnnotationStore:
         return {
             "scenario": scenario,
             "targets": module_targets(scenario, module),
-            "field_specs": module_field_specs(module),
+            "field_specs": module_field_specs(module, scenario),
             "manual_excerpt": _manual_excerpt(self.manual_text, module),
             "evidence": _visible_evidence(scenario),
             "draft": load_json(path) if path.exists() else None,
@@ -143,32 +144,23 @@ class AdjudicationStore:
         if missing_analysis:
             raise RuntimeError("adjudication is unavailable until calibration analysis is complete")
         queue_path = self.analysis_root / "disagreement_queue.jsonl"
-        documents = load_annotation_documents(self.annotations_root, validate=False)
-        annotators = {str(document["annotator_id"]) for document in documents}
-        missing = {"AI-A", "AI-B", "AI-C", "Human"} - annotators
-        if missing:
-            raise RuntimeError(f"adjudication is unavailable; missing independent annotators {sorted(missing)}")
-        submitted = {
-            (
-                str(document["annotator_id"]),
-                str(document["annotation_module"]),
-                str(document["scenario_id"]),
-            )
-            for document in documents
+        assignments_root = self.package_root / "assignments" / "round_calibration"
+        _, assigned_scenarios = expected_submission_documents(assignments_root)
+        scenario_context = {
+            scenario_id: scenario
+            for (_, scenario_id), scenario in assigned_scenarios.items()
         }
-        missing_assignments: list[str] = []
-        for annotator_id in ("AI-A", "AI-B", "AI-C", "Human"):
-            slug = annotator_id.lower().replace("-", "_")
-            assignment_root = self.package_root / "assignments" / "round_calibration" / slug
-            for module in ("A", "B", "C"):
-                for scenario in load_jsonl(assignment_root / f"module_{module.lower()}.jsonl"):
-                    key = (annotator_id, module, str(scenario["scenario_id"]))
-                    if key not in submitted:
-                        missing_assignments.append(":".join(key))
-        if missing_assignments:
+        documents = load_annotation_documents(
+            self.annotations_root,
+            validate=True,
+            scenarios=scenario_context,
+            require_scenario_context=True,
+        )
+        integrity = check_submission_integrity(assignments_root, documents)
+        if not integrity.ok:
             raise RuntimeError(
-                "adjudication is unavailable; incomplete independent annotation set "
-                f"({len(missing_assignments)} missing)"
+                "adjudication is unavailable; incomplete independent annotation set: "
+                + integrity.detail()
             )
         self.queue = load_jsonl(queue_path)
         self.violations = load_jsonl(self.analysis_root / "critical_violations.jsonl")

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .annotation_contract import check_submission_integrity
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
 from .validation import Validator
@@ -95,12 +96,17 @@ def evaluate_manual_ready(
     annotations_dir: str | Path,
     analysis_dir: str | Path,
     revision_log_path: str | Path,
+    assignments_root: str | Path | None = None,
 ) -> GateResult:
     manual_path = Path(manual_path)
     scenarios_path = Path(scenarios_path)
     coverage_path = Path(coverage_path)
     analysis_dir = Path(analysis_dir)
     revision_log_path = Path(revision_log_path)
+    assignments_root = Path(
+        assignments_root
+        or scenarios_path.parent.parent / "assignments" / "round_calibration"
+    )
 
     def manual_check() -> tuple[bool, str]:
         text = manual_path.read_text(encoding="utf-8")
@@ -126,9 +132,10 @@ def evaluate_manual_ready(
             scenarios=scenarios,
             require_scenario_context=True,
         )
-        annotators = {str(document["annotator_id"]) for document in documents}
-        missing = sorted(PRIMARY_ANNOTATORS - annotators)
-        return not missing, f"annotators={sorted(annotators)}; missing={missing}"
+        integrity = check_submission_integrity(
+            assignments_root, documents, annotators=PRIMARY_ANNOTATORS
+        )
+        return integrity.ok, integrity.detail()
 
     def analysis_check() -> tuple[bool, str]:
         required = {
@@ -184,6 +191,7 @@ def evaluate_semantic_reliability(
     annotations_dir: str | Path,
     analysis_dir: str | Path,
     quality_thresholds_path: str | Path | None = None,
+    assignments_root: str | Path | None = None,
 ) -> GateResult:
     main_scenarios_path = Path(main_scenarios_path)
     edge_scenarios_path = Path(edge_scenarios_path)
@@ -191,6 +199,10 @@ def evaluate_semantic_reliability(
     quality_thresholds_path = Path(
         quality_thresholds_path
         or Path(__file__).with_name("settings") / "quality_thresholds_v1.json"
+    )
+    assignments_root = Path(
+        assignments_root
+        or main_scenarios_path.parent.parent / "assignments" / "round_validation"
     )
 
     def corpus_check() -> tuple[bool, str]:
@@ -211,15 +223,14 @@ def evaluate_semantic_reliability(
             scenarios=scenarios,
             require_scenario_context=True,
         )
-        annotators = {str(document["annotator_id"]) for document in documents}
         versions = {str(document["manual_version"]) for document in documents}
         rounds = {str(document["annotation_round"]) for document in documents}
-        scenario_ids = {str(document["scenario_id"]) for document in documents}
-        missing = sorted(PRIMARY_ANNOTATORS - annotators)
-        passed = not missing and versions == {"1.0"} and rounds <= {"VALIDATION", "REANNOTATION"}
-        return passed, (
-            f"annotators={sorted(annotators)}; missing={missing}; manual_versions={sorted(versions)}; "
-            f"rounds={sorted(rounds)}; annotated_scenarios={len(scenario_ids)}"
+        integrity = check_submission_integrity(
+            assignments_root, documents, annotators=PRIMARY_ANNOTATORS
+        )
+        passed = integrity.ok and versions == {"1.0"} and rounds <= {"VALIDATION", "REANNOTATION"}
+        return passed, integrity.detail() + (
+            f"; manual_versions={sorted(versions)}; rounds={sorted(rounds)}"
         )
 
     def metrics_check() -> tuple[bool, str]:

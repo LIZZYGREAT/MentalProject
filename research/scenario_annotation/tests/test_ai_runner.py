@@ -38,7 +38,7 @@ def test_exported_packet_contains_only_one_visible_scenario_and_relevant_manual_
 
 
 def _valid_raw_output() -> dict:
-    return {
+    value = {
         "scenario_validity": {
             "scenario_valid": "YES",
             "scenario_plausibility": "HIGH",
@@ -53,12 +53,28 @@ def _valid_raw_output() -> dict:
                 "evidence_span": "我完全不知道怎么下手，今天肯定做不出来",
                 "evidence_strength": "STRONG",
                 "scope": "EPISODE",
+                "unknown_reason": "NOT_MENTIONED",
                 "ambiguity_flag": False,
                 "annotator_confidence": "HIGH",
                 "notes": "直接的 episode-specific 陈述。",
             }
         ],
     }
+    for variable in ("IMPORTANCE", "C_OUT", "U_PERC", "F_REC"):
+        value["records"].append(
+            {
+                "variable": variable,
+                "target_ref": "E_HARD_TASK_LOW_CEXEC",
+                "label": "NO_EVIDENCE",
+                "evidence_refs": [],
+                "evidence_strength": "N/A",
+                "scope": "EPISODE",
+                "unknown_reason": "NOT_MENTIONED",
+                "ambiguity_flag": False,
+                "annotator_confidence": "HIGH",
+            }
+        )
+    return value
 
 
 def _import(tmp_path: Path, raw: dict) -> Path:
@@ -109,6 +125,13 @@ def test_importer_rejects_model_control_of_system_fields(tmp_path) -> None:
     raw = _valid_raw_output()
     raw["annotator_id"] = "Human"
     with pytest.raises(ValueError, match="output contract failure"):
+        _import(tmp_path, raw)
+
+
+def test_ai_partial_annotation_cannot_import_as_complete(tmp_path) -> None:
+    raw = _valid_raw_output()
+    raw["records"] = raw["records"][:1]
+    with pytest.raises(ValueError, match="completeness failure"):
         _import(tmp_path, raw)
 
 
