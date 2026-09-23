@@ -192,12 +192,17 @@ def evaluate_manual_ready(
         orthogonality = json.loads(
             (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
         )
-        if orthogonality.get("expected_checks", 0) <= 0 or orthogonality.get("missing_checks") != 0:
+        if (
+            orthogonality.get("expected_checks", 0) <= 0
+            or orthogonality.get("missing_checks") != 0
+            or orthogonality.get("invalid_design_checks", 0) != 0
+        ):
             return False, (
                 "orthogonality expectations are incomplete: "
                 f"expected={orthogonality.get('expected_checks')}; "
                 f"evaluated={orthogonality.get('evaluated_checks')}; "
-                f"missing={orthogonality.get('missing_checks')}"
+                f"missing={orthogonality.get('missing_checks')}; "
+                f"invalid_design={orthogonality.get('invalid_design_checks', 0)}"
             )
         return True, "analysis outputs complete and input manifest is current"
 
@@ -427,12 +432,17 @@ def evaluate_semantic_reliability(
         orthogonality = json.loads(
             (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
         )
-        if orthogonality.get("expected_checks", 0) <= 0 or orthogonality.get("missing_checks") != 0:
+        if (
+            orthogonality.get("expected_checks", 0) <= 0
+            or orthogonality.get("missing_checks") != 0
+            or orthogonality.get("invalid_design_checks", 0) != 0
+        ):
             return False, (
                 "orthogonality expectations are incomplete: "
                 f"expected={orthogonality.get('expected_checks')}; "
                 f"evaluated={orthogonality.get('evaluated_checks')}; "
-                f"missing={orthogonality.get('missing_checks')}"
+                f"missing={orthogonality.get('missing_checks')}; "
+                f"invalid_design={orthogonality.get('invalid_design_checks', 0)}"
             )
         verify_analysis_manifest_current(
             analysis_dir / "analysis_manifest.json",

@@ -4,7 +4,9 @@ import shutil
 
 import pytest
 
+from research.scenario_annotation.annotation_catalog import BY_VARIABLE
 from research.scenario_annotation.analysis.common import AnnotationRow
+from research.scenario_annotation.analysis.common import assignment_coverage_by_scenario
 from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
 from research.scenario_annotation.analysis.artifact_validity import evaluate_artifact_validity
 from research.scenario_annotation.analysis.anchors import analyze_anchors, anchor_summary
@@ -173,6 +175,166 @@ def test_orthogonality_reports_each_expected_check_when_annotations_are_missing(
     assert summary["expected_checks"] == 1
     assert summary["evaluated_checks"] == 0
     assert summary["missing_checks"] == 1
+
+
+def test_within_annotator_missing_checks_use_assigned_intersection() -> None:
+    pair = {
+        "pair_id": "ASSIGNED",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "expected_sensitive_constructs": ["LIFECYCLE"],
+        "expected_invariant_constructs": [],
+    }
+    coverage = {
+        "LEFT": {"A": {"AI-A", "AI-C", "Human"}},
+        "RIGHT": {"A": {"AI-A", "AI-C", "AI-B"}},
+    }
+    rows = [
+        _row("LEFT", "AI-A", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+        _row("RIGHT", "AI-A", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+        _row("LEFT", "AI-C", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+    ]
+
+    results = analyze_orthogonality(rows, [pair], assignment_coverage=coverage)
+    summary = orthogonality_summary(results)
+
+    assert {row.annotator_id for row in results} == {"AI-A", "AI-C"}
+    assert {row.status for row in results} == {"EVALUATED", "NOT_COMPARABLE"}
+    assert summary["missing_checks"] == 1
+    assert summary["invalid_design_checks"] == 0
+
+
+def test_assignment_without_shared_within_annotator_is_invalid_design() -> None:
+    pair = {
+        "pair_id": "NO_SHARED_RATER",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "expected_sensitive_constructs": ["LIFECYCLE"],
+        "expected_invariant_constructs": [],
+    }
+    coverage = {
+        "LEFT": {"A": {"AI-A"}},
+        "RIGHT": {"A": {"AI-B"}},
+    }
+
+    results = analyze_orthogonality([], [pair], assignment_coverage=coverage)
+    summary = orthogonality_summary(results)
+
+    assert len(results) == 1
+    assert results[0].status == "INVALID_DESIGN"
+    assert summary["missing_checks"] == 0
+    assert summary["invalid_design_checks"] == 1
+
+
+def test_between_groups_requires_every_assigned_member_annotation() -> None:
+    pair = {
+        "pair_id": "GROUP_COVERAGE",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "BETWEEN_GROUPS",
+        "expected_sensitive_constructs": [],
+        "expected_invariant_constructs": ["LIFECYCLE"],
+        "target_mapping": {
+            "LIFECYCLE": {"left_target_ref": "TARGET", "right_target_ref": "TARGET"}
+        },
+    }
+    coverage = {
+        "LEFT": {"A": {"AI-A", "AI-C"}},
+        "RIGHT": {"A": {"AI-B", "Human"}},
+    }
+    rows = [
+        _row("LEFT", "AI-A", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+        _row("LEFT", "AI-C", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+        _row("RIGHT", "AI-B", "LIFECYCLE", "SKIPPED", "TARGET", "A"),
+    ]
+
+    results = analyze_orthogonality(rows, [pair], assignment_coverage=coverage)
+    summary = orthogonality_summary(results)
+
+    assert len(results) == 1
+    assert results[0].status == "NOT_COMPARABLE"
+    assert summary["missing_checks"] == 1
+    assert summary["invalid_design_checks"] == 0
+
+
+def test_committed_calibration_pair_design_is_compatible_with_assignments() -> None:
+    assignment_root = PACKAGE_ROOT / "assignments" / "round_calibration"
+    pairs = load_jsonl(PACKAGE_ROOT / "hidden" / "pair_design.jsonl")
+    scenarios = {
+        str(row["scenario_id"]): row
+        for row in load_jsonl(PACKAGE_ROOT / "scenarios" / "calibration.jsonl")
+    }
+    assignment_coverage = assignment_coverage_by_scenario(assignment_root)
+    expected_annotation_keys: set[tuple[str, str, str, str, str]] = set()
+
+    for pair in pairs:
+        left_id, right_id = (str(value) for value in pair["scenario_ids"])
+        mode = str(pair["comparison_mode"])
+        mappings = pair.get("target_mapping", {})
+        constructs = [
+            *pair.get("expected_sensitive_constructs", []),
+            *pair.get("expected_invariant_constructs", []),
+        ]
+        for construct in constructs:
+            mapping = mappings.get(construct, {})
+            variable = str(mapping.get("target_variable", construct))
+            spec = BY_VARIABLE[variable]
+            left_assigned = assignment_coverage.get(left_id, {}).get(spec.module, set())
+            right_assigned = assignment_coverage.get(right_id, {}).get(spec.module, set())
+            if mode == "WITHIN_ANNOTATOR":
+                assert left_assigned & right_assigned, (pair["pair_id"], construct)
+            else:
+                assert left_assigned, (pair["pair_id"], construct, "empty left assignment group")
+                assert right_assigned, (pair["pair_id"], construct, "empty right assignment group")
+                assert not left_assigned & right_assigned, (pair["pair_id"], construct, "group overlap")
+
+            for scenario_id, assigned in ((left_id, left_assigned), (right_id, right_assigned)):
+                explicit = mapping.get(f"{'left' if scenario_id == left_id else 'right'}_target_ref")
+                if explicit:
+                    target_ref = str(explicit)
+                elif spec.module == "C":
+                    targets = [
+                        str(item["response_unit_ref"])
+                        for item in scenarios[scenario_id].get("bot_response_units", [])
+                    ]
+                    assert len(targets) == 1, (pair["pair_id"], construct, targets)
+                    target_ref = targets[0]
+                else:
+                    targets = list(dict.fromkeys(
+                        str(item["event_ref"])
+                        for field in ("focal_events", "current_tasks")
+                        for item in scenarios[scenario_id].get(field, [])
+                        if item.get("event_ref")
+                    ))
+                    assert len(targets) == 1, (pair["pair_id"], construct, targets)
+                    target_ref = targets[0]
+                for annotator in assigned:
+                    expected_annotation_keys.add(
+                        (scenario_id, spec.module, annotator, target_ref, variable)
+                    )
+
+    rows = [
+        _row(
+            scenario_id,
+            annotator,
+            variable,
+            "TEST_LABEL",
+            target_ref,
+            module,
+            **({"partial_encoding_basis": "TEST_BASIS"} if variable == "EXECUTION_EXPOSURE" else {}),
+        )
+        for scenario_id, module, annotator, target_ref, variable in sorted(expected_annotation_keys)
+    ]
+    results = analyze_orthogonality(
+        rows,
+        pairs,
+        scenarios=scenarios,
+        assignment_coverage=assignment_coverage,
+    )
+    summary = orthogonality_summary(results)
+
+    assert results
+    assert summary["missing_checks"] == 0
+    assert summary["invalid_design_checks"] == 0
 
 
 def test_design_anchors_are_audited_and_mismatches_enter_manual_review() -> None:
@@ -356,7 +518,7 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path, monkeypatc
     manifest_text = manifest_path.read_text(encoding="utf-8")
     assert str(repository_root) not in manifest_text
     manifest = json.loads(manifest_text)
-    assert manifest["analysis_version"] == "1.2"
+    assert manifest["analysis_version"] == "1.3"
     assert all("logical_path" in entry and "path" not in entry for entry in manifest["scenario_files"])
     assert manifest["analysis_code_sha256"]
 

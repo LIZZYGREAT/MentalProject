@@ -2,35 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from ..annotation_catalog import BY_VARIABLE
-from ..loader import load_json, load_jsonl
+from ..loader import load_jsonl
 from .common import AnnotationRow
-
-
-def assigned_annotators_by_scenario(assignments_root: str | Path) -> dict[str, set[str]]:
-    """Read Module A scenario assignments and return their expected annotators."""
-    root = Path(assignments_root)
-    assigned: dict[str, set[str]] = defaultdict(set)
-    if not root.exists():
-        return {}
-    for directory in sorted(path for path in root.iterdir() if path.is_dir()):
-        manifest_path = directory / "manifest.json"
-        if not manifest_path.exists():
-            continue
-        manifest = load_json(manifest_path)
-        annotator = str(manifest.get("annotator_id", ""))
-        module_a = directory / "module_a.jsonl"
-        if not annotator or not module_a.exists():
-            continue
-        for scenario in load_jsonl(module_a):
-            scenario_id = str(scenario.get("scenario_id", ""))
-            if scenario_id:
-                assigned[scenario_id].add(annotator)
-    return dict(assigned)
 
 
 def load_review_decisions(path: str | Path | None) -> dict[tuple[str, str], dict[str, Any]]:

@@ -14,10 +14,10 @@ from .agreement import FieldMetric, analyze_agreement
 from .anchors import (
     analyze_anchors,
     anchor_summary,
-    assigned_annotators_by_scenario,
     load_review_decisions,
 )
 from .common import (
+    assignment_coverage_by_scenario,
     annotation_files,
     flatten_annotations,
     load_annotation_documents,
@@ -138,15 +138,25 @@ def run_analysis(
     pairs = load_jsonl(pairs_path)
     anchors = load_jsonl(anchor_reference_path)
     review_decisions = load_review_decisions(anchor_review_decisions_path)
-    expected_anchor_annotators = (
-        assigned_annotators_by_scenario(assignments_root)
+    assignment_coverage = (
+        assignment_coverage_by_scenario(assignments_root)
         if assignments_root is not None
+        else None
+    )
+    expected_anchor_annotators = (
+        {
+            scenario_id: modules.get("A", set())
+            for scenario_id, modules in assignment_coverage.items()
+        }
+        if assignment_coverage is not None
         else None
     )
 
     metrics = analyze_agreement(rows)
     violations = find_critical_violations(rows, scenarios, coverage)
-    orthogonality = analyze_orthogonality(rows, pairs, scenarios=scenarios)
+    orthogonality = analyze_orthogonality(
+        rows, pairs, scenarios=scenarios, assignment_coverage=assignment_coverage
+    )
     anchor_audit = analyze_anchors(
         anchors,
         rows,

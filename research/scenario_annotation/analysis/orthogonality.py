@@ -78,6 +78,7 @@ def analyze_orthogonality(
     pair_designs: Iterable[Mapping[str, Any]],
     *,
     scenarios: Mapping[str, Mapping[str, Any]] | None = None,
+    assignment_coverage: Mapping[str, Mapping[str, set[str]]] | None = None,
 ) -> list[OrthogonalityResult]:
     rows = list(rows)
     all_annotators = sorted({row.annotator_id for row in rows})
@@ -136,17 +137,29 @@ def analyze_orthogonality(
                         resolved.append(None)
 
                 left_ref, right_ref = resolved
+                left_by_rater = _record_labels(
+                    rows, scenario_id=left_id, target_ref=left_ref or "",
+                    target_variable=variable, record_attribute=record_attribute,
+                ) if left_ref else {}
+                right_by_rater = _record_labels(
+                    rows, scenario_id=right_id, target_ref=right_ref or "",
+                    target_variable=variable, record_attribute=record_attribute,
+                ) if right_ref else {}
                 if mode == "WITHIN_ANNOTATOR":
-                    raters = all_annotators or [None]
+                    if assignment_coverage is None:
+                        raters: list[str | None] = all_annotators or [None]
+                    else:
+                        left_assigned = assignment_coverage.get(left_id, {}).get(spec.module if spec else "", set())
+                        right_assigned = assignment_coverage.get(right_id, {}).get(spec.module if spec else "", set())
+                        raters = sorted(left_assigned & right_assigned)
+                        if not raters:
+                            results.append(OrthogonalityResult(
+                                pair_id, mode, None, construct, expectation,
+                                left_ref, right_ref, [], [], "INVALID_DESIGN", None,
+                                "WITHIN_ANNOTATOR assignment has no shared annotator",
+                            ))
+                            continue
                     for annotator in raters:
-                        left_by_rater = _record_labels(
-                            rows, scenario_id=left_id, target_ref=left_ref or "",
-                            target_variable=variable, record_attribute=record_attribute,
-                        ) if left_ref else {}
-                        right_by_rater = _record_labels(
-                            rows, scenario_id=right_id, target_ref=right_ref or "",
-                            target_variable=variable, record_attribute=record_attribute,
-                        ) if right_ref else {}
                         left = left_by_rater.get(annotator or "", [])
                         right = right_by_rater.get(annotator or "", [])
                         duplicate = len(left) > 1 or len(right) > 1
@@ -158,23 +171,47 @@ def analyze_orthogonality(
                             left_ref, right_ref, left, right, status, outcome, local_issue,
                         ))
                 else:
-                    left_by_rater = _record_labels(
-                        rows, scenario_id=left_id, target_ref=left_ref or "",
-                        target_variable=variable, record_attribute=record_attribute,
-                    ) if left_ref else {}
-                    right_by_rater = _record_labels(
-                        rows, scenario_id=right_id, target_ref=right_ref or "",
-                        target_variable=variable, record_attribute=record_attribute,
-                    ) if right_ref else {}
-                    left = [item for values in left_by_rater.values() for item in values]
-                    right = [item for values in right_by_rater.values() for item in values]
-                    overlapping_raters = set(left_by_rater) & set(right_by_rater)
-                    duplicate = any(len(values) > 1 for values in (*left_by_rater.values(), *right_by_rater.values()))
+                    if assignment_coverage is None:
+                        left_assigned = set(left_by_rater)
+                        right_assigned = set(right_by_rater)
+                    else:
+                        module = spec.module if spec else ""
+                        left_assigned = assignment_coverage.get(left_id, {}).get(module, set())
+                        right_assigned = assignment_coverage.get(right_id, {}).get(module, set())
+                    overlapping_raters = left_assigned & right_assigned
+                    duplicate = any(
+                        len(values) > 1
+                        for annotator in left_assigned
+                        for values in (left_by_rater.get(annotator, []),)
+                    ) or any(
+                        len(values) > 1
+                        for annotator in right_assigned
+                        for values in (right_by_rater.get(annotator, []),)
+                    )
+                    unexpected = (
+                        (set(left_by_rater) - left_assigned)
+                        | (set(right_by_rater) - right_assigned)
+                    ) if assignment_coverage is not None else set()
+                    left = [item for annotator in sorted(left_assigned) for item in left_by_rater.get(annotator, [])]
+                    right = [item for annotator in sorted(right_assigned) for item in right_by_rater.get(annotator, [])]
+                    has_missing_assignment = (
+                        any(len(left_by_rater.get(annotator, [])) != 1 for annotator in left_assigned)
+                        or any(len(right_by_rater.get(annotator, [])) != 1 for annotator in right_assigned)
+                        if assignment_coverage is not None
+                        else not left or not right
+                    )
                     local_issue = issue or (
-                        "annotator overlap violates BETWEEN_GROUPS design" if overlapping_raters else
+                        "BETWEEN_GROUPS assignment contains an empty group"
+                        if assignment_coverage is not None and (not left_assigned or not right_assigned) else
+                        "annotator overlap violates BETWEEN_GROUPS assignment" if overlapping_raters else
+                        "annotations include annotators outside BETWEEN_GROUPS assignments" if unexpected else
                         "multiple records for a target/variable/rater" if duplicate else None
                     )
-                    status = "INVALID_DESIGN" if local_issue else "EVALUATED" if left and right else "NOT_COMPARABLE"
+                    status = (
+                        "INVALID_DESIGN" if local_issue
+                        else "NOT_COMPARABLE" if has_missing_assignment
+                        else "EVALUATED"
+                    )
                     outcome = _outcome(expectation, left, right, mode) if status == "EVALUATED" else None
                     results.append(OrthogonalityResult(
                         pair_id, mode, None, construct, expectation,
@@ -195,12 +232,24 @@ def orthogonality_summary(results: Iterable[OrthogonalityResult]) -> dict[str, A
             "status": row.status,
             "design_issue": row.design_issue,
         }
-        for row in rows if row.status != "EVALUATED"
+        for row in rows if row.status == "NOT_COMPARABLE"
+    ]
+    invalid_design = [
+        {
+            "pair_id": row.pair_id,
+            "comparison_mode": row.comparison_mode,
+            "annotator_id": row.annotator_id,
+            "construct": row.construct,
+            "expectation": row.expectation,
+            "design_issue": row.design_issue,
+        }
+        for row in rows if row.status == "INVALID_DESIGN"
     ]
     return {
         "expected_checks": len(rows),
         "evaluated_checks": sum(row.status == "EVALUATED" for row in rows),
         "missing_checks": len(missing),
         "missing_check_details": missing,
-        "invalid_design_checks": sum(row.status == "INVALID_DESIGN" for row in rows),
+        "invalid_design_checks": len(invalid_design),
+        "invalid_design_details": invalid_design,
     }
