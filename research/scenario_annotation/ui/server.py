@@ -156,6 +156,7 @@ class AdjudicationStore:
                 quality_thresholds_path=self.session.quality_thresholds_path,
                 manual_path=self.session.manual_path,
                 assignments_root=self.session.assignments_root,
+                repository_root=self.package_root.parents[1],
             )
         except ValueError as exc:
             raise RuntimeError(f"adjudication is unavailable; {exc}") from exc

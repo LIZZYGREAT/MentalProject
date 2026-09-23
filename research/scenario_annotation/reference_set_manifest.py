@@ -30,6 +30,7 @@ def build_reference_set_manifest(
     assignments_root: str | Path,
     manual_path: str | Path,
     scenario_paths: Iterable[str | Path],
+    repository_root: str | Path,
 ) -> dict[str, Any]:
     reference = Path(reference_set_path)
     analysis_path = Path(analysis_manifest_path)
@@ -41,10 +42,10 @@ def build_reference_set_manifest(
     if not annotation_paths or not assignment_paths or not scenarios:
         raise ValueError("reference provenance requires annotation, assignment, and scenario files")
 
-    annotation_hash = sha256_fileset(annotation_paths)
-    scenario_hash = sha256_fileset(scenarios)
+    annotation_hash = sha256_fileset(annotation_paths, repository_root=repository_root)
+    scenario_hash = sha256_fileset(scenarios, repository_root=repository_root)
     manual_hash = sha256_file(manual_path)
-    assignment_hash = sha256_fileset(assignment_paths)
+    assignment_hash = sha256_fileset(assignment_paths, repository_root=repository_root)
     source_analysis = load_json(analysis_path)
     if source_analysis.get("annotation_fileset_sha256") != annotation_hash:
         raise ValueError("source analysis manifest does not match current annotation files")

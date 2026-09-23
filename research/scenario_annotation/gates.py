@@ -445,6 +445,7 @@ def evaluate_representation_freeze(
     gate_a_analysis_manifest_path: str | Path | None = None,
     gate_b_analysis_manifest_path: str | Path | None = None,
     reference_set_manifest_path: str | Path | None = None,
+    repository_root: str | Path | None = None,
 ) -> GateResult:
     gate_a_path = Path(gate_a_path)
     gate_b_path = Path(gate_b_path)
@@ -455,6 +456,7 @@ def evaluate_representation_freeze(
     reference_set_manifest_path = Path(
         reference_set_manifest_path or gold_path.with_name("reference_set_manifest.json")
     )
+    repository_root = Path(repository_root or Path(__file__).resolve().parents[2]).resolve()
     revision_log_path = Path(revision_log_path)
     gate_a_analysis_manifest_path = Path(gate_a_analysis_manifest_path) if gate_a_analysis_manifest_path else None
     gate_b_analysis_manifest_path = Path(gate_b_analysis_manifest_path) if gate_b_analysis_manifest_path else None
@@ -523,7 +525,7 @@ def evaluate_representation_freeze(
             and reference_manifest.get("manual_sha256") == sha256_file(manual_path)
         )
         scenario_hash_matches = reference_manifest.get("scenario_fileset_sha256") == sha256_fileset(
-            (main_scenarios_path, edge_scenarios_path)
+            (main_scenarios_path, edge_scenarios_path), repository_root=repository_root
         )
         passed = (
             result.ok

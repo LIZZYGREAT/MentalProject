@@ -27,9 +27,15 @@ def test_reference_set_manifest_binds_analysis_annotations_assignments_manual_an
     analysis_manifest_file.write_text(
         json.dumps(
             {
-                "annotation_fileset_sha256": sha256_fileset([annotation_file]),
-                "assignment_fileset_sha256": sha256_fileset([assignment_file, manifest_file]),
-                "scenario_fileset_sha256": sha256_fileset([scenario_file]),
+                "annotation_fileset_sha256": sha256_fileset(
+                    [annotation_file], repository_root=tmp_path
+                ),
+                "assignment_fileset_sha256": sha256_fileset(
+                    [assignment_file, manifest_file], repository_root=tmp_path
+                ),
+                "scenario_fileset_sha256": sha256_fileset(
+                    [scenario_file], repository_root=tmp_path
+                ),
                 "manual_sha256": sha256_file(manual_file),
             }
         ),
@@ -43,13 +49,20 @@ def test_reference_set_manifest_binds_analysis_annotations_assignments_manual_an
         assignments_root=assignments,
         manual_path=manual_file,
         scenario_paths=[scenario_file],
+        repository_root=tmp_path,
     )
 
     assert manifest["source_analysis_manifest_sha256"] == sha256_file(analysis_manifest_file)
-    assert manifest["annotation_fileset_sha256"] == sha256_fileset([annotation_file])
-    assert manifest["assignment_fileset_sha256"] == sha256_fileset([assignment_file, manifest_file])
+    assert manifest["annotation_fileset_sha256"] == sha256_fileset(
+        [annotation_file], repository_root=tmp_path
+    )
+    assert manifest["assignment_fileset_sha256"] == sha256_fileset(
+        [assignment_file, manifest_file], repository_root=tmp_path
+    )
     assert manifest["manual_sha256"] == sha256_file(manual_file)
-    assert manifest["scenario_fileset_sha256"] == sha256_fileset([scenario_file])
+    assert manifest["scenario_fileset_sha256"] == sha256_fileset(
+        [scenario_file], repository_root=tmp_path
+    )
     assert manifest["reference_set_sha256"] == sha256_file(reference_file)
 
     annotation_file.write_text('{"records": [1]}\n', encoding="utf-8")
@@ -61,4 +74,5 @@ def test_reference_set_manifest_binds_analysis_annotations_assignments_manual_an
             assignments_root=assignments,
             manual_path=manual_file,
             scenario_paths=[scenario_file],
+            repository_root=tmp_path,
         )

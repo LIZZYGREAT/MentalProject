@@ -75,6 +75,7 @@ def freeze_representation(
         gate_a_analysis_manifest_path=gate_a_analysis_manifest_path,
         gate_b_analysis_manifest_path=analysis_manifest_path,
         reference_set_manifest_path=reference_set_manifest_path,
+        repository_root=repository_root,
     )
     if gate.status != "PASS":
         raise FreezeBlockedError("representation freeze blocked: " + " | ".join(gate.blocking_reasons))
@@ -92,7 +93,9 @@ def freeze_representation(
         "scenario_bank_version": scenario_version,
         "gold_set_version": gold_version,
         "manual_sha256": sha256_file(manual_path),
-        "scenario_corpus_sha256": sha256_fileset([main_scenarios_path, edge_scenarios_path]),
+        "scenario_corpus_sha256": sha256_fileset(
+            [main_scenarios_path, edge_scenarios_path], repository_root=repository_root
+        ),
         "reference_set_sha256": sha256_file(gold_path),
         "reference_set_manifest_sha256": sha256_file(reference_set_manifest_path),
         "quality_threshold_settings_version": thresholds["settings_version"],
@@ -100,7 +103,7 @@ def freeze_representation(
         "analysis_manifest_sha256": sha256_file(analysis_manifest_path),
         "gate_a_analysis_manifest_sha256": sha256_file(gate_a_analysis_manifest_path),
         "schema_bundle_version": "1.0",
-        "schema_bundle_sha256": sha256_fileset(schema_paths),
+        "schema_bundle_sha256": sha256_fileset(schema_paths, repository_root=repository_root),
         "schema_digests": {path.name: sha256_file(path) for path in schema_paths},
         "schema_versions": {
             "scenario": "1.0",

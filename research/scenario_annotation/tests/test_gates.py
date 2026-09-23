@@ -176,7 +176,9 @@ def test_freeze_requires_reference_set_manifest_to_bind_gate_b_analysis(tmp_path
                 "annotation_fileset_sha256": "1" * 64,
                 "assignment_fileset_sha256": "2" * 64,
                 "manual_sha256": "3" * 64,
-                "scenario_fileset_sha256": sha256_fileset([main, edge]),
+                "scenario_fileset_sha256": sha256_fileset(
+                    [main, edge], repository_root=tmp_path
+                ),
                 "reference_set_sha256": sha256_file(gold),
             }
         ),
@@ -193,6 +195,7 @@ def test_freeze_requires_reference_set_manifest_to_bind_gate_b_analysis(tmp_path
         gate_a_analysis_manifest_path=tmp_path / "gate_a_analysis_manifest.json",
         gate_b_analysis_manifest_path=gate_b_manifest,
         reference_set_manifest_path=reference_manifest,
+        repository_root=tmp_path,
     )
 
     check = next(item for item in result.checks if item.name == "adjudicated_reference_set")
@@ -306,6 +309,7 @@ def test_freeze_gold_check_rejects_one_missing_target_variable(tmp_path: Path) -
         edge_scenarios_path=edge,
         gold_path=gold,
         revision_log_path=tmp_path / "revisions.jsonl",
+        repository_root=tmp_path,
     )
     check = next(item for item in result.checks if item.name == "adjudicated_reference_set")
     assert not check.passed

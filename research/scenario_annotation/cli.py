@@ -193,17 +193,23 @@ def _reference_set_command(args: argparse.Namespace) -> int:
             require_scenario_context=True,
         )
         analysis_manifest = json.loads(args.analysis_manifest.read_text(encoding="utf-8"))
+        repository_root = Path(__file__).resolve().parents[2]
         verify_analysis_manifest_current(
             args.analysis_manifest,
             annotations_dir=args.annotations_dir,
             scenario_paths=args.scenarios,
-            coverage_path=analysis_manifest["coverage_file"]["path"],
-            pair_design_path=analysis_manifest["pair_design_file"]["path"],
-            quality_thresholds_path=analysis_manifest["quality_threshold_file"]["path"],
-            anchor_reference_path=analysis_manifest["anchor_reference_file"]["path"],
-            anchor_review_decisions_path=analysis_manifest["anchor_review_decisions_path"],
+            coverage_path=repository_root / analysis_manifest["coverage_file"]["logical_path"],
+            pair_design_path=repository_root / analysis_manifest["pair_design_file"]["logical_path"],
+            quality_thresholds_path=repository_root / analysis_manifest["quality_threshold_file"]["logical_path"],
+            anchor_reference_path=repository_root / analysis_manifest["anchor_reference_file"]["logical_path"],
+            anchor_review_decisions_path=(
+                Path(__file__).resolve().parent
+                / "adjudication"
+                / "anchor_review_decisions.jsonl"
+            ),
             manual_path=args.manual,
             assignments_root=args.assignments_root,
+            repository_root=repository_root,
         )
         records = build_reference_set(
             annotation_documents=documents,
@@ -219,6 +225,7 @@ def _reference_set_command(args: argparse.Namespace) -> int:
             assignments_root=args.assignments_root,
             manual_path=args.manual,
             scenario_paths=args.scenarios,
+            repository_root=repository_root,
         )
         manifest_output = args.manifest_output or args.output.with_name("reference_set_manifest.json")
         write_reference_set_manifest(manifest_output, manifest)

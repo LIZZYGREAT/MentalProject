@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -9,7 +10,11 @@ from research.scenario_annotation.analysis.artifact_validity import evaluate_art
 from research.scenario_annotation.analysis.anchors import analyze_anchors, anchor_summary
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality, orthogonality_summary
 from research.scenario_annotation.analysis.pipeline import run_analysis
-from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
+from research.scenario_annotation.analysis_manifest import (
+    build_analysis_manifest,
+    verify_analysis_manifest_current,
+    write_analysis_manifest,
+)
 from research.scenario_annotation.assignments import build_assignments
 from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.corpus import write_calibration
@@ -17,6 +22,26 @@ from research.scenario_annotation.loader import load_jsonl
 
 
 PACKAGE_ROOT = Path(__file__).parents[1]
+
+
+def _prepare_analysis_repository(repository_root: Path) -> Path:
+    package_root = repository_root / "research" / "scenario_annotation"
+    package_root.mkdir(parents=True)
+    shutil.copytree(PACKAGE_ROOT / "analysis", package_root / "analysis")
+    shutil.copytree(PACKAGE_ROOT / "schemas", package_root / "schemas")
+    for relative in (
+        "analysis_manifest.py",
+        "artifact_fingerprint.py",
+        "annotation_catalog.py",
+        "annotation_contract.py",
+        "assignments.py",
+        "validation.py",
+    ):
+        shutil.copy2(PACKAGE_ROOT / relative, package_root / relative)
+    for folder in ("manuals", "settings"):
+        shutil.copytree(PACKAGE_ROOT / folder, package_root / folder)
+    (package_root / "adjudication").mkdir()
+    return package_root
 
 
 def _row(scenario: str, annotator: str, variable: str, label, target: str, module: str, **extra) -> AnnotationRow:
@@ -268,11 +293,17 @@ def _annotation_document(annotator: str, label: str, evidence_ref: str) -> dict:
     }
 
 
-def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
-    corpus_root = tmp_path / "corpus"
+def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "research.scenario_annotation.analysis_manifest._git_revision",
+        lambda _: "test-revision",
+    )
+    repository_root = tmp_path / "repo"
+    package_root = _prepare_analysis_repository(repository_root)
+    corpus_root = package_root
     write_calibration(corpus_root)
-    annotations = tmp_path / "annotations"
-    annotations.mkdir()
+    annotations = package_root / "annotations" / "calibration"
+    annotations.mkdir(parents=True)
     documents = [
         _annotation_document("AI-A", "LOW", "MSG_019"),
         _annotation_document("AI-B", "LOW", "MSG_019"),
@@ -283,13 +314,19 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
         (annotations / f"annotation_{index}.json").write_text(
             json.dumps(document, ensure_ascii=False), encoding="utf-8"
         )
-    output = tmp_path / "output"
+    output = package_root / "analysis" / "outputs" / "calibration"
     summary = run_analysis(
         annotations_dir=annotations,
         scenarios_path=corpus_root / "scenarios" / "calibration.jsonl",
         coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
         pairs_path=corpus_root / "hidden" / "pair_design.jsonl",
         output_dir=output,
+        quality_thresholds_path=package_root / "settings" / "quality_thresholds_v1.json",
+        repository_root=repository_root,
+        anchor_review_decisions_path=(
+            package_root / "adjudication" / "anchor_review_decisions.jsonl"
+        ),
+        manual_path=package_root / "manuals" / "coding_manual_v0.1.md",
     )
     assert summary["documents"] == 4
     assert summary["records"] == 4
@@ -318,6 +355,73 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
     assert generated_validity["status"] == "FAIL"
     assert generated_validity["checks"]["assignment_submission_integrity"] == "NOT_EVALUATED"
 
+    manifest_path = output / "analysis_manifest.json"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert str(repository_root) not in manifest_text
+    manifest = json.loads(manifest_text)
+    assert manifest["analysis_version"] == "1.1"
+    assert all("logical_path" in entry and "path" not in entry for entry in manifest["scenario_files"])
+    assert manifest["analysis_code_sha256"]
+
+    relocated_root = tmp_path / "relocated_repo"
+    shutil.copytree(repository_root, relocated_root)
+    relocated_package = relocated_root / "research" / "scenario_annotation"
+    relocated_manifest = relocated_package / "analysis" / "outputs" / "calibration" / "analysis_manifest.json"
+    verify_analysis_manifest_current(
+        relocated_manifest,
+        annotations_dir=relocated_package / "annotations" / "calibration",
+        scenario_paths=[relocated_package / "scenarios" / "calibration.jsonl"],
+        coverage_path=relocated_package / "hidden" / "coverage_tags.jsonl",
+        pair_design_path=relocated_package / "hidden" / "pair_design.jsonl",
+        quality_thresholds_path=relocated_package / "settings" / "quality_thresholds_v1.json",
+        anchor_reference_path=relocated_package / "hidden" / "anchor_reference.jsonl",
+        anchor_review_decisions_path=(
+            relocated_package / "adjudication" / "anchor_review_decisions.jsonl"
+        ),
+        manual_path=relocated_package / "manuals" / "coding_manual_v0.1.md",
+        repository_root=relocated_root,
+    )
+    relocated_manifest_data = json.loads(relocated_manifest.read_text(encoding="utf-8"))
+    relocated_manifest_data["analysis_version"] = "0.9"
+    relocated_manifest.write_text(json.dumps(relocated_manifest_data), encoding="utf-8")
+    with pytest.raises(ValueError, match="analysis version is stale"):
+        verify_analysis_manifest_current(
+            relocated_manifest,
+            annotations_dir=relocated_package / "annotations" / "calibration",
+            scenario_paths=[relocated_package / "scenarios" / "calibration.jsonl"],
+            coverage_path=relocated_package / "hidden" / "coverage_tags.jsonl",
+            pair_design_path=relocated_package / "hidden" / "pair_design.jsonl",
+            quality_thresholds_path=relocated_package / "settings" / "quality_thresholds_v1.json",
+            anchor_reference_path=relocated_package / "hidden" / "anchor_reference.jsonl",
+            anchor_review_decisions_path=(
+                relocated_package / "adjudication" / "anchor_review_decisions.jsonl"
+            ),
+            manual_path=relocated_package / "manuals" / "coding_manual_v0.1.md",
+            repository_root=relocated_root,
+        )
+    relocated_manifest_data["analysis_version"] = manifest["analysis_version"]
+    relocated_manifest.write_text(json.dumps(relocated_manifest_data), encoding="utf-8")
+    agreement_code = relocated_package / "analysis" / "agreement.py"
+    agreement_code.write_text(
+        agreement_code.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="analysis implementation changed"):
+        verify_analysis_manifest_current(
+            relocated_manifest,
+            annotations_dir=relocated_package / "annotations" / "calibration",
+            scenario_paths=[relocated_package / "scenarios" / "calibration.jsonl"],
+            coverage_path=relocated_package / "hidden" / "coverage_tags.jsonl",
+            pair_design_path=relocated_package / "hidden" / "pair_design.jsonl",
+            quality_thresholds_path=relocated_package / "settings" / "quality_thresholds_v1.json",
+            anchor_reference_path=relocated_package / "hidden" / "anchor_reference.jsonl",
+            anchor_review_decisions_path=(
+                relocated_package / "adjudication" / "anchor_review_decisions.jsonl"
+            ),
+            manual_path=relocated_package / "manuals" / "coding_manual_v0.1.md",
+            repository_root=relocated_root,
+        )
+
     anchor_reference_path = corpus_root / "hidden" / "anchor_reference.jsonl"
     anchor_reference_path.write_text(anchor_reference_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="stale analysis manifest"):
@@ -327,7 +431,12 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
             scenario_paths=[corpus_root / "scenarios" / "calibration.jsonl"],
             coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
             pair_design_path=corpus_root / "hidden" / "pair_design.jsonl",
-            quality_thresholds_path=PACKAGE_ROOT / "settings" / "quality_thresholds_v1.json",
+            quality_thresholds_path=package_root / "settings" / "quality_thresholds_v1.json",
+            anchor_review_decisions_path=(
+                package_root / "adjudication" / "anchor_review_decisions.jsonl"
+            ),
+            manual_path=package_root / "manuals" / "coding_manual_v0.1.md",
+            repository_root=repository_root,
         )
 
     annotation_path = annotations / "annotation_0.json"
@@ -339,7 +448,12 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
             scenario_paths=[corpus_root / "scenarios" / "calibration.jsonl"],
             coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
             pair_design_path=corpus_root / "hidden" / "pair_design.jsonl",
-            quality_thresholds_path=PACKAGE_ROOT / "settings" / "quality_thresholds_v1.json",
+            quality_thresholds_path=package_root / "settings" / "quality_thresholds_v1.json",
+            anchor_review_decisions_path=(
+                package_root / "adjudication" / "anchor_review_decisions.jsonl"
+            ),
+            manual_path=package_root / "manuals" / "coding_manual_v0.1.md",
+            repository_root=repository_root,
         )
 
 
