@@ -3,7 +3,7 @@
   "$id": "https://mindflow.local/schemas/human-draft-v1.json",
   "title": "MindFlow Atomic Human Annotation Draft",
   "type": "object",
-  "required": ["draft_version", "status", "scenario_id", "annotation_module", "annotator_id", "manual_version", "scenario_version", "flagged_for_review", "updated_at", "payload", "validation_errors", "annotation_document"],
+  "required": ["draft_version", "status", "scenario_id", "annotation_module", "annotator_id", "manual_version", "manual_sha256", "scenario_version", "flagged_for_review", "updated_at", "payload", "validation_errors", "annotation_document"],
   "properties": {
     "draft_version": {"const": "1.0"},
     "status": {"enum": ["IN_PROGRESS", "COMPLETE"]},
@@ -11,6 +11,7 @@
     "annotation_module": {"enum": ["A", "B", "C"]},
     "annotator_id": {"const": "Human"},
     "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "manual_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
     "flagged_for_review": {"type": "boolean"},
     "updated_at": {"type": "string", "format": "date-time"},

@@ -35,6 +35,7 @@ def regenerate_calibration(output_root: str | Path) -> None:
         root / "assignments" / "round_calibration",
         annotation_round="CALIBRATION",
         manual_version="0.1",
+        manual_path=Path(__file__).parent / "manuals" / "coding_manual_v0.1.md",
         scenario_version="0.1",
         seed=12001,
     )

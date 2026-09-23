@@ -7,6 +7,7 @@ from research.scenario_annotation.ai_runner.contracts import RetryReason, retry_
 from research.scenario_annotation.ai_runner.importer import import_ai_output
 from research.scenario_annotation.ai_runner.packets import export_ai_packets
 from research.scenario_annotation.ai_runner.packets import _manual_excerpt
+from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.loader import load_json, load_jsonl
 from research.scenario_annotation.validation import FORBIDDEN_VISIBLE_KEYS, Validator
 
@@ -27,6 +28,7 @@ def test_exported_packet_contains_only_one_visible_scenario_and_relevant_manual_
         output_dir=tmp_path,
     )
     assert summary["scenario_count"] == 9
+    assert summary["manual_sha256"] == sha256_file(PACKAGE / "manuals" / "coding_manual_v0.1.md")
     packet = load_json(tmp_path / "CAL_019.json")
     assert packet["scenario_id"] == "CAL_019"
     assert packet["annotation_module"] == "B"
@@ -96,6 +98,7 @@ def _import(tmp_path: Path, raw: dict) -> Path:
         scenario_id="CAL_019",
         assignment_path=ASSIGNMENT / "module_b.jsonl",
         assignment_manifest_path=ASSIGNMENT / "manifest.json",
+        manual_path=PACKAGE / "manuals" / "coding_manual_v0.1.md",
         raw_output_path=raw_path,
         raw_output_schema_path=PACKAGE / "schemas" / "ai_output.schema.json",
         output_dir=tmp_path / "drafts",
@@ -118,6 +121,9 @@ def test_importer_owns_system_fields_and_records_provenance(tmp_path) -> None:
     assert record["scenario_version"] == "0.1"
     assert record["annotation_id"] == "CAL_019:B:E_HARD_TASK_LOW_CEXEC:C_EXEC:AI-A"
     assert document["runner_provenance"]["provider"] == "provider-a"
+    expected_manual_hash = sha256_file(PACKAGE / "manuals" / "coding_manual_v0.1.md")
+    assert document["manual_sha256"] == expected_manual_hash
+    assert document["runner_provenance"]["manual_sha256"] == expected_manual_hash
     assert document["runner_provenance"]["attempt"] == 1
     assert len(document["runner_provenance"]["raw_output_sha256"]) == 64
     scenarios = {row["scenario_id"]: row for row in load_jsonl(ASSIGNMENT / "module_b.jsonl")}

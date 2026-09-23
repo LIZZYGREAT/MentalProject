@@ -28,6 +28,7 @@ def test_reference_set_manifest_binds_analysis_annotations_assignments_manual_an
         json.dumps(
             {
                 "annotation_fileset_sha256": sha256_fileset([annotation_file]),
+                "assignment_fileset_sha256": sha256_fileset([assignment_file, manifest_file]),
                 "scenario_fileset_sha256": sha256_fileset([scenario_file]),
                 "manual_sha256": sha256_file(manual_file),
             }

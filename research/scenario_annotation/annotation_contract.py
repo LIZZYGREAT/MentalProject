@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .annotation_catalog import FieldRequirement, field_specs
+from .assignments import verify_assignment_manifest
 from .loader import load_json, load_jsonl
 
 
@@ -120,14 +121,25 @@ def expected_submission_documents(
     assignments_root: str | Path,
     *,
     annotators: Iterable[str] | None = None,
-) -> tuple[set[SubmissionKey], dict[tuple[str, str], Mapping[str, Any]]]:
+) -> tuple[
+    set[SubmissionKey],
+    dict[tuple[str, str], Mapping[str, Any]],
+    dict[str, Mapping[str, Any]],
+]:
     root = Path(assignments_root)
     selected = set(annotators) if annotators is not None else None
     expected: set[SubmissionKey] = set()
     scenarios: dict[tuple[str, str], Mapping[str, Any]] = {}
+    provenance: dict[str, Mapping[str, Any]] = {}
     for manifest_path in sorted(root.glob("*/manifest.json")):
-        manifest = load_json(manifest_path)
+        unverified_manifest = load_json(manifest_path)
+        manual_path = root.parent.parent / "manuals" / f"coding_manual_v{unverified_manifest['manual_version']}.md"
+        manifest = verify_assignment_manifest(
+            manifest_path,
+            manual_path=manual_path,
+        )
         annotator = str(manifest["annotator_id"])
+        provenance[annotator] = manifest
         if selected is not None and annotator not in selected:
             continue
         for item in manifest["files"]:
@@ -138,7 +150,7 @@ def expected_submission_documents(
                 scenarios[(module, scenario_id)] = scenario
     if not expected:
         raise ValueError(f"no assignment documents found in {root}")
-    return expected, scenarios
+    return expected, scenarios, provenance
 
 
 def check_submission_integrity(
@@ -147,7 +159,7 @@ def check_submission_integrity(
     *,
     annotators: Iterable[str] | None = None,
 ) -> SubmissionIntegrity:
-    expected, scenarios = expected_submission_documents(assignments_root, annotators=annotators)
+    expected, scenarios, provenance = expected_submission_documents(assignments_root, annotators=annotators)
     documents = list(documents)
     document_keys = [
         (
@@ -161,6 +173,12 @@ def check_submission_integrity(
     actual = set(document_keys)
     incomplete: list[str] = []
     for key, document in zip(document_keys, documents):
+        manifest = provenance.get(key[0])
+        if manifest is not None and (
+            str(document.get("manual_version")) != str(manifest["manual_version"])
+            or document.get("manual_sha256") != manifest["manual_sha256"]
+        ):
+            incomplete.append(f"{':'.join(key)}: annotation manual provenance does not match assignment manifest")
         scenario = scenarios.get((key[1], key[2]))
         if scenario is None:
             continue

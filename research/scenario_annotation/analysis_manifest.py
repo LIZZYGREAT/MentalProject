@@ -28,6 +28,8 @@ def build_analysis_manifest(
     repository_root: str | Path,
     anchor_reference_path: str | Path | None = None,
     anchor_review_decisions_path: str | Path | None = None,
+    manual_path: str | Path | None = None,
+    assignments_root: str | Path | None = None,
 ) -> dict[str, Any]:
     annotations = sorted((Path(path).resolve() for path in annotation_paths), key=lambda item: item.as_posix())
     scenarios = sorted((Path(path).resolve() for path in scenario_paths), key=lambda item: item.as_posix())
@@ -37,10 +39,18 @@ def build_analysis_manifest(
         anchor_review_decisions_path
         or Path(__file__).parent / "adjudication" / "anchor_review_decisions.jsonl"
     ).resolve()
+    manual = Path(
+        manual_path
+        or Path(__file__).parent / "manuals" / f"coding_manual_v{manual_version}.md"
+    ).resolve()
+    assignments = annotation_files(assignments_root) if assignments_root is not None else []
+    manual_fingerprint = fingerprint(manual)
     return {
         "analysis_version": ANALYSIS_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "manual_version": manual_version,
+        "manual_file": manual_fingerprint,
+        "manual_sha256": manual_fingerprint["sha256"],
         "scenario_files": [fingerprint(path) for path in scenarios],
         "scenario_fileset_sha256": sha256_fileset(scenarios),
         "coverage_file": fingerprint(coverage_path),
@@ -48,6 +58,8 @@ def build_analysis_manifest(
         "anchor_reference_file": fingerprint(anchor_reference),
         "anchor_review_decisions_path": review_decisions.as_posix(),
         "anchor_review_decisions_file": fingerprint(review_decisions) if review_decisions.is_file() else None,
+        "assignment_artifacts": [fingerprint(path) for path in assignments],
+        "assignment_fileset_sha256": sha256_fileset(assignments) if assignments else None,
         "annotation_artifacts": [fingerprint(path) for path in annotations],
         "annotation_fileset_sha256": sha256_fileset(annotations),
         "quality_threshold_version": settings["settings_version"],
@@ -68,6 +80,8 @@ def verify_analysis_manifest_current(
     pair_design_path: str | Path, quality_thresholds_path: str | Path,
     anchor_reference_path: str | Path | None = None,
     anchor_review_decisions_path: str | Path | None = None,
+    manual_path: str | Path | None = None,
+    assignments_root: str | Path | None = None,
 ) -> Mapping[str, Any]:
     manifest = load_json(manifest_path)
     anchor_reference = Path(anchor_reference_path or Path(coverage_path).parent / "anchor_reference.jsonl").resolve()
@@ -75,7 +89,9 @@ def verify_analysis_manifest_current(
         anchor_review_decisions_path
         or Path(__file__).parent / "adjudication" / "anchor_review_decisions.jsonl"
     ).resolve()
-    entries = [*manifest.get("scenario_files", []), manifest.get("coverage_file", {}), manifest.get("pair_design_file", {}), manifest.get("anchor_reference_file", {}), *manifest.get("annotation_artifacts", []), manifest.get("quality_threshold_file", {})]
+    recorded_manual = manifest.get("manual_file", {})
+    manual = Path(manual_path or recorded_manual.get("path", "")).resolve()
+    entries = [*manifest.get("scenario_files", []), manifest.get("coverage_file", {}), manifest.get("pair_design_file", {}), manifest.get("anchor_reference_file", {}), *([recorded_manual] if recorded_manual else []), *manifest.get("assignment_artifacts", []), *manifest.get("annotation_artifacts", []), manifest.get("quality_threshold_file", {})]
     if manifest.get("anchor_review_decisions_file") is not None:
         entries.append(manifest["anchor_review_decisions_file"])
     errors = [error for entry in entries if (error := verify_fingerprint(entry))]
@@ -83,6 +99,20 @@ def verify_analysis_manifest_current(
         errors.append("annotation artifact set changed")
     if sha256_fileset(Path(path).resolve() for path in scenario_paths) != manifest.get("scenario_fileset_sha256"):
         errors.append("scenario artifact set changed")
+    if not recorded_manual or manual.as_posix() != str(recorded_manual.get("path")):
+        errors.append("analysis manifest manual path does not match the current session")
+    if assignments_root is None:
+        if manifest.get("assignment_artifacts"):
+            errors.append("assignment root is required to verify the recorded assignment fileset")
+    else:
+        assignment_paths = annotation_files(assignments_root)
+        actual_assignment_hash = sha256_fileset(assignment_paths) if assignment_paths else None
+        if actual_assignment_hash != manifest.get("assignment_fileset_sha256"):
+            errors.append("assignment artifact set changed")
+        recorded_assignment_paths = {str(entry.get("path")) for entry in manifest.get("assignment_artifacts", [])}
+        expected_assignment_paths = {Path(path).resolve().as_posix() for path in assignment_paths}
+        if expected_assignment_paths != recorded_assignment_paths:
+            errors.append("analysis manifest assignment files do not match the current session")
     expected_paths = {Path(coverage_path).resolve().as_posix(), Path(pair_design_path).resolve().as_posix(), Path(quality_thresholds_path).resolve().as_posix(), anchor_reference.as_posix()}
     recorded_paths = {str(manifest.get("coverage_file", {}).get("path")), str(manifest.get("pair_design_file", {}).get("path")), str(manifest.get("quality_threshold_file", {}).get("path")), str(manifest.get("anchor_reference_file", {}).get("path"))}
     if expected_paths != recorded_paths:

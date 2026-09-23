@@ -65,6 +65,7 @@ def run_analysis(
     assignments_root: str | Path | None = None,
     anchor_reference_path: str | Path | None = None,
     anchor_review_decisions_path: str | Path | None = None,
+    manual_path: str | Path | None = None,
 ) -> dict[str, Any]:
     only = only or {"agreement", "violations", "orthogonality", "anchors", "disagreement", "report"}
     scenario_paths = (
@@ -93,6 +94,7 @@ def run_analysis(
         assignments_root=assignments_root,
         anchor_reference_path=anchor_reference_path,
         anchor_review_decisions_path=anchor_review_decisions_path,
+        manual_path=manual_path,
     )
     (root / "artifact_validity.json").write_text(
         json.dumps(artifact_validity, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -106,6 +108,7 @@ def run_analysis(
         "coverage_validator",
         "anchor_reference_validator",
         "anchor_review_decision_validator",
+        "manual_provenance",
     )
     failed_inputs = [
         name for name in required_inputs
@@ -197,16 +200,23 @@ def run_analysis(
     manual_versions = {str(document["manual_version"]) for document in documents}
     if len(manual_versions) != 1:
         raise ValueError(f"analysis inputs contain multiple manual versions: {sorted(manual_versions)}")
+    manual_version = manual_versions.pop()
+    resolved_manual_path = Path(
+        manual_path
+        or Path(__file__).parents[1] / "manuals" / f"coding_manual_v{manual_version}.md"
+    )
     manifest = build_analysis_manifest(
         annotation_paths=annotation_files(annotations_dir),
         scenario_paths=scenario_paths,
         coverage_path=coverage_path,
         pair_design_path=pairs_path,
         quality_thresholds_path=quality_thresholds_path,
-        manual_version=manual_versions.pop(),
+        manual_version=manual_version,
         repository_root=repository_root or Path(__file__).parents[3],
         anchor_reference_path=anchor_reference_path,
         anchor_review_decisions_path=anchor_review_decisions_path,
+        manual_path=resolved_manual_path,
+        assignments_root=assignments_root,
     )
     write_analysis_manifest(root / "analysis_manifest.json", manifest)
     return {

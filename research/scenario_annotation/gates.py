@@ -182,6 +182,12 @@ def evaluate_manual_ready(
             quality_thresholds_path=quality_thresholds_path,
             anchor_reference_path=coverage_path.parent / "anchor_reference.jsonl",
             anchor_review_decisions_path=Path(__file__).parent / "adjudication" / "anchor_review_decisions.jsonl",
+            manual_path=(
+                assignments_root.parent.parent
+                / "manuals"
+                / f"coding_manual_v{load_json(assignments_root / 'human' / 'manifest.json')['manual_version']}.md"
+            ),
+            assignments_root=assignments_root,
         )
         orthogonality = json.loads(
             (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
@@ -270,6 +276,7 @@ def evaluate_semantic_reliability(
     assignments_root: str | Path | None = None,
     coverage_path: str | Path | None = None,
     pair_design_path: str | Path | None = None,
+    manual_path: str | Path | None = None,
 ) -> GateResult:
     main_scenarios_path = Path(main_scenarios_path)
     edge_scenarios_path = Path(edge_scenarios_path)
@@ -284,6 +291,7 @@ def evaluate_semantic_reliability(
     )
     coverage_path = Path(coverage_path or main_scenarios_path.parent.parent / "hidden" / "coverage_tags.jsonl")
     pair_design_path = Path(pair_design_path or main_scenarios_path.parent.parent / "hidden" / "pair_design.jsonl")
+    manual_path = Path(manual_path or Path(__file__).parent / "manuals" / "coding_manual_v1.0.md")
 
     def corpus_check() -> tuple[bool, str]:
         main = Validator().validate_paths([main_scenarios_path], "scenario")
@@ -380,6 +388,8 @@ def evaluate_semantic_reliability(
             coverage_path=coverage_path,
             pair_design_path=pair_design_path,
             quality_thresholds_path=quality_thresholds_path,
+            manual_path=manual_path,
+            assignments_root=assignments_root,
         )
         return True, "analysis outputs complete and input manifest is current"
 

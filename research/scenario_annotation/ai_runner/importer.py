@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from ..assignments import verify_assignment_manifest
 from ..annotation_contract import check_annotation_completeness
 from ..loader import load_json, load_jsonl
 from ..validation import Validator
@@ -34,6 +35,7 @@ def import_ai_output(
     scenario_id: str,
     assignment_path: str | Path,
     assignment_manifest_path: str | Path,
+    manual_path: str | Path,
     raw_output_path: str | Path,
     raw_output_schema_path: str | Path,
     output_dir: str | Path,
@@ -47,9 +49,14 @@ def import_ai_output(
 ) -> Path:
     if attempt < 1:
         raise ValueError("attempt must be at least 1")
-    manifest = load_json(assignment_manifest_path)
-    if manifest.get("annotator_id") != annotator_id or manifest.get("annotation_round") != annotation_round:
-        raise ValueError("assignment manifest does not match annotator/round")
+    manifest = verify_assignment_manifest(
+        assignment_manifest_path,
+        manual_path=manual_path,
+        assignment_path=assignment_path,
+        annotator_id=annotator_id,
+        annotation_round=annotation_round,
+        module=module,
+    )
     scenarios = {str(row["scenario_id"]): row for row in load_jsonl(assignment_path)}
     scenario = scenarios.get(scenario_id)
     if scenario is None:
@@ -97,11 +104,13 @@ def import_ai_output(
         "annotator_id": annotator_id,
         "annotation_round": annotation_round,
         "manual_version": manifest["manual_version"],
+        "manual_sha256": manifest["manual_sha256"],
         "scenario_validity": raw["scenario_validity"],
         "runner_provenance": {
             "provider": provider,
             "model": model,
             "prompt_manual_version": manifest["manual_version"],
+            "manual_sha256": manifest["manual_sha256"],
             "temperature": temperature,
             "seed": seed,
             "request_id": request_id,

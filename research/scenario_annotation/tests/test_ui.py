@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from research.scenario_annotation.drafts import MODULE_VARIABLES, export_annotations
+from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.loader import load_jsonl
 from research.scenario_annotation.ui.server import AnnotationStore, create_app
 from research.scenario_annotation.validation import Validator
@@ -48,6 +50,54 @@ def _valid_module_b_payload(scenario: dict) -> dict:
         "flagged_for_review": False,
         "mark_complete": True,
     }
+
+
+def _single_scenario_assignment(
+    tmp_path: Path, scenario: dict, module: str
+) -> tuple[Path, Path, Path]:
+    """Create a minimal but fully content-bound assignment for an export test."""
+    package_root = tmp_path / "export_package"
+    assignment_root = package_root / "assignments" / "round_calibration" / "human"
+    manual_path = package_root / "manuals" / "coding_manual_v0.1.md"
+    manual_path.parent.mkdir(parents=True)
+    shutil.copy2(PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md", manual_path)
+
+    files = []
+    selected_assignment = None
+    for current_module in ("A", "B", "C"):
+        assignment_path = assignment_root / f"module_{current_module.lower()}.jsonl"
+        rows = [scenario] if current_module == module else []
+        encoded = "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows
+        ).encode("utf-8")
+        assignment_path.parent.mkdir(parents=True, exist_ok=True)
+        assignment_path.write_bytes(encoded)
+        files.append(
+            {
+                "module": current_module,
+                "path": assignment_path.name,
+                "scenario_count": len(rows),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        )
+        if current_module == module:
+            selected_assignment = assignment_path
+
+    manifest = {
+        "assignment_version": "1.0",
+        "annotation_round": "CALIBRATION",
+        "annotator_id": "Human",
+        "manual_version": "0.1",
+        "manual_sha256": sha256_file(manual_path),
+        "scenario_version": "0.1",
+        "randomization_seed": 1,
+        "counterbalance_rule": "single-scenario export fixture",
+        "files": files,
+    }
+    manifest_path = assignment_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    assert selected_assignment is not None
+    return selected_assignment, manifest_path, manual_path
 
 
 def test_annotation_ui_cannot_access_hidden_metadata(tmp_path: Path) -> None:
@@ -113,16 +163,15 @@ def test_completed_human_draft_exports_to_validated_jsonl(tmp_path: Path) -> Non
     store = AnnotationStore(PACKAGE_ROOT, draft_root=draft_root)
     scenario = store.scenarios["B"]["CAL_019"]
     store.save("B", "CAL_019", _valid_module_b_payload(scenario))
-    assignment = tmp_path / "assignment.jsonl"
-    assignment.write_text(
-        json.dumps(scenario, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    assignment, manifest_path, manual_path = _single_scenario_assignment(tmp_path, scenario, "B")
     output = tmp_path / "formal" / "module_b.jsonl"
 
     count = export_annotations(
         annotator_id="Human",
         module="B",
         assignment_path=assignment,
+        assignment_manifest_path=manifest_path,
+        manual_path=manual_path,
         draft_dir=draft_root / "module_b",
         output_path=output,
     )
@@ -209,9 +258,11 @@ def test_annotation_session_selects_round_manifest_manual(tmp_path: Path) -> Non
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["annotation_round"] = "VALIDATION"
     manifest["manual_version"] = "1.0"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     (root / "manuals").mkdir(parents=True)
-    (root / "manuals" / "coding_manual_v1.0.md").write_text("manual v1.0", encoding="utf-8")
+    manual_path = root / "manuals" / "coding_manual_v1.0.md"
+    manual_path.write_text("manual v1.0", encoding="utf-8")
+    manifest["manual_sha256"] = sha256_file(manual_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     store = AnnotationStore(root, round_name="validation", annotator_id="Human")
 
@@ -219,3 +270,34 @@ def test_annotation_session_selects_round_manifest_manual(tmp_path: Path) -> Non
     assert store.session.manual_version == "1.0"
     assert store.manual_text == "manual v1.0"
     assert store.draft_root == (root / "annotations" / "drafts" / "human" / "validation").resolve()
+
+
+def test_annotation_session_rejects_changed_manual_content(tmp_path: Path) -> None:
+    root = tmp_path / "package"
+    source = PACKAGE_ROOT / "assignments" / "round_calibration" / "human"
+    target = root / "assignments" / "round_calibration" / "human"
+    shutil.copytree(source, target)
+    manual_path = root / "manuals" / "coding_manual_v0.1.md"
+    manual_path.parent.mkdir(parents=True)
+    shutil.copy2(PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md", manual_path)
+    manual_path.write_text(manual_path.read_text(encoding="utf-8") + "\nchanged\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manual content hash"):
+        AnnotationStore(root, round_name="calibration", annotator_id="Human")
+
+
+def test_annotation_session_rejects_changed_assignment_content(tmp_path: Path) -> None:
+    root = tmp_path / "package"
+    source = PACKAGE_ROOT / "assignments" / "round_calibration" / "human"
+    target = root / "assignments" / "round_calibration" / "human"
+    shutil.copytree(source, target)
+    (root / "manuals").mkdir(parents=True)
+    shutil.copy2(
+        PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md",
+        root / "manuals" / "coding_manual_v0.1.md",
+    )
+    with (target / "module_a.jsonl").open("a", encoding="utf-8") as assignment_file:
+        assignment_file.write("{}\n")
+
+    with pytest.raises(ValueError, match="row count does not match manifest"):
+        AnnotationStore(root, round_name="calibration", annotator_id="Human")

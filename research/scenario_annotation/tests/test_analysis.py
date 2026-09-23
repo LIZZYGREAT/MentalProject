@@ -11,6 +11,7 @@ from research.scenario_annotation.analysis.orthogonality import analyze_orthogon
 from research.scenario_annotation.analysis.pipeline import run_analysis
 from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
 from research.scenario_annotation.assignments import build_assignments
+from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.corpus import write_calibration
 from research.scenario_annotation.loader import load_jsonl
 
@@ -257,6 +258,7 @@ def _annotation_document(annotator: str, label: str, evidence_ref: str) -> dict:
         "annotator_id": annotator,
         "annotation_round": "CALIBRATION",
         "manual_version": "0.1",
+        "manual_sha256": sha256_file(PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md"),
         "scenario_validity": {
             "scenario_valid": "YES",
             "scenario_plausibility": "HIGH",
@@ -397,13 +399,18 @@ def test_analysis_writes_failed_validity_for_hidden_metadata_leak(tmp_path) -> N
 def test_artifact_validity_checks_assignment_file_integrity(tmp_path) -> None:
     corpus_root = tmp_path / "corpus"
     write_calibration(corpus_root)
-    assignments = tmp_path / "assignments"
+    package_root = tmp_path / "package"
+    assignments = package_root / "assignments" / "round_calibration"
+    manual_path = package_root / "manuals" / "coding_manual_v0.1.md"
+    manual_path.parent.mkdir(parents=True)
+    manual_path.write_bytes((PACKAGE_ROOT / "manuals" / "coding_manual_v0.1.md").read_bytes())
     build_assignments(
         corpus_root / "scenarios" / "calibration.jsonl",
         corpus_root / "hidden" / "pair_design.jsonl",
         assignments,
         annotation_round="CALIBRATION",
         manual_version="0.1",
+        manual_path=manual_path,
         scenario_version="0.1",
         seed=12001,
     )
@@ -422,4 +429,7 @@ def test_artifact_validity_checks_assignment_file_integrity(tmp_path) -> None:
 
     assert result["checks"]["assignment_submission_integrity"] == "FAIL"
     issues = result["details"]["assignment_submission_integrity"]["issues"]
-    assert any(issue["code"] == "ASSIGNMENT_HASH_MISMATCH" for issue in issues)
+    assert any(
+        "assignment file hash does not match manifest" in issue["message"]
+        for issue in issues
+    )

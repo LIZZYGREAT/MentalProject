@@ -17,6 +17,7 @@ def _build(tmp_path: Path) -> tuple[Path, Path]:
         assignments_root,
         annotation_round="CALIBRATION",
         manual_version="0.1",
+        manual_path=Path(__file__).parents[1] / "manuals" / "coding_manual_v0.1.md",
         scenario_version="0.1",
         seed=12001,
     )

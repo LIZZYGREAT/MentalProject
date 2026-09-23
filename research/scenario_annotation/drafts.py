@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from jsonschema import Draft202012Validator, FormatChecker
 
 from .annotation_catalog import field_specs
+from .assignments import verify_assignment_manifest
 from .annotation_contract import (
     check_annotation_completeness,
     module_targets,
@@ -66,6 +67,7 @@ def build_annotation_document(
         "annotator_id": annotator_id,
         "annotation_round": annotation_round,
         "manual_version": manifest["manual_version"],
+        "manual_sha256": manifest["manual_sha256"],
         "scenario_validity": payload.get("scenario_validity"),
         "records": records,
     }
@@ -133,6 +135,7 @@ def save_human_draft(
         "annotation_module": module,
         "annotator_id": "Human",
         "manual_version": manifest["manual_version"],
+        "manual_sha256": manifest["manual_sha256"],
         "scenario_version": scenario["scenario_version"],
         "flagged_for_review": flagged_for_review,
         "updated_at": timestamp,
@@ -153,9 +156,18 @@ def export_annotations(
     annotator_id: str,
     module: str,
     assignment_path: str | Path,
+    assignment_manifest_path: str | Path,
+    manual_path: str | Path,
     draft_dir: str | Path,
     output_path: str | Path,
 ) -> int:
+    manifest = verify_assignment_manifest(
+        assignment_manifest_path,
+        manual_path=manual_path,
+        assignment_path=assignment_path,
+        annotator_id=annotator_id,
+        module=module,
+    )
     scenarios = {str(row["scenario_id"]): row for row in load_jsonl(assignment_path)}
     documents: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -175,6 +187,8 @@ def export_annotations(
             continue
         if document.get("annotator_id") != annotator_id or document.get("annotation_module") != module:
             raise ValueError(f"{path}: annotator/module mismatch")
+        if document.get("manual_sha256") != manifest["manual_sha256"]:
+            raise ValueError(f"{path}: annotation manual hash does not match the assignment")
         completeness = check_annotation_completeness(document, scenarios[scenario_id], module)
         if not completeness.ok:
             raise ValueError(f"{path}: " + "; ".join(completeness.messages()))

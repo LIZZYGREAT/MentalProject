@@ -1,8 +1,10 @@
 import json
+import hashlib
 
 import pytest
 
 from research.scenario_annotation.annotation_catalog import field_specs
+from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.reference_set import build_reference_set
 
 
@@ -39,23 +41,50 @@ def _document(annotator: str, *, disagreement: bool = False) -> dict:
         "annotation_module": "C",
         "annotator_id": annotator,
         "annotation_round": "VALIDATION",
+        "manual_version": "1.0",
+        "manual_sha256": hashlib.sha256(b"manual v1.0\n").hexdigest(),
         "records": records,
     }
 
 
 def _assignments_root(tmp_path, annotators=("AI-A", "AI-B", "AI-C", "Human")):
-    root = tmp_path / "assignments"
+    package_root = tmp_path / "package"
+    root = package_root / "assignments" / "round_validation"
+    manual_dir = package_root / "manuals"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    manual_path = manual_dir / "coding_manual_v1.0.md"
+    manual_path.write_bytes(b"manual v1.0\n")
     for annotator in annotators:
         directory = root / annotator.lower().replace("-", "_")
         directory.mkdir(parents=True)
-        (directory / "module_c.jsonl").write_text(
-            json.dumps(_scenario(), ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        assignment_files = []
+        for module in ("A", "B", "C"):
+            path = directory / f"module_{module.lower()}.jsonl"
+            rows = [_scenario()] if module == "C" else []
+            path.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            assignment_files.append(
+                {
+                    "module": module,
+                    "path": path.name,
+                    "scenario_count": len(rows),
+                    "sha256": sha256_file(path),
+                }
+            )
         (directory / "manifest.json").write_text(
             json.dumps(
                 {
+                    "assignment_version": "1.0",
                     "annotator_id": annotator,
-                    "files": [{"module": "C", "path": "module_c.jsonl"}],
+                    "annotation_round": "VALIDATION",
+                    "manual_version": "1.0",
+                    "manual_sha256": sha256_file(manual_path),
+                    "scenario_version": "1.0",
+                    "randomization_seed": 7,
+                    "counterbalance_rule": "fixture",
+                    "files": assignment_files,
                 }
             ),
             encoding="utf-8",

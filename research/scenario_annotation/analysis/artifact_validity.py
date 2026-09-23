@@ -82,83 +82,25 @@ def _extend_result(
 def _assignment_issues(
     assignments_root: Path,
     documents: list[dict[str, Any]],
-    validator: Validator,
 ) -> tuple[int, list[ValidationIssue]]:
     manifests = sorted(assignments_root.glob("*/manifest.json"))
     issues: list[ValidationIssue] = []
     if not manifests:
         return 0, [_issue(str(assignments_root), "no assignment manifests found", "NO_ASSIGNMENTS")]
-
-    safe_manifests: list[Path] = []
-    for manifest_path in manifests:
-        if _is_within(manifest_path, assignments_root):
-            safe_manifests.append(manifest_path)
-        else:
-            issues.append(
-                _issue(
-                    str(manifest_path),
-                    "assignment manifest resolves outside its root",
-                    "ASSIGNMENT_PATH_INVALID",
-                )
-            )
-    manifest_result = validator.validate_paths(safe_manifests, "assignment-manifest")
-    issues.extend(manifest_result.issues)
-    for manifest_path in safe_manifests:
-        try:
-            manifest = load_json(manifest_path)
-            for entry in manifest.get("files", []):
-                artifact_name = str(entry["path"])
-                artifact_path = manifest_path.parent / artifact_name
-                if artifact_path.is_symlink() or not _is_within(
-                    artifact_path, manifest_path.parent
-                ):
-                    issues.append(
-                        _issue(
-                            str(artifact_path),
-                            "assignment file resolves outside its annotator directory",
-                            "ASSIGNMENT_PATH_INVALID",
-                        )
-                    )
-                    continue
-                if not artifact_path.is_file():
-                    issues.append(
-                        _issue(
-                            str(artifact_path),
-                            "assigned scenario file is missing",
-                            "ASSIGNMENT_FILE_MISSING",
-                        )
-                    )
-                    continue
-                digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-                if digest != entry.get("sha256"):
-                    issues.append(
-                        _issue(
-                            str(artifact_path),
-                            "assignment file hash does not match its manifest",
-                            "ASSIGNMENT_HASH_MISMATCH",
-                        )
-                    )
-                rows = load_jsonl(artifact_path)
-                if len(rows) != entry.get("scenario_count"):
-                    issues.append(
-                        _issue(
-                            str(artifact_path),
-                            "assignment row count does not match its manifest",
-                            "ASSIGNMENT_COUNT_MISMATCH",
-                        )
-                    )
-        except (ArtifactLoadError, OSError, KeyError, TypeError, AttributeError) as exc:
-            issues.append(_issue(str(manifest_path), str(exc), "ASSIGNMENT_LOAD"))
-
+    unsafe = [path for path in manifests if path.is_symlink() or not _is_within(path, assignments_root)]
+    if unsafe:
+        issues.extend(
+            _issue(str(path), "assignment manifest resolves outside its root", "ASSIGNMENT_PATH_INVALID")
+            for path in unsafe
+        )
+        return 0, issues
     try:
         integrity = check_submission_integrity(assignments_root, documents)
         if not integrity.ok:
-            issues.append(
-                _issue(str(assignments_root), integrity.detail(), "SUBMISSION_INCOMPLETE")
-            )
+            issues.append(_issue(str(assignments_root), integrity.detail(), "SUBMISSION_INCOMPLETE"))
     except (ArtifactLoadError, OSError, ValueError, KeyError, TypeError) as exc:
         issues.append(_issue(str(assignments_root), str(exc), "SUBMISSION_CHECK_ERROR"))
-    return manifest_result.checked, issues
+    return len(manifests), issues
 
 
 def evaluate_artifact_validity(
@@ -170,6 +112,7 @@ def evaluate_artifact_validity(
     assignments_root: str | Path | None = None,
     anchor_reference_path: str | Path | None = None,
     anchor_review_decisions_path: str | Path | None = None,
+    manual_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Validate every input that can affect Stage 1 analysis.
 
@@ -260,6 +203,41 @@ def evaluate_artifact_validity(
         )
     annotation_checked = sum(result.checked for result in annotation_results)
 
+    manual_issues: list[ValidationIssue] = []
+    manual_versions = {str(document.get("manual_version", "")) for document in documents}
+    manual_checks = 0
+    for document in documents:
+        version = str(document.get("manual_version", ""))
+        current_manual = Path(
+            manual_path
+            or Path(__file__).parents[1] / "manuals" / f"coding_manual_v{version}.md"
+        )
+        manual_checks += 1
+        try:
+            digest = hashlib.sha256(current_manual.read_bytes()).hexdigest()
+        except OSError as exc:
+            manual_issues.append(_issue(str(current_manual), str(exc), "MANUAL_MISSING"))
+            continue
+        if document.get("manual_sha256") != digest:
+            manual_issues.append(
+                _issue(
+                    str(document.get("scenario_id", "")),
+                    "annotation manual hash does not match current manual content",
+                    "ANNOTATION_MANUAL_HASH_MISMATCH",
+                )
+            )
+        runner = document.get("runner_provenance")
+        if isinstance(runner, dict) and runner.get("manual_sha256") != document.get("manual_sha256"):
+            manual_issues.append(
+                _issue(
+                    str(document.get("scenario_id", "")),
+                    "runner provenance manual hash differs from the annotation artifact",
+                    "RUNNER_MANUAL_HASH_MISMATCH",
+                )
+            )
+    if len(manual_versions) > 1:
+        manual_issues.append(_issue(str(annotations_dir), "annotations use multiple manual versions", "MIXED_MANUAL_VERSIONS"))
+
     pair_result = validator.validate_paths([pairs_path], "pair-design", scenarios=scenarios)
     pair_extra_issues: list[ValidationIssue] = []
     if pair_result.checked == 0 and not pair_result.issues:
@@ -321,7 +299,7 @@ def evaluate_artifact_validity(
     assignment_not_configured = assignments_root is None
     if assignments_root is not None:
         assignment_checked, assignment_issues = _assignment_issues(
-            Path(assignments_root), documents, validator
+            Path(assignments_root), documents
         )
     else:
         assignment_issues.append(
@@ -364,6 +342,7 @@ def evaluate_artifact_validity(
         "pair_design_validator": (pair_checked, pair_validation_issues),
         "coverage_validator": (coverage_checked, coverage_validation_issues),
         "anchor_reference_validator": (anchor_checked, anchor_validation_issues),
+        "manual_provenance": (manual_checks, manual_issues),
         "anchor_review_decision_validator": (
             max(review_result.checked, 1) if review_not_required else review_result.checked,
             list(review_result.issues),

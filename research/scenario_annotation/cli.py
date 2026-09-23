@@ -36,6 +36,7 @@ def _build_assignments_command(args: argparse.Namespace) -> int:
         args.output_dir or root / "assignments" / "round_calibration",
         annotation_round="CALIBRATION",
         manual_version=args.manual_version,
+        manual_path=args.manual or root / "manuals" / f"coding_manual_v{args.manual_version}.md",
         scenario_version=args.scenario_version,
         seed=args.seed,
     )
@@ -74,6 +75,9 @@ def _analysis_command(args: argparse.Namespace) -> int:
             quality_thresholds_path=root / "settings" / "quality_thresholds_v1.json",
             repository_root=root.parents[1],
             assignments_root=assignments,
+            manual_path=args.manual or root / "manuals" / (
+                "coding_manual_v0.1.md" if round_name == "calibration" else "coding_manual_v1.0.md"
+            ),
         )
     except ValueError as exc:
         print(f"FAIL: {exc}")
@@ -124,6 +128,7 @@ def _semantic_gate_command(args: argparse.Namespace) -> int:
         assignments_root=root / "assignments" / "round_validation",
         coverage_path=root / "hidden" / "coverage_tags.jsonl",
         pair_design_path=root / "hidden" / "pair_design.jsonl",
+        manual_path=args.manual or root / "manuals" / "coding_manual_v1.0.md",
     )
     output = args.output or root / "manifests" / "gate_b_semantic_reliability.json"
     write_gate_result(output, result)
@@ -197,6 +202,8 @@ def _reference_set_command(args: argparse.Namespace) -> int:
             quality_thresholds_path=analysis_manifest["quality_threshold_file"]["path"],
             anchor_reference_path=analysis_manifest["anchor_reference_file"]["path"],
             anchor_review_decisions_path=analysis_manifest["anchor_review_decisions_path"],
+            manual_path=args.manual,
+            assignments_root=args.assignments_root,
         )
         records = build_reference_set(
             annotation_documents=documents,
@@ -286,6 +293,7 @@ def _import_ai_output_command(args: argparse.Namespace) -> int:
             scenario_id=args.scenario_id,
             assignment_path=assignment_root / f"module_{args.module.lower()}.jsonl",
             assignment_manifest_path=assignment_root / "manifest.json",
+            manual_path=root / "manuals" / "coding_manual_v0.1.md",
             raw_output_path=args.input,
             raw_output_schema_path=root / "schemas" / "ai_output.schema.json",
             output_dir=output_dir,
@@ -322,6 +330,8 @@ def _export_annotations_command(args: argparse.Namespace) -> int:
                 annotator_id=args.annotator,
                 module=module,
                 assignment_path=assignment_root / f"module_{module.lower()}.jsonl",
+                assignment_manifest_path=assignment_root / "manifest.json",
+                manual_path=root / "manuals" / "coding_manual_v0.1.md",
                 draft_dir=draft_root / f"module_{module.lower()}",
                 output_path=output_root / f"module_{module.lower()}.jsonl",
             )
@@ -373,6 +383,7 @@ def _add_analysis_parser(
     command.add_argument("--coverage", type=Path)
     command.add_argument("--pair-design", type=Path)
     command.add_argument("--assignments-root", type=Path)
+    command.add_argument("--manual", type=Path)
     command.add_argument("--output-dir", type=Path)
     command.set_defaults(handler=_analysis_command, analysis_kind=analysis_kind)
 
@@ -457,6 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assignments.add_argument("--round", dest="round_name", choices=("calibration",), required=True)
     assignments.add_argument("--manual-version", default="0.1")
+    assignments.add_argument("--manual", type=Path)
     assignments.add_argument("--scenario-version", default="0.1")
     assignments.add_argument("--seed", type=int, default=12001)
     assignments.add_argument("--scenarios", type=Path)

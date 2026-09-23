@@ -154,12 +154,14 @@ class AdjudicationStore:
                 coverage_path=self.session.coverage_path,
                 pair_design_path=self.session.pair_design_path,
                 quality_thresholds_path=self.session.quality_thresholds_path,
+                manual_path=self.session.manual_path,
+                assignments_root=self.session.assignments_root,
             )
         except ValueError as exc:
             raise RuntimeError(f"adjudication is unavailable; {exc}") from exc
         queue_path = self.analysis_root / "disagreement_queue.jsonl"
         assignments_root = self.session.assignments_root
-        _, assigned_scenarios = expected_submission_documents(assignments_root)
+        _, assigned_scenarios, _ = expected_submission_documents(assignments_root)
         scenario_context = {
             scenario_id: scenario
             for (_, scenario_id), scenario in assigned_scenarios.items()

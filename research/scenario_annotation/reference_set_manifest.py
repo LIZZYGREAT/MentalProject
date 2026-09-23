@@ -44,19 +44,22 @@ def build_reference_set_manifest(
     annotation_hash = sha256_fileset(annotation_paths)
     scenario_hash = sha256_fileset(scenarios)
     manual_hash = sha256_file(manual_path)
+    assignment_hash = sha256_fileset(assignment_paths)
     source_analysis = load_json(analysis_path)
     if source_analysis.get("annotation_fileset_sha256") != annotation_hash:
         raise ValueError("source analysis manifest does not match current annotation files")
     if source_analysis.get("scenario_fileset_sha256") != scenario_hash:
         raise ValueError("source analysis manifest does not match current scenario files")
-    if source_analysis.get("manual_sha256") not in (None, manual_hash):
+    if source_analysis.get("manual_sha256") != manual_hash:
         raise ValueError("source analysis manifest does not match the current coding manual")
+    if source_analysis.get("assignment_fileset_sha256") != assignment_hash:
+        raise ValueError("source analysis manifest does not match current assignment files")
 
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_analysis_manifest_sha256": sha256_file(analysis_path),
         "annotation_fileset_sha256": annotation_hash,
-        "assignment_fileset_sha256": sha256_fileset(assignment_paths),
+        "assignment_fileset_sha256": assignment_hash,
         "manual_sha256": manual_hash,
         "scenario_fileset_sha256": scenario_hash,
         "reference_set_sha256": sha256_file(reference),

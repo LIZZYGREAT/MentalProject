@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..assignments import verify_assignment_manifest
 from ..loader import load_json, load_jsonl
 
 
@@ -57,11 +58,14 @@ def export_ai_packets(
         raise ValueError("prompt packets are only available for AI-A, AI-B, and AI-C")
     if module not in MODULE_MARKERS:
         raise ValueError(f"unknown module: {module}")
-    manifest = load_json(assignment_manifest_path)
-    if manifest.get("annotator_id") != annotator_id:
-        raise ValueError("assignment manifest annotator does not match requested annotator")
-    if manifest.get("annotation_round") != annotation_round:
-        raise ValueError("assignment manifest round does not match requested round")
+    manifest = verify_assignment_manifest(
+        assignment_manifest_path,
+        manual_path=manual_path,
+        assignment_path=assignment_path,
+        annotator_id=annotator_id,
+        annotation_round=annotation_round,
+        module=module,
+    )
     scenarios = load_jsonl(assignment_path)
     if any(scenario.get("annotation_modules") != [module] for scenario in scenarios):
         raise ValueError("assignment contains a scenario view for another module")
@@ -108,6 +112,7 @@ def export_ai_packets(
         "annotator_id": annotator_id,
         "annotation_module": module,
         "manual_version": manifest["manual_version"],
+        "manual_sha256": manifest["manual_sha256"],
         "scenario_count": len(scenarios),
         "packet_sha256": packet_digests,
     }

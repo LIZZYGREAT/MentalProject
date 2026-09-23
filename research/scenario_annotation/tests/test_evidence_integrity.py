@@ -39,6 +39,7 @@ def _document(module: str, records: list[dict]) -> dict:
         "annotator_id": "AI-A",
         "annotation_round": "CALIBRATION",
         "manual_version": "0.1",
+        "manual_sha256": "a" * 64,
         "scenario_validity": {
             "scenario_valid": "YES",
             "scenario_plausibility": "HIGH",

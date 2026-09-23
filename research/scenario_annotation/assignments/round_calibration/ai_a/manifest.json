@@ -23,6 +23,7 @@
       "sha256": "6481640e0ddb2d86c56cd598ff44fbff47672c2653064f9380707e80619b4f66"
     }
   ],
+  "manual_sha256": "435479a3a13027bfbc17afb694f0785d5fe0e8dcf47c75b9022c5cfdbe6d4e53",
   "manual_version": "0.1",
   "randomization_seed": 12001,
   "scenario_version": "0.1"

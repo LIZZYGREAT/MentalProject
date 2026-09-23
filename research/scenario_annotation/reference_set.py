@@ -61,7 +61,7 @@ def build_reference_set(
     integrity = check_submission_integrity(assignments_root, annotation_documents)
     if not integrity.ok:
         raise ValueError("SUBMISSION_INCOMPLETE: " + integrity.detail())
-    expected_documents, _ = expected_submission_documents(assignments_root)
+    expected_documents, _, _ = expected_submission_documents(assignments_root)
     scenario_index = {str(scenario["scenario_id"]): scenario for scenario in scenarios}
     expected = expected_reference_keys(scenario_index.values())
     grouped: dict[ReferenceKey, list[Any]] = defaultdict(list)

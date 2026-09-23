@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .assignments import verify_assignment_manifest
 from .loader import load_json
 
 
@@ -32,7 +33,8 @@ class AnnotationSession:
     ) -> "AnnotationSession":
         root = Path(package_root).resolve()
         assignment_root = root / "assignments" / f"round_{round_name}" / annotator_slug(annotator_id)
-        manifest = load_json(assignment_root / "manifest.json")
+        manifest_path = assignment_root / "manifest.json"
+        manifest = load_json(manifest_path)
         expected_round = round_name.upper()
         if manifest.get("annotator_id") != annotator_id:
             raise ValueError("assignment manifest annotator does not match the requested session")
@@ -42,6 +44,12 @@ class AnnotationSession:
         manual_path = root / "manuals" / f"coding_manual_v{manual_version}.md"
         if not manual_path.exists():
             raise ValueError(f"manual selected by assignment manifest does not exist: {manual_path}")
+        manifest = verify_assignment_manifest(
+            manifest_path,
+            manual_path=manual_path,
+            annotator_id=annotator_id,
+            annotation_round=expected_round,
+        )
         return cls(
             package_root=root,
             round_name=round_name,
@@ -77,7 +85,8 @@ class AdjudicationSession:
     def resolve(cls, package_root: str | Path, *, round_name: str) -> "AdjudicationSession":
         root = Path(package_root).resolve()
         assignments_root = root / "assignments" / f"round_{round_name}"
-        manifests = [load_json(path) for path in sorted(assignments_root.glob("*/manifest.json"))]
+        manifest_paths = sorted(assignments_root.glob("*/manifest.json"))
+        manifests = [load_json(path) for path in manifest_paths]
         if not manifests:
             raise ValueError(f"no assignment manifests found for round {round_name}")
         versions = {str(manifest["manual_version"]) for manifest in manifests}
@@ -86,6 +95,14 @@ class AdjudicationSession:
             raise ValueError("round assignment manifests do not share one manual/round configuration")
         manual_version = versions.pop()
         manual_path = root / "manuals" / f"coding_manual_v{manual_version}.md"
+        manifests = [
+            verify_assignment_manifest(
+                manifest_path,
+                manual_path=manual_path,
+                annotation_round=round_name.upper(),
+            )
+            for manifest_path in manifest_paths
+        ]
         if round_name == "calibration":
             scenario_paths = (root / "scenarios" / "calibration.jsonl",)
         else:

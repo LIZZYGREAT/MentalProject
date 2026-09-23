@@ -16,6 +16,10 @@ from research.scenario_annotation.gates import (
 
 def _write_submission_fixture(root: Path, *, round_name: str, manual_version: str) -> list[dict]:
     documents = []
+    manual_path = root.parent.parent / "manuals" / f"coding_manual_v{manual_version}.md"
+    manual_path.parent.mkdir(parents=True, exist_ok=True)
+    manual_path.write_text("test coding manual\n", encoding="utf-8")
+    manual_sha = sha256_file(manual_path)
     scenario = {
         "scenario_id": "S1",
         "scenario_version": "1.0",
@@ -25,13 +29,31 @@ def _write_submission_fixture(root: Path, *, round_name: str, manual_version: st
     for annotator in ("AI-A", "AI-B", "AI-C", "Human"):
         assignment = root / annotator.lower().replace("-", "_")
         assignment.mkdir(parents=True)
-        (assignment / "module_c.jsonl").write_text(json.dumps(scenario) + "\n", encoding="utf-8")
+        manifest_files = []
+        for module in ("A", "B", "C"):
+            path = assignment / f"module_{module.lower()}.jsonl"
+            rows = [scenario] if module == "C" else []
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            manifest_files.append(
+                {
+                    "module": module,
+                    "path": path.name,
+                    "scenario_count": len(rows),
+                    "sha256": sha256_file(path),
+                }
+            )
         (assignment / "manifest.json").write_text(
             json.dumps(
                 {
+                    "assignment_version": "1.0",
                     "annotator_id": annotator,
                     "annotation_round": round_name,
-                    "files": [{"module": "C", "path": "module_c.jsonl"}],
+                    "manual_version": manual_version,
+                    "manual_sha256": manual_sha,
+                    "scenario_version": "1.0",
+                    "randomization_seed": 17,
+                    "counterbalance_rule": "fixture",
+                    "files": manifest_files,
                 }
             ),
             encoding="utf-8",
@@ -52,6 +74,7 @@ def _write_submission_fixture(root: Path, *, round_name: str, manual_version: st
                 "annotator_id": annotator,
                 "annotation_round": round_name,
                 "manual_version": manual_version,
+                "manual_sha256": manual_sha,
                 "records": records,
             }
         )
