@@ -61,7 +61,7 @@ def _counterbalanced_ids(
     annotator_index: int,
 ) -> set[str]:
     selected = {str(scenario["scenario_id"]) for scenario in scenarios}
-    presentation_pairs = [pair for pair in pairs if pair.get("manipulated_factor") == "presentation_mode"]
+    presentation_pairs = [pair for pair in pairs if pair.get("comparison_mode") == "BETWEEN_GROUPS"]
     for pair_index, pair in enumerate(sorted(presentation_pairs, key=lambda item: str(item["pair_id"]))):
         left, right = (str(item) for item in pair["scenario_ids"])
         keep = (left, right)[(annotator_index + pair_index) % 2]

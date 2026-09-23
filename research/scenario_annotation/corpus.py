@@ -313,28 +313,44 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
     artifacts.append(_scenario(24, 1, "STRUCTURED", ["A", "C"], "Known now vs known later", "当前时间为 15:00。日历仍显示 16:00 与导师会面，系统查询结果为 pending，尚未收到取消通知。机器人在 14:50 建议先用两分钟整理最想问的一个问题。", ["KNOWN_AT", "FUTURE_LEAKAGE", "BOT_RELEVANCE", "REVISION_TIMING", "RECOVERY_SUGGESTION"], focal_events=[appointment], recent=recent, bot_units=bot, cutoff=cutoff))
 
     pairs = [
-        _pair("PRES_SCHEDULED", ["CAL_001", "CAL_002"], "presentation_mode", ["LIFECYCLE"], ["EVENT_FAMILY", "EXECUTION_EXPOSURE"], ["NATURAL_STRUCTURED", "COURSE"], "同一 scheduled-only 事实的 natural/structured 双版本。"),
-        _pair("PRES_PARTIAL_INTERVAL", ["CAL_003", "CAL_004"], "presentation_mode", ["PARTIAL_ENCODING_BASIS"], ["LIFECYCLE", "EXECUTION_EXPOSURE"], ["NATURAL_STRUCTURED", "PARTIAL"], "同一 actual interval partial 的双版本。"),
-        _pair("PRES_PARTIAL_FRACTION", ["CAL_005", "CAL_006"], "presentation_mode", ["PARTIAL_ENCODING_BASIS"], ["LIFECYCLE", "EXECUTION_EXPOSURE"], ["NATURAL_STRUCTURED", "PARTIAL"], "同一 fraction-only partial 的双版本。"),
-        _pair("PRES_SKIPPED", ["CAL_007", "CAL_008"], "presentation_mode", ["LIFECYCLE"], ["OBLIGATION_EXISTS"], ["NATURAL_STRUCTURED", "MISSED_NOT_OBLIGATION"], "同一明确缺席且无补做 commitment 的双版本。"),
-        _pair("CONTRAST_MISSED_OBLIGATION", ["CAL_008", "CAL_009"], "catch_up_commitment", ["OBLIGATION_EXISTS"], ["COURSE_LIFECYCLE"], ["OBLIGATION", "MINIMAL_CONTRAST"], "只在第二个场景加入实际未来行动承诺。"),
-        _pair("CONTRAST_RECOVERY_FIT", ["CAL_016", "CAL_017"], "explicit_recovery_fit_evidence", ["F_REC"], ["RECOVERY_OCCURRENCE", "R_POT"], ["RECOVERY", "APPRAISAL"], "活动均发生，只有第二个有 participant-specific fit evidence。"),
-        _pair("CONTRAST_DIFFICULTY_CEXEC", ["CAL_018", "CAL_019"], "explicit_c_exec_evidence", ["C_EXEC"], ["D_POT"], ["APPRAISAL", "CROSS_LAYER_TRAP"], "objective task requirements 保持不变。"),
-        _pair("CONTRAST_UNCERTAINTY_2X2", ["CAL_022", "CAL_023"], "structural_vs_perceived_uncertainty", ["U_CONTEXT", "U_PERC"], ["EVENT_FAMILY"], ["U_CONTEXT", "U_PERC", "ORTHOGONAL"], "构造 high/low 与 low/high 的交叉边界。"),
+        _pair("PRES_SCHEDULED", ["CAL_001", "CAL_002"], "presentation_mode", [], ["EVENT_FAMILY", "LIFECYCLE", "EXECUTION_EXPOSURE"], ["NATURAL_STRUCTURED", "COURSE"], "同一 scheduled-only 事实的 natural/structured 双版本。", "PRESENTATION_EQUIVALENCE", "BETWEEN_GROUPS", {"LIFECYCLE": {"left_target_ref": "E_COURSE_SCHEDULED", "right_target_ref": "E_COURSE_SCHEDULED"}, "EXECUTION_EXPOSURE": {"left_target_ref": "E_COURSE_SCHEDULED", "right_target_ref": "E_COURSE_SCHEDULED"}}),
+        _pair("PRES_PARTIAL_INTERVAL", ["CAL_003", "CAL_004"], "presentation_mode", [], ["EVENT_FAMILY", "LIFECYCLE", "EXECUTION_EXPOSURE", "PARTIAL_ENCODING_BASIS"], ["NATURAL_STRUCTURED", "PARTIAL"], "同一 actual interval partial 的 natural/structured 双版本。", "PRESENTATION_EQUIVALENCE", "BETWEEN_GROUPS", {"LIFECYCLE": {"left_target_ref": "E_COURSE_PARTIAL_INTERVAL", "right_target_ref": "E_COURSE_PARTIAL_INTERVAL"}, "EXECUTION_EXPOSURE": {"left_target_ref": "E_COURSE_PARTIAL_INTERVAL", "right_target_ref": "E_COURSE_PARTIAL_INTERVAL"}, "PARTIAL_ENCODING_BASIS": {"target_variable": "EXECUTION_EXPOSURE", "record_attribute": "partial_encoding_basis", "left_target_ref": "E_COURSE_PARTIAL_INTERVAL", "right_target_ref": "E_COURSE_PARTIAL_INTERVAL"}}),
+        _pair("PRES_PARTIAL_FRACTION", ["CAL_005", "CAL_006"], "presentation_mode", [], ["EVENT_FAMILY", "LIFECYCLE", "EXECUTION_EXPOSURE", "PARTIAL_ENCODING_BASIS"], ["NATURAL_STRUCTURED", "PARTIAL"], "同一 fraction-only partial 的 natural/structured 双版本。", "PRESENTATION_EQUIVALENCE", "BETWEEN_GROUPS", {"LIFECYCLE": {"left_target_ref": "E_COURSE_PARTIAL_FRACTION", "right_target_ref": "E_COURSE_PARTIAL_FRACTION"}, "EXECUTION_EXPOSURE": {"left_target_ref": "E_COURSE_PARTIAL_FRACTION", "right_target_ref": "E_COURSE_PARTIAL_FRACTION"}, "PARTIAL_ENCODING_BASIS": {"target_variable": "EXECUTION_EXPOSURE", "record_attribute": "partial_encoding_basis", "left_target_ref": "E_COURSE_PARTIAL_FRACTION", "right_target_ref": "E_COURSE_PARTIAL_FRACTION"}}),
+        _pair("PRES_SKIPPED", ["CAL_007", "CAL_008"], "presentation_mode", [], ["EVENT_FAMILY", "LIFECYCLE", "OBLIGATION_EXISTS"], ["NATURAL_STRUCTURED", "MISSED_NOT_OBLIGATION"], "同一明确缺席且无补做 commitment 的 natural/structured 双版本。", "PRESENTATION_EQUIVALENCE", "BETWEEN_GROUPS", {"LIFECYCLE": {"left_target_ref": "E_COURSE_SKIPPED", "right_target_ref": "E_COURSE_SKIPPED"}, "OBLIGATION_EXISTS": {"left_target_ref": "E_COURSE_SKIPPED", "right_target_ref": "E_COURSE_SKIPPED"}}),
+        _pair("CONTRAST_MISSED_OBLIGATION", ["CAL_008", "CAL_009"], "catch_up_commitment", ["OBLIGATION_EXISTS"], [], ["OBLIGATION", "MINIMAL_CONTRAST"], "只在第二个场景加入实际未来行动承诺；比较明确标注的 missed course 与 catch-up obligation。", "MINIMAL_CONTRAST", "WITHIN_ANNOTATOR", {"OBLIGATION_EXISTS": {"left_target_ref": "E_COURSE_SKIPPED", "right_target_ref": "E_COURSE_CATCHUP"}}),
+        _pair("CONTRAST_RECOVERY_FIT", ["CAL_016", "CAL_017"], "explicit_recovery_fit_evidence", ["F_REC"], ["RECOVERY_OCCURRENCE", "R_POT"], ["RECOVERY", "APPRAISAL"], "活动均发生，只有第二个有 participant-specific fit evidence。", "MINIMAL_CONTRAST", "WITHIN_ANNOTATOR", {"F_REC": {"left_target_ref": "E_WALK", "right_target_ref": "E_WALK_FIT"}, "RECOVERY_OCCURRENCE": {"left_target_ref": "E_WALK", "right_target_ref": "E_WALK_FIT"}, "R_POT": {"left_target_ref": "E_WALK", "right_target_ref": "E_WALK_FIT"}}),
+        _pair("CONTRAST_DIFFICULTY_CEXEC", ["CAL_018", "CAL_019"], "explicit_c_exec_evidence", ["C_EXEC"], ["D_POT"], ["APPRAISAL", "CROSS_LAYER_TRAP"], "objective task requirements 保持不变。", "MINIMAL_CONTRAST", "WITHIN_ANNOTATOR", {"C_EXEC": {"left_target_ref": "E_HARD_TASK", "right_target_ref": "E_HARD_TASK_LOW_CEXEC"}, "D_POT": {"left_target_ref": "E_HARD_TASK", "right_target_ref": "E_HARD_TASK_LOW_CEXEC"}}),
+        _pair("CONTRAST_UNCERTAINTY_2X2", ["CAL_022", "CAL_023"], "structural_vs_perceived_uncertainty", ["U_CONTEXT", "U_PERC"], [], ["U_CONTEXT", "U_PERC", "ORTHOGONAL"], "两个因素形成交叉边界：结构信息清楚程度与个体主观不确定性分别变化。", "ORTHOGONAL_CROSS", "WITHIN_ANNOTATOR", {"U_CONTEXT": {"left_target_ref": "E_RULES_UNKNOWN", "right_target_ref": "E_RULES_CLEAR"}, "U_PERC": {"left_target_ref": "E_RULES_UNKNOWN", "right_target_ref": "E_RULES_CLEAR"}}),
     ]
     return artifacts, pairs
 
 
-def _pair(pair_id: str, scenario_ids: list[str], factor: str, sensitive: list[str], invariant: list[str], tags: list[str], notes: str) -> dict[str, Any]:
-    return {
+def _pair(
+    pair_id: str,
+    scenario_ids: list[str],
+    factor: str,
+    sensitive: list[str],
+    invariant: list[str],
+    tags: list[str],
+    notes: str,
+    pair_kind: str,
+    comparison_mode: str,
+    target_mapping: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    pair = {
         "pair_id": pair_id,
         "scenario_ids": scenario_ids,
         "manipulated_factor": factor,
+        "comparison_mode": comparison_mode,
+        "pair_kind": pair_kind,
         "expected_sensitive_constructs": sensitive,
         "expected_invariant_constructs": invariant,
         "coverage_tags": tags,
         "design_notes": notes,
     }
+    if target_mapping:
+        pair["target_mapping"] = target_mapping
+    return pair
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:

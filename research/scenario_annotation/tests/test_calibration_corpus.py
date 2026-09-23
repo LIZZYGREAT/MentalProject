@@ -1,7 +1,11 @@
 import json
+from pathlib import Path
 
 from research.scenario_annotation.corpus import build_calibration, write_calibration
 from research.scenario_annotation.validation import FORBIDDEN_VISIBLE_KEYS, Validator
+
+
+PACKAGE_ROOT = Path(__file__).parents[1]
 
 
 def test_calibration_has_24_scenarios_and_four_six_window_packs() -> None:
@@ -86,3 +90,62 @@ def test_presentation_pairs_are_natural_structured_counterparts() -> None:
         assert {left["presentation_mode"], right["presentation_mode"]} == {"NATURAL", "STRUCTURED"}
         assert left["focal_events"] == right["focal_events"]
         assert left["observed_conversation_evidence"] == right["observed_conversation_evidence"]
+
+
+def test_pair_design_declares_comparison_semantics_and_maps_all_constructs() -> None:
+    artifacts, pairs = build_calibration()
+    scenarios = {item.visible["scenario_id"]: item.visible for item in artifacts}
+    presentation = [pair for pair in pairs if pair["pair_kind"] == "PRESENTATION_EQUIVALENCE"]
+    assert len(presentation) == 4
+    assert all(pair["comparison_mode"] == "BETWEEN_GROUPS" for pair in presentation)
+    assert all(pair["expected_sensitive_constructs"] == [] for pair in presentation)
+    interval_pair = next(pair for pair in presentation if pair["pair_id"] == "PRES_PARTIAL_INTERVAL")
+    assert interval_pair["target_mapping"]["PARTIAL_ENCODING_BASIS"] == {
+        "target_variable": "EXECUTION_EXPOSURE",
+        "record_attribute": "partial_encoding_basis",
+        "left_target_ref": "E_COURSE_PARTIAL_INTERVAL",
+        "right_target_ref": "E_COURSE_PARTIAL_INTERVAL",
+    }
+    path = PACKAGE_ROOT / "hidden" / "pair_design.jsonl"
+    result = Validator().validate_paths(
+        [path],
+        "pair-design",
+        scenarios=scenarios,
+    )
+    assert result.ok, [str(issue) for issue in result.issues]
+
+
+def test_pair_design_rejects_unknown_construct_and_ambiguous_target(tmp_path) -> None:
+    scenarios = {
+        "LEFT": {
+            "scenario_id": "LEFT",
+            "annotation_modules": ["A"],
+            "focal_events": [{"event_ref": "E1"}, {"event_ref": "E2"}],
+            "current_tasks": [],
+            "bot_response_units": [],
+        },
+        "RIGHT": {
+            "scenario_id": "RIGHT",
+            "annotation_modules": ["A"],
+            "focal_events": [{"event_ref": "E3"}],
+            "current_tasks": [],
+            "bot_response_units": [],
+        },
+    }
+    pair = {
+        "pair_id": "BAD",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "manipulated_factor": "test",
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "pair_kind": "MINIMAL_CONTRAST",
+        "expected_sensitive_constructs": ["COURSE_LIFECYCLE", "LIFECYCLE"],
+        "expected_invariant_constructs": [],
+        "coverage_tags": ["TEST"],
+        "design_notes": "invalid mappings must fail closed",
+    }
+    path = tmp_path / "pairs.jsonl"
+    path.write_text(json.dumps(pair) + "\n", encoding="utf-8")
+    result = Validator().validate_paths([path], "pair-design", scenarios=scenarios)
+    codes = {issue.code for issue in result.issues}
+    assert "PAIR_UNKNOWN_CONSTRUCT" in codes
+    assert "PAIR_AMBIGUOUS_TARGET" in codes

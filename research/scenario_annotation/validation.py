@@ -11,7 +11,7 @@ import unicodedata
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from .annotation_catalog import EVENT_SUBTYPES, LIFECYCLES
+from .annotation_catalog import BY_VARIABLE, EVENT_SUBTYPES, LIFECYCLES
 from .loader import ArtifactLoadError, iter_artifacts, load_json
 
 
@@ -123,6 +123,8 @@ class Validator:
                     issues.append(ValidationIssue(source, json_path, error.message, "SCHEMA"))
                 if artifact_type == "scenario":
                     issues.extend(self._scenario_semantics(value, source))
+                elif artifact_type == "pair-design":
+                    issues.extend(self._pair_design_semantics(value, source, scenarios))
                 elif artifact_type.endswith("annotation"):
                     scenario = scenarios.get(str(value.get("scenario_id"))) if scenarios else None
                     issues.extend(
@@ -136,6 +138,85 @@ class Validator:
         except ArtifactLoadError as exc:
             issues.append(ValidationIssue(str(next(iter(paths), "artifact")), "", str(exc), "LOAD"))
         return ValidationResult(checked=checked, issues=tuple(issues))
+
+    def _pair_design_semantics(
+        self,
+        pair: Mapping[str, Any],
+        source: str,
+        scenarios: Mapping[str, Mapping[str, Any]] | None,
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        sensitive = [str(value) for value in pair.get("expected_sensitive_constructs", [])]
+        invariant = [str(value) for value in pair.get("expected_invariant_constructs", [])]
+        expectations = list(dict.fromkeys((*sensitive, *invariant)))
+        mappings = pair.get("target_mapping", {})
+        if set(sensitive) & set(invariant):
+            issues.append(ValidationIssue(source, "", "construct cannot be both sensitive and invariant", "PAIR_EXPECTATION_CONFLICT"))
+        if not expectations:
+            issues.append(ValidationIssue(source, "", "pair must declare at least one expected construct", "PAIR_EXPECTATION_EMPTY"))
+
+        kind = pair.get("pair_kind")
+        mode = pair.get("comparison_mode")
+        required_mode = "BETWEEN_GROUPS" if kind == "PRESENTATION_EQUIVALENCE" else "WITHIN_ANNOTATOR"
+        if kind in {"PRESENTATION_EQUIVALENCE", "MINIMAL_CONTRAST", "ORTHOGONAL_CROSS"} and mode != required_mode:
+            issues.append(ValidationIssue(source, "/comparison_mode", f"{kind} requires {required_mode}", "PAIR_COMPARISON_MODE"))
+        if kind == "PRESENTATION_EQUIVALENCE" and sensitive:
+            issues.append(ValidationIssue(source, "/expected_sensitive_constructs", "presentation equivalence expects semantic invariance, not sensitivity", "PAIR_PRESENTATION_SENSITIVE"))
+
+        record_properties = self._schema("event-annotation").get("$defs", {}).get("record", {}).get("properties", {})
+        pair_scenarios: list[Mapping[str, Any] | None] = [None, None]
+        if scenarios is not None:
+            scenario_ids = [str(value) for value in pair.get("scenario_ids", [])]
+            pair_scenarios = [scenarios.get(scenario_id) for scenario_id in scenario_ids]
+            for index, scenario in enumerate(pair_scenarios):
+                if scenario is None:
+                    issues.append(ValidationIssue(source, f"/scenario_ids/{index}", "pair references a scenario missing from the supplied corpus", "PAIR_SCENARIO_MISSING"))
+
+        for construct in expectations:
+            mapping = mappings.get(construct, {}) if isinstance(mappings, Mapping) else {}
+            target_variable = str(mapping.get("target_variable", construct)) if isinstance(mapping, Mapping) else construct
+            record_attribute = str(mapping.get("record_attribute", "")) if isinstance(mapping, Mapping) else ""
+            spec = BY_VARIABLE.get(target_variable)
+            if spec is None:
+                issues.append(ValidationIssue(source, f"/target_mapping/{construct}", f"{construct!r} does not map to an Annotation Catalog variable", "PAIR_UNKNOWN_CONSTRUCT"))
+                continue
+            if construct != target_variable and not record_attribute:
+                issues.append(ValidationIssue(source, f"/target_mapping/{construct}", "a construct alias must declare a record_attribute target", "PAIR_TARGET_MAPPING"))
+            if record_attribute and record_attribute not in record_properties:
+                issues.append(ValidationIssue(source, f"/target_mapping/{construct}/record_attribute", f"unknown annotation record attribute {record_attribute!r}", "PAIR_UNKNOWN_RECORD_ATTRIBUTE"))
+
+            if scenarios is None or any(scenario is None for scenario in pair_scenarios):
+                continue
+            explicit_left = mapping.get("left_target_ref") if isinstance(mapping, Mapping) else None
+            explicit_right = mapping.get("right_target_ref") if isinstance(mapping, Mapping) else None
+            resolved_refs: list[str | None] = []
+            for side, scenario, explicit in zip(("left", "right"), pair_scenarios, (explicit_left, explicit_right)):
+                assert scenario is not None
+                if spec.module == "C":
+                    candidates = [str(row.get("response_unit_ref", "")) for row in scenario.get("bot_response_units", [])]
+                else:
+                    candidates = list(dict.fromkeys(
+                        str(row.get("event_ref", ""))
+                        for collection in ("focal_events", "current_tasks")
+                        for row in scenario.get(collection, [])
+                        if row.get("event_ref")
+                    ))
+                if explicit:
+                    target_ref = str(explicit)
+                    if target_ref not in candidates:
+                        issues.append(ValidationIssue(source, f"/target_mapping/{construct}/{side}_target_ref", f"target {target_ref!r} is not an annotation target in scenario {scenario.get('scenario_id')}", "PAIR_TARGET_NOT_FOUND"))
+                    resolved_refs.append(target_ref)
+                elif len(candidates) == 1:
+                    resolved_refs.append(candidates[0])
+                elif len(candidates) > 1:
+                    issues.append(ValidationIssue(source, f"/target_mapping/{construct}", f"scenario {scenario.get('scenario_id')} has multiple targets; add an explicit {side}_target_ref", "PAIR_AMBIGUOUS_TARGET"))
+                    resolved_refs.append(None)
+                else:
+                    issues.append(ValidationIssue(source, f"/target_mapping/{construct}", f"scenario {scenario.get('scenario_id')} has no target for {target_variable}", "PAIR_TARGET_NOT_FOUND"))
+                    resolved_refs.append(None)
+            if (explicit_left is None) != (explicit_right is None) and any(ref is None for ref in resolved_refs):
+                issues.append(ValidationIssue(source, f"/target_mapping/{construct}", "both sides must resolve to one unambiguous target", "PAIR_TARGET_MAPPING"))
+        return issues
 
     def _scenario_semantics(self, scenario: Mapping[str, Any], source: str) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
