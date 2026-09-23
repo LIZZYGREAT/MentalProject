@@ -63,3 +63,30 @@ def test_catalog_variables_match_schema_and_manual() -> None:
         variables = {spec.variable for spec in field_specs(module)}
         assert variables == _schema_variable_enum(module)
         assert all(variable in manual for variable in variables)
+
+
+def _schema_label_options(module: str) -> dict[str, set]:
+    schema_name = {"A": "event_annotation.schema.json", "B": "appraisal_annotation.schema.json", "C": "bot_annotation.schema.json"}[module]
+    schema = load_json(PACKAGE / "schemas" / schema_name)
+    record = schema["$defs"]["record"] if module == "A" else schema["properties"]["records"]["items"]
+    global_labels = record["properties"]["label"].get("enum")
+    if global_labels is not None:
+        return {spec.variable: set(global_labels) for spec in field_specs(module) if spec.options}
+    options: dict[str, set] = {}
+    for condition in record.get("allOf", []):
+        variables = condition["if"]["properties"]["variable"]
+        names = [variables["const"]] if "const" in variables else variables["enum"]
+        labels = set(condition["then"]["properties"]["label"]["enum"])
+        options.update({name: labels for name in names})
+    return options
+
+
+def test_catalog_label_options_match_schema_enums() -> None:
+    for module in ("A", "B", "C"):
+        schema_options = _schema_label_options(module)
+        catalog_options = {
+            spec.variable: set(spec.options)
+            for spec in field_specs(module)
+            if spec.options
+        }
+        assert catalog_options == schema_options

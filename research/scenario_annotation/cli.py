@@ -163,7 +163,7 @@ def _reference_set_command(args: argparse.Namespace) -> int:
     from .reference_set import build_reference_set, load_adjudications, write_reference_set
 
     try:
-        scenarios = load_jsonl(args.scenarios)
+        scenarios = [row for path in args.scenarios for row in load_jsonl(path)]
         scenario_index = {str(row["scenario_id"]): row for row in scenarios}
         documents = load_annotation_documents(
             args.annotations_dir,
@@ -475,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="combine unanimous annotations and explicit adjudications into a complete Reference Set",
     )
     reference.add_argument("--annotations-dir", type=Path, required=True)
-    reference.add_argument("--scenarios", type=Path, required=True)
+    reference.add_argument("--scenarios", type=Path, nargs="+", required=True)
     reference.add_argument("--adjudications", type=Path, required=True)
     reference.add_argument("--output", type=Path, required=True)
     reference.set_defaults(handler=_reference_set_command)

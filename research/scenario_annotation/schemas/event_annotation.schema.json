@@ -67,6 +67,7 @@
       },
       "allOf": [
         {"if": {"properties": {"variable": {"const": "EVENT_FAMILY"}}}, "then": {"properties": {"label": {"enum": ["COURSE", "TASK", "STRUCTURED_EVENT", "RECOVERY_ACTIVITY", "SLEEP", "NAP", "CONSEQUENCE_EVENT", "OTHER", "UNKNOWN"]}}}},
+        {"if": {"properties": {"variable": {"const": "PARENT_RELATION"}}}, "then": {"properties": {"label": {"enum": ["NONE", "PARENT_REF", "UNKNOWN", "N/A"]}}}},
         {"if": {"properties": {"variable": {"const": "OBLIGATION_EXISTS"}}}, "then": {"properties": {"label": {"enum": ["YES", "NO", "UNKNOWN"]}}}},
         {"if": {"properties": {"variable": {"enum": ["ACTIVE_LEAF", "CANCELLATION"]}}}, "then": {"properties": {"label": {"enum": ["YES", "NO", "UNKNOWN", "N/A"]}}}},
         {"if": {"properties": {"variable": {"enum": ["D_POT", "U_CONTEXT", "R_POT", "DEADLINE_SCARCITY_BAND"]}}}, "then": {"properties": {"label": {"enum": ["LOW", "MEDIUM", "HIGH", "UNKNOWN", "N/A"]}}}},

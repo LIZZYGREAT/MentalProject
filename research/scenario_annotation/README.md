@@ -67,7 +67,7 @@ Import a returned JSON object through the runner instead of editing system field
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli import-ai-output --round calibration --annotator AI-A --module B --scenario-id CAL_019 --input returned.json --provider provider-a --model model-a --request-id request-001
 ```
 
-The runner owns IDs, versions, annotator/round metadata, timestamps, and provenance.It records provider/model/settings/request/attempt and the raw-output digest, then validates the enriched draft against the exact assignment scenario.
+The runner owns IDs, versions, annotator/round metadata, timestamps, and provenance. It records provider/model/settings/request/attempt and the raw-output digest, then validates the enriched draft against the exact assignment scenario. Transport-valid but incomplete output is rejected by the same completeness contract used by Human drafts, export, gates, and adjudication.
 
 Start the Human calibration UI from the repository root:
 
@@ -75,7 +75,7 @@ Start the Human calibration UI from the repository root:
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.ui --round calibration --annotator Human
 ```
 
-The server listens only on `127.0.0.1`. Annotation mode has fixed backend paths for the Human assignment, Coding Manual, schemas, and Human drafts; it has no reader for hidden design metadata, AI output, Gold, or analysis reports. Drafts are written atomically as one JSON file per Scenario × Module so work can be resumed without rewriting a shared JSONL file.
+The server listens only on `127.0.0.1`. The requested round and annotator are resolved through the assignment manifest, including the selected Coding Manual and draft location; annotation mode has no reader for hidden design metadata, AI output, Gold, or analysis reports. Drafts are written atomically as one JSON file per Scenario × Module so work can be resumed without rewriting a shared JSONL file. The same command naturally supports `--round validation` and `--round reannotation` after their manifests exist.
 
 When every scenario in a module is marked complete, export and revalidate the formal annotation documents:
 
@@ -91,7 +91,7 @@ After all independent annotation documents have passed schema validation, run th
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli analyze --round calibration
 ```
 
-The pipeline writes `field_metrics.csv`, confusion matrices, critical violation records and rates, orthogonality checks, a disagreement/adjudication queue, and construct-level Markdown reports. It refuses to run on an empty annotation drop and never edits the coding manual automatically.
+The pipeline writes `field_metrics.csv`, confusion matrices, semantic violation records and eligible-opportunity rates, an explicit Artifact Validity result, orthogonality checks, a disagreement/adjudication queue, construct-level Markdown reports, and `analysis_manifest.json`. The manifest binds the exact annotations, scenarios, hidden design inputs, threshold settings, manual version, and Git revision. Gates and adjudication reject stale analysis after any bound input changes.
 
 Only after all four independent assignment sets have been exported and the full calibration analysis output exists, start the adjudication view:
 
@@ -100,6 +100,14 @@ Only after all four independent assignment sets have been exported and the full 
 ```
 
 It presents all independent labels and evidence, agreement counts, and related critical-violation flags. A reviewer must explicitly enter the final label,reason, and `KEEP` / `REVISE` / `SIMPLIFY` / `DROP` decision; the UI never preselects a majority label.
+
+Build the complete Reference Set after adjudication:
+
+```powershell
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli build-reference-set --annotations-dir <formal-annotations> --scenarios <formal-scenarios.jsonl> --adjudications <adjudication-dir> --output <reference-set.jsonl>
+```
+
+Every required `scenario_id × target_ref × variable` becomes a reference record. Only full unanimity produces `UNANIMOUS`; every disagreement requires an explicit adjudication and produces `ADJUDICATED`. A majority vote never becomes Gold automatically.
 
 Validate completed annotation documents against the exact visible assignment used by that annotator:
 
@@ -124,7 +132,6 @@ After the 96-scenario blind round, evaluate Gate B and then freeze only if every
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli freeze-representation --manual-version 1.0 --scenario-version 1.0
 ```
 
-The freeze command validates prior gates, the final manual, 72 Main + 24 Edge scenarios, formal Gold coverage, and final construct decisions. It will not overwrite an existing versioned manifest.
+The freeze command validates prior gates and their bound analysis manifests, the final manual, 72 Main + 24 Edge scenarios, complete target×variable Reference Set coverage, and final construct decisions. Its immutable manifest includes hashes for the manual, scenario corpus, Reference Set, quality thresholds, analysis inputs, and schema bundle. It will not overwrite an existing versioned manifest.
 
-Gate B separates zero-tolerance protocol violations from semantic misunderstanding rates. The project thresholds are versioned in
-`settings/quality_thresholds_v1.json`; they are engineering settings, not claimed as universal statistical laws.
+Artifact Validity is a strict PASS/FAIL gate for schema, hidden metadata, evidence integrity, temporal boundaries, envelope consistency, and structural double encoding. Semantic misunderstanding metrics are reported separately with their own eligible denominators. The project thresholds are versioned in `settings/quality_thresholds_v1.json`; they are engineering settings, not claimed as universal statistical laws.
