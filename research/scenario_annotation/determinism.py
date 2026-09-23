@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .assignments import ANNOTATORS, build_assignments
+from .artifact_fingerprint import sha256_file
 from .corpus import write_calibration
 
 
@@ -54,6 +55,6 @@ def byte_mismatches(
             mismatches.append(f"missing committed artifact: {relative_path.as_posix()}")
         elif not generated_path.exists():
             mismatches.append(f"generator omitted artifact: {relative_path.as_posix()}")
-        elif committed_path.read_bytes() != generated_path.read_bytes():
+        elif sha256_file(committed_path) != sha256_file(generated_path):
             mismatches.append(f"byte mismatch: {relative_path.as_posix()}")
     return mismatches

@@ -56,7 +56,7 @@ def _analysis_command(args: argparse.Namespace) -> int:
         annotations = root / "annotations" / "calibration"
         output = root / "analysis" / "outputs" / "calibration"
     else:
-        scenarios = root / "scenarios" / ("main.jsonl" if round_name == "validation" else "calibration.jsonl")
+        scenarios = [root / "scenarios" / "main.jsonl", root / "scenarios" / "edge.jsonl"]
         annotations = root / "annotations" / round_name
         output = root / "analysis" / "outputs" / round_name
     only = None if args.analysis_kind == "all" else {args.analysis_kind}
@@ -68,6 +68,8 @@ def _analysis_command(args: argparse.Namespace) -> int:
             pairs_path=args.pair_design or root / "hidden" / "pair_design.jsonl",
             output_dir=args.output_dir or output,
             only=only,
+            quality_thresholds_path=root / "settings" / "quality_thresholds_v1.json",
+            repository_root=root.parents[1],
         )
     except ValueError as exc:
         print(f"FAIL: {exc}")
@@ -88,6 +90,8 @@ def _manual_gate_command(args: argparse.Namespace) -> int:
         analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "calibration",
         revision_log_path=args.revision_log or root / "adjudication" / "representation_revision_log.jsonl",
         assignments_root=root / "assignments" / "round_calibration",
+        pair_design_path=root / "hidden" / "pair_design.jsonl",
+        quality_thresholds_path=root / "settings" / "quality_thresholds_v1.json",
     )
     output = args.output or root / "manifests" / "gate_a_manual_ready.json"
     write_gate_result(output, result)
@@ -108,6 +112,8 @@ def _semantic_gate_command(args: argparse.Namespace) -> int:
         analysis_dir=args.analysis_dir or root / "analysis" / "outputs" / "validation",
         quality_thresholds_path=args.quality_thresholds,
         assignments_root=root / "assignments" / "round_validation",
+        coverage_path=root / "hidden" / "coverage_tags.jsonl",
+        pair_design_path=root / "hidden" / "pair_design.jsonl",
     )
     output = args.output or root / "manifests" / "gate_b_semantic_reliability.json"
     write_gate_result(output, result)

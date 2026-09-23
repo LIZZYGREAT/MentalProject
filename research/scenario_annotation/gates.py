@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .annotation_contract import check_submission_integrity
+from .analysis_manifest import verify_analysis_manifest_current
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
 from .reference_set import expected_reference_keys
@@ -98,6 +99,8 @@ def evaluate_manual_ready(
     analysis_dir: str | Path,
     revision_log_path: str | Path,
     assignments_root: str | Path | None = None,
+    pair_design_path: str | Path | None = None,
+    quality_thresholds_path: str | Path | None = None,
 ) -> GateResult:
     manual_path = Path(manual_path)
     scenarios_path = Path(scenarios_path)
@@ -108,6 +111,8 @@ def evaluate_manual_ready(
         assignments_root
         or scenarios_path.parent.parent / "assignments" / "round_calibration"
     )
+    pair_design_path = Path(pair_design_path or scenarios_path.parent.parent / "hidden" / "pair_design.jsonl")
+    quality_thresholds_path = Path(quality_thresholds_path or Path(__file__).with_name("settings") / "quality_thresholds_v1.json")
 
     def manual_check() -> tuple[bool, str]:
         text = manual_path.read_text(encoding="utf-8")
@@ -145,10 +150,21 @@ def evaluate_manual_ready(
             "artifact_validity.json",
             "disagreement_report.md",
             "scenario_annotation_report.md",
+            "analysis_manifest.json",
         }
         present = {path.name for path in analysis_dir.iterdir()} if analysis_dir.exists() else set()
         missing = sorted(required - present)
-        return not missing, f"missing_analysis_outputs={missing}"
+        if missing:
+            return False, f"missing_analysis_outputs={missing}"
+        verify_analysis_manifest_current(
+            analysis_dir / "analysis_manifest.json",
+            annotations_dir=annotations_dir,
+            scenario_paths=[scenarios_path],
+            coverage_path=coverage_path,
+            pair_design_path=pair_design_path,
+            quality_thresholds_path=quality_thresholds_path,
+        )
+        return True, "analysis outputs complete and input manifest is current"
 
     def revision_check() -> tuple[bool, str]:
         result = Validator().validate_paths([revision_log_path], "revision-log")
@@ -194,6 +210,8 @@ def evaluate_semantic_reliability(
     analysis_dir: str | Path,
     quality_thresholds_path: str | Path | None = None,
     assignments_root: str | Path | None = None,
+    coverage_path: str | Path | None = None,
+    pair_design_path: str | Path | None = None,
 ) -> GateResult:
     main_scenarios_path = Path(main_scenarios_path)
     edge_scenarios_path = Path(edge_scenarios_path)
@@ -206,6 +224,8 @@ def evaluate_semantic_reliability(
         assignments_root
         or main_scenarios_path.parent.parent / "assignments" / "round_validation"
     )
+    coverage_path = Path(coverage_path or main_scenarios_path.parent.parent / "hidden" / "coverage_tags.jsonl")
+    pair_design_path = Path(pair_design_path or main_scenarios_path.parent.parent / "hidden" / "pair_design.jsonl")
 
     def corpus_check() -> tuple[bool, str]:
         main = Validator().validate_paths([main_scenarios_path], "scenario")
@@ -278,10 +298,21 @@ def evaluate_semantic_reliability(
             "disagreement_queue.jsonl",
             "disagreement_report.md",
             "scenario_annotation_report.md",
+            "analysis_manifest.json",
         }
         present = {path.name for path in analysis_dir.iterdir()} if analysis_dir.exists() else set()
         missing = sorted(required - present)
-        return not missing, f"missing_analysis_outputs={missing}"
+        if missing:
+            return False, f"missing_analysis_outputs={missing}"
+        verify_analysis_manifest_current(
+            analysis_dir / "analysis_manifest.json",
+            annotations_dir=annotations_dir,
+            scenario_paths=[main_scenarios_path, edge_scenarios_path],
+            coverage_path=coverage_path,
+            pair_design_path=pair_design_path,
+            quality_thresholds_path=quality_thresholds_path,
+        )
+        return True, "analysis outputs complete and input manifest is current"
 
     checks = (
         _check("formal_corpus_schema_and_count", corpus_check),

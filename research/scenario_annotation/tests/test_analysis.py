@@ -1,12 +1,18 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from research.scenario_annotation.analysis.common import AnnotationRow
 from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality
 from research.scenario_annotation.analysis.pipeline import run_analysis
+from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
 from research.scenario_annotation.corpus import write_calibration
 from research.scenario_annotation.loader import load_jsonl
+
+
+PACKAGE_ROOT = Path(__file__).parents[1]
 
 
 def _row(scenario: str, annotator: str, variable: str, label, target: str, module: str, **extra) -> AnnotationRow:
@@ -138,6 +144,19 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
         "disagreement_queue.jsonl",
         "disagreement_report.md",
         "scenario_annotation_report.md",
+        "analysis_manifest.json",
     }
     assert expected == {path.name for path in output.iterdir()}
     assert "Construct: C_EXEC" in (output / "scenario_annotation_report.md").read_text(encoding="utf-8")
+
+    annotation_path = annotations / "annotation_0.json"
+    annotation_path.write_text(annotation_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="stale analysis manifest"):
+        verify_analysis_manifest_current(
+            output / "analysis_manifest.json",
+            annotations_dir=annotations,
+            scenario_paths=[corpus_root / "scenarios" / "calibration.jsonl"],
+            coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
+            pair_design_path=corpus_root / "hidden" / "pair_design.jsonl",
+            quality_thresholds_path=PACKAGE_ROOT / "settings" / "quality_thresholds_v1.json",
+        )

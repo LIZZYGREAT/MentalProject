@@ -16,6 +16,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from ..annotation_contract import check_submission_integrity, expected_submission_documents
+from ..analysis_manifest import verify_analysis_manifest_current
 from ..ai_runner.packets import _manual_excerpt
 from ..analysis.common import flatten_annotations, load_annotation_documents
 from ..drafts import module_targets, save_human_draft
@@ -138,12 +139,24 @@ class AdjudicationStore:
             "artifact_validity.json",
             "orthogonality.jsonl",
             "scenario_annotation_report.md",
+            "analysis_manifest.json",
         }
         missing_analysis = sorted(
             name for name in required_analysis if not (self.analysis_root / name).exists()
         )
         if missing_analysis:
             raise RuntimeError("adjudication is unavailable until calibration analysis is complete")
+        try:
+            verify_analysis_manifest_current(
+                self.analysis_root / "analysis_manifest.json",
+                annotations_dir=self.annotations_root,
+                scenario_paths=[self.package_root / "scenarios" / "calibration.jsonl"],
+                coverage_path=self.package_root / "hidden" / "coverage_tags.jsonl",
+                pair_design_path=self.package_root / "hidden" / "pair_design.jsonl",
+                quality_thresholds_path=self.package_root / "settings" / "quality_thresholds_v1.json",
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"adjudication is unavailable; {exc}") from exc
         queue_path = self.analysis_root / "disagreement_queue.jsonl"
         assignments_root = self.package_root / "assignments" / "round_calibration"
         _, assigned_scenarios = expected_submission_documents(assignments_root)

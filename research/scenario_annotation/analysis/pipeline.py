@@ -8,9 +8,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from ..analysis_manifest import build_analysis_manifest, write_analysis_manifest
 from ..loader import load_jsonl
 from .agreement import FieldMetric, analyze_agreement
 from .common import (
+    annotation_files,
     flatten_annotations,
     load_annotation_documents,
     load_hidden_by_scenario,
@@ -42,14 +44,25 @@ def write_metrics(path: Path, metrics: list[FieldMetric]) -> None:
 def run_analysis(
     *,
     annotations_dir: str | Path,
-    scenarios_path: str | Path,
+    scenarios_path: str | Path | Iterable[str | Path],
     coverage_path: str | Path,
     pairs_path: str | Path,
     output_dir: str | Path,
     only: set[str] | None = None,
+    quality_thresholds_path: str | Path | None = None,
+    repository_root: str | Path | None = None,
 ) -> dict[str, Any]:
     only = only or {"agreement", "violations", "orthogonality", "disagreement", "report"}
-    scenarios = load_scenarios(scenarios_path)
+    scenario_paths = (
+        [Path(scenarios_path)]
+        if isinstance(scenarios_path, (str, Path))
+        else [Path(path) for path in scenarios_path]
+    )
+    scenarios = {
+        scenario_id: scenario
+        for path in scenario_paths
+        for scenario_id, scenario in load_scenarios(path).items()
+    }
     documents = load_annotation_documents(
         annotations_dir,
         validate=True,
@@ -63,6 +76,10 @@ def run_analysis(
     pairs = load_jsonl(pairs_path)
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    quality_thresholds_path = Path(
+        quality_thresholds_path
+        or Path(__file__).parents[1] / "settings" / "quality_thresholds_v1.json"
+    )
 
     metrics = analyze_agreement(rows)
     violations = find_critical_violations(rows, scenarios, coverage)
@@ -119,6 +136,19 @@ def run_analysis(
             encoding="utf-8",
             newline="\n",
         )
+    manual_versions = {str(document["manual_version"]) for document in documents}
+    if len(manual_versions) != 1:
+        raise ValueError(f"analysis inputs contain multiple manual versions: {sorted(manual_versions)}")
+    manifest = build_analysis_manifest(
+        annotation_paths=annotation_files(annotations_dir),
+        scenario_paths=scenario_paths,
+        coverage_path=coverage_path,
+        pair_design_path=pairs_path,
+        quality_thresholds_path=quality_thresholds_path,
+        manual_version=manual_versions.pop(),
+        repository_root=repository_root or Path(__file__).parents[3],
+    )
+    write_analysis_manifest(root / "analysis_manifest.json", manifest)
     return {
         "documents": len(documents),
         "records": len(rows),
