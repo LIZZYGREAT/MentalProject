@@ -51,6 +51,19 @@ def test_no_annotator_sees_both_presentation_variants(tmp_path) -> None:
         }
         for pair in pairs:
             assert len(assigned.intersection(pair["scenario_ids"])) == 1
+    for pair in pairs:
+        left, right = pair["scenario_ids"]
+        left_count = right_count = 0
+        for annotator in ANNOTATORS:
+            assigned = {
+                row["scenario_id"]
+                for row in load_jsonl(
+                    root / annotator.lower().replace("-", "_") / "module_a.jsonl"
+                )
+            }
+            left_count += left in assigned
+            right_count += right in assigned
+        assert left_count == right_count == len(ANNOTATORS) // 2
 
 
 def test_assignment_views_are_blind_and_purpose_scoped(tmp_path) -> None:

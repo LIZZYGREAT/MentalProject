@@ -137,6 +137,7 @@ class AdjudicationStore:
             "semantic_violation_rates.json",
             "artifact_validity.json",
             "orthogonality.jsonl",
+            "orthogonality_summary.json",
             "scenario_annotation_report.md",
             "analysis_manifest.json",
         }

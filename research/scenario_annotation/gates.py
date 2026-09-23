@@ -151,6 +151,7 @@ def evaluate_manual_ready(
             "field_metrics.csv",
             "semantic_violation_rates.json",
             "artifact_validity.json",
+            "orthogonality_summary.json",
             "disagreement_report.md",
             "scenario_annotation_report.md",
             "analysis_manifest.json",
@@ -167,6 +168,16 @@ def evaluate_manual_ready(
             pair_design_path=pair_design_path,
             quality_thresholds_path=quality_thresholds_path,
         )
+        orthogonality = json.loads(
+            (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
+        )
+        if orthogonality.get("expected_checks", 0) <= 0 or orthogonality.get("missing_checks") != 0:
+            return False, (
+                "orthogonality expectations are incomplete: "
+                f"expected={orthogonality.get('expected_checks')}; "
+                f"evaluated={orthogonality.get('evaluated_checks')}; "
+                f"missing={orthogonality.get('missing_checks')}"
+            )
         return True, "analysis outputs complete and input manifest is current"
 
     def revision_check() -> tuple[bool, str]:
@@ -303,6 +314,7 @@ def evaluate_semantic_reliability(
             "semantic_violation_rates.json",
             "artifact_validity.json",
             "orthogonality.jsonl",
+            "orthogonality_summary.json",
             "disagreement_queue.jsonl",
             "disagreement_report.md",
             "scenario_annotation_report.md",
@@ -312,6 +324,16 @@ def evaluate_semantic_reliability(
         missing = sorted(required - present)
         if missing:
             return False, f"missing_analysis_outputs={missing}"
+        orthogonality = json.loads(
+            (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
+        )
+        if orthogonality.get("expected_checks", 0) <= 0 or orthogonality.get("missing_checks") != 0:
+            return False, (
+                "orthogonality expectations are incomplete: "
+                f"expected={orthogonality.get('expected_checks')}; "
+                f"evaluated={orthogonality.get('evaluated_checks')}; "
+                f"missing={orthogonality.get('missing_checks')}"
+            )
         verify_analysis_manifest_current(
             analysis_dir / "analysis_manifest.json",
             annotations_dir=annotations_dir,

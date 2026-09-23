@@ -5,7 +5,7 @@ import pytest
 
 from research.scenario_annotation.analysis.common import AnnotationRow
 from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
-from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality
+from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality, orthogonality_summary
 from research.scenario_annotation.analysis.pipeline import run_analysis
 from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
 from research.scenario_annotation.corpus import write_calibration
@@ -66,11 +66,87 @@ def test_orthogonality_flags_expected_change_and_invariant_spillover() -> None:
     pair = {
         "pair_id": "P",
         "scenario_ids": ["A", "B"],
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "pair_kind": "MINIMAL_CONTRAST",
         "expected_sensitive_constructs": ["C_EXEC"],
         "expected_invariant_constructs": ["D_POT"],
     }
-    statuses = {item.status for item in analyze_orthogonality(rows, [pair])}
-    assert statuses == {"EXPECTED_CHANGE", "POTENTIAL_SPILLOVER"}
+    results = analyze_orthogonality(rows, [pair])
+    assert {item.status for item in results} == {"EVALUATED"}
+    assert {item.outcome for item in results} == {"EXPECTED_CHANGE", "POTENTIAL_SPILLOVER"}
+
+
+def test_presentation_equivalence_is_evaluated_between_counterbalanced_groups() -> None:
+    rows = [
+        _row("LEFT", "AI-A", "LIFECYCLE", "SKIPPED", "COURSE", "A"),
+        _row("LEFT", "AI-C", "LIFECYCLE", "SKIPPED", "COURSE", "A"),
+        _row("RIGHT", "AI-B", "LIFECYCLE", "SKIPPED", "COURSE", "A"),
+        _row("RIGHT", "Human", "LIFECYCLE", "SKIPPED", "COURSE", "A"),
+    ]
+    pair = {
+        "pair_id": "PRESENTATION",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "BETWEEN_GROUPS",
+        "pair_kind": "PRESENTATION_EQUIVALENCE",
+        "expected_sensitive_constructs": [],
+        "expected_invariant_constructs": ["LIFECYCLE"],
+        "target_mapping": {
+            "LIFECYCLE": {"left_target_ref": "COURSE", "right_target_ref": "COURSE"}
+        },
+    }
+    result = analyze_orthogonality(rows, [pair])[0]
+    assert result.comparison_mode == "BETWEEN_GROUPS"
+    assert result.status == "EVALUATED"
+    assert result.outcome == "INVARIANT_HELD"
+    assert len(result.left_labels) == len(result.right_labels) == 2
+
+
+def test_orthogonality_uses_record_attribute_and_explicit_target_refs() -> None:
+    rows = [
+        _row("LEFT", "AI-A", "EXECUTION_EXPOSURE", "PARTIAL", "TARGET_A", "A", partial_encoding_basis="ACTUAL_INTERVAL"),
+        _row("RIGHT", "AI-A", "EXECUTION_EXPOSURE", "PARTIAL", "TARGET_B", "A", partial_encoding_basis="FRACTION_ONLY"),
+        _row("LEFT", "AI-A", "EXECUTION_EXPOSURE", "ACTIVE", "OTHER_A", "A", partial_encoding_basis="OTHER_EXPLICIT"),
+        _row("RIGHT", "AI-A", "EXECUTION_EXPOSURE", "ACTIVE", "OTHER_B", "A", partial_encoding_basis="OTHER_EXPLICIT"),
+    ]
+    pair = {
+        "pair_id": "ATTRIBUTE",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "pair_kind": "MINIMAL_CONTRAST",
+        "expected_sensitive_constructs": [],
+        "expected_invariant_constructs": ["PARTIAL_ENCODING_BASIS"],
+        "target_mapping": {
+            "PARTIAL_ENCODING_BASIS": {
+                "target_variable": "EXECUTION_EXPOSURE",
+                "record_attribute": "partial_encoding_basis",
+                "left_target_ref": "TARGET_A",
+                "right_target_ref": "TARGET_B",
+            }
+        },
+    }
+    result = analyze_orthogonality(rows, [pair])[0]
+    assert result.status == "EVALUATED"
+    assert result.left_labels[0]["label"] == "ACTUAL_INTERVAL"
+    assert result.right_labels[0]["label"] == "FRACTION_ONLY"
+    assert result.outcome == "POTENTIAL_SPILLOVER"
+
+
+def test_orthogonality_reports_each_expected_check_when_annotations_are_missing() -> None:
+    pair = {
+        "pair_id": "MISSING",
+        "scenario_ids": ["LEFT", "RIGHT"],
+        "comparison_mode": "WITHIN_ANNOTATOR",
+        "pair_kind": "MINIMAL_CONTRAST",
+        "expected_sensitive_constructs": ["LIFECYCLE"],
+        "expected_invariant_constructs": [],
+    }
+    results = analyze_orthogonality([], [pair])
+    summary = orthogonality_summary(results)
+    assert len(results) == 1
+    assert results[0].status == "NOT_COMPARABLE"
+    assert summary["expected_checks"] == 1
+    assert summary["evaluated_checks"] == 0
+    assert summary["missing_checks"] == 1
 
 
 def _annotation_document(annotator: str, label: str, evidence_ref: str) -> dict:
@@ -141,12 +217,17 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
         "semantic_violation_rates.json",
         "artifact_validity.json",
         "orthogonality.jsonl",
+        "orthogonality_summary.json",
         "disagreement_queue.jsonl",
         "disagreement_report.md",
         "scenario_annotation_report.md",
         "analysis_manifest.json",
     }
     assert expected == {path.name for path in output.iterdir()}
+    generated_orthogonality = json.loads(
+        (output / "orthogonality_summary.json").read_text(encoding="utf-8")
+    )
+    assert generated_orthogonality["missing_checks"] > 0
     assert "Construct: C_EXEC" in (output / "scenario_annotation_report.md").read_text(encoding="utf-8")
 
     annotation_path = annotations / "annotation_0.json"

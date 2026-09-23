@@ -21,8 +21,9 @@ from .common import (
 from .confusion import confusion_matrices
 from .critical_violations import CriticalViolation, find_critical_violations, violation_rates
 from .disagreement import DisagreementItem, build_disagreement_queue
-from .orthogonality import OrthogonalityResult, analyze_orthogonality
+from .orthogonality import OrthogonalityResult, analyze_orthogonality, orthogonality_summary
 from .report import build_construct_report, build_disagreement_report
+from ..validation import Validator
 
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
@@ -74,6 +75,14 @@ def run_analysis(
         raise ValueError("annotation documents contain no records")
     coverage = load_hidden_by_scenario(coverage_path)
     pairs = load_jsonl(pairs_path)
+    pair_validation = Validator().validate_paths(
+        [pairs_path], "pair-design", scenarios=scenarios
+    )
+    if not pair_validation.ok:
+        raise ValueError(
+            "pair design validation failed before analysis: "
+            + "; ".join(str(issue) for issue in pair_validation.issues)
+        )
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     quality_thresholds_path = Path(
@@ -83,7 +92,7 @@ def run_analysis(
 
     metrics = analyze_agreement(rows)
     violations = find_critical_violations(rows, scenarios, coverage)
-    orthogonality = analyze_orthogonality(rows, pairs)
+    orthogonality = analyze_orthogonality(rows, pairs, scenarios=scenarios)
     disagreements = build_disagreement_queue(rows)
 
     if "agreement" in only:
@@ -125,6 +134,10 @@ def run_analysis(
         )
     if "orthogonality" in only:
         _write_jsonl(root / "orthogonality.jsonl", (item.to_dict() for item in orthogonality))
+        (root / "orthogonality_summary.json").write_text(
+            json.dumps(orthogonality_summary(orthogonality), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if "disagreement" in only:
         _write_jsonl(root / "disagreement_queue.jsonl", (item.to_dict() for item in disagreements))
         (root / "disagreement_report.md").write_text(

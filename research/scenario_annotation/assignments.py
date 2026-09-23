@@ -9,6 +9,7 @@ import random
 from typing import Any, Iterable, Mapping
 
 from .loader import load_jsonl
+from .validation import Validator
 
 
 ANNOTATORS = ("AI-A", "AI-B", "AI-C", "Human")
@@ -90,6 +91,15 @@ def build_assignments(
 ) -> dict[str, Any]:
     scenarios = load_jsonl(scenario_path)
     pairs = load_jsonl(pair_design_path)
+    scenario_index = {str(row["scenario_id"]): row for row in scenarios}
+    pair_validation = Validator().validate_paths(
+        [pair_design_path], "pair-design", scenarios=scenario_index
+    )
+    if not pair_validation.ok:
+        raise ValueError(
+            "pair design validation failed before assignment: "
+            + "; ".join(str(issue) for issue in pair_validation.issues)
+        )
     root = Path(output_dir)
     summary: dict[str, Any] = {"annotators": {}, "seed": seed}
     for annotator_index, annotator in enumerate(ANNOTATORS):

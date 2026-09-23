@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 from .agreement import FieldMetric
 from .critical_violations import CriticalViolation
 from .disagreement import DisagreementItem
-from .orthogonality import OrthogonalityResult
+from .orthogonality import OrthogonalityResult, orthogonality_summary
 
 
 def build_disagreement_report(items: Iterable[DisagreementItem]) -> str:
@@ -47,10 +47,17 @@ def build_construct_report(
     violations = list(violations)
     orthogonality = list(orthogonality)
     disagreements = list(disagreements)
+    orthogonality_coverage = orthogonality_summary(orthogonality)
     lines = [
         "# Scenario Annotation Report",
         "",
         "This report is field-level. It does not use an overall score to freeze the representation layer.",
+        "",
+        "## Orthogonality Coverage",
+        "",
+        f"- expected_checks: {orthogonality_coverage['expected_checks']}",
+        f"- evaluated_checks: {orthogonality_coverage['evaluated_checks']}",
+        f"- missing_checks: {orthogonality_coverage['missing_checks']}",
         "",
     ]
     for metric in metrics:
@@ -77,8 +84,9 @@ def build_construct_report(
                 f"- Common Confusions: {len(related_disagreements)} queued disagreements",
                 (
                     "- Minimal-Pair Orthogonality: "
-                    f"{sum(item.status == 'POTENTIAL_SPILLOVER' for item in related_ortho)} spillover(s), "
-                    f"{sum(item.status == 'MISSING_EXPECTED_CHANGE' for item in related_ortho)} missing expected change(s)"
+                f"{sum(item.outcome == 'POTENTIAL_SPILLOVER' for item in related_ortho)} spillover(s), "
+                f"{sum(item.outcome == 'MISSING_EXPECTED_CHANGE' for item in related_ortho)} missing expected change(s), "
+                f"{sum(item.status != 'EVALUATED' for item in related_ortho)} unevaluated check(s)"
                 ),
                 "- Adjudication Summary: pending explicit adjudication; majority vote not used",
                 f"- Decision: {status}",
