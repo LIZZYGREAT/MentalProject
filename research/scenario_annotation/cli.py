@@ -55,10 +55,12 @@ def _analysis_command(args: argparse.Namespace) -> int:
         scenarios = root / "scenarios" / "calibration.jsonl"
         annotations = root / "annotations" / "calibration"
         output = root / "analysis" / "outputs" / "calibration"
+        assignments = args.assignments_root or root / "assignments" / "round_calibration"
     else:
         scenarios = [root / "scenarios" / "main.jsonl", root / "scenarios" / "edge.jsonl"]
         annotations = root / "annotations" / round_name
         output = root / "analysis" / "outputs" / round_name
+        assignments = args.assignments_root or root / "assignments" / "round_validation"
     only = None if args.analysis_kind == "all" else {args.analysis_kind}
     try:
         summary = run_analysis(
@@ -70,9 +72,16 @@ def _analysis_command(args: argparse.Namespace) -> int:
             only=only,
             quality_thresholds_path=root / "settings" / "quality_thresholds_v1.json",
             repository_root=root.parents[1],
+            assignments_root=assignments,
         )
     except ValueError as exc:
         print(f"FAIL: {exc}")
+        return 2
+    if summary["artifact_validity"] != "PASS":
+        print(
+            "FAIL: analysis completed with artifact validity "
+            f"{summary['artifact_validity']}; see artifact_validity.json"
+        )
         return 2
     print(f"PASS: analysis complete {summary}")
     return 0
@@ -331,6 +340,7 @@ def _add_analysis_parser(
     command.add_argument("--scenarios", type=Path)
     command.add_argument("--coverage", type=Path)
     command.add_argument("--pair-design", type=Path)
+    command.add_argument("--assignments-root", type=Path)
     command.add_argument("--output-dir", type=Path)
     command.set_defaults(handler=_analysis_command, analysis_kind=analysis_kind)
 

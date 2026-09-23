@@ -160,6 +160,17 @@ def evaluate_manual_ready(
         missing = sorted(required - present)
         if missing:
             return False, f"missing_analysis_outputs={missing}"
+        validity = json.loads(
+            (analysis_dir / "artifact_validity.json").read_text(encoding="utf-8")
+        )
+        validity_checks = validity.get("checks", {})
+        if validity.get("status") != "PASS" or not validity_checks or any(
+            status != "PASS" for status in validity_checks.values()
+        ):
+            return False, (
+                "artifact validity did not PASS: "
+                f"status={validity.get('status')}; checks={validity_checks}"
+            )
         verify_analysis_manifest_current(
             analysis_dir / "analysis_manifest.json",
             annotations_dir=annotations_dir,

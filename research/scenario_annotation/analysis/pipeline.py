@@ -5,11 +5,11 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 from ..analysis_manifest import build_analysis_manifest, write_analysis_manifest
 from ..loader import load_jsonl
+from .artifact_validity import evaluate_artifact_validity
 from .agreement import FieldMetric, analyze_agreement
 from .common import (
     annotation_files,
@@ -23,7 +23,6 @@ from .critical_violations import CriticalViolation, find_critical_violations, vi
 from .disagreement import DisagreementItem, build_disagreement_queue
 from .orthogonality import OrthogonalityResult, analyze_orthogonality, orthogonality_summary
 from .report import build_construct_report, build_disagreement_report
-from ..validation import Validator
 
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
@@ -57,6 +56,7 @@ def run_analysis(
     only: set[str] | None = None,
     quality_thresholds_path: str | Path | None = None,
     repository_root: str | Path | None = None,
+    assignments_root: str | Path | None = None,
 ) -> dict[str, Any]:
     only = only or {"agreement", "violations", "orthogonality", "disagreement", "report"}
     scenario_paths = (
@@ -64,6 +64,40 @@ def run_analysis(
         if isinstance(scenarios_path, (str, Path))
         else [Path(path) for path in scenarios_path]
     )
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    quality_thresholds_path = Path(
+        quality_thresholds_path
+        or Path(__file__).parents[1] / "settings" / "quality_thresholds_v1.json"
+    )
+    artifact_validity = evaluate_artifact_validity(
+        scenarios_paths=scenario_paths,
+        annotations_dir=annotations_dir,
+        coverage_path=coverage_path,
+        pairs_path=pairs_path,
+        assignments_root=assignments_root,
+    )
+    (root / "artifact_validity.json").write_text(
+        json.dumps(artifact_validity, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    required_inputs = (
+        "scenario_validator",
+        "annotation_validator",
+        "pair_design_validator",
+        "coverage_validator",
+    )
+    failed_inputs = [
+        name for name in required_inputs
+        if artifact_validity["checks"][name] != "PASS"
+    ]
+    if failed_inputs:
+        raise ValueError(
+            "artifact validation failed before analysis: "
+            + ", ".join(failed_inputs)
+            + f"; see {root / 'artifact_validity.json'}"
+        )
     scenarios = {
         scenario_id: scenario
         for path in scenario_paths
@@ -80,20 +114,6 @@ def run_analysis(
         raise ValueError("annotation documents contain no records")
     coverage = load_hidden_by_scenario(coverage_path)
     pairs = load_jsonl(pairs_path)
-    pair_validation = Validator().validate_paths(
-        [pairs_path], "pair-design", scenarios=scenarios
-    )
-    if not pair_validation.ok:
-        raise ValueError(
-            "pair design validation failed before analysis: "
-            + "; ".join(str(issue) for issue in pair_validation.issues)
-        )
-    root = Path(output_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    quality_thresholds_path = Path(
-        quality_thresholds_path
-        or Path(__file__).parents[1] / "settings" / "quality_thresholds_v1.json"
-    )
 
     metrics = analyze_agreement(rows)
     violations = find_critical_violations(rows, scenarios, coverage)
@@ -111,26 +131,6 @@ def run_analysis(
         (root / "semantic_violation_rates.json").write_text(
             json.dumps(
                 violation_rates(violations, rows, scenarios, coverage),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ) + "\n",
-            encoding="utf-8",
-        )
-        (root / "artifact_validity.json").write_text(
-            json.dumps(
-                {
-                    "status": "PASS",
-                    "validated_at": datetime.now(timezone.utc).isoformat(),
-                    "checks": {
-                        "schema_validity": "PASS",
-                        "hidden_metadata": "PASS",
-                        "evidence_reference_integrity": "PASS",
-                        "future_evidence": "PASS",
-                        "envelope_consistency": "PASS",
-                        "double_encoding_structural_validity": "PASS",
-                    },
-                },
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -174,4 +174,5 @@ def run_analysis(
         "violations": len(violations),
         "orthogonality_checks": len(orthogonality),
         "disagreements": len(disagreements),
+        "artifact_validity": artifact_validity["status"],
     }

@@ -5,9 +5,11 @@ import pytest
 
 from research.scenario_annotation.analysis.common import AnnotationRow
 from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
+from research.scenario_annotation.analysis.artifact_validity import evaluate_artifact_validity
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality, orthogonality_summary
 from research.scenario_annotation.analysis.pipeline import run_analysis
 from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
+from research.scenario_annotation.assignments import build_assignments
 from research.scenario_annotation.corpus import write_calibration
 from research.scenario_annotation.loader import load_jsonl
 
@@ -229,6 +231,9 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
     )
     assert generated_orthogonality["missing_checks"] > 0
     assert "Construct: C_EXEC" in (output / "scenario_annotation_report.md").read_text(encoding="utf-8")
+    generated_validity = json.loads((output / "artifact_validity.json").read_text(encoding="utf-8"))
+    assert generated_validity["status"] == "FAIL"
+    assert generated_validity["checks"]["assignment_submission_integrity"] == "NOT_EVALUATED"
 
     annotation_path = annotations / "annotation_0.json"
     annotation_path.write_text(annotation_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
@@ -241,3 +246,87 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
             pair_design_path=corpus_root / "hidden" / "pair_design.jsonl",
             quality_thresholds_path=PACKAGE_ROOT / "settings" / "quality_thresholds_v1.json",
         )
+
+
+def test_artifact_validity_fails_for_invalid_scenario(tmp_path) -> None:
+    corpus_root = tmp_path / "corpus"
+    write_calibration(corpus_root)
+    scenario_path = corpus_root / "scenarios" / "calibration.jsonl"
+    scenarios = load_jsonl(scenario_path)
+    scenarios[0]["participant_context"]["known_at"] = "2026-09-30T08:00:00+08:00"
+    scenario_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in scenarios),
+        encoding="utf-8",
+    )
+    annotations = tmp_path / "annotations"
+    annotations.mkdir()
+
+    result = evaluate_artifact_validity(
+        scenarios_paths=[scenario_path],
+        annotations_dir=annotations,
+        coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
+        pairs_path=corpus_root / "hidden" / "pair_design.jsonl",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["checks"]["scenario_validator"] == "FAIL"
+    assert result["checks"]["known_at_checks"] == "FAIL"
+
+
+def test_analysis_writes_failed_validity_for_hidden_metadata_leak(tmp_path) -> None:
+    corpus_root = tmp_path / "corpus"
+    write_calibration(corpus_root)
+    scenario_path = corpus_root / "scenarios" / "calibration.jsonl"
+    scenarios = load_jsonl(scenario_path)
+    scenarios[0]["coverage_tags"] = ["HIGH_LOAD"]
+    scenario_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in scenarios),
+        encoding="utf-8",
+    )
+    annotations = tmp_path / "annotations"
+    annotations.mkdir()
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="artifact validation failed"):
+        run_analysis(
+            annotations_dir=annotations,
+            scenarios_path=scenario_path,
+            coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
+            pairs_path=corpus_root / "hidden" / "pair_design.jsonl",
+            output_dir=output,
+        )
+
+    validity = json.loads((output / "artifact_validity.json").read_text(encoding="utf-8"))
+    assert validity["status"] == "FAIL"
+    assert validity["checks"]["hidden_metadata"] == "FAIL"
+
+
+def test_artifact_validity_checks_assignment_file_integrity(tmp_path) -> None:
+    corpus_root = tmp_path / "corpus"
+    write_calibration(corpus_root)
+    assignments = tmp_path / "assignments"
+    build_assignments(
+        corpus_root / "scenarios" / "calibration.jsonl",
+        corpus_root / "hidden" / "pair_design.jsonl",
+        assignments,
+        annotation_round="CALIBRATION",
+        manual_version="0.1",
+        scenario_version="0.1",
+        seed=12001,
+    )
+    assignment_file = assignments / "ai_a" / "module_a.jsonl"
+    assignment_file.write_text(assignment_file.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    annotations = tmp_path / "annotations"
+    annotations.mkdir()
+
+    result = evaluate_artifact_validity(
+        scenarios_paths=[corpus_root / "scenarios" / "calibration.jsonl"],
+        annotations_dir=annotations,
+        coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
+        pairs_path=corpus_root / "hidden" / "pair_design.jsonl",
+        assignments_root=assignments,
+    )
+
+    assert result["checks"]["assignment_submission_integrity"] == "FAIL"
+    issues = result["details"]["assignment_submission_integrity"]["issues"]
+    assert any(issue["code"] == "ASSIGNMENT_HASH_MISMATCH" for issue in issues)
