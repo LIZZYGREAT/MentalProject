@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/reference-set-manifest-v1.json",
+  "title": "MindFlow Stage 1 Reference Set Provenance Manifest",
+  "type": "object",
+  "required": ["created_at", "source_analysis_manifest_sha256", "annotation_fileset_sha256", "assignment_fileset_sha256", "manual_sha256", "scenario_fileset_sha256", "reference_set_sha256"],
+  "properties": {
+    "created_at": {"type": "string", "format": "date-time"},
+    "source_analysis_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "annotation_fileset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "assignment_fileset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "manual_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scenario_fileset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reference_set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

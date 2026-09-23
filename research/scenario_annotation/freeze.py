@@ -44,6 +44,7 @@ def freeze_representation(
     output_path: str | Path,
     gate_a_analysis_manifest_path: str | Path | None = None,
     analysis_manifest_path: str | Path | None = None,
+    reference_set_manifest_path: str | Path | None = None,
     quality_thresholds_path: str | Path | None = None,
     schema_dir: str | Path | None = None,
     representation_version: str = "1.0",
@@ -54,6 +55,10 @@ def freeze_representation(
     package_root = Path(__file__).resolve().parent
     analysis_manifest_path = Path(
         analysis_manifest_path or Path(field_metrics_path).parent / "analysis_manifest.json"
+    )
+    reference_set_manifest_path = Path(
+        reference_set_manifest_path
+        or Path(gold_path).with_name("reference_set_manifest.json")
     )
     quality_thresholds_path = Path(
         quality_thresholds_path or package_root / "settings" / "quality_thresholds_v1.json"
@@ -69,6 +74,7 @@ def freeze_representation(
         revision_log_path=revision_log_path,
         gate_a_analysis_manifest_path=gate_a_analysis_manifest_path,
         gate_b_analysis_manifest_path=analysis_manifest_path,
+        reference_set_manifest_path=reference_set_manifest_path,
     )
     if gate.status != "PASS":
         raise FreezeBlockedError("representation freeze blocked: " + " | ".join(gate.blocking_reasons))
@@ -88,6 +94,7 @@ def freeze_representation(
         "manual_sha256": sha256_file(manual_path),
         "scenario_corpus_sha256": sha256_fileset([main_scenarios_path, edge_scenarios_path]),
         "reference_set_sha256": sha256_file(gold_path),
+        "reference_set_manifest_sha256": sha256_file(reference_set_manifest_path),
         "quality_threshold_settings_version": thresholds["settings_version"],
         "quality_threshold_sha256": sha256_file(quality_thresholds_path),
         "analysis_manifest_sha256": sha256_file(analysis_manifest_path),

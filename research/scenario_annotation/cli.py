@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import tempfile
 from typing import Sequence
@@ -152,6 +153,7 @@ def _freeze_command(args: argparse.Namespace) -> int:
             output_path=args.output or root / "manifests" / "representation_semantics_v1.0.json",
             gate_a_analysis_manifest_path=args.gate_a_analysis_manifest or root / "analysis" / "outputs" / "calibration" / "analysis_manifest.json",
             analysis_manifest_path=args.analysis_manifest or root / "analysis" / "outputs" / "validation" / "analysis_manifest.json",
+            reference_set_manifest_path=args.reference_set_manifest,
             quality_thresholds_path=args.quality_thresholds or root / "settings" / "quality_thresholds_v1.json",
             schema_dir=root / "schemas",
             representation_version=args.representation_version,
@@ -168,8 +170,13 @@ def _freeze_command(args: argparse.Namespace) -> int:
 
 def _reference_set_command(args: argparse.Namespace) -> int:
     from .analysis.common import load_annotation_documents
+    from .analysis_manifest import verify_analysis_manifest_current
     from .loader import load_jsonl
     from .reference_set import build_reference_set, load_adjudications, write_reference_set
+    from .reference_set_manifest import (
+        build_reference_set_manifest,
+        write_reference_set_manifest,
+    )
 
     try:
         scenarios = [row for path in args.scenarios for row in load_jsonl(path)]
@@ -180,16 +187,41 @@ def _reference_set_command(args: argparse.Namespace) -> int:
             scenarios=scenario_index,
             require_scenario_context=True,
         )
+        analysis_manifest = json.loads(args.analysis_manifest.read_text(encoding="utf-8"))
+        verify_analysis_manifest_current(
+            args.analysis_manifest,
+            annotations_dir=args.annotations_dir,
+            scenario_paths=args.scenarios,
+            coverage_path=analysis_manifest["coverage_file"]["path"],
+            pair_design_path=analysis_manifest["pair_design_file"]["path"],
+            quality_thresholds_path=analysis_manifest["quality_threshold_file"]["path"],
+            anchor_reference_path=analysis_manifest["anchor_reference_file"]["path"],
+            anchor_review_decisions_path=analysis_manifest["anchor_review_decisions_path"],
+        )
         records = build_reference_set(
             annotation_documents=documents,
             scenarios=scenarios,
             adjudications=load_adjudications(args.adjudications),
+            assignments_root=args.assignments_root,
         )
         count = write_reference_set(args.output, records)
-    except (OSError, ValueError) as exc:
+        manifest = build_reference_set_manifest(
+            reference_set_path=args.output,
+            analysis_manifest_path=args.analysis_manifest,
+            annotations_dir=args.annotations_dir,
+            assignments_root=args.assignments_root,
+            manual_path=args.manual,
+            scenario_paths=args.scenarios,
+        )
+        manifest_output = args.manifest_output or args.output.with_name("reference_set_manifest.json")
+        write_reference_set_manifest(manifest_output, manifest)
+        validation = Validator().validate_paths([manifest_output], "reference-set-manifest")
+        if not validation.ok:
+            raise ValueError("reference set provenance manifest failed schema validation")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"FAIL: {exc}")
         return 2
-    print(f"PASS: built complete Reference Set ({count} target×variable records)")
+    print(f"PASS: built complete Reference Set ({count} target×variable records); manifest={manifest_output}")
     return 0
 
 
@@ -384,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
             "adjudication",
             "freeze-manifest",
             "reference-record",
+            "reference-set-manifest",
         ),
     )
     validate.add_argument("paths", nargs="+", type=Path)
@@ -474,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--output", type=Path)
     freeze.add_argument("--gate-a-analysis-manifest", type=Path)
     freeze.add_argument("--analysis-manifest", type=Path)
+    freeze.add_argument("--reference-set-manifest", type=Path)
     freeze.add_argument("--quality-thresholds", type=Path)
     freeze.add_argument("--representation-version", default="1.0")
     freeze.add_argument("--manual-version", default="1.0")
@@ -488,7 +522,11 @@ def build_parser() -> argparse.ArgumentParser:
     reference.add_argument("--annotations-dir", type=Path, required=True)
     reference.add_argument("--scenarios", type=Path, nargs="+", required=True)
     reference.add_argument("--adjudications", type=Path, required=True)
+    reference.add_argument("--assignments-root", type=Path, required=True)
+    reference.add_argument("--analysis-manifest", type=Path, required=True)
+    reference.add_argument("--manual", type=Path, required=True)
     reference.add_argument("--output", type=Path, required=True)
+    reference.add_argument("--manifest-output", type=Path)
     reference.set_defaults(handler=_reference_set_command)
 
     export_packets = subparsers.add_parser(

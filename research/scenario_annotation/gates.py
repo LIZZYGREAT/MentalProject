@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping
 
 from .annotation_contract import check_submission_integrity
 from .analysis_manifest import verify_analysis_manifest_current
-from .artifact_fingerprint import sha256_file
+from .artifact_fingerprint import sha256_file, sha256_fileset
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
 from .reference_set import expected_reference_keys
@@ -434,6 +434,7 @@ def evaluate_representation_freeze(
     revision_log_path: str | Path,
     gate_a_analysis_manifest_path: str | Path | None = None,
     gate_b_analysis_manifest_path: str | Path | None = None,
+    reference_set_manifest_path: str | Path | None = None,
 ) -> GateResult:
     gate_a_path = Path(gate_a_path)
     gate_b_path = Path(gate_b_path)
@@ -441,6 +442,9 @@ def evaluate_representation_freeze(
     main_scenarios_path = Path(main_scenarios_path)
     edge_scenarios_path = Path(edge_scenarios_path)
     gold_path = Path(gold_path)
+    reference_set_manifest_path = Path(
+        reference_set_manifest_path or gold_path.with_name("reference_set_manifest.json")
+    )
     revision_log_path = Path(revision_log_path)
     gate_a_analysis_manifest_path = Path(gate_a_analysis_manifest_path) if gate_a_analysis_manifest_path else None
     gate_b_analysis_manifest_path = Path(gate_b_analysis_manifest_path) if gate_b_analysis_manifest_path else None
@@ -466,6 +470,14 @@ def evaluate_representation_freeze(
     def gold_check() -> tuple[bool, str]:
         result = Validator().validate_paths([gold_path], "reference-record")
         rows = load_jsonl(gold_path)
+        manifest_validation = Validator().validate_paths(
+            [reference_set_manifest_path], "reference-set-manifest"
+        )
+        reference_manifest = (
+            json.loads(reference_set_manifest_path.read_text(encoding="utf-8"))
+            if reference_set_manifest_path.is_file()
+            else {}
+        )
         scenarios = [
             row
             for path in (main_scenarios_path, edge_scenarios_path)
@@ -478,11 +490,51 @@ def evaluate_representation_freeze(
         }
         missing = sorted(expected - actual)
         unexpected = sorted(actual - expected)
-        passed = result.ok and len(scenarios) == 96 and not missing and not unexpected
+        annotator_count_mismatches = [
+            row.get("reference_id", "")
+            for row in rows
+            if row.get("source_annotator_count") != row.get("expected_annotator_count")
+        ]
+        gate_b_manifest_hash = (
+            sha256_file(gate_b_analysis_manifest_path)
+            if gate_b_analysis_manifest_path is not None and gate_b_analysis_manifest_path.exists()
+            else None
+        )
+        source_analysis_matches = (
+            gate_b_manifest_hash is not None
+            and reference_manifest.get("source_analysis_manifest_sha256") == gate_b_manifest_hash
+        )
+        reference_hash_matches = (
+            gold_path.is_file()
+            and reference_manifest.get("reference_set_sha256") == sha256_file(gold_path)
+        )
+        manual_hash_matches = (
+            manual_path.is_file()
+            and reference_manifest.get("manual_sha256") == sha256_file(manual_path)
+        )
+        scenario_hash_matches = reference_manifest.get("scenario_fileset_sha256") == sha256_fileset(
+            (main_scenarios_path, edge_scenarios_path)
+        )
+        passed = (
+            result.ok
+            and manifest_validation.ok
+            and len(scenarios) == 96
+            and not missing
+            and not unexpected
+            and not annotator_count_mismatches
+            and source_analysis_matches
+            and reference_hash_matches
+            and manual_hash_matches
+            and scenario_hash_matches
+        )
         return passed, (
-            f"schema_valid={result.ok}; formal_scenarios={len(scenarios)}; "
+            f"schema_valid={result.ok}; manifest_schema_valid={manifest_validation.ok}; "
+            f"source_analysis_matches_gate_b={source_analysis_matches}; "
+            f"reference_hash_matches={reference_hash_matches}; manual_hash_matches={manual_hash_matches}; "
+            f"scenario_hash_matches={scenario_hash_matches}; formal_scenarios={len(scenarios)}; "
             f"expected_keys={len(expected)}; actual_keys={len(actual)}; "
-            f"missing_reference_keys={missing}; unexpected_reference_keys={unexpected}"
+            f"missing_reference_keys={missing}; unexpected_reference_keys={unexpected}; "
+            f"annotator_count_mismatches={annotator_count_mismatches}"
         )
 
     def decision_check() -> tuple[bool, str]:

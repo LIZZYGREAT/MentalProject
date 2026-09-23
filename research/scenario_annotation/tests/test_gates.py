@@ -4,6 +4,7 @@ import json
 import pytest
 
 from research.scenario_annotation.annotation_catalog import field_specs
+from research.scenario_annotation.artifact_fingerprint import sha256_file, sha256_fileset
 from research.scenario_annotation.freeze import FreezeBlockedError, freeze_representation
 from research.scenario_annotation.gates import (
     evaluate_manual_ready,
@@ -122,6 +123,58 @@ def test_freeze_refuses_to_create_manifest_before_gates_pass(tmp_path: Path) -> 
     else:
         raise AssertionError("freeze should have been blocked")
     assert not output.exists()
+
+
+def test_freeze_requires_reference_set_manifest_to_bind_gate_b_analysis(tmp_path: Path) -> None:
+    main = tmp_path / "main.jsonl"
+    edge = tmp_path / "edge.jsonl"
+    scenarios = [
+        {
+            "scenario_id": f"S{index:03d}",
+            "annotation_modules": ["C"],
+            "bot_response_units": [{"response_unit_ref": f"BOT{index:03d}"}],
+        }
+        for index in range(96)
+    ]
+    main.write_text("".join(json.dumps(row) + "\n" for row in scenarios[:72]), encoding="utf-8")
+    edge.write_text("".join(json.dumps(row) + "\n" for row in scenarios[72:]), encoding="utf-8")
+    gold = tmp_path / "reference_set.jsonl"
+    gold.write_text("", encoding="utf-8")
+    manual = tmp_path / "manual.md"
+    manual.write_text("v1.0\n", encoding="utf-8")
+    gate_b_manifest = tmp_path / "gate_b_analysis_manifest.json"
+    gate_b_manifest.write_text("{}\n", encoding="utf-8")
+    reference_manifest = tmp_path / "reference_set_manifest.json"
+    reference_manifest.write_text(
+        json.dumps(
+            {
+                "created_at": "2026-09-23T00:00:00+00:00",
+                "source_analysis_manifest_sha256": "0" * 64,
+                "annotation_fileset_sha256": "1" * 64,
+                "assignment_fileset_sha256": "2" * 64,
+                "manual_sha256": "3" * 64,
+                "scenario_fileset_sha256": sha256_fileset([main, edge]),
+                "reference_set_sha256": sha256_file(gold),
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = evaluate_representation_freeze(
+        gate_a_path=tmp_path / "gate_a.json",
+        gate_b_path=tmp_path / "gate_b.json",
+        manual_path=manual,
+        main_scenarios_path=main,
+        edge_scenarios_path=edge,
+        gold_path=gold,
+        revision_log_path=tmp_path / "revisions.jsonl",
+        gate_a_analysis_manifest_path=tmp_path / "gate_a_analysis_manifest.json",
+        gate_b_analysis_manifest_path=gate_b_manifest,
+        reference_set_manifest_path=reference_manifest,
+    )
+
+    check = next(item for item in result.checks if item.name == "adjudicated_reference_set")
+    assert not check.passed
+    assert "source_analysis_matches_gate_b=False" in check.detail
 
 
 def test_gate_b_uses_versioned_semantic_thresholds() -> None:

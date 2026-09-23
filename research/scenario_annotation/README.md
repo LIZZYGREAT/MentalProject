@@ -104,10 +104,10 @@ It presents all independent labels and evidence, agreement counts, and related c
 Build the complete Reference Set after adjudication:
 
 ```powershell
-& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli build-reference-set --annotations-dir <formal-annotations> --scenarios <formal-scenarios.jsonl> --adjudications <adjudication-dir> --output <reference-set.jsonl>
+& 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli build-reference-set --annotations-dir <formal-annotations> --scenarios <formal-scenarios.jsonl> --adjudications <adjudication-dir> --assignments-root <formal-assignments> --analysis-manifest <gate-b-analysis-manifest.json> --manual <coding-manual.md> --output <reference-set.jsonl>
 ```
 
-Every required `scenario_id × target_ref × variable` becomes a reference record. Only full unanimity produces `UNANIMOUS`; every disagreement requires an explicit adjudication and produces `ADJUDICATED`. A majority vote never becomes Gold automatically.
+Before building the Reference Set, the command verifies that every assigned annotator submitted a complete module document. Each reference record records the actual and expected annotator counts. It writes `reference_set_manifest.json` next to the Reference Set, binding it to the source analysis manifest, annotation and assignment filesets, coding manual, and scenario files. Only full unanimity produces `UNANIMOUS`; every disagreement requires an explicit adjudication and produces `ADJUDICATED`. A majority vote never becomes Gold automatically.
 
 Validate completed annotation documents against the exact visible assignment used by that annotator:
 
@@ -132,6 +132,6 @@ After the 96-scenario blind round, evaluate Gate B and then freeze only if every
 & 'D:\Miniconda\envs\MentalProject\python.exe' -m research.scenario_annotation.cli freeze-representation --manual-version 1.0 --scenario-version 1.0
 ```
 
-The freeze command validates prior gates and their bound analysis manifests, the final manual, 72 Main + 24 Edge scenarios, complete target×variable Reference Set coverage, and final construct decisions. Its immutable manifest includes hashes for the manual, scenario corpus, Reference Set, quality thresholds, analysis inputs, and schema bundle. It will not overwrite an existing versioned manifest.
+The freeze command validates prior gates and their bound analysis manifests, the final manual, 72 Main + 24 Edge scenarios, complete target×variable Reference Set coverage, its source analysis binding, and final construct decisions. Its immutable manifest includes hashes for the manual, scenario corpus, Reference Set and its provenance manifest, quality thresholds, analysis inputs, and schema bundle. It will not overwrite an existing versioned manifest.
 
 Artifact Validity is a strict PASS/FAIL gate for schema, hidden metadata, evidence integrity, temporal boundaries, envelope consistency, and structural double encoding. Semantic misunderstanding metrics are reported separately with their own eligible denominators. The project thresholds are versioned in `settings/quality_thresholds_v1.json`; they are engineering settings, not claimed as universal statistical laws.

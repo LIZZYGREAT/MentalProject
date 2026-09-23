@@ -9,8 +9,13 @@ from typing import Any, Iterable, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .annotation_catalog import BY_VARIABLE
 from .analysis.common import flatten_annotations
-from .annotation_contract import expected_annotation_keys
+from .annotation_contract import (
+    check_submission_integrity,
+    expected_annotation_keys,
+    expected_submission_documents,
+)
 from .loader import load_json, load_jsonl
 from .validation import Validator
 
@@ -50,7 +55,13 @@ def build_reference_set(
     annotation_documents: Iterable[Mapping[str, Any]],
     scenarios: Iterable[Mapping[str, Any]],
     adjudications: Iterable[Mapping[str, Any]],
+    assignments_root: str | Path,
 ) -> list[dict[str, Any]]:
+    annotation_documents = list(annotation_documents)
+    integrity = check_submission_integrity(assignments_root, annotation_documents)
+    if not integrity.ok:
+        raise ValueError("SUBMISSION_INCOMPLETE: " + integrity.detail())
+    expected_documents, _ = expected_submission_documents(assignments_root)
     scenario_index = {str(scenario["scenario_id"]): scenario for scenario in scenarios}
     expected = expected_reference_keys(scenario_index.values())
     grouped: dict[ReferenceKey, list[Any]] = defaultdict(list)
@@ -71,6 +82,22 @@ def build_reference_set(
     unresolved: list[ReferenceKey] = []
     for key in sorted(expected):
         rows = grouped[key]
+        spec = BY_VARIABLE.get(key[2])
+        if spec is None:
+            raise ValueError(f"reference key uses unknown annotation variable {key[2]!r}")
+        expected_annotators = {
+            annotator
+            for annotator, module, scenario_id in expected_documents
+            if module == spec.module and scenario_id == key[0]
+        }
+        source_annotators = {row.annotator_id for row in rows}
+        if source_annotators != expected_annotators:
+            raise ValueError(
+                f"assigned annotator mismatch for {key}: "
+                f"source={sorted(source_annotators)}; expected={sorted(expected_annotators)}"
+            )
+        if len(rows) != len(source_annotators):
+            raise ValueError(f"duplicate annotation source for reference key {key}")
         labels = {json.dumps(row.label, ensure_ascii=False, sort_keys=True) for row in rows}
         source_ids = sorted(row.annotation_id for row in rows)
         manual_versions = {str(row.record.get("manual_version")) for row in rows}
@@ -99,6 +126,8 @@ def build_reference_set(
                 "gold_label": gold_label,
                 "resolution_mode": resolution_mode,
                 "source_annotation_ids": source_ids,
+                "source_annotator_count": len(source_annotators),
+                "expected_annotator_count": len(expected_annotators),
                 "manual_version": manual_versions.pop(),
                 "scenario_version": scenario_versions.pop(),
             }
@@ -138,4 +167,3 @@ def write_reference_set(
 
 def load_adjudications(path: str | Path) -> list[dict[str, Any]]:
     return _load_records(path)
-

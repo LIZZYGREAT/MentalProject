@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from research.scenario_annotation.annotation_catalog import field_specs
@@ -36,22 +38,46 @@ def _document(annotator: str, *, disagreement: bool = False) -> dict:
         "scenario_id": "S1",
         "annotation_module": "C",
         "annotator_id": annotator,
+        "annotation_round": "VALIDATION",
         "records": records,
     }
 
 
-def test_unanimous_annotations_become_reference_records() -> None:
+def _assignments_root(tmp_path, annotators=("AI-A", "AI-B", "AI-C", "Human")):
+    root = tmp_path / "assignments"
+    for annotator in annotators:
+        directory = root / annotator.lower().replace("-", "_")
+        directory.mkdir(parents=True)
+        (directory / "module_c.jsonl").write_text(
+            json.dumps(_scenario(), ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        (directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "annotator_id": annotator,
+                    "files": [{"module": "C", "path": "module_c.jsonl"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_unanimous_annotations_become_reference_records(tmp_path) -> None:
     documents = [_document(annotator) for annotator in ("AI-A", "AI-B", "AI-C", "Human")]
     records = build_reference_set(
         annotation_documents=documents,
         scenarios=[_scenario()],
         adjudications=[],
+        assignments_root=_assignments_root(tmp_path),
     )
     assert len(records) == len(field_specs("C"))
     assert {record["resolution_mode"] for record in records} == {"UNANIMOUS"}
+    assert all(record["source_annotator_count"] == 4 for record in records)
+    assert all(record["expected_annotator_count"] == 4 for record in records)
 
 
-def test_disagreement_without_adjudication_blocks_reference_set() -> None:
+def test_disagreement_without_adjudication_blocks_reference_set(tmp_path) -> None:
     documents = [
         _document("AI-A"),
         _document("AI-B"),
@@ -63,10 +89,11 @@ def test_disagreement_without_adjudication_blocks_reference_set() -> None:
             annotation_documents=documents,
             scenarios=[_scenario()],
             adjudications=[],
+            assignments_root=_assignments_root(tmp_path),
         )
 
 
-def test_disagreement_with_adjudication_becomes_reference_record() -> None:
+def test_disagreement_with_adjudication_becomes_reference_record(tmp_path) -> None:
     documents = [
         _document("AI-A"),
         _document("AI-B"),
@@ -88,7 +115,19 @@ def test_disagreement_with_adjudication_becomes_reference_record() -> None:
         annotation_documents=documents,
         scenarios=[_scenario()],
         adjudications=[adjudication],
+        assignments_root=_assignments_root(tmp_path),
     )
     support = next(record for record in records if record["variable"] == "SUPPORT_GATE")
     assert support["resolution_mode"] == "ADJUDICATED"
     assert support["gold_label"] == "NON_SUPPORTIVE"
+
+
+def test_reference_set_rejects_missing_assigned_annotator(tmp_path) -> None:
+    documents = [_document(annotator) for annotator in ("AI-A", "AI-B", "AI-C")]
+    with pytest.raises(ValueError, match="SUBMISSION_INCOMPLETE"):
+        build_reference_set(
+            annotation_documents=documents,
+            scenarios=[_scenario()],
+            adjudications=[],
+            assignments_root=_assignments_root(tmp_path),
+        )

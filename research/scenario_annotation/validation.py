@@ -92,6 +92,7 @@ class Validator:
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
             "reference-record": "reference_record.schema.json",
+            "reference-set-manifest": "reference_set_manifest.schema.json",
         }
         try:
             name = names[artifact_type]
