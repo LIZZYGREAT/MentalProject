@@ -10,11 +10,7 @@ from research.scenario_annotation.analysis.artifact_validity import evaluate_art
 from research.scenario_annotation.analysis.anchors import analyze_anchors, anchor_summary
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality, orthogonality_summary
 from research.scenario_annotation.analysis.pipeline import run_analysis
-from research.scenario_annotation.analysis_manifest import (
-    build_analysis_manifest,
-    verify_analysis_manifest_current,
-    write_analysis_manifest,
-)
+from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
 from research.scenario_annotation.assignments import build_assignments
 from research.scenario_annotation.artifact_fingerprint import sha256_file
 from research.scenario_annotation.corpus import write_calibration
@@ -35,6 +31,7 @@ def _prepare_analysis_repository(repository_root: Path) -> Path:
         "annotation_catalog.py",
         "annotation_contract.py",
         "assignments.py",
+        "gates.py",
         "validation.py",
     ):
         shutil.copy2(PACKAGE_ROOT / relative, package_root / relative)
@@ -359,7 +356,7 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path, monkeypatc
     manifest_text = manifest_path.read_text(encoding="utf-8")
     assert str(repository_root) not in manifest_text
     manifest = json.loads(manifest_text)
-    assert manifest["analysis_version"] == "1.1"
+    assert manifest["analysis_version"] == "1.2"
     assert all("logical_path" in entry and "path" not in entry for entry in manifest["scenario_files"])
     assert manifest["analysis_code_sha256"]
 

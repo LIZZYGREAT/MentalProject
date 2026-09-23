@@ -12,6 +12,7 @@ from research.scenario_annotation.analysis.agreement import (
 from research.scenario_annotation.analysis.common import AnnotationRow
 from research.scenario_annotation.analysis.disagreement import build_disagreement_queue
 from research.scenario_annotation.analysis.pipeline import write_metrics
+from research.scenario_annotation.analysis.report import build_construct_report
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -106,6 +107,10 @@ def test_field_metrics_expose_rater_count_coverage_and_csv_round_trips_it(tmp_pa
     assert metric.max_raters_per_unit == 4
     assert metric.mean_raters_per_unit == pytest.approx(7 / 3)
     assert metric.rater_count_distribution == {1: 1, 2: 1, 4: 1}
+    report = build_construct_report([metric], [], [], [])
+    assert "Units / Pairable Units: 3 / 2" in report
+    assert "Raters per Unit: min=1; mean=2.333; max=4" in report
+    assert 'Rater Count Distribution: `{"1": 1, "2": 1, "4": 1}`' in report
 
     output = tmp_path / "field_metrics.csv"
     write_metrics(output, [metric])

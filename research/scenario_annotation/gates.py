@@ -324,6 +324,7 @@ def evaluate_semantic_reliability(
     def metrics_check() -> tuple[bool, str]:
         metrics_path = analysis_dir / "field_metrics.csv"
         import csv
+        import math
 
         with metrics_path.open("r", encoding="utf-8", newline="") as stream:
             metrics = list(csv.DictReader(stream))
@@ -332,8 +333,60 @@ def evaluate_semantic_reliability(
             for row in metrics
             if row.get("freeze_status") in {"RECONSIDER", "INSUFFICIENT_DATA"}
         ]
-        passed = bool(metrics) and not blocked
-        return passed, f"field_count={len(metrics)}; blocked_fields={blocked}"
+        coverage_errors: list[str] = []
+        required_coverage = {
+            "n_units",
+            "pairable_units",
+            "min_raters_per_unit",
+            "max_raters_per_unit",
+            "mean_raters_per_unit",
+            "rater_count_distribution",
+        }
+        for row in metrics:
+            missing = sorted(required_coverage - set(row))
+            if missing:
+                coverage_errors.append(f"{row.get('field', '')}: missing {missing}")
+                continue
+            try:
+                n_units = int(row["n_units"])
+                pairable_units = int(row["pairable_units"])
+                distribution = {
+                    int(raters): int(count)
+                    for raters, count in json.loads(row["rater_count_distribution"]).items()
+                }
+                min_raters = int(row["min_raters_per_unit"])
+                max_raters = int(row["max_raters_per_unit"])
+                mean_raters = float(row["mean_raters_per_unit"])
+            except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+                coverage_errors.append(f"{row.get('field', '')}: invalid coverage values ({exc})")
+                continue
+            distribution_units = sum(distribution.values())
+            calculated_pairable = sum(
+                count for raters, count in distribution.items() if raters >= 2
+            )
+            observed_raterrange = (
+                min(distribution, default=0),
+                max(distribution, default=0),
+            )
+            calculated_mean = (
+                sum(raters * count for raters, count in distribution.items()) / n_units
+                if n_units
+                else 0.0
+            )
+            if (
+                n_units <= 0
+                or any(raters < 1 or count <= 0 for raters, count in distribution.items())
+                or distribution_units != n_units
+                or pairable_units != calculated_pairable
+                or observed_raterrange != (min_raters, max_raters)
+                or not math.isclose(mean_raters, calculated_mean, rel_tol=0.0, abs_tol=1e-6)
+            ):
+                coverage_errors.append(f"{row.get('field', '')}: rater coverage summary is inconsistent")
+        passed = bool(metrics) and not blocked and not coverage_errors
+        return passed, (
+            f"field_count={len(metrics)}; blocked_fields={blocked}; "
+            f"rater_coverage_errors={coverage_errors}"
+        )
 
     def violation_check() -> tuple[bool, str]:
         rates = json.loads((analysis_dir / "semantic_violation_rates.json").read_text(encoding="utf-8"))
@@ -345,7 +398,7 @@ def evaluate_semantic_reliability(
         settings = json.loads(quality_thresholds_path.read_text(encoding="utf-8"))
         passed, exceeded = evaluate_violation_thresholds(rates, settings)
         return passed, (
-            f"settings_version={settings['settings_version']}; exceeded_thresholds={exceeded}"
+            f"settings_version={settings['settings_version']}; failed_metrics={exceeded}"
         )
 
     def artifact_validity_check() -> tuple[bool, str]:
@@ -418,19 +471,75 @@ def evaluate_semantic_reliability(
 
 def evaluate_violation_thresholds(
     rates: Mapping[str, Mapping[str, Any]], settings: Mapping[str, Any]
-) -> tuple[bool, dict[str, dict[str, float | str]]]:
-    exceeded: dict[str, dict[str, float | str]] = {}
-    groups = (("SEMANTIC_MISUNDERSTANDING", settings.get("semantic_misunderstanding_max_rates", {})),)
-    for category, thresholds in groups:
-        for metric, maximum in thresholds.items():
-            actual = float(rates.get(metric, {}).get("rate", 0.0))
-            if actual > float(maximum):
-                exceeded[str(metric)] = {
-                    "category": category,
-                    "actual": actual,
-                    "maximum": float(maximum),
-                }
-    return not exceeded, exceeded
+) -> tuple[bool, dict[str, dict[str, float | int | str]]]:
+    from math import isfinite
+
+    failures: dict[str, dict[str, float | int | str]] = {}
+    thresholds = settings.get("semantic_misunderstanding_max_rates", {})
+    minimums = settings.get("semantic_misunderstanding_min_eligible_counts", {})
+    if set(thresholds) != set(minimums):
+        return False, {
+            "ELIGIBILITY_MINIMA_CONFIGURATION": {
+                "category": "INSUFFICIENT_COVERAGE",
+                "required_metrics": ",".join(sorted(thresholds)),
+                "configured_metrics": ",".join(sorted(minimums)),
+            }
+        }
+    if settings.get("eligibility_minima_status") != "APPROVED_AFTER_FORMAL_BANK_REVIEW":
+        failures["ELIGIBILITY_MINIMA_POLICY"] = {
+            "category": "INSUFFICIENT_COVERAGE",
+            "policy_status": str(settings.get("eligibility_minima_status", "MISSING")),
+            "required_status": "APPROVED_AFTER_FORMAL_BANK_REVIEW",
+        }
+
+    for metric, maximum in thresholds.items():
+        minimum = int(minimums[metric])
+        metric_result = rates.get(metric)
+        raw_eligible_count = (
+            metric_result.get("eligible_count")
+            if isinstance(metric_result, Mapping)
+            else None
+        )
+        if (
+            not isinstance(raw_eligible_count, int)
+            or isinstance(raw_eligible_count, bool)
+            or raw_eligible_count < 0
+        ):
+            failures[str(metric)] = {
+                "category": "INVALID_METRIC",
+                "issue": "eligible_count must be a nonnegative integer",
+            }
+            continue
+        eligible_count = raw_eligible_count
+        if eligible_count < minimum or not isinstance(metric_result, Mapping) or "rate" not in metric_result:
+            failures[str(metric)] = {
+                "category": "INSUFFICIENT_COVERAGE",
+                "eligible_count": eligible_count,
+                "minimum": minimum,
+            }
+            continue
+        raw_rate = metric_result["rate"]
+        if (
+            not isinstance(raw_rate, (int, float))
+            or isinstance(raw_rate, bool)
+            or not isfinite(float(raw_rate))
+            or not 0 <= float(raw_rate) <= 1
+        ):
+            failures[str(metric)] = {
+                "category": "INVALID_METRIC",
+                "issue": "rate must be finite and between zero and one",
+                "eligible_count": eligible_count,
+            }
+            continue
+        actual = float(raw_rate)
+        if actual > float(maximum):
+            failures[str(metric)] = {
+                "category": "SEMANTIC_MISUNDERSTANDING",
+                "actual": actual,
+                "maximum": float(maximum),
+                "eligible_count": eligible_count,
+            }
+    return not failures, failures
 
 
 def evaluate_representation_freeze(

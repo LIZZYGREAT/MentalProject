@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
 from typing import Iterable, Mapping
 
 from .agreement import FieldMetric
@@ -77,6 +78,15 @@ def build_construct_report(
                 f"- Status: {status}",
                 "- Definition Version: supplied manual version",
                 f"- N: {metric.n_valid}",
+                f"- Units / Pairable Units: {metric.n_units} / {metric.pairable_units}",
+                (
+                    "- Raters per Unit: "
+                    f"min={metric.min_raters_per_unit}; "
+                    f"mean={metric.mean_raters_per_unit:.3f}; "
+                    f"max={metric.max_raters_per_unit}"
+                ),
+                "- Rater Count Distribution: "
+                f"`{json.dumps(metric.rater_count_distribution, sort_keys=True)}`",
                 f"- Unknown/No-Evidence Rate: {metric.unknown_rate:.3f}",
                 f"- Agreement alpha: {_fmt(metric.krippendorff_alpha)} ({metric.alpha_type})",
                 f"- Raw agreement: {_fmt(metric.raw_agreement)}",

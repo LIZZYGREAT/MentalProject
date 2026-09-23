@@ -1,5 +1,6 @@
 {
   "artifact_validity_required": true,
+  "eligibility_minima_status": "PROVISIONAL_REQUIRES_FORMAL_BANK_REVIEW",
   "semantic_misunderstanding_max_rates": {
     "FreeTimeAsRecoveryErrorRate": 0.05,
     "MissedCourseAutomaticObligationErrorRate": 0.05,
@@ -7,5 +8,12 @@
     "TaskHelpAsSupportErrorRate": 0.05,
     "UnsupportedAppraisalInferenceRate": 0.05
   },
-  "settings_version": "1.0"
+  "semantic_misunderstanding_min_eligible_counts": {
+    "FreeTimeAsRecoveryErrorRate": 1,
+    "MissedCourseAutomaticObligationErrorRate": 1,
+    "ParentChildObligationDoubleCountRate": 1,
+    "TaskHelpAsSupportErrorRate": 1,
+    "UnsupportedAppraisalInferenceRate": 1
+  },
+  "settings_version": "1.1"
 }

@@ -3,14 +3,62 @@
   "$id": "https://mindflow.local/schemas/quality-thresholds-v1.json",
   "title": "MindFlow Stage 1 Versioned Quality Thresholds",
   "type": "object",
-  "required": ["settings_version", "artifact_validity_required", "semantic_misunderstanding_max_rates"],
+  "required": [
+    "settings_version",
+    "artifact_validity_required",
+    "eligibility_minima_status",
+    "semantic_misunderstanding_max_rates",
+    "semantic_misunderstanding_min_eligible_counts"
+  ],
   "properties": {
-    "settings_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
-    "artifact_validity_required": {"const": true},
+    "settings_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "artifact_validity_required": {
+      "const": true
+    },
+    "eligibility_minima_status": {
+      "enum": [
+        "PROVISIONAL_REQUIRES_FORMAL_BANK_REVIEW",
+        "APPROVED_AFTER_FORMAL_BANK_REVIEW"
+      ]
+    },
     "semantic_misunderstanding_max_rates": {
       "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
+      "required": [
+        "FreeTimeAsRecoveryErrorRate",
+        "MissedCourseAutomaticObligationErrorRate",
+        "ParentChildObligationDoubleCountRate",
+        "TaskHelpAsSupportErrorRate",
+        "UnsupportedAppraisalInferenceRate"
+      ],
+      "properties": {
+        "FreeTimeAsRecoveryErrorRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "MissedCourseAutomaticObligationErrorRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "ParentChildObligationDoubleCountRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "TaskHelpAsSupportErrorRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "UnsupportedAppraisalInferenceRate": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "semantic_misunderstanding_min_eligible_counts": {
+      "type": "object",
+      "required": [
+        "FreeTimeAsRecoveryErrorRate",
+        "MissedCourseAutomaticObligationErrorRate",
+        "ParentChildObligationDoubleCountRate",
+        "TaskHelpAsSupportErrorRate",
+        "UnsupportedAppraisalInferenceRate"
+      ],
+      "properties": {
+        "FreeTimeAsRecoveryErrorRate": {"type": "integer", "minimum": 1},
+        "MissedCourseAutomaticObligationErrorRate": {"type": "integer", "minimum": 1},
+        "ParentChildObligationDoubleCountRate": {"type": "integer", "minimum": 1},
+        "TaskHelpAsSupportErrorRate": {"type": "integer", "minimum": 1},
+        "UnsupportedAppraisalInferenceRate": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

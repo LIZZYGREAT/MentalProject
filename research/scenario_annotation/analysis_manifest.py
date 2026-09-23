@@ -18,7 +18,7 @@ from .artifact_fingerprint import (
 from .loader import load_json
 
 
-ANALYSIS_VERSION = "1.1"
+ANALYSIS_VERSION = "1.2"
 _PACKAGE_RELATIVE = Path("research") / "scenario_annotation"
 _ANALYSIS_SUPPORT_FILES = (
     "analysis_manifest.py",
@@ -26,6 +26,7 @@ _ANALYSIS_SUPPORT_FILES = (
     "annotation_catalog.py",
     "annotation_contract.py",
     "assignments.py",
+    "gates.py",
     "validation.py",
 )
 

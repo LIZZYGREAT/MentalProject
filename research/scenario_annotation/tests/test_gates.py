@@ -6,12 +6,14 @@ import pytest
 from research.scenario_annotation.annotation_catalog import field_specs
 from research.scenario_annotation.artifact_fingerprint import sha256_file, sha256_fileset
 from research.scenario_annotation.freeze import FreezeBlockedError, freeze_representation
+from research.scenario_annotation.analysis.critical_violations import violation_rates
 from research.scenario_annotation.gates import (
     evaluate_manual_ready,
     evaluate_representation_freeze,
     evaluate_semantic_reliability,
     evaluate_violation_thresholds,
 )
+from research.scenario_annotation.validation import Validator
 
 
 def _write_submission_fixture(root: Path, *, round_name: str, manual_version: str) -> list[dict]:
@@ -205,21 +207,84 @@ def test_freeze_requires_reference_set_manifest_to_bind_gate_b_analysis(tmp_path
 
 def test_gate_b_uses_versioned_semantic_thresholds() -> None:
     settings = {
+        "eligibility_minima_status": "APPROVED_AFTER_FORMAL_BANK_REVIEW",
         "semantic_misunderstanding_max_rates": {"TaskHelpAsSupportErrorRate": 0.05},
+        "semantic_misunderstanding_min_eligible_counts": {"TaskHelpAsSupportErrorRate": 1},
     }
     acceptable = {
-        "TaskHelpAsSupportErrorRate": {"rate": 0.04},
+        "TaskHelpAsSupportErrorRate": {"eligible_count": 1, "rate": 0.04},
     }
     passed, exceeded = evaluate_violation_thresholds(acceptable, settings)
     assert passed
     assert exceeded == {}
 
     rejected = {
-        "TaskHelpAsSupportErrorRate": {"rate": 0.06},
+        "TaskHelpAsSupportErrorRate": {"eligible_count": 1, "rate": 0.06},
     }
     passed, exceeded = evaluate_violation_thresholds(rejected, settings)
     assert not passed
     assert exceeded["TaskHelpAsSupportErrorRate"]["category"] == "SEMANTIC_MISUNDERSTANDING"
+
+
+def test_zero_eligible_opportunities_cannot_pass_with_zero_error_rate() -> None:
+    rates = violation_rates([], [], {}, {})
+    metrics = set(rates)
+    settings = {
+        "eligibility_minima_status": "APPROVED_AFTER_FORMAL_BANK_REVIEW",
+        "semantic_misunderstanding_max_rates": {metric: 0.05 for metric in metrics},
+        "semantic_misunderstanding_min_eligible_counts": {metric: 1 for metric in metrics},
+    }
+
+    passed, failures = evaluate_violation_thresholds(rates, settings)
+
+    assert not passed
+    assert set(failures) == metrics
+    assert all(item["category"] == "INSUFFICIENT_COVERAGE" for item in failures.values())
+    assert all(item["eligible_count"] == 0 and item["minimum"] == 1 for item in failures.values())
+
+
+def test_gate_b_rejects_provisional_minima_even_with_opportunity_coverage() -> None:
+    settings = {
+        "eligibility_minima_status": "PROVISIONAL_REQUIRES_FORMAL_BANK_REVIEW",
+        "semantic_misunderstanding_max_rates": {"TaskHelpAsSupportErrorRate": 0.05},
+        "semantic_misunderstanding_min_eligible_counts": {"TaskHelpAsSupportErrorRate": 1},
+    }
+    rates = {"TaskHelpAsSupportErrorRate": {"eligible_count": 1, "rate": 0.0}}
+
+    passed, failures = evaluate_violation_thresholds(rates, settings)
+
+    assert not passed
+    assert failures["ELIGIBILITY_MINIMA_POLICY"]["category"] == "INSUFFICIENT_COVERAGE"
+
+
+def test_gate_b_rejects_missing_or_nonfinite_semantic_metrics() -> None:
+    settings = {
+        "eligibility_minima_status": "APPROVED_AFTER_FORMAL_BANK_REVIEW",
+        "semantic_misunderstanding_max_rates": {"TaskHelpAsSupportErrorRate": 0.05},
+        "semantic_misunderstanding_min_eligible_counts": {"TaskHelpAsSupportErrorRate": 1},
+    }
+    for rates in (
+        {"TaskHelpAsSupportErrorRate": {"rate": 0.0}},
+        {"TaskHelpAsSupportErrorRate": {"eligible_count": 1, "rate": float("nan")}},
+    ):
+        passed, failures = evaluate_violation_thresholds(rates, settings)
+        assert not passed
+        assert failures["TaskHelpAsSupportErrorRate"]["category"] == "INVALID_METRIC"
+
+
+def test_quality_threshold_settings_define_all_eligible_count_floors() -> None:
+    package_root = Path(__file__).parents[1]
+    settings_path = package_root / "settings" / "quality_thresholds_v1.json"
+    validation = Validator().validate_paths([settings_path], "quality-thresholds")
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert validation.ok, [str(issue) for issue in validation.issues]
+    assert settings["settings_version"] == "1.1"
+    assert settings["eligibility_minima_status"] == "PROVISIONAL_REQUIRES_FORMAL_BANK_REVIEW"
+    assert set(settings["semantic_misunderstanding_max_rates"]) == set(
+        settings["semantic_misunderstanding_min_eligible_counts"]
+    )
+    assert all(value >= 1 for value in settings["semantic_misunderstanding_min_eligible_counts"].values())
 
 
 @pytest.mark.parametrize("damage", ["missing_scenario", "missing_variable"])
