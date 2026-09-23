@@ -6,6 +6,7 @@ import pytest
 from research.scenario_annotation.ai_runner.contracts import RetryReason, retry_allowed
 from research.scenario_annotation.ai_runner.importer import import_ai_output
 from research.scenario_annotation.ai_runner.packets import export_ai_packets
+from research.scenario_annotation.ai_runner.packets import _manual_excerpt
 from research.scenario_annotation.loader import load_json, load_jsonl
 from research.scenario_annotation.validation import FORBIDDEN_VISIBLE_KEYS, Validator
 
@@ -35,6 +36,14 @@ def test_exported_packet_contains_only_one_visible_scenario_and_relevant_manual_
     for key in FORBIDDEN_VISIBLE_KEYS:
         assert f'"{key}"' not in serialized_view
     assert "gold_label" not in serialized_view
+
+
+def test_manual_heading_changes_do_not_break_module_extraction() -> None:
+    manual = (PACKAGE / "manuals" / "coding_manual_v0.1.md").read_text(encoding="utf-8")
+    renamed = manual.replace("## 4. Module B", "## 四、个人评估模块")
+    excerpt = _manual_excerpt(renamed, "B")
+    assert "## 四、个人评估模块" in excerpt
+    assert "Module C" not in excerpt
 
 
 def _valid_raw_output() -> dict:

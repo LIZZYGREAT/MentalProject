@@ -11,10 +11,12 @@ from ..loader import load_json, load_jsonl
 
 
 AI_ANNOTATORS = {"AI-A", "AI-B", "AI-C"}
-MODULE_TITLES = {
-    "A": ("## 3. Module A", "## 4. Module B"),
-    "B": ("## 4. Module B", "## 5. Module C"),
-    "C": ("## 5. Module C", "## 6. Critical"),
+MODULE_MARKERS = {
+    module: (
+        f"<!-- ANNOTATION_MODULE:{module}:START -->",
+        f"<!-- ANNOTATION_MODULE:{module}:END -->",
+    )
+    for module in ("A", "B", "C")
 }
 
 
@@ -23,12 +25,12 @@ def _digest(value: bytes) -> str:
 
 
 def _manual_excerpt(text: str, module: str) -> str:
-    start_marker, end_marker = MODULE_TITLES[module]
+    start_marker, end_marker = MODULE_MARKERS[module]
     start = text.find(start_marker)
     end = text.find(end_marker, start + len(start_marker))
     if start < 0 or end < 0:
         raise ValueError(f"cannot locate Module {module} section in coding manual")
-    return text[start:end].strip()
+    return text[start + len(start_marker):end].strip()
 
 
 def _compact_contract(schema: dict[str, Any]) -> dict[str, Any]:
@@ -53,7 +55,7 @@ def export_ai_packets(
 ) -> dict[str, Any]:
     if annotator_id not in AI_ANNOTATORS:
         raise ValueError("prompt packets are only available for AI-A, AI-B, and AI-C")
-    if module not in MODULE_TITLES:
+    if module not in MODULE_MARKERS:
         raise ValueError(f"unknown module: {module}")
     manifest = load_json(assignment_manifest_path)
     if manifest.get("annotator_id") != annotator_id:

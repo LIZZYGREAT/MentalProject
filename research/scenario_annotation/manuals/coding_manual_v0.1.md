@@ -26,6 +26,7 @@ Unknown reason 只能取：`NOT_MENTIONED`、`INSUFFICIENT_DETAIL`、
 发现 `known_at > known_at_cutoff`、hidden metadata、无法解释的时间重叠或事实自相矛盾时，
 不得自行修正输入，应报告 QA 问题。
 
+<!-- ANNOTATION_MODULE:A:START -->
 ## 3. Module A — Event / Lifecycle / Exposure / Obligation / Recovery
 
 Module A 的时间事实字段为 `SCHEDULED_START`、`SCHEDULED_END`、`ACTUAL_START`、`ACTUAL_END` 与 `DEADLINE`。
@@ -254,6 +255,8 @@ Module A 的时间事实字段为 `SCHEDULED_START`、`SCHEDULED_END`、`ACTUAL_
 - **Counterexample:** “明天截止”但 remaining work 未知不能自动 `HIGH`。
 - **Minimal-Pair Example:** deadline 不变，只改变 remaining effort。
 
+<!-- ANNOTATION_MODULE:A:END -->
+<!-- ANNOTATION_MODULE:B:START -->
 ## 4. Module B — Personal Appraisal Evidence
 
 Module B 每个 dimension 单独一条 record。Directional label 必须引用逐字 `evidence_span`。
@@ -357,6 +360,8 @@ Module B 每个 dimension 单独一条 record。Directional label 必须引用�
 - **Counterexample:** “我应该可以”没有清楚 target 时不是自动 `STABLE_GENERAL`。
 - **Minimal-Pair Example:** “今天”/“高数一直”/“一般考试都”。
 
+<!-- ANNOTATION_MODULE:B:END -->
+<!-- ANNOTATION_MODULE:C:START -->
 ## 5. Module C — Bot Interaction / Support Representation
 
 Module C 的单位是完整 `BotResponseUnit`，不是把一句话拆成多个 support pulse。只评价发送时
@@ -474,6 +479,7 @@ Module C 的单位是完整 `BotResponseUnit`，不是把一句话拆成多个 s
 - **Counterexample:** 10:30 的回复不能用于把 10:03 预填为 seen。
 - **Minimal-Pair Example:** 相同 response，一版有 cutoff 前 receipt，一版没有。
 
+<!-- ANNOTATION_MODULE:C:END -->
 ## 6. Critical forbidden-inference checklist
 
 提交前逐项检查：
