@@ -25,9 +25,19 @@ _ANALYSIS_SUPPORT_FILES = (
     "artifact_fingerprint.py",
     "annotation_catalog.py",
     "annotation_contract.py",
-    "assignments.py",
-    "gates.py",
     "validation.py",
+)
+_ANALYSIS_SCHEMA_FILES = (
+    "scenario.schema.json",
+    "event_annotation.schema.json",
+    "appraisal_annotation.schema.json",
+    "bot_annotation.schema.json",
+    "pair_design.schema.json",
+    "coverage_tags.schema.json",
+    "anchor_reference.schema.json",
+    "anchor_review.schema.json",
+    "assignment_manifest.schema.json",
+    "quality_thresholds.schema.json",
 )
 
 
@@ -39,7 +49,7 @@ def _analysis_code_paths(repository_root: Path) -> list[Path]:
     package_root = _package_root(repository_root)
     paths = list((package_root / "analysis").rglob("*.py"))
     paths.extend(package_root / name for name in _ANALYSIS_SUPPORT_FILES)
-    paths.extend((package_root / "schemas").glob("*.schema.json"))
+    paths.extend(package_root / "schemas" / name for name in _ANALYSIS_SCHEMA_FILES)
     paths = sorted((path.resolve() for path in paths), key=lambda path: path.as_posix())
     missing = [path for path in paths if not path.is_file()]
     if missing:

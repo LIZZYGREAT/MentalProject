@@ -521,11 +521,55 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path, monkeypatc
     assert manifest["analysis_version"] == "1.3"
     assert all("logical_path" in entry and "path" not in entry for entry in manifest["scenario_files"])
     assert manifest["analysis_code_sha256"]
+    recorded_code_paths = {
+        str(entry["logical_path"]) for entry in manifest["analysis_code_files"]
+    }
+    assert not any(path.endswith(("/assignments.py", "/gates.py")) for path in recorded_code_paths)
+    recorded_schemas = {
+        Path(path).name for path in recorded_code_paths if "/schemas/" in path
+    }
+    assert recorded_schemas == {
+        "scenario.schema.json",
+        "event_annotation.schema.json",
+        "appraisal_annotation.schema.json",
+        "bot_annotation.schema.json",
+        "pair_design.schema.json",
+        "coverage_tags.schema.json",
+        "anchor_reference.schema.json",
+        "anchor_review.schema.json",
+        "assignment_manifest.schema.json",
+        "quality_thresholds.schema.json",
+    }
 
     relocated_root = tmp_path / "relocated_repo"
     shutil.copytree(repository_root, relocated_root)
     relocated_package = relocated_root / "research" / "scenario_annotation"
     relocated_manifest = relocated_package / "analysis" / "outputs" / "calibration" / "analysis_manifest.json"
+    verify_analysis_manifest_current(
+        relocated_manifest,
+        annotations_dir=relocated_package / "annotations" / "calibration",
+        scenario_paths=[relocated_package / "scenarios" / "calibration.jsonl"],
+        coverage_path=relocated_package / "hidden" / "coverage_tags.jsonl",
+        pair_design_path=relocated_package / "hidden" / "pair_design.jsonl",
+        quality_thresholds_path=relocated_package / "settings" / "quality_thresholds_v1.json",
+        anchor_reference_path=relocated_package / "hidden" / "anchor_reference.jsonl",
+        anchor_review_decisions_path=(
+            relocated_package / "adjudication" / "anchor_review_decisions.jsonl"
+        ),
+        manual_path=relocated_package / "manuals" / "coding_manual_v0.1.md",
+        repository_root=relocated_root,
+    )
+    for unrelated_path in (
+        relocated_package / "assignments.py",
+        relocated_package / "gates.py",
+        relocated_package / "schemas" / "freeze_manifest.schema.json",
+        relocated_package / "schemas" / "reference_record.schema.json",
+        relocated_package / "schemas" / "reference_set_manifest.schema.json",
+    ):
+        unrelated_path.write_text(
+            unrelated_path.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
     verify_analysis_manifest_current(
         relocated_manifest,
         annotations_dir=relocated_package / "annotations" / "calibration",
