@@ -6,6 +6,7 @@ import pytest
 from research.scenario_annotation.analysis.common import AnnotationRow
 from research.scenario_annotation.analysis.critical_violations import find_critical_violations, violation_rates
 from research.scenario_annotation.analysis.artifact_validity import evaluate_artifact_validity
+from research.scenario_annotation.analysis.anchors import analyze_anchors, anchor_summary
 from research.scenario_annotation.analysis.orthogonality import analyze_orthogonality, orthogonality_summary
 from research.scenario_annotation.analysis.pipeline import run_analysis
 from research.scenario_annotation.analysis_manifest import verify_analysis_manifest_current
@@ -151,6 +152,84 @@ def test_orthogonality_reports_each_expected_check_when_annotations_are_missing(
     assert summary["missing_checks"] == 1
 
 
+def test_design_anchors_are_audited_and_mismatches_enter_manual_review() -> None:
+    anchors = [
+        {
+            "anchor_id": "A_PARTIAL",
+            "scenario_id": "S_PARTIAL",
+            "target_ref": "E_PARTIAL",
+            "variable": "PARTIAL_ENCODING_BASIS",
+            "target_variable": "EXECUTION_EXPOSURE",
+            "record_attribute": "partial_encoding_basis",
+            "intended_label": "ACTUAL_INTERVAL",
+            "is_gold": False,
+        },
+        {
+            "anchor_id": "A_LIFECYCLE",
+            "scenario_id": "S_SKIP",
+            "target_ref": "E_SKIP",
+            "variable": "LIFECYCLE",
+            "intended_label": "SKIPPED",
+            "is_gold": False,
+        },
+    ]
+    rows = [
+        _row(
+            "S_PARTIAL", "AI-A", "EXECUTION_EXPOSURE", "PARTIAL", "E_PARTIAL", "A",
+            partial_encoding_basis="ACTUAL_INTERVAL",
+        ),
+        _row("S_SKIP", "AI-B", "LIFECYCLE", "ATTENDED", "E_SKIP", "A"),
+    ]
+    expected = {"S_PARTIAL": {"AI-A"}, "S_SKIP": {"AI-B"}}
+
+    audit = analyze_anchors(anchors, rows, expected_annotators=expected)
+    summary = anchor_summary(audit)
+
+    assert [item["status"] for item in audit] == ["MATCH", "MISMATCH_REVIEW_REQUIRED"]
+    assert audit[1]["review_status"] == "REVIEW_REQUIRED"
+    assert summary["expected_anchors"] == 2
+    assert summary["evaluated_checks"] == 2
+    assert summary["unexplained_mismatches"] == 1
+
+    reviewed = analyze_anchors(
+        anchors,
+        rows,
+        expected_annotators=expected,
+        review_decisions={
+            ("A_LIFECYCLE", "AI-B"): {
+                "disposition": "VALID_ALTERNATIVE",
+                "reviewer_id": "Human",
+                "rationale": "The available evidence permits this alternative reading.",
+            }
+        },
+    )
+    assert reviewed[1]["status"] == "MISMATCH_RESOLVED"
+    assert anchor_summary(reviewed)["unexplained_mismatches"] == 0
+
+
+def test_anchor_audit_requires_every_assigned_annotator_record() -> None:
+    anchor = {
+        "anchor_id": "A_SKIP",
+        "scenario_id": "S_SKIP",
+        "target_ref": "E_SKIP",
+        "variable": "LIFECYCLE",
+        "intended_label": "SKIPPED",
+        "is_gold": False,
+    }
+    rows = [_row("S_SKIP", "AI-A", "LIFECYCLE", "SKIPPED", "E_SKIP", "A")]
+    audit = analyze_anchors(
+        [anchor],
+        rows,
+        expected_annotators={"S_SKIP": {"AI-A", "AI-B"}},
+    )
+
+    assert {item["status"] for item in audit} == {"MATCH", "NOT_COMPARABLE"}
+    summary = anchor_summary(audit)
+    assert summary["expected_checks"] == 2
+    assert summary["evaluated_checks"] == 1
+    assert summary["missing_checks"] == 1
+
+
 def _annotation_document(annotator: str, label: str, evidence_ref: str) -> dict:
     record = {
         "annotation_id": f"CAL_019:B:C_EXEC:{annotator}",
@@ -220,6 +299,8 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
         "artifact_validity.json",
         "orthogonality.jsonl",
         "orthogonality_summary.json",
+        "anchor_audit.jsonl",
+        "anchor_summary.json",
         "disagreement_queue.jsonl",
         "disagreement_report.md",
         "scenario_annotation_report.md",
@@ -234,6 +315,18 @@ def test_full_analysis_pipeline_writes_all_required_outputs(tmp_path) -> None:
     generated_validity = json.loads((output / "artifact_validity.json").read_text(encoding="utf-8"))
     assert generated_validity["status"] == "FAIL"
     assert generated_validity["checks"]["assignment_submission_integrity"] == "NOT_EVALUATED"
+
+    anchor_reference_path = corpus_root / "hidden" / "anchor_reference.jsonl"
+    anchor_reference_path.write_text(anchor_reference_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="stale analysis manifest"):
+        verify_analysis_manifest_current(
+            output / "analysis_manifest.json",
+            annotations_dir=annotations,
+            scenario_paths=[corpus_root / "scenarios" / "calibration.jsonl"],
+            coverage_path=corpus_root / "hidden" / "coverage_tags.jsonl",
+            pair_design_path=corpus_root / "hidden" / "pair_design.jsonl",
+            quality_thresholds_path=PACKAGE_ROOT / "settings" / "quality_thresholds_v1.json",
+        )
 
     annotation_path = annotations / "annotation_0.json"
     annotation_path.write_text(annotation_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")

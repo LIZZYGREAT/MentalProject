@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/anchor-review-v1.json",
+  "title": "MindFlow Stage 1 Calibration Anchor Review Decision",
+  "type": "object",
+  "required": ["anchor_id", "annotator_id", "disposition", "reviewer_id", "reviewed_at", "rationale"],
+  "properties": {
+    "anchor_id": {"type": "string", "minLength": 1},
+    "annotator_id": {"type": "string", "minLength": 1},
+    "disposition": {"enum": ["VALID_ALTERNATIVE", "ANCHOR_INVALIDATED"]},
+    "reviewer_id": {"type": "string", "minLength": 1},
+    "reviewed_at": {"type": "string", "format": "date-time"},
+    "rationale": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

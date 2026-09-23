@@ -137,6 +137,8 @@ def _scenario(
     bot_units: list[dict[str, Any]] | None = None,
     cutoff: datetime | None = None,
     anchor: tuple[str, str, Any, str] | None = None,
+    anchor_target_variable: str | None = None,
+    anchor_record_attribute: str | None = None,
 ) -> ScenarioArtifact:
     pack = _pack(pack_number)
     scenario_id = f"CAL_{number:03d}"
@@ -191,6 +193,10 @@ def _scenario(
             "reference_type": "DESIGN_ANCHOR",
             "is_gold": False,
         }
+        if anchor_target_variable:
+            anchor_value["target_variable"] = anchor_target_variable
+        if anchor_record_attribute:
+            anchor_value["record_attribute"] = anchor_record_attribute
     return ScenarioArtifact(visible, coverage, anchor_value)
 
 
@@ -216,7 +222,7 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
     ):
         cutoff = at(2, 12)
         event = _event("E_COURSE_PARTIAL_INTERVAL", "统计学", "有精确实际参与区间。", at(2, 10, 25), "P02", scheduled_start=at(2, 10), scheduled_end=at(2, 11, 40), actual_start=at(2, 10), actual_end=at(2, 10, 25))
-        artifacts.append(_scenario(number, 2, mode, ["A"], "Course PARTIAL / actual interval", narrative, ["COURSE", "PARTIAL", "ACTUAL_INTERVAL", "SINGLE_EXPOSURE"], focal_events=[event], cutoff=cutoff, anchor=("E_COURSE_PARTIAL_INTERVAL", "PARTIAL_ENCODING_BASIS", "ACTUAL_INTERVAL", "精确实际区间是唯一主要 partial 编码路径。")))
+        artifacts.append(_scenario(number, 2, mode, ["A"], "Course PARTIAL / actual interval", narrative, ["COURSE", "PARTIAL", "ACTUAL_INTERVAL", "SINGLE_EXPOSURE"], focal_events=[event], cutoff=cutoff, anchor=("E_COURSE_PARTIAL_INTERVAL", "PARTIAL_ENCODING_BASIS", "ACTUAL_INTERVAL", "精确实际区间是唯一主要 partial 编码路径。"), anchor_target_variable="EXECUTION_EXPOSURE", anchor_record_attribute="partial_encoding_basis"))
 
     # 5–6: fraction-only partial, dual presentation.
     for number, mode, narrative in (
@@ -225,7 +231,7 @@ def build_calibration() -> tuple[list[ScenarioArtifact], list[dict[str, Any]]]:
     ):
         cutoff = at(3, 18)
         event = _event("E_COURSE_PARTIAL_FRACTION", "计算机实验", "参与者只提供了大致参与比例。", cutoff - timedelta(minutes=10), "P02", scheduled_start=at(3, 14), scheduled_end=at(3, 15, 40), exposure_fraction=0.5)
-        artifacts.append(_scenario(number, 2, mode, ["A"], "Course PARTIAL / fraction only", narrative, ["COURSE", "PARTIAL", "FRACTION_ONLY", "SINGLE_EXPOSURE"], focal_events=[event], cutoff=cutoff, anchor=("E_COURSE_PARTIAL_FRACTION", "PARTIAL_ENCODING_BASIS", "FRACTION_ONLY", "没有 actual interval，比例是唯一明确编码。")))
+        artifacts.append(_scenario(number, 2, mode, ["A"], "Course PARTIAL / fraction only", narrative, ["COURSE", "PARTIAL", "FRACTION_ONLY", "SINGLE_EXPOSURE"], focal_events=[event], cutoff=cutoff, anchor=("E_COURSE_PARTIAL_FRACTION", "PARTIAL_ENCODING_BASIS", "FRACTION_ONLY", "没有 actual interval，比例是唯一明确编码。"), anchor_target_variable="EXECUTION_EXPOSURE", anchor_record_attribute="partial_encoding_basis"))
 
     # 7–8: missed course without a catch-up obligation, dual presentation.
     for number, mode, narrative in (

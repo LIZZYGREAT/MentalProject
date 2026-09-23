@@ -168,6 +168,8 @@ def evaluate_artifact_validity(
     coverage_path: str | Path,
     pairs_path: str | Path,
     assignments_root: str | Path | None = None,
+    anchor_reference_path: str | Path | None = None,
+    anchor_review_decisions_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Validate every input that can affect Stage 1 analysis.
 
@@ -296,6 +298,24 @@ def evaluate_artifact_validity(
             _issue(str(coverage_path), "no coverage tags were loaded", "NO_COVERAGE_TAGS")
         )
 
+    if anchor_reference_path is None:
+        anchor_result = ValidationResult(
+            0,
+            (_issue("anchor reference", "anchor_reference_path was not provided", "ANCHOR_ROOT_NOT_CONFIGURED"),),
+        )
+    else:
+        anchor_result = validator.validate_paths([anchor_reference_path], "anchor-reference")
+        if anchor_result.checked == 0 and not anchor_result.issues:
+            anchor_result = ValidationResult(
+                0,
+                (_issue(str(anchor_reference_path), "no design anchors were loaded", "NO_ANCHORS"),),
+            )
+    review_not_required = anchor_review_decisions_path is None or not Path(anchor_review_decisions_path).exists()
+    if review_not_required:
+        review_result = ValidationResult(0, ())
+    else:
+        review_result = validator.validate_paths([anchor_review_decisions_path], "anchor-review")
+
     assignment_checked = 0
     assignment_issues: list[ValidationIssue] = []
     assignment_not_configured = assignments_root is None
@@ -322,6 +342,7 @@ def evaluate_artifact_validity(
     coverage_checked, coverage_validation_issues = _extend_result(
         [coverage_result], coverage_extra_issues
     )
+    anchor_checked, anchor_validation_issues = anchor_result.checked, list(anchor_result.issues)
 
     hidden_issues = [
         issue for issue in scenario_validation_issues if issue.code == "HIDDEN_METADATA"
@@ -342,6 +363,11 @@ def evaluate_artifact_validity(
         "annotation_validator": (annotation_validation_checked, annotation_validation_issues),
         "pair_design_validator": (pair_checked, pair_validation_issues),
         "coverage_validator": (coverage_checked, coverage_validation_issues),
+        "anchor_reference_validator": (anchor_checked, anchor_validation_issues),
+        "anchor_review_decision_validator": (
+            max(review_result.checked, 1) if review_not_required else review_result.checked,
+            list(review_result.issues),
+        ),
         "assignment_submission_integrity": (assignment_checked, assignment_issues),
         "hidden_metadata": (scenario_checked, hidden_issues),
         "evidence_reference_integrity": (annotation_checked, evidence_issues),
@@ -352,6 +378,8 @@ def evaluate_artifact_validity(
         name: (
             "NOT_EVALUATED"
             if name == "assignment_submission_integrity" and assignment_not_configured
+            else "PASS"
+            if name == "anchor_review_decision_validator" and review_not_required
             else _status(checked, issues)
         )
         for name, (checked, issues) in check_inputs.items()

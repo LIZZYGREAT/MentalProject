@@ -376,6 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
             "bot-annotation",
             "pair-design",
             "anchor-reference",
+            "anchor-review",
             "coverage-tags",
             "assignment-manifest",
             "revision-log",

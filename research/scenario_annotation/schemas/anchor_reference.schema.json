@@ -9,10 +9,18 @@
     "scenario_id": {"type": "string", "minLength": 1},
     "target_ref": {"type": "string", "minLength": 1},
     "variable": {"type": "string", "minLength": 1},
+    "target_variable": {"type": "string", "minLength": 1},
+    "record_attribute": {"type": "string", "minLength": 1},
     "intended_label": {"type": ["string", "number"]},
     "rationale": {"type": "string", "minLength": 1},
     "reference_type": {"const": "DESIGN_ANCHOR"},
     "is_gold": {"const": false}
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"required": ["record_attribute"]},
+      "then": {"required": ["target_variable"]}
+    }
+  ]
 }

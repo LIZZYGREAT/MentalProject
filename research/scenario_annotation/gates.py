@@ -152,6 +152,8 @@ def evaluate_manual_ready(
             "semantic_violation_rates.json",
             "artifact_validity.json",
             "orthogonality_summary.json",
+            "anchor_audit.jsonl",
+            "anchor_summary.json",
             "disagreement_report.md",
             "scenario_annotation_report.md",
             "analysis_manifest.json",
@@ -178,6 +180,8 @@ def evaluate_manual_ready(
             coverage_path=coverage_path,
             pair_design_path=pair_design_path,
             quality_thresholds_path=quality_thresholds_path,
+            anchor_reference_path=coverage_path.parent / "anchor_reference.jsonl",
+            anchor_review_decisions_path=Path(__file__).parent / "adjudication" / "anchor_review_decisions.jsonl",
         )
         orthogonality = json.loads(
             (analysis_dir / "orthogonality_summary.json").read_text(encoding="utf-8")
@@ -190,6 +194,29 @@ def evaluate_manual_ready(
                 f"missing={orthogonality.get('missing_checks')}"
             )
         return True, "analysis outputs complete and input manifest is current"
+
+    def anchor_check() -> tuple[bool, str]:
+        path = analysis_dir / "anchor_summary.json"
+        if not path.exists():
+            return False, "missing anchor_summary.json"
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        expected = int(summary.get("expected_checks", 0))
+        evaluated = int(summary.get("evaluated_checks", 0))
+        missing = int(summary.get("missing_checks", 0))
+        invalid = int(summary.get("invalid_checks", 0))
+        unexplained = int(summary.get("unexplained_mismatches", 0))
+        passed = (
+            int(summary.get("expected_anchors", 0)) > 0
+            and expected > 0
+            and evaluated == expected
+            and missing == 0
+            and invalid == 0
+            and unexplained == 0
+        )
+        return passed, (
+            f"expected_checks={expected}; evaluated_checks={evaluated}; missing_checks={missing}; "
+            f"invalid_checks={invalid}; unexplained_mismatches={unexplained}"
+        )
 
     def revision_check() -> tuple[bool, str]:
         result = Validator().validate_paths([revision_log_path], "revision-log")
@@ -205,6 +232,7 @@ def evaluate_manual_ready(
         _check("critical_boundary_coverage", coverage_check),
         _check("independent_primary_annotators", annotation_check),
         _check("calibration_analysis_outputs", analysis_check),
+        _check("calibration_design_anchor_audit", anchor_check),
         _check("resolved_revision_decisions", revision_check),
     )
     blockers = tuple(check.detail for check in checks if not check.passed)

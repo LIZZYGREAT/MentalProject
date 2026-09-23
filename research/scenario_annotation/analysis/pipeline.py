@@ -11,6 +11,12 @@ from ..analysis_manifest import build_analysis_manifest, write_analysis_manifest
 from ..loader import load_jsonl
 from .artifact_validity import evaluate_artifact_validity
 from .agreement import FieldMetric, analyze_agreement
+from .anchors import (
+    analyze_anchors,
+    anchor_summary,
+    assigned_annotators_by_scenario,
+    load_review_decisions,
+)
 from .common import (
     annotation_files,
     flatten_annotations,
@@ -57,8 +63,10 @@ def run_analysis(
     quality_thresholds_path: str | Path | None = None,
     repository_root: str | Path | None = None,
     assignments_root: str | Path | None = None,
+    anchor_reference_path: str | Path | None = None,
+    anchor_review_decisions_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    only = only or {"agreement", "violations", "orthogonality", "disagreement", "report"}
+    only = only or {"agreement", "violations", "orthogonality", "anchors", "disagreement", "report"}
     scenario_paths = (
         [Path(scenarios_path)]
         if isinstance(scenarios_path, (str, Path))
@@ -70,12 +78,21 @@ def run_analysis(
         quality_thresholds_path
         or Path(__file__).parents[1] / "settings" / "quality_thresholds_v1.json"
     )
+    anchor_reference_path = Path(
+        anchor_reference_path or Path(coverage_path).parent / "anchor_reference.jsonl"
+    )
+    anchor_review_decisions_path = Path(
+        anchor_review_decisions_path
+        or Path(__file__).parents[1] / "adjudication" / "anchor_review_decisions.jsonl"
+    )
     artifact_validity = evaluate_artifact_validity(
         scenarios_paths=scenario_paths,
         annotations_dir=annotations_dir,
         coverage_path=coverage_path,
         pairs_path=pairs_path,
         assignments_root=assignments_root,
+        anchor_reference_path=anchor_reference_path,
+        anchor_review_decisions_path=anchor_review_decisions_path,
     )
     (root / "artifact_validity.json").write_text(
         json.dumps(artifact_validity, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -87,6 +104,8 @@ def run_analysis(
         "annotation_validator",
         "pair_design_validator",
         "coverage_validator",
+        "anchor_reference_validator",
+        "anchor_review_decision_validator",
     )
     failed_inputs = [
         name for name in required_inputs
@@ -114,10 +133,24 @@ def run_analysis(
         raise ValueError("annotation documents contain no records")
     coverage = load_hidden_by_scenario(coverage_path)
     pairs = load_jsonl(pairs_path)
+    anchors = load_jsonl(anchor_reference_path)
+    review_decisions = load_review_decisions(anchor_review_decisions_path)
+    expected_anchor_annotators = (
+        assigned_annotators_by_scenario(assignments_root)
+        if assignments_root is not None
+        else None
+    )
 
     metrics = analyze_agreement(rows)
     violations = find_critical_violations(rows, scenarios, coverage)
     orthogonality = analyze_orthogonality(rows, pairs, scenarios=scenarios)
+    anchor_audit = analyze_anchors(
+        anchors,
+        rows,
+        expected_annotators=expected_anchor_annotators,
+        review_decisions=review_decisions,
+    )
+    anchors_summary = anchor_summary(anchor_audit)
     disagreements = build_disagreement_queue(rows)
 
     if "agreement" in only:
@@ -143,6 +176,13 @@ def run_analysis(
             json.dumps(orthogonality_summary(orthogonality), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+    if "anchors" in only:
+        _write_jsonl(root / "anchor_audit.jsonl", anchor_audit)
+        (root / "anchor_summary.json").write_text(
+            json.dumps(anchors_summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     if "disagreement" in only:
         _write_jsonl(root / "disagreement_queue.jsonl", (item.to_dict() for item in disagreements))
         (root / "disagreement_report.md").write_text(
@@ -165,6 +205,8 @@ def run_analysis(
         quality_thresholds_path=quality_thresholds_path,
         manual_version=manual_versions.pop(),
         repository_root=repository_root or Path(__file__).parents[3],
+        anchor_reference_path=anchor_reference_path,
+        anchor_review_decisions_path=anchor_review_decisions_path,
     )
     write_analysis_manifest(root / "analysis_manifest.json", manifest)
     return {
@@ -173,6 +215,8 @@ def run_analysis(
         "fields": len(metrics),
         "violations": len(violations),
         "orthogonality_checks": len(orthogonality),
+        "anchor_checks": anchors_summary["expected_checks"],
+        "anchor_unexplained_mismatches": anchors_summary["unexplained_mismatches"],
         "disagreements": len(disagreements),
         "artifact_validity": artifact_validity["status"],
     }

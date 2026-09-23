@@ -81,6 +81,7 @@ class Validator:
             "bot-annotation": "bot_annotation.schema.json",
             "pair-design": "pair_design.schema.json",
             "anchor-reference": "anchor_reference.schema.json",
+            "anchor-review": "anchor_review.schema.json",
             "coverage-tags": "coverage_tags.schema.json",
             "assignment-manifest": "assignment_manifest.schema.json",
             "revision-log": "revision_log.schema.json",
