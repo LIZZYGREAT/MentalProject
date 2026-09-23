@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindflow.local/schemas/reference-record-v1.json",
+  "title": "MindFlow Stage 1 Reference Record",
+  "type": "object",
+  "required": ["reference_id", "scenario_id", "target_ref", "variable", "gold_label", "resolution_mode", "source_annotation_ids", "manual_version", "scenario_version"],
+  "properties": {
+    "reference_id": {"type": "string", "minLength": 1},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "target_ref": {"type": "string", "minLength": 1},
+    "variable": {"type": "string", "minLength": 1},
+    "gold_label": {"type": ["string", "number", "null"]},
+    "resolution_mode": {"enum": ["UNANIMOUS", "ADJUDICATED"]},
+    "source_annotation_ids": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "manual_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "scenario_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"}
+  },
+  "additionalProperties": false
+}

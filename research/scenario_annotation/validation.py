@@ -90,6 +90,7 @@ class Validator:
             "human-draft": "human_draft.schema.json",
             "adjudication": "adjudication.schema.json",
             "freeze-manifest": "freeze_manifest.schema.json",
+            "reference-record": "reference_record.schema.json",
         }
         try:
             name = names[artifact_type]

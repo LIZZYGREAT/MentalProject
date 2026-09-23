@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping
 from .annotation_contract import check_submission_integrity
 from .analysis.common import load_annotation_documents
 from .loader import load_jsonl
+from .reference_set import expected_reference_keys
 from .validation import Validator
 
 
@@ -340,17 +341,26 @@ def evaluate_representation_freeze(
         return passed, f"final_manual={manual_path}; final_marker={passed}"
 
     def gold_check() -> tuple[bool, str]:
-        result = Validator().validate_paths([gold_path], "adjudication")
+        result = Validator().validate_paths([gold_path], "reference-record")
         rows = load_jsonl(gold_path)
-        formal_ids = {
-            str(row["scenario_id"])
+        scenarios = [
+            row
             for path in (main_scenarios_path, edge_scenarios_path)
             for row in load_jsonl(path)
+        ]
+        expected = expected_reference_keys(scenarios)
+        actual = {
+            (str(row["scenario_id"]), str(row["target_ref"]), str(row["variable"]))
+            for row in rows
         }
-        gold_ids = {str(row["scenario_id"]) for row in rows}
-        missing = sorted(formal_ids - gold_ids)
-        passed = result.ok and len(formal_ids) == 96 and not missing
-        return passed, f"schema_valid={result.ok}; formal_scenarios={len(formal_ids)}; missing_gold_scenarios={missing}"
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        passed = result.ok and len(scenarios) == 96 and not missing and not unexpected
+        return passed, (
+            f"schema_valid={result.ok}; formal_scenarios={len(scenarios)}; "
+            f"expected_keys={len(expected)}; actual_keys={len(actual)}; "
+            f"missing_reference_keys={missing}; unexpected_reference_keys={unexpected}"
+        )
 
     def decision_check() -> tuple[bool, str]:
         result = Validator().validate_paths([revision_log_path], "revision-log")

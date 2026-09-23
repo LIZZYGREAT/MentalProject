@@ -147,6 +147,33 @@ def _freeze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reference_set_command(args: argparse.Namespace) -> int:
+    from .analysis.common import load_annotation_documents
+    from .loader import load_jsonl
+    from .reference_set import build_reference_set, load_adjudications, write_reference_set
+
+    try:
+        scenarios = load_jsonl(args.scenarios)
+        scenario_index = {str(row["scenario_id"]): row for row in scenarios}
+        documents = load_annotation_documents(
+            args.annotations_dir,
+            validate=True,
+            scenarios=scenario_index,
+            require_scenario_context=True,
+        )
+        records = build_reference_set(
+            annotation_documents=documents,
+            scenarios=scenarios,
+            adjudications=load_adjudications(args.adjudications),
+        )
+        count = write_reference_set(args.output, records)
+    except (OSError, ValueError) as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    print(f"PASS: built complete Reference Set ({count} target×variable records)")
+    return 0
+
+
 def _export_ai_packets_command(args: argparse.Namespace) -> int:
     from .ai_runner.packets import export_ai_packets
 
@@ -335,6 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
             "gate-result",
             "adjudication",
             "freeze-manifest",
+            "reference-record",
         ),
     )
     validate.add_argument("paths", nargs="+", type=Path)
@@ -428,6 +456,16 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--scenario-version", default="1.0")
     freeze.add_argument("--gold-version", default="1.0")
     freeze.set_defaults(handler=_freeze_command)
+
+    reference = subparsers.add_parser(
+        "build-reference-set",
+        help="combine unanimous annotations and explicit adjudications into a complete Reference Set",
+    )
+    reference.add_argument("--annotations-dir", type=Path, required=True)
+    reference.add_argument("--scenarios", type=Path, required=True)
+    reference.add_argument("--adjudications", type=Path, required=True)
+    reference.add_argument("--output", type=Path, required=True)
+    reference.set_defaults(handler=_reference_set_command)
 
     export_packets = subparsers.add_parser(
         "export-ai-packets", help="export provider-neutral one-scenario prompt packets"
