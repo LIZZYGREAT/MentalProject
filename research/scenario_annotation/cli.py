@@ -429,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
             "anchor-review",
             "coverage-tags",
             "assignment-manifest",
+            "quality-thresholds",
             "revision-log",
             "gate-result",
             "adjudication",
