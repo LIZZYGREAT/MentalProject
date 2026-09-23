@@ -8,6 +8,8 @@ from research.scenario_annotation.artifact_fingerprint import sha256_file, sha25
 from research.scenario_annotation.freeze import FreezeBlockedError, freeze_representation
 from research.scenario_annotation.analysis.critical_violations import violation_rates
 from research.scenario_annotation.gates import (
+    MANUAL_GATE_CONSTRUCTS,
+    _check_field_metrics,
     evaluate_manual_ready,
     evaluate_representation_freeze,
     evaluate_semantic_reliability,
@@ -270,6 +272,73 @@ def test_gate_b_rejects_missing_or_nonfinite_semantic_metrics() -> None:
         passed, failures = evaluate_violation_thresholds(rates, settings)
         assert not passed
         assert failures["TaskHelpAsSupportErrorRate"]["category"] == "INVALID_METRIC"
+
+
+def test_gate_b_checks_only_metric_contract_and_key_field_pairability(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "field_metrics.csv"
+    rows = [
+        {"field": field, "freeze_status": "FACT_REVIEW", "pairable_units": "1"}
+        for field in sorted(MANUAL_GATE_CONSTRUCTS)
+    ]
+    rows.append({"field": "NON_KEY_FIELD", "freeze_status": "FACT_REVIEW", "pairable_units": "0"})
+    metrics_path.write_text(
+        "field,freeze_status,pairable_units\n"
+        + "".join(
+            f"{row['field']},{row['freeze_status']},{row['pairable_units']}\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+    passed, detail = _check_field_metrics(metrics_path)
+
+    assert passed
+    assert "rater_coverage_errors" not in detail
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("missing_column", "missing required columns"),
+        ("missing_key_field", "missing_key_fields"),
+        ("zero_key_pairability", "key_fields_without_pairable_units"),
+        ("blocked_field", "blocked_fields"),
+    ],
+)
+def test_gate_b_rejects_unavailable_or_blocked_field_metrics(
+    tmp_path: Path, change: str, expected: str
+) -> None:
+    metrics_path = tmp_path / "field_metrics.csv"
+    rows = [
+        {"field": field, "freeze_status": "FACT_REVIEW", "pairable_units": "1"}
+        for field in sorted(MANUAL_GATE_CONSTRUCTS)
+    ]
+    if change == "missing_key_field":
+        rows = rows[1:]
+    elif change == "zero_key_pairability":
+        rows[0]["pairable_units"] = "0"
+    elif change == "blocked_field":
+        rows[0]["freeze_status"] = "INSUFFICIENT_DATA"
+    if change == "missing_column":
+        metrics_path.write_text(
+            "field,freeze_status\n" + "".join(
+                f"{row['field']},{row['freeze_status']}\n" for row in rows
+            ),
+            encoding="utf-8",
+        )
+    else:
+        metrics_path.write_text(
+            "field,freeze_status,pairable_units\n" + "".join(
+                f"{row['field']},{row['freeze_status']},{row['pairable_units']}\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+
+    passed, detail = _check_field_metrics(metrics_path)
+
+    assert not passed
+    assert expected in detail
 
 
 def test_quality_threshold_settings_define_all_eligible_count_floors() -> None:

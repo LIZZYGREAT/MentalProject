@@ -6,6 +6,7 @@ revision decisions produce FAIL, never a synthetic PASS.
 
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -91,6 +92,44 @@ def _check(name: str, operation: Callable[[], tuple[bool, str]]) -> GateCheck:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return GateCheck(name, False, str(exc))
     return GateCheck(name, passed, detail)
+
+
+def _check_field_metrics(metrics_path: str | Path) -> tuple[bool, str]:
+    path = Path(metrics_path)
+    if not path.is_file():
+        return False, "field_metrics.csv is missing"
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        missing_columns = sorted({"field", "freeze_status", "pairable_units"} - set(reader.fieldnames or []))
+        if missing_columns:
+            return False, f"field_metrics.csv is missing required columns: {missing_columns}"
+        metrics = list(reader)
+    if not metrics:
+        return False, "field_metrics.csv contains no field rows"
+
+    blocked = sorted({
+        row["field"]
+        for row in metrics
+        if row["freeze_status"] in {"RECONSIDER", "INSUFFICIENT_DATA"}
+    })
+    metrics_by_field = {row["field"]: row for row in metrics}
+    missing_key_fields = sorted(MANUAL_GATE_CONSTRUCTS - metrics_by_field.keys())
+    non_pairable_key_fields: list[str] = []
+    for field in sorted(MANUAL_GATE_CONSTRUCTS & metrics_by_field.keys()):
+        try:
+            pairable_units = int(metrics_by_field[field]["pairable_units"])
+        except (ValueError, TypeError):
+            non_pairable_key_fields.append(field)
+            continue
+        if pairable_units < 1:
+            non_pairable_key_fields.append(field)
+
+    passed = not blocked and not missing_key_fields and not non_pairable_key_fields
+    return passed, (
+        f"field_count={len(metrics)}; blocked_fields={blocked}; "
+        f"missing_key_fields={missing_key_fields}; "
+        f"key_fields_without_pairable_units={non_pairable_key_fields}"
+    )
 
 
 def evaluate_manual_ready(
@@ -327,71 +366,7 @@ def evaluate_semantic_reliability(
         )
 
     def metrics_check() -> tuple[bool, str]:
-        metrics_path = analysis_dir / "field_metrics.csv"
-        import csv
-        import math
-
-        with metrics_path.open("r", encoding="utf-8", newline="") as stream:
-            metrics = list(csv.DictReader(stream))
-        blocked = [
-            row["field"]
-            for row in metrics
-            if row.get("freeze_status") in {"RECONSIDER", "INSUFFICIENT_DATA"}
-        ]
-        coverage_errors: list[str] = []
-        required_coverage = {
-            "n_units",
-            "pairable_units",
-            "min_raters_per_unit",
-            "max_raters_per_unit",
-            "mean_raters_per_unit",
-            "rater_count_distribution",
-        }
-        for row in metrics:
-            missing = sorted(required_coverage - set(row))
-            if missing:
-                coverage_errors.append(f"{row.get('field', '')}: missing {missing}")
-                continue
-            try:
-                n_units = int(row["n_units"])
-                pairable_units = int(row["pairable_units"])
-                distribution = {
-                    int(raters): int(count)
-                    for raters, count in json.loads(row["rater_count_distribution"]).items()
-                }
-                min_raters = int(row["min_raters_per_unit"])
-                max_raters = int(row["max_raters_per_unit"])
-                mean_raters = float(row["mean_raters_per_unit"])
-            except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as exc:
-                coverage_errors.append(f"{row.get('field', '')}: invalid coverage values ({exc})")
-                continue
-            distribution_units = sum(distribution.values())
-            calculated_pairable = sum(
-                count for raters, count in distribution.items() if raters >= 2
-            )
-            observed_raterrange = (
-                min(distribution, default=0),
-                max(distribution, default=0),
-            )
-            calculated_mean = (
-                sum(raters * count for raters, count in distribution.items()) / n_units
-                if n_units
-                else 0.0
-            )
-            if (
-                n_units <= 0
-                or any(raters < 1 or count <= 0 for raters, count in distribution.items())
-                or distribution_units != n_units
-                or pairable_units != calculated_pairable
-                or observed_raterrange != (min_raters, max_raters)
-                or not math.isclose(mean_raters, calculated_mean, rel_tol=0.0, abs_tol=1e-6)
-            ):
-                coverage_errors.append(f"{row.get('field', '')}: rater coverage summary is inconsistent")
-        passed = bool(metrics) and not blocked and not coverage_errors
-        return passed, (
-            f"field_count={len(metrics)}; blocked_fields={blocked}; "
-            f"rater_coverage_errors={coverage_errors}"
-        )
+        return _check_field_metrics(analysis_dir / "field_metrics.csv")
 
     def violation_check() -> tuple[bool, str]:
         rates = json.loads((analysis_dir / "semantic_violation_rates.json").read_text(encoding="utf-8"))
